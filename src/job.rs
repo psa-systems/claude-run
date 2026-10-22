@@ -45,6 +45,9 @@ pub struct RunnerDefaults {
     pub budget_warn_fraction: f64,
     /// Issues one run may create when the action sets no override.
     pub max_issues_per_run: u32,
+    /// Timeout for the post-success review session (CLAUDE-449), `youtrack`
+    /// kind only, when the action sets no override.
+    pub review_timeout_seconds: u32,
 }
 
 impl Default for RunnerDefaults {
@@ -56,6 +59,7 @@ impl Default for RunnerDefaults {
             daily_budget_usd: 5.00,
             budget_warn_fraction: crate::usage::DEFAULT_WARN_FRACTION,
             max_issues_per_run: crate::provider::DEFAULT_MAX_ISSUES_PER_RUN,
+            review_timeout_seconds: 1800,
         }
     }
 }
@@ -74,6 +78,8 @@ pub struct EffectiveLimits {
     /// This run's issue-creation ceiling, enforced at the provider boundary by
     /// [`crate::provider::AuditedTracker`].
     pub max_issues_per_run: u32,
+    /// Timeout for the post-success review session (CLAUDE-449).
+    pub review_timeout: Duration,
 }
 
 impl EffectiveLimits {
@@ -104,6 +110,10 @@ pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> Eff
             .budget_warn_fraction
             .unwrap_or(defaults.budget_warn_fraction),
         max_issues_per_run: l.max_issues_per_run.unwrap_or(defaults.max_issues_per_run),
+        review_timeout: Duration::from_secs(
+            l.review_timeout_seconds
+                .unwrap_or(defaults.review_timeout_seconds) as u64,
+        ),
     }
 }
 

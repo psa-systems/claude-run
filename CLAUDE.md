@@ -116,6 +116,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - Stream-log readers return `io::Result`; an unreadable log finalizes as transient ([CLAUDE-256](docs/conventions/claude-runtime.md#stream-log-read-failures-claude-256))
 - No `claude` child can leave work running past its own turn ([CLAUDE-280](docs/conventions/claude-runtime.md#no-background-work-claude-280))
 - The checkpoint-push watcher runs on a plain OS thread, not a tokio task ([CLAUDE-448](docs/conventions/claude-runtime.md#checkpoint-push-watcher-runs-off-a-plain-os-thread-not-a-tokio-task-claude-448))
+- A successful run's PR opens as a draft and gets a read-only review session before promotion ([CLAUDE-449](docs/conventions/claude-runtime.md#post-success-review-session-runs-with-no-edit-or-write-claude-449))
 
 ### Log and state retention
 

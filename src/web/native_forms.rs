@@ -302,6 +302,10 @@ fn apply_common(
             &c.limit_budget_warn_fraction,
         )?,
         max_issues_per_run: parse_opt_u32("Max issues per run", &c.limit_max_issues_per_run)?,
+        // The post-success review session (CLAUDE-449) applies only to the
+        // `youtrack` kind, which has its own editor (`YoutrackEditForm` in
+        // `web/mod.rs`); this shared block backs no kind that runs one.
+        review_timeout_seconds: None,
     };
     set_or_remove(
         map,

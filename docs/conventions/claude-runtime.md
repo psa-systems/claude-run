@@ -42,6 +42,41 @@ No `claude` child can leave work running past its own turn (CLAUDE-280). `Claude
 
 The `Bash` tool's own foreground-command timeout is unrelated to the `timeout(1)` wrapper around the whole child and defaults to 2 minutes (ceiling 10), so without this a long foreground command (a full check suite, a container build) is killed by the tool itself well before the run's own wall-clock budget, and a retry with no explicit `timeout` just repeats the same kill. `ClaudeInvoker::invoke` (`src/claude.rs`) sets `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS` in every child's environment, next to `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`, both equal to the invocation's own `timeout` in milliseconds, for every caller. Because the child is already wrapped in `timeout(1)` for exactly that long, raising the tool's own ceiling to match removes nothing that was not already bounded by the run's budget.
 
+## Post-success review session runs with no Edit or Write (CLAUDE-449)
+
+A successful `youtrack` run's PR is never promoted straight to ready. `finalize` always opens it as a draft first
+(`create_pr_with_draft(..., true, None)`), and `process_job` then runs `run_review_session` (`src/native/youtrack.rs`),
+a second, fresh-context `claude` invocation over the same workdir before deciding what to do with that draft. Its
+`claude::ClaudeBlock` is cloned from the action's own and its `allowed_tools` is forcibly overridden to
+`Read,Glob,Grep,Bash` regardless of what the action grants the main session, because a review that could edit the
+work it is judging could also edit away its own findings. It gets its own timeout
+(`limits.review_timeout_seconds`, default `1800`, rejected at load if set to `0`), its own stream log path (so it
+never interleaves with the main session's), and the run's remaining spend ceiling as its `--max-budget-usd`.
+
+The verdict is read from the workdir, not from the invocation's own exit code: the review session is told to write
+`.claude-run-review-pass` with its notes if the work looks done, or `.claude-run-review-fail` with its findings
+otherwise. `run_review_session` removes any stale marker before invoking, then after a clean, non-timed-out return
+compares `git rev-parse HEAD` before and after and re-reads `workdir::uncommitted_or_stashed`, filtering out the two
+marker paths themselves (an untracked marker file is an expected write, not evidence of the session having edited the
+work) before deciding anything else there counts as `workdir_touched`. Reading exactly one marker yields `Pass`/`Fail`
+with that marker's trimmed contents as the verdict text; both markers, no marker, a timed-out session
+(`ClaudeResult::timed_out`), or any `workdir_touched` all collapse to `NoVerdict`, since none of those is a reviewer
+opinion the runner can act on, only a malfunction it detected.
+
+`finalize`'s `review: Option<&ReviewOutcome>` parameter decides the outcome from there: `None` or `Some(Pass(_))`
+promotes the draft via `mark_pr_ready` and folds the verdict notes into the success comment's own "## Review" section;
+`Some(Fail(findings))` leaves the PR a draft, posts `findings` on both the PR and the issue, and counts the attempt -
+below `max_attempts_per_key` it reverts `AI Agent` to `Queued` (`Finalized::ReviewFailed { requeued: true, .. }`) so a
+later run resumes onto the same branch and PR (the built-in prompt's resume step already tells a resumed run to read
+the PR's comments for a timed-out salvage's note; CLAUDE-449 extends that same sentence to also cover a review
+session's findings), at the cap it parks on `Needs Review` instead (`requeued: false`); `Some(NoVerdict(cause))`
+always parks on `Needs Review` regardless of the attempt count, logged at `error` naming the key and `cause`, since
+there is no finding to fix and resuming would just repeat the same malfunction. Every one of the four outcomes
+(`CodeReview`, `ReviewFailed{requeued:true}`, `ReviewFailed{requeued:false}`, and the `NoVerdict` parking) is covered
+by its own `finalize`-level test in `src/native/youtrack.rs`; `run_review_session` itself has a dedicated test per
+verdict path (pass, fail, no marker, both markers, timeout, edited a tracked file, committed) plus one asserting the
+invocation's `--allowed-tools` and `--max-budget-usd` argv and its own stream log path.
+
 ## Checkpoint-push watcher runs off a plain OS thread, not a tokio task (CLAUDE-448)
 
 `process_job` (`src/native/youtrack.rs`) needs to push checkpoint commits every 60 seconds WHILE `claude.invoke` is synchronously blocking the task, so the watcher cannot be a tokio task sharing that same future: it is `run_checkpoint_watcher`, spawned on a plain OS thread via `std::thread::scope` around the `claude.invoke` call, which also lets it borrow `forge: &dyn Forge`, `job: &YoutrackJob` and the workdir path directly instead of needing `'static`/`Arc` clones. A `std::sync::mpsc::channel` is the stop signal: the watcher's loop calls `stop_rx.recv_timeout(interval)`, ticking on `Timeout` and returning the moment `recv_timeout` reports `Disconnected`, which happens as soon as `claude.invoke` returns and the scope's body drops its `Sender`, so the watcher does not wait out a whole extra interval after the run already finished. The `Receiver` must be moved into the watcher closure by value, never passed by reference (`Receiver<T>` is `Send` but not `Sync`, so `&Receiver<T>` is not `Send` and will not cross the `scope.spawn` boundary). The one piece of real work the watcher does, recording the first opened PR into `agent_pull_requests`, is async (`ci_failure::store::record_agent_pr`), so the watcher captures a `tokio::runtime::Handle` (via `Handle::current()`, read on the calling task before the thread is spawned) and calls `handle.block_on(...)` on its own OS thread to run that one query. A direct unit test of `run_checkpoint_watcher` (as opposed to `process_job`'s own tests, which exercise the production call site on the always-multi-threaded daemon runtime) must use `#[tokio::test(flavor = "multi_thread")]`: under the default `current_thread` flavor the test's own task is synchronously parked inside the `std::thread::scope` join while the watcher's `block_on` has no spare worker thread left to drive it, which deadlocks rather than fails.

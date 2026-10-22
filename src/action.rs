@@ -1004,6 +1004,29 @@ post:
         );
     }
 
+    /// `limits.review_timeout_seconds: 0` is rejected at load (CLAUDE-449): a
+    /// zero-second review session can never do anything, so it fails fast
+    /// instead of silently reading as a crash/no-marker NoVerdict at run time.
+    #[test]
+    fn validate_str_rejects_zero_review_timeout() {
+        let raw = "name: yt\nkind: youtrack\nlimits:\n  review_timeout_seconds: 0\nnative:\n  youtrack: {}\n";
+        let err = validate_str(raw, "<candidate>").unwrap_err();
+        assert!(
+            matches!(&err, Error::ActionInvalidField { field, .. }
+                if field == "limits.review_timeout_seconds"),
+            "got {err:?}"
+        );
+    }
+
+    /// An action that omits `limits.review_timeout_seconds` entirely loads
+    /// fine; the default lives in `RunnerDefaults::review_timeout_seconds`,
+    /// not here.
+    #[test]
+    fn validate_str_accepts_missing_review_timeout() {
+        let raw = "name: yt\nkind: youtrack\nnative:\n  youtrack: {}\n";
+        validate_str(raw, "<candidate>").unwrap();
+    }
+
     /// Collects the log lines emitted while a closure runs, so the deprecation
     /// warn path can be asserted on rather than assumed (mirrors
     /// `claude.rs`'s `capture_logs`).
@@ -1899,6 +1922,12 @@ pub struct Limits {
     /// hundred. Unset falls back to
     /// [`crate::provider::DEFAULT_MAX_ISSUES_PER_RUN`]; `0` creates nothing.
     pub max_issues_per_run: Option<u32>,
+    /// Timeout for the post-success review session (CLAUDE-449): a
+    /// fresh-context claude session that checks the completed work against
+    /// the issue before finalize promotes the PR to ready. `youtrack` kind
+    /// only. Unset falls back to [`crate::job::RunnerDefaults::review_timeout_seconds`]
+    /// (1800); `Some(0)` is rejected at load (see `validate_native`).
+    pub review_timeout_seconds: Option<u32>,
 }
 
 /// Per-action keyed parallel execution.
@@ -2150,6 +2179,17 @@ fn validate_native(action: &Action, label: &str) -> Result<()> {
                 name: action.name.clone(),
                 field: "native.youtrack.dependencies.recheck_timeout".to_string(),
                 reason: format!("`{raw}` is not a valid duration: {e}"),
+                path: label.to_string(),
+            });
+        }
+        // `limits.review_timeout_seconds` (CLAUDE-449): `0` would hand the
+        // review session no time to do anything, which always reads as a
+        // crash/no-marker NoVerdict, so it fails fast at load instead.
+        if action.limits.review_timeout_seconds == Some(0) {
+            return Err(Error::ActionInvalidField {
+                name: action.name.clone(),
+                field: "limits.review_timeout_seconds".to_string(),
+                reason: "must be at least 1 second".to_string(),
                 path: label.to_string(),
             });
         }

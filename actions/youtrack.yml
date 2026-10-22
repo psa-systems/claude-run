@@ -20,11 +20,14 @@
 # AI Agent state machine (labels configurable under native.youtrack.states):
 #   Queued       -> picked up by this action
 #   Working      -> claude is running (set in the pre step)
-#   Code Review  -> the runner opened a PR after a successful run; the code needs human review (finalize step)
+#   Code Review  -> a successful run's PR passed the post-success review session (below) and was promoted out of
+#                   draft; the code needs human review (finalize step)
 #   Needs Review -> claude couldn't proceed and parked the job by writing .claude-run-needs-review; the issue needs
 #                   human input (finalize step) - the attempt counter is NOT incremented. A timeout also lands here
 #                   even when a checkpoint push (below) already salvaged the work into a draft PR - CLAUDE-453 tracks
-#                   auto-requeuing a timeout back to Queued instead, as a deliberately descoped follow-up of CLAUDE-448
+#                   auto-requeuing a timeout back to Queued instead, as a deliberately descoped follow-up of CLAUDE-448.
+#                   The post-success review session (below) also lands here when it gave no usable verdict, and when
+#                   a real fail verdict's attempt count has reached max_attempts_per_key
 #   Failed       -> claude or a step had a hard failure (finalize step)
 #   Done         -> a run that deliberately produced tracker output rather than code and wrote
 #                   .claude-run-no-code-change; no PR is opened and State is left alone (CLAUDE-214, label configurable
@@ -41,6 +44,16 @@
 # never fails the job over it, and the rejection is named in whichever outcome comment finalize posts. The default
 # branch is never checkpoint-pushed. Only the Forgejo (`fj`) backend implements checkpoint_push today; CLAUDE-452
 # tracks the GitHub backend as a deliberately descoped follow-up.
+#
+# Post-success review session (CLAUDE-449): a successful run's PR is always opened as a draft first. Before promoting
+# it, the runner spends a second, separate-context claude invocation reviewing the same workdir read-only
+# (allowed_tools forced to Read,Glob,Grep,Bash regardless of this file's own claude.allowed_tools; its own timeout,
+# limits.review_timeout_seconds below; the run's remaining spend ceiling). A pass (.claude-run-review-pass) promotes
+# the draft to ready and folds the verdict notes into the success comment. A fail (.claude-run-review-fail) leaves the
+# PR a draft, posts the findings on the PR and the issue, counts the attempt, and requeues to Queued below
+# max_attempts_per_key or parks at Needs Review at the cap - either way the built-in prompt's resume step (below)
+# tells the agent to read the PR's comments and fix what the review found. No marker, both markers, a timeout, or the
+# review session touching the workdir all collapse to no usable verdict, which always parks at Needs Review instead.
 #
 # Working can also revert to Queued (CLAUDE-439), with a comment naming the reason and no attempt counted: a transient
 # claude result (an authentication failure, or a rate-limit / usage-limit signal) after the pre step already wrote
@@ -76,6 +89,7 @@ limits:
   max_attempts_per_key: 3
   max_runs_per_day: 100
   claude_timeout_seconds: 3600
+  review_timeout_seconds: 1800
   daily_budget_usd: 150.00
 
 schedule:

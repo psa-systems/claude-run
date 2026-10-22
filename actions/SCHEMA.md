@@ -47,6 +47,7 @@ limits: # optional per-action overrides of the built-in defaults
   max_attempts_per_key: 3
   max_runs_per_day: 20
   claude_timeout_seconds: 600
+  review_timeout_seconds: 1800
   daily_budget_usd: 5.00
   run_budget_usd: 5.00      # spend ceiling for ONE run; unset = daily_budget_usd
   budget_warn_fraction: 0.8 # warn once at this fraction of run_budget_usd
@@ -864,6 +865,7 @@ Per-action overrides for the runner-wide defaults. Any subset of:
 | `max_attempts_per_key`   | `3`     |
 | `max_runs_per_day`       | `20`    |
 | `claude_timeout_seconds` | `600`   |
+| `review_timeout_seconds` | `1800`  |
 | `daily_budget_usd`       | `5.00`  |
 | `run_budget_usd`         | the effective `daily_budget_usd` |
 | `budget_warn_fraction`   | `0.80`  |
@@ -895,6 +897,23 @@ The default branch is never checkpoint-pushed. Only the Forgejo backend implemen
 (CLAUDE-452 tracks the GitHub backend as a descoped follow-up), and a timeout still always parks on `needs_review`
 exactly as the CLAUDE-379 paragraph above describes, even when a checkpoint push already salvaged the work into a
 draft PR (CLAUDE-453 tracks auto-requeuing that case back to Queued as a further descoped follow-up).
+
+CLAUDE-449: a run that finishes successfully with no outstanding needs-review/no-code marker does not promote its PR
+straight to ready. `finalize` always opens it as a draft first, then `process_job` runs a second, separate-context
+review session against the same workdir: a fresh `claude` invocation with `allowed_tools` forced to
+`Read,Glob,Grep,Bash` (Edit and Write are never granted, regardless of the action's own `claude.allowed_tools`), its
+own stream log, the run's remaining spend ceiling as its `--max-budget-usd`, and its own timeout,
+`limits.review_timeout_seconds` (default `1800`, rejected at load if set to `0`). The review session is told to write
+`.claude-run-review-pass` with its notes if the work looks done, or `.claude-run-review-fail` with its findings if not;
+writing neither, both, timing out, or touching the workdir (a new commit, or any tracked/untracked change beyond the
+two marker files) all collapse to no usable verdict. A pass promotes the draft PR to ready via `mark_pr_ready` and
+folds the verdict notes into the success comment's own "## Review" section. A fail leaves the PR a draft, posts the
+findings on both the PR and the issue, and counts the attempt: below `max_attempts_per_key` it requeues to `Queued`
+(the built-in prompt's resume step, same as a CLAUDE-379/CLAUDE-448 resumed run, tells the agent to read the PR's
+comments and fix what the review found) so the issue leaves the candidate set and must be re-queued by a human
+instead of looping on its own. No usable verdict always parks on `AI Agent = needs_review` instead, never the
+attempt-cap-based Queued/needs_review split a real fail gets, since a runner-detected malfunction is not a reviewer
+opinion to act on; the cause is logged at `error` naming the key either way.
 
 CLAUDE-439: neither a transient claude result nor a pause/login-required trip strands the issue on Working. A transient
 result (an authentication failure, or a rate-limit / usage-limit signal `classify_transient` recognizes) after the pre

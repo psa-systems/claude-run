@@ -27,7 +27,14 @@
 //!              no-code  (.claude-run-no-code-change) -> AI Agent=
 //!                       states.no_code (default Done), marker text commented,
 //!                       no PR
-//!              success  -> Forge::create_pr, AI Agent=Code Review
+//!              success  -> Forge::create_pr_with_draft (always draft), then a
+//!                          fresh-context, read-only review session checks the
+//!                          work against the issue (CLAUDE-449): pass -> PR
+//!                          promoted to ready, AI Agent=Code Review; fail/no
+//!                          verdict -> PR stays draft, findings posted on the
+//!                          PR and the issue, AI Agent=Queued (below the
+//!                          attempt cap) or Needs Review (at it, or on no
+//!                          verdict)
 //!                          (PR-create failure -> AI Agent=Failed)
 //!              failure  -> AI Agent=Failed, no PR
 //! ```
@@ -85,6 +92,14 @@ const NO_CODE_MARKER: &str = ".claude-run-no-code-change";
 /// How often the checkpoint-push watcher (CLAUDE-448) ticks while `claude` is
 /// still running.
 const CHECKPOINT_PUSH_INTERVAL: Duration = Duration::from_secs(60);
+/// The post-success review session (CLAUDE-449) writes this to verdict the
+/// completed work as acceptable; its contents (if any) are folded into the
+/// success comment under a `## Review` heading.
+const REVIEW_PASS_MARKER: &str = ".claude-run-review-pass";
+/// The post-success review session (CLAUDE-449) writes this to verdict the
+/// completed work as NOT yet acceptable; its contents are the findings posted
+/// on the PR and the issue instead of promoting the PR to ready.
+const REVIEW_FAIL_MARKER: &str = ".claude-run-review-fail";
 
 /// A typed YouTrack job: an eligible issue plus the repo resolved from its
 /// project's enabled VCS integration.
@@ -1492,6 +1507,51 @@ async fn process_job(
         ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1)
     });
 
+    // ---- post-success review session (CLAUDE-449) ----
+    // A fresh-context session that checks the completed work against the
+    // issue before the PR is promoted, run only when the main session
+    // succeeded with no outstanding blocker/no-code marker (a blocker or a
+    // deliberate no-code run never opens a PR, so there is nothing to
+    // review). Billed exactly like the main invocation.
+    let review = if claude_ran
+        && claude_result.ok
+        && !workdir_path.join(NEEDS_REVIEW_MARKER).exists()
+        && !workdir_path.join(NO_CODE_MARKER).exists()
+    {
+        let review_stream_log = ClaudeInvoker::review_stream_log_path(
+            &paths.logs_dir(),
+            &action.name,
+            key,
+            attempts + 1,
+        );
+        let (outcome, review_result) = crate::blocking::in_place(|| {
+            run_review_session(
+                claude,
+                &action.claude,
+                job,
+                &workdir_path,
+                limits.review_timeout,
+                &review_stream_log,
+                cancel,
+                Some(spend.remaining_usd()),
+            )
+        });
+        spend.record(&review_result);
+        crate::usage::record_invocation(
+            pool,
+            &action.name,
+            Some(key),
+            Some(run_id),
+            &review_stream_log,
+            &review_result,
+        )
+        .await;
+        state::daily_cost_add(pool, &action.name, review_result.cost).await?;
+        Some(outcome)
+    } else {
+        None
+    };
+
     // ---- finalize (the native "post"): every external mutation lives here ----
     // Synchronous. Finalize no longer polls CI (that
     // wait is now driven by a webhook event), so it returns promptly.
@@ -1513,6 +1573,9 @@ async fn process_job(
                 started: started_wall,
             },
             checkpoint_rejected.as_deref(),
+            review.as_ref(),
+            attempts + 1,
+            limits.max_attempts_per_key,
         )
     });
     // ---- record a newly opened PR against its issue ----
@@ -1532,6 +1595,11 @@ async fn process_job(
             | Finalized::TimedOut {
                 pr_number: Some(pr_number),
                 head_branch: Some(head_branch),
+            }
+            | Finalized::ReviewFailed {
+                pr_number: Some(pr_number),
+                head_branch: Some(head_branch),
+                ..
             },
         ) = &finalize_res
         {
@@ -1636,6 +1704,7 @@ async fn process_job(
     // PR at all, so it is checked and preserved just the same.
     crate::blocking::in_place(|| match &finalize_res {
         Ok(Finalized::CodeReview { .. })
+        | Ok(Finalized::ReviewFailed { .. })
         | Ok(Finalized::TimedOut {
             pr_number: Some(_),
             head_branch: Some(_),
@@ -2338,7 +2407,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "Steps:",
         "1. Run 'yt issue inspect {{key}}' to read the full description, acceptance criteria and every comment. Then decide, before you change any code, whether you can finish and verify ALL of it before the deadline. If you cannot, do not start: take the blocker path below immediately, with a reason that begins 'Task too large:', says why, proposes a split of {{key}} into PR-sized pieces (one line per piece naming the acceptance criteria it would own), and ends with the question 'Split {{key}} as proposed?'. If you can, commit to finishing: from this point the only ways to end the run are completing every acceptance criterion with evidence (step 8), the blocker path for a real blocker, or the no-code path. Running short on time is never a reason to stop; keep working until you are done or the runner kills the run, because your committed work is kept either way.",
         "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
-        "3. If {{existing_branch}} is empty, create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, ALSO read that PR's own comments (a prior timed-out run may have left one explaining what it salvaged and why, e.g. a draft PR opened from uncommitted work at kill time), then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
+        "3. If {{existing_branch}} is empty, create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, ALSO read that PR's own comments (a prior timed-out run may have left one explaining what it salvaged and why, e.g. a draft PR opened from uncommitted work at kill time, or a separate fresh-context review session may have left one listing findings that kept the PR a draft), then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
         "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit whose body ends with the bare '#{{key}}' reference, so a kill leaves committed progress instead of none; the final commit still carries the full PR-description format from step 7 and stays the branch tip. The runner pushes your commits as WIP checkpoints automatically every 60 seconds while you work, from whatever feature branch is checked out, and opens a draft PR from the first one - this is not something you do, and a checkpoint landing is not a stopping point or a reason to wrap up early; keep working exactly as step 1 describes until you are done, blocked, or killed.",
         "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (e.g. the repo's 'just check', tests, or build) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off.",
         "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
@@ -2458,7 +2527,7 @@ fn render_prompt_template(
     let deadline_utc = deadline_utc(now, claude_timeout);
     let existing_pr_url = resume.map(|r| r.pr_url.as_str()).unwrap_or("");
     let existing_branch = resume.map(|r| r.branch.as_str()).unwrap_or("");
-    let vars: [(&str, &str); 12] = [
+    let vars: [(&str, &str); 14] = [
         ("key", job.key.as_str()),
         ("summary", job.summary.as_str()),
         ("clone_url", job.clone_url.as_str()),
@@ -2471,6 +2540,8 @@ fn render_prompt_template(
         ("write_projects", write_projects),
         ("existing_pr_url", existing_pr_url),
         ("existing_branch", existing_branch),
+        ("review_pass_marker", REVIEW_PASS_MARKER),
+        ("review_fail_marker", REVIEW_FAIL_MARKER),
     ];
 
     let mut out = String::with_capacity(template.len());
@@ -2499,6 +2570,176 @@ fn render_prompt_template(
     }
     out.push_str(rest);
     out
+}
+
+/// The built-in review-session prompt (CLAUDE-449): a fresh-context claude
+/// session, invoked with no Edit or Write tool, that checks the completed
+/// work against the issue before `finalize` promotes the PR to ready. Shares
+/// [`render_prompt_template`]'s placeholders.
+fn default_review_prompt() -> String {
+    [
+        "You are reviewing a completed run of another agent session on YouTrack issue {{key}}: {{summary}}, before its pull request is promoted from draft to ready.",
+        "",
+        "Working directory: {{workdir}} - the finished branch is already checked out here. You have READ-ONLY tools: no Edit, no Write. Do not modify ANY file, do not run 'git commit', 'git add', 'git checkout -b', or anything else that changes the working tree or history; a review that touches the workdir is discarded and the issue is parked for a human instead of trusting your verdict.",
+        "",
+        "1. Run 'yt issue inspect {{key}}' to read the description, acceptance criteria, and every comment.",
+        "2. Read the diff of this branch against its base (e.g. 'git log' and 'git diff' against the merge-base) and the repository as it now stands.",
+        "3. For each acceptance criterion, decide whether the diff actually satisfies it, with concrete evidence (file:line, command output, or a passing test you can see was run). A criterion that removes or deletes something needs a grep showing zero hits, not an assertion.",
+        "4. If every criterion is satisfied with evidence, write a short verdict (what you checked, and why it passes) to this file:",
+        "     {{workdir}}/{{review_pass_marker}}",
+        "5. If any criterion is unmet, contradicted, or unverifiable, write the findings (which criteria, what is missing or wrong, and what you'd need to see fixed) to this file instead:",
+        "     {{workdir}}/{{review_fail_marker}}",
+        "6. Write to EXACTLY ONE of those two files. Do not write YouTrack comments, do not set any field, do not touch the tracker at all: this session reports only through the marker file, which the runner posts verbatim.",
+    ]
+    .join("\n")
+}
+
+/// Build the review session's instruction text for `job`, substituting the
+/// same `{{...}}` placeholders [`build_prompt`] uses.
+fn build_review_prompt(job: &YoutrackJob, workdir: &Path) -> String {
+    render_prompt_template(
+        &default_review_prompt(),
+        job,
+        workdir,
+        Duration::from_secs(0),
+        SystemTime::now(),
+        "",
+        None,
+    )
+}
+
+/// The post-success review session's verdict (CLAUDE-449).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewOutcome {
+    /// The review session wrote [`REVIEW_PASS_MARKER`]; its contents are the
+    /// verdict notes, folded into the success comment.
+    Pass(String),
+    /// The review session wrote [`REVIEW_FAIL_MARKER`]; its contents are the
+    /// findings posted on the PR and the issue instead of promoting it.
+    Fail(String),
+    /// No usable verdict: neither marker, both markers, a timed-out review
+    /// session, or a review session that touched the workdir. Always routes
+    /// to Needs Review (never the attempt-cap-based Queued/Needs Review
+    /// split [`ReviewOutcome::Fail`] gets), since there is no reviewer
+    /// opinion to act on, only a runner-detected malfunction.
+    NoVerdict(String),
+}
+
+/// The git HEAD commit of `workdir`, or `None` on any error (not a git repo,
+/// detached-with-no-commit, `git` missing). Used only to detect whether the
+/// review session moved HEAD; a lookup failure is treated the same as "we
+/// cannot tell", which the caller folds into a conservative `NoVerdict`.
+fn git_head_sha(workdir: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Run the post-success review session and return its verdict. Invoked from
+/// `process_job` only after the main agent session succeeded with no
+/// outstanding needs-review/no-code marker; `claude_cfg`'s `allowed_tools` is
+/// overridden to a read-only set regardless of the action's own
+/// configuration, so the review can never itself change the work it is
+/// judging.
+#[allow(clippy::too_many_arguments)]
+fn run_review_session(
+    claude: &ClaudeInvoker,
+    claude_cfg: &action::ClaudeBlock,
+    job: &YoutrackJob,
+    workdir: &Path,
+    timeout: Duration,
+    stream_log: &Path,
+    cancel: &CancellationToken,
+    budget_usd: Option<f64>,
+) -> (ReviewOutcome, ClaudeResult) {
+    let pass_marker = workdir.join(REVIEW_PASS_MARKER);
+    let fail_marker = workdir.join(REVIEW_FAIL_MARKER);
+    let _ = std::fs::remove_file(&pass_marker);
+    let _ = std::fs::remove_file(&fail_marker);
+
+    let before_sha = git_head_sha(workdir);
+    let mut review_cfg = claude_cfg.clone();
+    review_cfg.allowed_tools = Some("Read,Glob,Grep,Bash".to_string());
+    let prompt = build_review_prompt(job, workdir);
+
+    let invoke_result = claude.invoke(
+        &prompt,
+        &review_cfg,
+        timeout,
+        workdir,
+        stream_log,
+        cancel,
+        budget_usd,
+    );
+    let result = match invoke_result {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                ReviewOutcome::NoVerdict(format!("the review session failed to start: {e}")),
+                ClaudeResult::synthesized("review session failed to start", e.to_string()),
+            );
+        }
+    };
+
+    if result.timed_out {
+        return (
+            ReviewOutcome::NoVerdict("the review session timed out".to_string()),
+            result,
+        );
+    }
+
+    let after_sha = git_head_sha(workdir);
+    let dirty = workdir::uncommitted_or_stashed(workdir);
+    let dirty_beyond_markers = match &dirty {
+        Ok(d) => {
+            !d.stashes.is_empty()
+                || d.paths.iter().any(|p| {
+                    let path = p.get(3..).unwrap_or(p).trim();
+                    path != REVIEW_PASS_MARKER && path != REVIEW_FAIL_MARKER
+                })
+        }
+        Err(_) => true,
+    };
+    let workdir_touched = before_sha != after_sha || dirty_beyond_markers;
+    if workdir_touched {
+        return (
+            ReviewOutcome::NoVerdict(
+                "the review session modified the workdir (it is read-only by contract)".to_string(),
+            ),
+            result,
+        );
+    }
+
+    let pass = pass_marker.exists();
+    let fail = fail_marker.exists();
+    let outcome = match (pass, fail) {
+        (true, false) => ReviewOutcome::Pass(
+            std::fs::read_to_string(&pass_marker)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        ),
+        (false, true) => ReviewOutcome::Fail(
+            std::fs::read_to_string(&fail_marker)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        ),
+        (true, true) => ReviewOutcome::NoVerdict(
+            "the review session wrote both the pass and fail markers".to_string(),
+        ),
+        (false, false) => {
+            ReviewOutcome::NoVerdict("the review session wrote no verdict marker".to_string())
+        }
+    };
+    (outcome, result)
 }
 
 /// Outcome of [`finalize`]: which AI Agent transition was applied. Carried into
@@ -2553,6 +2794,17 @@ enum Finalized {
         pr_number: Option<u64>,
         head_branch: Option<String>,
     },
+    /// The post-success review session (CLAUDE-449) found problems, or gave
+    /// no usable verdict; the PR it opened/adopted stays a draft, and AI
+    /// Agent goes to Queued (below the attempt cap, review findings only -
+    /// never for a `NoVerdict`) or Needs Review (at the cap, or always for a
+    /// `NoVerdict`) instead of Code Review.
+    ReviewFailed {
+        pr_url: String,
+        pr_number: Option<u64>,
+        head_branch: Option<String>,
+        requeued: bool,
+    },
 }
 
 impl Finalized {
@@ -2563,6 +2815,10 @@ impl Finalized {
             Finalized::CodeReview { .. } => "Code Review",
             Finalized::Failed { .. } => "Failed",
             Finalized::TimedOut { .. } => "Timed Out",
+            Finalized::ReviewFailed { requeued: true, .. } => "Queued (review)",
+            Finalized::ReviewFailed {
+                requeued: false, ..
+            } => "Needs Review (review)",
         }
     }
 }
@@ -2585,6 +2841,9 @@ fn record_finalize_outcome(
 ) -> (bool, String) {
     let finalize_cause = match finalize_res {
         Ok(Finalized::Failed { cause, .. }) => Some(cause.as_str()),
+        Ok(Finalized::ReviewFailed { .. }) => {
+            Some("the post-success review found problems; the PR was left as a draft")
+        }
         _ => None,
     };
     let ok = claude_result.ok && !post_failed && finalize_cause.is_none();
@@ -2621,6 +2880,16 @@ fn finalize(
     // fails the job; named in whichever outcome comment this call produces so
     // it is never silent.
     checkpoint_push_rejected: Option<&str>,
+    // CLAUDE-449: the post-success review session's verdict, or `None` when
+    // no review ran (claude did not succeed, or the review step itself was
+    // never reached). Only consulted in the success branch below.
+    review: Option<&ReviewOutcome>,
+    // This run's attempt count AFTER this attempt (i.e. `attempts_before +
+    // 1`), and the action's cap, so a `ReviewOutcome::Fail` can pick Queued
+    // (below cap) vs Needs Review (at cap) the same way `report_cap_reached`
+    // does for the ordinary attempt cap.
+    attempts_after: u32,
+    max_attempts_per_key: u32,
 ) -> Result<Finalized> {
     let public_url = crate::run_footer::resolved_public_url();
     // CLAUDE-448: appended to whichever outcome body this call produces, right
@@ -2680,18 +2949,21 @@ fn finalize(
         // from the commit messages, which already carry the bare #<KEY>-N
         // reference.
         let host = host_only(&job.repo_host);
-        match forge.create_pr(workdir, &host, pr_strategy) {
+        // CLAUDE-449: always create/adopt as a draft, whether this is a fresh
+        // PR or a resumed run reclaiming a checkpoint-opened one, so a
+        // review session has a draft to inspect either way; the two cases
+        // converge below on whether it gets promoted to ready.
+        match forge.create_pr_with_draft(workdir, &host, pr_strategy, true, None) {
             Ok(pr) => {
                 let url = pr_url(job, &pr);
                 // A resumed run (CLAUDE-275) may be adopting a draft PR a
                 // prior timed-out run salvaged (CLAUDE-379); now that the run
                 // succeeded, replace the salvage's placeholder title/body
-                // (CLAUDE-398) with the finished tip's own text, then strip
-                // the draft/`WIP: ` status. Both are best-effort: a failure
-                // here does not block the success outcome, it just leaves
-                // the PR looking like (or titled like) a draft until fixed
-                // by hand, and the cause is named in both the error log and
-                // the success comment below so it is never silent.
+                // (CLAUDE-398) with the finished tip's own text. Best-effort:
+                // a failure here does not block the success outcome, it just
+                // leaves the PR looking like a draft's text until fixed by
+                // hand, and the cause is named in both the error log and the
+                // outcome comment below so it is never silent.
                 let mut text_refresh_error = None;
                 if resumed {
                     if let Some(pr_number) = pr.number {
@@ -2701,35 +2973,106 @@ fn finalize(
                             error!(key = %job.key, pr_number, error = %e, "refreshing the resumed PR's title/body failed (continuing)");
                             text_refresh_error = Some(e.to_string());
                         }
-                        if let Err(e) = forge.mark_pr_ready(&host, &job.repo_path, pr_number) {
-                            error!(key = %job.key, pr_number, error = %e, "clearing draft status on the resumed PR failed (continuing)");
-                        }
                     }
                 }
-                let body = success_comment(claude_result, &url);
-                let body = match text_refresh_error {
-                    Some(e) => format!("{body}\n\nPR text could not be updated: {e}"),
-                    None => body,
+                let text_refresh_note = |body: String| -> String {
+                    match &text_refresh_error {
+                        Some(e) => format!("{body}\n\nPR text could not be updated: {e}"),
+                        None => body,
+                    }
                 };
-                let body = match &pr.push_comment_failure {
-                    Some(e) => format!("{body}\n\n{e}"),
-                    None => body,
+                let push_comment_note = |body: String| -> String {
+                    match &pr.push_comment_failure {
+                        Some(e) => format!("{body}\n\n{e}"),
+                        None => body,
+                    }
                 };
-                let body = append_compaction_note(&body, stream_log, &job.key);
-                let body = note_checkpoint_rejection(body);
-                let body =
-                    crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
-                comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
-                // Finalize no longer waits for CI itself. When
-                // `automerge.enabled`, the merge happens later, driven by a
-                // `success`/`recover` Action-run webhook event on this PR (see
-                // `crate::web::webhooks`), not by a poll here. The issue simply
-                // stays at Code Review until that event (or a human) advances it.
-                Ok(Finalized::CodeReview {
-                    pr_url: url,
-                    pr_number: pr.number,
-                    head_branch: pr.head_branch,
-                })
+                match review {
+                    None | Some(ReviewOutcome::Pass(_)) => {
+                        if let Some(pr_number) = pr.number {
+                            if let Err(e) = forge.mark_pr_ready(&host, &job.repo_path, pr_number) {
+                                error!(key = %job.key, pr_number, error = %e, "promoting the reviewed PR to ready failed (continuing)");
+                            }
+                        }
+                        let body = success_comment(claude_result, &url);
+                        let body = match review {
+                            Some(ReviewOutcome::Pass(notes)) if !notes.is_empty() => {
+                                format!("{body}\n\n## Review\n\n{notes}")
+                            }
+                            _ => body,
+                        };
+                        let body = text_refresh_note(body);
+                        let body = push_comment_note(body);
+                        let body = append_compaction_note(&body, stream_log, &job.key);
+                        let body = note_checkpoint_rejection(body);
+                        let body = crate::run_footer::append_job(
+                            &body,
+                            public_url.as_deref(),
+                            run,
+                            &job.key,
+                        );
+                        comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
+                        // Finalize no longer waits for CI itself. When
+                        // `automerge.enabled`, the merge happens later, driven by a
+                        // `success`/`recover` Action-run webhook event on this PR (see
+                        // `crate::web::webhooks`), not by a poll here. The issue simply
+                        // stays at Code Review until that event (or a human) advances it.
+                        Ok(Finalized::CodeReview {
+                            pr_url: url,
+                            pr_number: pr.number,
+                            head_branch: pr.head_branch,
+                        })
+                    }
+                    Some(ReviewOutcome::Fail(findings))
+                    | Some(ReviewOutcome::NoVerdict(findings)) => {
+                        let no_verdict = matches!(review, Some(ReviewOutcome::NoVerdict(_)));
+                        if no_verdict {
+                            error!(key = %job.key, cause = %findings, "post-success review gave no usable verdict; PR left as draft, Needs Review");
+                        }
+                        if let Some(pr_number) = pr.number {
+                            if let Err(e) = post_review_findings_on_pr(
+                                forge,
+                                &host,
+                                &job.repo_path,
+                                pr_number,
+                                &job.key,
+                                findings,
+                            ) {
+                                error!(key = %job.key, pr_number, error = %e, "posting review findings on the PR failed (continuing)");
+                            }
+                        }
+                        // A `NoVerdict` is the runner's own detected
+                        // malfunction (timeout, no marker, a touched
+                        // workdir), not a reviewer opinion on the work, so it
+                        // always parks for a human rather than feeding the
+                        // ordinary attempt-cap-based requeue.
+                        let requeued = !no_verdict && attempts_after < max_attempts_per_key;
+                        let target = if requeued {
+                            &src.states.queued
+                        } else {
+                            &src.states.needs_review
+                        };
+                        let body =
+                            review_findings_comment(claude_result, &url, findings, no_verdict);
+                        let body = text_refresh_note(body);
+                        let body = push_comment_note(body);
+                        let body = append_compaction_note(&body, stream_log, &job.key);
+                        let body = note_checkpoint_rejection(body);
+                        let body = crate::run_footer::append_job(
+                            &body,
+                            public_url.as_deref(),
+                            run,
+                            &job.key,
+                        );
+                        comment_then_field(backend, src, &job.key, &body, target)?;
+                        Ok(Finalized::ReviewFailed {
+                            pr_url: url,
+                            pr_number: pr.number,
+                            head_branch: pr.head_branch,
+                            requeued,
+                        })
+                    }
+                }
             }
             Err(e) => {
                 // The error reaches the journal here (the run loop only records
@@ -3184,6 +3527,60 @@ fn success_comment(r: &ClaudeResult, pr_url: &str) -> String {
         format!("Cost: ${} USD", r.cost),
     ]
     .join("\n")
+}
+
+/// Issue comment for a [`Finalized::ReviewFailed`] outcome: the PR stays a
+/// draft, so the comment says so and names where the findings also landed.
+fn review_findings_comment(
+    r: &ClaudeResult,
+    pr_url: &str,
+    findings: &str,
+    no_verdict: bool,
+) -> String {
+    let headline = if no_verdict {
+        "Claude AI agent run completed, but the post-success review gave no usable verdict. \
+         The PR is left as a draft pending a human decision:"
+    } else {
+        "Claude AI agent run completed, but the post-success review found problems. \
+         The PR is left as a draft until they are fixed:"
+    };
+    [
+        headline.to_string(),
+        String::new(),
+        format!("Draft PR: {pr_url}"),
+        String::new(),
+        "Review findings:".to_string(),
+        String::new(),
+        findings.to_string(),
+        String::new(),
+        r.summary.clone(),
+        String::new(),
+        format!("Cost: ${} USD", r.cost),
+    ]
+    .join("\n")
+}
+
+/// Post `findings` as a comment on PR `pr_number`, through a scratch file
+/// since [`Forge::pr_comment`] reads its body from disk (mirrors the
+/// timeout-salvage PR comment above).
+fn post_review_findings_on_pr(
+    forge: &dyn Forge,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    key: &str,
+    findings: &str,
+) -> Result<()> {
+    let body = format!("Post-success review findings:\n\n{findings}");
+    let scratch = std::env::temp_dir().join(format!("claude-run-review-pr-comment-{key}.md"));
+    std::fs::write(&scratch, &body)?;
+    let result = forge.pr_comment(host, repo, pr_number, &scratch);
+    if let Err(e) = std::fs::remove_file(&scratch) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            error!(path = %scratch.display(), error = %e, "removing the review PR comment scratch file failed");
+        }
+    }
+    result
 }
 
 fn pr_failure_comment(r: &ClaudeResult, err: &Error, work: &WorkLocation) -> String {
@@ -3888,6 +4285,7 @@ mod tests {
             run_budget_usd: 5.0,
             budget_warn_fraction: 0.8,
             max_issues_per_run: 25,
+            review_timeout: Duration::from_secs(1800),
         };
         let cancel = CancellationToken::new();
         let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
@@ -3976,6 +4374,7 @@ mod tests {
             run_budget_usd: 5.0,
             budget_warn_fraction: 0.8,
             max_issues_per_run: 25,
+            review_timeout: Duration::from_secs(1800),
         };
         let cancel = CancellationToken::new();
         let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
@@ -4048,6 +4447,7 @@ mod tests {
             run_budget_usd: 5.0,
             budget_warn_fraction: 0.8,
             max_issues_per_run: 25,
+            review_timeout: Duration::from_secs(1800),
         };
         let cancel = CancellationToken::new();
         let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
@@ -4137,6 +4537,7 @@ mod tests {
             run_budget_usd: 5.0,
             budget_warn_fraction: 0.8,
             max_issues_per_run: 25,
+            review_timeout: Duration::from_secs(1800),
         };
         let cancel = CancellationToken::new();
         let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
@@ -4231,6 +4632,7 @@ mod tests {
             run_budget_usd: 5.0,
             budget_warn_fraction: 0.8,
             max_issues_per_run: 25,
+            review_timeout: Duration::from_secs(1800),
         };
         let claude = ClaudeInvoker::new(None);
         let cancel = CancellationToken::new();
@@ -4327,6 +4729,7 @@ mod tests {
             run_budget_usd: 5.0,
             budget_warn_fraction: 0.8,
             max_issues_per_run: 25,
+            review_timeout: Duration::from_secs(1800),
         };
         let claude = ClaudeInvoker::new(None);
         let cancel = CancellationToken::new();
@@ -6193,6 +6596,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6233,6 +6639,9 @@ mod tests {
             false,
             test_comment_run(),
             Some("remote rejected non-fast-forward update"),
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6285,6 +6694,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6333,6 +6745,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6383,6 +6798,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6424,6 +6842,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -6491,6 +6912,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -6531,6 +6955,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6612,7 +7039,7 @@ mod tests {
                         "dev.a8n.run",
                         "pr",
                         "create",
-                        "feat: x",
+                        "WIP: feat: x",
                         "--body-file",
                         body_path.as_str(),
                         "--head",
@@ -6641,6 +7068,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -6745,7 +7175,7 @@ mod tests {
                         "dev.a8n.run",
                         "pr",
                         "create",
-                        "feat: x",
+                        "WIP: feat: x",
                         "--body-file",
                         body_path.as_str(),
                         "--head",
@@ -6793,6 +7223,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -6852,6 +7285,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -7368,6 +7804,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert!(
@@ -7450,6 +7889,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert!(matches!(res, Finalized::Failed { .. }), "{res:?}");
@@ -7556,6 +7998,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -7624,6 +8069,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));
@@ -7668,6 +8116,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert!(
@@ -7713,6 +8164,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert!(
@@ -7870,6 +8324,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -7925,6 +8382,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -8106,6 +8566,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -8267,6 +8730,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -8361,6 +8827,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -8509,6 +8978,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         // The PR still counts, even though the comment on it failed.
@@ -8660,7 +9132,7 @@ mod tests {
                         "dev.a8n.run",
                         "pr",
                         "create",
-                        "feat: x",
+                        "WIP: feat: x",
                         "--body-file",
                         body_path.as_str(),
                         "--head",
@@ -8720,6 +9192,9 @@ mod tests {
             true,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -8817,7 +9292,7 @@ mod tests {
                         "dev.a8n.run",
                         "pr",
                         "create",
-                        "feat: x",
+                        "WIP: feat: x",
                         "--body-file",
                         body_path.as_str(),
                         "--head",
@@ -8863,6 +9338,9 @@ mod tests {
             true,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -9014,6 +9492,9 @@ mod tests {
             true,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -9071,6 +9552,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn default_prompt_tells_a_resumed_run_to_read_and_fix_review_findings() {
+        // CLAUDE-449: a re-queue reached via a failed review session must be
+        // told that its PR's comments may carry findings that kept the PR a
+        // draft, not just a timed-out run's salvage note.
+        let p = default_youtrack_prompt();
+        assert!(
+            p.contains("a separate fresh-context review session may have left one listing findings that kept the PR a draft"),
+            "the default prompt must tell a resumed run to read and fix review findings:\n{p}"
+        );
+    }
+
     // ---- automerge no longer polls from finalize -------------
 
     /// A YoutrackSource with automerge enabled.
@@ -9119,6 +9612,9 @@ mod tests {
             false,
             test_comment_run(),
             None,
+            None,
+            1,
+            1000,
         )
         .unwrap();
         assert_eq!(
@@ -10363,5 +10859,856 @@ mod tests {
         reconcile_restart_inflight(&pool, &paths, &dyn_runner).await;
 
         assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    // --- CLAUDE-449: the post-success review session ---
+
+    const REVIEW_RESULT_OK: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.1}"#;
+
+    fn review_stub(dir: &Path, body: &str) -> PathBuf {
+        let stub = dir.join("review-claude-stub.sh");
+        crate::testutil::write_stub(&stub, body);
+        stub
+    }
+
+    #[test]
+    fn run_review_session_pass_marker_yields_pass_outcome_with_its_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\necho 'checked every criterion, all good' > {}\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                REVIEW_PASS_MARKER
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, result) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &cancel,
+            None,
+        );
+        assert!(result.ok);
+        assert_eq!(
+            outcome,
+            ReviewOutcome::Pass("checked every criterion, all good".to_string())
+        );
+    }
+
+    #[test]
+    fn run_review_session_fail_marker_yields_fail_outcome_with_its_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\necho 'criterion 2 has no test' > {}\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                REVIEW_FAIL_MARKER
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, result) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &cancel,
+            None,
+        );
+        assert!(result.ok);
+        assert_eq!(
+            outcome,
+            ReviewOutcome::Fail("criterion 2 has no test".to_string())
+        );
+    }
+
+    #[test]
+    fn run_review_session_no_marker_is_a_no_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let stub = review_stub(
+            scratch.path(),
+            &format!("#!/bin/sh\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n"),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, _) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &cancel,
+            None,
+        );
+        assert!(
+            matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("no verdict marker"))
+        );
+    }
+
+    #[test]
+    fn run_review_session_both_markers_is_a_no_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\necho ok > {}\necho bad > {}\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                REVIEW_PASS_MARKER, REVIEW_FAIL_MARKER
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, _) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &cancel,
+            None,
+        );
+        assert!(
+            matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("both the pass and fail markers"))
+        );
+    }
+
+    #[test]
+    fn run_review_session_timeout_is_a_no_verdict() {
+        // Pin a coreutils-faithful `timeout` (exit 124) so this holds on hosts
+        // whose `timeout` is busybox; see the helper for the full rationale.
+        crate::testutil::ensure_coreutils_timeout_on_path();
+
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let stub = review_stub(scratch.path(), "#!/bin/sh\nexec sleep 30\n");
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, result) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(1),
+            &scratch.path().join("stream.jsonl"),
+            &cancel,
+            None,
+        );
+        assert!(result.timed_out);
+        assert!(
+            matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("timed out"))
+        );
+    }
+
+    #[test]
+    fn run_review_session_editing_a_tracked_file_is_a_no_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        // The review session is read-only by contract: writing to the pass
+        // marker is fine, but touching an already-tracked file (even without
+        // committing) must discard the verdict rather than trust it.
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\necho ok > {}\necho changed > f.txt\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                REVIEW_PASS_MARKER
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, _) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &cancel,
+            None,
+        );
+        assert!(
+            matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("read-only by contract"))
+        );
+    }
+
+    #[test]
+    fn run_review_session_committing_is_also_a_no_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\necho ok > {}\ngit commit --allow-empty -m 'sneaky commit' >/dev/null\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                REVIEW_PASS_MARKER
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, _) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &cancel,
+            None,
+        );
+        assert!(
+            matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("read-only by contract"))
+        );
+    }
+
+    #[test]
+    fn run_review_session_invokes_with_read_only_tools_and_the_given_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let argv_path = scratch.path().join("review-argv.txt");
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\necho ok > {}\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                argv_path.display(),
+                REVIEW_PASS_MARKER
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        // The action's own block grants the full tool set; the review
+        // session must override it regardless.
+        let action_claude_cfg = action::ClaudeBlock {
+            allowed_tools: Some("Read,Edit,Write,Bash,Glob,Grep".to_string()),
+            ..action::ClaudeBlock::default()
+        };
+        let stream_log = scratch.path().join("streams").join("review.jsonl");
+        let (outcome, _) = run_review_session(
+            &claude,
+            &action_claude_cfg,
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &stream_log,
+            &cancel,
+            Some(2.5),
+        );
+        assert_eq!(outcome, ReviewOutcome::Pass("ok".to_string()));
+        let argv = std::fs::read_to_string(&argv_path).unwrap();
+        assert!(
+            argv.lines()
+                .any(|l| l == "--allowed-tools=Read,Glob,Grep,Bash"),
+            "the review session must never get Edit or Write, got:\n{argv}"
+        );
+        assert!(
+            argv.lines().any(|l| l == "--max-budget-usd=2.5000"),
+            "the run's remaining spend ceiling must reach the review session, got:\n{argv}"
+        );
+        assert!(
+            stream_log.exists(),
+            "the review session must get its own stream log path"
+        );
+    }
+
+    /// CLAUDE-449 criterion: a review pass promotes the draft PR to ready and
+    /// folds the verdict notes into the success comment's "## Review" section.
+    #[test]
+    fn finalize_review_pass_promotes_pr_and_names_review_in_the_success_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    r#"{"pull_requests":[{"number":7,"title":"WIP: feat: x","head_sha":"abc"}]}"#,
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: feat: x",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "edit",
+                        "contoso/claude-run#7",
+                        "--title",
+                        "feat: x",
+                    ],
+                    "",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            test_comment_run(),
+            None,
+            Some(&ReviewOutcome::Pass("all criteria check out".to_string())),
+            1,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::CodeReview {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                pr_number: Some(7),
+                head_branch: Some("feat/x".into()),
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"),
+            "a passing review must still promote the draft PR to ready: {calls:?}"
+        );
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .unwrap_or_else(|| panic!("no issue comment call recorded: {calls:?}"));
+        assert!(
+            comment.contains("## Review") && comment.contains("all criteria check out"),
+            "the success comment must carry the review's notes: {comment}"
+        );
+    }
+
+    /// CLAUDE-449 criterion: a review fail below the attempt cap leaves the
+    /// PR a draft, posts the findings on the PR and the issue, and requeues
+    /// (AI Agent=Queued) rather than failing the run outright.
+    #[test]
+    fn finalize_review_fail_below_cap_leaves_pr_draft_and_requeues() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: feat: x",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "comment",
+                        "contoso/claude-run#7",
+                        "--body-file",
+                        std::env::temp_dir()
+                            .join("claude-run-review-pr-comment-MK-16.md")
+                            .to_string_lossy()
+                            .as_ref(),
+                    ],
+                    "",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Queued"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            test_comment_run(),
+            None,
+            Some(&ReviewOutcome::Fail(
+                "criterion 3 has no evidence".to_string(),
+            )),
+            1,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::ReviewFailed {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                pr_number: Some(7),
+                head_branch: Some("feat/x".into()),
+                requeued: true,
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("pr edit")),
+            "a failing review must never promote the draft PR: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("fj --host dev.a8n.run pr comment contoso/claude-run#7")),
+            "the findings must be posted on the PR: {calls:?}"
+        );
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .unwrap_or_else(|| panic!("no issue comment call recorded: {calls:?}"));
+        assert!(
+            comment.contains("criterion 3 has no evidence"),
+            "the findings must also be posted on the issue: {comment}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Queued"),
+            "below the attempt cap a review fail must requeue, not park: {calls:?}"
+        );
+    }
+
+    /// CLAUDE-449 criterion: the same review fail AT the attempt cap parks
+    /// the issue at Needs Review instead of requeueing it forever.
+    #[test]
+    fn finalize_review_fail_at_cap_parks_at_needs_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: feat: x",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "comment",
+                        "contoso/claude-run#7",
+                        "--body-file",
+                        std::env::temp_dir()
+                            .join("claude-run-review-pr-comment-MK-16.md")
+                            .to_string_lossy()
+                            .as_ref(),
+                    ],
+                    "",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            test_comment_run(),
+            None,
+            Some(&ReviewOutcome::Fail(
+                "criterion 3 has no evidence".to_string(),
+            )),
+            3,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::ReviewFailed {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                pr_number: Some(7),
+                head_branch: Some("feat/x".into()),
+                requeued: false,
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "at the attempt cap a review fail must park at Needs Review: {calls:?}"
+        );
+    }
+
+    /// CLAUDE-449 criterion: a `NoVerdict` (no marker, both markers, timeout,
+    /// or a workdir-touching review) always parks at Needs Review, even
+    /// below the attempt cap, since there is no reviewer opinion to act on.
+    #[test]
+    fn finalize_review_no_verdict_always_parks_at_needs_review_even_below_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: feat: x",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "comment",
+                        "contoso/claude-run#7",
+                        "--body-file",
+                        std::env::temp_dir()
+                            .join("claude-run-review-pr-comment-MK-16.md")
+                            .to_string_lossy()
+                            .as_ref(),
+                    ],
+                    "",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = std::cell::RefCell::new(None);
+        let logs = capture_logs(|| {
+            *res.borrow_mut() = Some(finalize(
+                &backend,
+                &backend,
+                &src(),
+                &job(),
+                dir.path(),
+                &ok_result(),
+                PrStrategy::Branch,
+                None,
+                Duration::from_secs(1800),
+                false,
+                test_comment_run(),
+                None,
+                Some(&ReviewOutcome::NoVerdict(
+                    "the review session timed out".to_string(),
+                )),
+                1,
+                1000,
+            ));
+        });
+        let res = res.into_inner().unwrap().unwrap();
+        assert_eq!(
+            res,
+            Finalized::ReviewFailed {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                pr_number: Some(7),
+                head_branch: Some("feat/x".into()),
+                requeued: false,
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "a NoVerdict must always park at Needs Review, even far below the attempt cap: {calls:?}"
+        );
+        assert!(
+            logs.contains("ERROR") && logs.contains("the review session timed out"),
+            "a NoVerdict must emit an error log naming the cause, got:\n{logs}"
+        );
     }
 }

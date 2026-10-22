@@ -3046,6 +3046,9 @@ struct YoutrackEditForm {
     limit_budget_warn_fraction: String,
     /// Issues one run may create in the tracker.
     limit_max_issues_per_run: String,
+    /// Timeout for the post-success review session (CLAUDE-449). Blank
+    /// falls back to the runner default (1800s); zero is rejected.
+    limit_review_timeout_seconds: String,
     /// Per-run parallelism cap (number-as-text, like the `limit_*` fields).
     concurrency_max_parallel: String,
     /// Comma-separated job-field names composing the concurrency key.
@@ -3205,6 +3208,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         limit_run_budget_usd: f(a.limits.run_budget_usd),
         limit_budget_warn_fraction: f(a.limits.budget_warn_fraction),
         limit_max_issues_per_run: n(a.limits.max_issues_per_run),
+        limit_review_timeout_seconds: n(a.limits.review_timeout_seconds),
         concurrency_max_parallel: a.concurrency.max_parallel.to_string(),
         concurrency_key: a.concurrency.key.join(", "),
         enabled: a.enabled.then(|| "on".to_string()),
@@ -3458,6 +3462,13 @@ fn youtrack_form_to_yaml(
         run_budget_usd: pf64("Per-run budget (USD)", &form.limit_run_budget_usd)?,
         budget_warn_fraction: pf64("Budget warning fraction", &form.limit_budget_warn_fraction)?,
         max_issues_per_run: pu32("Max issues per run", &form.limit_max_issues_per_run)?,
+        review_timeout_seconds: match pu32(
+            "Review timeout (seconds)",
+            &form.limit_review_timeout_seconds,
+        )? {
+            Some(0) => return Err("Review timeout (seconds) must be at least 1".to_string()),
+            v => v,
+        },
     };
     set_or_remove(
         map,
@@ -8262,6 +8273,7 @@ mod tests {
             f.claude_effort = "xhigh".to_string();
             f.limit_max_runs_per_day = "24".to_string();
             f.limit_daily_budget_usd = "1.50".to_string();
+            f.limit_review_timeout_seconds = "900".to_string();
             f.enabled = Some("on".to_string());
             f
         }
@@ -8286,6 +8298,7 @@ mod tests {
             );
             assert_eq!(a.limits.max_runs_per_day, Some(24));
             assert_eq!(a.limits.daily_budget_usd, Some(1.5));
+            assert_eq!(a.limits.review_timeout_seconds, Some(900));
             assert_eq!(a.claude.permission_mode.as_deref(), Some("acceptEdits"));
             // The editor carries the per-action model, so saving an action
             // through the form does not drop a pinned `model:`.
@@ -9066,6 +9079,23 @@ mod tests {
             assert!(body.contains("Claude timeout"));
         }
 
+        #[test]
+        fn form_omits_review_timeout_when_blank() {
+            let mut f = filled_form();
+            f.limit_review_timeout_seconds = "".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let a = crate::action::validate_str(&yaml, "<test>").unwrap().action;
+            assert_eq!(a.limits.review_timeout_seconds, None);
+        }
+
+        #[test]
+        fn form_rejects_zero_review_timeout() {
+            let mut f = filled_form();
+            f.limit_review_timeout_seconds = "0".to_string();
+            let err = youtrack_form_to_yaml(empty_base(), &f).unwrap_err();
+            assert!(err.contains("Review timeout"), "unexpected error: {err}");
+        }
+
         #[tokio::test]
         async fn youtrack_new_page_renders_form() {
             let tmp = tempfile::tempdir().unwrap();
@@ -9083,6 +9113,8 @@ mod tests {
             // The form posts to the create route, which lives under /actions/new/
             // so it never shadows the /actions/:name detail route.
             assert!(body.contains("/actions/new/youtrack"));
+            // The post-success review session's timeout is editable (CLAUDE-449).
+            assert!(body.contains("name=\"limit_review_timeout_seconds\""));
         }
 
         #[tokio::test]

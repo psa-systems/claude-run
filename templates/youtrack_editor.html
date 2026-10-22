@@ -148,6 +148,14 @@
   {% call m::limits_block(form.limit_max_attempts_per_key, form.limit_max_runs_per_day, form.limit_claude_timeout_seconds, form.limit_daily_budget_usd, form.limit_run_budget_usd, form.limit_budget_warn_fraction, form.limit_max_issues_per_run) %}
 
   <div class="card">
+    <h3>Review</h3>
+    <div class="grid2">
+      {% call m::numfield("Review timeout (seconds)", "limit_review_timeout_seconds", form.limit_review_timeout_seconds, "unset = 1800; 0 is rejected", "1") %}
+    </div>
+    <p class="hint dim">Timeout for the post-success review session (CLAUDE-449): a fresh-context claude session that checks the completed work against the issue before the PR is promoted from draft to ready.</p>
+  </div>
+
+  <div class="card">
     <h3>Concurrency</h3>
     <div class="grid2">
       {% call m::numfield("Max parallel", "concurrency_max_parallel", form.concurrency_max_parallel, "1 = strictly sequential", "1") %}
