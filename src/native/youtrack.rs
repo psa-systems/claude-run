@@ -711,7 +711,13 @@ pub async fn reconcile_restart_inflight(
                         error!(action = %action_name, key = %key, error = %e, "restart reconcile: set_field to Queued failed; key stays on Working until the next restart");
                         continue;
                     }
-                    if let Err(e) = backend.comment(&key, RESTART_REQUEUE_COMMENT) {
+                    let comment = crate::run_footer::append_run(
+                        RESTART_REQUEUE_COMMENT,
+                        crate::run_footer::resolved_public_url().as_deref(),
+                        None,
+                        None,
+                    );
+                    if let Err(e) = backend.comment(&key, &comment) {
                         warn!(action = %action_name, key = %key, error = %e, "restart reconcile: re-queue comment failed (field was already set to Queued)");
                     }
                     info!(action = %action_name, key = %key, "restart reconcile: re-queued an issue stranded on Working by a dead process");
@@ -1043,7 +1049,7 @@ async fn evaluate_eligibility(
         }
     }
     // ---- dependency gate ----
-    match dependency_gate(pool, backend, src, action, key, bypass_backoff).await {
+    match dependency_gate(pool, backend, src, action, key, bypass_backoff, None).await {
         Ok(GateDecision::Proceed) => Eligibility::Eligible,
         Ok(GateDecision::Blocked { blockers }) => {
             info!(
@@ -1115,6 +1121,7 @@ async fn process_job(
     run_id: i64,
 ) -> Result<ProcessedJob> {
     let started = Instant::now();
+    let started_wall = chrono::Utc::now();
     let action = &loaded.action;
     let key = &job.key;
     let attempts = state::attempts_get(pool, &action.name, key).await?;
@@ -1141,6 +1148,8 @@ async fn process_job(
             key,
             attempts,
             limits.max_attempts_per_key,
+            run_id,
+            started_wall,
         );
         return Ok(ProcessedJob::CapHit { key: key.clone() });
     }
@@ -1182,7 +1191,17 @@ async fn process_job(
     // leave it Queued (auto-resumes when the dependency clears), consume no
     // attempt, and never clone or invoke claude. A disabled gate (or a met/absent
     // dependency set) returns `Proceed`.
-    match dependency_gate(pool, backend, src, &action.name, key, bypass_backoff).await {
+    match dependency_gate(
+        pool,
+        backend,
+        src,
+        &action.name,
+        key,
+        bypass_backoff,
+        Some(run_id),
+    )
+    .await
+    {
         Ok(GateDecision::Proceed) => {}
         Ok(GateDecision::Blocked { blockers }) => {
             info!(
@@ -1375,6 +1394,11 @@ async fn process_job(
                 &action.name,
                 key,
                 &requeue_comment(&claude_result),
+                Some(crate::run_footer::CommentRun {
+                    run_id,
+                    attempt: attempts + 1,
+                    started: started_wall,
+                }),
             );
         });
         return Ok(ProcessedJob::Transient { key: key.clone() });
@@ -1396,6 +1420,11 @@ async fn process_job(
                 &action.name,
                 key,
                 &requeue_comment(&claude_result),
+                Some(crate::run_footer::CommentRun {
+                    run_id,
+                    attempt: attempts + 1,
+                    started: started_wall,
+                }),
             );
         });
         return Ok(ProcessedJob::Transient { key: key.clone() });
@@ -1427,6 +1456,11 @@ async fn process_job(
             stream_log.as_deref(),
             limits.claude_timeout,
             resume.is_some(),
+            crate::run_footer::CommentRun {
+                run_id,
+                attempt: attempts + 1,
+                started: started_wall,
+            },
         )
     });
     // ---- record a newly opened PR against its issue ----
@@ -1458,6 +1492,11 @@ async fn process_job(
                 *pr_number,
                 head_branch,
                 salvaged,
+                crate::run_footer::CommentRun {
+                    run_id,
+                    attempt: attempts + 1,
+                    started: started_wall,
+                },
             )
             .await;
         }
@@ -1466,7 +1505,20 @@ async fn process_job(
         // (CLAUDE-429) a prior timeout left on this PR. A resumed run that
         // times out again, or that fails, leaves the flag set.
         if matches!(&finalize_res, Ok(Finalized::CodeReview { .. })) {
-            clear_salvaged_for_resume(pool, forge, backend, &action.name, job, resume.id).await;
+            clear_salvaged_for_resume(
+                pool,
+                forge,
+                backend,
+                &action.name,
+                job,
+                resume.id,
+                crate::run_footer::CommentRun {
+                    run_id,
+                    attempt: attempts + 1,
+                    started: started_wall,
+                },
+            )
+            .await;
         }
     }
     let post_failed = match &finalize_res {
@@ -1672,6 +1724,7 @@ async fn record_new_pr(
     pr_number: u64,
     head_branch: &str,
     salvaged: bool,
+    run: crate::run_footer::CommentRun,
 ) {
     use crate::ci_failure::store;
     let host = host_only(&job.repo_host);
@@ -1696,6 +1749,12 @@ async fn record_new_pr(
             job.repo_path
         );
         forge.note(message.clone());
+        let message = crate::run_footer::append_job(
+            &message,
+            crate::run_footer::resolved_public_url().as_deref(),
+            run,
+            &job.key,
+        );
         if let Err(e) = backend.comment(&job.key, &message) {
             warn!(key = %job.key, error = %e, "PR-record-failure comment also failed (continuing)");
         }
@@ -1720,6 +1779,7 @@ async fn clear_salvaged_for_resume(
     action_name: &str,
     job: &YoutrackJob,
     pr_id: i64,
+    run: crate::run_footer::CommentRun,
 ) {
     use crate::ci_failure::store;
     let now = state::now_iso();
@@ -1729,6 +1789,12 @@ async fn clear_salvaged_for_resume(
             "CLAUDE-429: clearing the salvaged flag on the resumed PR in the agent_pull_requests store failed ({e}); automerge stays blocked until this is cleared by hand or another resumed run succeeds"
         );
         forge.note(message.clone());
+        let message = crate::run_footer::append_job(
+            &message,
+            crate::run_footer::resolved_public_url().as_deref(),
+            run,
+            &job.key,
+        );
         if let Err(e) = backend.comment(&job.key, &message) {
             warn!(key = %job.key, error = %e, "salvaged-clear-failure comment also failed (continuing)");
         }
@@ -1845,6 +1911,7 @@ async fn dependency_gate(
     action: &str,
     key: &str,
     bypass_backoff: bool,
+    run_id: Option<i64>,
 ) -> Result<GateDecision> {
     let deps = &src.dependencies;
     // Disabled: a no-op. No `yt` read, no DB touch; pickup proceeds as before.
@@ -1888,7 +1955,13 @@ async fn dependency_gate(
         .map(|p| p.signature != signature)
         .unwrap_or(true);
     if changed {
-        if let Err(e) = backend.comment(key, &blocked_comment(&blockers)) {
+        let body = crate::run_footer::append_run(
+            &blocked_comment(&blockers),
+            crate::run_footer::resolved_public_url().as_deref(),
+            run_id,
+            None,
+        );
+        if let Err(e) = backend.comment(key, &body) {
             // Best-effort: a comment failure must not strand the gate.
             warn!(action = %action, key = %key, error = %e, "dependency-gate blocker comment failed (non-fatal)");
         }
@@ -2379,7 +2452,9 @@ fn finalize(
     stream_log: Option<&Path>,
     claude_timeout: Duration,
     resumed: bool,
+    run: crate::run_footer::CommentRun,
 ) -> Result<Finalized> {
+    let public_url = crate::run_footer::resolved_public_url();
     let needs_review = workdir.join(NEEDS_REVIEW_MARKER);
     let skip_marker = workdir.join(SKIP_ATTEMPT_MARKER);
     let no_code = workdir.join(NO_CODE_MARKER);
@@ -2392,6 +2467,7 @@ fn finalize(
         }
         let reason = std::fs::read_to_string(&needs_review)?.trim().to_string();
         let reason = append_compaction_note(&reason, stream_log, &job.key);
+        let reason = crate::run_footer::append_job(&reason, public_url.as_deref(), run, &job.key);
         if let Err(e) = backend.comment(&job.key, &reason) {
             warn!(key = %job.key, error = %e, "issue comment failed (continuing to tag / AI Agent write)");
         }
@@ -2412,6 +2488,7 @@ fn finalize(
         // the behavior below: the ahead check fails and AI Agent goes
         // to Failed.
         let summary = std::fs::read_to_string(&no_code)?.trim().to_string();
+        let summary = crate::run_footer::append_job(&summary, public_url.as_deref(), run, &job.key);
         let label = src.states.no_code_label().to_string();
         comment_then_field(backend, src, &job.key, &summary, &label)?;
         info!(key = %job.key, %label, "no-code-change marker present; skipping PR");
@@ -2455,6 +2532,8 @@ fn finalize(
                     None => body,
                 };
                 let body = append_compaction_note(&body, stream_log, &job.key);
+                let body =
+                    crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
                 comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
                 // Finalize no longer waits for CI itself. When
                 // `automerge.enabled`, the merge happens later, driven by a
@@ -2484,6 +2563,8 @@ fn finalize(
                     _ => "push",
                 };
                 let body = pr_failure_comment(claude_result, &e, &location);
+                let body =
+                    crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
                 comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
                 Ok(Finalized::Failed {
                     cause: e.to_string(),
@@ -2510,6 +2591,7 @@ fn finalize(
             claude_timeout,
         );
         let body = timeout_comment(claude_result, claude_timeout, &salvage);
+        let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
         if let Err(e) = backend.comment(&job.key, &body) {
             warn!(key = %job.key, error = %e, "timeout comment failed (continuing)");
         }
@@ -2528,6 +2610,7 @@ fn finalize(
     } else {
         // Failure: crash, empty prompt, or pre failure.
         let body = failure_comment(claude_result);
+        let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
         Ok(Finalized::Failed {
             cause: claude_result.error.clone(),
@@ -2574,6 +2657,7 @@ fn append_compaction_note(body: &str, stream_log: Option<&Path>, key: &str) -> S
 /// after a runner merge, and the YouTrack workflow
 /// (`docs/yt-workflow-resolve-on-pr-merge.js`) resolves the issue once it sees
 /// the merge.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn complete_automerge(
     backend: &dyn IssueTracker,
     forge: &dyn Forge,
@@ -2582,9 +2666,15 @@ pub(crate) fn complete_automerge(
     repo: &str,
     pr_number: u64,
     pr_url: &str,
+    run_id: Option<i64>,
 ) -> Result<()> {
     forge.merge_pr(host, repo, pr_number)?;
-    let body = merged_comment(pr_url);
+    let body = crate::run_footer::append_run(
+        &merged_comment(pr_url),
+        crate::run_footer::resolved_public_url().as_deref(),
+        run_id,
+        None,
+    );
     if let Err(e) = backend.comment(issue_key, &body) {
         error!(key = %issue_key, error = %e, "post-automerge comment failed");
     }
@@ -2746,6 +2836,7 @@ pub(crate) fn automerge_merge_failed_comment(pr_url: &str, error: &str) -> Strin
 /// stale-attempts banner keeps showing the key), so each write is attempted
 /// independently and a failure of either logs at `error` naming the key and
 /// the cause.
+#[allow(clippy::too_many_arguments)]
 fn report_cap_reached(
     backend: &dyn IssueTracker,
     src: &YoutrackSource,
@@ -2753,8 +2844,16 @@ fn report_cap_reached(
     key: &str,
     attempts: u32,
     cap: u32,
+    run_id: i64,
+    started: chrono::DateTime<chrono::Utc>,
 ) {
     let body = cap_reached_comment(attempts, cap);
+    let body = crate::run_footer::append_run(
+        &body,
+        crate::run_footer::resolved_public_url().as_deref(),
+        Some(run_id),
+        Some(started),
+    );
     if let Err(e) = backend.comment(key, &body) {
         error!(action = %action, key = %key, error = %e, "attempt-cap comment failed");
     }
@@ -2809,6 +2908,7 @@ fn requeue_off_working(
     action: &str,
     key: &str,
     body: &str,
+    run: Option<crate::run_footer::CommentRun>,
 ) {
     let current = match backend.get_field(key, &src.custom_field) {
         Ok(v) => v,
@@ -2821,7 +2921,21 @@ fn requeue_off_working(
         info!(action = %action, key = %key, current = %current.trim(), "AI Agent already advanced off Working; leaving untouched");
         return;
     }
-    if let Err(e) = comment_then_field(backend, src, key, body, &src.states.queued) {
+    let body = match run {
+        Some(run) => crate::run_footer::append_job(
+            body,
+            crate::run_footer::resolved_public_url().as_deref(),
+            run,
+            key,
+        ),
+        None => crate::run_footer::append_run(
+            body,
+            crate::run_footer::resolved_public_url().as_deref(),
+            None,
+            None,
+        ),
+    };
+    if let Err(e) = comment_then_field(backend, src, key, &body, &src.states.queued) {
         error!(action = %action, key = %key, error = %e, "re-queueing after a stopped run failed; the issue is stranded on Working");
     }
 }
@@ -4051,6 +4165,16 @@ mod tests {
         YoutrackSource::default()
     }
 
+    fn test_comment_run() -> crate::run_footer::CommentRun {
+        crate::run_footer::CommentRun {
+            run_id: 1,
+            attempt: 1,
+            started: chrono::DateTime::parse_from_rfc3339("2026-10-12T18:41:03Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
     fn ok_result() -> ClaudeResult {
         ClaudeResult {
             ok: true,
@@ -4202,9 +4326,12 @@ mod tests {
             "act",
             "MK-16",
             "stopped, no fault of the issue",
+            None,
         );
         assert_eq!(tracker.field(), "Queued");
-        assert_eq!(tracker.comments.lock().unwrap().len(), 1);
+        let comments = tracker.comments.lock().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].contains("Run: no run id is available for this comment"));
         assert_eq!(
             tracker.set_calls.lock().unwrap().as_slice(),
             [("AI Agent".to_string(), "Queued".to_string())]
@@ -4223,6 +4350,7 @@ mod tests {
             "act",
             "MK-16",
             "stopped, no fault of the issue",
+            None,
         );
         assert_eq!(tracker.field(), "Code Review");
         assert!(tracker.comments.lock().unwrap().is_empty());
@@ -4239,7 +4367,7 @@ mod tests {
             ..FakeTracker::new("Working")
         };
         let logs = capture_logs(|| {
-            requeue_off_working(&tracker, &src(), "act", "MK-16", "body");
+            requeue_off_working(&tracker, &src(), "act", "MK-16", "body", None);
         });
         assert!(logs.contains("ERROR"), "{logs}");
         assert!(logs.contains("MK-16"), "{logs}");
@@ -4256,7 +4384,7 @@ mod tests {
             ..FakeTracker::new("Working")
         };
         let logs = capture_logs(|| {
-            requeue_off_working(&tracker, &src(), "act", "MK-16", "body");
+            requeue_off_working(&tracker, &src(), "act", "MK-16", "body", None);
         });
         assert!(logs.contains("ERROR"), "{logs}");
         assert!(logs.contains("MK-16"), "{logs}");
@@ -5553,6 +5681,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -5607,6 +5736,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -5653,6 +5783,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -5701,6 +5832,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -5740,6 +5872,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -5805,6 +5938,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -5843,6 +5977,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -5951,6 +6086,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(
@@ -6010,6 +6146,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(
@@ -6524,6 +6661,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert!(
@@ -6604,6 +6742,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert!(matches!(res, Finalized::Failed { .. }), "{res:?}");
@@ -6708,6 +6847,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(
@@ -6774,6 +6914,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));
@@ -6816,6 +6957,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert!(
@@ -6859,6 +7001,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert!(
@@ -7014,6 +7157,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(
@@ -7067,6 +7211,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(
@@ -7246,6 +7391,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(
@@ -7405,6 +7551,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(
@@ -7497,6 +7644,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(
@@ -7643,6 +7791,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         // The PR still counts, even though the comment on it failed.
@@ -7852,6 +8001,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             true,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(
@@ -7993,6 +8143,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             true,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(
@@ -8142,6 +8293,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             true,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(
@@ -8245,6 +8397,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            test_comment_run(),
         )
         .unwrap();
         assert_eq!(
@@ -8274,33 +8427,20 @@ mod tests {
         // and mergeable: merge as a merge-commit, then a best-effort comment.
         // No `State` and no `AI Agent` write - the YouTrack workflow resolves
         // the issue once it observes the merge.
-        let runner = Arc::new(
-            StubRunner::new()
-                .ok(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "merge",
-                        "contoso/claude-run#7",
-                        "--method",
-                        "merge",
-                        "--delete",
-                    ],
-                    "",
-                )
-                .ok(
-                    "yt",
-                    &[
-                        "issue",
-                        "comment",
-                        "MK-16",
-                        "The runner merged this PR after its CI checks passed (automerge).\n\nPR: https://dev.a8n.run/contoso/claude-run/pulls/7",
-                    ],
-                    "",
-                ),
-        );
+        let runner = Arc::new(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "merge",
+                "contoso/claude-run#7",
+                "--method",
+                "merge",
+                "--delete",
+            ],
+            "",
+        ));
         let backend = CliBackend::new(runner.clone());
         complete_automerge(
             &backend,
@@ -8310,12 +8450,19 @@ mod tests {
             "contoso/claude-run",
             7,
             "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            Some(3),
         )
         .unwrap();
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls.iter().any(|c| c
                 == "fj --host dev.a8n.run pr merge contoso/claude-run#7 --method merge --delete"),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with(
+                "yt issue comment MK-16 The runner merged this PR after its CI checks passed (automerge).\n\nPR: https://dev.a8n.run/contoso/claude-run/pulls/7"
+            ) && c.contains("Run: ") && c.contains("Duration: ")),
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.contains("set-state")), "{calls:?}");
@@ -8407,14 +8554,14 @@ mod tests {
         let mut s = src();
 
         let pool = mem_pool().await;
-        let d = dependency_gate(&pool, &backend, &s, "act", "AUDIT-7", false)
+        let d = dependency_gate(&pool, &backend, &s, "act", "AUDIT-7", false, None)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Blocked { .. }), "default blocks");
 
         s.dependencies.block_cross_project = false;
         let pool = mem_pool().await;
-        let d = dependency_gate(&pool, &backend, &s, "act", "AUDIT-7", false)
+        let d = dependency_gate(&pool, &backend, &s, "act", "AUDIT-7", false, None)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Proceed), "scoped gate proceeds");
@@ -8453,7 +8600,7 @@ mod tests {
         let comments = || count("yt issue comment MK-16");
 
         // First eval: blocked, comments once, persists backoff.
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false)
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Blocked { .. }));
@@ -8467,7 +8614,7 @@ mod tests {
         assert!(st.blocked_until_ms > state::now_epoch_ms());
 
         // Second eval within the backoff window: no read, no comment.
-        let d2 = dependency_gate(&pool, &backend, &s, "act", "MK-16", false)
+        let d2 = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
             .await
             .unwrap();
         match d2 {
@@ -8489,7 +8636,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let d3 = dependency_gate(&pool, &backend, &s, "act", "MK-16", false)
+        let d3 = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
             .await
             .unwrap();
         assert!(matches!(d3, GateDecision::Blocked { .. }));
@@ -8520,7 +8667,7 @@ mod tests {
         let s = src();
 
         // First block, then age it by three hours with an already-expired window.
-        let d = dependency_gate(&pool, &backend, &s, "act", "AUD-31", false)
+        let d = dependency_gate(&pool, &backend, &s, "act", "AUD-31", false, None)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Blocked { .. }));
@@ -8535,7 +8682,7 @@ mod tests {
         .unwrap();
 
         // Re-evaluate: still blocked, window re-armed, stamp untouched.
-        let d2 = dependency_gate(&pool, &backend, &s, "act", "AUD-31", false)
+        let d2 = dependency_gate(&pool, &backend, &s, "act", "AUD-31", false, None)
             .await
             .unwrap();
         assert!(matches!(d2, GateDecision::Blocked { .. }));
@@ -8571,7 +8718,7 @@ mod tests {
         let backend = CliBackend::new(runner.clone());
         let mut s = src();
         s.dependencies.enabled = false;
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false)
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Proceed));
@@ -8601,7 +8748,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false)
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Proceed));
@@ -8640,7 +8787,7 @@ mod tests {
         .await
         .unwrap();
 
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", true)
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", true, None)
             .await
             .unwrap();
         assert!(
@@ -8681,7 +8828,7 @@ mod tests {
             .await
             .unwrap();
 
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", true)
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", true, None)
             .await
             .unwrap();
         match d {
@@ -8741,7 +8888,7 @@ mod tests {
         .await
         .unwrap();
 
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false)
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
             .await
             .unwrap();
         match d {
@@ -8797,7 +8944,7 @@ mod tests {
                     &["issue", "inspect", "TOOL-34", "--json"],
                     blocked_inspect,
                 )
-                .ok("yt", &["issue", "comment", "TOOL-34", &blocked_body], "")
+                .ok_prefix(&format!("yt issue comment TOOL-34 {blocked_body}"), "")
                 .ok(
                     "yt",
                     &["issue", "get-field", "TOOL-33", "AI Agent"],
@@ -8827,10 +8974,10 @@ mod tests {
         {
             let calls = runner.calls.lock().unwrap();
             assert!(
-                calls
-                    .iter()
-                    .any(|c| c == &format!("yt issue comment TOOL-34 {blocked_body}")),
-                "blocked issue still gets its blocker comment: {calls:?}"
+                calls.iter().any(|c| c
+                    .starts_with(&format!("yt issue comment TOOL-34 {blocked_body}"))
+                    && c.contains("Run: no run id is available for this comment")),
+                "blocked issue still gets its blocker comment, with the run footer: {calls:?}"
             );
         }
         let st = state::dependency_gate_get(&pool, "act", "TOOL-34")
@@ -9057,7 +9204,18 @@ mod tests {
         let forge = CliBackend::new(runner);
         let backend = CliBackend::new(Arc::new(StubRunner::new()));
 
-        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x", false).await;
+        record_new_pr(
+            &pool,
+            &forge,
+            &backend,
+            "act",
+            &job(),
+            9,
+            "feat/x",
+            false,
+            test_comment_run(),
+        )
+        .await;
 
         let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
             .await
@@ -9081,7 +9239,18 @@ mod tests {
         let forge = CliBackend::new(runner);
         let backend = CliBackend::new(Arc::new(StubRunner::new()));
 
-        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x", true).await;
+        record_new_pr(
+            &pool,
+            &forge,
+            &backend,
+            "act",
+            &job(),
+            9,
+            "feat/x",
+            true,
+            test_comment_run(),
+        )
+        .await;
 
         let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
             .await
@@ -9119,7 +9288,16 @@ mod tests {
         .await
         .unwrap();
 
-        clear_salvaged_for_resume(&pool, &forge, &backend, "act", &job(), id).await;
+        clear_salvaged_for_resume(
+            &pool,
+            &forge,
+            &backend,
+            "act",
+            &job(),
+            id,
+            test_comment_run(),
+        )
+        .await;
 
         let rec = store::agent_pr_for_issue(&pool, "MK-16")
             .await
@@ -9186,7 +9364,16 @@ mod tests {
             .finish();
         let dispatch_guard = tracing::subscriber::set_default(sub);
 
-        clear_salvaged_for_resume(&pool, &forge, &backend, "act", &job(), id).await;
+        clear_salvaged_for_resume(
+            &pool,
+            &forge,
+            &backend,
+            "act",
+            &job(),
+            id,
+            test_comment_run(),
+        )
+        .await;
 
         drop(dispatch_guard);
         let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
@@ -9222,11 +9409,33 @@ mod tests {
         let forge = CliBackend::new(runner);
         let backend = CliBackend::new(Arc::new(StubRunner::new()));
 
-        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x", false).await;
+        record_new_pr(
+            &pool,
+            &forge,
+            &backend,
+            "act",
+            &job(),
+            9,
+            "feat/x",
+            false,
+            test_comment_run(),
+        )
+        .await;
         // A second record for the SAME PR number is exactly what would happen if
         // `process_job` recorded on a resumed run too; `record_new_pr` reports
         // the conflict as a `note` + comment rather than panicking.
-        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x", false).await;
+        record_new_pr(
+            &pool,
+            &forge,
+            &backend,
+            "act",
+            &job(),
+            9,
+            "feat/x",
+            false,
+            test_comment_run(),
+        )
+        .await;
 
         assert_eq!(
             forge.take_notices().len(),

@@ -96,6 +96,19 @@ impl Daemon {
         crate::config::EmailConfig::from_env()
             .map_err(|e| anyhow::anyhow!("email configuration: {e}"))?;
 
+        // CLAUDE-446: every runner-posted comment's footer needs this to
+        // build a run link. Warn once at startup rather than let the gap go
+        // unnoticed until someone reads a comment that could not link back.
+        if crate::config::public_url()
+            .map_err(|e| anyhow::anyhow!("CLAUDE_RUN_PUBLIC_URL: {e}"))?
+            .is_none()
+        {
+            warn!(
+                "CLAUDE_RUN_PUBLIC_URL is not set; comments the runner posts to issues will not \
+                 be able to link back to the run that posted them"
+            );
+        }
+
         let effective = crate::settings::effective(&pool, &self.on_disk).await?;
         let replay_window_secs = effective.webhook.replay_window_secs;
 

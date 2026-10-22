@@ -29,3 +29,10 @@ password in memory for the call's lifetime. The invite link in the email body is
 `public_url`, never from the request's `Host` header, because an invite emailed from one browser session is not
 necessarily accepted from the same one. Logging around a send names the recipient address but never the invite
 token, the full link, or the SMTP password; a send failure's log line carries the lettre/SMTP error text only.
+
+`public_url` (`CLAUDE_RUN_PUBLIC_URL`) has a second reader besides this invite flow: `crate::config::public_url`
+(CLAUDE-446) resolves it straight from the environment, with none of `EmailConfig`'s other SMTP requirements, so the
+run-comment footer (`docs/configuration.md#run-comment-footer-claude-446`) can link back to a run even when SMTP is
+entirely unset or broken. The two readers deliberately stay separate: `EmailConfig::from_env()` still requires
+`smtp_host` and `from` alongside `public_url` before an invite can be emailed, but a footer link needs only the one
+variable.

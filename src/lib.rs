@@ -53,6 +53,7 @@ pub mod provider;
 pub mod readiness;
 pub mod report;
 pub mod retention;
+pub mod run_footer;
 pub mod scheduler;
 pub mod secrets;
 pub mod service_auth;
