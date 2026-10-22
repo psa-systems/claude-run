@@ -9565,6 +9565,7 @@ mod tests {
         // in `config.rs`).
         #[tokio::test]
         async fn settings_page_shows_the_email_card_read_only_from_the_environment() {
+            let _env = crate::config::public_url_env_lock().await;
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
 

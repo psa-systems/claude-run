@@ -1112,6 +1112,26 @@ pub fn public_url() -> std::result::Result<Option<String>, String> {
     public_url_from_env(|k| std::env::var(k).ok())
 }
 
+/// Test-only serialization of the process-global `CLAUDE_RUN_PUBLIC_URL` var,
+/// shared across every module whose test mutates it directly (`auth.rs`,
+/// `web/mod.rs`, `native/closed_issue_summary.rs`): `cargo test` runs the lib
+/// tests in parallel, so any test that sets or clears this var around a call
+/// into [`public_url`] or [`crate::run_footer::resolved_public_url`] must hold
+/// this lock first, same reasoning as `secrets::key_file_env_lock`.
+#[cfg(test)]
+static PUBLIC_URL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub async fn public_url_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    PUBLIC_URL_ENV_LOCK.lock().await
+}
+
+/// [`public_url_env_lock`] for a non-async test.
+#[cfg(test)]
+pub fn public_url_env_lock_blocking() -> tokio::sync::MutexGuard<'static, ()> {
+    PUBLIC_URL_ENV_LOCK.blocking_lock()
+}
+
 /// Build an [`EmailConfig`] from an environment lookup, pure over `get` so
 /// tests exercise every precedence and failure case without touching the
 /// process environment. `get` returns `None` for an unset variable, as

@@ -2296,6 +2296,7 @@ mod tests {
     // in `config.rs`).
     #[tokio::test]
     async fn create_invite_by_email_follows_the_smtp_environment() {
+        let _env = crate::config::public_url_env_lock().await;
         let pool = setup_pool().await;
         let (router, cookie) = signed_in_accounts_router(&pool).await;
 
