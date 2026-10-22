@@ -2038,13 +2038,24 @@ impl Forge for CliBackend {
     /// Strategy is always branch-backed here: AGit has no server branch to
     /// push between-commit, so checkpointing only applies to the default
     /// branch strategy's workdir layout.
+    ///
+    /// No feature branch yet (no commit ahead of the default branch) is
+    /// "nothing to checkpoint", not a failure: it degrades to `Ok(None)`
+    /// exactly like an unchanged tip, so an early tick (before the agent's
+    /// first local commit) never counts as a rejected push and never stops
+    /// checkpointing for the rest of the run. This also means the default
+    /// branch itself is never a push target: `resolve_feature_branch` only
+    /// ever resolves to a branch strictly ahead of it.
     fn checkpoint_push(
         &self,
         workdir: &Path,
         host: &str,
         body: Option<&str>,
     ) -> Result<Option<PullRequest>> {
-        let branch = self.resolve_feature_branch(workdir)?;
+        let branch = match self.resolve_feature_branch(workdir) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
         let repo = self.origin_repo_path(workdir)?;
         let token_url = self.clone_url(host, &repo).ok();
         let token_url = token_url.as_deref();
@@ -4079,6 +4090,27 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c == "git log -1 --format=%b feat/x"),
             "the tip commit's own body must never be read when a body override is supplied: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_push_no_feature_branch_yet_degrades_to_ok_none() {
+        // Before the agent's first local commit, there is no branch ahead of
+        // the base yet; this is "nothing to checkpoint", not a rejected
+        // push, so it must not error and must touch neither the remote nor
+        // the PR.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(StubRunner::new(), "origin/main", &["main"], &[]);
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let result = b
+            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"))
+            .unwrap();
+        assert!(result.is_none());
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "no feature branch yet must not push: {calls:?}"
         );
     }
 
