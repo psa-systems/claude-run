@@ -78,7 +78,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - `closed-issue-summary` is a reporting action; shipped action queries stay disjoint ([CLAUDE-218, CLAUDE-215](docs/conventions/actions.md#reporting-actions-claude-218-claude-215))
 - Every YouTrack write goes through run-scoped `AuditedTracker`, which caps and attributes it ([CLAUDE-234](docs/conventions/actions.md#audited-youtrack-writes-claude-234))
 - Every runner-posted comment carries a run/timing footer, appended at the call site, not in `IssueTracker` ([CLAUDE-446](docs/conventions/actions.md#run-comment-footer-claude-446))
-- `claude-run mcp stdio` is a read-only MCP server; stdout carries only MCP frames, no tool ever writes ([CLAUDE-437](docs/conventions/mcp.md))
+- `claude-run mcp stdio` and an opt-in HTTP listener serve the same read-only MCP tools; HTTP sits behind its own OAuth/TOTP gate ([CLAUDE-437, CLAUDE-442](docs/conventions/mcp.md))
 
 ### State store and config
 

@@ -21,6 +21,8 @@ anstyle = "1"
 anyhow = "1"
 askama = "0.12"
 async-stream = "0.3"
+async-trait = "0.1"
+base64 = "0.22"
 cron = "0.12"
 daemonize = "0.5"
 dirs = "5"
@@ -147,7 +149,11 @@ features = ["full"]
 [dependencies.rmcp]
 version = "1.7.0"
 default-features = false
-features = ["server", "macros", "transport-io"]
+features = ["server", "macros", "transport-io", "transport-streamable-http-server"]
+
+[dependencies.mcp-web]
+version = "0.1"
+registry = "pandoras-box-cargo"
 
 [dependencies.tracing-subscriber]
 version = "0.3"
@@ -162,4 +168,4 @@ tempfile = "3"
 [dev-dependencies.rmcp]
 version = "1.7.0"
 default-features = false
-features = ["client"]
+features = ["client", "transport-streamable-http-client-reqwest"]

@@ -17,3 +17,18 @@ port = 7321
 # serves its /setup page until an administrator exists. Set auth_token_ref later
 # (Settings -> secrets, then this file) only if API clients need a bearer token
 # as well.
+
+# [mcp]
+# Off by default (CLAUDE-442): the troubleshooting MCP tools are read-only but
+# still worth gating behind an explicit opt-in. Uncomment to serve them over
+# Streamable HTTP at /mcp, behind mcp-web's own OAuth 2.1 / local-account /
+# TOTP web layer. 0.0.0.0, matching [web] above, since a loopback bind inside
+# a container is reachable only from that container.
+# enabled = true
+# bind = "0.0.0.0:7322"
+# public_url must be the externally reachable URL this listener answers on
+# (through whatever reverse proxy terminates TLS); mcp-web anchors its OAuth
+# issuer and redirect URIs to it, so a wrong value breaks the OAuth dance
+# rather than just producing a cosmetic link.
+# public_url = "https://mcp.claude-run.example.com"
+# admin_email = "admin@example.com"

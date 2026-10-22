@@ -136,6 +136,14 @@ services:
     # no socket). Ephemeral per container so nothing stale survives a restart.
     tmpfs:
       - /run/claude-run
+    # CLAUDE-442: the troubleshooting MCP listener is off by default
+    # ([mcp].enabled = false until set otherwise in config.toml), so no port is
+    # published here either. Uncomment this once [mcp] is enabled in
+    # deploy/container-config.toml (or the mounted config.toml); it only
+    # forwards the container's own bind, so leave TLS to the operator's reverse
+    # proxy rather than terminating it on this port directly.
+    # ports:
+    #   - "7322:7322"
 
   # CLAUDE-287: Docker-in-Docker sidecar, so `claude` sessions the daemon spawns
   # can run `docker`, `docker compose` and `docker buildx` (this repo's own

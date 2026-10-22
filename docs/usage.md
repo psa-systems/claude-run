@@ -82,6 +82,18 @@ It exposes exactly seven tools, each read-only (no tool ever writes):
 }
 ```
 
+### Same tools, over HTTP (CLAUDE-442)
+
+The daemon can also serve those seven tools over MCP's Streamable HTTP transport at `/mcp`, for a client that is not
+running on this host. It is off by default; set `[mcp] enabled = true` (see
+[configuration.md](configuration.md#mcp-over-http-claude-442)) to turn it on. Unlike `mcp stdio`, the HTTP listener is
+gated behind its own OAuth 2.1 / local-account / TOTP web layer (the `mcp-web` crate), entirely separate from both the
+daemon's own `[web]` dashboard auth and from `mcp stdio`'s "if you can exec into the container, you can use it"
+model; see [docs/conventions/mcp.md](conventions/mcp.md#serving-the-same-tools-over-http-claude-442) for the auth
+model, the two key files, and the stream-log sensitivity note. A client talks to it the same way it would any OAuth-
+protected MCP server: discover the server's metadata, complete the OAuth dance to obtain a bearer token, then call
+tools with `Authorization: Bearer <token>` against `https://<public_url>/mcp`.
+
 ## Web UI pages
 
 The daemon's TCP web UI (loopback by default; see [Web UI / API auth](auth.md#web-ui--api-auth)) is more than the Dashboard. The pages an operator
