@@ -1486,10 +1486,19 @@ fn serve_run(
     };
 
     let mut push_err = None;
+    let mut push_comment_failure = None;
     if matches!(decision, Decision::Push { .. }) {
-        if let Err(e) = push_fix(backend, cmd, &branch, workdir) {
-            warn!(repo = %cmd.repo, pr = cmd.number, error = %e, "push failed (commenting the failure)");
-            push_err = Some(e.to_string());
+        match push_fix(backend, cmd, &branch, workdir) {
+            Ok(()) => {
+                let head = cloned_head
+                    .as_deref()
+                    .expect("claude only runs after a successful clone");
+                push_comment_failure = post_fix_push_comment(backend, cmd, workdir, head);
+            }
+            Err(e) => {
+                warn!(repo = %cmd.repo, pr = cmd.number, error = %e, "push failed (commenting the failure)");
+                push_err = Some(e.to_string());
+            }
         }
     }
 
@@ -1502,7 +1511,12 @@ fn serve_run(
         backend,
         cmd,
         &reply_dir,
-        outcome_comment(&decision, &claude_result, push_err.as_deref()),
+        outcome_comment(
+            &decision,
+            &claude_result,
+            push_err.as_deref(),
+            push_comment_failure.as_deref(),
+        ),
     );
 
     let summary = format!(
@@ -1961,6 +1975,51 @@ fn push_fix(
     git_push(workdir, &push_url, branch)
 }
 
+/// Post the CLAUDE-447 `comment-webhook fix push` comment after [`push_fix`]
+/// succeeds. The issue key is read out of the pushed tip's commit body
+/// (CLAUDE-398's bare `#<KEY>-N` reference) rather than threaded through
+/// `VerifiedCommentCommand`, which carries no YouTrack key at all (it
+/// addresses a forge PR, not a tracker issue); `repo#number` stands in when
+/// the tip carries none. `cloned_head` is the clone's tip BEFORE the decision
+/// gate's own leftover commit, so the range covers everything this fix push
+/// actually added. Resolving the new tip or the commit log is best-effort (a
+/// failure degrades to `Unavailable` subjects rather than skipping the
+/// comment); only the `pr_comment` call's own failure is reported back to the
+/// caller, per [`crate::push_comment::post`].
+fn post_fix_push_comment(
+    backend: &dyn Backend,
+    cmd: &VerifiedCommentCommand,
+    workdir: &FsPath,
+    cloned_head: &str,
+) -> Option<String> {
+    let new_sha = git_output(workdir, &["rev-parse", "HEAD"]).ok()?;
+    let issue_key = git_output(workdir, &["log", "-1", "--format=%B", "HEAD"])
+        .ok()
+        .and_then(|body| crate::provider::bare_issue_key(&body))
+        .unwrap_or_else(|| format!("{}#{}", cmd.repo, cmd.number));
+    let range = format!("{cloned_head}..{new_sha}");
+    let subjects = match git_output(workdir, &["log", "--format=%s", &range]) {
+        Ok(stdout) => crate::push_comment::CommitSubjects::Listed(
+            stdout.lines().map(str::to_string).collect(),
+        ),
+        Err(_) => crate::push_comment::CommitSubjects::Unavailable,
+    };
+    let public_url = crate::run_footer::resolved_public_url();
+    let ctx = crate::push_comment::PushCommentContext {
+        event: crate::push_comment::PushEvent::CommentWebhookFixPush,
+        issue_key: &issue_key,
+        draft: false,
+        old_sha: Some(cloned_head),
+        new_sha: Some(&new_sha),
+        subjects,
+        public_url: public_url.as_deref(),
+        run_id: None,
+        started: None,
+    };
+    let scratch = git_dir_scratch(workdir).unwrap_or_else(|_| std::env::temp_dir());
+    crate::push_comment::post(backend, &cmd.host, &cmd.repo, cmd.number, &scratch, &ctx)
+}
+
 /// Whether [`push_fix`] has anything left to commit: the freshly staged index
 /// (via the `git add -A` above) still differs from `HEAD`, or a merge is in
 /// progress (`MERGE_HEAD` present), which that commit concludes. When the
@@ -2210,6 +2269,7 @@ pub fn outcome_comment(
     decision: &Decision,
     claude: &ClaudeResult,
     push_err: Option<&str>,
+    push_comment_failure: Option<&str>,
 ) -> String {
     match decision {
         Decision::ClaudeFailed => {
@@ -2276,14 +2336,20 @@ pub fn outcome_comment(
                 "No changes reached the PR; this needs human review.".to_string(),
             ]
             .join("\n"),
-            None => [
-                "**Claude pushed a commit.**".to_string(),
-                String::new(),
-                claude.summary.clone(),
-                String::new(),
-                "CI will re-run on the new commit. Review the diff before merging.".to_string(),
-            ]
-            .join("\n"),
+            None => {
+                let mut lines = vec![
+                    "**Claude pushed a commit.**".to_string(),
+                    String::new(),
+                    claude.summary.clone(),
+                    String::new(),
+                    "CI will re-run on the new commit. Review the diff before merging.".to_string(),
+                ];
+                if let Some(err) = push_comment_failure {
+                    lines.push(String::new());
+                    lines.push(format!("Note: {err}"));
+                }
+                lines.join("\n")
+            }
         },
     }
 }
@@ -3388,32 +3454,43 @@ mod tests {
             killed: false,
             exit_code: Some(0),
         };
-        let pushed = outcome_comment(&Decision::Push { files: 1, lines: 2 }, &ok, None);
+        let pushed = outcome_comment(&Decision::Push { files: 1, lines: 2 }, &ok, None, None);
         assert!(pushed.contains("Claude pushed a commit."));
         let push_failed = outcome_comment(
             &Decision::Push { files: 1, lines: 2 },
             &ok,
             Some("git push exited 1"),
+            None,
         );
         assert!(push_failed.contains("push FAILED"));
         assert!(!push_failed.contains("Claude pushed a commit."));
-        assert!(outcome_comment(&Decision::NoChanges, &ok, None).contains("made no changes"));
+        let pushed_with_comment_failure = outcome_comment(
+            &Decision::Push { files: 1, lines: 2 },
+            &ok,
+            None,
+            Some("boom"),
+        );
+        assert!(pushed_with_comment_failure.contains("Claude pushed a commit."));
+        assert!(pushed_with_comment_failure.contains("Note: boom"));
+        assert!(outcome_comment(&Decision::NoChanges, &ok, None, None).contains("made no changes"));
         assert!(outcome_comment(
             &Decision::TooBig {
                 files: 99,
                 lines: 9
             },
             &ok,
+            None,
             None
         )
         .contains("too large"));
         let failed = ClaudeResult::synthesized("claude exited 1", "tail");
-        assert!(outcome_comment(&Decision::ClaudeFailed, &failed, None).contains("FAILED"));
+        assert!(outcome_comment(&Decision::ClaudeFailed, &failed, None, None).contains("FAILED"));
         let unresolved = outcome_comment(
             &Decision::UnresolvedConflicts {
                 paths: vec!["a.txt".to_string()],
             },
             &ok,
+            None,
             None,
         );
         assert!(unresolved.contains("unresolved merge conflicts"));
@@ -3424,6 +3501,7 @@ mod tests {
                 reason: "git diff exited 1".to_string(),
             },
             &ok,
+            None,
             None,
         );
         assert!(measure_failed.contains("Measuring the change failed"));
@@ -3440,23 +3518,23 @@ mod tests {
     fn claude_failed_comment_explains_recognized_exit_codes() {
         let mut timed_out = ClaudeResult::synthesized("claude exited 124, see stream.jsonl", "");
         timed_out.timed_out = true;
-        let body = outcome_comment(&Decision::ClaudeFailed, &timed_out, None);
+        let body = outcome_comment(&Decision::ClaudeFailed, &timed_out, None, None);
         assert!(body.contains("timeout"), "{body}");
         assert!(body.contains("claude_timeout_seconds"), "{body}");
 
         let mut killed = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
         killed.killed = true;
-        let body = outcome_comment(&Decision::ClaudeFailed, &killed, None);
+        let body = outcome_comment(&Decision::ClaudeFailed, &killed, None, None);
         assert!(body.contains("SIGKILL"), "{body}");
         assert!(body.contains("out-of-memory"), "{body}");
 
         let plain = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "tail");
-        let with_hint = outcome_comment(&Decision::ClaudeFailed, &plain, None);
+        let with_hint = outcome_comment(&Decision::ClaudeFailed, &plain, None, None);
         let without_hint_field = {
             let mut r = plain.clone();
             r.timed_out = false;
             r.killed = false;
-            outcome_comment(&Decision::ClaudeFailed, &r, None)
+            outcome_comment(&Decision::ClaudeFailed, &r, None, None)
         };
         assert_eq!(with_hint, without_hint_field);
         assert!(!with_hint.contains("timeout"), "{with_hint}");
@@ -3479,7 +3557,7 @@ mod tests {
         let mut killed = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
         killed.killed = true;
         killed.summary = summary;
-        let body = outcome_comment(&Decision::ClaudeFailed, &killed, None);
+        let body = outcome_comment(&Decision::ClaudeFailed, &killed, None, None);
         assert!(!body.contains("signature"), "{body}");
         assert!(!body.contains("secret reasoning"), "{body}");
     }
@@ -4964,6 +5042,100 @@ mod tests {
         assert!(
             trace.contains("built-in: git push"),
             "expected the push to have actually run, trace: {trace}"
+        );
+    }
+
+    /// CLAUDE-447: a successful fix push posts the `comment-webhook fix push`
+    /// event, the issue key read off the tip commit's bare `#<KEY>-N`
+    /// reference, the PR's ready state, and the commit range.
+    #[test]
+    fn post_fix_push_comment_names_the_event_and_issue_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let cloned_head = git_output(dir, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+        git_in(dir, &["commit", "-q", "-m", "fix the thing\n\n#CLAUDE-447"]).unwrap();
+
+        let scratch = git_dir_scratch(dir).unwrap();
+        let body_arg = scratch
+            .join("claude-run-push-comment-7-comment-webhook_fix_push.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "comment",
+                "contoso/claude-run#7",
+                "--body-file",
+                &body_arg,
+            ],
+            "",
+        ));
+        let backend = CliBackend::new(runner.clone());
+        let cmd = gate_cmd();
+
+        let failure = post_fix_push_comment(&backend, &cmd, dir, &cloned_head);
+        assert!(failure.is_none(), "{failure:?}");
+
+        let calls = runner.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("fj --host dev.a8n.run pr comment contoso/claude-run#7")),
+            "{calls:?}"
+        );
+    }
+
+    /// A failed `pr_comment` call never fails the push it reports on: the
+    /// caller gets back the failure line to fold into its own reply, and
+    /// nothing panics or retries.
+    #[test]
+    fn post_fix_push_comment_failure_is_reported_not_retried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let cloned_head = git_output(dir, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+        git_in(dir, &["commit", "-q", "-m", "fix the thing"]).unwrap();
+
+        let scratch = git_dir_scratch(dir).unwrap();
+        let body_arg = scratch
+            .join("claude-run-push-comment-7-comment-webhook_fix_push.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(StubRunner::new().fail(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "comment",
+                "contoso/claude-run#7",
+                "--body-file",
+                &body_arg,
+            ],
+            1,
+            "network error",
+        ));
+        let backend = CliBackend::new(runner.clone());
+        let cmd = gate_cmd();
+
+        let failure = post_fix_push_comment(&backend, &cmd, dir, &cloned_head);
+        let failure = failure.expect("the failed fj call must surface as a failure line");
+        assert!(failure.contains("comment-webhook fix push"), "{failure}");
+        assert!(failure.contains("network error"), "{failure}");
+
+        let calls = runner.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.iter().filter(|c| c.contains("pr comment")).count(),
+            1,
+            "a failed write must never be retried: {calls:?}"
         );
     }
 }

@@ -2415,11 +2415,31 @@ mod tests {
         // consults gh, though the push below falls back to the daemon's own
         // `gh` login since no action token_ref is set.
         let push_remote = "https://x-access-token:ghp_from_login@github.com/octo/widget.git";
-        let runner = Arc::new(with_git(StubRunner::new(), "feat/x", push_remote).ok(
-            "gh",
-            &["auth", "token", "--hostname", "github.com"],
-            "ghp_from_login\n",
-        ));
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-11-initial_push__PR_opened_.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", push_remote)
+                .ok(
+                    "gh",
+                    &["auth", "token", "--hostname", "github.com"],
+                    "ghp_from_login\n",
+                )
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "11",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
+                    "",
+                ),
+        );
         let transport = Arc::new(StubTransport::new(
             true,
             json!({"structuredContent": {"number": 11, "html_url": "https://github.com/octo/widget/pull/11"}}),
@@ -2457,11 +2477,17 @@ mod tests {
         for call in calls.iter() {
             assert!(!call.contains("ghp_from_login"), "{call}");
         }
+        // PR creation itself never consulted `gh`; the only other `gh` call
+        // is the CLAUDE-447 push comment posted after the push succeeded.
         assert!(
-            !calls
-                .iter()
-                .any(|c| c.starts_with("gh ") && c != "gh auth token --hostname github.com"),
+            !calls.iter().any(|c| c.starts_with("gh ")
+                && c != "gh auth token --hostname github.com"
+                && !c.starts_with("gh pr comment 11")),
             "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("gh pr comment 11")),
+            "the push comment must be posted after a successful push: {calls:?}"
         );
         drop(calls);
         let envs = runner.envs.lock().unwrap();
