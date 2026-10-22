@@ -497,6 +497,29 @@ pub trait Forge: Send + Sync {
         )))
     }
 
+    /// A periodic checkpoint push (CLAUDE-448): push `workdir`'s current
+    /// feature branch with the repo's hooks bypassed (a checkpoint push runs
+    /// while the agent is still editing, so a `pre-push` hook would check a
+    /// half-edited tree and compete with the agent for CPU), posting a
+    /// `checkpoint push` PR comment and opening (or adopting) a draft PR with
+    /// `body` on the FIRST successful checkpoint of a run. Returns the
+    /// resulting PR when something was pushed, `None` when the branch's tip
+    /// already matched the remote (nothing new to push). Never called with
+    /// the repo's default branch. The default errors so a backend without
+    /// support (every test-only stub) reports clearly rather than silently
+    /// no-op'ing.
+    fn checkpoint_push(
+        &self,
+        workdir: &std::path::Path,
+        host: &str,
+        body: Option<&str>,
+    ) -> Result<Option<PullRequest>> {
+        let _ = (workdir, host, body);
+        Err(Error::Other(anyhow::anyhow!(
+            "checkpoint_push not supported by this forge backend"
+        )))
+    }
+
     /// Drain the operator-visible notices this backend accumulated
     /// while serving the job, e.g. an open-PR lookup that failed and was
     /// degraded to a create. The caller persists them as `run_events` so they
