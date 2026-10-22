@@ -22,11 +22,25 @@
 #   Working      -> claude is running (set in the pre step)
 #   Code Review  -> the runner opened a PR after a successful run; the code needs human review (finalize step)
 #   Needs Review -> claude couldn't proceed and parked the job by writing .claude-run-needs-review; the issue needs
-#                   human input (finalize step) - the attempt counter is NOT incremented
+#                   human input (finalize step) - the attempt counter is NOT incremented. A timeout also lands here
+#                   even when a checkpoint push (below) already salvaged the work into a draft PR - CLAUDE-453 tracks
+#                   auto-requeuing a timeout back to Queued instead, as a deliberately descoped follow-up of CLAUDE-448
 #   Failed       -> claude or a step had a hard failure (finalize step)
 #   Done         -> a run that deliberately produced tracker output rather than code and wrote
 #                   .claude-run-no-code-change; no PR is opened and State is left alone (CLAUDE-214, label configurable
 #                   as native.youtrack.states.no_code)
+#
+# Checkpoint pushes (CLAUDE-448): while claude is running, the runner pushes the feature branch's current commits
+# every 60 seconds with hooks skipped (--no-verify on the checkpoint push only, never on the final push a successful
+# run makes), so a killed or timed-out run still leaves its work reachable on the forge. The first successful
+# checkpoint push opens a draft PR (salvaged=true, same CLAUDE-398/CLAUDE-379 body shape as a timeout salvage, but
+# with no Closes line since the run is still going) and every push after that posts a `checkpoint push` PR comment
+# (CLAUDE-447). A run that resolves normally afterwards promotes that draft PR exactly like a resumed run does
+# (CLAUDE-429): refresh_pr_text + mark_pr_ready, salvaged cleared. If a checkpoint push is ever rejected by the forge
+# (for example a force-pushed or deleted branch), the watcher logs it, stops checkpointing for the rest of the run,
+# never fails the job over it, and the rejection is named in whichever outcome comment finalize posts. The default
+# branch is never checkpoint-pushed. Only the Forgejo (`fj`) backend implements checkpoint_push today; CLAUDE-452
+# tracks the GitHub backend as a deliberately descoped follow-up.
 #
 # Working can also revert to Queued (CLAUDE-439), with a comment naming the reason and no attempt counted: a transient
 # claude result (an authentication failure, or a rate-limit / usage-limit signal) after the pre step already wrote
