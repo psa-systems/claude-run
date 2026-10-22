@@ -25,9 +25,10 @@ credentials live in the Keychain rather than `.credentials.json`, so the symlink
 `timeout`, `git`, `yt` (youtrack-cli), `fj` (forgejo-cli), `just`, `kingfisher`, and `docker` (client, Compose, buildx).
 Tool versions come from the base image tag; moving a tool means bumping that tag, not editing a Dockerfile `RUN` block.
 The runtime stage smoke-checks every one of those tools in a single `RUN`, so a base image that loses a tool fails the
-image build instead of the first job. The container runs as the non-root user `claudebot` (uid 100, gid 101, matching
-the ids the earlier Alpine-based image used) with `$HOME=/home/claudebot`, which holds nothing persistent: everything
-the operator cares about lives on the three flat volumes below.
+image build instead of the first job. The container runs as the non-root user `appuser` (uid 1001, gid 1001, the id
+every first-party image's shared `gosu-entrypoint.sh` falls back to) with `$HOME=/home/claudebot` (the path kept from
+the earlier `claudebot` user), which holds nothing persistent: everything the operator cares about lives on the three
+flat volumes below.
 
 **Published image (CLAUDE-88).** CI publishes the runtime image to the Forgejo OCI registry on every push to main (
 `:latest`) and every release tag (`:vX.Y.Z`), the only published artifact. The image publish runs
@@ -74,9 +75,19 @@ Each tool's store is a subdirectory rather than a mount of its own, because the 
 
 **CI images (CLAUDE-383).** `compose.yml` also sets seven `RUNS_ON_*` variables on `claude-bot`, one per image CI uses (`RUNS_ON_OPENSUSE_BASE_HEAVY`, `RUNS_ON_OPENSUSE_BASE_MASSIVE`, `RUNS_ON_OPENSUSE_BASE_LIGHT`, `RUNS_ON_OPENSUSE_BASE_MEDIUM`, `RUNS_ON_RUST_BUILDER_MUSL`, `RUNS_ON_RUST_BUILDER_GLIBC`, `RUNS_ON_RUST_BUILDER_GLIBC_WINDOWS`). A workflow's `runs-on: ${{ vars.RUNS_ON_* }}` resolves the same name to a runner LABEL; the container's environment variable of the same name is the pullable IMAGE that label's runner runs, so an agent session can `docker run "$RUNS_ON_RUST_BUILDER_MUSL"` or reference `${RUNS_ON_RUST_BUILDER_MUSL}` in a compose file and get the exact image CI uses, with nothing from the GitHub Container Registry involved. See `deploy/bot-CLAUDE.md`'s "CI images" section for what the agent is told.
 
-**Running user.** The runtime stage stays on `USER root` (the base image's last `USER` is `dev`) so `oci-build/entrypoint.sh` can chown the mounted volumes to `claudebot`, then drops to that user with `setpriv --reuid=claudebot --regid=claudebot --init-groups` (pattern 3 in `governance/CONTAINER_UID_GID.md`); Leap packages neither `su-exec` nor `gosu`, and `setpriv` (util-linux, already in the base) is the equivalent gosu's own README names. The daemon itself runs non-root. `catatonit` (already in the base image) is PID 1 and execs `entrypoint.sh` as its child, so any process an agent session leaves running when its own session exits is reaped instead of accumulating as a zombie for the life of the container (CLAUDE-310). Do NOT set `user:` in compose: the entrypoint would lose the privileges the chown needs and a volume owned by another uid could never be repaired from inside. Two consequences for the operator:
+**Running user.** The runtime stage stays on `USER root` (the base image's last `USER` is `dev`) so the shared,
+byte-identical `/usr/local/bin/gosu-entrypoint.sh` (CONTAINER_UID_GID.md; installed from the upstream `gosu` 1.19
+release binary, since Leap packages neither `su-exec` nor `gosu`) can run its root hooks, remap `appuser` to the
+resolved uid/gid, and chown the mounted volumes, then drop to `appuser` with `gosu`. The daemon itself runs non-root.
+`catatonit` (already in the base image) is PID 1 and execs `gosu-entrypoint.sh` as its child, so any process an agent
+session leaves running when its own session exits is reaped instead of accumulating as a zombie for the life of the
+container (CLAUDE-310). Image-specific root work (config seeding, the data-dir chown) lives in hooks under
+`/etc/entrypoint.d/`, run after the remap and before the chown; `gosu-entrypoint.sh` itself is never edited per image.
+A compose `user:` pin disables the remap, hooks and chown and instead requires every `DATA_DIRS` entry to already be
+writable by that uid:gid (set `PUID`/`PGID` to override the id the image falls back to, 1001). Two consequences for
+the operator:
 
-- `docker compose exec` lands as root unless you pass `--user claudebot`. Always pass it for the login commands below, or the credentials are written root-owned and only become usable after the next restart's chown.
+- `docker compose exec` lands as root unless you pass `--user appuser`. Always pass it for the login commands below, or the credentials are written root-owned and only become usable after the next restart's chown.
 - The chown skips `$CLAUDE_RUN_DATA_DIR/workdirs`, which is a tree of job git clones the runtime user created itself; walking it on every boot would be slow for no gain.
 
 **Docker access (CLAUDE-287).** Agent sessions run against a Docker-in-Docker sidecar, `claude-bot-docker`
@@ -116,7 +127,7 @@ for the verified cause and the upstream reports.
 
 **No unix-socket API.** The image runs `serve --no-socket`, so the daemon binds only the TCP listener. That socket is the CLI's control plane, and this container has no CLI operator: the web UI and its `/api` routes are the whole interface, and they carry the same handlers (`/api/actions/<n>/trigger`, `/api/pause`, `/api/resume`, `/settings/<section>`). Binding it here would only leave a second copy of that control plane with no token gate on it, reachable by the `claude` agent the daemon spawns as the same user. `claude-run trigger` and `claude-run cancel` inside the container therefore fail, naming the reason rather than claiming no daemon is running; every other subcommand (`secret set`, `action list`, `status`) works as before because it goes to the database directly. Override `command: ["serve"]` in compose if a deployment really does want the socket.
 
-**Troubleshooting MCP server.** `claude-run mcp stdio` is a DB-direct subcommand like `status` or `action list`: it needs no daemon and works the same way inside this container. Point an MCP client at it with `docker compose exec --user claudebot claude-bot claude-run mcp stdio`; see [docs/usage.md](usage.md#read-only-troubleshooting-mcp-server) for the tool list and an example client config.
+**Troubleshooting MCP server.** `claude-run mcp stdio` is a DB-direct subcommand like `status` or `action list`: it needs no daemon and works the same way inside this container. Point an MCP client at it with `docker compose exec --user appuser claude-bot claude-run mcp stdio`; see [docs/usage.md](usage.md#read-only-troubleshooting-mcp-server) for the tool list and an example client config.
 
 **Web bind and first-run setup.** The image seeds a bootstrap `config.toml` (from `deploy/container-config.toml`) that binds `0.0.0.0:7321`, because a loopback bind inside a container is reachable from nothing outside it, published port or reverse proxy included. A non-loopback bind requires auth, and that credential is created in the browser: open the URL and the daemon serves `/setup`, which takes a username and a password and creates the first account. No token, no key file, no CLI. Every account after that comes from an invite minted on the Accounts page, never from `/setup` again. The seeded `config.toml` is copied only when the config volume has none, so operator edits survive restarts and image upgrades. See [Web UI / API auth](auth.md#web-ui--api-auth) for what setup is and is not (it is trust-on-first-use; bring the instance up behind the proxy).
 
@@ -126,15 +137,15 @@ for the verified cause and the upstream reports.
 docker compose up --detach
 
 # Create the first web account at https://<your-host>/setup, then the tool logins:
-docker compose exec --user claudebot claude-bot claude auth login
-docker compose exec --user claudebot claude-bot yt auth login --base-url https://yt.example.com
-docker compose exec --user claudebot claude-bot fj auth add-key
-docker compose exec --user claudebot claude-bot gh auth login
+docker compose exec --user appuser claude-bot claude auth login
+docker compose exec --user appuser claude-bot yt auth login --base-url https://yt.example.com
+docker compose exec --user appuser claude-bot fj auth add-key
+docker compose exec --user appuser claude-bot gh auth login
 
 docker compose restart
 ```
 
-`claude auth login` needs the interactive TTY that `docker compose exec` provides; `claude setup-token` is the long-lived-token alternative. Verify with `claude auth status`, `yt auth list`, `fj auth list` and `gh auth status` through the same `exec --user claudebot` form.
+`claude auth login` needs the interactive TTY that `docker compose exec` provides; `claude setup-token` is the long-lived-token alternative. Verify with `claude auth status`, `yt auth list`, `fj auth list` and `gh auth status` through the same `exec --user appuser` form.
 
 To use an API key instead of an interactive Claude login, set `ANTHROPIC_API_KEY` in the service `environment:` and skip `claude auth login`. Nothing else changes: since CLAUDE-247 the daemon no longer requires a credentials file to start.
 

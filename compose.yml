@@ -44,10 +44,11 @@ services:
     restart: unless-stopped
     networks:
       claude-bot-private:
-    # CLAUDE-247: no `user:` here. The image starts as root so its entrypoint can
-    # chown the volumes, then drops to claudebot with setpriv (pattern 3 in
-    # governance/CONTAINER_UID_GID.md). A `user:` override would leave the
-    # entrypoint without the privileges the chown needs.
+    # CLAUDE-443: no `user:` here. The image starts as root so the shared
+    # gosu-entrypoint.sh (governance/CONTAINER_UID_GID.md) can run its root
+    # hooks and chown the volumes, then drops to appuser with gosu. A `user:`
+    # override would disable the remap and chown, requiring every data dir to
+    # already be writable by that uid:gid.
     environment:
       # CLAUDE-253: the image already sets every path (three flat roots plus the
       # tool stores under them), so nothing here has to restate them. Override
