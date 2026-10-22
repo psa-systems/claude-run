@@ -64,6 +64,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - Every `git` subprocess authenticates from the forge key store; failures carry redacted stderr ([CLAUDE-252](docs/conventions/forge.md#git-authentication-and-errors-claude-252))
 - Read-only `fj` and `gh` calls retry up to 4 attempts on non-zero exit; writes never retry ([CLAUDE-366, CLAUDE-407](docs/conventions/forge.md#read-only-fj-retries-claude-366))
 - Every git network call, including push, retries up to 4 attempts; the AGit `fj pr create -aA` path stays excluded ([CLAUDE-396](docs/conventions/forge.md#git-network-retries-claude-396))
+- Every runner write to a PR branch posts one `push_comment` naming the event, issue, state, and SHA range ([CLAUDE-447](docs/conventions/forge.md#push-comments-on-every-pr-branch-write-claude-447))
 
 ### Container runtime
 
