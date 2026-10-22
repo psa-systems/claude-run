@@ -147,7 +147,11 @@ features = ["full"]
 [dependencies.rmcp]
 version = "1.7.0"
 default-features = false
-features = ["server", "macros", "transport-io"]
+features = ["server", "macros", "transport-io", "transport-streamable-http-server"]
+
+[dependencies.mcp-web]
+version = "0.1"
+registry = "pandoras-box-cargo"
 
 [dependencies.tracing-subscriber]
 version = "0.3"
