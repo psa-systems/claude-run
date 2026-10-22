@@ -656,6 +656,8 @@ mod tests {
     /// missing-canned-response failure rather than a passing test.
     #[test]
     fn file_report_creates_the_issue_and_links_it_as_a_subtask() {
+        let _env = crate::config::public_url_env_lock_blocking();
+        std::env::remove_var("CLAUDE_RUN_PUBLIC_URL");
         let gathered = vec![
             (
                 "CLAUDE".to_string(),

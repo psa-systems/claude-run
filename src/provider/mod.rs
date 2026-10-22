@@ -144,6 +144,13 @@ pub struct PullRequest {
     /// has nothing to resume there.
     #[serde(default)]
     pub head_branch: Option<String>,
+    /// Set when the push-comment this PR's push (CLAUDE-447) tried to post
+    /// on the PR itself failed; `None` on success or when nothing was
+    /// pushed (the branch was already up to date). The caller folds this
+    /// into its own run outcome comment (`pr_create`/success/salvage) the
+    /// same way it already folds a [`Forge::refresh_pr_text`] failure in.
+    #[serde(default)]
+    pub push_comment_failure: Option<String>,
 }
 
 /// Direction of an issue link, mirroring the YouTrack REST `IssueLink.direction`
@@ -369,6 +376,28 @@ pub(crate) fn probe_denied(
          {cause}",
         out.exit_code
     ))
+}
+
+/// The bare `#<KEY>-N` issue reference every runner-made commit body ends
+/// with (CLAUDE-398), read out of `text` for a push comment (CLAUDE-447)
+/// that has no YouTrack job key passed in directly (the GitHub provider
+/// layer, which only sees the repo and the commit text). `None` when no such
+/// token appears.
+pub fn bare_issue_key(text: &str) -> Option<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '#')
+        .find_map(|tok| {
+            let tok = tok.strip_prefix('#')?;
+            let (letters, rest) = tok.split_at(tok.find(|c: char| !c.is_ascii_uppercase())?);
+            if letters.is_empty() {
+                return None;
+            }
+            let digits = rest.strip_prefix('-')?;
+            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                Some(format!("{letters}-{digits}"))
+            } else {
+                None
+            }
+        })
 }
 
 /// Reject a PR tip subject that is empty or a template heading/bare issue
@@ -1552,6 +1581,33 @@ mod tests {
     #[test]
     fn validate_pr_subject_accepts_a_real_subject() {
         validate_pr_subject("Pin base image digests", "feat/x").unwrap();
+    }
+
+    #[test]
+    fn bare_issue_key_finds_trailing_reference() {
+        let body = "Add the push-comment module.\n\nSome body text.\n\n#CLAUDE-447";
+        assert_eq!(bare_issue_key(body), Some("CLAUDE-447".to_string()));
+    }
+
+    #[test]
+    fn bare_issue_key_finds_reference_among_other_tokens() {
+        let body = "See #NOTAKEY and also #CLAUDE-447 for details.";
+        assert_eq!(bare_issue_key(body), Some("CLAUDE-447".to_string()));
+    }
+
+    #[test]
+    fn bare_issue_key_none_when_absent() {
+        assert_eq!(bare_issue_key("no issue reference here"), None);
+    }
+
+    #[test]
+    fn bare_issue_key_rejects_lowercase_letters() {
+        assert_eq!(bare_issue_key("#claude-447"), None);
+    }
+
+    #[test]
+    fn bare_issue_key_rejects_non_numeric_suffix() {
+        assert_eq!(bare_issue_key("#CLAUDE-abc"), None);
     }
 
     /// A failed clone must say WHY. `git clone exited 128` alone is

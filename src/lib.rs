@@ -50,6 +50,7 @@ pub mod native;
 pub mod paint;
 pub mod pause;
 pub mod provider;
+pub mod push_comment;
 pub mod readiness;
 pub mod report;
 pub mod retention;

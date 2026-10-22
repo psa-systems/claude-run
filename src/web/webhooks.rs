@@ -4769,10 +4769,23 @@ async fn apply_automerge_decision(
                             "action-run success: branch-updated comment failed",
                         )
                         .await;
+                        let push_comment_failure = post_branch_updated_push_comment(
+                            forge.clone(),
+                            host,
+                            repo,
+                            pr_number,
+                            &row.issue_key,
+                            status.head_sha.as_deref(),
+                        )
+                        .await;
                         info!(repo = %repo, pr = pr_number, "action-run success: branch behind base; updated, left at Code Review");
-                        Ok(AutomergeOutcome::Acted(format!(
+                        let mut outcome = format!(
                             "PR #{pr_number} branch updated from base; will automerge on next green run"
-                        )))
+                        );
+                        if let Some(err) = push_comment_failure {
+                            outcome.push_str(&format!(" ({err})"));
+                        }
+                        Ok(AutomergeOutcome::Acted(outcome))
                     }
                     Err(e) => {
                         let msg = format!("update_pr_branch failed: {e}");
@@ -5128,6 +5141,53 @@ async fn post_issue_comment(
             error!(repo = %repo, pr = pr_number, issue = %issue_key, error = %e, "{context} (task panicked)");
         }
     }
+}
+
+/// Post the CLAUDE-447 `branch updated from base` PR comment after
+/// [`Forge::update_pr_branch`] succeeds. This is a server-side forge
+/// operation with no local clone to run `git log` against, so the new SHA
+/// and commit subjects are always [`crate::push_comment::CommitSubjects::Unavailable`];
+/// `old_sha` is the pre-update head [`PrStatus::head_sha`] already read.
+/// Automerge only acts on a ready (non-draft) PR, so `draft` is always
+/// `false`. A failed comment post never fails the branch update it reports
+/// on: it is logged at `error` inside [`crate::push_comment::post`] and
+/// returned here for the caller to fold into its own outcome.
+async fn post_branch_updated_push_comment(
+    forge: Arc<dyn Forge>,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    issue_key: &str,
+    old_sha: Option<&str>,
+) -> Option<String> {
+    let host = host.to_string();
+    let repo = repo.to_string();
+    let issue_key = issue_key.to_string();
+    let old_sha = old_sha.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        let public_url = crate::run_footer::resolved_public_url();
+        let ctx = crate::push_comment::PushCommentContext {
+            event: crate::push_comment::PushEvent::BranchUpdatedFromBase,
+            issue_key: &issue_key,
+            draft: false,
+            old_sha: old_sha.as_deref(),
+            new_sha: None,
+            subjects: crate::push_comment::CommitSubjects::Unavailable,
+            public_url: public_url.as_deref(),
+            run_id: None,
+            started: None,
+        };
+        crate::push_comment::post(
+            forge.as_ref(),
+            &host,
+            &repo,
+            pr_number,
+            &std::env::temp_dir(),
+            &ctx,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Some(format!("push comment task panicked: {e}")))
 }
 
 /// Resolve a source's configured webhook secret to plaintext, loading the age key
@@ -5674,6 +5734,12 @@ mod tests {
         state_field: StdMutex<Option<String>>,
         /// When set, `get_field` fails with this message.
         state_field_error: StdMutex<Option<String>>,
+        /// When set, `pr_comment` fails with this message instead of
+        /// recording the comment body.
+        pr_comment_error: StdMutex<Option<String>>,
+        /// Every body `pr_comment` was asked to post, read from its
+        /// `--body-file`-style path argument.
+        pr_comments: StdMutex<Vec<String>>,
     }
 
     impl StoreBackend {
@@ -5689,6 +5755,8 @@ mod tests {
                 merge_pr_error: StdMutex::new(None),
                 state_field: StdMutex::new(None),
                 state_field_error: StdMutex::new(None),
+                pr_comment_error: StdMutex::new(None),
+                pr_comments: StdMutex::new(Vec::new()),
             }
         }
         fn with_legacy_match(self, key: &str) -> Self {
@@ -5754,6 +5822,15 @@ mod tests {
         }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+        /// Make `pr_comment` fail with `message` instead of recording the
+        /// comment body.
+        fn with_pr_comment_error(self, message: &str) -> Self {
+            *self.pr_comment_error.lock().unwrap() = Some(message.to_string());
+            self
+        }
+        fn pr_comments(&self) -> Vec<String> {
+            self.pr_comments.lock().unwrap().clone()
         }
     }
 
@@ -5885,10 +5962,19 @@ mod tests {
             &self,
             _host: &str,
             _repo: &str,
-            _pr_number: u64,
-            _body_file: &Path,
+            pr_number: u64,
+            body_file: &Path,
         ) -> crate::error::Result<()> {
-            unreachable!()
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("pr_comment {pr_number}"));
+            if let Some(message) = self.pr_comment_error.lock().unwrap().clone() {
+                return Err(crate::error::Error::Other(anyhow::anyhow!(message)));
+            }
+            let body = std::fs::read_to_string(body_file)?;
+            self.pr_comments.lock().unwrap().push(body);
+            Ok(())
         }
         fn issue_comment(
             &self,
@@ -11298,6 +11384,75 @@ mod tests {
             );
             assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
             assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
+            // CLAUDE-447: the branch-updated-from-base push comment landed on
+            // the PR itself, naming the event and the issue.
+            assert!(calls.iter().any(|c| c == "pr_comment 7"), "{calls:?}");
+            let pr_comments = backend.pr_comments();
+            assert_eq!(pr_comments.len(), 1, "{pr_comments:?}");
+            assert!(
+                pr_comments[0].contains("branch updated from base"),
+                "{}",
+                pr_comments[0]
+            );
+            assert!(pr_comments[0].contains("MK-16"), "{}", pr_comments[0]);
+        }
+
+        /// A failed push-comment post never fails the branch update it
+        /// reports on (CLAUDE-447): the run still succeeds, but its own
+        /// outcome names the failure.
+        #[tokio::test]
+        async fn behind_base_update_push_comment_failure_is_named_but_does_not_fail_the_run() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                false,
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_pr_status_behind("success", true, Some(true))
+                    .with_pr_comment_error("fj exited 1"),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result.contains("branch updated"), "{result}");
+            assert!(result.contains("fj exited 1"), "{result}");
+            let calls = backend.calls();
+            assert!(calls.iter().any(|c| c == "update_pr_branch 7"), "{calls:?}");
+            assert!(
+                backend.pr_comments().is_empty(),
+                "a failed post must never record a comment body"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.as_str() == "pr_comment 7")
+                    .count(),
+                1,
+                "a failed write must never be retried: {calls:?}"
+            );
         }
 
         #[tokio::test]
