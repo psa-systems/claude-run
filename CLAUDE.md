@@ -95,6 +95,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - The CI webhook runs one `claude` analysis pass over the full redacted log ([CLAUDE-274](docs/conventions/ci-failures.md#single-analysis-pass-claude-274))
 - A CI failure on an open PR routes by who opened the PR ([CLAUDE-276](docs/conventions/ci-failures.md#route-by-pr-opener-claude-276))
 - Two separate webhook listeners, each with its own DB-backed daily run cap ([CLAUDE-323, CLAUDE-364](docs/conventions/ci-failures.md#webhook-listeners-and-run-caps-claude-323-claude-364))
+- A checkpoint push opens a draft PR mid-run, before any timeout ([CLAUDE-448](docs/conventions/ci-failures.md#checkpoint-pushes-open-a-draft-pr-before-any-timeout-claude-448))
 
 ### Merge and automerge
 
@@ -103,6 +104,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - A reconciler backstops webhook automerge so no green PR sits unwatched ([CLAUDE-328](docs/conventions/merge.md#automerge-reconciler-claude-328))
 - `PrStatus.behind_base` separates a behind-base PR from a real conflict ([CLAUDE-309, FJ-99](docs/conventions/merge.md#behind-base-prs-claude-309-fj-99))
 - The runner writes no `State` on merge; a YouTrack workflow resolves the issue ([CLAUDE-327](docs/conventions/merge.md#state-on-merge-is-a-youtrack-workflow-claude-327))
+- A checkpoint-opened PR is `salvaged` from the moment it is opened, not only after a timeout ([CLAUDE-448](docs/conventions/merge.md#salvaged-prs-block-automerge-claude-429))
 
 ### Claude invocation and runtime
 
@@ -113,6 +115,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - The stream-log relay reports its own I/O failures instead of truncating silently ([CLAUDE-233](docs/conventions/claude-runtime.md#stream-log-write-failures-claude-233))
 - Stream-log readers return `io::Result`; an unreadable log finalizes as transient ([CLAUDE-256](docs/conventions/claude-runtime.md#stream-log-read-failures-claude-256))
 - No `claude` child can leave work running past its own turn ([CLAUDE-280](docs/conventions/claude-runtime.md#no-background-work-claude-280))
+- The checkpoint-push watcher runs on a plain OS thread, not a tokio task ([CLAUDE-448](docs/conventions/claude-runtime.md#checkpoint-push-watcher-runs-off-a-plain-os-thread-not-a-tokio-task-claude-448))
 
 ### Log and state retention
 

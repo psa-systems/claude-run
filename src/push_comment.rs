@@ -20,9 +20,9 @@ use crate::provider::Forge;
 pub const MAX_COMMIT_LINES: usize = 20;
 
 /// Which runner-owned write to a PR branch this comment reports on
-/// (CLAUDE-447's enumerated table). `CheckpointPush` is reserved for
-/// CLAUDE-448 (the checkpoint-commit epic this issue is required for) and is
-/// listed here only so the label stays in one place when that issue lands.
+/// (CLAUDE-447's enumerated table, plus CLAUDE-448's `CheckpointPush`: one of
+/// the periodic WIP pushes a checkpoint watcher makes while the agent is
+/// still running, hooks disabled, CLAUDE-448 step 1/2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushEvent {
     InitialPush,
@@ -31,6 +31,7 @@ pub enum PushEvent {
     CommentWebhookFixPush,
     MergedRemoteBranchBeforePush,
     BranchUpdatedFromBase,
+    CheckpointPush,
 }
 
 impl PushEvent {
@@ -42,6 +43,7 @@ impl PushEvent {
             PushEvent::CommentWebhookFixPush => "comment-webhook fix push",
             PushEvent::MergedRemoteBranchBeforePush => "merged remote branch before push",
             PushEvent::BranchUpdatedFromBase => "branch updated from base",
+            PushEvent::CheckpointPush => "checkpoint push",
         }
     }
 }
@@ -190,6 +192,7 @@ mod tests {
             PushEvent::CommentWebhookFixPush,
             PushEvent::MergedRemoteBranchBeforePush,
             PushEvent::BranchUpdatedFromBase,
+            PushEvent::CheckpointPush,
         ];
         for event in events {
             let body = build_body(&ctx(event, CommitSubjects::Listed(vec!["one".into()])));

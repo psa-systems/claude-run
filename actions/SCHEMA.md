@@ -879,6 +879,23 @@ Unlike a gate row, the counter row is not deleted when the trouble clears: it is
 
 CLAUDE-379: a run that hits `claude_timeout_seconds` (exit 124) no longer just parks the issue with whatever the agent built left behind in the workdir. `finalize`'s timeout branch commits any dirty tree as a `WIP: uncommitted changes at timeout` commit, pushes, and opens a **draft** PR from it (Forgejo: `WIP: `-prefixed title, fj's own draft convention; GitHub: the real draft flag) with a comment on the PR explaining the timeout and that re-queuing resumes this branch. A clean tree with nothing ahead of the remote default branch salvages nothing, and the timeout comment says so instead. Every salvage step (the git-state read, the WIP commit, the push/PR-create, the PR comment) that fails is logged at `error` and named in the issue's timeout comment separately, never swallowed. The issue still ends on `AI Agent = needs_review` and the attempt counter still increments exactly as a timeout always did; the salvaged PR is recorded into the CLAUDE-275 `agent_pull_requests` store the same way a successful run's PR is, so a re-queue resumes onto it, and the built-in prompt's resume step tells the agent to also read that PR's own comments. A later resumed run that finishes successfully strips the draft/`WIP: ` status and overwrites the salvage's placeholder title/body with the finished tip's own text (CLAUDE-398). The recorded row is also flagged `salvaged` (CLAUDE-429, only for a PR salvaged after the migration that added the column), and the runner's automerge (see "CI-gated automerge" below) never acts on a flagged PR, however its draft status changes, until that same resumed-success path clears the flag; a human can still merge it by hand. See [Timeout salvages work as a draft PR](../docs/conventions/ci-failures.md#timeout-salvages-work-as-a-draft-pr-claude-379) for the full mechanism.
 
+CLAUDE-448: a run no longer has to hit the timeout for its work to be salvaged. While `claude` is running, the runner
+ticks a checkpoint-push watcher every 60 seconds that pushes the feature branch's current commits with hooks skipped
+(`--no-verify` on this push only, never on the final push a successful run makes). The first successful checkpoint
+push opens the same kind of draft PR the CLAUDE-379 timeout salvage opens (recorded `salvaged: true` in
+`agent_pull_requests`, so automerge leaves it alone exactly as above), and every push after that, including that
+first one, posts a `checkpoint push` PR comment (CLAUDE-447). A run that then finishes normally promotes that draft
+PR through the same CLAUDE-398/CLAUDE-429 path a resumed run's success already uses: `refresh_pr_text` overwrites the
+placeholder title/body with the finished tip's own text, `mark_pr_ready` strips the draft status, and `salvaged` is
+cleared, with no new branching needed since the checkpoint-opened PR is wired into the run's own `resume` state the
+same way a re-queued issue's PR would be. If a checkpoint push is ever rejected (non-fast-forward, a deleted or
+protected branch), the watcher logs it at `error`, stops checkpointing for the rest of the run, never fails the job
+over it, and the rejection is named in whichever outcome comment `finalize` ends up posting, success or otherwise.
+The default branch is never checkpoint-pushed. Only the Forgejo backend implements `Forge::checkpoint_push` today
+(CLAUDE-452 tracks the GitHub backend as a descoped follow-up), and a timeout still always parks on `needs_review`
+exactly as the CLAUDE-379 paragraph above describes, even when a checkpoint push already salvaged the work into a
+draft PR (CLAUDE-453 tracks auto-requeuing that case back to Queued as a further descoped follow-up).
+
 CLAUDE-439: neither a transient claude result nor a pause/login-required trip strands the issue on Working. A transient
 result (an authentication failure, or a rate-limit / usage-limit signal `classify_transient` recognizes) after the pre
 step already wrote `AI Agent = Working` reverts it to Queued instead, with a comment naming the cause and reusing the

@@ -1286,6 +1286,38 @@ impl CliBackend {
         Ok(())
     }
 
+    /// Like [`Self::push_branch`], but with `--no-verify` (CLAUDE-448 step
+    /// 2): a checkpoint push runs while the agent is still editing, so the
+    /// repo's `pre-push` hook would check a half-edited working tree rather
+    /// than the pushed commit, and would compete with the agent for CPU.
+    fn push_branch_no_verify(
+        &self,
+        workdir: &Path,
+        branch: &str,
+        token_url: Option<&str>,
+    ) -> Result<()> {
+        let refspec = format!("{branch}:{branch}");
+        let push_args = [
+            "push",
+            "--no-verify",
+            "--set-upstream",
+            "origin",
+            refspec.as_str(),
+        ];
+        let secrets = token_url_secrets(token_url);
+        let out =
+            crate::provider::retry_git_network("push", &secrets, &self.git_retry_waits, || {
+                crate::provider::run_authed_git(
+                    self.runner.as_ref(),
+                    Some(workdir),
+                    &push_args,
+                    token_url,
+                )
+            })?;
+        Self::checked_redacting("git", out, &push_args, &secrets)?;
+        Ok(())
+    }
+
     /// An already-open PR whose head branch is `branch`, matched by
     /// `head_ref` against `list_open_prs` (`fj pr search --repo <repo> --state
     /// open --json`). Returns the first match (a repo has at most one open PR per
@@ -1999,6 +2031,70 @@ impl Forge for CliBackend {
             PrStrategy::Branch => self.create_pr_branch(workdir, host, &branch, draft, body),
             PrStrategy::Agit => self.create_pr_agit(workdir, host),
         }
+    }
+
+    /// Push the current tip with hooks bypassed (CLAUDE-448), opening or
+    /// adopting a draft PR on the first push that lands anything new.
+    /// Strategy is always branch-backed here: AGit has no server branch to
+    /// push between-commit, so checkpointing only applies to the default
+    /// branch strategy's workdir layout.
+    ///
+    /// No feature branch yet (no commit ahead of the default branch) is
+    /// "nothing to checkpoint", not a failure: it degrades to `Ok(None)`
+    /// exactly like an unchanged tip, so an early tick (before the agent's
+    /// first local commit) never counts as a rejected push and never stops
+    /// checkpointing for the rest of the run. This also means the default
+    /// branch itself is never a push target: `resolve_feature_branch` only
+    /// ever resolves to a branch strictly ahead of it.
+    fn checkpoint_push(
+        &self,
+        workdir: &Path,
+        host: &str,
+        body: Option<&str>,
+    ) -> Result<Option<PullRequest>> {
+        let branch = match self.resolve_feature_branch(workdir) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let repo = self.origin_repo_path(workdir)?;
+        let token_url = self.clone_url(host, &repo).ok();
+        let token_url = token_url.as_deref();
+        let local_sha = self.rev_parse(workdir, &branch)?;
+        let remote_sha = self.remote_branch_sha(workdir, &branch, token_url)?;
+        if remote_sha.as_deref() == Some(local_sha.as_str()) {
+            return Ok(None);
+        }
+        self.push_branch_no_verify(workdir, &branch, token_url)?;
+        let mut pr = self.find_or_create_pr(workdir, host, &repo, &branch, true, body)?;
+        if let Some(pr_number) = pr.number {
+            let issue_key = self.tip_issue_key(workdir, &branch);
+            let subjects = self.commit_subjects_since(workdir, remote_sha.as_deref(), &local_sha);
+            let public_url = crate::run_footer::resolved_public_url();
+            match self.git_dir_scratch(workdir) {
+                Ok(scratch) => {
+                    let ctx = crate::push_comment::PushCommentContext {
+                        event: crate::push_comment::PushEvent::CheckpointPush,
+                        issue_key: &issue_key,
+                        draft: true,
+                        old_sha: remote_sha.as_deref(),
+                        new_sha: Some(&local_sha),
+                        subjects,
+                        public_url: public_url.as_deref(),
+                        run_id: None,
+                        started: None,
+                    };
+                    pr.push_comment_failure =
+                        crate::push_comment::post(self, host, &repo, pr_number, &scratch, &ctx);
+                }
+                Err(e) => {
+                    tracing::error!(pr_number, error = %e, "resolving the checkpoint push comment scratch directory failed");
+                    pr.push_comment_failure = Some(format!(
+                        "PR comment for checkpoint push failed: resolving the scratch directory failed: {e}"
+                    ));
+                }
+            }
+        }
+        Ok(Some(pr))
     }
 
     /// Strip the `WIP: ` title prefix a timeout-salvaged draft PR (CLAUDE-379)
@@ -3994,6 +4090,209 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c == "git log -1 --format=%b feat/x"),
             "the tip commit's own body must never be read when a body override is supplied: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_push_no_feature_branch_yet_degrades_to_ok_none() {
+        // Before the agent's first local commit, there is no branch ahead of
+        // the base yet; this is "nothing to checkpoint", not a rejected
+        // push, so it must not error and must touch neither the remote nor
+        // the PR.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(StubRunner::new(), "origin/main", &["main"], &[]);
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let result = b
+            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"))
+            .unwrap();
+        assert!(result.is_none());
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "no feature branch yet must not push: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_push_unchanged_tip_pushes_nothing() {
+        // When the local branch tip already matches the remote's, there is
+        // nothing new to checkpoint: no push, no PR lookup/create, no
+        // comment.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n");
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let result = b
+            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"))
+            .unwrap();
+        assert!(result.is_none());
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "an unchanged tip must not push: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("pr search") || c.contains("pr create")),
+            "an unchanged tip must not touch the PR at all: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_push_sequential_ticks_use_no_verify_and_open_draft_once() {
+        // CLAUDE-448: the first tick that lands new commits pushes with
+        // `--no-verify` and opens a draft PR; a second tick with further new
+        // commits pushes again with `--no-verify` but adopts the
+        // already-open PR (no second `pr create`), and both ticks post their
+        // own `checkpoint push` comment.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "sha1\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "sha1", "");
+        let runner = with_open_pr_search(runner, "[]").ok(
+            "git",
+            &[
+                "push",
+                "--no-verify",
+                "--set-upstream",
+                "origin",
+                "feat/x:feat/x",
+            ],
+            "",
+        );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path_str = scratch
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = runner
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "feat/x"],
+                "feat(x): wip\n",
+            )
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "create",
+                    "WIP: feat(x): wip",
+                    "--body-file",
+                    body_path_str.as_str(),
+                    "--head",
+                    "feat/x",
+                    "--json",
+                ],
+                r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%B", "feat/x"],
+                "feat(x): wip\n\n#MK-16\n",
+            )
+            .ok(
+                "git",
+                &["log", "--format=%s", "origin/main..sha1"],
+                "feat(x): wip\n",
+            )
+            .ok_prefix(
+                "fj --host dev.a8n.run pr comment contoso/claude-run#77 --body-file",
+                "",
+            );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+
+        let first = b
+            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"))
+            .unwrap()
+            .expect("first tick landed new commits and must push");
+        assert_eq!(first.number, Some(77));
+
+        // Second tick: the branch has moved to sha2, already open PR #77
+        // adopted instead of recreated.
+        *runner.calls.lock().unwrap() = Vec::new();
+        let runner2 = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "sha2\n")],
+        );
+        let runner2 = with_remote_state(runner2, "feat/x", "sha2", "sha1\trefs/heads/feat/x\n");
+        let runner2 = with_open_pr_search(
+            runner2,
+            r#"[{"number":77,"title":"WIP: feat(x): wip","head_ref":"feat/x"}]"#,
+        );
+        let (runner2, _scratch2) = with_git_dir_scratch(runner2, wd.path());
+        let runner2 = runner2
+            .ok(
+                "git",
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%B", "feat/x"],
+                "feat(x): more wip\n\n#MK-16\n",
+            )
+            .ok(
+                "git",
+                &["log", "--format=%s", "sha1..sha2"],
+                "feat(x): more wip\n",
+            )
+            .ok_prefix(
+                "fj --host dev.a8n.run pr comment contoso/claude-run#77 --body-file",
+                "",
+            );
+        let runner2 = Arc::new(runner2);
+        let b2 = CliBackend::new(runner2.clone());
+        let second = b2
+            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"))
+            .unwrap()
+            .expect("second tick landed further new commits and must push");
+        assert_eq!(
+            second.number,
+            Some(77),
+            "the second tick must adopt the already-open draft PR, not create a second one"
+        );
+
+        let second_calls = runner2.calls.lock().unwrap();
+        assert!(
+            !second_calls.iter().any(|c| c.contains("pr create")),
+            "the second tick must not create a second PR: {second_calls:?}"
+        );
+        assert!(
+            second_calls
+                .iter()
+                .any(|c| c.starts_with("git push --no-verify")),
+            "the second tick must push with hooks bypassed too: {second_calls:?}"
+        );
+        assert_eq!(
+            second_calls
+                .iter()
+                .filter(|c| c.starts_with("fj --host dev.a8n.run pr comment"))
+                .count(),
+            1,
+            "the second tick must post its own checkpoint-push comment: {second_calls:?}"
         );
     }
 
