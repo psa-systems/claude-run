@@ -85,37 +85,37 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
                 .post(native_forms::closed_issue_summary_create),
         )
         .route("/actions", post(action_create))
-        .route("/actions/:name", get(action_detail))
-        .route("/actions/:name/durations", get(action_durations))
+        .route("/actions/{name}", get(action_detail))
+        .route("/actions/{name}/durations", get(action_durations))
         // The log page is global and lives at `/logs`. This route is
         // kept as a permanent redirect that carries the action into the Action
         // filter, so existing links and bookmarks keep working.
-        .route("/actions/:name/events", get(action_events_redirect))
+        .route("/actions/{name}/events", get(action_events_redirect))
         .route(
-            "/actions/:name/edit",
+            "/actions/{name}/edit",
             get(action_edit_page).post(action_edit_save),
         )
         // Dispatches to the structured editor for the action's own
         // native kind (raw editor for `scripted`).
         .route(
-            "/actions/:name/form",
+            "/actions/{name}/form",
             get(action_form_page).post(action_form_save),
         )
-        .route("/actions/:name/export", get(action_export))
-        .route("/actions/:name/delete", post(action_delete))
+        .route("/actions/{name}/export", get(action_export))
+        .route("/actions/{name}/delete", post(action_delete))
         // The one diagnostics screen. Every `run_events` row, for
         // every action, undeduplicated and filterable; `?action=` narrows it.
         .route("/logs", get(logs))
         .route("/secrets", get(secrets_page).post(secret_create))
-        .route("/secrets/:name/rotate", post(secret_rotate))
-        .route("/secrets/:name/delete", post(secret_delete))
+        .route("/secrets/{name}/rotate", post(secret_rotate))
+        .route("/secrets/{name}/delete", post(secret_delete))
         // On-demand access check. GET renders the page (no probing);
         // POST runs the check and swaps the result table in. The per-secret
         // Check button on /secrets lands on the same page with that credential's
         // identity probe already run.
         .route("/access", get(access_page))
         .route("/access/check", post(access_check))
-        .route("/secrets/:name/check", post(secret_check))
+        .route("/secrets/{name}/check", post(secret_check))
         // Runtime settings page. GET renders all sections; POST saves
         // one section (re-rendering inline serde errors on rejection). Behind the
         // same auth gate as every other TCP route.
@@ -132,7 +132,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         .route("/settings/auth/github", post(auth_save_github))
         .route("/settings/auth/git", post(auth_save_git))
         .route("/settings/auth/email/test", post(auth_test_email))
-        .route("/settings/:section", post(settings_save))
+        .route("/settings/{section}", post(settings_save))
         // Historical reporting page (spend / runs / time-of-day /
         // day-of-week). Global by default; `action` + `range` query params narrow
         // it. The shared aggregations live in `crate::report`.
@@ -144,10 +144,13 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         // `/about`) so the busy / idle / unknown states are rendered by one
         // handler and an activity-query failure cannot be mistaken for idle.
         .route("/about/activity", get(about_activity))
-        .route("/runs/:id", get(run_detail))
-        .route("/runs/:id/jobs/:key/attempt/:attempt", get(job_stream_page))
+        .route("/runs/{id}", get(run_detail))
         .route(
-            "/sse/runs/:id/jobs/:key/attempt/:attempt",
+            "/runs/{id}/jobs/{key}/attempt/{attempt}",
+            get(job_stream_page),
+        )
+        .route(
+            "/sse/runs/{id}/jobs/{key}/attempt/{attempt}",
             get(job_stream_sse),
         )
         .route("/static/htmx.min.js", get(htmx_handler))
@@ -829,7 +832,7 @@ async fn fetch_recent_runs(
         run_row_columns()
     );
     let sql = crate::db::q(pool, &sql).into_owned();
-    let mut q = sqlx::query_as::<_, RunRow>(&sql);
+    let mut q = sqlx::query_as::<_, RunRow>(sqlx::AssertSqlSafe(sql.as_str()));
     for b in &binds {
         q = q.bind(b);
     }
@@ -849,7 +852,7 @@ async fn count_recent_runs(
     let (where_clause, binds) = view.where_clause(show_empty);
     let sql = format!("SELECT COUNT(*) FROM runs{where_clause}");
     let sql = crate::db::q(pool, &sql).into_owned();
-    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+    let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
     for b in &binds {
         q = q.bind(b);
     }
@@ -862,9 +865,12 @@ async fn count_recent_runs(
 /// actions that actually have runs (not every indexed action), and serves as the
 /// allow-list that whitelists the incoming `?action=` value.
 async fn distinct_run_actions(pool: &DbPool) -> Result<Vec<String>, WebError> {
-    let rows = sqlx::query_scalar::<_, String>(&crate::db::q(
-        pool,
-        "SELECT DISTINCT action_name FROM runs ORDER BY action_name",
+    let rows = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT DISTINCT action_name FROM runs ORDER BY action_name",
+        )
+        .into_owned(),
     ))
     .fetch_all(pool)
     .await?;
@@ -875,9 +881,12 @@ async fn distinct_run_actions(pool: &DbPool) -> Result<Vec<String>, WebError> {
 /// alphabetically. Drives the dashboard Triggered filter dropdown and whitelists
 /// the incoming `?triggered=` value.
 async fn distinct_triggered_by(pool: &DbPool) -> Result<Vec<String>, WebError> {
-    let rows = sqlx::query_scalar::<_, String>(&crate::db::q(
-        pool,
-        "SELECT DISTINCT triggered_by FROM runs ORDER BY triggered_by",
+    let rows = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT DISTINCT triggered_by FROM runs ORDER BY triggered_by",
+        )
+        .into_owned(),
     ))
     .fetch_all(pool)
     .await?;
@@ -1101,12 +1110,12 @@ async fn search_jobs(
     // Summary search (always on). `strpos(lower(...), needle)` is a plain
     // substring test, so query text containing LIKE metacharacters (% _) needs
     // no escaping. `lower()` is ASCII-only on SQLite, matching the ASCII needle.
-    let summary_rows = sqlx::query_as::<_, JobSearchRow>(&crate::db::q(pool,
+    let summary_rows = sqlx::query_as::<_, JobSearchRow>(sqlx::AssertSqlSafe(crate::db::q(pool,
         "SELECT run_id, action_name, job_key, attempt, ts, ok, timed_out, summary, stream_log_path \
          FROM job_outcomes \
          WHERE summary IS NOT NULL AND strpos(lower(summary), ?) > 0 \
          ORDER BY id DESC LIMIT ?",
-    ))
+    ).into_owned()))
     .bind(&needle)
     .bind(SEARCH_SUMMARY_LIMIT)
     .fetch_all(pool)
@@ -1148,12 +1157,12 @@ async fn search_jobs(
     if in_stream {
         // Scope: the most recent failed-job attempts that recorded a stream log
         // path. Fetch one past the cap to detect truncation.
-        let mut candidates = sqlx::query_as::<_, JobSearchRow>(&crate::db::q(pool,
+        let mut candidates = sqlx::query_as::<_, JobSearchRow>(sqlx::AssertSqlSafe(crate::db::q(pool,
             "SELECT run_id, action_name, job_key, attempt, ts, ok, timed_out, summary, stream_log_path \
              FROM job_outcomes \
              WHERE ok = 0 AND stream_log_path IS NOT NULL \
              ORDER BY id DESC LIMIT ?",
-        ))
+        ).into_owned()))
         .bind(SEARCH_STREAM_MAX_FILES as i64 + 1)
         .fetch_all(pool)
         .await?;
@@ -1679,17 +1688,23 @@ async fn dashboard(
 
     // Today totals: sum across all actions
     let today = state::today_local().to_string();
-    let totals: Option<(i64, f64)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT CAST(COALESCE(SUM(run_count), 0) AS BIGINT), COALESCE(SUM(cost_usd), 0.0) \
+    let totals: Option<(i64, f64)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT CAST(COALESCE(SUM(run_count), 0) AS BIGINT), COALESCE(SUM(cost_usd), 0.0) \
          FROM daily_ledger WHERE date = ?",
+        )
+        .into_owned(),
     ))
     .bind(&today)
     .fetch_optional(pool)
     .await?;
-    let today_actions: i64 = sqlx::query_scalar(&crate::db::q(
-        pool,
-        "SELECT COUNT(*) FROM daily_ledger WHERE date = ? AND run_count > 0",
+    let today_actions: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT COUNT(*) FROM daily_ledger WHERE date = ? AND run_count > 0",
+        )
+        .into_owned(),
     ))
     .bind(&today)
     .fetch_one(pool)
@@ -1852,10 +1867,11 @@ async fn action_detail(
         "SELECT {} FROM runs WHERE action_name = ?{empty_filter} ORDER BY started_at DESC LIMIT 50",
         run_row_columns()
     );
-    let runs = sqlx::query_as::<_, RunRow>(&crate::db::q(pool, &sql))
-        .bind(&name)
-        .fetch_all(pool)
-        .await?;
+    let runs =
+        sqlx::query_as::<_, RunRow>(sqlx::AssertSqlSafe(crate::db::q(pool, &sql).into_owned()))
+            .bind(&name)
+            .fetch_all(pool)
+            .await?;
     // Input/poll-phase diagnostics (VCS probe failures, no-VCS
     // drops) recorded by `gather()`. Queried by action name independent of any
     // run row, so a zero-job poll's events are surfaced too.
@@ -1901,12 +1917,15 @@ async fn action_durations(
     }
     // Same recent window as the action-detail table (last 50 by start). The
     // query returns newest-first; the chart wants oldest-first, so reverse.
-    let runs = sqlx::query_as::<_, RunRow>(&crate::db::q(
-        pool,
-        &format!(
-            "SELECT {} FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
-            run_row_columns()
-        ),
+    let runs = sqlx::query_as::<_, RunRow>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            &format!(
+                "SELECT {} FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
+                run_row_columns()
+            ),
+        )
+        .into_owned(),
     ))
     .bind(&name)
     .fetch_all(pool)
@@ -1956,9 +1975,8 @@ fn events_window_start() -> String {
 /// Distinct `level` values present in `run_events`, alphabetically.
 /// Drives the Level dropdown and whitelists the incoming `?level=`.
 async fn distinct_event_levels(pool: &DbPool) -> Result<Vec<String>, WebError> {
-    let rows = sqlx::query_scalar::<_, String>(&crate::db::q(
-        pool,
-        "SELECT DISTINCT level FROM run_events ORDER BY level",
+    let rows = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "SELECT DISTINCT level FROM run_events ORDER BY level").into_owned(),
     ))
     .fetch_all(pool)
     .await?;
@@ -1970,9 +1988,12 @@ async fn distinct_event_levels(pool: &DbPool) -> Result<Vec<String>, WebError> {
 /// this is the events table's own action column, not `runs`': an action can have
 /// diagnostics without ever having produced a run row.
 async fn distinct_event_actions(pool: &DbPool) -> Result<Vec<String>, WebError> {
-    let rows = sqlx::query_scalar::<_, String>(&crate::db::q(
-        pool,
-        "SELECT DISTINCT action_name FROM run_events ORDER BY action_name",
+    let rows = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT DISTINCT action_name FROM run_events ORDER BY action_name",
+        )
+        .into_owned(),
     ))
     .fetch_all(pool)
     .await?;
@@ -1984,9 +2005,9 @@ async fn distinct_event_actions(pool: &DbPool) -> Result<Vec<String>, WebError> 
 /// `context` is free-form (a project key, or `config-collision`) and nullable;
 /// NULL/empty is not a selectable value, so it is excluded from the list.
 async fn distinct_event_contexts(pool: &DbPool) -> Result<Vec<String>, WebError> {
-    let rows = sqlx::query_scalar::<_, String>(&crate::db::q(pool,
+    let rows = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(crate::db::q(pool,
         "SELECT DISTINCT context FROM run_events WHERE context IS NOT NULL AND context <> '' ORDER BY context",
-    ))
+    ).into_owned()))
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -2152,7 +2173,7 @@ async fn count_run_events(
     let (where_clause, binds) = view.where_clause(started_at);
     let sql = format!("SELECT COUNT(*) FROM run_events{where_clause}");
     let sql = crate::db::q(pool, &sql).into_owned();
-    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+    let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
     for b in &binds {
         q = q.bind(b);
     }
@@ -2174,7 +2195,7 @@ async fn fetch_run_events(
         "SELECT run_id, ts, level, context, message, action_name FROM run_events{where_clause} {order_by} LIMIT ? OFFSET ?"
     );
     let sql = crate::db::q(pool, &sql).into_owned();
-    let mut q = sqlx::query_as::<_, state::RunEventLogRecord>(&sql);
+    let mut q = sqlx::query_as::<_, state::RunEventLogRecord>(sqlx::AssertSqlSafe(sql.as_str()));
     for b in &binds {
         q = q.bind(b);
     }
@@ -5602,9 +5623,8 @@ async fn action_link_template(
     action_name: &str,
     base_url: Option<&str>,
 ) -> Option<String> {
-    let declared: Option<String> = sqlx::query_scalar(&crate::db::q(
-        pool,
-        "SELECT link_template FROM actions WHERE name = ?",
+    let declared: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "SELECT link_template FROM actions WHERE name = ?").into_owned(),
     ))
     .bind(action_name)
     .fetch_optional(pool)
@@ -5717,9 +5737,12 @@ async fn run_detail(
     Query(q): Query<RunDetailQuery>,
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
-    let Some(run): Option<RunRow> = sqlx::query_as::<_, RunRow>(&crate::db::q(
-        pool,
-        &format!("SELECT {} FROM runs WHERE id = ?", run_row_columns()),
+    let Some(run): Option<RunRow> = sqlx::query_as::<_, RunRow>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            &format!("SELECT {} FROM runs WHERE id = ?", run_row_columns()),
+        )
+        .into_owned(),
     ))
     .bind(id)
     .fetch_optional(pool)
@@ -5727,9 +5750,9 @@ async fn run_detail(
     else {
         return Ok((StatusCode::NOT_FOUND, format!("no run #{id}")).into_response());
     };
-    let outcomes = sqlx::query_as::<_, JobOutcomeRow>(&crate::db::q(pool,
+    let outcomes = sqlx::query_as::<_, JobOutcomeRow>(sqlx::AssertSqlSafe(crate::db::q(pool,
         "SELECT job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, attempt_counted, duration_ms, timed_out, summary FROM job_outcomes WHERE run_id = ? ORDER BY id ASC",
-    ))
+    ).into_owned()))
     .bind(id)
     .fetch_all(pool)
     .await?;
@@ -5916,9 +5939,8 @@ async fn job_stream_page(
     AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
 ) -> Result<Html<String>, WebError> {
     // Resolve the run's action so we can compute the stream-log path.
-    let action_name: Option<String> = sqlx::query_scalar(&crate::db::q(
-        &s.api.pool,
-        "SELECT action_name FROM runs WHERE id = ?",
+    let action_name: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(&s.api.pool, "SELECT action_name FROM runs WHERE id = ?").into_owned(),
     ))
     .bind(id)
     .fetch_optional(&s.api.pool)
@@ -5972,9 +5994,12 @@ async fn job_stream_sse(
     headers: HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, WebError> {
-    let run: Option<(String, Option<String>)> = sqlx::query_as(&crate::db::q(
-        &s.api.pool,
-        "SELECT action_name, ended_at FROM runs WHERE id = ?",
+    let run: Option<(String, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            &s.api.pool,
+            "SELECT action_name, ended_at FROM runs WHERE id = ?",
+        )
+        .into_owned(),
     ))
     .bind(id)
     .fetch_optional(&s.api.pool)
@@ -6067,9 +6092,9 @@ async fn job_stream_sse(
                 Ok(None) => {
                     // EOF: either the run is still writing more, or it's done.
                     // Check the DB to decide whether to keep waiting.
-                    let done: Option<i64> = sqlx::query_scalar(&crate::db::q(&pool,
+                    let done: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(crate::db::q(&pool,
                         "SELECT id FROM job_outcomes WHERE run_id = ? AND job_key = ? AND attempt = ?",
-                    ))
+                    ).into_owned()))
                     .bind(id)
                     .bind(&key)
                     .bind(attempt as i64)
@@ -8204,9 +8229,12 @@ mod tests {
                 0
             );
             // History is kept.
-            let runs: i64 = sqlx::query_scalar(&crate::db::q(
-                &s.api.pool,
-                "SELECT COUNT(*) FROM runs WHERE action_name = ?",
+            let runs: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    &s.api.pool,
+                    "SELECT COUNT(*) FROM runs WHERE action_name = ?",
+                )
+                .into_owned(),
             ))
             .bind("act")
             .fetch_one(&s.api.pool)
@@ -11381,10 +11409,13 @@ mod tests {
         }
 
         async fn seed_run(pool: &DbPool, id: i64) {
-            sqlx::query(&crate::db::q(
-                pool,
-                "INSERT INTO runs (id, action_name, started_at, triggered_by) \
+            sqlx::query(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    pool,
+                    "INSERT INTO runs (id, action_name, started_at, triggered_by) \
                  VALUES (?, 'act', '2026-06-26T00:00:00+00:00', 'schedule')",
+                )
+                .into_owned(),
             ))
             .bind(id)
             .execute(pool)
@@ -11403,11 +11434,11 @@ mod tests {
             summary: Option<&str>,
             stream_log_path: Option<&str>,
         ) {
-            sqlx::query(&crate::db::q(pool,
+            sqlx::query(sqlx::AssertSqlSafe(crate::db::q(pool,
                 "INSERT INTO job_outcomes \
                  (run_id, action_name, job_key, attempt, ts, ok, claude_ran, claude_ok, summary, stream_log_path) \
                  VALUES (?, 'act', ?, ?, ?, ?, 1, ?, ?, ?)",
-            ))
+            ).into_owned()))
             .bind(run_id)
             .bind(job_key)
             .bind(attempt)

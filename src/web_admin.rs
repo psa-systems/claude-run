@@ -167,9 +167,12 @@ fn row_to_account(row: AccountRow) -> Account {
 /// Load an account by id, or `None` when it does not exist (removed, or never
 /// created).
 pub async fn load_by_id(pool: &DbPool, id: i64) -> Result<Option<Account>> {
-    let row: Option<AccountRow> = sqlx::query_as(&crate::db::q(
-        pool,
-        &format!("SELECT {SELECT_COLUMNS} FROM web_accounts WHERE id = ?"),
+    let row: Option<AccountRow> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            &format!("SELECT {SELECT_COLUMNS} FROM web_accounts WHERE id = ?"),
+        )
+        .into_owned(),
     ))
     .bind(id)
     .fetch_optional(pool)
@@ -179,9 +182,12 @@ pub async fn load_by_id(pool: &DbPool, id: i64) -> Result<Option<Account>> {
 
 /// Load an account by username, case-insensitively.
 pub async fn load_by_username(pool: &DbPool, username: &str) -> Result<Option<Account>> {
-    let row: Option<AccountRow> = sqlx::query_as(&crate::db::q(
-        pool,
-        &format!("SELECT {SELECT_COLUMNS} FROM web_accounts WHERE username_key = ?"),
+    let row: Option<AccountRow> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            &format!("SELECT {SELECT_COLUMNS} FROM web_accounts WHERE username_key = ?"),
+        )
+        .into_owned(),
     ))
     .bind(username.trim().to_lowercase())
     .fetch_optional(pool)
@@ -192,23 +198,29 @@ pub async fn load_by_username(pool: &DbPool, username: &str) -> Result<Option<Ac
 /// Whether any account already exists. Cheaper than loading one, and what the
 /// setup page and the gate ask to decide whether `/setup` is still live.
 pub async fn exists(pool: &DbPool) -> Result<bool> {
-    let n: i64 = sqlx::query_scalar(&crate::db::q(pool, "SELECT COUNT(*) FROM web_accounts"))
-        .fetch_one(pool)
-        .await?;
+    let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "SELECT COUNT(*) FROM web_accounts").into_owned(),
+    ))
+    .fetch_one(pool)
+    .await?;
     Ok(n > 0)
 }
 
 /// List every account for the accounts-management page, newest first.
 pub async fn list(pool: &DbPool) -> Result<Vec<AccountSummary>> {
-    let rows: Vec<(i64, String, String, i64, Option<String>)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT a.id, a.username, a.created_at, \
+    let rows: Vec<(i64, String, String, i64, Option<String>)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(
+                pool,
+                "SELECT a.id, a.username, a.created_at, \
          CASE WHEN a.totp_enrolled_at IS NOT NULL THEN 1 ELSE 0 END, b.username \
          FROM web_accounts a LEFT JOIN web_accounts b ON b.id = a.created_by \
          ORDER BY a.id ASC",
-    ))
-    .fetch_all(pool)
-    .await?;
+            )
+            .into_owned(),
+        ))
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
         .map(
@@ -261,10 +273,13 @@ async fn create_account(
     let password_hash = hash_password(password)?;
     let session_key = new_session_key()?;
     let now = chrono::Utc::now().to_rfc3339();
-    let id: i64 = sqlx::query_scalar(&crate::db::q(
-        pool,
-        "INSERT INTO web_accounts (username, username_key, password_hash, session_key, \
+    let id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "INSERT INTO web_accounts (username, username_key, password_hash, session_key, \
          created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .into_owned(),
     ))
     .bind(username)
     .bind(&username_key)
@@ -296,9 +311,11 @@ pub async fn remove(pool: &DbPool, actor_id: i64, target_id: i64) -> Result<()> 
             "you cannot remove your own account".to_string(),
         ));
     }
-    let count: i64 = sqlx::query_scalar(&crate::db::q(pool, "SELECT COUNT(*) FROM web_accounts"))
-        .fetch_one(pool)
-        .await?;
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "SELECT COUNT(*) FROM web_accounts").into_owned(),
+    ))
+    .fetch_one(pool)
+    .await?;
     if count <= 1 {
         return Err(Error::Secret(
             "the last remaining account cannot be removed".to_string(),
@@ -307,17 +324,22 @@ pub async fn remove(pool: &DbPool, actor_id: i64, target_id: i64) -> Result<()> 
     let target = load_by_id(pool, target_id)
         .await?
         .ok_or_else(|| Error::Secret("no such account".to_string()))?;
-    sqlx::query(&crate::db::q(
-        pool,
-        "DELETE FROM web_account_recovery_codes WHERE account_id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "DELETE FROM web_account_recovery_codes WHERE account_id = ?",
+        )
+        .into_owned(),
     ))
     .bind(target_id)
     .execute(pool)
     .await?;
-    sqlx::query(&crate::db::q(pool, "DELETE FROM web_accounts WHERE id = ?"))
-        .bind(target_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "DELETE FROM web_accounts WHERE id = ?").into_owned(),
+    ))
+    .bind(target_id)
+    .execute(pool)
+    .await?;
     info!(
         username = target.username,
         account_id = target_id,
@@ -335,10 +357,10 @@ pub async fn set_password(pool: &DbPool, id: i64, password: &str) -> Result<Acco
     validate(&current.username, password)?;
     let password_hash = hash_password(password)?;
     let session_key = new_session_key()?;
-    sqlx::query(&crate::db::q(
+    sqlx::query(sqlx::AssertSqlSafe(crate::db::q(
         pool,
         "UPDATE web_accounts SET password_hash = ?, session_key = ?, updated_at = ? WHERE id = ?",
-    ))
+    ).into_owned()))
     .bind(&password_hash)
     .bind(&session_key)
     .bind(chrono::Utc::now().to_rfc3339())
@@ -418,11 +440,11 @@ pub async fn begin_totp_enrollment(
     let ciphertext = key
         .encrypt(&base32)
         .map_err(|e| Error::Secret(format!("encrypting the TOTP secret: {e}")))?;
-    sqlx::query(&crate::db::q(
+    sqlx::query(sqlx::AssertSqlSafe(crate::db::q(
         pool,
         "UPDATE web_accounts SET totp_secret = ?, totp_enrolled_at = NULL, totp_last_step = NULL, \
          updated_at = ? WHERE id = ?",
-    ))
+    ).into_owned()))
     .bind(&ciphertext)
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(id)
@@ -458,10 +480,13 @@ pub async fn confirm_totp_enrollment(
     };
     let codes = generate_recovery_codes()?;
     let now_str = now.to_rfc3339();
-    sqlx::query(&crate::db::q(
-        pool,
-        "UPDATE web_accounts SET totp_enrolled_at = ?, totp_last_step = ?, updated_at = ? \
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "UPDATE web_accounts SET totp_enrolled_at = ?, totp_last_step = ?, updated_at = ? \
          WHERE id = ?",
+        )
+        .into_owned(),
     ))
     .bind(&now_str)
     .bind(matched_step as i64)
@@ -469,20 +494,23 @@ pub async fn confirm_totp_enrollment(
     .bind(id)
     .execute(pool)
     .await?;
-    sqlx::query(&crate::db::q(
-        pool,
-        "DELETE FROM web_account_recovery_codes WHERE account_id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "DELETE FROM web_account_recovery_codes WHERE account_id = ?",
+        )
+        .into_owned(),
     ))
     .bind(id)
     .execute(pool)
     .await?;
     for plain in &codes {
         let hash = hash_password(plain)?;
-        sqlx::query(&crate::db::q(
+        sqlx::query(sqlx::AssertSqlSafe(crate::db::q(
             pool,
             "INSERT INTO web_account_recovery_codes (account_id, code_hash, used_at, created_at) \
              VALUES (?, ?, NULL, ?)",
-        ))
+        ).into_owned()))
         .bind(id)
         .bind(&hash)
         .bind(&now_str)
@@ -514,9 +542,12 @@ pub async fn verify_totp_or_recovery(
                 .totp_last_step
                 .is_some_and(|last| last >= matched_step as i64);
             if !replay {
-                sqlx::query(&crate::db::q(
-                    pool,
-                    "UPDATE web_accounts SET totp_last_step = ? WHERE id = ?",
+                sqlx::query(sqlx::AssertSqlSafe(
+                    crate::db::q(
+                        pool,
+                        "UPDATE web_accounts SET totp_last_step = ? WHERE id = ?",
+                    )
+                    .into_owned(),
                 ))
                 .bind(matched_step as i64)
                 .bind(account.id)
@@ -532,10 +563,13 @@ pub async fn verify_totp_or_recovery(
 }
 
 async fn try_consume_recovery_code(pool: &DbPool, account_id: i64, code: &str) -> Result<bool> {
-    let rows: Vec<(i64, String)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT id, code_hash FROM web_account_recovery_codes \
+    let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT id, code_hash FROM web_account_recovery_codes \
          WHERE account_id = ? AND used_at IS NULL",
+        )
+        .into_owned(),
     ))
     .bind(account_id)
     .fetch_all(pool)
@@ -547,9 +581,12 @@ async fn try_consume_recovery_code(pool: &DbPool, account_id: i64, code: &str) -
             .verify_password(code.as_bytes(), &parsed)
             .is_ok()
         {
-            sqlx::query(&crate::db::q(
-                pool,
-                "UPDATE web_account_recovery_codes SET used_at = ? WHERE id = ?",
+            sqlx::query(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    pool,
+                    "UPDATE web_account_recovery_codes SET used_at = ? WHERE id = ?",
+                )
+                .into_owned(),
             ))
             .bind(chrono::Utc::now().to_rfc3339())
             .bind(id)
@@ -609,19 +646,25 @@ pub async fn reset_totp(pool: &DbPool, id: i64) -> Result<Account> {
         return Err(Error::Secret("no such account".to_string()));
     };
     let session_key = new_session_key()?;
-    sqlx::query(&crate::db::q(
-        pool,
-        "UPDATE web_accounts SET totp_secret = NULL, totp_enrolled_at = NULL, \
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "UPDATE web_accounts SET totp_secret = NULL, totp_enrolled_at = NULL, \
          totp_last_step = NULL, session_key = ?, updated_at = ? WHERE id = ?",
+        )
+        .into_owned(),
     ))
     .bind(&session_key)
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(id)
     .execute(pool)
     .await?;
-    sqlx::query(&crate::db::q(
-        pool,
-        "DELETE FROM web_account_recovery_codes WHERE account_id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "DELETE FROM web_account_recovery_codes WHERE account_id = ?",
+        )
+        .into_owned(),
     ))
     .bind(id)
     .execute(pool)
@@ -650,11 +693,11 @@ pub async fn create_invite(
     let token_hash = hash_password(&token)?;
     let now = chrono::Utc::now();
     let expires_at = now + chrono::Duration::hours(INVITE_TTL_HOURS);
-    let id: i64 = sqlx::query_scalar(&crate::db::q(
+    let id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(crate::db::q(
         pool,
         "INSERT INTO web_invites (token_hash, created_by, created_at, expires_at, used_at, email) \
          VALUES (?, ?, ?, ?, NULL, ?) RETURNING id",
-    ))
+    ).into_owned()))
     .bind(&token_hash)
     .bind(created_by)
     .bind(now.to_rfc3339())
@@ -668,15 +711,19 @@ pub async fn create_invite(
 /// List outstanding (unused, unexpired) invites for the management page.
 pub async fn list_invites(pool: &DbPool) -> Result<Vec<InviteSummary>> {
     let now = chrono::Utc::now().to_rfc3339();
-    let rows: Vec<(i64, String, String, String, Option<String>)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT i.id, a.username, i.created_at, i.expires_at, i.email FROM web_invites i \
+    let rows: Vec<(i64, String, String, String, Option<String>)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(
+                pool,
+                "SELECT i.id, a.username, i.created_at, i.expires_at, i.email FROM web_invites i \
          JOIN web_accounts a ON a.id = i.created_by \
          WHERE i.used_at IS NULL AND i.expires_at > ? ORDER BY i.id DESC",
-    ))
-    .bind(&now)
-    .fetch_all(pool)
-    .await?;
+            )
+            .into_owned(),
+        ))
+        .bind(&now)
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
         .map(
@@ -695,9 +742,12 @@ pub async fn list_invites(pool: &DbPool) -> Result<Vec<InviteSummary>> {
 /// used or gone, since the caller's intent (this invite must not work) is
 /// already satisfied.
 pub async fn revoke_invite(pool: &DbPool, id: i64) -> Result<()> {
-    sqlx::query(&crate::db::q(
-        pool,
-        "DELETE FROM web_invites WHERE id = ? AND used_at IS NULL",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "DELETE FROM web_invites WHERE id = ? AND used_at IS NULL",
+        )
+        .into_owned(),
     ))
     .bind(id)
     .execute(pool)
@@ -711,10 +761,13 @@ pub async fn revoke_invite(pool: &DbPool, id: i64) -> Result<()> {
 pub async fn find_live_invite_by_token(pool: &DbPool, token: &str) -> Result<Option<Invite>> {
     let now = chrono::Utc::now().to_rfc3339();
     let rows: Vec<(i64, String, i64, String, String, Option<String>)> =
-        sqlx::query_as(&crate::db::q(
-            pool,
-            "SELECT id, token_hash, created_by, created_at, expires_at, used_at \
+        sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(
+                pool,
+                "SELECT id, token_hash, created_by, created_at, expires_at, used_at \
              FROM web_invites WHERE used_at IS NULL AND expires_at > ?",
+            )
+            .into_owned(),
         ))
         .bind(&now)
         .fetch_all(pool)
@@ -759,9 +812,12 @@ pub async fn accept_invite(
     let session_key = new_session_key()?;
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
-    let used: i64 = sqlx::query_scalar(&crate::db::q(
-        pool,
-        "SELECT COUNT(*) FROM web_invites WHERE id = ? AND used_at IS NULL",
+    let used: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT COUNT(*) FROM web_invites WHERE id = ? AND used_at IS NULL",
+        )
+        .into_owned(),
     ))
     .bind(invite.id)
     .fetch_one(&mut *tx)
@@ -771,10 +827,13 @@ pub async fn accept_invite(
             "this invite has already been used".to_string(),
         ));
     }
-    let id: i64 = sqlx::query_scalar(&crate::db::q(
-        pool,
-        "INSERT INTO web_accounts (username, username_key, password_hash, session_key, \
+    let id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "INSERT INTO web_accounts (username, username_key, password_hash, session_key, \
          created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .into_owned(),
     ))
     .bind(username.trim())
     .bind(&username_key)
@@ -785,9 +844,8 @@ pub async fn accept_invite(
     .bind(invite.created_by)
     .fetch_one(&mut *tx)
     .await?;
-    sqlx::query(&crate::db::q(
-        pool,
-        "UPDATE web_invites SET used_at = ? WHERE id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "UPDATE web_invites SET used_at = ? WHERE id = ?").into_owned(),
     ))
     .bind(&now)
     .bind(invite.id)
@@ -866,9 +924,12 @@ mod tests {
         create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let stored: String = sqlx::query_scalar(&crate::db::q(
-            &pool,
-            "SELECT password_hash FROM web_accounts WHERE username_key = 'admin'",
+        let stored: String = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "SELECT password_hash FROM web_accounts WHERE username_key = 'admin'",
+            )
+            .into_owned(),
         ))
         .fetch_one(&pool)
         .await

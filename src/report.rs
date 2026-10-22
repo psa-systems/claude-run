@@ -231,7 +231,7 @@ pub async fn daily(pool: &DbPool, range: Range, action: Option<&str>) -> Result<
     sql.push_str(" GROUP BY date ORDER BY date");
 
     let sql = crate::db::q(pool, &sql).into_owned();
-    let mut q = sqlx::query_as::<_, (String, f64, i64)>(&sql);
+    let mut q = sqlx::query_as::<_, (String, f64, i64)>(sqlx::AssertSqlSafe(sql.as_str()));
     if let Some(c) = &cutoff {
         q = q.bind(c);
     }
@@ -289,7 +289,7 @@ async fn outcome_cost_rows(
         sql.push_str(" AND action_name = ?");
     }
     let sql = crate::db::q(pool, &sql).into_owned();
-    let mut q = sqlx::query_as::<_, (String, f64)>(&sql);
+    let mut q = sqlx::query_as::<_, (String, f64)>(sqlx::AssertSqlSafe(sql.as_str()));
     if let Some(c) = &cutoff {
         q = q.bind(c);
     }
@@ -315,7 +315,7 @@ async fn run_span_rows(
         sql.push_str(" AND action_name = ?");
     }
     let sql = crate::db::q(pool, &sql).into_owned();
-    let mut q = sqlx::query_as::<_, (String, Option<String>)>(&sql);
+    let mut q = sqlx::query_as::<_, (String, Option<String>)>(sqlx::AssertSqlSafe(sql.as_str()));
     if let Some(c) = &cutoff {
         q = q.bind(c);
     }
@@ -409,7 +409,7 @@ pub async fn summary(pool: &DbPool, range: Range, action: Option<&str>) -> Resul
         sql.push_str(" AND action_name = ?");
     }
     let sql = crate::db::q(pool, &sql).into_owned();
-    let mut q = sqlx::query_as::<_, (f64, i64)>(&sql);
+    let mut q = sqlx::query_as::<_, (f64, i64)>(sqlx::AssertSqlSafe(sql.as_str()));
     if let Some(c) = &cutoff_date {
         q = q.bind(c);
     }
@@ -471,7 +471,7 @@ pub async fn claude_usage(
             Option<f64>,
             Option<f64>,
         ),
-    >(&sql);
+    >(sqlx::AssertSqlSafe(sql.as_str()));
     if let Some(c) = &cutoff {
         q = q.bind(c);
     }
@@ -523,7 +523,7 @@ pub async fn claude_usage(
             Option<String>,
             Option<String>,
         ),
-    >(&recent_sql);
+    >(sqlx::AssertSqlSafe(recent_sql.as_str()));
     if let Some(c) = &cutoff {
         rq = rq.bind(c);
     }
@@ -637,7 +637,7 @@ mod tests {
         state::daily_count_increment(&pool, "beta").await.unwrap();
 
         // A finished run (10 min) and an in-flight run (NULL ended_at) for alpha.
-        sqlx::query(&crate::db::q(&pool, "INSERT INTO runs (action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by) VALUES (?, ?, ?, 0, 1, 'cli')"))
+        sqlx::query(sqlx::AssertSqlSafe(crate::db::q(&pool, "INSERT INTO runs (action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by) VALUES (?, ?, ?, 0, 1, 'cli')").into_owned()))
             .bind("alpha")
             .bind("2026-06-14T10:00:00Z")
             .bind("2026-06-14T10:10:00Z")
@@ -707,9 +707,12 @@ mod tests {
     }
 
     async fn seed_run(pool: &DbPool, action: &str) -> i64 {
-        sqlx::query_scalar(&crate::db::q(
-            pool,
-            "INSERT INTO runs (action_name, started_at) VALUES (?, ?) RETURNING id",
+        sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(
+                pool,
+                "INSERT INTO runs (action_name, started_at) VALUES (?, ?) RETURNING id",
+            )
+            .into_owned(),
         ))
         .bind(action)
         .bind("2026-06-14T00:00:00Z")
@@ -731,9 +734,10 @@ mod tests {
         seven_day: Option<f64>,
         api_retries_json: Option<&str>,
     ) {
-        sqlx::query(&crate::db::q(
-            pool,
-            "INSERT INTO claude_invocations \
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                pool,
+                "INSERT INTO claude_invocations \
              (ts, action, job_key, run_id, exit_code, timed_out, ok, cost_usd, total_tokens, \
               rate_limit_status, rate_limit_type, five_hour_utilization, five_hour_resets_at, \
               seven_day_utilization, seven_day_resets_at, max_five_hour_utilization, \
@@ -745,6 +749,8 @@ mod tests {
                ?, ?, \
                ?, ?, \
                ?, ?, ?, ?)",
+            )
+            .into_owned(),
         ))
         .persistent(false)
         .bind(ts)

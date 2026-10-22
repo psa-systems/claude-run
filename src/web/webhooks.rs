@@ -780,7 +780,10 @@ impl WebhookState {
 /// is an axum path param resolved against the configured sources map.
 pub fn router(state: WebhookState) -> Router {
     Router::new()
-        .route("/webhooks/:provider/triage/:source", post(forgejo_webhook))
+        .route(
+            "/webhooks/{provider}/triage/{source}",
+            post(forgejo_webhook),
+        )
         .with_state(state)
 }
 
@@ -6171,15 +6174,20 @@ mod tests {
         )
         .await;
 
-        let (run_id,): (i64,) = sqlx::query_as(&crate::db::q(&pool, "SELECT id FROM runs"))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let (run_id,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT id FROM runs").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         let (claude_ran, claude_ok, claude_cost_usd): (i64, i64, f64) =
-            sqlx::query_as(&crate::db::q(
-                &pool,
-                "SELECT claude_ran, claude_ok, claude_cost_usd FROM job_outcomes",
+            sqlx::query_as(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    &pool,
+                    "SELECT claude_ran, claude_ok, claude_cost_usd FROM job_outcomes",
+                )
+                .into_owned(),
             ))
             .fetch_one(&pool)
             .await
@@ -6240,9 +6248,12 @@ mod tests {
         .await;
 
         assert_eq!(counting.call_count(), 0, "the classifier never ran");
-        let (claude_ran, claude_cost_usd): (i64, f64) = sqlx::query_as(&crate::db::q(
-            &pool,
-            "SELECT claude_ran, claude_cost_usd FROM job_outcomes",
+        let (claude_ran, claude_cost_usd): (i64, f64) = sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "SELECT claude_ran, claude_cost_usd FROM job_outcomes",
+            )
+            .into_owned(),
         ))
         .fetch_one(&pool)
         .await
@@ -6296,11 +6307,12 @@ mod tests {
         )
         .await;
 
-        let (exit,): (Option<i64>,) =
-            sqlx::query_as(&crate::db::q(&pool, "SELECT exit_code FROM runs"))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (exit,): (Option<i64>,) = sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT exit_code FROM runs").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             exit,
             Some(crate::exit::OVER_BUDGET as i64),
@@ -7458,9 +7470,8 @@ mod tests {
             )
             .await;
 
-            let (jobs, exit): (i64, Option<i64>) = sqlx::query_as(&crate::db::q(
-                &pool,
-                "SELECT jobs_processed, exit_code FROM runs",
+            let (jobs, exit): (i64, Option<i64>) = sqlx::query_as(sqlx::AssertSqlSafe(
+                crate::db::q(&pool, "SELECT jobs_processed, exit_code FROM runs").into_owned(),
             ))
             .fetch_one(&pool)
             .await
@@ -7469,11 +7480,12 @@ mod tests {
             assert_eq!(exit, Some(crate::exit::OK as i64), "{status}");
 
             // `ok` is an integer 0/1 column on both backends (see `crate::db::flag`).
-            let (ok, summary): (i64, Option<String>) =
-                sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let (ok, summary): (i64, Option<String>) = sqlx::query_as(sqlx::AssertSqlSafe(
+                crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes").into_owned(),
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             let ok = ok != 0;
             assert!(ok, "{status}");
             let summary = summary.expect("summary recorded");
@@ -7630,11 +7642,12 @@ mod tests {
                 "private={private}"
             );
 
-            let summary: Option<String> =
-                sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let summary: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+                crate::db::q(&pool, "SELECT summary FROM job_outcomes").into_owned(),
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             let summary = summary.expect("summary recorded");
             assert!(
                 summary.contains("log fetched and redacted"),
@@ -7673,11 +7686,12 @@ mod tests {
         .await;
 
         assert_eq!(logs.calls.lock().unwrap().len(), 1, "exactly one call");
-        let summary: Option<String> =
-            sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let summary: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT summary FROM job_outcomes").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let summary = summary.expect("summary recorded");
         assert!(summary.contains("log unavailable"), "{summary}");
     }
@@ -7734,11 +7748,12 @@ mod tests {
         )
         .await;
 
-        let summary: Option<String> =
-            sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let summary: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT summary FROM job_outcomes").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let summary = summary.expect("summary recorded");
         assert!(summary.contains("log unavailable"), "{summary}");
     }
@@ -7769,11 +7784,12 @@ mod tests {
         )
         .await;
 
-        let summary: Option<String> =
-            sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let summary: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT summary FROM job_outcomes").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let summary = summary.expect("summary recorded");
         assert!(summary.contains("log fetched and redacted"), "{summary}");
     }
@@ -7802,11 +7818,12 @@ mod tests {
         )
         .await;
 
-        let summary: Option<String> =
-            sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let summary: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT summary FROM job_outcomes").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let summary = summary.expect("summary recorded");
         assert!(summary.contains("log fetched and redacted"), "{summary}");
     }
@@ -7858,11 +7875,12 @@ mod tests {
             .await;
 
             // `ok` is an integer 0/1 column on both backends (see `crate::db::flag`).
-            let (ok, summary): (i64, Option<String>) =
-                sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let (ok, summary): (i64, Option<String>) = sqlx::query_as(sqlx::AssertSqlSafe(
+                crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes").into_owned(),
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             let ok = ok != 0;
             assert!(ok, "{statuses:?}");
             let summary = summary.expect("summary recorded");
@@ -7910,11 +7928,12 @@ mod tests {
             )
             .await;
 
-            let summary: Option<String> =
-                sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let summary: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+                crate::db::q(&pool, "SELECT summary FROM job_outcomes").into_owned(),
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             let summary = summary.expect("summary recorded");
             assert!(summary.contains("log-only"), "{label}: {summary}");
             assert!(!summary.contains("no job failed"), "{label}: {summary}");
@@ -7951,9 +7970,12 @@ mod tests {
             i64,
             Option<i64>,
             Option<String>,
-        ) = sqlx::query_as(&crate::db::q(
-            &pool,
-            "SELECT action_name, triggered_by, jobs_processed, exit_code, stage FROM runs",
+        ) = sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "SELECT action_name, triggered_by, jobs_processed, exit_code, stage FROM runs",
+            )
+            .into_owned(),
         ))
         .fetch_one(&pool)
         .await
@@ -7963,9 +7985,8 @@ mod tests {
         assert_eq!(jobs, 1);
         assert_eq!(exit, Some(crate::exit::OK as i64));
         assert_eq!(stage, None, "stage cleared on finish");
-        let inflight: i64 = sqlx::query_scalar(&crate::db::q(
-            &pool,
-            "SELECT COUNT(*) FROM run_inflight_jobs",
+        let inflight: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT COUNT(*) FROM run_inflight_jobs").into_owned(),
         ))
         .fetch_one(&pool)
         .await
@@ -7974,10 +7995,12 @@ mod tests {
 
         // The event's html_url is recorded as the job's outbound
         // link so the run-detail tables can link the key to the Forgejo run.
-        let run_id: i64 = sqlx::query_scalar(&crate::db::q(&pool, "SELECT id FROM runs"))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let run_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT id FROM runs").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let links = state::run_job_links(&pool, run_id).await.unwrap();
         assert_eq!(
             links.get("fabrikam/forgejo-cli#7").map(String::as_str),
@@ -7987,9 +8010,8 @@ mod tests {
 
         // The outcome carries a summary; with no backend it is the log-only note,
         // and it references the redacted artifact that the ready fetch wrote.
-        let (job_key, summary): (String, Option<String>) = sqlx::query_as(&crate::db::q(
-            &pool,
-            "SELECT job_key, summary FROM job_outcomes",
+        let (job_key, summary): (String, Option<String>) = sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT job_key, summary FROM job_outcomes").into_owned(),
         ))
         .fetch_one(&pool)
         .await
@@ -8030,15 +8052,16 @@ mod tests {
             "the spawned handler was expected to panic"
         );
 
-        let run_id: i64 = sqlx::query_scalar(&crate::db::q(&pool, "SELECT id FROM runs"))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let run_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT id FROM runs").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let mut ended: Option<String> = None;
         for _ in 0..200 {
-            ended = sqlx::query_scalar(&crate::db::q(
-                &pool,
-                "SELECT ended_at FROM runs WHERE id = ?",
+            ended = sqlx::query_scalar(sqlx::AssertSqlSafe(
+                crate::db::q(&pool, "SELECT ended_at FROM runs WHERE id = ?").into_owned(),
             ))
             .bind(run_id)
             .fetch_one(&pool)
@@ -8053,9 +8076,8 @@ mod tests {
             ended.is_some(),
             "a panicking webhook-triage handler must not leave its run row open"
         );
-        let exit: Option<i64> = sqlx::query_scalar(&crate::db::q(
-            &pool,
-            "SELECT exit_code FROM runs WHERE id = ?",
+        let exit: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT exit_code FROM runs WHERE id = ?").into_owned(),
         ))
         .bind(run_id)
         .fetch_one(&pool)
@@ -8142,9 +8164,8 @@ mod tests {
 
         let mut ended: Option<String> = None;
         for _ in 0..200 {
-            ended = sqlx::query_scalar(&crate::db::q(
-                &pool,
-                "SELECT ended_at FROM runs WHERE id = ?",
+            ended = sqlx::query_scalar(sqlx::AssertSqlSafe(
+                crate::db::q(&pool, "SELECT ended_at FROM runs WHERE id = ?").into_owned(),
             ))
             .bind(run_id)
             .fetch_one(&pool)
@@ -8159,9 +8180,8 @@ mod tests {
             ended.is_some(),
             "the guard's retry must close the row once the table is back"
         );
-        let exit: Option<i64> = sqlx::query_scalar(&crate::db::q(
-            &pool,
-            "SELECT exit_code FROM runs WHERE id = ?",
+        let exit: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT exit_code FROM runs WHERE id = ?").into_owned(),
         ))
         .bind(run_id)
         .fetch_one(&pool)
@@ -11802,9 +11822,8 @@ mod tests {
         /// assert a no-action reconciler pass opens zero of them and an
         /// acted/failed pass opens exactly one.
         async fn webhook_triage_runs_count(pool: &DbPool) -> i64 {
-            sqlx::query_scalar(&crate::db::q(
-                pool,
-                "SELECT COUNT(*) FROM runs WHERE action_name = ?",
+            sqlx::query_scalar(sqlx::AssertSqlSafe(
+                crate::db::q(pool, "SELECT COUNT(*) FROM runs WHERE action_name = ?").into_owned(),
             ))
             .bind(WEBHOOK_MINT_ACTION)
             .fetch_one(pool)
@@ -12971,9 +12990,9 @@ mod tests {
                 )
                 .await;
 
-                let run_id: i64 = sqlx::query_scalar(&crate::db::q(
-                    &pool,
-                    "SELECT id FROM runs ORDER BY id DESC LIMIT 1",
+                let run_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+                    crate::db::q(&pool, "SELECT id FROM runs ORDER BY id DESC LIMIT 1")
+                        .into_owned(),
                 ))
                 .fetch_one(&pool)
                 .await
@@ -13135,11 +13154,12 @@ mod tests {
                 .await;
 
                 assert_eq!(webhook_triage_runs_count(&pool).await, 1);
-                let (ok, summary): (i64, String) =
-                    sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
-                        .fetch_one(&pool)
-                        .await
-                        .unwrap();
+                let (ok, summary): (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(
+                    crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes").into_owned(),
+                ))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
                 assert_eq!(ok, 1);
                 assert_eq!(
                     summary,
@@ -13169,11 +13189,12 @@ mod tests {
                 .await;
 
                 assert_eq!(webhook_triage_runs_count(&pool).await, 1);
-                let (ok, summary): (i64, String) =
-                    sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
-                        .fetch_one(&pool)
-                        .await
-                        .unwrap();
+                let (ok, summary): (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(
+                    crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes").into_owned(),
+                ))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
                 assert_eq!(ok, 1);
                 assert_eq!(summary, "agent PR #7 already merged; marked merged");
             }
@@ -13200,11 +13221,12 @@ mod tests {
                 .await;
 
                 assert_eq!(webhook_triage_runs_count(&pool).await, 1);
-                let (ok, summary): (i64, String) =
-                    sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
-                        .fetch_one(&pool)
-                        .await
-                        .unwrap();
+                let (ok, summary): (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(
+                    crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes").into_owned(),
+                ))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
                 assert_eq!(ok, 1);
                 assert_eq!(
                     summary,
@@ -13235,11 +13257,12 @@ mod tests {
                 .await;
 
                 assert_eq!(webhook_triage_runs_count(&pool).await, 1);
-                let (ok, summary): (i64, String) =
-                    sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
-                        .fetch_one(&pool)
-                        .await
-                        .unwrap();
+                let (ok, summary): (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(
+                    crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes").into_owned(),
+                ))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
                 assert_eq!(ok, 0);
                 assert!(summary.contains("complete_automerge failed"), "{summary}");
 
