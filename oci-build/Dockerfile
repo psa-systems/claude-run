@@ -110,9 +110,28 @@ RUN nu --version \
     && docker buildx version \
     && git --version \
     && timeout --version \
-    && setpriv --version \
     && cargo --version \
-    && catatonit -V
+    && catatonit -V \
+    && usermod --help >/dev/null \
+    && groupmod --help >/dev/null
+
+# gosu (CLAUDE-443): Leap has no `gosu` package, so install the upstream
+# release binary and verify it against the checksums published in that
+# release's SHA256SUMS. `setpriv` stays installed by the base (nothing else
+# in this image uses it; it is simply not removed).
+ARG GOSU_VERSION=1.19
+ARG TARGETARCH
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+        amd64) GOSU_SHA256=52c8749d0142edd234e9d6bd5237dff2d81e71f43537e2f4f66f75dd4b243dd0 ;; \
+        arm64) GOSU_SHA256=3a8ef022d82c0bc4a98bcb144e77da714c25fcfa64dccc57f6aba7ae47ff1a44 ;; \
+        *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${TARGETARCH}"; \
+    echo "${GOSU_SHA256}  /usr/local/bin/gosu" | sha256sum -c -; \
+    chmod 0755 /usr/local/bin/gosu; \
+    gosu --version; \
+    gosu nobody true
 
 # claude-run itself, from the builder stage above.
 COPY --from=builder /build/target/release/claude-run /usr/local/bin/claude-run
@@ -132,12 +151,15 @@ COPY actions/*.yml /usr/share/claude-run/actions/
 # volume.
 COPY deploy/container-config.toml /usr/share/claude-run/config.toml
 
-# Non-root container user. Same ids the earlier Alpine image used (uid 100,
-# gid 101), so a volume from before CLAUDE-287 stays owned by this user. $HOME
-# is deliberately NOT where anything persists (CLAUDE-253): it is scratch, and
-# every store the operator cares about lives under the three volumes below.
-RUN groupadd --system --gid 101 claudebot \
-    && useradd --system --uid 100 --gid 101 --create-home --home-dir /home/claudebot claudebot
+# Runtime user (CLAUDE-443): uid/gid 1001, the id every first-party image's
+# gosu-entrypoint.sh falls back to when PUID/PGID are unset and the first data
+# dir has no owner to adopt. Home directory path kept at /home/claudebot
+# (CLAUDE-287's name) even though the user is now `appuser`, so ENV HOME below
+# and every store under it keep their paths. $HOME is deliberately NOT where
+# anything persists (CLAUDE-253): it is scratch, and every store the operator
+# cares about lives under the three volumes below.
+RUN groupadd --gid 1001 appuser \
+    && useradd --uid 1001 --gid 1001 --create-home --home-dir /home/claudebot appuser
 COPY deploy/bot-CLAUDE.md /home/claudebot/.claude/CLAUDE.md
 
 # CLAUDE-253: three flat mounts instead of seven XDG paths under a home
@@ -174,8 +196,16 @@ ENV CLAUDE_RUN_CONFIG_DIR=/config \
     GIT_CONFIG_GLOBAL=/config/git/config
 RUN mkdir -p /config/actions /config/claude-agent-home /config/git /config/youtrack-cli \
     /data/forgejo-cli /state /run/claude-run \
-    && chown -R claudebot:claudebot /config /data /state /run/claude-run \
-    && chown -R claudebot:claudebot /home/claudebot
+    && chown -R appuser:appuser /config /data /state /run/claude-run \
+    && chown -R appuser:appuser /home/claudebot
+
+# CLAUDE-443: gosu-entrypoint.sh's PUID/PGID remap and chown apply only to
+# these three (config, state, runtime dir, in that order); /data is excluded
+# because it holds workdirs/, a tree of job git clones the runtime user made
+# itself, which a recursive chown every boot would walk (handled instead by
+# the 20-data-dir.sh hook's shallow, workdirs-skipping chown).
+ENV APP_USER=appuser \
+    DATA_DIRS="/config /state /run/claude-run"
 
 # HOME is set explicitly because the runtime stage stays on USER root (see the
 # entrypoint note below): without it a root `docker compose exec` would write to
@@ -184,18 +214,23 @@ RUN mkdir -p /config/actions /config/claude-agent-home /config/git /config/youtr
 ENV HOME=/home/claudebot
 WORKDIR /home/claudebot
 
-# CLAUDE-247: the container STARTS as root so the entrypoint can chown the
-# mounted volumes, then drops to claudebot with setpriv (CLAUDE-287; Leap
-# packages neither su-exec nor gosu). This is a deliberate, recorded exception
-# to BUILD.md's non-root-runtime mandate (pattern 3 in
-# governance/CONTAINER_UID_GID.md); the daemon itself runs non-root. An operator
-# `user:` override in compose disables the chown and must not be set.
-COPY oci-build/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 0755 /usr/local/bin/entrypoint.sh
+# CLAUDE-443: the shared, byte-identical entrypoint (CONTAINER_UID_GID.md).
+# The image-specific root steps that used to live in entrypoint.sh (config
+# seeding, the data-dir chown) now run as hooks under /etc/entrypoint.d/.
+COPY oci-build/gosu-entrypoint.sh /usr/local/bin/gosu-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/gosu-entrypoint.sh
+COPY oci-build/entrypoint.d/ /etc/entrypoint.d/
+RUN chmod 0755 /etc/entrypoint.d/*.sh
 
+# The container starts as root so gosu-entrypoint.sh can run the hooks above
+# and chown the mounted volumes, then drops to appuser with gosu. A compose
+# `user:` pin disables the remap and chown; see gosu-entrypoint.sh for what it
+# requires instead (every DATA_DIRS entry already writable).
+#
 # catatonit is PID 1 so orphaned processes an agent session leaves behind are
 # reaped instead of accumulating as zombies for the life of the container
-# (CLAUDE-310); it execs entrypoint.sh as its only child and forwards signals.
+# (CLAUDE-310); it execs gosu-entrypoint.sh as its only child and forwards
+# signals.
 #
 # Foreground daemon (no --detach), and no unix-socket API. That socket is the
 # CLI's control plane; this image has no CLI operator (the web
@@ -203,5 +238,5 @@ RUN chmod 0755 /usr/local/bin/entrypoint.sh
 # an unauthenticated second copy of the control plane inside the container,
 # reachable by the agent the daemon spawns. Override the command to `serve` if a
 # deployment really does want it.
-ENTRYPOINT ["/usr/bin/catatonit", "--", "/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/catatonit", "--", "/usr/local/bin/gosu-entrypoint.sh", "/usr/local/bin/claude-run"]
 CMD ["serve", "--no-socket"]
