@@ -1083,6 +1083,35 @@ impl EmailConfig {
     }
 }
 
+/// Resolve `CLAUDE_RUN_PUBLIC_URL` from an environment lookup, independent of
+/// email/SMTP configuration (CLAUDE-446): the run-link footer on every
+/// runner-posted comment needs this value even on an instance with no SMTP
+/// configured, or whose SMTP configuration is otherwise broken, so it is not
+/// read through [`EmailConfig`]. Same validation as before: an absolute
+/// `http`/`https` URL, or unset.
+pub fn public_url_from_env(
+    get: impl Fn(&str) -> Option<String>,
+) -> std::result::Result<Option<String>, String> {
+    let public_url = get("CLAUDE_RUN_PUBLIC_URL").filter(|s| !s.is_empty());
+    if let Some(url) = public_url.as_deref() {
+        let parsed = url::Url::parse(url)
+            .map_err(|e| format!("CLAUDE_RUN_PUBLIC_URL `{url}` is not a valid URL: {e}"))?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(format!(
+                "CLAUDE_RUN_PUBLIC_URL `{url}` must be an absolute http or https URL"
+            ));
+        }
+    }
+    Ok(public_url)
+}
+
+/// Resolve `CLAUDE_RUN_PUBLIC_URL` from the real process environment. Thin
+/// wrapper over [`public_url_from_env`] so call sites do not each repeat the
+/// `std::env::var` lookup closure.
+pub fn public_url() -> std::result::Result<Option<String>, String> {
+    public_url_from_env(|k| std::env::var(k).ok())
+}
+
 /// Build an [`EmailConfig`] from an environment lookup, pure over `get` so
 /// tests exercise every precedence and failure case without touching the
 /// process environment. `get` returns `None` for an unset variable, as
@@ -1129,20 +1158,11 @@ pub fn email_config_from_env(
         None => non_empty(get("CLAUDE_RUN_SMTP_PASSWORD")),
     };
     let from = non_empty(get("CLAUDE_RUN_SMTP_FROM"));
-    let public_url = non_empty(get("CLAUDE_RUN_PUBLIC_URL"));
+    let public_url = public_url_from_env(&get)?;
 
     if let Some(from) = from.as_deref() {
         from.parse::<lettre::message::Mailbox>()
             .map_err(|e| format!("CLAUDE_RUN_SMTP_FROM `{from}` is not a valid mailbox: {e}"))?;
-    }
-    if let Some(url) = public_url.as_deref() {
-        let parsed = url::Url::parse(url)
-            .map_err(|e| format!("CLAUDE_RUN_PUBLIC_URL `{url}` is not a valid URL: {e}"))?;
-        if parsed.scheme() != "http" && parsed.scheme() != "https" {
-            return Err(format!(
-                "CLAUDE_RUN_PUBLIC_URL `{url}` must be an absolute http or https URL"
-            ));
-        }
     }
     if smtp_username.is_some() && password.is_none() {
         return Err(
@@ -1800,6 +1820,38 @@ mod tests {
         .unwrap();
         assert!(cfg.configured());
         assert_eq!(cfg.password(), Some("hunter2"));
+    }
+
+    /// CLAUDE-446: `public_url` must be available for the comment-footer link
+    /// builder with no SMTP settings present at all.
+    #[test]
+    fn public_url_from_env_is_available_with_no_smtp_settings() {
+        let url = public_url_from_env(env_map(&[(
+            "CLAUDE_RUN_PUBLIC_URL",
+            "https://claude-run.example.com",
+        )]))
+        .unwrap();
+        assert_eq!(url, Some("https://claude-run.example.com".to_string()));
+    }
+
+    /// A broken, unrelated SMTP setting fails `email_config_from_env` as a
+    /// whole, but must not take `public_url` down with it: the footer link
+    /// builder reads `public_url_from_env` directly, not through
+    /// `EmailConfig`.
+    #[test]
+    fn public_url_from_env_survives_a_broken_smtp_config() {
+        let pairs = env_map(&[
+            ("CLAUDE_RUN_SMTP_FROM", "not an address"),
+            ("CLAUDE_RUN_PUBLIC_URL", "https://claude-run.example.com"),
+        ]);
+        assert!(email_config_from_env(&pairs).is_err());
+        let url = public_url_from_env(&pairs).unwrap();
+        assert_eq!(url, Some("https://claude-run.example.com".to_string()));
+    }
+
+    #[test]
+    fn public_url_from_env_unset_is_none() {
+        assert_eq!(public_url_from_env(env_map(&[])).unwrap(), None);
     }
 
     /// No error message, across every failure case, may ever contain the
