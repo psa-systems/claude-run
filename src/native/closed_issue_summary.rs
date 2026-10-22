@@ -204,7 +204,7 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
         if run_pause.stop().await {
             break;
         }
-        match file_report(&tracker, &cfg, parent, window) {
+        match file_report(&tracker, &cfg, parent, window, run_id) {
             Ok(Filing::Filed(key)) => {
                 info!(action = %action.name, parent, report = %key, "filed the closed-issue summary");
                 filed += 1;
@@ -302,6 +302,7 @@ fn file_report(
     cfg: &ClosedIssueSummaryConfig,
     parent: &str,
     window: Window,
+    run_id: i64,
 ) -> Result<Filing> {
     if already_filed(backend, parent, window) {
         return Ok(Filing::AlreadyFiled);
@@ -322,10 +323,13 @@ fn file_report(
 
     let report = backend.create_issue(&project, &summary, &body, None)?;
     backend.link_issue(&report, &cfg.link_type, parent)?;
-    backend.comment(
-        parent,
+    let comment = crate::run_footer::append_run(
         &parent_comment(&report, window, total, &cfg.projects),
-    )?;
+        crate::run_footer::resolved_public_url().as_deref(),
+        Some(run_id),
+        None,
+    );
+    backend.comment(parent, &comment)?;
     Ok(Filing::Filed(report))
 }
 
@@ -704,11 +708,11 @@ mod tests {
                     ],
                     "",
                 )
-                .ok("yt", &["issue", "comment", "CLAUDE-100", &comment], ""),
+                .ok_prefix(&format!("yt issue comment CLAUDE-100 {comment}"), ""),
         );
         let backend = CliBackend::new(runner.clone());
 
-        let filed = file_report(&backend, &cfg(), "CLAUDE-100", window()).unwrap();
+        let filed = file_report(&backend, &cfg(), "CLAUDE-100", window(), 1).unwrap();
         assert_eq!(filed, Filing::Filed("CLAUDE-230".to_string()));
 
         let calls = runner.calls.lock().unwrap().clone();
@@ -722,6 +726,14 @@ mod tests {
         assert!(
             comment.contains("Report-Window: 2026-08-01..2026-08-07"),
             "{comment}"
+        );
+        assert!(
+            calls.iter().any(
+                |c| c.starts_with(&format!("yt issue comment CLAUDE-100 {comment}"))
+                    && c.contains("Run: link unavailable")
+                    && c.contains("Duration: ")
+            ),
+            "the parent comment must carry the run-footer: {calls:?}"
         );
         // The report is created in the parent's own project when none is configured.
         assert!(
@@ -748,7 +760,7 @@ mod tests {
         ));
         let backend = CliBackend::new(runner.clone());
 
-        let filed = file_report(&backend, &cfg(), "CLAUDE-100", window()).unwrap();
+        let filed = file_report(&backend, &cfg(), "CLAUDE-100", window(), 1).unwrap();
         assert_eq!(filed, Filing::AlreadyFiled);
 
         let calls = runner.calls.lock().unwrap();
@@ -785,7 +797,7 @@ mod tests {
         let backend = CliBackend::new(runner.clone());
         // The create call is unregistered, so this errors AFTER deciding to file.
         // Deciding to file is the assertion; the create shape is covered above.
-        assert!(file_report(&backend, &cfg(), "CLAUDE-100", window()).is_err());
+        assert!(file_report(&backend, &cfg(), "CLAUDE-100", window(), 1).is_err());
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls.iter().any(|c| c.contains("issue create")),
@@ -849,10 +861,10 @@ mod tests {
                     ],
                     "",
                 )
-                .ok("yt", &["issue", "comment", "CLAUDE-100", &comment], ""),
+                .ok_prefix(&format!("yt issue comment CLAUDE-100 {comment}"), ""),
         );
         let backend = CliBackend::new(runner.clone());
-        file_report(&backend, &cfg(), "CLAUDE-100", window()).unwrap();
+        file_report(&backend, &cfg(), "CLAUDE-100", window(), 1).unwrap();
 
         let calls = runner.calls.lock().unwrap();
         assert!(

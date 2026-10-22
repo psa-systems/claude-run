@@ -182,6 +182,16 @@ DB-backed `config.email` row from before CLAUDE-428 is retired automatically on 
 daemon logs one warning naming the key and the old host/from (never the password) and deletes both the row and its
 `email-smtp-password` secret.
 
+## Run comment footer (CLAUDE-446)
+
+`CLAUDE_RUN_PUBLIC_URL` is resolved independently of the rest of the SMTP configuration above (`public_url_from_env`
+in `src/config.rs`), so it is available for the run-comment footer even when SMTP is unset or misconfigured. Every
+comment the runner posts to an issue (job finalize, the dependency gate, automerge, CI-webhook triage, the
+closed-issue summary) ends with a footer naming the run (as a `/runs/<id>` or `/runs/<id>/jobs/<key>/attempt/<n>`
+link under this base URL), its start/finish time, and its duration, so a reader goes from the comment to the run in
+one click. The daemon logs one `warn` at `serve` startup naming `CLAUDE_RUN_PUBLIC_URL` when it is unset: comments
+still post, but the footer's `Run:` line says the link is unavailable instead of linking back.
+
 ## Logging
 
 Log verbosity is a [tracing

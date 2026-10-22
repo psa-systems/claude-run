@@ -1603,7 +1603,8 @@ async fn triage_and_mint(
                             .await;
                         }
                         Ok(false) => {
-                            return attach_to_open_failure(ctx, ev, &branch, &test_ids, m).await;
+                            return attach_to_open_failure(ctx, run_id, ev, &branch, &test_ids, m)
+                                .await;
                         }
                         Err(e) => {
                             error!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "youtrack state read failed; not attaching");
@@ -1621,7 +1622,7 @@ async fn triage_and_mint(
                         }
                     }
                 }
-                return attach_to_open_failure(ctx, ev, &branch, &test_ids, m).await;
+                return attach_to_open_failure(ctx, run_id, ev, &branch, &test_ids, m).await;
             }
             if m.state == "resolved" {
                 return reopen_resolved_failure(
@@ -1675,6 +1676,7 @@ async fn triage_and_mint(
         Ok(Some(record)) if record.state == "open" => {
             route_agent_pr_failure(
                 ctx,
+                run_id,
                 ev,
                 log_text,
                 log_available,
@@ -1765,6 +1767,7 @@ async fn issue_state_is_resolved(
 /// filed and this run is just another sighting of it.
 async fn attach_to_open_failure(
     ctx: &MintContext,
+    run_id: Option<i64>,
     ev: &VerifiedFailureEvent,
     branch: &str,
     test_ids: &[String],
@@ -1796,6 +1799,12 @@ async fn attach_to_open_failure(
 
     let backend = ctx.backend.clone();
     let body = attach_comment_body(ev, branch, test_ids);
+    let body = crate::run_footer::append_run(
+        &body,
+        crate::run_footer::resolved_public_url().as_deref(),
+        run_id,
+        None,
+    );
     let key_for_comment = key.clone();
     let result =
         tokio::task::spawn_blocking(move || backend.comment(&key_for_comment, &body)).await;
@@ -1880,9 +1889,16 @@ async fn reopen_resolved_failure(
     let key2 = key.clone();
     let regression_body = regression_comment_body(ev, &branch, &test_ids);
     let spend = spend.clone();
+    let public_url = crate::run_footer::resolved_public_url();
     let bucket =
         tokio::task::spawn_blocking(move || -> crate::error::Result<triage::TriageBucket> {
             backend.set_state(&key2, &mint_cfg.target_state)?;
+            let regression_body = crate::run_footer::append_run(
+                &regression_body,
+                public_url.as_deref(),
+                run_id,
+                None,
+            );
             backend.comment(&key2, &regression_body)?;
             let has_open_pr = resolve_has_open_pr(forge.as_ref(), &event);
             let input = TriageInput {
@@ -1897,7 +1913,13 @@ async fn reopen_resolved_failure(
                 log_token,
             };
             let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix, &spend);
-            backend.comment(&key2, &verdict.analysis)?;
+            let analysis = crate::run_footer::append_run(
+                &verdict.analysis,
+                public_url.as_deref(),
+                run_id,
+                None,
+            );
+            backend.comment(&key2, &analysis)?;
             if mint::queues_for_fix(verdict.bucket) && auto_fix_enabled {
                 backend.set_field(&key2, &mint_cfg.ai_agent_field, &mint_cfg.queued_value)?;
             }
@@ -1916,7 +1938,6 @@ async fn reopen_resolved_failure(
             return WebhookRunSummary::error(format!("task panicked: {e}"));
         }
     };
-    let _ = run_id;
     info!(repo = %ev.repo, run = ev.index_in_repo, %key, bucket = %bucket, "regression reopened a resolved ci-failure issue");
     WebhookRunSummary::store_decided(&StoreOutcome::Reopened { key })
 }
@@ -2249,6 +2270,7 @@ const NEEDS_REVIEW_VALUE: &str = "Needs Review";
 #[allow(clippy::too_many_arguments)]
 async fn route_agent_pr_failure(
     ctx: &MintContext,
+    webhook_run_id: Option<i64>,
     ev: &VerifiedFailureEvent,
     log_text: String,
     log_available: bool,
@@ -2357,6 +2379,12 @@ async fn route_agent_pr_failure(
             "CI failed the same way as the previous attempt on this PR (branch `{branch}`); stopping the fix-attempt loop instead of re-queueing.\n- Repeated failing tests: {tests_display}\n- This run: {}\n- Previous run: {previous_link}",
             ev.html_url
         );
+        let body = crate::run_footer::append_run(
+            &body,
+            crate::run_footer::resolved_public_url().as_deref(),
+            webhook_run_id,
+            None,
+        );
         let backend = ctx.backend.clone();
         let mint_cfg = ctx.mint_cfg.read().await.clone();
         let key = record.issue_key.clone();
@@ -2418,6 +2446,12 @@ async fn route_agent_pr_failure(
                 "CI failed again on this PR (run #{}, branch `{branch_owned}`).\n- Run: {}\n- Failing tests: {tests_display}\n\n{}",
                 event.index_in_repo, event.html_url, verdict.analysis
             );
+            let body = crate::run_footer::append_run(
+                &body,
+                crate::run_footer::resolved_public_url().as_deref(),
+                webhook_run_id,
+                None,
+            );
             backend.comment(&key, &body)?;
             backend.set_field(&key, &mint_cfg.ai_agent_field, &mint_cfg.queued_value)?;
             Ok(())
@@ -2459,6 +2493,12 @@ async fn route_agent_pr_failure(
         let body = format!(
             "Fix-attempt ceiling ({}) reached on this PR; flagging Needs Review.\nAttempts:\n{links}",
             webhook_cfg.agent_pr_fix_attempts
+        );
+        let body = crate::run_footer::append_run(
+            &body,
+            crate::run_footer::resolved_public_url().as_deref(),
+            webhook_run_id,
+            None,
         );
         let backend = ctx.backend.clone();
         let mint_cfg = ctx.mint_cfg.read().await.clone();
@@ -4825,6 +4865,7 @@ async fn apply_automerge_decision(
                         &repo_owned,
                         pr_number,
                         &pr_url_owned,
+                        None,
                     )
                 })
                 .await
@@ -5072,6 +5113,12 @@ async fn post_issue_comment(
 ) {
     let backend = mint.backend.clone();
     let key = issue_key.to_string();
+    let body = crate::run_footer::append_run(
+        &body,
+        crate::run_footer::resolved_public_url().as_deref(),
+        None,
+        None,
+    );
     match tokio::task::spawn_blocking(move || backend.comment(&key, &body)).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -6597,6 +6644,12 @@ mod tests {
         assert!(
             calls
                 .iter()
+                .any(|c| c.starts_with("comment CLAUDE-40 | Regression") && c.contains("Run: ")),
+            "the regression comment carries the run footer: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
                 .any(|c| c == "set_field CLAUDE-40 AI Agent Queued"),
             "AI Agent set exactly as a fresh code_fix issue would be: {calls:?}"
         );
@@ -6661,6 +6714,12 @@ mod tests {
         assert!(
             calls.iter().any(|c| c.starts_with("comment CLAUDE-41 |")),
             "attached with a comment: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("comment CLAUDE-41 |") && c.contains("Run: ")),
+            "the attach comment carries the run footer: {calls:?}"
         );
         assert!(
             !calls.iter().any(|c| c.starts_with("set_state")),
@@ -8427,6 +8486,12 @@ mod tests {
         assert!(
             calls
                 .iter()
+                .any(|c| c.starts_with("comment CLAUDE-40") && c.contains("Run: ")),
+            "the requeue comment carries the run footer: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
                 .any(|c| c == "set_field CLAUDE-40 AI Agent Queued"),
             "{calls:?}"
         );
@@ -8499,6 +8564,12 @@ mod tests {
                 .iter()
                 .any(|c| c.starts_with("comment CLAUDE-41") && c.contains("7103")),
             "the comment names this attempt's run: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("comment CLAUDE-41") && c.contains("Run: ")),
+            "the ceiling comment carries the run footer: {calls:?}"
         );
 
         let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 18)
@@ -8603,6 +8674,10 @@ mod tests {
         assert!(
             repeat_comment.contains("7200") && repeat_comment.contains("7201"),
             "names both runs: {repeat_comment}"
+        );
+        assert!(
+            repeat_comment.contains("Run: "),
+            "the repeated-failure comment carries the run footer: {repeat_comment}"
         );
 
         let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 20)
@@ -10917,6 +10992,12 @@ mod tests {
                 "{calls:?}"
             );
             assert!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with("comment MK-16") && c.contains("Run: ")),
+                "the merge comment carries the run footer: {calls:?}"
+            );
+            assert!(
                 !calls.iter().any(|c| c.starts_with("set_state")),
                 "no State write: {calls:?}"
             );
@@ -11155,6 +11236,12 @@ mod tests {
                 "{calls:?}"
             );
             assert!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with("comment MK-16") && c.contains("Run: ")),
+                "the not-mergeable comment carries the run footer: {calls:?}"
+            );
+            assert!(
                 !calls.iter().any(|c| c.starts_with("merge_pr")),
                 "{calls:?}"
             );
@@ -11381,6 +11468,10 @@ mod tests {
                 .find(|c| c.starts_with("comment MK-16"))
                 .unwrap_or_else(|| panic!("expected a comment, got {calls:?}"));
             assert!(comment.contains("not allowed to merge"), "{comment}");
+            assert!(
+                comment.contains("Run: "),
+                "the merge-error comment carries the run footer: {comment}"
+            );
             assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
             assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
         }
@@ -11417,6 +11508,10 @@ mod tests {
             calls
                 .into_iter()
                 .filter(|c| !c.starts_with("list_open_prs"))
+                .map(|c| match c.find("\nStarted: ") {
+                    Some(i) => c[..i].to_string(),
+                    None => c,
+                })
                 .collect()
         }
 

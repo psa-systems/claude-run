@@ -2530,6 +2530,11 @@ pub mod testutil {
         once: Mutex<HashMap<String, VecDeque<CmdOutput>>>,
         /// Binaries that should report as absent from PATH.
         missing: Vec<String>,
+        /// (binary, joined-args prefix) -> outcome, matched when no exact
+        /// `responses` entry does. For a call whose args end in dynamic text
+        /// (CLAUDE-446's run-footer timestamp) that a test cannot predict
+        /// exactly.
+        prefix_responses: Vec<(String, CmdOutput)>,
         /// Records every (binary, args) invocation for assertions.
         pub calls: Mutex<Vec<String>>,
         /// Records the injected child env per invocation for assertions.
@@ -2636,8 +2641,27 @@ pub mod testutil {
             self
         }
 
+        /// Register a successful (exit 0) response for any call whose
+        /// `binary args...` starts with `prefix`, for a call whose trailing
+        /// args carry dynamic text (e.g. a run-footer timestamp) a test
+        /// cannot predict exactly. Checked only after an exact `ok`/`fail`
+        /// match misses.
+        pub fn ok_prefix(mut self, prefix: &str, stdout: &str) -> Self {
+            self.prefix_responses.push((
+                prefix.to_string(),
+                CmdOutput {
+                    ok: true,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                },
+            ));
+            self
+        }
+
         fn lookup(&self, binary: &str, args: &[&str]) -> Result<CmdOutput> {
-            self.calls.lock().unwrap().push(Self::key(binary, args));
+            let key = Self::key(binary, args);
+            self.calls.lock().unwrap().push(key.clone());
             if self.missing.iter().any(|b| b == binary) {
                 return Err(Error::CliNotFound {
                     binary: binary.to_string(),
@@ -2647,20 +2671,24 @@ pub mod testutil {
                 .once
                 .lock()
                 .unwrap()
-                .get_mut(&Self::key(binary, args))
+                .get_mut(&key)
                 .and_then(VecDeque::pop_front)
             {
                 return Ok(out);
             }
-            self.responses
-                .get(&Self::key(binary, args))
-                .cloned()
-                .ok_or_else(|| {
-                    Error::Other(anyhow::anyhow!(
-                        "StubRunner: no canned response for `{}`",
-                        Self::key(binary, args)
-                    ))
-                })
+            if let Some(out) = self.responses.get(&key).cloned() {
+                return Ok(out);
+            }
+            if let Some((_, out)) = self
+                .prefix_responses
+                .iter()
+                .find(|(p, _)| key.starts_with(p))
+            {
+                return Ok(out.clone());
+            }
+            Err(Error::Other(anyhow::anyhow!(
+                "StubRunner: no canned response for `{key}`"
+            )))
         }
     }
 

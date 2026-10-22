@@ -18,6 +18,61 @@ pub struct Attempt<'a> {
     pub attempt: u32,
 }
 
+/// Which run and attempt a job-lifecycle comment belongs to, and when that
+/// attempt started: the context a finalize-path comment needs to build its
+/// footer, threaded in by the caller that already holds `run_id` and
+/// `Instant::now()`.
+#[derive(Clone, Copy)]
+pub struct CommentRun {
+    pub run_id: i64,
+    pub attempt: u32,
+    pub started: DateTime<Utc>,
+}
+
+/// `crate::config::public_url()`, defaulting to `None` on a malformed
+/// `CLAUDE_RUN_PUBLIC_URL` rather than letting a comment-posting path fail on
+/// a problem the daemon already logged once at startup.
+pub fn resolved_public_url() -> Option<String> {
+    crate::config::public_url().unwrap_or_default()
+}
+
+/// [`append`] for a job-lifecycle comment: links the job's own attempt page,
+/// with "now" as the finish time.
+pub fn append_job(body: &str, public_url: Option<&str>, run: CommentRun, key: &str) -> String {
+    append(
+        body,
+        public_url,
+        Some(run.run_id),
+        Some(Attempt {
+            key,
+            attempt: run.attempt,
+        }),
+        run.started,
+        Utc::now(),
+    )
+}
+
+/// [`append`] for a comment about a run as a whole rather than one job's
+/// attempt (webhook runs, the closed-issue summary, the dependency gate, the
+/// attempt-cap comment): links `/runs/<id>`, with "now" as both the start
+/// and finish time when no better start time is available.
+pub fn append_run(
+    body: &str,
+    public_url: Option<&str>,
+    run_id: Option<i64>,
+    started: Option<DateTime<Utc>>,
+) -> String {
+    let finished = Utc::now();
+    append(
+        body,
+        public_url,
+        run_id,
+        None,
+        started.unwrap_or(finished),
+        finished,
+    )
+}
+
 /// Render the footer text (leading blank line included) to append to a
 /// comment body.
 pub fn render(
@@ -172,5 +227,46 @@ mod tests {
         );
         assert!(body.starts_with("Opened a PR.\n\n"));
         assert!(body.contains("Run: https://claude-run.example.com/runs/1"));
+    }
+
+    #[test]
+    fn append_job_links_the_job_attempt_page() {
+        let run = CommentRun {
+            run_id: 9,
+            attempt: 3,
+            started: ts("2026-10-12T18:41:03Z"),
+        };
+        let body = append_job(
+            "Opened a PR.",
+            Some("https://claude-run.example.com"),
+            run,
+            "CLAUDE-446",
+        );
+        assert!(
+            body.contains("Run: https://claude-run.example.com/runs/9/jobs/CLAUDE-446/attempt/3")
+        );
+    }
+
+    #[test]
+    fn append_run_links_the_run_page_with_no_job_attempt() {
+        let body = append_run(
+            "Filed a report.",
+            Some("https://claude-run.example.com"),
+            Some(5),
+            Some(ts("2026-10-12T18:41:03Z")),
+        );
+        assert!(body.contains("Run: https://claude-run.example.com/runs/5"));
+        assert!(!body.contains("/jobs/"));
+    }
+
+    #[test]
+    fn append_run_with_no_run_id_says_so_explicitly() {
+        let body = append_run(
+            "Filed a report.",
+            Some("https://claude-run.example.com"),
+            None,
+            None,
+        );
+        assert!(body.contains("Run: no run id is available for this comment"));
     }
 }
