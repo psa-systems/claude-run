@@ -315,4 +315,236 @@ mod tests {
         let handle = spawn(&mcp_cfg, paths.clone(), pool).await;
         assert!(handle.is_none());
     }
+
+    /// A built router for the HTTP-path tests below, against
+    /// [`crate::db::test_pool`] so these run on whichever backend the test
+    /// run is pinned to (SQLite or, with `CLAUDE_RUN_TEST_DATABASE_URL` set,
+    /// PostgreSQL), exactly like every other `DbPool`-backed test here.
+    async fn built_router(dir: &std::path::Path) -> (std::sync::Arc<mcp_web::AppState>, Router) {
+        let paths = test_paths(dir);
+        let pool = crate::db::test_pool().await;
+        let mcp_cfg = cfg::McpConfig {
+            enabled: true,
+            public_url: Some("https://mcp.example.com".to_string()),
+            // The authenticated-client test below talks to a real loopback
+            // listener, whose `Host` header is `127.0.0.1:<port>`, not the
+            // `public_url` authority `build` already allows.
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            ..cfg::McpConfig::default()
+        };
+        build(&mcp_cfg, &paths, pool).await.unwrap()
+    }
+
+    /// Register the OAuth client an issued test token is attributed to.
+    /// `access_tokens.client_id` has a foreign key into `oauth_clients`, so a
+    /// token minted straight into the table (bypassing the real
+    /// dynamic-registration + authorize + token-exchange dance) needs this
+    /// row to exist first.
+    async fn register_test_client(pool: &sqlx::SqlitePool) {
+        mcp_web::db::insert_oauth_client(
+            pool,
+            "test-client",
+            None,
+            "[]",
+            Some("test client"),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn mcp_post_request(body: &str, token: Option<&str>) -> axum::http::Request<axum::body::Body> {
+        let mut builder = axum::http::Request::post("/mcp")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(
+                axum::http::header::ACCEPT,
+                "application/json, text/event-stream",
+            );
+        if let Some(token) = token {
+            builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_post_mcp_is_rejected_with_a_discovery_challenge() {
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, router) = built_router(dir.path()).await;
+
+        let response = router
+            .clone()
+            .oneshot(mcp_post_request("{}", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let challenge = response
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .expect("WWW-Authenticate header")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(challenge.contains(".well-known/oauth-protected-resource"));
+
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_or_revoked_bearer_token_is_rejected() {
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (state, router) = built_router(dir.path()).await;
+        let hash_pw = mcp_web::password::hash_password("irrelevant").unwrap();
+        let account =
+            mcp_web::db::create_account(&state.pool, "revoke-test@example.com", &hash_pw, false)
+                .await
+                .unwrap();
+        register_test_client(&state.pool).await;
+
+        // Never issued.
+        let response = router
+            .clone()
+            .oneshot(mcp_post_request("{}", Some("not-a-real-token")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // Issued, then revoked.
+        let hash = mcp_web::crypto::sha256_hex("a-revoked-token");
+        mcp_web::db::insert_access_token(
+            &state.pool,
+            &hash,
+            "test-client",
+            account.id,
+            None,
+            mcp_web::db::now_unix() + 3600,
+        )
+        .await
+        .unwrap();
+        mcp_web::db::revoke_access_token(&state.pool, &hash)
+            .await
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(mcp_post_request("{}", Some("a-revoked-token")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // Issued, but already expired.
+        let hash = mcp_web::crypto::sha256_hex("an-expired-token");
+        mcp_web::db::insert_access_token(
+            &state.pool,
+            &hash,
+            "test-client",
+            account.id,
+            None,
+            mcp_web::db::now_unix() - 1,
+        )
+        .await
+        .unwrap();
+        let response = router
+            .clone()
+            .oneshot(mcp_post_request("{}", Some("an-expired-token")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    /// Full round trip over real TCP: mint an account and a bearer token the
+    /// way the OAuth token endpoint would, then drive an actual `rmcp`
+    /// Streamable HTTP client through `initialize` / `tools/list` /
+    /// `tools/call`, proving the listener serves real MCP traffic end to end
+    /// rather than just passing the bearer check.
+    #[tokio::test]
+    async fn an_authenticated_client_lists_and_calls_the_seven_tools() {
+        use rmcp::model::CallToolRequestParams;
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+        use rmcp::transport::StreamableHttpClientTransport;
+        use rmcp::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (state, router) = built_router(dir.path()).await;
+
+        let hash = mcp_web::password::hash_password("irrelevant").unwrap();
+        let account =
+            mcp_web::db::create_account(&state.pool, "mcp-client@example.com", &hash, false)
+                .await
+                .unwrap();
+        register_test_client(&state.pool).await;
+        let raw_token = "a-live-test-token";
+        mcp_web::db::insert_access_token(
+            &state.pool,
+            &mcp_web::crypto::sha256_hex(raw_token),
+            "test-client",
+            account.id,
+            Some(mcp_web::ADVERTISED_SCOPE),
+            mcp_web::db::now_unix() + 3600,
+        )
+        .await
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let config = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header(raw_token);
+        let transport = StreamableHttpClientTransport::from_config(config);
+        let client = ().serve(transport).await.expect("client handshake");
+
+        let tools = client.list_all_tools().await.expect("tools/list");
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "get_attempts",
+                "get_ci_failure",
+                "get_run",
+                "get_status",
+                "get_stream_log",
+                "list_ci_failures",
+                "list_runs",
+            ]
+        );
+
+        let result = client
+            .call_tool(CallToolRequestParams::new("get_status"))
+            .await
+            .expect("tools/call get_status");
+        assert_ne!(result.is_error, Some(true));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("text content");
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["source"], "database");
+
+        client.cancel().await.ok();
+        server.abort();
+    }
 }

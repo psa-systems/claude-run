@@ -168,4 +168,4 @@ tempfile = "3"
 [dev-dependencies.rmcp]
 version = "1.7.0"
 default-features = false
-features = ["client"]
+features = ["client", "transport-streamable-http-client-reqwest"]
