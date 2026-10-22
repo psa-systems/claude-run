@@ -20,7 +20,7 @@ A `limit` or `tail_lines` argument above its max errors rather than clamping, so
 
 ## Dependency footprint
 
-`rmcp` (server + macros + stdio transport features) and `schemars` are the only new dependencies. Pin and feature set live in `[dependencies.rmcp]` in `Cargo.toml`; a `[dev-dependencies.rmcp]` entry adds the `client` feature so the in-process client/server test can drive the server as a real MCP client would, without pulling that feature into the shipped binary. Neither crate introduces a second version of `sqlx`, `sqlx-sqlite`, `libsqlite3-sys`, or `axum`; check with `cargo tree --duplicates` after touching either dependency.
+`rmcp` (server + macros + stdio and Streamable HTTP server transport features), `schemars`, and `mcp-web` are the only new dependencies the shipped binary carries. Pin and feature set live in `[dependencies.rmcp]` in `Cargo.toml`; a `[dev-dependencies.rmcp]` entry adds `client` and `transport-streamable-http-client-reqwest` so the client/server tests (both the in-process stdio one and the real-TCP HTTP one, CLAUDE-442) can drive the server as a real MCP client would, without pulling either feature into the shipped binary. The HTTP client feature brings `reqwest` and `wasm-streams` into `Cargo.lock` as transitive dev-only dependencies alongside it (the shipped binary already depends on its own, separately-configured `reqwest`, so this is not a second copy of anything shipped). Neither `rmcp` nor `schemars` introduces a second version of `sqlx`, `sqlx-sqlite`, `libsqlite3-sys`, or `axum`; check with `cargo tree --duplicates` after touching either dependency.
 
 ## Serving the same tools over HTTP (CLAUDE-442)
 
