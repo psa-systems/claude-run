@@ -45,9 +45,8 @@ file and the prompt disagree, the prompt wins. In outline you MAY:
   `relates to` the triggering issue, and not fixed in this run unless it blocks
   the triggering issue's acceptance criteria and lives in this repo.
 - Update, comment on, and link the issues YOU created during this run.
-- Comment on the triggering issue itself, including an early size note when you
-  expect it to be too large to finish and verify within the run's time budget.
-  The runner still posts its own outcome comment; do not duplicate it.
+- Comment on the triggering issue itself. The runner still posts its own
+  outcome comment; do not duplicate it.
 
 Hard bans, lifted only where the job prompt explicitly names an exception:
 
