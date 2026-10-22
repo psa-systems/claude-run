@@ -1127,9 +1127,12 @@ mod tests {
         .await
         .unwrap();
         // A fresh block is not a signal; age this one past the threshold.
-        sqlx::query(&crate::db::q(
-            &s.pool,
-            "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = 'AUD-31'",
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &s.pool,
+                "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = 'AUD-31'",
+            )
+            .into_owned(),
         ))
         .bind(state::now_epoch_ms() - 7_200_000)
         .execute(&s.pool)

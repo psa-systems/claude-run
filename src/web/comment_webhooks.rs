@@ -2405,15 +2405,16 @@ mod tests {
             "the spawned handler was expected to panic"
         );
 
-        let run_id: i64 = sqlx::query_scalar(&crate::db::q(&pool, "SELECT id FROM runs"))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let run_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT id FROM runs").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let mut ended: Option<String> = None;
         for _ in 0..200 {
-            ended = sqlx::query_scalar(&crate::db::q(
-                &pool,
-                "SELECT ended_at FROM runs WHERE id = ?",
+            ended = sqlx::query_scalar(sqlx::AssertSqlSafe(
+                crate::db::q(&pool, "SELECT ended_at FROM runs WHERE id = ?").into_owned(),
             ))
             .bind(run_id)
             .fetch_one(&pool)
@@ -2428,9 +2429,8 @@ mod tests {
             ended.is_some(),
             "a panicking webhook-comment handler must not leave its run row open"
         );
-        let exit: Option<i64> = sqlx::query_scalar(&crate::db::q(
-            &pool,
-            "SELECT exit_code FROM runs WHERE id = ?",
+        let exit: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT exit_code FROM runs WHERE id = ?").into_owned(),
         ))
         .bind(run_id)
         .fetch_one(&pool)

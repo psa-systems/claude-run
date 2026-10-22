@@ -81,7 +81,7 @@ pub async fn prune_older_than(pool: &DbPool, t: &RetentionTable, cutoff: &str) -
     // `t.table` / `t.ts_col` are `&'static str` constants from RETENTION_TABLES,
     // not user input, so this format! cannot inject. The cutoff is bound.
     let sql = format!("DELETE FROM {} WHERE {} < ?", t.table, t.ts_col);
-    let res = sqlx::query(&crate::db::q(pool, &sql))
+    let res = sqlx::query(sqlx::AssertSqlSafe(crate::db::q(pool, &sql).into_owned()))
         .bind(cutoff)
         .execute(pool)
         .await?;
@@ -128,9 +128,9 @@ mod tests {
     /// Seed one `runs` row so `job_outcomes.run_id`'s foreign key is satisfied.
     /// Returns its id.
     async fn seed_run(pool: &DbPool) -> i64 {
-        sqlx::query_scalar(&crate::db::q(pool,
+        sqlx::query_scalar(sqlx::AssertSqlSafe(crate::db::q(pool,
             "INSERT INTO runs (action_name, started_at) VALUES ('act', '2020-01-01T00:00:00Z') RETURNING id",
-        ))
+        ).into_owned()))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -138,15 +138,18 @@ mod tests {
 
     /// Insert a `job_outcomes` row with an explicit `ts`.
     async fn insert_outcome(pool: &DbPool, job_key: &str, ts: &str) {
-        sqlx::query(&crate::db::q(
-            pool,
-            r#"
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                pool,
+                r#"
             INSERT INTO job_outcomes (
                 run_id, action_name, job_key, attempt, ts, ok,
                 claude_ran, claude_ok, claude_cost_usd, attempt_counted,
                 summary, stream_log_path, duration_ms, timed_out
             ) VALUES (1, 'act', ?, 1, ?, 1, 1, 1, 0.0, 1, NULL, NULL, 0, 0)
             "#,
+            )
+            .into_owned(),
         ))
         .bind(job_key)
         .bind(ts)
@@ -156,19 +159,21 @@ mod tests {
     }
 
     async fn count(pool: &DbPool) -> i64 {
-        sqlx::query_scalar(&crate::db::q(pool, "SELECT COUNT(*) FROM job_outcomes"))
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(pool, "SELECT COUNT(*) FROM job_outcomes").into_owned(),
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     /// Insert a `run_events` row with an explicit `ts`. `run_id` is left NULL
     /// (events are recorded keyed by action_name + ts before any run exists).
     async fn insert_event(pool: &DbPool, message: &str, ts: &str) {
-        sqlx::query(&crate::db::q(
+        sqlx::query(sqlx::AssertSqlSafe(crate::db::q(
             pool,
             "INSERT INTO run_events (action_name, ts, level, message) VALUES ('act', ?, 'warn', ?)",
-        ))
+        ).into_owned()))
         .bind(ts)
         .bind(message)
         .execute(pool)
@@ -177,10 +182,12 @@ mod tests {
     }
 
     async fn count_events(pool: &DbPool) -> i64 {
-        sqlx::query_scalar(&crate::db::q(pool, "SELECT COUNT(*) FROM run_events"))
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(pool, "SELECT COUNT(*) FROM run_events").into_owned(),
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     fn cfg(enabled: bool, days: u64) -> DbRetentionConfig {
@@ -206,11 +213,12 @@ mod tests {
         let stats = sweep(&pool, &cfg(true, 180), now).await.unwrap();
         assert_eq!(stats.deleted, 1, "only the aged row is pruned");
         assert_eq!(count(&pool).await, 1);
-        let survivor: String =
-            sqlx::query_scalar(&crate::db::q(&pool, "SELECT job_key FROM job_outcomes"))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let survivor: String = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT job_key FROM job_outcomes").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(survivor, "FRESH-1", "the in-window row is kept");
     }
 
@@ -236,9 +244,12 @@ mod tests {
         // index (migrations/postgres/0001_init.sql) but phrases plans its own
         // way, and an empty table there would be seq-scanned whatever we index.
         let pool = crate::db::test_sqlite_pool().await;
-        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(&crate::db::q(
-            &pool,
-            "EXPLAIN QUERY PLAN DELETE FROM job_outcomes WHERE ts < ?",
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "EXPLAIN QUERY PLAN DELETE FROM job_outcomes WHERE ts < ?",
+            )
+            .into_owned(),
         ))
         .bind(Utc::now().to_rfc3339())
         .fetch_all(&pool)
@@ -277,11 +288,12 @@ mod tests {
         let stats = sweep(&pool, &cfg(true, 180), now).await.unwrap();
         assert_eq!(stats.deleted, 1, "only the aged run_events row is pruned");
         assert_eq!(count_events(&pool).await, 1);
-        let survivor: String =
-            sqlx::query_scalar(&crate::db::q(&pool, "SELECT message FROM run_events"))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let survivor: String = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT message FROM run_events").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(survivor, "FRESH", "the in-window run_events row is kept");
     }
 
@@ -307,9 +319,12 @@ mod tests {
         // index (migrations/postgres/0001_init.sql) but phrases plans its own
         // way, and an empty table there would be seq-scanned whatever we index.
         let pool = crate::db::test_sqlite_pool().await;
-        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(&crate::db::q(
-            &pool,
-            "EXPLAIN QUERY PLAN DELETE FROM run_events WHERE ts < ?",
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "EXPLAIN QUERY PLAN DELETE FROM run_events WHERE ts < ?",
+            )
+            .into_owned(),
         ))
         .bind(Utc::now().to_rfc3339())
         .fetch_all(&pool)
@@ -364,51 +379,60 @@ mod tests {
         let old = (now - Duration::days(200)).to_rfc3339();
         let fresh = (now - Duration::days(10)).to_rfc3339();
 
-        let failure_id: i64 = sqlx::query_scalar(&crate::db::q(
+        let failure_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(crate::db::q(
             &pool,
             "INSERT INTO ci_failures (repo, workflow_id, job_name, state, created_at, updated_at) \
              VALUES ('acme/widgets', 'checks.yml', 'test', 'open', ?, ?) RETURNING id",
-        ))
+        ).into_owned()))
         .bind(&old)
         .bind(&old)
         .fetch_one(&pool)
         .await
         .unwrap();
-        sqlx::query(&crate::db::q(
-            &pool,
-            "INSERT INTO ci_failure_tests (failure_id, test_id) VALUES (?, ?)",
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "INSERT INTO ci_failure_tests (failure_id, test_id) VALUES (?, ?)",
+            )
+            .into_owned(),
         ))
         .bind(failure_id)
         .bind("lib::a")
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(&crate::db::q(
-            &pool,
-            "INSERT INTO ci_failure_runs (failure_id, run_index, commit_sha, branch, ts) \
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "INSERT INTO ci_failure_runs (failure_id, run_index, commit_sha, branch, ts) \
              VALUES (?, 1, 'abc', 'main', ?)",
+            )
+            .into_owned(),
         ))
         .bind(failure_id)
         .bind(&old)
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(&crate::db::q(
-            &pool,
-            "INSERT INTO ci_failure_runs (failure_id, run_index, commit_sha, branch, ts) \
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "INSERT INTO ci_failure_runs (failure_id, run_index, commit_sha, branch, ts) \
              VALUES (?, 2, 'def', 'main', ?)",
+            )
+            .into_owned(),
         ))
         .bind(failure_id)
         .bind(&fresh)
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(&crate::db::q(
+        sqlx::query(sqlx::AssertSqlSafe(crate::db::q(
             &pool,
             "INSERT INTO agent_pull_requests \
              (action_name, issue_key, host, repo, pr_number, head_branch, state, created_at, updated_at) \
              VALUES ('youtrack', 'CLAUDE-1', 'dev.a8n.run', 'acme/widgets', 1, 'fix/x', 'open', ?, ?)",
-        ))
+        ).into_owned()))
         .bind(&old)
         .bind(&old)
         .execute(&pool)
@@ -421,9 +445,12 @@ mod tests {
             "only the aged ci_failure_runs row is pruned"
         );
 
-        let runs: i64 = sqlx::query_scalar(&crate::db::q(
-            &pool,
-            "SELECT COUNT(*) FROM ci_failure_runs WHERE failure_id = ?",
+        let runs: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "SELECT COUNT(*) FROM ci_failure_runs WHERE failure_id = ?",
+            )
+            .into_owned(),
         ))
         .bind(failure_id)
         .fetch_one(&pool)
@@ -431,25 +458,24 @@ mod tests {
         .unwrap();
         assert_eq!(runs, 1, "the in-window run survives");
 
-        let failures: i64 =
-            sqlx::query_scalar(&crate::db::q(&pool, "SELECT COUNT(*) FROM ci_failures"))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let failures: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT COUNT(*) FROM ci_failures").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(failures, 1, "ci_failures is never pruned by age");
 
-        let tests: i64 = sqlx::query_scalar(&crate::db::q(
-            &pool,
-            "SELECT COUNT(*) FROM ci_failure_tests",
+        let tests: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT COUNT(*) FROM ci_failure_tests").into_owned(),
         ))
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(tests, 1, "ci_failure_tests is never pruned by age");
 
-        let prs: i64 = sqlx::query_scalar(&crate::db::q(
-            &pool,
-            "SELECT COUNT(*) FROM agent_pull_requests",
+        let prs: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT COUNT(*) FROM agent_pull_requests").into_owned(),
         ))
         .fetch_one(&pool)
         .await

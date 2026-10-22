@@ -534,7 +534,7 @@ async fn test_pg_pool_at(url: &str, max_connections: u32) -> DbPool {
         .after_connect(move |conn, _meta| {
             let set_path = set_path.clone();
             Box::pin(async move {
-                conn.execute(&*set_path).await?;
+                conn.execute(sqlx::AssertSqlSafe(set_path)).await?;
                 Ok(())
             })
         })
@@ -544,9 +544,11 @@ async fn test_pg_pool_at(url: &str, max_connections: u32) -> DbPool {
     refuse_live_database(&pool, "public")
         .await
         .expect("refuse a live runner database");
-    pool.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
-        .await
-        .expect("create the test schema");
+    pool.execute(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA IF NOT EXISTS {schema}"
+    )))
+    .await
+    .expect("create the test schema");
     POSTGRES_MIGRATOR
         .run(&pool)
         .await
@@ -784,12 +786,14 @@ mod tests {
     async fn refuse_live_database_flags_a_schema_that_already_has_sqlx_migrations() {
         let pool = skip_without_postgres!();
         let migrated_schema = format!("cr_test_guard_migrated_{}", std::process::id());
-        pool.execute(&*format!("CREATE SCHEMA {migrated_schema}"))
-            .await
-            .unwrap();
-        pool.execute(&*format!(
+        pool.execute(sqlx::AssertSqlSafe(format!(
+            "CREATE SCHEMA {migrated_schema}"
+        )))
+        .await
+        .unwrap();
+        pool.execute(sqlx::AssertSqlSafe(format!(
             "CREATE TABLE {migrated_schema}._sqlx_migrations (version bigint)"
-        ))
+        )))
         .await
         .unwrap();
 
@@ -801,20 +805,24 @@ mod tests {
             .await
             .unwrap();
         assert!(err.to_string().contains(&database), "{err}");
-        pool.execute(&*format!("DROP SCHEMA {migrated_schema} CASCADE"))
-            .await
-            .unwrap();
+        pool.execute(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA {migrated_schema} CASCADE"
+        )))
+        .await
+        .unwrap();
 
         let empty_schema = format!("cr_test_guard_empty_{}", std::process::id());
-        pool.execute(&*format!("CREATE SCHEMA {empty_schema}"))
+        pool.execute(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {empty_schema}")))
             .await
             .unwrap();
         refuse_live_database(&pool, &empty_schema)
             .await
             .expect("a schema without _sqlx_migrations is not refused");
-        pool.execute(&*format!("DROP SCHEMA {empty_schema} CASCADE"))
-            .await
-            .unwrap();
+        pool.execute(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA {empty_schema} CASCADE"
+        )))
+        .await
+        .unwrap();
     }
 
     /// CLAUDE-436 regression: a NULL utilization bind declares the `Any`
@@ -874,10 +882,12 @@ mod tests {
         .await
         .expect("valued-utilization insert on the same connection must not hit 22P03");
 
-        let count: i64 = sqlx::query_scalar(&q(&pool, "SELECT COUNT(*) FROM claude_invocations"))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            q(&pool, "SELECT COUNT(*) FROM claude_invocations").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(count, 2);
     }
 }

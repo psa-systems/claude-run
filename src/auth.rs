@@ -2119,9 +2119,12 @@ mod tests {
         let account = crate::web_admin::create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        sqlx::query(&crate::db::q(
-            &pool,
-            "UPDATE web_accounts SET totp_secret = ?, totp_enrolled_at = ? WHERE id = ?",
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "UPDATE web_accounts SET totp_secret = ?, totp_enrolled_at = ? WHERE id = ?",
+            )
+            .into_owned(),
         ))
         .bind(b"not a real ciphertext".to_vec())
         .bind(chrono::Utc::now().to_rfc3339())

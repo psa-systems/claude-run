@@ -42,10 +42,13 @@ pub async fn dependency_gate_get(
     action: &str,
     key: &str,
 ) -> Result<Option<DependencyGateState>> {
-    let row: Option<(i64, i64, String)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT blocked_until, blocked_since, signature FROM dependency_gate \
+    let row: Option<(i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT blocked_until, blocked_since, signature FROM dependency_gate \
          WHERE action_name = ? AND job_key = ?",
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(key)
@@ -73,9 +76,10 @@ pub async fn dependency_gate_upsert(
     signature: &str,
 ) -> Result<()> {
     let now = now_iso();
-    sqlx::query(&crate::db::q(
-        pool,
-        r#"
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         INSERT INTO dependency_gate
             (action_name, job_key, blocked_until, blocked_since, signature, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -84,6 +88,8 @@ pub async fn dependency_gate_upsert(
             signature = excluded.signature,
             updated_at = excluded.updated_at
         "#,
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(key)
@@ -115,7 +121,7 @@ pub async fn dependency_gate_retain(pool: &DbPool, action: &str, keys: &[String]
         )
     };
     let sql = crate::db::q(pool, &sql).into_owned();
-    let mut q = sqlx::query(&sql).bind(action);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(action);
     for k in keys {
         q = q.bind(k);
     }
@@ -160,9 +166,10 @@ pub async fn dependency_gates_stale(
     threshold_ms: i64,
     limit: i64,
 ) -> Result<Vec<StaleGate>> {
-    let rows = sqlx::query_as::<_, StaleGate>(&crate::db::q(
-        pool,
-        r#"
+    let rows = sqlx::query_as::<_, StaleGate>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         SELECT action_name,
                job_key,
                signature,
@@ -174,6 +181,8 @@ pub async fn dependency_gates_stale(
         ORDER BY blocked_for_ms DESC
         LIMIT ?3
         "#,
+        )
+        .into_owned(),
     ))
     .bind(now_ms)
     .bind(threshold_ms)
@@ -185,9 +194,12 @@ pub async fn dependency_gates_stale(
 
 /// Drop the dependency-gate row for `(action, key)` (its dependencies cleared).
 pub async fn dependency_gate_clear(pool: &DbPool, action: &str, key: &str) -> Result<()> {
-    sqlx::query(&crate::db::q(
-        pool,
-        "DELETE FROM dependency_gate WHERE action_name = ? AND job_key = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "DELETE FROM dependency_gate WHERE action_name = ? AND job_key = ?",
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(key)
@@ -241,14 +253,17 @@ pub async fn attempt_cap_hits(
     // A cap of 0 would match every row including count 0; the counters start at
     // 1, so clamp the SQL floor to 1 and let the per-action compare below decide.
     let min_cap = caps.values().copied().fold(default_cap, u32::min).max(1);
-    let rows: Vec<(String, String, i64, String)> = sqlx::query_as(&crate::db::q(
-        pool,
-        r#"
+    let rows: Vec<(String, String, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         SELECT action_name, job_key, count, last_at
         FROM attempt_counters
         WHERE count >= ?1
         ORDER BY count DESC, last_at DESC
         "#,
+        )
+        .into_owned(),
     ))
     .bind(min_cap as i64)
     .fetch_all(pool)
@@ -271,9 +286,12 @@ pub async fn attempt_cap_hits(
 }
 
 pub async fn attempts_get(pool: &DbPool, action: &str, key: &str) -> Result<u32> {
-    let row: Option<(i64,)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT count FROM attempt_counters WHERE action_name = ? AND job_key = ?",
+    let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT count FROM attempt_counters WHERE action_name = ? AND job_key = ?",
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(key)
@@ -284,15 +302,18 @@ pub async fn attempts_get(pool: &DbPool, action: &str, key: &str) -> Result<u32>
 
 pub async fn attempts_increment(pool: &DbPool, action: &str, key: &str) -> Result<u32> {
     let now = now_iso();
-    sqlx::query(&crate::db::q(
-        pool,
-        r#"
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         INSERT INTO attempt_counters (action_name, job_key, count, last_at)
         VALUES (?, ?, 1, ?)
         ON CONFLICT(action_name, job_key) DO UPDATE SET
             count = attempt_counters.count + 1,
             last_at = excluded.last_at
         "#,
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(key)
@@ -307,9 +328,12 @@ pub async fn attempts_increment(pool: &DbPool, action: &str, key: &str) -> Resul
 /// caller (the API handler) can 404 an unknown counter instead of a silent
 /// no-op on a mistyped key.
 pub async fn attempts_clear(pool: &DbPool, action: &str, key: &str) -> Result<bool> {
-    let result = sqlx::query(&crate::db::q(
-        pool,
-        "DELETE FROM attempt_counters WHERE action_name = ? AND job_key = ?",
+    let result = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "DELETE FROM attempt_counters WHERE action_name = ? AND job_key = ?",
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(key)
@@ -320,9 +344,12 @@ pub async fn attempts_clear(pool: &DbPool, action: &str, key: &str) -> Result<bo
 
 pub async fn daily_count_get(pool: &DbPool, action: &str) -> Result<u32> {
     let today = today_local().to_string();
-    let row: Option<(i64,)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT run_count FROM daily_ledger WHERE action_name = ? AND date = ?",
+    let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT run_count FROM daily_ledger WHERE action_name = ? AND date = ?",
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(&today)
@@ -333,14 +360,17 @@ pub async fn daily_count_get(pool: &DbPool, action: &str) -> Result<u32> {
 
 pub async fn daily_count_increment(pool: &DbPool, action: &str) -> Result<()> {
     let today = today_local().to_string();
-    sqlx::query(&crate::db::q(
-        pool,
-        r#"
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         INSERT INTO daily_ledger (action_name, date, run_count, cost_usd)
         VALUES (?, ?, 1, 0.0)
         ON CONFLICT(action_name, date) DO UPDATE SET
             run_count = daily_ledger.run_count + 1
         "#,
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(&today)
@@ -351,9 +381,12 @@ pub async fn daily_count_increment(pool: &DbPool, action: &str) -> Result<()> {
 
 pub async fn daily_cost_get(pool: &DbPool, action: &str) -> Result<f64> {
     let today = today_local().to_string();
-    let row: Option<(f64,)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT cost_usd FROM daily_ledger WHERE action_name = ? AND date = ?",
+    let row: Option<(f64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT cost_usd FROM daily_ledger WHERE action_name = ? AND date = ?",
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(&today)
@@ -364,14 +397,17 @@ pub async fn daily_cost_get(pool: &DbPool, action: &str) -> Result<f64> {
 
 pub async fn daily_cost_add(pool: &DbPool, action: &str, amount: f64) -> Result<()> {
     let today = today_local().to_string();
-    sqlx::query(&crate::db::q(
-        pool,
-        r#"
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         INSERT INTO daily_ledger (action_name, date, run_count, cost_usd)
         VALUES (?, ?, 0, ?)
         ON CONFLICT(action_name, date) DO UPDATE SET
             cost_usd = daily_ledger.cost_usd + excluded.cost_usd
         "#,
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(&today)
@@ -383,13 +419,16 @@ pub async fn daily_cost_add(pool: &DbPool, action: &str, amount: f64) -> Result<
 
 pub async fn run_begin(pool: &DbPool, action: &str, triggered_by: &str) -> Result<i64> {
     let now = now_iso();
-    let id = sqlx::query_scalar::<_, i64>(&crate::db::q(
-        pool,
-        r#"
+    let id = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         INSERT INTO runs (action_name, started_at, triggered_by)
         VALUES (?, ?, ?)
         RETURNING id
         "#,
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(&now)
@@ -405,9 +444,8 @@ pub async fn run_begin(pool: &DbPool, action: &str, triggered_by: &str) -> Resul
 /// the `runs.job_keys` column.
 pub async fn run_set_job_keys(pool: &DbPool, run_id: i64, keys: &[String]) -> Result<()> {
     let payload = serde_json::to_string(keys)?;
-    sqlx::query(&crate::db::q(
-        pool,
-        "UPDATE runs SET job_keys = ? WHERE id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "UPDATE runs SET job_keys = ? WHERE id = ?").into_owned(),
     ))
     .bind(payload)
     .bind(run_id)
@@ -426,9 +464,8 @@ pub async fn run_set_job_links(
     links: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     let payload = serde_json::to_string(links)?;
-    sqlx::query(&crate::db::q(
-        pool,
-        "UPDATE runs SET job_links = ? WHERE id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "UPDATE runs SET job_links = ? WHERE id = ?").into_owned(),
     ))
     .bind(payload)
     .bind(run_id)
@@ -443,9 +480,8 @@ pub async fn run_job_links(
     pool: &DbPool,
     run_id: i64,
 ) -> Result<std::collections::BTreeMap<String, String>> {
-    let row: Option<(Option<String>,)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT job_links FROM runs WHERE id = ?",
+    let row: Option<(Option<String>,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "SELECT job_links FROM runs WHERE id = ?").into_owned(),
     ))
     .bind(run_id)
     .fetch_optional(pool)
@@ -463,9 +499,8 @@ pub async fn run_job_links(
 /// it from gaps in `job_outcomes`. Pass `Some(key)` before processing a job;
 /// `run_finish` clears it back to NULL when the run ends.
 pub async fn run_set_current_job(pool: &DbPool, run_id: i64, key: Option<&str>) -> Result<()> {
-    sqlx::query(&crate::db::q(
-        pool,
-        "UPDATE runs SET current_job_key = ? WHERE id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "UPDATE runs SET current_job_key = ? WHERE id = ?").into_owned(),
     ))
     .bind(key)
     .bind(run_id)
@@ -479,9 +514,8 @@ pub async fn run_set_current_job(pool: &DbPool, run_id: i64, key: Option<&str>) 
 /// fast-path advances it through download / triage / classify / mint).
 /// `run_finish` clears it together with `current_job_key`.
 pub async fn run_stage_set(pool: &DbPool, run_id: i64, stage: Option<&str>) -> Result<()> {
-    sqlx::query(&crate::db::q(
-        pool,
-        "UPDATE runs SET stage = ? WHERE id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "UPDATE runs SET stage = ? WHERE id = ?").into_owned(),
     ))
     .bind(stage)
     .bind(run_id)
@@ -504,10 +538,13 @@ pub async fn run_inflight_add(
     key: &str,
     concurrency_key: &str,
 ) -> Result<()> {
-    sqlx::query(&crate::db::q(
-        pool,
-        "INSERT INTO run_inflight_jobs (run_id, job_key, concurrency_key) VALUES (?, ?, ?) \
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "INSERT INTO run_inflight_jobs (run_id, job_key, concurrency_key) VALUES (?, ?, ?) \
          ON CONFLICT DO NOTHING",
+        )
+        .into_owned(),
     ))
     .bind(run_id)
     .bind(key)
@@ -519,9 +556,12 @@ pub async fn run_inflight_add(
 
 /// Clear one job's in-flight marker when it finishes.
 pub async fn run_inflight_remove(pool: &DbPool, run_id: i64, key: &str) -> Result<()> {
-    sqlx::query(&crate::db::q(
-        pool,
-        "DELETE FROM run_inflight_jobs WHERE run_id = ? AND job_key = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "DELETE FROM run_inflight_jobs WHERE run_id = ? AND job_key = ?",
+        )
+        .into_owned(),
     ))
     .bind(run_id)
     .bind(key)
@@ -532,9 +572,12 @@ pub async fn run_inflight_remove(pool: &DbPool, run_id: i64, key: &str) -> Resul
 
 /// The set of job keys currently in flight for a run.
 pub async fn run_inflight_keys(pool: &DbPool, run_id: i64) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT job_key FROM run_inflight_jobs WHERE run_id = ?",
+    let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT job_key FROM run_inflight_jobs WHERE run_id = ?",
+        )
+        .into_owned(),
     ))
     .bind(run_id)
     .fetch_all(pool)
@@ -543,9 +586,8 @@ pub async fn run_inflight_keys(pool: &DbPool, run_id: i64) -> Result<Vec<String>
 }
 
 pub async fn run_job_keys(pool: &DbPool, run_id: i64) -> Result<Vec<String>> {
-    let row: Option<(Option<String>,)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT job_keys FROM runs WHERE id = ?",
+    let row: Option<(Option<String>,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "SELECT job_keys FROM runs WHERE id = ?").into_owned(),
     ))
     .bind(run_id)
     .fetch_optional(pool)
@@ -620,12 +662,15 @@ pub async fn run_events_record(
     events: &[InputEvent],
 ) -> Result<()> {
     for e in events {
-        sqlx::query(&crate::db::q(
-            pool,
-            r#"
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                pool,
+                r#"
             INSERT INTO run_events (run_id, action_name, ts, level, context, message)
             VALUES (NULL, ?, ?, ?, ?, ?)
             "#,
+            )
+            .into_owned(),
         ))
         .bind(action)
         .bind(poll_ts)
@@ -650,12 +695,15 @@ pub async fn run_events_record_for_run(
 ) -> Result<()> {
     let ts = now_iso();
     for e in events {
-        sqlx::query(&crate::db::q(
-            pool,
-            r#"
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                pool,
+                r#"
             INSERT INTO run_events (run_id, action_name, ts, level, context, message)
             VALUES (?, ?, ?, ?, ?, ?)
             "#,
+            )
+            .into_owned(),
         ))
         .bind(run_id)
         .bind(action)
@@ -680,9 +728,12 @@ pub async fn run_events_attach(
     action: &str,
     poll_ts: &str,
 ) -> Result<()> {
-    sqlx::query(&crate::db::q(
-        pool,
-        "UPDATE run_events SET run_id = ? WHERE action_name = ? AND ts = ? AND run_id IS NULL",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "UPDATE run_events SET run_id = ? WHERE action_name = ? AND ts = ? AND run_id IS NULL",
+        )
+        .into_owned(),
     ))
     .bind(run_id)
     .bind(action)
@@ -701,15 +752,18 @@ pub async fn run_events_for_action(
     action: &str,
     limit: i64,
 ) -> Result<Vec<RunEventRecord>> {
-    let rows = sqlx::query_as::<_, RunEventRecord>(&crate::db::q(
-        pool,
-        r#"
+    let rows = sqlx::query_as::<_, RunEventRecord>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         SELECT run_id, ts, level, context, message
         FROM run_events
         WHERE action_name = ?
         ORDER BY ts DESC, id DESC
         LIMIT ?
         "#,
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(limit)
@@ -726,10 +780,10 @@ pub async fn run_events_last_message_containing(
     action: &str,
     needle: &str,
 ) -> Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as(&crate::db::q(
+    let row: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(crate::db::q(
         pool,
         "SELECT message FROM run_events WHERE action_name = ? AND strpos(message, ?) > 0 ORDER BY ts DESC, id DESC LIMIT 1",
-    ))
+    ).into_owned()))
     .bind(action)
     .bind(needle)
     .fetch_optional(pool)
@@ -750,9 +804,12 @@ pub async fn run_events_count_for_action(
     action: &str,
     started_at: Option<&str>,
 ) -> Result<i64> {
-    let count = sqlx::query_scalar::<_, i64>(&crate::db::q(
-        pool,
-        "SELECT COUNT(*) FROM run_events WHERE action_name = ? AND ts >= ?",
+    let count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT COUNT(*) FROM run_events WHERE action_name = ? AND ts >= ?",
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(started_at.unwrap_or(""))
@@ -771,10 +828,11 @@ const DIAGNOSTIC_LEVELS: &str = "('warn', 'error')";
 pub async fn run_events_count_since(pool: &DbPool, since: &str) -> Result<i64> {
     let sql =
         format!("SELECT COUNT(*) FROM run_events WHERE ts >= ? AND level IN {DIAGNOSTIC_LEVELS}");
-    let count = sqlx::query_scalar::<_, i64>(&crate::db::q(pool, &sql))
-        .bind(since)
-        .fetch_one(pool)
-        .await?;
+    let count =
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(crate::db::q(pool, &sql).into_owned()))
+            .bind(since)
+            .fetch_one(pool)
+            .await?;
     Ok(count)
 }
 
@@ -818,11 +876,13 @@ async fn run_events_grouped_by(
         LIMIT ?
         "#
     );
-    let rows = sqlx::query_as::<_, RunEventCount>(&crate::db::q(pool, &sql))
-        .bind(since)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query_as::<_, RunEventCount>(sqlx::AssertSqlSafe(
+        crate::db::q(pool, &sql).into_owned(),
+    ))
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
     Ok(rows)
 }
 
@@ -884,7 +944,7 @@ pub async fn access_failures_recent(
         }
     );
     let sql = crate::db::q(pool, &sql).into_owned();
-    let mut query = sqlx::query_as::<_, AccessFailure>(&sql)
+    let mut query = sqlx::query_as::<_, AccessFailure>(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(since)
         .bind(ACCESS_FAILURE_PREFIX)
         .bind(ACCESS_RECOVERY_PREFIX);
@@ -904,9 +964,10 @@ pub async fn access_failure_is_open(
     action: &str,
     context: Option<&str>,
 ) -> Result<bool> {
-    let newest: Option<String> = sqlx::query_scalar(&crate::db::q(
-        pool,
-        r#"
+    let newest: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         SELECT message
         FROM run_events
         WHERE action_name = ?1
@@ -915,6 +976,8 @@ pub async fn access_failure_is_open(
         ORDER BY ts DESC, id DESC
         LIMIT 1
         "#,
+        )
+        .into_owned(),
     ))
     .bind(action)
     .bind(context)
@@ -938,13 +1001,16 @@ pub async fn run_finish(
     // run has no job in flight, so every break/finish path that reaches here
     // also drops the stale "running" marker. The live stage is
     // cleared the same way so it never outlives its run.
-    sqlx::query(&crate::db::q(
-        pool,
-        r#"
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         UPDATE runs
         SET ended_at = ?, exit_code = ?, jobs_processed = ?, current_job_key = NULL, stage = NULL
         WHERE id = ?
         "#,
+        )
+        .into_owned(),
     ))
     .bind(&now)
     .bind(exit_code as i64)
@@ -954,9 +1020,8 @@ pub async fn run_finish(
     .await?;
     // A finished run has nothing in flight; drop any stale in-flight
     // job markers alongside clearing the legacy single-job marker above.
-    sqlx::query(&crate::db::q(
-        pool,
-        "DELETE FROM run_inflight_jobs WHERE run_id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "DELETE FROM run_inflight_jobs WHERE run_id = ?").into_owned(),
     ))
     .bind(run_id)
     .execute(pool)
@@ -1055,13 +1120,16 @@ pub struct InflightJobRow {
 /// behind for its finished jobs, and the single-instance lock guarantees no
 /// other process is adding rows concurrently.
 pub async fn run_inflight_rows_all(pool: &DbPool) -> Result<Vec<InflightJobRow>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(&crate::db::q(
-        pool,
-        r#"
+    let rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         SELECT r.action_name, rij.job_key
         FROM run_inflight_jobs rij
         JOIN runs r ON r.id = rij.run_id
         "#,
+        )
+        .into_owned(),
     ))
     .fetch_all(pool)
     .await?;
@@ -1109,9 +1177,12 @@ pub async fn reap_orphaned_runs(pool: &DbPool) -> Result<u64> {
 async fn close_open_runs(pool: &DbPool, exit_code: i32) -> Result<u64> {
     let now = now_iso();
     // A dead process reports no stage; clear it with the end state.
-    let result = sqlx::query(&crate::db::q(
-        pool,
-        "UPDATE runs SET ended_at = ?, exit_code = ?, stage = NULL WHERE ended_at IS NULL",
+    let result = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "UPDATE runs SET ended_at = ?, exit_code = ?, stage = NULL WHERE ended_at IS NULL",
+        )
+        .into_owned(),
     ))
     .bind(&now)
     .bind(exit_code as i64)
@@ -1119,9 +1190,11 @@ async fn close_open_runs(pool: &DbPool, exit_code: i32) -> Result<u64> {
     .await?;
     // Nothing of the dead process is in flight, so any in-flight job
     // markers it left are leftovers. Clear them all.
-    sqlx::query(&crate::db::q(pool, "DELETE FROM run_inflight_jobs"))
-        .execute(pool)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "DELETE FROM run_inflight_jobs").into_owned(),
+    ))
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected())
 }
 
@@ -1148,15 +1221,18 @@ pub struct JobOutcome<'a> {
 
 pub async fn job_outcome_insert(pool: &DbPool, r: &JobOutcome<'_>) -> Result<()> {
     let now = now_iso();
-    sqlx::query(&crate::db::q(
-        pool,
-        r#"
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         INSERT INTO job_outcomes (
             run_id, action_name, job_key, attempt, ts, ok,
             claude_ran, claude_ok, claude_cost_usd, attempt_counted,
             summary, stream_log_path, duration_ms, timed_out
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
+        )
+        .into_owned(),
     ))
     .bind(r.run_id)
     .bind(r.action_name)
@@ -1180,9 +1256,12 @@ pub async fn job_outcome_insert(pool: &DbPool, r: &JobOutcome<'_>) -> Result<()>
 // ---- Phase 2: pause + action index --------------------------------------
 
 pub async fn global_pause_status(pool: &DbPool) -> Result<Option<(String, Option<String>)>> {
-    let row: Option<(String, Option<String>)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT paused_at, reason FROM global_pause WHERE id = 1",
+    let row: Option<(String, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT paused_at, reason FROM global_pause WHERE id = 1",
+        )
+        .into_owned(),
     ))
     .fetch_optional(pool)
     .await?;
@@ -1191,12 +1270,15 @@ pub async fn global_pause_status(pool: &DbPool) -> Result<Option<(String, Option
 
 pub async fn global_pause_set(pool: &DbPool, reason: Option<&str>) -> Result<()> {
     let now = now_iso();
-    sqlx::query(&crate::db::q(
-        pool,
-        r#"
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         INSERT INTO global_pause (id, paused_at, reason) VALUES (1, ?, ?)
         ON CONFLICT(id) DO UPDATE SET paused_at = excluded.paused_at, reason = excluded.reason
         "#,
+        )
+        .into_owned(),
     ))
     .bind(&now)
     .bind(reason)
@@ -1206,9 +1288,11 @@ pub async fn global_pause_set(pool: &DbPool, reason: Option<&str>) -> Result<()>
 }
 
 pub async fn global_pause_clear(pool: &DbPool) -> Result<()> {
-    sqlx::query(&crate::db::q(pool, "DELETE FROM global_pause WHERE id = 1"))
-        .execute(pool)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "DELETE FROM global_pause WHERE id = 1").into_owned(),
+    ))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1216,9 +1300,12 @@ pub async fn action_pause_status(
     pool: &DbPool,
     action: &str,
 ) -> Result<Option<(String, Option<String>)>> {
-    let row: Option<(String, Option<String>)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT paused_at, reason FROM paused_actions WHERE action_name = ?",
+    let row: Option<(String, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT paused_at, reason FROM paused_actions WHERE action_name = ?",
+        )
+        .into_owned(),
     ))
     .bind(action)
     .fetch_optional(pool)
@@ -1228,12 +1315,12 @@ pub async fn action_pause_status(
 
 pub async fn action_pause_set(pool: &DbPool, action: &str, reason: Option<&str>) -> Result<()> {
     let now = now_iso();
-    sqlx::query(&crate::db::q(pool,
+    sqlx::query(sqlx::AssertSqlSafe(crate::db::q(pool,
         r#"
         INSERT INTO paused_actions (action_name, paused_at, reason) VALUES (?, ?, ?)
         ON CONFLICT(action_name) DO UPDATE SET paused_at = excluded.paused_at, reason = excluded.reason
         "#,
-    ))
+    ).into_owned()))
     .bind(action)
     .bind(&now)
     .bind(reason)
@@ -1243,9 +1330,8 @@ pub async fn action_pause_set(pool: &DbPool, action: &str, reason: Option<&str>)
 }
 
 pub async fn action_pause_clear(pool: &DbPool, action: &str) -> Result<()> {
-    sqlx::query(&crate::db::q(
-        pool,
-        "DELETE FROM paused_actions WHERE action_name = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "DELETE FROM paused_actions WHERE action_name = ?").into_owned(),
     ))
     .bind(action)
     .execute(pool)
@@ -1293,9 +1379,10 @@ impl sqlx::FromRow<'_, sqlx::any::AnyRow> for ActionIndexRow {
 }
 
 pub async fn action_index_upsert(pool: &DbPool, row: &ActionIndexRow) -> Result<()> {
-    sqlx::query(&crate::db::q(
-        pool,
-        r#"
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         INSERT INTO actions (
             name, file_path, yaml_sha256, enabled,
             schedule_kind, schedule_spec, last_seen_at, parse_error, link_template, max_parallel
@@ -1311,6 +1398,8 @@ pub async fn action_index_upsert(pool: &DbPool, row: &ActionIndexRow) -> Result<
             link_template = excluded.link_template,
             max_parallel = excluded.max_parallel
         "#,
+        )
+        .into_owned(),
     ))
     .bind(&row.name)
     .bind(&row.file_path)
@@ -1328,18 +1417,21 @@ pub async fn action_index_upsert(pool: &DbPool, row: &ActionIndexRow) -> Result<
 }
 
 pub async fn action_index_list(pool: &DbPool) -> Result<Vec<ActionIndexRow>> {
-    let rows = sqlx::query_as::<_, ActionIndexRow>(&crate::db::q(pool,
+    let rows = sqlx::query_as::<_, ActionIndexRow>(sqlx::AssertSqlSafe(crate::db::q(pool,
         "SELECT name, file_path, yaml_sha256, enabled, schedule_kind, schedule_spec, last_seen_at, parse_error, link_template, max_parallel FROM actions ORDER BY name",
-    ))
+    ).into_owned()))
     .fetch_all(pool)
     .await?;
     Ok(rows)
 }
 
 pub async fn action_last_run_started(pool: &DbPool, action: &str) -> Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT started_at FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 1",
+    let row: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT started_at FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 1",
+        )
+        .into_owned(),
     ))
     .bind(action)
     .fetch_optional(pool)
@@ -1351,10 +1443,12 @@ pub async fn action_last_run_started(pool: &DbPool, action: &str) -> Result<Opti
 /// no row matched, mirroring [`secret_delete`]. Only touches the derived index;
 /// the caller is responsible for the on-disk YAML and the runtime purge.
 pub async fn action_index_delete(pool: &DbPool, name: &str) -> Result<bool> {
-    let res = sqlx::query(&crate::db::q(pool, "DELETE FROM actions WHERE name = ?"))
-        .bind(name)
-        .execute(pool)
-        .await?;
+    let res = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "DELETE FROM actions WHERE name = ?").into_owned(),
+    ))
+    .bind(name)
+    .execute(pool)
+    .await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -1364,16 +1458,14 @@ pub async fn action_index_delete(pool: &DbPool, name: &str) -> Result<bool> {
 /// `job_outcomes`) and on-disk stream logs are intentionally left intact so a
 /// re-created same-name action re-associates its audit trail.
 pub async fn action_runtime_purge(pool: &DbPool, name: &str) -> Result<()> {
-    sqlx::query(&crate::db::q(
-        pool,
-        "DELETE FROM attempt_counters WHERE action_name = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "DELETE FROM attempt_counters WHERE action_name = ?").into_owned(),
     ))
     .bind(name)
     .execute(pool)
     .await?;
-    sqlx::query(&crate::db::q(
-        pool,
-        "DELETE FROM daily_ledger WHERE action_name = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "DELETE FROM daily_ledger WHERE action_name = ?").into_owned(),
     ))
     .bind(name)
     .execute(pool)
@@ -1398,9 +1490,12 @@ pub async fn action_purge_state(pool: &DbPool, name: &str) -> Result<bool> {
 /// this holds. The daemon additionally consults its in-memory in-flight set for
 /// a job dispatched but not yet recorded as a run.
 pub async fn action_has_active_run(pool: &DbPool, action: &str) -> Result<bool> {
-    let row: Option<(i64,)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT id FROM runs WHERE action_name = ? AND ended_at IS NULL LIMIT 1",
+    let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT id FROM runs WHERE action_name = ? AND ended_at IS NULL LIMIT 1",
+        )
+        .into_owned(),
     ))
     .bind(action)
     .fetch_optional(pool)
@@ -1427,10 +1522,10 @@ pub struct ActiveRun {
 /// past `run_begin`. The daemon's in-flight map covers that, and the two are
 /// combined in `crate::api::activity`.
 pub async fn active_runs(pool: &DbPool) -> Result<Vec<ActiveRun>> {
-    let rows: Vec<(i64, String, String)> = sqlx::query_as(&crate::db::q(
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(crate::db::q(
         pool,
         "SELECT id, action_name, started_at FROM runs WHERE ended_at IS NULL ORDER BY started_at",
-    ))
+    ).into_owned()))
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -1449,14 +1544,17 @@ pub async fn active_runs(pool: &DbPool) -> Result<Vec<ActiveRun>> {
 /// pickup run never re-claims work another open run already holds. Joins
 /// `run_inflight_jobs` (per-job markers, migration 0007) to the open `runs` rows.
 pub async fn action_inflight_keys(pool: &DbPool, action: &str) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(&crate::db::q(
-        pool,
-        r#"
+    let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         SELECT rij.job_key
         FROM run_inflight_jobs rij
         JOIN runs r ON r.id = rij.run_id
         WHERE r.action_name = ? AND r.ended_at IS NULL
         "#,
+        )
+        .into_owned(),
     ))
     .bind(action)
     .fetch_all(pool)
@@ -1471,15 +1569,18 @@ pub async fn action_inflight_keys(pool: &DbPool, action: &str) -> Result<Vec<Str
 /// only park on the KeyGate. NULL `concurrency_key` values (rows written before
 /// migration 0016) are ignored. Joins `run_inflight_jobs` to the open `runs`.
 pub async fn action_inflight_concurrency_keys(pool: &DbPool, action: &str) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(&crate::db::q(
-        pool,
-        r#"
+    let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         SELECT DISTINCT rij.concurrency_key
         FROM run_inflight_jobs rij
         JOIN runs r ON r.id = rij.run_id
         WHERE r.action_name = ? AND r.ended_at IS NULL
           AND rij.concurrency_key IS NOT NULL
         "#,
+        )
+        .into_owned(),
     ))
     .bind(action)
     .fetch_all(pool)
@@ -1500,9 +1601,12 @@ pub struct SecretMeta {
 
 /// List stored secrets (names + timestamps only), alphabetical by name.
 pub async fn secret_list(pool: &DbPool) -> Result<Vec<SecretMeta>> {
-    let rows = sqlx::query_as::<_, SecretMeta>(&crate::db::q(
-        pool,
-        "SELECT name, created_at, last_used_at FROM secrets ORDER BY name",
+    let rows = sqlx::query_as::<_, SecretMeta>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT name, created_at, last_used_at FROM secrets ORDER BY name",
+        )
+        .into_owned(),
     ))
     .fetch_all(pool)
     .await?;
@@ -1511,11 +1615,12 @@ pub async fn secret_list(pool: &DbPool) -> Result<Vec<SecretMeta>> {
 
 /// True when a secret with `name` already exists.
 pub async fn secret_exists(pool: &DbPool, name: &str) -> Result<bool> {
-    let row: Option<(i64,)> =
-        sqlx::query_as(&crate::db::q(pool, "SELECT id FROM secrets WHERE name = ?"))
-            .bind(name)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "SELECT id FROM secrets WHERE name = ?").into_owned(),
+    ))
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.is_some())
 }
 
@@ -1523,9 +1628,12 @@ pub async fn secret_exists(pool: &DbPool, name: &str) -> Result<bool> {
 /// callers should check [`secret_exists`] first for a friendly message.
 pub async fn secret_create(pool: &DbPool, name: &str, ciphertext: &[u8]) -> Result<()> {
     let now = now_iso();
-    sqlx::query(&crate::db::q(
-        pool,
-        "INSERT INTO secrets (name, ciphertext, created_at) VALUES (?, ?, ?)",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "INSERT INTO secrets (name, ciphertext, created_at) VALUES (?, ?, ?)",
+        )
+        .into_owned(),
     ))
     .bind(name)
     .bind(ciphertext)
@@ -1538,9 +1646,8 @@ pub async fn secret_create(pool: &DbPool, name: &str, ciphertext: &[u8]) -> Resu
 /// Rotate an existing secret's value in place (keeps `created_at`). Returns
 /// `false` when no secret with `name` exists.
 pub async fn secret_rotate(pool: &DbPool, name: &str, ciphertext: &[u8]) -> Result<bool> {
-    let res = sqlx::query(&crate::db::q(
-        pool,
-        "UPDATE secrets SET ciphertext = ? WHERE name = ?",
+    let res = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "UPDATE secrets SET ciphertext = ? WHERE name = ?").into_owned(),
     ))
     .bind(ciphertext)
     .bind(name)
@@ -1551,18 +1658,19 @@ pub async fn secret_rotate(pool: &DbPool, name: &str, ciphertext: &[u8]) -> Resu
 
 /// Delete a secret. Returns `false` when no secret with `name` exists.
 pub async fn secret_delete(pool: &DbPool, name: &str) -> Result<bool> {
-    let res = sqlx::query(&crate::db::q(pool, "DELETE FROM secrets WHERE name = ?"))
-        .bind(name)
-        .execute(pool)
-        .await?;
+    let res = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "DELETE FROM secrets WHERE name = ?").into_owned(),
+    ))
+    .bind(name)
+    .execute(pool)
+    .await?;
     Ok(res.rows_affected() > 0)
 }
 
 /// Fetch a secret's raw ciphertext for decryption at run time.
 pub async fn secret_get_ciphertext(pool: &DbPool, name: &str) -> Result<Option<Vec<u8>>> {
-    let row: Option<(Vec<u8>,)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT ciphertext FROM secrets WHERE name = ?",
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "SELECT ciphertext FROM secrets WHERE name = ?").into_owned(),
     ))
     .bind(name)
     .fetch_optional(pool)
@@ -1573,9 +1681,8 @@ pub async fn secret_get_ciphertext(pool: &DbPool, name: &str) -> Result<Option<V
 /// Bump a secret's `last_used_at` to now (best-effort run-time audit).
 pub async fn secret_touch(pool: &DbPool, name: &str) -> Result<()> {
     let now = now_iso();
-    sqlx::query(&crate::db::q(
-        pool,
-        "UPDATE secrets SET last_used_at = ? WHERE name = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "UPDATE secrets SET last_used_at = ? WHERE name = ?").into_owned(),
     ))
     .bind(&now)
     .bind(name)
@@ -1651,10 +1758,11 @@ const RUN_RECORD_COLUMNS: &str = "id, action_name, started_at, ended_at, exit_co
 /// One `runs` row by id, or `None` when no run has that id.
 pub async fn run_get(pool: &DbPool, run_id: i64) -> Result<Option<RunRecord>> {
     let sql = format!("SELECT {RUN_RECORD_COLUMNS} FROM runs WHERE id = ?");
-    let row = sqlx::query_as::<_, RunRecord>(&crate::db::q(pool, &sql))
-        .bind(run_id)
-        .fetch_optional(pool)
-        .await?;
+    let row =
+        sqlx::query_as::<_, RunRecord>(sqlx::AssertSqlSafe(crate::db::q(pool, &sql).into_owned()))
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row)
 }
 
@@ -1686,7 +1794,7 @@ pub async fn runs_list(
     }
     sql.push_str(" ORDER BY started_at DESC LIMIT ?");
     let dialect_sql = crate::db::q(pool, &sql);
-    let mut q = sqlx::query_as::<_, RunRecord>(&dialect_sql);
+    let mut q = sqlx::query_as::<_, RunRecord>(sqlx::AssertSqlSafe(dialect_sql.as_ref()));
     if let Some(a) = action {
         q = q.bind(a);
     }
@@ -1736,11 +1844,14 @@ impl sqlx::FromRow<'_, sqlx::any::AnyRow> for JobOutcomeRecord {
 
 /// Every `job_outcomes` row for one run, oldest attempt first.
 pub async fn job_outcomes_for_run(pool: &DbPool, run_id: i64) -> Result<Vec<JobOutcomeRecord>> {
-    let rows = sqlx::query_as::<_, JobOutcomeRecord>(&crate::db::q(
-        pool,
-        "SELECT job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, \
+    let rows = sqlx::query_as::<_, JobOutcomeRecord>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, \
          duration_ms, timed_out, summary, stream_log_path \
          FROM job_outcomes WHERE run_id = ? ORDER BY id ASC",
+        )
+        .into_owned(),
     ))
     .bind(run_id)
     .fetch_all(pool)
@@ -1751,10 +1862,13 @@ pub async fn job_outcomes_for_run(pool: &DbPool, run_id: i64) -> Result<Vec<JobO
 /// This run's `run_events`, warn/error diagnostics first (then newest first
 /// within each group), for `mcp stdio`'s `get_run` tool.
 pub async fn run_events_for_run(pool: &DbPool, run_id: i64) -> Result<Vec<RunEventRecord>> {
-    let rows = sqlx::query_as::<_, RunEventRecord>(&crate::db::q(
-        pool,
-        "SELECT run_id, ts, level, context, message FROM run_events WHERE run_id = ? \
+    let rows = sqlx::query_as::<_, RunEventRecord>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT run_id, ts, level, context, message FROM run_events WHERE run_id = ? \
          ORDER BY (CASE WHEN level IN ('warn', 'error') THEN 0 ELSE 1 END), ts DESC, id DESC",
+        )
+        .into_owned(),
     ))
     .bind(run_id)
     .fetch_all(pool)
@@ -1775,10 +1889,13 @@ pub async fn job_outcome_stream_log(
 ) -> Result<Option<(i64, Option<String>)>> {
     let row: Option<(i64, Option<String>)> = match attempt {
         Some(a) => {
-            sqlx::query_as(&crate::db::q(
-                pool,
-                "SELECT attempt, stream_log_path FROM job_outcomes \
+            sqlx::query_as(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    pool,
+                    "SELECT attempt, stream_log_path FROM job_outcomes \
                  WHERE run_id = ? AND job_key = ? AND attempt = ?",
+                )
+                .into_owned(),
             ))
             .bind(run_id)
             .bind(job_key)
@@ -1787,10 +1904,13 @@ pub async fn job_outcome_stream_log(
             .await?
         }
         None => {
-            sqlx::query_as(&crate::db::q(
-                pool,
-                "SELECT attempt, stream_log_path FROM job_outcomes \
+            sqlx::query_as(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    pool,
+                    "SELECT attempt, stream_log_path FROM job_outcomes \
                  WHERE run_id = ? AND job_key = ? ORDER BY attempt DESC LIMIT 1",
+                )
+                .into_owned(),
             ))
             .bind(run_id)
             .bind(job_key)
@@ -1810,9 +1930,8 @@ mod tests {
     }
 
     async fn stage_of(pool: &DbPool, run_id: i64) -> Option<String> {
-        sqlx::query_scalar::<_, Option<String>>(&crate::db::q(
-            pool,
-            "SELECT stage FROM runs WHERE id = ?",
+        sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(
+            crate::db::q(pool, "SELECT stage FROM runs WHERE id = ?").into_owned(),
         ))
         .bind(run_id)
         .fetch_one(pool)
@@ -1968,9 +2087,8 @@ mod tests {
     }
 
     async fn exit_code_of(pool: &DbPool, run_id: i64) -> Option<i64> {
-        sqlx::query_scalar::<_, Option<i64>>(&crate::db::q(
-            pool,
-            "SELECT exit_code FROM runs WHERE id = ?",
+        sqlx::query_scalar::<_, Option<i64>>(sqlx::AssertSqlSafe(
+            crate::db::q(pool, "SELECT exit_code FROM runs WHERE id = ?").into_owned(),
         ))
         .bind(run_id)
         .fetch_one(pool)
@@ -1979,9 +2097,8 @@ mod tests {
     }
 
     async fn ended_at_of(pool: &DbPool, run_id: i64) -> Option<String> {
-        sqlx::query_scalar::<_, Option<String>>(&crate::db::q(
-            pool,
-            "SELECT ended_at FROM runs WHERE id = ?",
+        sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(
+            crate::db::q(pool, "SELECT ended_at FROM runs WHERE id = ?").into_owned(),
         ))
         .bind(run_id)
         .fetch_one(pool)
@@ -2002,9 +2119,8 @@ mod tests {
 
         assert_eq!(exit_code_of(&pool, run).await, Some(crate::exit::OK as i64));
         assert!(ended_at_of(&pool, run).await.is_some());
-        let processed: i64 = sqlx::query_scalar(&crate::db::q(
-            &pool,
-            "SELECT jobs_processed FROM runs WHERE id = ?",
+        let processed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT jobs_processed FROM runs WHERE id = ?").into_owned(),
         ))
         .bind(run)
         .fetch_one(&pool)
@@ -2324,9 +2440,12 @@ mod tests {
         .unwrap();
 
         // The timed_out column persisted exactly for the timeout job.
-        let flag: i64 = sqlx::query_scalar(&crate::db::q(
-            &pool,
-            "SELECT timed_out FROM job_outcomes WHERE job_key = 'TIMEOUT-1'",
+        let flag: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "SELECT timed_out FROM job_outcomes WHERE job_key = 'TIMEOUT-1'",
+            )
+            .into_owned(),
         ))
         .fetch_one(&pool)
         .await
@@ -2335,9 +2454,9 @@ mod tests {
 
         // The web failed-job count (ok = 0 AND timed_out = 0) sees only the
         // hard failure, not the timeout.
-        let failed: i64 = sqlx::query_scalar(&crate::db::q(&pool,
+        let failed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(crate::db::q(&pool,
             "SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = ? AND o.ok = 0 AND o.timed_out = 0",
-        ))
+        ).into_owned()))
         .bind(run_id)
         .fetch_one(&pool)
         .await
@@ -2363,9 +2482,8 @@ mod tests {
     }
 
     async fn runs_count(pool: &DbPool, action: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>(&crate::db::q(
-            pool,
-            "SELECT COUNT(*) FROM runs WHERE action_name = ?",
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(
+            crate::db::q(pool, "SELECT COUNT(*) FROM runs WHERE action_name = ?").into_owned(),
         ))
         .bind(action)
         .fetch_one(pool)
@@ -2761,9 +2879,12 @@ mod tests {
             .unwrap();
 
         // Age the row, then re-arm with a CHANGED blocker set (a blocker cleared).
-        sqlx::query(&crate::db::q(
-            &pool,
-            "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = 'AUD-31'",
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = 'AUD-31'",
+            )
+            .into_owned(),
         ))
         .bind(first.blocked_since_ms - 7_200_000)
         .execute(&pool)
@@ -2899,18 +3020,24 @@ mod tests {
         dependency_gate_upsert(&pool, "other", "TR-8", now + 240_000, "TR-7 (depends on)")
             .await
             .unwrap();
-        sqlx::query(&crate::db::q(
-            &pool,
-            "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = ?",
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = ?",
+            )
+            .into_owned(),
         ))
         .bind(now - 7_200_000)
         .bind("AUD-31")
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(&crate::db::q(
-            &pool,
-            "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = ?",
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = ?",
+            )
+            .into_owned(),
         ))
         .bind(now - 93_600_000)
         .bind("TR-8")

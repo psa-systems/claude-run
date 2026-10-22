@@ -670,9 +670,10 @@ pub(crate) async fn try_record_invocation(
     // force a fresh Parse on every execution or a later non-NULL bind on the
     // same connection sends 8 bytes into a `float4` slot and Postgres
     // rejects it with 22P03.
-    sqlx::query(&crate::db::q(
-        pool,
-        r#"
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
         INSERT INTO claude_invocations (
             ts, action, job_key, run_id, exit_code, timed_out, ok, cost_usd,
             total_tokens, rate_limit_status, rate_limit_type,
@@ -688,6 +689,8 @@ pub(crate) async fn try_record_invocation(
             ?, ?, ?, ?
         )
         "#,
+        )
+        .into_owned(),
     ))
     .persistent(false)
     .bind(crate::state::now_iso())
@@ -1161,9 +1164,12 @@ mod tests {
             "stream.jsonl",
             &[rate_limit_event("allowed", 0.42, 0.10, false, "none")],
         );
-        let run_id: i64 = sqlx::query_scalar(&crate::db::q(
-            &pool,
-            "INSERT INTO runs (action_name, started_at) VALUES (?, ?) RETURNING id",
+        let run_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "INSERT INTO runs (action_name, started_at) VALUES (?, ?) RETURNING id",
+            )
+            .into_owned(),
         ))
         .bind("youtrack")
         .bind("2026-09-01T00:00:00Z")
@@ -1177,10 +1183,10 @@ mod tests {
         r.usage = parse_stream_usage(&log);
         record_invocation(&pool, "youtrack", Some("CLAUDE-1"), Some(run_id), &log, &r).await;
 
-        let row: (String, Option<String>, Option<i64>, f64, Option<f64>) = sqlx::query_as(&crate::db::q(
+        let row: (String, Option<String>, Option<i64>, f64, Option<f64>) = sqlx::query_as(sqlx::AssertSqlSafe(crate::db::q(
             &pool,
             "SELECT action, job_key, run_id, cost_usd, five_hour_utilization FROM claude_invocations",
-        ))
+        ).into_owned()))
         .fetch_one(&pool)
         .await
         .unwrap();

@@ -1821,12 +1821,15 @@ async fn docker_gc_loop(cfg: Arc<tokio::sync::RwLock<crate::config::DockerGcConf
 async fn inflight_stream_log_jobs(
     pool: &DbPool,
 ) -> Result<std::collections::HashSet<(String, String)>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT r.action_name, j.job_key
+    let rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT r.action_name, j.job_key
          FROM run_inflight_jobs j
          JOIN runs r ON r.id = j.run_id
          WHERE r.ended_at IS NULL",
+        )
+        .into_owned(),
     ))
     .fetch_all(pool)
     .await?;
@@ -2639,10 +2642,12 @@ mod tests {
         Arc::get_mut(&mut dispatch).unwrap().readiness = gate.clone();
         dispatch.execute("act", "test").await.unwrap();
 
-        let runs: i64 = sqlx::query_scalar(&crate::db::q(&pool, "SELECT COUNT(*) FROM runs"))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let runs: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT COUNT(*) FROM runs").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(runs, 0, "no run row may be opened while unready");
 
         // The credential appearing is all it takes; nothing else is consulted.
@@ -2910,9 +2915,8 @@ mod tests {
         );
 
         // History survives the prune.
-        let runs: i64 = sqlx::query_scalar(&crate::db::q(
-            &pool,
-            "SELECT COUNT(*) FROM runs WHERE action_name = ?",
+        let runs: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT COUNT(*) FROM runs WHERE action_name = ?").into_owned(),
         ))
         .bind("doomed")
         .fetch_one(&pool)

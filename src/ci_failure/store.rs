@@ -114,7 +114,7 @@ pub async fn find_match(
          LIMIT 1"
     );
     let sql = db::q(pool, &sql).into_owned();
-    let mut query = sqlx::query(&sql)
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(repo)
         .bind(workflow_id)
         .bind(job_name);
@@ -134,11 +134,11 @@ pub async fn find_match(
 
 /// Fetch one `ci_failures` row by id.
 pub async fn get_failure(pool: &DbPool, id: i64) -> Result<Option<Failure>> {
-    let row = sqlx::query(&db::q(
+    let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
         "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, created_at, updated_at \
          FROM ci_failures WHERE id = ?",
-    ))
+    ).into_owned()))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -157,11 +157,11 @@ pub async fn record_failure(
     state: &str,
     now: &str,
 ) -> Result<i64> {
-    let id: i64 = sqlx::query_scalar(&db::q(
+    let id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(db::q(
         pool,
         "INSERT INTO ci_failures (repo, workflow_id, job_name, infra_kind, issue_key, state, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-    ))
+    ).into_owned()))
     .bind(repo)
     .bind(workflow_id)
     .bind(job_name)
@@ -179,10 +179,13 @@ pub async fn record_failure(
 /// already recorded on a repeat sighting is skipped rather than erroring.
 pub async fn add_tests(pool: &DbPool, failure_id: i64, test_ids: &[String]) -> Result<()> {
     for test_id in test_ids {
-        sqlx::query(&db::q(
-            pool,
-            "INSERT INTO ci_failure_tests (failure_id, test_id) VALUES (?, ?) \
+        sqlx::query(sqlx::AssertSqlSafe(
+            db::q(
+                pool,
+                "INSERT INTO ci_failure_tests (failure_id, test_id) VALUES (?, ?) \
              ON CONFLICT DO NOTHING",
+            )
+            .into_owned(),
         ))
         .bind(failure_id)
         .bind(test_id)
@@ -202,11 +205,11 @@ pub async fn attach_run(
     pr_number: Option<i64>,
     ts: &str,
 ) -> Result<i64> {
-    let id: i64 = sqlx::query_scalar(&db::q(
+    let id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(db::q(
         pool,
         "INSERT INTO ci_failure_runs (failure_id, run_index, commit_sha, branch, pr_number, ts) \
          VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
-    ))
+    ).into_owned()))
     .bind(failure_id)
     .bind(run_index)
     .bind(commit_sha)
@@ -231,9 +234,8 @@ pub async fn set_run_test_ids(pool: &DbPool, run_id: i64, test_ids: &[String]) -
     } else {
         Some(test_ids.join("\n"))
     };
-    sqlx::query(&db::q(
-        pool,
-        "UPDATE ci_failure_runs SET test_ids = ? WHERE id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        db::q(pool, "UPDATE ci_failure_runs SET test_ids = ? WHERE id = ?").into_owned(),
     ))
     .bind(joined)
     .bind(run_id)
@@ -255,11 +257,14 @@ pub async fn previous_run_test_ids(
     pr_number: i64,
     before_run_id: i64,
 ) -> Result<Option<(i64, Vec<String>)>> {
-    let row: Option<(i64, Option<String>)> = sqlx::query_as(&db::q(
-        pool,
-        "SELECT run_index, test_ids FROM ci_failure_runs \
+    let row: Option<(i64, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "SELECT run_index, test_ids FROM ci_failure_runs \
          WHERE failure_id = ? AND pr_number = ? AND id < ? \
          ORDER BY id DESC LIMIT 1",
+        )
+        .into_owned(),
     ))
     .bind(failure_id)
     .bind(pr_number)
@@ -279,9 +284,12 @@ pub async fn set_issue(
     issue_key: Option<&str>,
     now: &str,
 ) -> Result<()> {
-    sqlx::query(&db::q(
-        pool,
-        "UPDATE ci_failures SET issue_key = ?, updated_at = ? WHERE id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "UPDATE ci_failures SET issue_key = ?, updated_at = ? WHERE id = ?",
+        )
+        .into_owned(),
     ))
     .bind(issue_key)
     .bind(now)
@@ -298,9 +306,12 @@ pub async fn set_failure_state(
     state: &str,
     now: &str,
 ) -> Result<()> {
-    sqlx::query(&db::q(
-        pool,
-        "UPDATE ci_failures SET state = ?, updated_at = ? WHERE id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "UPDATE ci_failures SET state = ?, updated_at = ? WHERE id = ?",
+        )
+        .into_owned(),
     ))
     .bind(state)
     .bind(now)
@@ -312,9 +323,12 @@ pub async fn set_failure_state(
 
 /// Every distinct branch `failure_id` has been seen on, sorted.
 pub async fn distinct_branches(pool: &DbPool, failure_id: i64) -> Result<Vec<String>> {
-    let branches: Vec<String> = sqlx::query_scalar(&db::q(
-        pool,
-        "SELECT DISTINCT branch FROM ci_failure_runs WHERE failure_id = ? ORDER BY branch",
+    let branches: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "SELECT DISTINCT branch FROM ci_failure_runs WHERE failure_id = ? ORDER BY branch",
+        )
+        .into_owned(),
     ))
     .bind(failure_id)
     .fetch_all(pool)
@@ -326,11 +340,11 @@ pub async fn distinct_branches(pool: &DbPool, failure_id: i64) -> Result<Vec<Str
 /// used to find or lazily create the store row backing an agent's own PR, whose
 /// `ci_failures` row is addressed by issue key rather than by test overlap).
 pub async fn failure_for_issue(pool: &DbPool, issue_key: &str) -> Result<Option<Failure>> {
-    let row = sqlx::query(&db::q(
+    let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
         "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, created_at, updated_at \
          FROM ci_failures WHERE issue_key = ?",
-    ))
+    ).into_owned()))
     .bind(issue_key)
     .fetch_optional(pool)
     .await?;
@@ -341,10 +355,13 @@ pub async fn failure_for_issue(pool: &DbPool, issue_key: &str) -> Result<Option<
 /// sorted. CLAUDE-276: used to comment the same issue link onto every open
 /// PR a `pr_only` failure's two distinct branches turned out to be on.
 pub async fn pr_numbers_for_failure(pool: &DbPool, failure_id: i64) -> Result<Vec<i64>> {
-    let numbers: Vec<i64> = sqlx::query_scalar(&db::q(
-        pool,
-        "SELECT DISTINCT pr_number FROM ci_failure_runs \
+    let numbers: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "SELECT DISTINCT pr_number FROM ci_failure_runs \
          WHERE failure_id = ? AND pr_number IS NOT NULL ORDER BY pr_number",
+        )
+        .into_owned(),
     ))
     .bind(failure_id)
     .fetch_all(pool)
@@ -360,10 +377,13 @@ pub async fn run_indexes_for_failure_pr(
     failure_id: i64,
     pr_number: i64,
 ) -> Result<Vec<i64>> {
-    let indexes: Vec<i64> = sqlx::query_scalar(&db::q(
-        pool,
-        "SELECT run_index FROM ci_failure_runs \
+    let indexes: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "SELECT run_index FROM ci_failure_runs \
          WHERE failure_id = ? AND pr_number = ? ORDER BY run_index",
+        )
+        .into_owned(),
     ))
     .bind(failure_id)
     .bind(pr_number)
@@ -388,7 +408,7 @@ pub async fn list_failures(pool: &DbPool, state: Option<&str>, limit: i64) -> Re
         }
     };
     let dialect_sql = db::q(pool, sql);
-    let mut query = sqlx::query(&dialect_sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(dialect_sql.as_ref()));
     if let Some(s) = state {
         query = query.bind(s);
     }
@@ -412,12 +432,12 @@ pub async fn record_agent_pr(
     salvaged: bool,
     now: &str,
 ) -> Result<i64> {
-    let id: i64 = sqlx::query_scalar(&db::q(
+    let id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(db::q(
         pool,
         "INSERT INTO agent_pull_requests \
          (action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?) RETURNING id",
-    ))
+    ).into_owned()))
     .bind(action_name)
     .bind(issue_key)
     .bind(host)
@@ -436,9 +456,12 @@ pub async fn record_agent_pr(
 /// Clear `id`'s `salvaged` flag: called only from the resumed-success path
 /// (CLAUDE-429), once a resumed run on a salvaged PR finishes successfully.
 pub async fn clear_salvaged(pool: &DbPool, id: i64, now: &str) -> Result<()> {
-    sqlx::query(&db::q(
-        pool,
-        "UPDATE agent_pull_requests SET salvaged = 0, updated_at = ? WHERE id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "UPDATE agent_pull_requests SET salvaged = 0, updated_at = ? WHERE id = ?",
+        )
+        .into_owned(),
     ))
     .bind(now)
     .bind(id)
@@ -455,11 +478,11 @@ pub async fn agent_pr(
     repo: &str,
     pr_number: i64,
 ) -> Result<Option<AgentPullRequest>> {
-    let row = sqlx::query(&db::q(
+    let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
         "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at \
          FROM agent_pull_requests WHERE host = ? AND repo = ? AND pr_number = ?",
-    ))
+    ).into_owned()))
     .bind(host)
     .bind(repo)
     .bind(pr_number)
@@ -475,11 +498,11 @@ pub async fn agent_pr_for_issue(
     pool: &DbPool,
     issue_key: &str,
 ) -> Result<Option<AgentPullRequest>> {
-    let row = sqlx::query(&db::q(
+    let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
         "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at \
          FROM agent_pull_requests WHERE issue_key = ? ORDER BY updated_at DESC LIMIT 1",
-    ))
+    ).into_owned()))
     .bind(issue_key)
     .fetch_optional(pool)
     .await?;
@@ -491,11 +514,11 @@ pub async fn agent_pr_for_issue(
 /// missed delivery must not leave a green PR stuck at Code Review forever, so
 /// the reconciler walks this list on its own tick independent of any webhook.
 pub async fn open_agent_prs(pool: &DbPool) -> Result<Vec<AgentPullRequest>> {
-    let rows = sqlx::query(&db::q(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
         "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at \
          FROM agent_pull_requests WHERE state = 'open' ORDER BY id",
-    ))
+    ).into_owned()))
     .fetch_all(pool)
     .await?;
     rows.iter().map(agent_pr_from_row).collect()
@@ -503,10 +526,10 @@ pub async fn open_agent_prs(pool: &DbPool) -> Result<Vec<AgentPullRequest>> {
 
 /// Increment `id`'s `fix_attempts` by one.
 pub async fn bump_fix_attempts(pool: &DbPool, id: i64, now: &str) -> Result<()> {
-    sqlx::query(&db::q(
+    sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
         "UPDATE agent_pull_requests SET fix_attempts = fix_attempts + 1, updated_at = ? WHERE id = ?",
-    ))
+    ).into_owned()))
     .bind(now)
     .bind(id)
     .execute(pool)
@@ -516,9 +539,12 @@ pub async fn bump_fix_attempts(pool: &DbPool, id: i64, now: &str) -> Result<()> 
 
 /// Transition `id` to `state` (`open`, `merged`, `closed`).
 pub async fn set_agent_pr_state(pool: &DbPool, id: i64, state: &str, now: &str) -> Result<()> {
-    sqlx::query(&db::q(
-        pool,
-        "UPDATE agent_pull_requests SET state = ?, updated_at = ? WHERE id = ?",
+    sqlx::query(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "UPDATE agent_pull_requests SET state = ?, updated_at = ? WHERE id = ?",
+        )
+        .into_owned(),
     ))
     .bind(state)
     .bind(now)
@@ -558,9 +584,8 @@ mod tests {
         add_tests(pool, id, &ids).await.unwrap();
         // record_failure always stamps `now` for both timestamps; tests that
         // need a specific updated_at (for the tie-break case) set it directly.
-        sqlx::query(&db::q(
-            pool,
-            "UPDATE ci_failures SET updated_at = ? WHERE id = ?",
+        sqlx::query(sqlx::AssertSqlSafe(
+            db::q(pool, "UPDATE ci_failures SET updated_at = ? WHERE id = ?").into_owned(),
         ))
         .bind(updated_at)
         .bind(id)

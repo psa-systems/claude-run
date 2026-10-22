@@ -8351,9 +8351,9 @@ mod tests {
             .unwrap();
         assert!(matches!(d, GateDecision::Blocked { .. }));
         let aged = state::now_epoch_ms() - 3 * 3_600_000;
-        sqlx::query(&crate::db::q(&pool,
+        sqlx::query(sqlx::AssertSqlSafe(crate::db::q(&pool,
             "UPDATE dependency_gate SET blocked_since = ?, blocked_until = ? WHERE job_key = 'AUD-31'",
-        ))
+        ).into_owned()))
         .bind(aged)
         .bind(state::now_epoch_ms() - 1000)
         .execute(&pool)
