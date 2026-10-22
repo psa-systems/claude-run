@@ -345,7 +345,7 @@ async fn copy_table(
     let insert = format!("INSERT INTO {table} ({names}) VALUES ({placeholders})");
     let insert = db::q(target, &insert).into_owned();
 
-    let rows = sqlx::query(&db::q(source, &select))
+    let rows = sqlx::query(sqlx::AssertSqlSafe(db::q(source, &select).into_owned()))
         .fetch_all(source)
         .await?;
     let mut copied = 0i64;
@@ -355,7 +355,7 @@ async fn copy_table(
         // connection, so a NULL in a nullable REAL column on one row and a
         // real value in the same column on a later row of the same table
         // must not share a cached Parse.
-        let mut query = sqlx::query(&insert).persistent(false);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(insert.as_str())).persistent(false);
         for (i, column) in columns.iter().enumerate() {
             query = match column.kind {
                 ColumnKind::Int => query.bind(cell::<i64>(row, i, table, column)?),
@@ -408,22 +408,26 @@ async fn reset_identity_sequences(
             "SELECT setval(pg_get_serial_sequence('{table}', '{column}'), \
              COALESCE((SELECT MAX({column}) FROM {table}), 0) + 1, false)"
         );
-        sqlx::query(&sql).execute(&mut **tx).await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut **tx)
+            .await?;
     }
     Ok(())
 }
 
 async fn count_rows(pool: &DbPool, table: &str) -> Result<i64> {
-    let n: i64 = sqlx::query_scalar(&db::q(pool, &format!("SELECT COUNT(*) FROM {table}")))
-        .fetch_one(pool)
-        .await?;
+    let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        db::q(pool, &format!("SELECT COUNT(*) FROM {table}")).into_owned(),
+    ))
+    .fetch_one(pool)
+    .await?;
     Ok(n)
 }
 
 async fn count_rows_tx(tx: &mut sqlx::Transaction<'_, sqlx::Any>, table: &str) -> Result<i64> {
     // COUNT(*) needs no rewrite on either backend, so this reads the same
     // uncommitted state the copy is writing without going back to the pool.
-    let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+    let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
         .fetch_one(&mut **tx)
         .await?;
     Ok(n)
@@ -562,16 +566,16 @@ mod tests {
     /// per-type round trip.
     async fn seed(pool: &DbPool) {
         let q = |sql: &str| db::q(pool, sql).into_owned();
-        sqlx::query(&q("INSERT INTO actions (name, file_path, yaml_sha256, enabled, schedule_kind, schedule_spec, last_seen_at, max_parallel) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"))
+        sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO actions (name, file_path, yaml_sha256, enabled, schedule_kind, schedule_spec, last_seen_at, max_parallel) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")))
             .bind("youtrack").bind("/c/actions/youtrack.yml").bind("abc").bind(1i64)
             .bind("interval").bind("30m").bind("2026-09-01T00:00:00Z").bind(2i64)
             .execute(pool).await.unwrap();
-        sqlx::query(&q("INSERT INTO attempt_counters (action_name, job_key, count, last_at) VALUES (?, ?, ?, ?)"))
+        sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO attempt_counters (action_name, job_key, count, last_at) VALUES (?, ?, ?, ?)")))
             .bind("youtrack").bind("CLAUDE-1").bind(3i64).bind("2026-09-01T00:00:00Z")
             .execute(pool).await.unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO daily_ledger (action_name, date, run_count, cost_usd) VALUES (?, ?, ?, ?)",
-        ))
+        )))
         .bind("youtrack")
         .bind("2026-09-01")
         .bind(4i64)
@@ -579,31 +583,31 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(&q("INSERT INTO dependency_gate (action_name, job_key, blocked_until, signature, updated_at, blocked_since) VALUES (?, ?, ?, ?, ?, ?)"))
+        sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO dependency_gate (action_name, job_key, blocked_until, signature, updated_at, blocked_since) VALUES (?, ?, ?, ?, ?, ?)")))
             .bind("youtrack").bind("CLAUDE-2").bind(1_700_000_000_000i64).bind("sig")
             .bind("2026-09-01T00:00:00Z").bind(1_600_000_000_000i64)
             .execute(pool).await.unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO global_pause (id, paused_at, reason) VALUES (?, ?, ?)",
-        ))
+        )))
         .bind(1i64)
         .bind("2026-09-01T00:00:00Z")
         .bind("upgrade")
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO paused_actions (action_name, paused_at, reason) VALUES (?, ?, ?)",
-        ))
+        )))
         .bind("webhook-triage")
         .bind("2026-09-01T00:00:00Z")
         .bind("noisy")
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO secrets (name, ciphertext, created_at, last_used_at) VALUES (?, ?, ?, ?)",
-        ))
+        )))
         .bind("web-auth")
         .bind(vec![0u8, 159, 146, 150, 255])
         .bind("2026-09-01T00:00:00Z")
@@ -611,35 +615,35 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
-        ))
+        )))
         .bind("config.claude")
         .bind(r#"{"model":null}"#)
         .bind("2026-09-01T00:00:00Z")
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(&q("INSERT INTO web_admin (id, username, password_hash, session_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"))
+        sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO web_admin (id, username, password_hash, session_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")))
             .bind(1i64).bind("admin").bind("$argon2id$v=19$hash").bind("session-key")
             .bind("2026-09-01T00:00:00Z").bind("2026-09-01T00:00:00Z")
             .execute(pool).await.unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO web_admin_recovery_codes (code_hash, used_at, created_at) VALUES (?, ?, ?)",
-        ))
+        )))
         .bind("$argon2id$v=19$recoveryhash")
         .bind(None::<String>)
         .bind("2026-09-01T00:00:00Z")
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(&q("INSERT INTO web_accounts (id, username, username_key, password_hash, session_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"))
+        sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO web_accounts (id, username, username_key, password_hash, session_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")))
             .bind(1i64).bind("admin").bind("admin").bind("$argon2id$v=19$hash").bind("session-key")
             .bind("2026-09-01T00:00:00Z").bind("2026-09-01T00:00:00Z")
             .execute(pool).await.unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO web_account_recovery_codes (account_id, code_hash, used_at, created_at) VALUES (?, ?, ?, ?)",
-        ))
+        )))
         .bind(1i64)
         .bind("$argon2id$v=19$recoveryhash")
         .bind(None::<String>)
@@ -647,9 +651,9 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO web_invites (token_hash, created_by, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, ?)",
-        ))
+        )))
         .bind("invite-hash")
         .bind(1i64)
         .bind("2026-09-01T00:00:00Z")
@@ -658,29 +662,29 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        let run_id: i64 = sqlx::query_scalar(&q("INSERT INTO runs (action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by) VALUES (?, ?, ?, ?, ?, ?) RETURNING id"))
+        let run_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(q("INSERT INTO runs (action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by) VALUES (?, ?, ?, ?, ?, ?) RETURNING id")))
             .bind("youtrack").bind("2026-09-01T00:00:00Z").bind(None::<String>).bind(None::<i64>).bind(1i64).bind("cli")
             .fetch_one(pool).await.unwrap();
-        sqlx::query(&q("INSERT INTO job_outcomes (run_id, action_name, job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, summary, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+        sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO job_outcomes (run_id, action_name, job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, summary, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")))
             .bind(run_id).bind("youtrack").bind("CLAUDE-1").bind(1i64).bind("2026-09-01T00:00:00Z")
             .bind(1i64).bind(1i64).bind(1i64).bind(0.5f64).bind("done").bind(1234i64)
             .execute(pool).await.unwrap();
-        sqlx::query(&q("INSERT INTO run_events (run_id, action_name, ts, level, context, message) VALUES (?, ?, ?, ?, ?, ?)"))
+        sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO run_events (run_id, action_name, ts, level, context, message) VALUES (?, ?, ?, ?, ?, ?)")))
             .bind(run_id).bind("youtrack").bind("2026-09-01T00:00:00Z").bind("info").bind(None::<String>).bind("started")
             .execute(pool).await.unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO run_inflight_jobs (run_id, job_key, concurrency_key) VALUES (?, ?, ?)",
-        ))
+        )))
         .bind(run_id)
         .bind("CLAUDE-1")
         .bind("repo:claude-run")
         .execute(pool)
         .await
         .unwrap();
-        let failure_id: i64 = sqlx::query_scalar(&q(
+        let failure_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(q(
             "INSERT INTO ci_failures (repo, workflow_id, job_name, infra_kind, issue_key, state, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-        ))
+        )))
         .bind("contoso/claude-run")
         .bind("checks.yml")
         .bind("test")
@@ -692,18 +696,18 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO ci_failure_tests (failure_id, test_id) VALUES (?, ?)",
-        ))
+        )))
         .bind(failure_id)
         .bind("lib::a_test")
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO ci_failure_runs (failure_id, run_index, commit_sha, branch, pr_number, ts) \
              VALUES (?, ?, ?, ?, ?, ?)",
-        ))
+        )))
         .bind(failure_id)
         .bind(1i64)
         .bind("abc123")
@@ -713,11 +717,11 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO agent_pull_requests \
              (action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ))
+        )))
         .bind("youtrack")
         .bind("CLAUDE-1")
         .bind("dev.a8n.run")
@@ -731,7 +735,7 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(&q(
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO claude_invocations \
              (ts, action, job_key, run_id, exit_code, timed_out, ok, cost_usd, total_tokens, \
               rate_limit_status, rate_limit_type, five_hour_utilization, five_hour_resets_at, \
@@ -739,7 +743,7 @@ mod tests {
               max_seven_day_utilization, overage_status, is_using_overage, api_retries_json, \
               stream_log_path) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ))
+        )))
         .bind("2026-09-01T00:00:00Z")
         .bind("youtrack")
         .bind("CLAUDE-1")
@@ -799,9 +803,8 @@ mod tests {
             .await
             .unwrap();
 
-        let ciphertext: Vec<u8> = sqlx::query_scalar(&db::q(
-            &target,
-            "SELECT ciphertext FROM secrets WHERE name = ?",
+        let ciphertext: Vec<u8> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            db::q(&target, "SELECT ciphertext FROM secrets WHERE name = ?").into_owned(),
         ))
         .bind("web-auth")
         .fetch_one(&target)
@@ -809,9 +812,12 @@ mod tests {
         .unwrap();
         assert_eq!(ciphertext, vec![0u8, 159, 146, 150, 255]);
 
-        let cost: f64 = sqlx::query_scalar(&db::q(
-            &target,
-            "SELECT cost_usd FROM daily_ledger WHERE action_name = ?",
+        let cost: f64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            db::q(
+                &target,
+                "SELECT cost_usd FROM daily_ledger WHERE action_name = ?",
+            )
+            .into_owned(),
         ))
         .bind("youtrack")
         .fetch_one(&target)
@@ -819,9 +825,8 @@ mod tests {
         .unwrap();
         assert_eq!(cost, 1.25);
 
-        let hash: String = sqlx::query_scalar(&db::q(
-            &target,
-            "SELECT password_hash FROM web_admin WHERE id = ?",
+        let hash: String = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            db::q(&target, "SELECT password_hash FROM web_admin WHERE id = ?").into_owned(),
         ))
         .bind(1i64)
         .fetch_one(&target)
@@ -830,17 +835,21 @@ mod tests {
         assert_eq!(hash, "$argon2id$v=19$hash");
 
         // A NULL in a nullable column stays NULL rather than becoming a default.
-        let ended: Option<String> =
-            sqlx::query_scalar(&db::q(&target, "SELECT ended_at FROM runs LIMIT 1"))
-                .fetch_one(&target)
-                .await
-                .unwrap();
+        let ended: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            db::q(&target, "SELECT ended_at FROM runs LIMIT 1").into_owned(),
+        ))
+        .fetch_one(&target)
+        .await
+        .unwrap();
         assert_eq!(ended, None);
 
         // The child rows still point at the copied parent.
-        let joined: i64 = sqlx::query_scalar(&db::q(
-            &target,
-            "SELECT COUNT(*) FROM job_outcomes j JOIN runs r ON r.id = j.run_id",
+        let joined: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            db::q(
+                &target,
+                "SELECT COUNT(*) FROM job_outcomes j JOIN runs r ON r.id = j.run_id",
+            )
+            .into_owned(),
         ))
         .fetch_one(&target)
         .await
@@ -885,9 +894,12 @@ mod tests {
             .await
             .unwrap();
 
-        let run_id: i64 = sqlx::query_scalar(&db::q(
-            &target,
-            "INSERT INTO runs (action_name, started_at) VALUES (?, ?) RETURNING id",
+        let run_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            db::q(
+                &target,
+                "INSERT INTO runs (action_name, started_at) VALUES (?, ?) RETURNING id",
+            )
+            .into_owned(),
         ))
         .bind("youtrack")
         .bind("2026-09-02T00:00:00Z")
@@ -896,11 +908,11 @@ mod tests {
         .unwrap();
         assert!(run_id > 5000, "next run id was {run_id}");
 
-        let outcome_id: i64 = sqlx::query_scalar(&db::q(
+        let outcome_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(db::q(
             &target,
             "INSERT INTO job_outcomes (run_id, action_name, job_key, attempt, ts, ok, claude_ran, claude_ok) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-        ))
+        ).into_owned()))
         .bind(run_id)
         .bind("youtrack")
         .bind("CLAUDE-9")
@@ -914,10 +926,13 @@ mod tests {
         .unwrap();
         assert!(outcome_id > 5000, "next job outcome id was {outcome_id}");
 
-        let event_id: i64 = sqlx::query_scalar(&db::q(
-            &target,
-            "INSERT INTO run_events (run_id, action_name, ts, level, message) \
+        let event_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            db::q(
+                &target,
+                "INSERT INTO run_events (run_id, action_name, ts, level, message) \
              VALUES (?, ?, ?, ?, ?) RETURNING id",
+            )
+            .into_owned(),
         ))
         .bind(run_id)
         .bind("youtrack")
@@ -929,9 +944,12 @@ mod tests {
         .unwrap();
         assert!(event_id > 5000, "next run event id was {event_id}");
 
-        let secret_id: i64 = sqlx::query_scalar(&db::q(
-            &target,
-            "INSERT INTO secrets (name, ciphertext, created_at) VALUES (?, ?, ?) RETURNING id",
+        let secret_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            db::q(
+                &target,
+                "INSERT INTO secrets (name, ciphertext, created_at) VALUES (?, ?, ?) RETURNING id",
+            )
+            .into_owned(),
         ))
         .bind("minted-after")
         .bind(vec![7u8, 8])
@@ -941,11 +959,11 @@ mod tests {
         .unwrap();
         assert!(secret_id > 5000, "next secret id was {secret_id}");
 
-        let failure_id: i64 = sqlx::query_scalar(&db::q(
+        let failure_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(db::q(
             &target,
             "INSERT INTO ci_failures (repo, workflow_id, job_name, state, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
-        ))
+        ).into_owned()))
         .bind("contoso/claude-run")
         .bind("checks.yml")
         .bind("test")
@@ -957,10 +975,13 @@ mod tests {
         .unwrap();
         assert!(failure_id > 5000, "next ci_failures id was {failure_id}");
 
-        let run_row_id: i64 = sqlx::query_scalar(&db::q(
-            &target,
-            "INSERT INTO ci_failure_runs (failure_id, run_index, commit_sha, branch, ts) \
+        let run_row_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            db::q(
+                &target,
+                "INSERT INTO ci_failure_runs (failure_id, run_index, commit_sha, branch, ts) \
              VALUES (?, ?, ?, ?, ?) RETURNING id",
+            )
+            .into_owned(),
         ))
         .bind(failure_id)
         .bind(2i64)
@@ -975,12 +996,12 @@ mod tests {
             "next ci_failure_runs id was {run_row_id}"
         );
 
-        let agent_pr_id: i64 = sqlx::query_scalar(&db::q(
+        let agent_pr_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(db::q(
             &target,
             "INSERT INTO agent_pull_requests \
              (action_name, issue_key, host, repo, pr_number, head_branch, state, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-        ))
+        ).into_owned()))
         .bind("youtrack")
         .bind("CLAUDE-2")
         .bind("dev.a8n.run")
@@ -1004,9 +1025,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = seeded_source(dir.path()).await;
         let target = test_pool().await;
-        sqlx::query(&db::q(
-            &target,
-            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+        sqlx::query(sqlx::AssertSqlSafe(
+            db::q(
+                &target,
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+            )
+            .into_owned(),
         ))
         .bind("config.mint")
         .bind("{}")

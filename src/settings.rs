@@ -268,9 +268,8 @@ pub fn format_datetime(rfc3339: &str, prefs: &PreferencesConfig) -> String {
 
 /// Read a raw settings value by key. `None` when the key is absent.
 pub async fn get_raw(pool: &DbPool, key: &str) -> Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as(&crate::db::q(
-        pool,
-        "SELECT value FROM settings WHERE key = ?",
+    let row: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "SELECT value FROM settings WHERE key = ?").into_owned(),
     ))
     .bind(key)
     .fetch_optional(pool)
@@ -280,10 +279,13 @@ pub async fn get_raw(pool: &DbPool, key: &str) -> Result<Option<String>> {
 
 /// Upsert a raw settings value.
 pub async fn set_raw(pool: &DbPool, key: &str, value: &str) -> Result<()> {
-    sqlx::query(&crate::db::q(
-        pool,
-        "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        )
+        .into_owned(),
     ))
     .bind(key)
     .bind(value)
@@ -987,10 +989,12 @@ pub async fn retire_email_section(pool: &DbPool) -> Result<()> {
             from = old.from.as_deref().unwrap_or("(none)"),
             "retiring leftover config.email settings row (CLAUDE-428: SMTP is env-only now)"
         );
-        sqlx::query(&crate::db::q(pool, "DELETE FROM settings WHERE key = ?"))
-            .bind("config.email")
-            .execute(pool)
-            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(pool, "DELETE FROM settings WHERE key = ?").into_owned(),
+        ))
+        .bind("config.email")
+        .execute(pool)
+        .await?;
         crate::state::secret_delete(pool, crate::config::SMTP_PASSWORD_SECRET).await?;
     }
     Ok(())
