@@ -123,6 +123,10 @@ pub struct OnDiskConfig {
     /// Which database backend holds the runtime state. Bootstrap,
     /// not a DB-backed setting: it has to be known before the DB is open.
     pub database: DatabaseConfig,
+    /// Remote MCP listener settings (CLAUDE-442): bind, public URL, admin
+    /// bootstrap email, extra allowed `Host` values. Bootstrap, like `web` and
+    /// `webhook`: the daemon needs it before it binds the listener.
+    pub mcp: McpConfig,
 }
 
 /// Backend selection for the runtime state store.
@@ -141,6 +145,54 @@ pub struct DatabaseConfig {
     /// an environment value is readable through `docker inspect` and `/proc`,
     /// the same reasoning that puts the age key on a compose secret.
     pub url: Option<String>,
+}
+
+/// Remote MCP listener config (CLAUDE-442). Lives in `config.toml` because the
+/// daemon needs it before it binds the listener. Off by default: `enabled =
+/// false` means no listener binds, no key file and no `mcp-web.db` are ever
+/// created, and `serve` behaves exactly as it did before this section existed.
+///
+/// Serves the same seven read-only troubleshooting tools as `claude-run mcp
+/// stdio` (`src/mcp.rs`, CLAUDE-437), but over Streamable HTTP behind the
+/// `mcp-web` crate's local-account + OAuth 2.1 bearer layer, so a remote
+/// client can reach them without `docker compose exec`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    /// Master on/off switch, defaulting `false`. While `false` the listener
+    /// never binds and `ensure_mcp_keys` / the `mcp-web.db` open never run, so
+    /// an operator who never opts in gets no new file anywhere.
+    pub enabled: bool,
+    /// `host:port` the listener binds to. Defaults to `127.0.0.1:7322`;
+    /// the container config seed (`deploy/container-config.toml`) overrides
+    /// this to `0.0.0.0:7322`. 7322 is one past the web UI's default 7321 and
+    /// is not used by any other listener default in this file.
+    pub bind: String,
+    /// Public base URL the listener is reachable at. Required when `enabled`
+    /// is true: every OAuth issuer, resource identifier and discovery URL
+    /// anchors on this, never on the inbound `Host` header. Left unset, an
+    /// enabled listener fails to start with an `error` log naming this key;
+    /// the rest of the daemon keeps running.
+    pub public_url: Option<String>,
+    /// Email bootstrapped as the first `mcp-web` admin account on first
+    /// start. Unset leaves every signup a plain account.
+    pub admin_email: Option<String>,
+    /// Extra `Host` header values `/mcp` accepts, beyond the host and
+    /// non-default port already implied by `public_url`. Most deployments
+    /// need nothing here: `public_url`'s own authority is always allowed.
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1:7322".to_string(),
+            public_url: None,
+            admin_email: None,
+            allowed_hosts: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1523,6 +1575,57 @@ mod tests {
         )
         .unwrap();
         assert!(parsed.webhook.sources.is_empty());
+    }
+
+    // ---- MCP HTTP listener config (CLAUDE-442) -----------------
+
+    #[test]
+    fn mcp_config_defaults_to_disabled() {
+        let parsed: OnDiskConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed.mcp, McpConfig::default());
+        assert!(!parsed.mcp.enabled);
+        assert_eq!(parsed.mcp.bind, "127.0.0.1:7322");
+        assert!(parsed.mcp.public_url.is_none());
+        assert!(parsed.mcp.admin_email.is_none());
+        assert!(parsed.mcp.allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn mcp_config_parses_when_present() {
+        let parsed: OnDiskConfig = toml::from_str(
+            r#"
+            [mcp]
+            enabled = true
+            bind = "0.0.0.0:7322"
+            public_url = "https://mcp.example.com"
+            admin_email = "admin@example.com"
+            allowed_hosts = ["mcp.example.com"]
+            "#,
+        )
+        .unwrap();
+        assert!(parsed.mcp.enabled);
+        assert_eq!(parsed.mcp.bind, "0.0.0.0:7322");
+        assert_eq!(
+            parsed.mcp.public_url.as_deref(),
+            Some("https://mcp.example.com")
+        );
+        assert_eq!(parsed.mcp.admin_email.as_deref(), Some("admin@example.com"));
+        assert_eq!(
+            parsed.mcp.allowed_hosts,
+            vec!["mcp.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_mcp_field_fails_to_parse() {
+        let err = toml::from_str::<OnDiskConfig>(
+            r#"
+            [mcp]
+            enable = true
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("enable"));
     }
 
     #[test]
