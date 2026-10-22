@@ -118,7 +118,7 @@ to the complement in the same step: with only one of the two queries changed, an
 is matched by both actions or by neither. Then confirm the source:
 
 ```nu
-docker compose exec --user claudebot claude-bot claude-run action show audit-run | from json | get prompt_source
+docker compose exec --user appuser claude-bot claude-run action show audit-run | from json | get prompt_source
 ```
 
 It must print `builtin:audit`. `override` means a `prompt:` key is still in the file.

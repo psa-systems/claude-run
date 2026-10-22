@@ -5,7 +5,7 @@
 The container runs the daemon (`serve --no-socket`). Run CLI commands inside it, as the runtime user:
 
 ```nu
-docker compose exec --user claudebot claude-bot claude-run status
+docker compose exec --user appuser claude-bot claude-run status
 ```
 
 `trigger` and `cancel` talk to the daemon over its unix socket, which the container does not open, so they fail naming
@@ -76,7 +76,7 @@ It exposes exactly seven tools, each read-only (no tool ever writes):
   "mcpServers": {
     "claude-run": {
       "command": "docker",
-      "args": ["compose", "exec", "--no-TTY", "--user", "claudebot", "claude-bot", "claude-run", "mcp", "stdio"]
+      "args": ["compose", "exec", "--no-TTY", "--user", "appuser", "claude-bot", "claude-run", "mcp", "stdio"]
     }
   }
 }
