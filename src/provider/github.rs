@@ -2546,6 +2546,152 @@ mod tests {
     }
 
     #[test]
+    fn create_pr_marks_resumed_run_push_when_remote_already_has_the_branch() {
+        // CLAUDE-447: a non-empty `ls-remote` before the push means this
+        // branch was pushed before, so the event is `resumed-run push`, not
+        // `initial push (PR opened)`.
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-5-resumed-run_push.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .ok(
+                    "git",
+                    &["ls-remote", "--heads", "origin", "feat/x"],
+                    "abc123\trefs/heads/feat/x\n",
+                )
+                .ok("git", &["rev-parse", "HEAD"], "def456\n")
+                .ok(
+                    "git",
+                    &["log", "--format=%s", "abc123..def456"],
+                    "feat: x\n",
+                )
+                .ok("gh", &["--version"], "gh version 2.0.0")
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "create",
+                        "--head",
+                        "feat/x",
+                        "--base",
+                        "main",
+                        "--title",
+                        "feat: x",
+                        "--body",
+                        "body text",
+                    ],
+                    "https://github.com/octo/widget/pull/5\n",
+                )
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "5",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
+                    "",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(false, Value::Null));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        let pr = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
+        assert_eq!(pr.number, Some(5));
+        assert_eq!(pr.push_comment_failure, None);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with("gh pr comment 5")),
+            "the resumed-run push comment must be posted: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_with_draft_posts_timeout_salvage_push_comment() {
+        // CLAUDE-447: `draft` always overrides the event to `timeout
+        // salvage push`, regardless of whether the remote already had the
+        // branch.
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-9-timeout_salvage_push.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["rev-parse", "HEAD"], "def456\n")
+                .ok("gh", &["--version"], "gh version 2.0.0")
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "create",
+                        "--head",
+                        "feat/x",
+                        "--base",
+                        "main",
+                        "--title",
+                        "feat: x",
+                        "--body",
+                        "salvage body",
+                        "--draft",
+                    ],
+                    "https://github.com/octo/widget/pull/9\n",
+                )
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "9",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
+                    "",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(false, Value::Null));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        let pr = forge
+            .create_pr_with_draft(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+                true,
+                Some("salvage body"),
+            )
+            .unwrap();
+        assert_eq!(pr.number, Some(9));
+        assert_eq!(pr.push_comment_failure, None);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with("gh pr comment 9")),
+            "the timeout salvage push comment must be posted: {calls:?}"
+        );
+    }
+
+    #[test]
     fn create_pr_errors_no_backend_when_neither_available() {
         // MCP unreachable and gh absent -> NoBackend listing both attempts.
         let runner = Arc::new(with_git(StubRunner::new(), "feat/x", "origin").missing("gh"));
