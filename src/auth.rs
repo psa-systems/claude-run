@@ -434,7 +434,7 @@ pub fn protect(router: Router, gate: TokenGate) -> Router {
             "/account/2fa/setup",
             get(totp_setup_page).post(totp_setup_submit),
         )
-        .route("/invite/:token", get(invite_page).post(invite_submit))
+        .route("/invite/{token}", get(invite_page).post(invite_submit))
         .route("/settings/accounts", get(accounts_page))
         .route("/settings/accounts/invite", post(create_invite_submit))
         .route("/settings/accounts/remove", post(remove_account_submit))

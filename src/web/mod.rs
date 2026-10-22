@@ -85,37 +85,37 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
                 .post(native_forms::closed_issue_summary_create),
         )
         .route("/actions", post(action_create))
-        .route("/actions/:name", get(action_detail))
-        .route("/actions/:name/durations", get(action_durations))
+        .route("/actions/{name}", get(action_detail))
+        .route("/actions/{name}/durations", get(action_durations))
         // The log page is global and lives at `/logs`. This route is
         // kept as a permanent redirect that carries the action into the Action
         // filter, so existing links and bookmarks keep working.
-        .route("/actions/:name/events", get(action_events_redirect))
+        .route("/actions/{name}/events", get(action_events_redirect))
         .route(
-            "/actions/:name/edit",
+            "/actions/{name}/edit",
             get(action_edit_page).post(action_edit_save),
         )
         // Dispatches to the structured editor for the action's own
         // native kind (raw editor for `scripted`).
         .route(
-            "/actions/:name/form",
+            "/actions/{name}/form",
             get(action_form_page).post(action_form_save),
         )
-        .route("/actions/:name/export", get(action_export))
-        .route("/actions/:name/delete", post(action_delete))
+        .route("/actions/{name}/export", get(action_export))
+        .route("/actions/{name}/delete", post(action_delete))
         // The one diagnostics screen. Every `run_events` row, for
         // every action, undeduplicated and filterable; `?action=` narrows it.
         .route("/logs", get(logs))
         .route("/secrets", get(secrets_page).post(secret_create))
-        .route("/secrets/:name/rotate", post(secret_rotate))
-        .route("/secrets/:name/delete", post(secret_delete))
+        .route("/secrets/{name}/rotate", post(secret_rotate))
+        .route("/secrets/{name}/delete", post(secret_delete))
         // On-demand access check. GET renders the page (no probing);
         // POST runs the check and swaps the result table in. The per-secret
         // Check button on /secrets lands on the same page with that credential's
         // identity probe already run.
         .route("/access", get(access_page))
         .route("/access/check", post(access_check))
-        .route("/secrets/:name/check", post(secret_check))
+        .route("/secrets/{name}/check", post(secret_check))
         // Runtime settings page. GET renders all sections; POST saves
         // one section (re-rendering inline serde errors on rejection). Behind the
         // same auth gate as every other TCP route.
@@ -132,7 +132,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         .route("/settings/auth/github", post(auth_save_github))
         .route("/settings/auth/git", post(auth_save_git))
         .route("/settings/auth/email/test", post(auth_test_email))
-        .route("/settings/:section", post(settings_save))
+        .route("/settings/{section}", post(settings_save))
         // Historical reporting page (spend / runs / time-of-day /
         // day-of-week). Global by default; `action` + `range` query params narrow
         // it. The shared aggregations live in `crate::report`.
@@ -144,10 +144,13 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         // `/about`) so the busy / idle / unknown states are rendered by one
         // handler and an activity-query failure cannot be mistaken for idle.
         .route("/about/activity", get(about_activity))
-        .route("/runs/:id", get(run_detail))
-        .route("/runs/:id/jobs/:key/attempt/:attempt", get(job_stream_page))
+        .route("/runs/{id}", get(run_detail))
         .route(
-            "/sse/runs/:id/jobs/:key/attempt/:attempt",
+            "/runs/{id}/jobs/{key}/attempt/{attempt}",
+            get(job_stream_page),
+        )
+        .route(
+            "/sse/runs/{id}/jobs/{key}/attempt/{attempt}",
             get(job_stream_sse),
         )
         .route("/static/htmx.min.js", get(htmx_handler))

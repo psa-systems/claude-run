@@ -780,7 +780,10 @@ impl WebhookState {
 /// is an axum path param resolved against the configured sources map.
 pub fn router(state: WebhookState) -> Router {
     Router::new()
-        .route("/webhooks/:provider/triage/:source", post(forgejo_webhook))
+        .route(
+            "/webhooks/{provider}/triage/{source}",
+            post(forgejo_webhook),
+        )
         .with_state(state)
 }
 

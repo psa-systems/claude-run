@@ -105,19 +105,19 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/status", get(get_status))
         .route("/actions", get(list_actions))
-        .route("/actions/:name/trigger", post(trigger_action))
-        .route("/actions/:name/pause", post(pause_action))
-        .route("/actions/:name/resume", post(resume_action))
-        .route("/actions/:name/attempts/:key/reset", post(reset_attempts))
-        .route("/actions/:name/delete", post(delete_action))
-        .route("/runs/:id/cancel", post(cancel_run))
+        .route("/actions/{name}/trigger", post(trigger_action))
+        .route("/actions/{name}/pause", post(pause_action))
+        .route("/actions/{name}/resume", post(resume_action))
+        .route("/actions/{name}/attempts/{key}/reset", post(reset_attempts))
+        .route("/actions/{name}/delete", post(delete_action))
+        .route("/runs/{id}/cancel", post(cancel_run))
         .route("/pause", post(global_pause_handler))
         .route("/resume", post(global_resume_handler))
         // JSON settings round-trip, one section per request. Mounted
         // under `/api` over TCP (behind the token auth gate) and at root over
         // the unix socket. `<section>` is mint|webhook|log_filter|...; see `Section::ALL`.
         .route(
-            "/settings/:section",
+            "/settings/{section}",
             get(get_settings_section).put(put_settings_section),
         )
         // Reporting aggregations. Each accepts `range` (30d|90d|all,

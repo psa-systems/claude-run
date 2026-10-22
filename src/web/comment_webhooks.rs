@@ -435,7 +435,7 @@ impl CommentWebhookState {
 pub fn router(state: CommentWebhookState) -> Router {
     Router::new()
         .route(
-            "/webhooks/:provider/comment/:source",
+            "/webhooks/{provider}/comment/{source}",
             post(forgejo_comment_webhook),
         )
         .with_state(state)
