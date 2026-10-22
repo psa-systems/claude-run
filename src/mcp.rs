@@ -52,11 +52,15 @@ fn tool_not_found(cause: impl std::fmt::Display) -> CallToolResult {
 
 /// Validate `limit`: `None` becomes `default`, a value over `max` is an
 /// error naming the parameter and the value rather than being clamped.
-fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> Result<i64, CallToolResult> {
+fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> Result<i64, Box<CallToolResult>> {
     match limit {
         None => Ok(default),
-        Some(v) if v > max => Err(tool_error(format!("limit must not exceed {max} (got {v})"))),
-        Some(v) if v < 1 => Err(tool_error(format!("limit must be at least 1 (got {v})"))),
+        Some(v) if v > max => Err(Box::new(tool_error(format!(
+            "limit must not exceed {max} (got {v})"
+        )))),
+        Some(v) if v < 1 => Err(Box::new(tool_error(format!(
+            "limit must be at least 1 (got {v})"
+        )))),
         Some(v) => Ok(v),
     }
 }
@@ -184,7 +188,7 @@ impl McpServer {
     async fn list_runs(&self, Parameters(args): Parameters<ListRunsArgs>) -> CallToolResult {
         let limit = match validate_limit(args.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT) {
             Ok(l) => l,
-            Err(e) => return e,
+            Err(e) => return *e,
         };
         match state::runs_list(
             &self.pool,
@@ -364,7 +368,7 @@ impl McpServer {
     ) -> CallToolResult {
         let limit = match validate_limit(args.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT) {
             Ok(l) => l,
-            Err(e) => return e,
+            Err(e) => return *e,
         };
         match ci_failure::store::list_failures(&self.pool, args.state.as_deref(), limit).await {
             Ok(rows) => json_result(serde_json::to_value(rows).expect("Failure serializes")),

@@ -6,8 +6,8 @@ The image sets each root with its env var; [self-hosting.md](self-hosting.md) ma
 
 | Container path      | Env var                  | What                                                                                            |
 |---------------------|--------------------------|-------------------------------------------------------------------------------------------------|
-| `/config`           | `CLAUDE_RUN_CONFIG_DIR`  | `config.toml`, `actions/*.yml`, `secrets.key`                                                   |
-| `/data`             | `CLAUDE_RUN_DATA_DIR`    | `state.db` (SQLite backend only; see "State store backend"), `workdirs/`                        |
+| `/config`           | `CLAUDE_RUN_CONFIG_DIR`  | `config.toml`, `actions/*.yml`, `secrets.key`, `mcp-master.key`, `mcp-session.key` (CLAUDE-442)  |
+| `/data`             | `CLAUDE_RUN_DATA_DIR`    | `state.db` (SQLite backend only; see "State store backend"), `workdirs/`, `mcp-web.db` (CLAUDE-442) |
 | `/state`            | `CLAUDE_RUN_STATE_DIR`   | `logs/daemon.log`, `logs/<action>/<output.file>`, `logs/<action>/streams/<key>-attempt-<n>.jsonl`, `snippets/`, `webhook-logs/` |
 | `/run/claude-run`   | `CLAUDE_RUN_RUNTIME_DIR` | `daemon.pid`, `locks/<action>.lock` (no `daemon.sock`: the image runs `serve --no-socket`)      |
 
@@ -130,7 +130,8 @@ docker compose --profile postgres up --detach
 Configuration splits in two. `config.toml` is the **bootstrap** file: only what the daemon must know before it can open
 the DB and bind the listener, namely `[database]` (CLAUDE-250: which state store to open, see
 [State store backend](#state-store-backend-sqlite-or-postgresql-claude-250)), `[web]` (bind / port / `auth_token_ref` /
-login) and `[daemon]` binary overrides (
+login), `[mcp]` (CLAUDE-442: the troubleshooting MCP tools over HTTP, see
+[MCP over HTTP](#mcp-over-http-claude-442)) and `[daemon]` binary overrides (
 `nu_binary`, `claude_binary`) plus `[daemon].claude_config_dir` (CLAUDE-165: where the spawned agent reads its
 user-level `CLAUDE.md` / credentials from; defaults to `<CLAUDE_RUN_CONFIG_DIR>/claude-agent-home`, seeded at serve
 start with the slim bot `CLAUDE.md`, and with a symlink to the host `~/.claude/.credentials.json` when the host has
@@ -191,6 +192,41 @@ closed-issue summary) ends with a footer naming the run (as a `/runs/<id>` or `/
 link under this base URL), its start/finish time, and its duration, so a reader goes from the comment to the run in
 one click. The daemon logs one `warn` at `serve` startup naming `CLAUDE_RUN_PUBLIC_URL` when it is unset: comments
 still post, but the footer's `Run:` line says the link is unavailable instead of linking back.
+
+## MCP over HTTP (CLAUDE-442)
+
+`claude-run mcp stdio` (see [usage.md](usage.md#read-only-troubleshooting-mcp-server)) is DB-direct and needs no
+daemon. The same seven read-only tools are also available from the running daemon itself, over MCP's Streamable HTTP
+transport at `/mcp`, gated behind the external `mcp-web` crate's own multi-user OAuth 2.1 / local-account / TOTP web
+layer rather than the daemon's own `[web]` auth. This listener is off by default; a deployment that never needs a
+networked MCP client can ignore this section entirely.
+
+```toml
+# config.toml
+[mcp]
+enabled = true
+bind = "0.0.0.0:7322"
+public_url = "https://mcp.claude-run.example.com"
+admin_email = "admin@example.com"
+allowed_hosts = []
+```
+
+- **`enabled`** (default `false`): starts the listener. A misconfiguration below (no `public_url`, a corrupt key file)
+  never fails the rest of `serve`: `mcp_http::spawn` logs the cause at `error` and leaves the listener off.
+- **`bind`** (default `"127.0.0.1:7322"`): `host:port` for the HTTP listener, independent of `[web].bind`/`port`.
+- **`public_url`**: required when `enabled = true`. mcp-web anchors its OAuth issuer and redirect URIs to this value,
+  so it must be the externally reachable URL (through whatever reverse proxy terminates TLS), never the bind address.
+- **`admin_email`**: the mcp-web administrator account's email; optional, but needed to reach mcp-web's own admin UI.
+- **`allowed_hosts`**: extra `Host` header values the Streamable HTTP transport accepts, beyond the authority already
+  implied by `public_url`.
+
+**Key files and state.** On first start with `enabled = true`, the daemon generates two 32-byte keys under
+`CLAUDE_RUN_CONFIG_DIR`: `mcp-master.key` (encryption at rest for mcp-web's own store) and `mcp-session.key` (session
+signing), both mode `0600`, written with `create_new` so an existing file is read, never regenerated or overwritten. A
+missing file is generated once and logged; a present-but-corrupt file (fails to base64-decode to 32 bytes) is a loud
+startup-time error rather than a silent new key, since a new key would make existing mcp-web ciphertext unreadable.
+mcp-web keeps its own accounts, sessions and OAuth state in a separate SQLite database at
+`<CLAUDE_RUN_DATA_DIR>/mcp-web.db`, never in claude-run's own `state.db` or `[database]` backend.
 
 ## Logging
 

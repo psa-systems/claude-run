@@ -1,0 +1,9 @@
+# Registry alias for the Pandora's Box Forgejo Cargo registry on dev.a8n.run.
+#
+# The alias is a local label mapping the name `pandoras-box-cargo` to the
+# registry's sparse index, the same alias `mcp-web`'s own `.cargo/config.toml`
+# defines for itself. The index is public (no token needed to resolve it);
+# `mcp-web = { version = "0.1", registry = "pandoras-box-cargo" }` in
+# Cargo.toml depends on it.
+[registries.pandoras-box-cargo]
+index = "sparse+https://dev.a8n.run/api/packages/pandoras-box/cargo/"

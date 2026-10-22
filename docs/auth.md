@@ -209,3 +209,7 @@ Auth (and every action `token_ref`) reads from an encrypted secrets store. Two t
    unauthenticated) and create the secret at `http://127.0.0.1:7321/secrets`. The CLI avoids that loopback round-trip.
 
    `auth_token_ref` is the **name** of a stored secret. It is not the token value and not the `age` public key.
+
+## MCP HTTP auth (CLAUDE-442)
+
+The troubleshooting MCP tools served over HTTP at `/mcp` (see [configuration.md](configuration.md#mcp-over-http-claude-442)) sit behind a completely different gate than everything above on this page: the external `mcp-web` crate's own OAuth 2.1 authorization server, backed by its own local accounts (TOTP is offered at `/totp/enrol` but, unlike the dashboard's accounts, not required to sign in). It does not read `[web].auth_token_ref`, does not share a session with the dashboard login, and does not use `secrets.key` or the secrets store at all; its two keys (`mcp-master.key`, `mcp-session.key`) and its account database (`mcp-web.db`) are entirely its own, documented in [docs/conventions/mcp.md](conventions/mcp.md#serving-the-same-tools-over-http-claude-442). A dashboard account and an MCP account are unrelated: creating, disabling or deleting one does nothing to the other, even for the same email address. Treat granting MCP HTTP access as its own decision, not an extension of dashboard access.

@@ -450,6 +450,14 @@ impl Daemon {
             tokio::spawn(bind_and_serve_tcp(tcp_bind, config_path, tcp_app))
         });
 
+        // The read-only troubleshooting MCP tools over Streamable HTTP
+        // (CLAUDE-442), gated on `[mcp].enabled`. `spawn` itself logs and
+        // returns `None` on any precondition failure (unset `public_url`, a
+        // corrupt key file), so a misconfigured listener never takes down
+        // the rest of this `serve` call.
+        let mcp_http_task =
+            crate::mcp_http::spawn(&self.on_disk.mcp, self.paths.clone(), pool.clone()).await;
+
         // Drain verified webhook failure events for the lifetime of the daemon.
         // Each event triggers an `fj actions logs` fetch with retry + secret
         // redaction; the redacted artifacts land under `state_dir/webhook-logs/`.
@@ -717,6 +725,9 @@ impl Daemon {
         }
 
         if let Some(t) = server_tcp {
+            t.abort();
+        }
+        if let Some(t) = mcp_http_task {
             t.abort();
         }
         webhook_consumer.abort();

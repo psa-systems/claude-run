@@ -60,6 +60,16 @@ The window is a DB-backed runtime setting edited on the **Settings** page (the `
 
 Reporting interaction: the reports layer aggregates spend from `job_outcomes.ts`, and the web UI exposes 30-day and 90-day (and all-time) ranges. `retention_days` must stay `>=` the longest bounded range (90 days), so a save below 90 (while enabled) is rejected inline; the 180-day default leaves comfortable margin. The all-time range is inherently bounded by the retention window once a prune runs (its lower bound is whatever the oldest surviving row is), which is expected: retention is the layer that caps unbounded history.
 
+## MCP key backup (CLAUDE-442)
+
+The two key files the optional MCP HTTP listener generates on first start (`mcp-master.key`, `mcp-session.key`, both
+under `CLAUDE_RUN_CONFIG_DIR`; see [configuration.md](configuration.md#mcp-over-http-claude-442)) back up the same way
+`secrets.key` does and for the same reason: `mcp-master.key` decrypts `mcp-web.db`'s own encrypted-at-rest columns, so
+losing it makes that database's contents permanently unreadable, and the daemon refuses to mint a silent replacement
+on a corrupt or unreadable file rather than risk doing that by accident. Back these up alongside `secrets.key`
+whenever `[mcp].enabled = true`; a deployment that leaves the listener off never generates them and has nothing to
+back up.
+
 ## Display preferences (CLAUDE-154)
 
 Every timestamp is stored as an RFC3339 UTC string; how it is displayed in the web UI is a single global setting (this is a single-operator daemon with no user table, so there are no per-user rows). The `preferences` section is DB-backed and edited on the **Settings** page (the `Display preferences` section, or `GET` / `PUT /api/settings/preferences`). Fields:

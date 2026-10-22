@@ -31,6 +31,10 @@ RUN echo "build parallelism: CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"
 # dependency graph in this layer. BuildKit cache mounts catch what the layer
 # cache misses (eg. a Cargo.toml tweak).
 COPY Cargo.toml Cargo.lock ./
+# .cargo/config.toml defines the pandoras-box-cargo registry alias mcp-web
+# resolves through; cargo needs it before the dependency-only build below can
+# fetch that crate.
+COPY .cargo ./.cargo
 RUN mkdir -p src/bin \
     && echo "pub fn placeholder() {}" > src/lib.rs \
     && echo "fn main() {}" > src/bin/claude-run.rs
