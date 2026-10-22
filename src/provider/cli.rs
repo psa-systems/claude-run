@@ -890,9 +890,23 @@ impl CliBackend {
             // PR with `--head <branch>`).
             None => {
                 self.push_branch(workdir, branch, token_url)?;
-                self.find_or_create_pr(workdir, host, &repo, branch, draft, body)
+                let mut pr = self.find_or_create_pr(workdir, host, &repo, branch, draft, body)?;
+                self.post_branch_push_comment(
+                    workdir,
+                    host,
+                    &repo,
+                    branch,
+                    draft,
+                    crate::push_comment::PushEvent::InitialPush,
+                    None,
+                    &local_sha,
+                    &mut pr,
+                );
+                Ok(pr)
             }
-            // Equal to local: nothing to push; find-or-create the PR.
+            // Equal to local: nothing to push; find-or-create the PR. No push
+            // comment: nothing was written to the branch (CLAUDE-447 only
+            // requires a comment after an actual write).
             Some(ref remote_sha) if *remote_sha == local_sha => {
                 self.find_or_create_pr(workdir, host, &repo, branch, draft, body)
             }
@@ -907,7 +921,20 @@ impl CliBackend {
                     // A fast-forward push is legal when the remote tip is an
                     // ancestor of the local tip.
                     self.push_branch(workdir, branch, token_url)?;
-                    self.find_or_create_pr(workdir, host, &repo, branch, draft, body)
+                    let mut pr =
+                        self.find_or_create_pr(workdir, host, &repo, branch, draft, body)?;
+                    self.post_branch_push_comment(
+                        workdir,
+                        host,
+                        &repo,
+                        branch,
+                        draft,
+                        crate::push_comment::PushEvent::ResumedRunPush,
+                        Some(&remote_sha),
+                        &local_sha,
+                        &mut pr,
+                    );
+                    Ok(pr)
                 } else {
                     // Diverged: the remote gained commits (typically the
                     // runner's own "branch was behind its base" update) while
@@ -916,9 +943,148 @@ impl CliBackend {
                     // then find-or-create the PR as usual.
                     self.merge_remote_branch(workdir, branch, &local_sha, &remote_sha)?;
                     self.push_branch(workdir, branch, token_url)?;
-                    self.find_or_create_pr(workdir, host, &repo, branch, draft, body)
+                    let merged_sha = self.rev_parse(workdir, branch)?;
+                    let mut pr =
+                        self.find_or_create_pr(workdir, host, &repo, branch, draft, body)?;
+                    self.post_branch_push_comment(
+                        workdir,
+                        host,
+                        &repo,
+                        branch,
+                        draft,
+                        crate::push_comment::PushEvent::MergedRemoteBranchBeforePush,
+                        Some(&remote_sha),
+                        &merged_sha,
+                        &mut pr,
+                    );
+                    Ok(pr)
                 }
             }
+        }
+    }
+
+    /// Post the CLAUDE-447 push comment for a write made in
+    /// [`Self::create_pr_branch`] or [`Self::create_pr_agit`]. A no-op if the
+    /// PR has no number (an adopted lookup can race the actual create and
+    /// return an unopened placeholder; nothing here ever happens on that
+    /// path since every caller already has a number by the time it calls
+    /// this). `draft` overrides `event` to `TimeoutSalvagePush` regardless of
+    /// which git leg triggered the push, since the timeout-salvage caller's
+    /// intent is what the comment should name, not the git mechanics that
+    /// got the branch there. The failure, if any, is recorded on `pr` rather
+    /// than propagated: a failed comment must never fail, retry, or roll
+    /// back the push it reports on (CLAUDE-366).
+    #[allow(clippy::too_many_arguments)]
+    fn post_branch_push_comment(
+        &self,
+        workdir: &Path,
+        host: &str,
+        repo: &str,
+        branch: &str,
+        draft: bool,
+        event: crate::push_comment::PushEvent,
+        old_sha: Option<&str>,
+        new_sha: &str,
+        pr: &mut PullRequest,
+    ) {
+        let Some(pr_number) = pr.number else {
+            return;
+        };
+        let event = if draft {
+            crate::push_comment::PushEvent::TimeoutSalvagePush
+        } else {
+            event
+        };
+        let issue_key = self.tip_issue_key(workdir, branch);
+        let subjects = self.commit_subjects_since(workdir, old_sha, new_sha);
+        let public_url = crate::run_footer::resolved_public_url();
+        let scratch = match self.git_dir_scratch(workdir) {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::error!(
+                    pr_number,
+                    event = event.label(),
+                    error = %e,
+                    "resolving the push comment scratch directory failed"
+                );
+                pr.push_comment_failure = Some(format!(
+                    "PR comment for {} failed: resolving the scratch directory failed: {e}",
+                    event.label()
+                ));
+                return;
+            }
+        };
+        let ctx = crate::push_comment::PushCommentContext {
+            event,
+            issue_key: &issue_key,
+            draft,
+            old_sha,
+            new_sha: Some(new_sha),
+            subjects,
+            public_url: public_url.as_deref(),
+            run_id: None,
+            started: None,
+        };
+        pr.push_comment_failure =
+            crate::push_comment::post(self, host, repo, pr_number, &scratch, &ctx);
+    }
+
+    /// The bare `#<KEY>-N` issue reference (CLAUDE-398) out of `rev`'s tip
+    /// commit body, for a push comment's `Issue:` line. Falls back to `rev`
+    /// itself (the branch name) on a tip that carries none, or on a `git log`
+    /// failure, rather than failing the push comment outright: this is a
+    /// best-effort label, not load-bearing for the push or PR-create it
+    /// reports on.
+    fn tip_issue_key(&self, workdir: &Path, rev: &str) -> String {
+        let args = ["log", "-1", "--format=%B", rev];
+        match self
+            .runner
+            .run_in_env(Some(workdir), "git", &args, &[])
+            .and_then(|out| Self::checked("git", out, &args))
+        {
+            Ok(body) => crate::provider::bare_issue_key(&body).unwrap_or_else(|| rev.to_string()),
+            Err(_) => rev.to_string(),
+        }
+    }
+
+    /// Commit subjects in `old_sha..new_sha`, newest first, for a push
+    /// comment's body. `old_sha` of `None` (a brand-new branch) reads from
+    /// `origin/HEAD` instead, so the comment lists the branch's own commits
+    /// rather than an empty range. A `git log` failure degrades to
+    /// [`crate::push_comment::CommitSubjects::Unavailable`] rather than
+    /// failing the push comment outright: this is a best-effort listing, not
+    /// load-bearing for the push or PR-create it reports on.
+    fn commit_subjects_since(
+        &self,
+        workdir: &Path,
+        old_sha: Option<&str>,
+        new_sha: &str,
+    ) -> crate::push_comment::CommitSubjects {
+        let bound = match old_sha {
+            Some(old) => old.to_string(),
+            None => {
+                let args = ["rev-parse", "--abbrev-ref", "origin/HEAD"];
+                match self
+                    .runner
+                    .run_in_env(Some(workdir), "git", &args, &[])
+                    .and_then(|out| Self::checked("git", out, &args))
+                {
+                    Ok(base) => base.trim().to_string(),
+                    Err(_) => return crate::push_comment::CommitSubjects::Unavailable,
+                }
+            }
+        };
+        let range = format!("{bound}..{new_sha}");
+        let args = ["log", "--format=%s", range.as_str()];
+        match self
+            .runner
+            .run_in_env(Some(workdir), "git", &args, &[])
+            .and_then(|out| Self::checked("git", out, &args))
+        {
+            Ok(stdout) => crate::push_comment::CommitSubjects::Listed(
+                stdout.lines().map(str::to_string).collect(),
+            ),
+            Err(_) => crate::push_comment::CommitSubjects::Unavailable,
         }
     }
 
@@ -1309,7 +1475,28 @@ impl CliBackend {
                     .unwrap_or_else(|_| "<unparseable origin remote>".to_string());
                 pr_create_error(&self.fj, &repo, host, None, e)
             })?;
-        self.created_pr(&stdout)
+        let mut pr = self.created_pr(&stdout)?;
+        // AGit pushes `HEAD`'s local commits to `refs/for/<base>` with no
+        // server branch, so there is no previous tip to report (`old_sha:
+        // None`) and no `branch` name to resolve commit subjects against;
+        // `"HEAD"` stands in for both.
+        if let (Ok(repo), Ok(new_sha)) = (
+            self.origin_repo_path(workdir),
+            self.rev_parse(workdir, "HEAD"),
+        ) {
+            self.post_branch_push_comment(
+                workdir,
+                host,
+                &repo,
+                "HEAD",
+                false,
+                crate::push_comment::PushEvent::InitialPush,
+                None,
+                &new_sha,
+                &mut pr,
+            );
+        }
+        Ok(pr)
     }
 
     /// Probe that both CLIs are invokable (`<bin> --version`). Used by the
@@ -3319,6 +3506,423 @@ mod tests {
             !calls.iter().any(|c| c.contains("-aA")),
             "branch strategy must never invoke -aA: {calls:?}"
         );
+    }
+
+    #[test]
+    fn create_pr_branch_absent_posts_initial_push_comment() {
+        // CLAUDE-447: a brand-new branch (remote absent) posts an
+        // `initial push (PR opened)` comment naming the issue key and the
+        // commit range, after the push and PR create both succeed.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "abc123", "");
+        let runner = with_open_pr_search(runner, "[]")
+            .ok(
+                "git",
+                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "feat/x"],
+                "feat(x): do the thing\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "Body of the commit.\n\n#MK-16\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%B", "feat/x"],
+                "feat(x): do the thing\n\nBody of the commit.\n\n#MK-16\n",
+            )
+            .ok(
+                "git",
+                &["log", "--format=%s", "origin/main..abc123"],
+                "feat(x): do the thing\n",
+            );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path_str = scratch
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = runner
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "create",
+                    "feat(x): do the thing",
+                    "--body-file",
+                    body_path_str.as_str(),
+                    "--head",
+                    "feat/x",
+                    "--json",
+                ],
+                r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
+            )
+            .ok_prefix(
+                "fj --host dev.a8n.run pr comment contoso/claude-run#77 --body-file",
+                "",
+            );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
+        assert_eq!(pr.number, Some(77));
+        assert_eq!(pr.push_comment_failure, None);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("fj --host dev.a8n.run pr comment contoso/claude-run#77")),
+            "must post a push comment on the newly created PR: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_fast_forward_posts_resumed_run_push_comment() {
+        // CLAUDE-447: a fast-forward push onto an already-remote branch
+        // posts a `resumed-run push` comment, not `initial push`.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "newsha\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "newsha", "oldsha\trefs/heads/feat/x\n");
+        let runner = with_open_pr_search(runner, "[]")
+            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .ok(
+                "git",
+                &["merge-base", "--is-ancestor", "oldsha", "newsha"],
+                "",
+            )
+            .ok(
+                "git",
+                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "feat/x"],
+                "feat(x): more work\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "#CLAUDE-170\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%B", "feat/x"],
+                "#CLAUDE-170\n",
+            )
+            .ok(
+                "git",
+                &["log", "--format=%s", "oldsha..newsha"],
+                "feat(x): more work\n",
+            );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path_str = scratch
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = runner
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "create",
+                    "feat(x): more work",
+                    "--body-file",
+                    body_path_str.as_str(),
+                    "--head",
+                    "feat/x",
+                    "--json",
+                ],
+                r#"{"number":90,"html_url":"https://dev.a8n.run/n/c/pulls/90"}"#,
+            )
+            .ok_prefix(
+                "fj --host dev.a8n.run pr comment contoso/claude-run#90 --body-file",
+                "",
+            );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
+        assert_eq!(pr.number, Some(90));
+        assert_eq!(pr.push_comment_failure, None);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("fj --host dev.a8n.run pr comment contoso/claude-run#90")),
+            "must post a resumed-run push comment: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_diverged_posts_merged_remote_branch_comment() {
+        // CLAUDE-447: the diverged (merge-then-push) leg posts a
+        // `merged remote branch before push` comment on the adopted PR.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/yotun-96"],
+            &[("feat/yotun-96", "localsha\n")],
+        );
+        let runner = with_remote_state(
+            runner,
+            "feat/yotun-96",
+            "localsha",
+            "remotesha\trefs/heads/feat/yotun-96\n",
+        );
+        let runner = with_open_pr_search(
+            runner,
+            r#"[{"number":165,"head_ref":"feat/yotun-96","html_url":"https://dev.a8n.run/a/y/pulls/165"}]"#,
+        )
+        .ok("git", &["fetch", "origin", "feat/yotun-96"], "")
+        .fail(
+            "git",
+            &["merge-base", "--is-ancestor", "remotesha", "localsha"],
+            1,
+            "",
+        )
+        .ok(
+            "git",
+            &["log", "-1", "--format=%s", "feat/yotun-96"],
+            "feat: yotun\n",
+        )
+        .ok("git", &["merge", "--no-edit", "origin/feat/yotun-96"], "")
+        .ok(
+            "git",
+            &[
+                "push",
+                "--set-upstream",
+                "origin",
+                "feat/yotun-96:feat/yotun-96",
+            ],
+            "",
+        )
+        .ok(
+            "git",
+            &["log", "-1", "--format=%B", "feat/yotun-96"],
+            "feat: yotun\n\n#CLAUDE-96\n",
+        )
+        .ok(
+            "git",
+            &["log", "--format=%s", "remotesha..localsha"],
+            "feat: yotun\n",
+        );
+        let (runner, _scratch) = with_git_dir_scratch(runner, wd.path());
+        let runner = runner.ok_prefix(
+            "fj --host dev.a8n.run pr comment contoso/claude-run#165 --body-file",
+            "",
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
+        assert_eq!(pr.number, Some(165));
+        assert_eq!(pr.push_comment_failure, None);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("fj --host dev.a8n.run pr comment contoso/claude-run#165")),
+            "must post a merged-remote-branch push comment: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_draft_overrides_event_to_timeout_salvage() {
+        // CLAUDE-447: a draft create (timeout salvage, CLAUDE-379) posts a
+        // `timeout salvage push` comment regardless of which git leg
+        // actually performed the write.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "abc123", "");
+        let runner = with_open_pr_search(runner, "[]")
+            .ok(
+                "git",
+                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "feat/x"],
+                "WIP: feat(x): do the thing\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%B", "feat/x"],
+                "WIP: feat(x): do the thing\n\n#MK-16\n",
+            )
+            .ok(
+                "git",
+                &["log", "--format=%s", "origin/main..abc123"],
+                "feat(x): do the thing\n",
+            );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path_str = scratch
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = runner
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "create",
+                    "WIP: feat(x): do the thing",
+                    "--body-file",
+                    body_path_str.as_str(),
+                    "--head",
+                    "feat/x",
+                    "--json",
+                ],
+                r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
+            )
+            .ok_prefix(
+                "fj --host dev.a8n.run pr comment contoso/claude-run#77 --body-file",
+                "",
+            );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr_with_draft(
+                wd.path(),
+                "dev.a8n.run",
+                PrStrategy::Branch,
+                true,
+                Some("salvage body\n\n#MK-16\n"),
+            )
+            .unwrap();
+        assert_eq!(pr.number, Some(77));
+        assert_eq!(pr.push_comment_failure, None);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("fj --host dev.a8n.run pr comment contoso/claude-run#77")),
+            "a draft create must still post a push comment: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_failed_push_comment_is_recorded_but_never_fails_the_create() {
+        // CLAUDE-447: a `pr_comment` failure is never allowed to fail, retry,
+        // or roll back the push/create it reports on (CLAUDE-366); it is
+        // recorded on the returned PR for the caller's own outcome comment.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "abc123", "");
+        let runner = with_open_pr_search(runner, "[]")
+            .ok(
+                "git",
+                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "feat/x"],
+                "feat(x): do the thing\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "Body of the commit.\n\n#MK-16\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%B", "feat/x"],
+                "feat(x): do the thing\n\nBody of the commit.\n\n#MK-16\n",
+            )
+            .ok(
+                "git",
+                &["log", "--format=%s", "origin/main..abc123"],
+                "feat(x): do the thing\n",
+            );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path_str = scratch
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = runner
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "create",
+                    "feat(x): do the thing",
+                    "--body-file",
+                    body_path_str.as_str(),
+                    "--head",
+                    "feat/x",
+                    "--json",
+                ],
+                r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
+            )
+            .fail(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "comment",
+                    "contoso/claude-run#77",
+                    "--body-file",
+                    scratch
+                        .join("claude-run-push-comment-77-initial_push__PR_opened_.md")
+                        .to_string_lossy()
+                        .as_ref(),
+                ],
+                1,
+                "Error: unexpected status code 500",
+            );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
+        // The push and the PR create both succeeded despite the comment
+        // failure: this assertion is the whole point of the test.
+        assert_eq!(pr.number, Some(77));
+        let failure = pr
+            .push_comment_failure
+            .expect("a failed pr_comment call must be recorded on the PR");
+        assert!(failure.starts_with("PR comment for initial push (PR opened) failed:"));
+        assert!(failure.contains("500"));
     }
 
     #[test]
