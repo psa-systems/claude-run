@@ -45,8 +45,9 @@
 //! runner-creates-PR contract. The agent itself does local
 //! engineering work only (no push, no PR) and the bounded
 //! tracker writes [`default_youtrack_prompt`] permits: a descoped piece of the
-//! triggering issue goes to the configured `write_projects`, linked `subtask
-//! of` the triggering issue; an out-of-scope bug found elsewhere
+//! triggering issue goes to the configured `write_projects`, linked `relates
+//! to` (or `depends on` / `is required for` when one genuinely blocks the
+//! other) the triggering issue, never `subtask of` it; an out-of-scope bug found elsewhere
 //! goes to the project whose VCS integration binds the buggy repo (falling
 //! back to `write_projects`), linked `relates to` the triggering issue. Either
 //! way the agent may update / comment / link only the issues it created this
@@ -2372,12 +2373,16 @@ fn clone_repo(clone_url: &str, workdir: &Path, branch: Option<&str>) -> Result<(
 /// block, because the `No orphan notes` directive requires a run that discovers
 /// a gap to file it as a tracked, linked issue rather than mention it in prose.
 /// That permission splits into two cases: a descoped piece of the
-/// triggering issue is filed in `write_projects` and linked `subtask of`; a
-/// bug found outside the triggering issue's scope is filed in the project
-/// whose VCS integration binds the buggy repo (falling back to
-/// `write_projects`) and linked `relates to`. The ban that stays absolute is
-/// `AI Agent` on ANY issue: setting it queues work, so an agent that could set
-/// it could spawn runs.
+/// triggering issue is filed in `write_projects` and linked `relates to` (or
+/// `depends on` / `is required for` when one genuinely blocks the other),
+/// never `subtask of`, since that verb is reserved for linking under an epic
+/// or milestone root and making a work issue the parent lets closing the
+/// child auto-close the parent, or lets the dependency gate treat the parent
+/// as blocked by its own child; a bug found outside the triggering issue's
+/// scope is filed in the project whose VCS integration binds the buggy repo
+/// (falling back to `write_projects`) and linked `relates to`. The ban that
+/// stays absolute is `AI Agent` on ANY issue: setting it queues work, so an
+/// agent that could set it could spawn runs.
 pub(crate) fn default_youtrack_prompt() -> String {
     [
         "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.",
@@ -2393,8 +2398,9 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "YouTrack writes. You MAY do exactly the following, and nothing else:",
         "- Read anything the token can see, across every project: 'yt list --query=...', 'yt search', 'yt issue inspect <KEY>', 'yt project list' / 'yt project show' / 'yt project vcs list'.",
         "- Create an issue with 'yt issue create' in exactly two cases:",
-        "  1. A gap, deferred item, or descoped piece of {{key}} itself: create it ONLY in these projects: {{write_projects}}, then link it with 'yt issue link <new-issue> {{key}} --type \"subtask of\"'. This is how the CLAUDE.md 'No orphan notes' rule is satisfied: the piece becomes its own tracked issue instead of a sentence in the PR body that nobody owns.",
+        "  1. A gap, deferred item, or descoped piece of {{key}} itself: create it ONLY in these projects: {{write_projects}}, then link it with 'yt issue link <new-issue> {{key}} --type \"relates to\"', or with 'depends on' / 'is required for' when one of the two issues genuinely blocks the other. Never link it 'subtask of' {{key}}: that verb is reserved for linking under an epic or milestone root (an issue that only groups), never under a work issue, because closing a child auto-closes its parent and the dependency gate treats a parent as blocked by its own children, so a work issue made the parent of its own follow-up can never close its own loop. This is how the CLAUDE.md 'No orphan notes' rule is satisfied: the piece becomes its own tracked issue instead of a sentence in the PR body that nobody owns. Never file an issue whose only purpose is to verify, after {{key}}'s PR exists, that infrastructure or configuration outside the PR (a secret, a grant, a runner label, a deployed service, a dispatched workflow) took effect; assume that change was made and is correct. Never file an issue that can only start once {{key}}'s own PR is open or merged, since the agent that would work it is just as local-only as this one and cannot push, dispatch workflows, or open a PR to unblock it either.",
         "  2. A bug you find that is NOT part of {{key}}, in this repo or in any other repo (for example a defect in a server repo you hit while working on the app that calls it). If it blocks {{key}}'s acceptance criteria and lives in this repo, fix it as part of {{key}}'s change and file nothing. Otherwise do NOT fix it in this run; file it. First run 'yt search' for an open issue that already reports it; if one exists, file nothing and name that issue in your final summary. Create it in the project whose VCS integration binds the repo the bug lives in: find that project with 'yt project list' and 'yt project vcs list <PROJECT>', and if no project or more than one project binds that repo, create it in {{write_projects}}. Its description states what you observed, how to reproduce it, and the file:line or command output that shows it. Then link it with 'yt issue link <new-issue> {{key}} --type \"relates to\"'. If the bug blocks {{key}}'s acceptance criteria from another repo, also take the blocker path below and name the new issue in the reason.",
+        "- Before creating any link above, check whether it would make a cycle: whether the target is already blocked, directly or through a chain of 'depends on' / 'is required for' links, by the issue you are about to link it to. If creating the link would produce a cycle, do not create it, and say so in your final summary instead.",
         "- Update, comment on, and link ONLY the issues you created during THIS run: 'yt issue update', 'yt issue comment', 'yt issue link'.",
         "- On the triggering issue {{key}}, you MAY comment with 'yt issue comment {{key}}', and you MAY add the links named in the two create cases above, one per issue you created. The runner still posts its own outcome comment on {{key}}; do not duplicate it.",
         "",
@@ -2423,7 +2429,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "9. Stop. Do not push and do not open a PR; beyond the YouTrack writes permitted above, do not touch the tracker. The runner opens the PR from your commits and transitions the issue.",
         "",
         "If the issue asks for tracker output rather than code - a survey across repos, a report, issues to file - and you therefore finish DELIBERATELY with no commits:",
-        "  a. Do the permitted YouTrack writes above: create the issue(s), and link each one as a subtask of {{key}}.",
+        "  a. Do the permitted YouTrack writes above: create the issue(s), and link each one per the case 1 or 2 rules above.",
         "  b. Write the human-facing summary of what you produced, naming every issue you created, to this file (the file contents are posted verbatim as the issue comment by the runner):",
         "       {{workdir}}/{{no_code_marker}}",
         "  c. Do NOT write the blocker markers below; this is a successful outcome, not a parked one. The runner skips the PR entirely, posts your summary, and sets the AI Agent field to its no-code label.",
@@ -5872,8 +5878,12 @@ mod tests {
         );
         // The single permitted link write to the triggering issue.
         assert!(
-            p.contains("yt issue link <new-issue> MK-16 --type \"subtask of\""),
+            p.contains("yt issue link <new-issue> MK-16 --type \"relates to\""),
             "{p}"
+        );
+        assert!(
+            !p.contains("--type \"subtask of\""),
+            "a gap/deferred item must never be linked subtask of the triggering issue: {p}"
         );
         // The triggering issue may now also be commented on.
         assert!(
@@ -5984,6 +5994,45 @@ mod tests {
         assert!(
             p.contains("Do NOT start changing code for this. If you already committed work before finding the blocker, leave those commits as they are; do not revert them."),
             "{p}"
+        );
+    }
+
+    /// CLAUDE-454: a gap/deferred/descoped-piece follow-up must never be filed
+    /// as a subtask of the triggering issue (that makes the work issue a
+    /// parent, so closing the follow-up auto-closes it and the dependency gate
+    /// can block the parent on its own child), the prompt must rule out a
+    /// follow-up that only verifies infrastructure/config outside the PR or
+    /// that can only start once this issue's own PR exists, and it must tell
+    /// the agent to check for a link cycle before creating one.
+    #[test]
+    fn default_prompt_never_files_gaps_as_subtasks_and_checks_for_link_cycles() {
+        let p = default_youtrack_prompt();
+        assert!(
+            !p.contains("--type \"subtask of\""),
+            "no case must link a gap/deferred item subtask of the triggering issue: {p}"
+        );
+        assert!(
+            p.contains("Never link it 'subtask of' {{key}}"),
+            "the prompt must explicitly rule out subtask of for the gap/deferred case: {p}"
+        );
+        assert!(
+            p.contains("reserved for linking under an epic or milestone root"),
+            "the prompt must explain what subtask of is reserved for: {p}"
+        );
+        assert!(
+            p.contains("Never file an issue whose only purpose is to verify, after {{key}}'s PR exists, that infrastructure or configuration outside the PR"),
+            "the prompt must ban post-PR infrastructure-verification follow-ups: {p}"
+        );
+        assert!(
+            p.contains(
+                "Never file an issue that can only start once {{key}}'s own PR is open or merged"
+            ),
+            "the prompt must ban a follow-up gated on this issue's own PR: {p}"
+        );
+        assert!(
+            p.contains("check whether it would make a cycle")
+                && p.contains("do not create it, and say so in your final summary instead"),
+            "the prompt must require a cycle check before linking: {p}"
         );
     }
 

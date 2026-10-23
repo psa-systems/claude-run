@@ -365,10 +365,17 @@ and never an escape hatch for a code task the agent could not finish (that stays
 
 The built-in prompt correspondingly permits a bounded set of tracker writes: read across projects; create an issue in
 one of two cases (CLAUDE-297) - a descoped piece of the triggering issue, filed in `write_projects` and linked
-`subtask of` the triggering issue, or a bug found outside the triggering issue's scope, filed in the project whose
-VCS integration binds the buggy repo (falling back to `write_projects`) and linked `relates to` the triggering issue;
-and update, comment on and link only the issues the run itself created. Setting `AI Agent` on **any** issue stays
-banned, since setting it queues an agent run.
+`relates to` the triggering issue (or `depends on` / `is required for` when one genuinely blocks the other), never
+`subtask of` it (CLAUDE-454: that verb is reserved for linking under an epic or milestone root, since making a work
+issue the parent lets closing the follow-up auto-close it and lets the dependency gate block the parent on its own
+child), or a bug found outside the triggering issue's scope, filed in the project whose VCS integration binds the
+buggy repo (falling back to `write_projects`) and linked `relates to` the triggering issue; and update, comment on
+and link only the issues the run itself created. The prompt also rules out two kinds of follow-up regardless of link
+type: one whose only purpose is to verify, after the triggering issue's PR exists, that infrastructure or
+configuration outside the PR took effect, and one that can only start once that PR is open or merged, since the
+agent working it would be exactly as local-only as the one that filed it. Before creating a link it checks for a
+cycle (the target already blocked, directly or through a chain, by the issue being linked) and skips the link if one
+would result. Setting `AI Agent` on **any** issue stays banned, since setting it queues an agent run.
 
 ##### Forgejo token scopes (CLAUDE-196)
 

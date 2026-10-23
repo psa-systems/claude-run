@@ -13,11 +13,18 @@ Permitted by the built-in default prompt (`prompt_preset: default`, `default_you
 - Create an issue with `yt issue create` in exactly two cases. A gap, deferred item, or descoped piece of the
   triggering issue: restricted to `native.youtrack.write_projects` (defaulting to empty, which resolves to the
   **triggering issue's own project**, so the common case needs no configuration and no site specifics are baked into
-  the binary), linked `yt issue link <new-issue> <KEY> --type "subtask of"`. A bug found outside the triggering
+  the binary), linked `yt issue link <new-issue> <KEY> --type "relates to"` (or `depends on` / `is required for` when
+  one genuinely blocks the other), **never** `--type "subtask of"` (CLAUDE-454: that verb is reserved for linking
+  under an epic or milestone root, since making a work issue the parent lets closing the follow-up auto-close it and
+  lets the dependency gate block the parent on its own child). A bug found outside the triggering
   issue's scope, in this repo or another: filed in the project whose VCS integration binds the buggy repo, falling
   back to `native.youtrack.write_projects` when none or more than one project binds it, linked
   `yt issue link <new-issue> <KEY> --type "relates to"`; fixed in this run only if it blocks the triggering issue's
-  acceptance criteria and lives in the same repo, otherwise filed and left unfixed.
+  acceptance criteria and lives in the same repo, otherwise filed and left unfixed. Neither case files a follow-up
+  that can only start once the triggering issue's own PR is open or merged, or one whose only purpose is to verify
+  that infrastructure or configuration outside the PR took effect; the agent assumes that change was made and is
+  correct. Before creating either link, the agent checks that it would not create a dependency cycle and skips the
+  link, saying so in its run summary, if it would.
 - Update, comment on and link **only the issues the run itself created** during that attempt.
 - On the triggering issue, the only writes are the two link commands above, one per issue the run created.
 
