@@ -66,9 +66,15 @@
 # The agent does ONLY local engineering work on code (read issue, branch, change, commit locally, run the repo's
 # checks): no git push and no PR. Since CLAUDE-214 it may also make bounded tracker writes, in two cases (CLAUDE-297
 # split these): a gap, deferred item, or descoped piece of the triggering issue is filed in
-# native.youtrack.write_projects (defaulting to the triggering issue's own project) and linked subtask of the
-# triggering issue; a bug found outside the triggering issue's scope is filed in the project whose VCS integration
-# binds the buggy repo (falling back to native.youtrack.write_projects) and linked relates to the triggering issue.
+# native.youtrack.write_projects (defaulting to the triggering issue's own project) and linked relates to (or depends
+# on / is required for when one genuinely blocks the other), never subtask of, the triggering issue (CLAUDE-454:
+# subtask of is reserved for linking under an epic or milestone root, since making a work issue the parent lets
+# closing the follow-up auto-close it and lets the dependency gate block the parent on its own child); a bug found
+# outside the triggering issue's scope is filed in the project whose VCS integration binds the buggy repo (falling
+# back to native.youtrack.write_projects) and linked relates to the triggering issue. Neither case files a follow-up
+# whose only purpose is to verify, once the triggering issue's own PR exists, that infrastructure or configuration
+# outside the PR took effect, or one that can only start once that PR is open or merged; the agent also checks for a
+# link cycle before creating either link and skips the link if one would result.
 # Either way the agent may update / comment on / link only the issues it created this run, so a gap or bug it finds
 # becomes a tracked issue rather than a line of prose. The agent may also comment on the triggering issue itself; the
 # runner still posts its own outcome comment on it. Everything else stays the handler's: the AI Agent field on ANY issue, and every
