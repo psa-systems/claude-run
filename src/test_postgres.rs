@@ -662,17 +662,10 @@ exit 0
         write_stub(&dir.join("docker"), &script);
     }
 
-    /// `std::env::set_var("PATH", ...)` is process-global, so two tests that
-    /// each stub `docker` on PATH concurrently would stomp each other's
-    /// value. Every test below holds this for its whole body (not just the
-    /// mutation), serializing them against each other without touching any
-    /// other test in the suite.
-    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// `PATH` is process-global, so every test that stubs a binary on it holds
+    /// the crate-wide `testutil::path_env_lock` for its whole body.
     fn lock_path() -> std::sync::MutexGuard<'static, ()> {
-        PATH_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::testutil::path_env_lock()
     }
 
     fn with_stub_on_path<F: FnOnce()>(f: F) {

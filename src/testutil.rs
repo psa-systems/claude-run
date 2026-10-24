@@ -14,6 +14,14 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// The one lock every test that mutates the process-wide `PATH` must hold for
+/// its whole body. Separate per-module locks let one test restore a stale
+/// `PATH` snapshot over another's stub dir, so the stub vanishes mid-test.
+pub fn path_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Strip every ambient git-config and credential input from `cmd` before a
 /// test execs real `git`.
 ///
