@@ -815,8 +815,7 @@ pub(crate) fn git_allow_protocol_test_lock() -> std::sync::MutexGuard<'static, (
 /// unsound under concurrent access from other threads.
 #[cfg(test)]
 pub(crate) fn git_stub_path_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    crate::testutil::path_env_lock()
 }
 
 /// Serializes every test that sets the process-wide `GIT_TRACE` env var to
