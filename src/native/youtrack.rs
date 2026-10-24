@@ -2995,12 +2995,31 @@ fn finalize(
                 };
                 match review {
                     None | Some(ReviewOutcome::Pass(_)) => {
-                        if let Some(pr_number) = pr.number {
-                            if let Err(e) = forge.mark_pr_ready(&host, &job.repo_path, pr_number) {
-                                error!(key = %job.key, pr_number, error = %e, "promoting the reviewed PR to ready failed (continuing)");
+                        // Best-effort: a failed promotion does not block the
+                        // success outcome, but it is logged and named in the
+                        // comment so a PR left as a draft is never silent.
+                        let promote_error = match pr.number {
+                            Some(pr_number) => {
+                                match forge.mark_pr_ready(&host, &job.repo_path, pr_number) {
+                                    Ok(()) => None,
+                                    Err(e) => {
+                                        error!(key = %job.key, pr_number, error = %e, "promoting the reviewed PR to ready failed (continuing)");
+                                        Some(e.to_string())
+                                    }
+                                }
                             }
-                        }
+                            None => {
+                                error!(key = %job.key, url = %url, "promoting the reviewed PR to ready skipped: the PR number is unknown (continuing)");
+                                Some("the PR number is unknown".to_string())
+                            }
+                        };
                         let body = success_comment(claude_result, &url);
+                        let body = match &promote_error {
+                            Some(e) => {
+                                format!("{body}\n\nPR could not be promoted from draft: {e}")
+                            }
+                            None => body,
+                        };
                         let body = match review {
                             Some(ReviewOutcome::Pass(notes)) if !notes.is_empty() => {
                                 format!("{body}\n\n## Review\n\n{notes}")
@@ -9203,13 +9222,8 @@ mod tests {
                         "pr",
                         "edit",
                         "contoso/claude-run#7",
-                        "--title",
+                        "title",
                         "feat: x",
-                        "--body-file",
-                        std::env::temp_dir()
-                            .join("claude-run-pr-refresh-7.md")
-                            .to_string_lossy()
-                            .as_ref(),
                     ],
                     "",
                 )
@@ -9221,7 +9235,20 @@ mod tests {
                         "pr",
                         "edit",
                         "contoso/claude-run#7",
-                        "--title",
+                        "body",
+                        "body\n\n#MK-16",
+                    ],
+                    "",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "edit",
+                        "contoso/claude-run#7",
+                        "title",
                         "feat: x",
                     ],
                     "",
@@ -9258,13 +9285,14 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"),
+                .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 title feat: x"),
             "a resumed success must strip the WIP: prefix: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c.starts_with(
-                "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x --body-file"
-            )),
+            calls
+                .iter()
+                .any(|c| c
+                    .starts_with("fj --host dev.a8n.run pr edit contoso/claude-run#7 body body")),
             "a resumed success must refresh the salvage placeholder title/body too: {calls:?}"
         );
     }
@@ -9274,7 +9302,7 @@ mod tests {
         // CLAUDE-398 criterion 8: `refresh_pr_text` is best-effort (it must
         // never block the success outcome), but its failure is never silent:
         // it is logged AND named in the success comment. Omitting the
-        // combined --title/--body-file edit stub makes the refresh fail with
+        // title/body edit stubs makes the refresh fail with
         // a "no canned response" error from the StubRunner.
         let dir = tempfile::tempdir().unwrap();
         let git_dir = dir.path().join(".git");
@@ -9355,8 +9383,8 @@ mod tests {
                     &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
                     "",
                 )
-                // The combined --title/--body-file edit stub is deliberately
-                // absent: refresh_pr_text's `fj pr edit` call has no canned
+                // The refresh_pr_text's title/body edit stubs are deliberately
+                // absent: its `fj pr edit` calls have no canned
                 // response, so it fails. mark_pr_ready's own title-only edit
                 // is still stubbed, so it still succeeds independently.
                 .ok(
@@ -9367,7 +9395,7 @@ mod tests {
                         "pr",
                         "edit",
                         "contoso/claude-run#7",
-                        "--title",
+                        "title",
                         "feat: x",
                     ],
                     "",
@@ -9404,7 +9432,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"),
+                .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 title feat: x"),
             "mark_pr_ready must still succeed even when the refresh failed: {calls:?}"
         );
         let comment = calls
@@ -9503,13 +9531,8 @@ mod tests {
                         "pr",
                         "edit",
                         "contoso/claude-run#7",
-                        "--title",
+                        "title",
                         "feat: x",
-                        "--body-file",
-                        std::env::temp_dir()
-                            .join("claude-run-pr-refresh-7.md")
-                            .to_string_lossy()
-                            .as_ref(),
                     ],
                     "",
                 )
@@ -9521,7 +9544,20 @@ mod tests {
                         "pr",
                         "edit",
                         "contoso/claude-run#7",
-                        "--title",
+                        "body",
+                        "body\n\n#MK-16",
+                    ],
+                    "",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "edit",
+                        "contoso/claude-run#7",
+                        "title",
                         "feat: x",
                     ],
                     "",
@@ -9563,7 +9599,7 @@ mod tests {
         );
         assert!(
             calls.iter().any(|c| c.starts_with(
-                "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x --body-file"
+                "fj --host dev.a8n.run pr edit contoso/claude-run#7 body body"
             )),
             "a resumed success on a moved branch must still refresh the salvage placeholder title/body: {calls:?}"
         );
@@ -9584,7 +9620,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"),
+                .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 title feat: x"),
             "a resumed success on a moved branch must still strip the WIP: prefix: {calls:?}"
         );
     }
@@ -11262,7 +11298,7 @@ mod tests {
                         "pr",
                         "edit",
                         "contoso/claude-run#7",
-                        "--title",
+                        "title",
                         "feat: x",
                     ],
                     "",
@@ -11304,7 +11340,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"),
+                .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 title feat: x"),
             "a passing review must still promote the draft PR to ready: {calls:?}"
         );
         let comment = calls
@@ -11314,6 +11350,128 @@ mod tests {
         assert!(
             comment.contains("## Review") && comment.contains("all criteria check out"),
             "the success comment must carry the review's notes: {comment}"
+        );
+    }
+
+    /// CLAUDE-456: a failed promotion (no canned `pr edit` response) is logged
+    /// and named in the success comment; the issue still reaches Code Review.
+    #[test]
+    fn finalize_names_a_failed_draft_promotion_in_the_success_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    r#"{"pull_requests":[{"number":7,"title":"WIP: feat: x","head_sha":"abc"}]}"#,
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: feat: x",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            test_comment_run(),
+            None,
+            Some(&ReviewOutcome::Pass("all criteria check out".to_string())),
+            1,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::CodeReview {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                pr_number: Some(7),
+                head_branch: Some("feat/x".into()),
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .unwrap_or_else(|| panic!("no issue comment call recorded: {calls:?}"));
+        assert!(
+            comment.contains("PR could not be promoted from draft:"),
+            "a failed promotion must be named in the success comment: {comment}"
         );
     }
 

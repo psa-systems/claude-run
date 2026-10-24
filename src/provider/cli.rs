@@ -2126,7 +2126,7 @@ impl Forge for CliBackend {
             return Ok(());
         };
         let id = format!("{repo}#{pr_number}");
-        let args = ["--host", host, "pr", "edit", &id, "--title", stripped];
+        let args = ["--host", host, "pr", "edit", &id, "title", stripped];
         let out = self
             .runner
             .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
@@ -2139,10 +2139,9 @@ impl Forge for CliBackend {
     /// untouched. Otherwise reads the resolved feature branch's current tip
     /// subject/body, runs them through
     /// [`crate::provider::validate_pr_subject`], and overwrites the PR with
-    /// one `fj pr edit --title --body-file` call (CLAUDE-398). The body
-    /// scratch file goes through `std::env::temp_dir` rather than the
-    /// clone's git-directory scratch space, mirroring `pr_comment`'s scratch
-    /// convention, and is removed again whether or not the edit succeeds.
+    /// `fj pr edit <id> title` then `fj pr edit <id> body` (CLAUDE-398,
+    /// CLAUDE-456: `fj` has no `--title`/`--body-file` flags on `pr edit`).
+    /// A failed body edit after a successful title edit names the body step.
     fn refresh_pr_text(
         &self,
         workdir: &Path,
@@ -2168,35 +2167,22 @@ impl Forge for CliBackend {
             .run_in_env(Some(workdir), "git", &body_args, &[])?;
         let body = unwrap_prose(Self::checked("git", out, &body_args)?.trim());
 
-        let scratch = std::env::temp_dir().join(format!("claude-run-pr-refresh-{pr_number}.md"));
-        std::fs::write(&scratch, &body)?;
-        let scratch_arg = scratch.to_string_lossy().to_string();
         let id = format!("{repo}#{pr_number}");
-        let args = [
-            "--host",
-            host,
-            "pr",
-            "edit",
-            &id,
-            "--title",
-            title.as_str(),
-            "--body-file",
-            scratch_arg.as_str(),
-        ];
-        let res = self
+        let title_args = ["--host", host, "pr", "edit", &id, "title", title.as_str()];
+        let out = self
             .runner
-            .run_in_env(None, &self.fj, &args, &self.fj_envs())
-            .and_then(|out| Self::checked(&self.fj, out, &args));
-        if let Err(e) = std::fs::remove_file(&scratch) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::error!(
-                    path = %scratch.display(),
-                    error = %e,
-                    "removing the PR refresh scratch file failed"
-                );
-            }
-        }
-        res.map(|_| ())
+            .run_in_env(None, &self.fj, &title_args, &self.fj_envs())?;
+        Self::checked(&self.fj, out, &title_args)?;
+        let body_args = ["--host", host, "pr", "edit", &id, "body", body.as_str()];
+        self.runner
+            .run_in_env(None, &self.fj, &body_args, &self.fj_envs())
+            .and_then(|out| Self::checked(&self.fj, out, &body_args))
+            .map_err(|e| {
+                Error::Other(anyhow::anyhow!(
+                    "PR #{pr_number} body edit failed after the title was updated: {e}"
+                ))
+            })?;
+        Ok(())
     }
 
     fn take_notices(&self) -> Vec<String> {
@@ -4332,9 +4318,9 @@ mod tests {
 
     #[test]
     fn refresh_pr_text_overwrites_a_draft_prs_title_and_body() {
-        // CLAUDE-398: a draft (`WIP: `-prefixed) PR gets one combined
-        // `fj pr edit --title --body-file` call built from the resolved
-        // feature branch's current tip.
+        // CLAUDE-398: a draft (`WIP: `-prefixed) PR gets a `title` then a
+        // `body` `fj pr edit` call built from the resolved feature branch's
+        // current tip.
         let wd = tempfile::tempdir().unwrap();
         let runner = with_open_pr_search(
             StubRunner::new(),
@@ -4357,36 +4343,95 @@ mod tests {
                 &["log", "-1", "--format=%b", "feat/x"],
                 "Finished.\n\n#MK-16\n",
             );
-        let scratch_path = std::env::temp_dir().join("claude-run-pr-refresh-7.md");
-        let runner = runner.ok(
-            "fj",
-            &[
-                "--host",
-                "dev.a8n.run",
-                "pr",
-                "edit",
-                "contoso/claude-run#7",
-                "--title",
-                "feat: the real thing",
-                "--body-file",
-                scratch_path.to_string_lossy().as_ref(),
-            ],
-            "",
-        );
+        let runner = runner
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "edit",
+                    "contoso/claude-run#7",
+                    "title",
+                    "feat: the real thing",
+                ],
+                "",
+            )
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "edit",
+                    "contoso/claude-run#7",
+                    "body",
+                    "Finished.\n\n#MK-16",
+                ],
+                "",
+            );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         b.refresh_pr_text(wd.path(), "dev.a8n.run", "contoso/claude-run", 7)
             .unwrap();
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls.iter().any(|c| c.starts_with(
-                "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: the real thing --body-file"
-            )),
-            "the draft PR must be overwritten with the tip's own title and body: {calls:?}"
+            calls.iter().any(|c| c
+                == "fj --host dev.a8n.run pr edit contoso/claude-run#7 title feat: the real thing"),
+            "the draft PR's title must be overwritten with the tip's subject: {calls:?}"
         );
         assert!(
-            !scratch_path.exists(),
-            "the body scratch file must be removed again after the edit"
+            calls.iter().any(|c| c
+                .starts_with("fj --host dev.a8n.run pr edit contoso/claude-run#7 body Finished.")),
+            "the draft PR's body must be overwritten with the tip's body: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("--title") || c.contains("pr edit contoso/claude-run#7 --")),
+            "fj pr edit has no --title/--body-file flags: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_pr_text_names_the_body_step_when_only_the_body_edit_fails() {
+        // CLAUDE-456: the title lands, the body edit has no canned response
+        // and fails; the error says the title was already updated.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_open_pr_search(
+            StubRunner::new(),
+            r#"[{"number":7,"title":"WIP: feat: x","head_ref":"feat/x"}]"#,
+        );
+        let runner = with_branch_resolution(
+            runner,
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = runner
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "Done.\n")
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "edit",
+                    "contoso/claude-run#7",
+                    "title",
+                    "feat: x",
+                ],
+                "",
+            );
+        let b = CliBackend::new(Arc::new(runner));
+        let err = b
+            .refresh_pr_text(wd.path(), "dev.a8n.run", "contoso/claude-run", 7)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("body edit failed after the title was updated"),
+            "got {err}"
         );
     }
 
