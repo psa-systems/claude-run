@@ -72,7 +72,11 @@ for) a fresh marker per branch. When `infra_failure::detect` recognizes such a c
 the FULL redacted log (no LLM, no I/O) and reads the same text `failure_signature` does, not the bounded copy the
 classifier prompt gets, because a capacity abort is post-steps and is exactly what that bound cuts. It ships three
 deliberately conservative kinds, each requiring an unambiguous phrase: `disk-full`, `out-of-memory`, and
-`runner-unavailable`. An over-broad pattern would merge unrelated code failures across branches, so an undetected
+`runner-unavailable`. Before matching, the detector drops cargo test-result lines (`test ... ... ok` / `FAILED` /
+`ignored[, ...]`, with or without a leading timestamp) and the bare `<target>::<test>` paths cargo lists under
+`failures:`, so a test whose NAME happens to contain a detector phrase (for example a test asserting on `ENOSPC`
+handling) never matches, whether that test passed or failed; only text the runner or toolchain itself emitted as a
+diagnostic counts. An over-broad pattern would merge unrelated code failures across branches, so an undetected
 condition is the preferred failure mode. The `ci_failure` store dedupes an infra failure the same way as a code failure
 now (by its `infra:<kind>` fingerprint id, CLAUDE-272's `fingerprint::fingerprint`), so the branch-agnostic collapse
 described here matters mainly to the legacy-adoption fallback, not to the primary path.

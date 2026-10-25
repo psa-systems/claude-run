@@ -37,11 +37,65 @@ pub struct InfraFailure {
 /// Run the infrastructure detectors against a full redacted job log, most
 /// specific first. `None` when no detector matches, which is the common case: a
 /// code failure must never match here.
+///
+/// Cargo test-result lines (`test <name> ... ok` / `FAILED` / `ignored[, ...]`)
+/// and the bare `<target>::<test>` paths cargo lists under `failures:` are
+/// dropped before any detector runs, so a test whose NAME happens to contain a
+/// detector phrase (`enospc`, `out of memory`, ...) never matches here, whether
+/// that test passed or failed: only text the runner or toolchain emitted as a
+/// diagnostic counts.
 pub fn detect(log: &str) -> Option<InfraFailure> {
-    let lower = log.to_ascii_lowercase();
+    let filtered = strip_test_name_lines(log);
+    let lower = filtered.to_ascii_lowercase();
     detect_disk_full(&lower)
         .or_else(|| detect_out_of_memory(&lower))
         .or_else(|| detect_runner_unavailable(&lower))
+}
+
+/// Drop lines that carry only a test name: a `test ... ... ok|FAILED|ignored`
+/// result line, or a bare `<target>::<test>` path from cargo's `failures:`
+/// list. Every other line, including its original casing, passes through
+/// unchanged so the detectors below still see it verbatim.
+fn strip_test_name_lines(log: &str) -> String {
+    log.lines()
+        .filter(|line| !is_test_result_line(line) && !is_test_path_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Trim a line and drop a single leading timestamp token, as the forge log
+/// format writes it (e.g. `2024-01-01T12:00:00.123456789Z `).
+fn strip_leading_timestamp(line: &str) -> &str {
+    let trimmed = line.trim();
+    match trimmed.split_once(' ') {
+        Some((first, rest)) if first.ends_with('Z') => rest.trim_start(),
+        _ => trimmed,
+    }
+}
+
+/// `test <name> ... ok`, `test <name> ... FAILED`, `test <name> ... ignored`
+/// or `test <name> ... ignored, <reason>`, with or without a leading
+/// timestamp.
+fn is_test_result_line(line: &str) -> bool {
+    let Some(rest) = strip_leading_timestamp(line).strip_prefix("test ") else {
+        return false;
+    };
+    let Some((_, status)) = rest.split_once(" ... ") else {
+        return false;
+    };
+    let status = status.trim();
+    status == "ok" || status == "FAILED" || status == "ignored" || status.starts_with("ignored,")
+}
+
+/// A bare `<target>::<test>` path, the indented list cargo prints under
+/// `failures:`, with or without a leading timestamp: no whitespace, at least
+/// one `::`, and nothing but identifier characters and `::`.
+fn is_test_path_line(line: &str) -> bool {
+    let s = strip_leading_timestamp(line);
+    !s.is_empty()
+        && s.contains("::")
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
 }
 
 /// `disk-full`: the kernel's own ENOSPC wording, or a workflow capacity-guard
@@ -221,6 +275,73 @@ mod tests {
         let b = detect("df reports 0 bytes: no space left on device (os error 28)\n").unwrap();
         assert_eq!(a.kind, b.kind);
         assert_eq!(a, b, "same kind and same problem sentence");
+    }
+
+    #[test]
+    fn a_passing_test_named_after_a_detector_phrase_does_not_match() {
+        // CLAUDE-459: this repo's own `disk_full_is_detected_from_enospc...`
+        // test prints exactly this line on every passing run.
+        assert!(detect(
+            "test infra_failure::tests::disk_full_is_detected_from_enospc_and_from_a_capacity_guard ... ok\n"
+        )
+        .is_none());
+        assert!(detect("test oom::tests::out_of_memory_is_detected ... ok\n").is_none());
+        assert!(
+            detect("test net::tests::runner_unavailable_when_host_unresolvable ... ok\n").is_none()
+        );
+        // Same, with the forge log's leading timestamp token.
+        assert!(detect(
+            "2024-01-01T12:00:00.123456789Z test infra_failure::tests::disk_full_is_detected_from_enospc_and_from_a_capacity_guard ... ok\n"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_failing_test_named_after_a_detector_phrase_does_not_match() {
+        assert!(detect("test disk_full_enospc_regression ... FAILED\n").is_none());
+        assert!(detect("test out_of_memory_regression ... FAILED\n").is_none());
+        assert!(detect("test runner_unavailable_regression ... FAILED\n").is_none());
+        assert!(detect(
+            "2024-01-01T12:00:00.000000000Z test disk_full_enospc_regression ... FAILED\n"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_bare_test_path_under_failures_does_not_match() {
+        assert!(detect(
+            "failures:\n    infra_failure::tests::disk_full_is_detected_from_enospc_and_from_a_capacity_guard\n\n\
+             test result: FAILED. 0 passed; 1 failed\n"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_real_diagnostic_still_matches_alongside_a_coincidentally_named_passing_test() {
+        assert_eq!(
+            kind_of(
+                "test infra_failure::tests::disk_full_is_detected_from_enospc_and_from_a_capacity_guard ... ok\n\
+                 error: failed to write: No space left on device (os error 28)\n"
+            )
+            .as_deref(),
+            Some("disk-full")
+        );
+        assert_eq!(
+            kind_of(
+                "test oom::tests::out_of_memory_is_detected ... ok\n\
+                 Memory cgroup out of memory: OOM-killed process 1234 (rustc)\n"
+            )
+            .as_deref(),
+            Some("out-of-memory")
+        );
+        assert_eq!(
+            kind_of(
+                "test net::tests::runner_unavailable_is_detected ... ok\n\
+                 curl: (6) Could not resolve host: dev.a8n.run\n"
+            )
+            .as_deref(),
+            Some("runner-unavailable")
+        );
     }
 
     #[test]

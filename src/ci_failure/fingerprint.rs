@@ -183,6 +183,18 @@ error: 1 target failed:
     }
 
     #[test]
+    fn fingerprint_ignores_a_passing_tests_name_and_returns_the_real_failure() {
+        // CLAUDE-459: a passing test whose NAME contains "enospc" must not
+        // mask the actual failing test with a branch-agnostic infra key.
+        let log = "\
+     Running unittests src/lib.rs (target/debug/deps/claude_run-abc)
+test infra_failure::tests::disk_full_is_detected_from_enospc_and_from_a_capacity_guard ... ok
+test foo ... FAILED
+";
+        assert_eq!(fingerprint(log), vec!["lib::foo".to_string()]);
+    }
+
+    #[test]
     fn fingerprint_falls_back_to_the_normalized_signature() {
         let log = "error: could not compile `billing-service` (lib) due to 1 previous error\n";
         let fp = fingerprint(log);
