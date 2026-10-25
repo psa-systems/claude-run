@@ -1225,6 +1225,26 @@ impl CliBackend {
         Ok(())
     }
 
+    /// `MERGE_HEAD` exists only while a merge is in progress, which is
+    /// exactly the state that makes `git merge --abort` meaningful; checking
+    /// it before running the abort (CLAUDE-458) is what lets
+    /// [`Self::merge_remote_branch`] tell a real conflict, where aborting is
+    /// correct, apart from a merge that never started (a dirty tree, an
+    /// unrelated history, a rejecting hook, ...), where `git merge --abort`
+    /// itself would fail with "fatal: There is no merge to abort" and bury
+    /// the original cause. Same exit-code convention as `is_ancestor`: 0
+    /// means present, 1 means absent, anything else is a real failure that
+    /// propagates.
+    fn merge_head_present(&self, workdir: &Path) -> Result<bool> {
+        let args = ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"];
+        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        match out.exit_code {
+            0 => Ok(true),
+            1 => Ok(false),
+            _ => Self::checked("git", out, &args).map(|_| unreachable!()),
+        }
+    }
+
     /// Merge `origin/<branch>` into the local branch (CLAUDE-382),
     /// called only once `is_ancestor` has ruled out a plain fast-forward: the
     /// remote gained commits (typically the runner's own "branch was behind
@@ -1232,9 +1252,12 @@ impl CliBackend {
     /// neither is an ancestor of the other. A clean merge leaves the local
     /// branch with the remote tip as an ancestor, so the caller's subsequent
     /// push stays a fast-forward; `--force` is never used anywhere in this
-    /// path. A conflicting merge is aborted immediately (never left for the
-    /// caller to push over) and reported loudly, naming both SHAs and the
-    /// workdir, exactly as this arm did before it attempted a merge at all.
+    /// path. A failed merge is only ever a conflict if `MERGE_HEAD` is
+    /// present (CLAUDE-458): only then is `git merge --abort` run, never
+    /// otherwise, since a merge that never started leaves nothing to abort
+    /// and `git merge --abort` would fail with its own unrelated error,
+    /// hiding the real cause. Either way the merge's own stderr reaches the
+    /// returned error, naming both SHAs and the workdir.
     fn merge_remote_branch(
         &self,
         workdir: &Path,
@@ -1250,6 +1273,24 @@ impl CliBackend {
         }
         // `git merge` prints its CONFLICT lines on stdout, not stderr.
         let merge_stderr = crate::provider::append_stdout_tail(out.stderr.trim(), &out.stdout, &[]);
+        let merge_exit_code = out.exit_code;
+        if !self.merge_head_present(workdir)? {
+            error!(
+                branch = %branch,
+                local_sha = %local_sha,
+                remote_sha = %remote_sha,
+                workdir = %workdir.display(),
+                exit_code = merge_exit_code,
+                stderr = %merge_stderr,
+                "merging the remote branch into the local work failed before a merge started"
+            );
+            return Err(Error::Other(anyhow::anyhow!(
+                "remote branch `{branch}` has diverged from the local work (local {local_sha}, \
+                 remote {remote_sha}) and merging origin/{branch} into it failed before a \
+                 merge started (exit {merge_exit_code}, workdir `{}`): {merge_stderr}",
+                workdir.display()
+            )));
+        }
         error!(
             branch = %branch,
             local_sha = %local_sha,
@@ -1262,7 +1303,17 @@ impl CliBackend {
         let abort_out = self
             .runner
             .run_in_env(Some(workdir), "git", &abort_args, &[])?;
-        Self::checked("git", abort_out, &abort_args)?;
+        if !abort_out.ok {
+            let abort_stderr = abort_out.stderr.trim();
+            return Err(Error::Other(anyhow::anyhow!(
+                "remote branch `{branch}` has diverged from the local work (local {local_sha}, \
+                 remote {remote_sha}) and merging origin/{branch} into it conflicted \
+                 ({merge_stderr}); aborting that merge then also failed (exit {}, \
+                 {abort_stderr}). The workdir `{}` may be left mid-merge.",
+                abort_out.exit_code,
+                workdir.display()
+            )));
+        }
         Err(Error::Other(anyhow::anyhow!(
             "remote branch `{branch}` has diverged from the local work (local {local_sha}, \
              remote {remote_sha}) and merging origin/{branch} into it conflicted ({merge_stderr}); \
@@ -5220,6 +5271,11 @@ mod tests {
                 1,
                 "CONFLICT (content): Merge conflict in src/lib.rs",
             )
+            .ok(
+                "git",
+                &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+                "",
+            )
             .ok("git", &["merge", "--abort"], "")
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
         let runner = Arc::new(runner);
@@ -5249,6 +5305,172 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.starts_with("git push")),
             "a conflicting merge must not push: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("--force")),
+            "no force anywhere: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_diverged_merge_failed_before_starting_is_not_reported_as_conflict() {
+        // CLAUDE-458: the merge fails for a reason other than a conflict (a
+        // dirty tree, an unrelated history, a rejecting hook, ...), so
+        // `MERGE_HEAD` is never created. `git merge --abort` must not run
+        // (there is nothing to abort), and the returned error must report
+        // the merge's own stderr, exit code, branch, both SHAs, and the
+        // workdir, without claiming a conflict or an abort.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "localsha\n")],
+        );
+        let runner = with_remote_state(
+            runner,
+            "feat/x",
+            "localsha",
+            "remotesha\trefs/heads/feat/x\n",
+        );
+        let runner = with_open_pr_search(runner, "[]")
+            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .fail(
+                "git",
+                &["merge-base", "--is-ancestor", "remotesha", "localsha"],
+                1,
+                "",
+            )
+            .fail(
+                "git",
+                &["merge", "--no-edit", "origin/feat/x"],
+                128,
+                "fatal: refusing to merge unrelated histories",
+            )
+            .fail(
+                "git",
+                &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+                1,
+                "",
+            )
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        match b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap_err()
+        {
+            Error::Other(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("feat/x"), "names the branch: {msg}");
+                assert!(msg.contains("localsha"), "names the local SHA: {msg}");
+                assert!(msg.contains("remotesha"), "names the remote SHA: {msg}");
+                assert!(
+                    msg.contains(&wd.path().display().to_string()),
+                    "names the workdir: {msg}"
+                );
+                assert!(msg.contains("128"), "names the merge exit code: {msg}");
+                assert!(
+                    msg.contains("refusing to merge unrelated histories"),
+                    "carries the merge's own stderr: {msg}"
+                );
+                assert!(
+                    !msg.contains("conflicted"),
+                    "must not claim a conflict that never happened: {msg}"
+                );
+                assert!(
+                    !msg.contains("aborted"),
+                    "must not claim an abort that never ran: {msg}"
+                );
+            }
+            other => panic!("expected Other actionable error, got {other:?}"),
+        }
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c == "git merge --abort"),
+            "no MERGE_HEAD means nothing to abort: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "a failed merge must not push: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("--force")),
+            "no force anywhere: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_diverged_merge_conflict_and_failed_abort_reports_both() {
+        // CLAUDE-458: a real conflict (MERGE_HEAD present) whose abort then
+        // ALSO fails. The returned error must carry both the original merge
+        // stderr and the abort's own failure, not just one or the other.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "localsha\n")],
+        );
+        let runner = with_remote_state(
+            runner,
+            "feat/x",
+            "localsha",
+            "remotesha\trefs/heads/feat/x\n",
+        );
+        let runner = with_open_pr_search(runner, "[]")
+            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .fail(
+                "git",
+                &["merge-base", "--is-ancestor", "remotesha", "localsha"],
+                1,
+                "",
+            )
+            .fail(
+                "git",
+                &["merge", "--no-edit", "origin/feat/x"],
+                1,
+                "CONFLICT (content): Merge conflict in src/lib.rs",
+            )
+            .ok(
+                "git",
+                &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+                "",
+            )
+            .fail(
+                "git",
+                &["merge", "--abort"],
+                128,
+                "fatal: Could not reset index",
+            )
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        match b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap_err()
+        {
+            Error::Other(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("Merge conflict in src/lib.rs"),
+                    "carries the original merge's stderr: {msg}"
+                );
+                assert!(
+                    msg.contains("Could not reset index"),
+                    "carries the abort's own stderr: {msg}"
+                );
+            }
+            other => panic!("expected Other actionable error, got {other:?}"),
+        }
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c == "git merge --abort"),
+            "MERGE_HEAD present means abort must still be attempted: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "a failed merge must not push: {calls:?}"
         );
         assert!(
             !calls.iter().any(|c| c.contains("--force")),
