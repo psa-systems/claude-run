@@ -2445,7 +2445,13 @@ mod tests {
         // `GIT_ALLOW_PROTOCOL` replaces git's default allowlist rather than
         // widening it, so `file` (needed by `url`'s own `ls-remote`) stays
         // listed alongside `ext`; the lock keeps this test's set/remove pair
-        // from racing another thread's.
+        // from racing another thread's. The `git_stub_path_test_lock` is also
+        // needed: this test resolves `git` off `PATH`, and without it a
+        // concurrent run of `pinned_clone_stub_git_records_no_token_in_argv_and_credential_in_env`
+        // can interleave its own temporary `PATH` mutation into this test's
+        // `git` invocations, intermittently pointing them at a stub binary
+        // that no longer exists.
+        let _path_guard = git_stub_path_test_lock();
         let _guard = git_allow_protocol_test_lock();
         std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
         let result = restore_default_branch_refs_retrying(&url, "feat", &workdir, 50, &NO_WAIT);
