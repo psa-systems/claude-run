@@ -700,6 +700,12 @@ mod tests {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
+        // Reads the process-wide `PATH` below to build the child's env; held
+        // for the whole body per `testutil::path_env_lock`'s contract so no
+        // other test's concurrent `PATH` mutation can hand this test a torn
+        // or wrong value (CLAUDE-461).
+        let _path_guard = crate::testutil::path_env_lock();
+
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
