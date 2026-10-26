@@ -70,6 +70,12 @@ pub fn clear_ambient_git_env(cmd: &mut Command) {
 pub fn ensure_coreutils_timeout_on_path() {
     use std::sync::OnceLock;
 
+    // Hold the same lock every other PATH reader/mutator in the suite holds
+    // (see `path_env_lock`) for the whole read-then-maybe-write below, so this
+    // function can never race a concurrent `std::env::set_var("PATH", ...)`
+    // from another test thread.
+    let _path_guard = path_env_lock();
+
     static SHIM_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
     let dir = SHIM_DIR.get_or_init(|| {
         let dir = std::env::temp_dir().join("claude-run-test-timeout-shim");
