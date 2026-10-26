@@ -4924,6 +4924,14 @@ mod tests {
     // while this test's task is synchronously blocked on `watcher.join()`; a
     // `current_thread` runtime has no other thread left to drive the DB
     // query, which deadlocks instead of completing.
+    //
+    // The main thread polls `forge.call_count()` instead of sleeping a fixed
+    // duration before dropping `stop_tx` (CLAUDE-462): a fixed sleep assumes
+    // the watcher thread gets scheduled promptly enough to tick twice in the
+    // window, which is not guaranteed under CPU contention from the rest of
+    // the suite running in parallel. `checkpoint_push` clamps to the last
+    // configured result once `calls` exceeds the results vec, so polling
+    // past 2 ticks is harmless.
     #[tokio::test(flavor = "multi_thread")]
     async fn run_checkpoint_watcher_records_the_first_opened_pr_once() {
         let pool = mem_pool().await;
@@ -4948,7 +4956,10 @@ mod tests {
                     stop_rx,
                 )
             });
-            std::thread::sleep(Duration::from_millis(40));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while forge.call_count() < 2 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             drop(stop_tx);
             watcher.join().unwrap()
         });
