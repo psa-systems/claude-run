@@ -4669,15 +4669,16 @@ async fn apply_automerge_decision(
             "automerge disabled for this action; no action".to_string(),
         ));
     }
-    // A PR opened by the timeout salvage path (CLAUDE-379) is never
-    // automerged however its draft status changes, until a resumed run
-    // clears the flag by finishing successfully (CLAUDE-429). Checked before
-    // any forge call (`pr_status` included), so a salvaged PR's automerge
+    // A PR the runner opened before its run finished (a timeout salvage or
+    // a checkpoint push, CLAUDE-379 / CLAUDE-448) is never automerged
+    // however its draft status changes, until a resumed run clears the
+    // flag by finishing successfully (CLAUDE-429). Checked before any
+    // forge call (`pr_status` included), so a salvaged PR's automerge
     // decision never depends on live CI state.
     if row.salvaged {
-        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR was salvaged from a timed-out run; automerge blocked");
+        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR was opened by the runner before its run finished; automerge blocked");
         let body = format!(
-            "This PR was salvaged from a timed-out run; the runner will not automerge it. A human must review and merge it by hand, or re-queue the issue so a resumed run finishes the work.\n\nPR: {pr_url}"
+            "This PR was opened by the runner before its run finished (a checkpoint push or a timeout salvage); the runner will not automerge it until a run finishes the work. A human must review and merge it by hand, or re-queue the issue so a resumed run finishes the work.\n\nPR: {pr_url}"
         );
         record_automerge_outcome_and_comment_once(
             mint,
@@ -4688,13 +4689,13 @@ async fn apply_automerge_decision(
                 issue_key: &row.issue_key,
             },
             "info",
-            "salvaged from a timed-out run; automerge blocked".to_string(),
+            "opened before its run finished; automerge blocked".to_string(),
             body,
             "action-run success: salvaged-pr comment failed",
         )
         .await;
         return Ok(AutomergeOutcome::NoAction(
-            "PR was salvaged from a timed-out run; automerge blocked".to_string(),
+            "PR was opened by the runner before its run finished; automerge blocked".to_string(),
         ));
     }
     // A GitHub-hosted PR must route through `GithubForge`, not
@@ -12034,7 +12035,7 @@ mod tests {
                 .unwrap();
             let salvage_events = events
                 .iter()
-                .filter(|e| e.message.contains("salvaged from a timed-out run"))
+                .filter(|e| e.message.contains("opened before its run finished"))
                 .count();
             assert_eq!(salvage_events, 2, "a run_events row every pass: {events:?}");
 
@@ -12043,6 +12044,85 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(row.state, "open", "never retired by automerge");
+        }
+
+        /// CLAUDE-463: `salvaged` is set for both a timeout salvage and a
+        /// checkpoint-opened draft PR, so the automerge-blocked message must
+        /// not claim a timeout happened: it did not for the latter case.
+        /// Covers the issue comment, the `run_events` message and the
+        /// `NoAction` reason all at once.
+        #[tokio::test]
+        async fn apply_automerge_decision_on_salvaged_pr_never_claims_a_timeout() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                true,
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(7, "")]));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let row = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 7)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let outcome = apply_automerge_decision(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+                &row,
+            )
+            .await
+            .unwrap();
+
+            let reason = match outcome {
+                AutomergeOutcome::NoAction(reason) => reason,
+                other => panic!("expected NoAction, got {other:?}"),
+            };
+            assert!(
+                !reason.to_lowercase().contains("timed out")
+                    && !reason.to_lowercase().contains("timed-out"),
+                "NoAction reason claims a timeout: {reason:?}"
+            );
+
+            let calls = backend.calls();
+            let comment = calls
+                .iter()
+                .find(|c| c.starts_with("comment MK-16"))
+                .unwrap_or_else(|| panic!("no comment posted: {calls:?}"));
+            assert!(
+                !comment.to_lowercase().contains("timed out")
+                    && !comment.to_lowercase().contains("timed-out"),
+                "issue comment claims a timeout: {comment:?}"
+            );
+
+            let events = state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 50)
+                .await
+                .unwrap();
+            assert!(
+                events.iter().any(|e| {
+                    let m = e.message.to_lowercase();
+                    !m.contains("timed out")
+                        && !m.contains("timed-out")
+                        && m.contains("opened before its run finished")
+                }),
+                "no run_events row with the cause-neutral message: {events:?}"
+            );
         }
 
         #[tokio::test]

@@ -1209,8 +1209,20 @@ impl CliBackend {
     /// `git merge-base` fails with exit 128 ("not a valid commit name")
     /// rather than resolving ancestry. Authenticated per invocation via
     /// `token_url` (CLAUDE-395), same as [`Self::remote_branch_sha`].
+    ///
+    /// The refspec names the tracking ref explicitly (CLAUDE-464): the
+    /// runner's workdir is a `--single-branch` shallow clone
+    /// (`shallow_clone` in `src/provider/mod.rs`), whose configured refspec
+    /// covers only the cloned branch, so a bare `git fetch origin <branch>`
+    /// writes `FETCH_HEAD` only and creates no `refs/remotes/origin/<branch>`;
+    /// [`Self::merge_remote_branch`] then fails to resolve `origin/<branch>`.
+    /// No leading `+`: the ref never exists yet in a fresh workdir, so the
+    /// create succeeds without forcing it, and a rejected update (which can
+    /// only happen on a later call reusing the same workdir) is a real signal
+    /// worth surfacing rather than overwriting.
     fn fetch_branch(&self, workdir: &Path, branch: &str, token_url: Option<&str>) -> Result<()> {
-        let args = ["fetch", "origin", branch];
+        let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+        let args = ["fetch", "origin", refspec.as_str()];
         let secrets = token_url_secrets(token_url);
         let out =
             crate::provider::retry_git_network("fetch", &secrets, &self.git_retry_waits, || {
@@ -3744,7 +3756,15 @@ mod tests {
         );
         let runner = with_remote_state(runner, "feat/x", "newsha", "oldsha\trefs/heads/feat/x\n");
         let runner = with_open_pr_search(runner, "[]")
-            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                ],
+                "",
+            )
             .ok(
                 "git",
                 &["merge-base", "--is-ancestor", "oldsha", "newsha"],
@@ -3838,7 +3858,11 @@ mod tests {
             runner,
             r#"[{"number":165,"head_ref":"feat/yotun-96","html_url":"https://dev.a8n.run/a/y/pulls/165"}]"#,
         )
-        .ok("git", &["fetch", "origin", "feat/yotun-96"], "")
+        .ok(
+                "git",
+                &["fetch", "origin", "refs/heads/feat/yotun-96:refs/remotes/origin/feat/yotun-96"],
+                "",
+            )
         .fail(
             "git",
             &["merge-base", "--is-ancestor", "remotesha", "localsha"],
@@ -5081,7 +5105,15 @@ mod tests {
         let runner = with_open_pr_search(runner, "[]")
             // CLAUDE-382: fetched before the ancestry check, so the remote
             // tip's objects (oldsha) are present locally when it runs.
-            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                ],
+                "",
+            )
             // remote (oldsha) IS an ancestor of local (newsha) -> fast-forward.
             .ok(
                 "git",
@@ -5143,7 +5175,7 @@ mod tests {
         );
         let fetch_idx = calls
             .iter()
-            .position(|c| c == "git fetch origin feat/x")
+            .position(|c| c == "git fetch origin refs/heads/feat/x:refs/remotes/origin/feat/x")
             .expect("fetch must be called before the ancestry check");
         let ancestor_idx = calls
             .iter()
@@ -5182,7 +5214,11 @@ mod tests {
             runner,
             r#"[{"number":165,"head_ref":"feat/yotun-96","html_url":"https://dev.a8n.run/a/y/pulls/165"}]"#,
         )
-        .ok("git", &["fetch", "origin", "feat/yotun-96"], "")
+        .ok(
+                "git",
+                &["fetch", "origin", "refs/heads/feat/yotun-96:refs/remotes/origin/feat/yotun-96"],
+                "",
+            )
         // Neither commit is an ancestor of the other -> diverged (exit 1).
         .fail(
             "git",
@@ -5258,7 +5294,15 @@ mod tests {
             "remotesha\trefs/heads/feat/x\n",
         );
         let runner = with_open_pr_search(runner, "[]")
-            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                ],
+                "",
+            )
             .fail(
                 "git",
                 &["merge-base", "--is-ancestor", "remotesha", "localsha"],
@@ -5334,7 +5378,15 @@ mod tests {
             "remotesha\trefs/heads/feat/x\n",
         );
         let runner = with_open_pr_search(runner, "[]")
-            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                ],
+                "",
+            )
             .fail(
                 "git",
                 &["merge-base", "--is-ancestor", "remotesha", "localsha"],
@@ -5419,7 +5471,15 @@ mod tests {
             "remotesha\trefs/heads/feat/x\n",
         );
         let runner = with_open_pr_search(runner, "[]")
-            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                ],
+                "",
+            )
             .fail(
                 "git",
                 &["merge-base", "--is-ancestor", "remotesha", "localsha"],
@@ -5728,7 +5788,15 @@ mod tests {
             "remotesha\trefs/heads/fix/CLAUDE-206\n",
         );
         let runner = with_failed_open_pr_search(runner)
-            .ok("git", &["fetch", "origin", "fix/CLAUDE-206"], "")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/fix/CLAUDE-206:refs/remotes/origin/fix/CLAUDE-206",
+                ],
+                "",
+            )
             .fail(
                 "git",
                 &["merge-base", "--is-ancestor", "remotesha", "localsha"],
@@ -5901,7 +5969,11 @@ mod tests {
 
     #[test]
     fn fetch_branch_retries_once_and_succeeds_on_second_attempt() {
-        let args = ["fetch", "origin", "feature"];
+        let args = [
+            "fetch",
+            "origin",
+            "refs/heads/feature:refs/remotes/origin/feature",
+        ];
         let runner = Arc::new(
             StubRunner::new()
                 .fail_once("git", &args, 1, "connect timeout")
@@ -5911,6 +5983,165 @@ mod tests {
         b.fetch_branch(Path::new("/tmp/wd"), "feature", None)
             .unwrap();
         assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    }
+
+    /// CLAUDE-464: reproduces the bug in a real `--single-branch` workdir
+    /// exactly like the runner's own (`shallow_clone`, pinned to the
+    /// *default* branch, CLAUDE.md step 3: the agent creates its feature
+    /// branch locally off that clone). The pinned clone's configured
+    /// refspec covers only `main`, never the locally created `feat/x`, so
+    /// before the fix `fetch_branch`'s bare `git fetch origin <branch>`
+    /// writes `FETCH_HEAD` only and leaves no `refs/remotes/origin/feat/x`;
+    /// the following `merge_remote_branch` then fails with "not something
+    /// we can merge". This test fails on that code with exactly that cause.
+    /// After the fix, the fetch creates the tracking ref, the merge
+    /// succeeds, and the subsequent push is a fast-forward (never
+    /// `--force`).
+    #[test]
+    fn fetch_branch_then_merge_succeeds_in_a_real_single_branch_workdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let git_in = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&origin, &["init", "-q", "-b", "main"]);
+        git_in(&origin, &["config", "user.name", "t"]);
+        git_in(&origin, &["config", "user.email", "t@t.example"]);
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-q", "-m", "init"]);
+
+        let url = format!("file://{}", origin.display());
+        let workdir = tmp.path().join("workdir");
+        // The runner's own clone shape for a fresh job: `--single-branch`,
+        // pinned to the default branch (`shallow_clone` in
+        // `src/provider/mod.rs`).
+        crate::provider::shallow_clone(&url, Some("main"), &workdir, 50).unwrap();
+        // A clone never inherits `origin`'s local `user.name`/`user.email`
+        // (git identity is per-repo config, never copied by `clone`), and
+        // the CI container sets neither globally, so the local commit below
+        // needs its own.
+        git_in(&workdir, &["config", "user.name", "t"]);
+        git_in(&workdir, &["config", "user.email", "t@t.example"]);
+
+        // The agent creates its feature branch locally, off the pinned
+        // clone (CLAUDE.md step 3), and the runner pushes it to a
+        // same-named branch on `origin` (the happy path, no fetch
+        // involved: `push_branch`'s `--set-upstream` creates the remote
+        // branch without needing a matching fetch refspec).
+        git_in(&workdir, &["checkout", "-q", "-b", "feat/x"]);
+        std::fs::write(workdir.join("g.txt"), "y").unwrap();
+        git_in(&workdir, &["add", "."]);
+        git_in(&workdir, &["commit", "-q", "-m", "feat commit"]);
+        git_in(&workdir, &["push", "-q", "origin", "feat/x:feat/x"]);
+
+        // The checkpoint watcher (CLAUDE-448) pushes another commit
+        // straight to the remote branch while the run keeps working;
+        // modeled here as a second worktree on `origin` committing directly
+        // to `feat/x` (a plain `checkout` of it in the non-bare `origin`
+        // repo would conflict with `main` already being checked out there).
+        let origin_feat = tmp.path().join("origin-feat-worktree");
+        git_in(
+            &origin,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                origin_feat.to_str().unwrap(),
+                "feat/x",
+            ],
+        );
+        std::fs::write(origin_feat.join("h.txt"), "z").unwrap();
+        git_in(&origin_feat, &["add", "."]);
+        git_in(&origin_feat, &["commit", "-q", "-m", "checkpoint push"]);
+        let remote_sha = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin_feat)
+                .args(["rev-parse", "feat/x"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        // Drop the worktree so `feat/x` is no longer "checked out" anywhere
+        // in `origin`, which would otherwise reject the fast-forward push
+        // this test makes to it at the end.
+        git_in(
+            &origin,
+            &["worktree", "remove", origin_feat.to_str().unwrap()],
+        );
+
+        // The agent rewrites its own local history (the PMCP-9 incident),
+        // diverging from the checkpoint commit it never fetched.
+        git_in(
+            &workdir,
+            &["commit", "--amend", "-q", "-m", "feat commit v2"],
+        );
+        let local_sha = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&workdir)
+                .args(["rev-parse", "feat/x"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_ne!(
+            local_sha, remote_sha,
+            "setup must diverge: neither side is an ancestor of the other"
+        );
+
+        let b = CliBackend::new(Arc::new(ProcessRunner::new()));
+        b.fetch_branch(&workdir, "feat/x", None).unwrap();
+        // The pre-fix bug surfaces exactly here: a fetch that wrote only
+        // `FETCH_HEAD` leaves `merge_remote_branch` unable to resolve
+        // `origin/feat/x`, so the merge fails before it starts with "not
+        // something we can merge" (the `unwrap` below panics with that
+        // message on the pre-fix code).
+        b.merge_remote_branch(&workdir, "feat/x", &local_sha, &remote_sha)
+            .unwrap();
+
+        // The merge leaves the remote tip as an ancestor, so the push the
+        // caller makes next is a plain fast-forward.
+        git_in(&workdir, &["push", "origin", "feat/x:feat/x"]);
+        let pushed_sha = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["rev-parse", "feat/x"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let merged_local_sha = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&workdir)
+                .args(["rev-parse", "feat/x"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(pushed_sha, merged_local_sha);
     }
 
     #[test]
