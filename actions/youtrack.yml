@@ -64,7 +64,10 @@
 # unaffected and still finalizes as Failed.
 #
 # The agent does ONLY local engineering work on code (read issue, branch, change, commit locally, run the repo's
-# checks): no git push and no PR. Since CLAUDE-214 it may also make bounded tracker writes, in two cases (CLAUDE-297
+# checks): no git push and no PR. Since the checkpoint-push watcher above publishes the agent's commits while it is
+# still running (CLAUDE-465), the agent is told never to rewrite that branch's history (no reset, --amend, rebase,
+# filter-branch, or force push) to fix a mistake; a new commit on top is the only way, so a checkpoint already on the
+# remote is never orphaned. Since CLAUDE-214 it may also make bounded tracker writes, in two cases (CLAUDE-297
 # split these): a gap, deferred item, or descoped piece of the triggering issue is filed in
 # native.youtrack.write_projects (defaulting to the triggering issue's own project) and linked relates to (or depends
 # on / is required for when one genuinely blocks the other), never subtask of, the triggering issue (CLAUDE-454:
