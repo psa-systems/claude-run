@@ -1568,6 +1568,7 @@ async fn process_job(
             stream_log.as_deref(),
             limits.claude_timeout,
             resume.is_some(),
+            resume.as_ref().map(|r| r.pr_url.as_str()),
             crate::run_footer::CommentRun {
                 run_id,
                 attempt: attempts + 1,
@@ -1666,6 +1667,7 @@ async fn process_job(
     if let Ok(Finalized::Failed {
         cause,
         pr_step: Some(step),
+        ..
     }) = &finalize_res
     {
         if let Some(log_path) = stream_log.as_deref() {
@@ -2786,6 +2788,14 @@ enum Finalized {
         /// `None` for the claude-crash/pre-failure arm, whose cause is
         /// already inside that same stream log.
         pr_step: Option<&'static str>,
+        /// CLAUDE-467: `true` when a push or PR-create failure re-queued
+        /// the issue onto its recorded open PR instead of parking it at a
+        /// terminal Failed (below `max_attempts_per_key`, with a recorded
+        /// PR, and the field still `Working` at requeue time). Always
+        /// `false` for the claude-crash/pre-failure arm and for a push/PR
+        /// failure that has no recorded PR, is at the attempt cap, or finds
+        /// the field already advanced off `Working`.
+        requeued: bool,
     },
     /// Claude hit the wall-clock limit (exit 124). The work may be
     /// complete, partial, or absent, so the issue is NOT marked Failed: a
@@ -2819,7 +2829,10 @@ impl Finalized {
             Finalized::NeedsReview => "Needs Review",
             Finalized::NoCodeChange => "No Code Change",
             Finalized::CodeReview { .. } => "Code Review",
-            Finalized::Failed { .. } => "Failed",
+            Finalized::Failed { requeued: true, .. } => "Queued (push)",
+            Finalized::Failed {
+                requeued: false, ..
+            } => "Failed",
             Finalized::TimedOut { .. } => "Timed Out",
             Finalized::ReviewFailed { requeued: true, .. } => "Queued (review)",
             Finalized::ReviewFailed {
@@ -2880,6 +2893,12 @@ fn finalize(
     stream_log: Option<&Path>,
     claude_timeout: Duration,
     resumed: bool,
+    // CLAUDE-467: this issue's recorded open PR URL at finalize time (a
+    // CLAUDE-275 resume, or one the checkpoint-push watcher adopted
+    // mid-run), if any. Consulted only in the push/PR-create failure arm
+    // below, to decide whether a re-queue resumes a real PR instead of
+    // parking at a terminal Failed.
+    resume_pr_url: Option<&str>,
     run: crate::run_footer::CommentRun,
     // CLAUDE-448: the reason the periodic checkpoint-push watcher stopped
     // checkpointing partway through this run (a rejected push), if any. Never
@@ -3115,15 +3134,73 @@ fn finalize(
                     WorkLocation::RemoteBranch { .. } => "pr_create",
                     _ => "push",
                 };
-                let body = pr_failure_comment(claude_result, &e, &location);
-                let body = note_checkpoint_rejection(body);
-                let body =
-                    crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
-                comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
-                Ok(Finalized::Failed {
-                    cause: e.to_string(),
-                    pr_step: Some(pr_step),
-                })
+                // CLAUDE-467: a push or PR-create failure after the work is
+                // already safe (or recorded against an open PR) is not a
+                // hard failure of the work itself, so re-queue below the
+                // attempt cap when this issue has a recorded PR to resume.
+                // With no recorded PR, or at the cap, this degrades to the
+                // same terminal Failed as before.
+                match resume_pr_url {
+                    Some(pr_url) if attempts_after < max_attempts_per_key => {
+                        // Re-read first: a human or another agent may have
+                        // already advanced the field off Working while this
+                        // run was in flight, in which case it is left
+                        // untouched rather than stomped back to Queued
+                        // (mirrors the timeout arm's own re-read below).
+                        let current = backend
+                            .get_field(&job.key, &src.custom_field)
+                            .unwrap_or_default();
+                        let requeued = current.trim() == src.states.working;
+                        let body = if requeued {
+                            push_failure_requeue_comment(
+                                claude_result,
+                                &e,
+                                pr_step,
+                                pr_url,
+                                attempts_after,
+                                max_attempts_per_key,
+                            )
+                        } else {
+                            pr_failure_comment(claude_result, &e, &location)
+                        };
+                        let body = note_checkpoint_rejection(body);
+                        let body = crate::run_footer::append_job(
+                            &body,
+                            public_url.as_deref(),
+                            run,
+                            &job.key,
+                        );
+                        if let Err(ce) = backend.comment(&job.key, &body) {
+                            warn!(key = %job.key, error = %ce, "issue comment failed (continuing to AI Agent write)");
+                        }
+                        if requeued {
+                            backend.set_field(&job.key, &src.custom_field, &src.states.queued)?;
+                        } else {
+                            info!(key = %job.key, current = %current.trim(), "push/PR-create failure requeue skipped: AI Agent already advanced off Working");
+                        }
+                        Ok(Finalized::Failed {
+                            cause: e.to_string(),
+                            pr_step: Some(pr_step),
+                            requeued,
+                        })
+                    }
+                    _ => {
+                        let body = pr_failure_comment(claude_result, &e, &location);
+                        let body = note_checkpoint_rejection(body);
+                        let body = crate::run_footer::append_job(
+                            &body,
+                            public_url.as_deref(),
+                            run,
+                            &job.key,
+                        );
+                        comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
+                        Ok(Finalized::Failed {
+                            cause: e.to_string(),
+                            pr_step: Some(pr_step),
+                            requeued: false,
+                        })
+                    }
+                }
             }
         }
     } else if claude_result.timed_out {
@@ -3171,6 +3248,7 @@ fn finalize(
         Ok(Finalized::Failed {
             cause: claude_result.error.clone(),
             pr_step: None,
+            requeued: false,
         })
     }
 }
@@ -3633,6 +3711,42 @@ fn pr_failure_comment(r: &ClaudeResult, err: &Error, work: &WorkLocation) -> Str
         err.to_string(),
         String::new(),
         location_line,
+        String::new(),
+        r.summary.clone(),
+        String::new(),
+        format!("Cost: ${} USD", r.cost),
+    ]
+    .join("\n");
+    body.push_str(&raw_event_details(&r.raw));
+    body
+}
+
+/// Issue comment for a push/PR-create failure (CLAUDE-467) that re-queues
+/// below `max_attempts_per_key` onto this issue's recorded open PR, rather
+/// than parking it at a terminal Failed: names the step that actually
+/// failed, the cause, the PR it will resume, and the attempt count.
+fn push_failure_requeue_comment(
+    r: &ClaudeResult,
+    err: &Error,
+    pr_step: &str,
+    pr_url: &str,
+    attempts_after: u32,
+    max_attempts_per_key: u32,
+) -> String {
+    let step_line = match pr_step {
+        "pr_create" => "but opening the PR FAILED",
+        _ => "but pushing the branch FAILED",
+    };
+    let mut body = [
+        format!("Claude AI agent run completed {step_line}:"),
+        String::new(),
+        err.to_string(),
+        String::new(),
+        format!(
+            "This issue has a recorded open PR: {pr_url}. AI Agent has been returned to Queued \
+             (attempt {attempts_after} of {max_attempts_per_key}); the next run resumes that \
+             PR's branch rather than opening a new one."
+        ),
         String::new(),
         r.summary.clone(),
         String::new(),
@@ -6662,6 +6776,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -6705,6 +6820,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             Some("remote rejected non-fast-forward update"),
             None,
@@ -6760,6 +6876,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -6811,6 +6928,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -6864,6 +6982,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -6908,6 +7027,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -6978,6 +7098,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -7021,6 +7142,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -7134,6 +7256,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -7289,6 +7412,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -7351,6 +7475,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -7870,6 +7995,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -7955,6 +8081,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -8064,6 +8191,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -8135,6 +8263,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -8182,6 +8311,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -8230,6 +8360,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -8243,6 +8374,7 @@ mod tests {
                 Finalized::Failed {
                     ref cause,
                     pr_step: None,
+                    requeued: false,
                 } if cause == "claude exited 1, see stream.jsonl"
             ),
             "{res:?}"
@@ -8267,6 +8399,7 @@ mod tests {
         let finalize_res: Result<Finalized> = Ok(Finalized::Failed {
             cause: "provider CLI `git push` failed (exit 128): no upstream".to_string(),
             pr_step: Some("push"),
+            requeued: false,
         });
         let (ok, summary) = record_finalize_outcome(&claude, &finalize_res, false);
         assert!(!ok, "a PR-path failure must never record ok = true");
@@ -8288,6 +8421,7 @@ mod tests {
         let finalize_res: Result<Finalized> = Ok(Finalized::Failed {
             cause: claude.error.clone(),
             pr_step: None,
+            requeued: false,
         });
         let (ok, summary) = record_finalize_outcome(&claude, &finalize_res, false);
         assert!(!ok);
@@ -8390,6 +8524,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -8448,6 +8583,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -8632,6 +8768,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -8796,6 +8933,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -8893,6 +9031,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -9044,6 +9183,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -9266,6 +9406,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             true,
+            None,
             test_comment_run(),
             None,
             None,
@@ -9413,6 +9554,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             true,
+            None,
             test_comment_run(),
             None,
             None,
@@ -9575,6 +9717,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             true,
+            None,
             test_comment_run(),
             None,
             None,
@@ -9695,6 +9838,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
@@ -11321,6 +11465,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             Some(&ReviewOutcome::Pass("all criteria check out".to_string())),
@@ -11449,6 +11594,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             Some(&ReviewOutcome::Pass("all criteria check out".to_string())),
@@ -11588,6 +11734,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             Some(&ReviewOutcome::Fail(
@@ -11745,6 +11892,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             Some(&ReviewOutcome::Fail(
@@ -11887,6 +12035,7 @@ mod tests {
                 None,
                 Duration::from_secs(1800),
                 false,
+                None,
                 test_comment_run(),
                 None,
                 Some(&ReviewOutcome::NoVerdict(
