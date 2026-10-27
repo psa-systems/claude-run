@@ -5222,8 +5222,12 @@ mod tests {
                     stop_rx,
                 )
             });
-            // Long enough for several more intervals to have elapsed had the
-            // watcher kept ticking after the rejection.
+            // Wait for the rejecting tick (CLAUDE-462), then leave several more
+            // intervals in which a still-ticking watcher would be caught.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while forge.call_count() < 1 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             std::thread::sleep(Duration::from_millis(40));
             drop(stop_tx);
             watcher.join().unwrap()
