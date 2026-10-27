@@ -2597,11 +2597,14 @@ fn default_review_prompt() -> String {
         "1. Run 'yt issue inspect {{key}}' to read the description, acceptance criteria, and every comment.",
         "2. Read the diff of this branch against its base (e.g. 'git log' and 'git diff' against the merge-base) and the repository as it now stands.",
         "3. For each acceptance criterion, decide whether the diff actually satisfies it, with concrete evidence (file:line, command output, or a passing test you can see was run). A criterion that removes or deletes something needs a grep showing zero hits, not an assertion.",
-        "4. If every criterion is satisfied with evidence, write a short verdict (what you checked, and why it passes) to this file:",
+        "4. State in one sentence the invariant the issue's Goal establishes, as a contract. Derive it from the Goal and the root cause in the Background, not from the criteria list: a named list of files or backends is a lower bound, never the full scope.",
+        "5. Derive a search pattern for the SHAPE of code that invariant governs (every implementation of the same trait, every call site of the same kind, every consumer of the same config key), independent of the files the diff touched, and run it over the WHOLE repository with Glob/Grep, not just the changed files.",
+        "6. Classify every hit the sweep finds as compliant, not-applicable (state the concrete reason it cannot be affected), or violating. For a fix to an `if`/success branch, also check its `else`/failure branch for the same gap.",
+        "7. If every criterion is satisfied AND the sweep finds no violating or uncovered hit, write a verdict to this file: what you checked, why it passes, and the classified table from steps 4-6 as its evidence.",
         "     {{workdir}}/{{review_pass_marker}}",
-        "5. If any criterion is unmet, contradicted, or unverifiable, write the findings (which criteria, what is missing or wrong, and what you'd need to see fixed) to this file instead:",
+        "8. If any criterion is unmet, contradicted, or unverifiable, OR the sweep finds a hit that is violating, OR a hit the invariant governs but the issue's Goal or file set does not cover, write the findings to this file instead, even when every written criterion is satisfied: name the invariant, the search pattern, and each uncovered or violating hit with file:line.",
         "     {{workdir}}/{{review_fail_marker}}",
-        "6. Write to EXACTLY ONE of those two files. Do not write YouTrack comments, do not set any field, do not touch the tracker at all: this session reports only through the marker file, which the runner posts verbatim.",
+        "9. Write to EXACTLY ONE of those two files. Do not write YouTrack comments, do not set any field, do not touch the tracker at all: this session reports only through the marker file, which the runner posts verbatim.",
     ]
     .join("\n")
 }
@@ -11419,6 +11422,63 @@ mod tests {
         assert!(
             stream_log.exists(),
             "the review session must get its own stream log path"
+        );
+    }
+
+    /// CLAUDE-471: `build_review_prompt` resolves every `{{...}}` placeholder
+    /// it uses and still names both marker files and the read-only
+    /// constraint (asserted on resolved values, never on the sweep
+    /// instruction's own wording - that would certify prose).
+    #[test]
+    fn build_review_prompt_resolves_placeholders_and_keeps_markers_and_read_only_constraint() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = build_review_prompt(&job(), dir.path());
+        assert!(
+            !prompt.contains("{{") && !prompt.contains("}}"),
+            "every placeholder must resolve, got:\n{prompt}"
+        );
+        assert!(prompt.contains(&job().key));
+        assert!(prompt.contains(&dir.path().display().to_string()));
+        assert!(prompt.contains(REVIEW_PASS_MARKER));
+        assert!(prompt.contains(REVIEW_FAIL_MARKER));
+        assert!(prompt.contains("no Edit, no Write"));
+    }
+
+    /// CLAUDE-471 criterion: a fail marker written alongside all-satisfied
+    /// criteria (the sweep is the only thing finding a problem) still yields
+    /// `ReviewOutcome::Fail` and the existing fail routing - no new routing
+    /// is needed for the new fail reason.
+    #[test]
+    fn run_review_session_fail_marker_wins_even_when_criteria_are_all_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\necho 'all criteria satisfied, but the sweep found an uncovered call site at src/native/github.rs:120' > {}\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                REVIEW_FAIL_MARKER
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, result) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &cancel,
+            None,
+        );
+        assert!(result.ok);
+        assert_eq!(
+            outcome,
+            ReviewOutcome::Fail(
+                "all criteria satisfied, but the sweep found an uncovered call site at src/native/github.rs:120"
+                    .to_string()
+            )
         );
     }
 

@@ -50,9 +50,14 @@
 # Post-success review session (CLAUDE-449): a successful run's PR is always opened as a draft first. Before promoting
 # it, the runner spends a second, separate-context claude invocation reviewing the same workdir read-only
 # (allowed_tools forced to Read,Glob,Grep,Bash regardless of this file's own claude.allowed_tools; its own timeout,
-# limits.review_timeout_seconds below; the run's remaining spend ceiling). A pass (.claude-run-review-pass) promotes
-# the draft to ready and folds the verdict notes into the success comment. A fail (.claude-run-review-fail) leaves the
-# PR a draft, posts the findings on the PR and the issue, counts the attempt, and requeues to Queued below
+# limits.review_timeout_seconds below; the run's remaining spend ceiling). Before the verdict (CLAUDE-471), the
+# reviewer independently states the invariant the issue's Goal establishes, derives a search pattern for the SHAPE of
+# code that invariant governs (independent of the files the diff touched), sweeps the WHOLE repository with
+# Glob/Grep, and classifies every hit as compliant, not-applicable, or violating - so a diff that satisfies every
+# written criterion still fails if the sweep finds a violating or uncovered hit (a named file or backend list is a
+# lower bound, never the full scope). A pass (.claude-run-review-pass) promotes the draft to ready and folds the
+# verdict notes, including the classified table, into the success comment. A fail (.claude-run-review-fail) leaves
+# the PR a draft, posts the findings on the PR and the issue, counts the attempt, and requeues to Queued below
 # max_attempts_per_key or parks at Needs Review at the cap - either way the built-in prompt's resume step (below)
 # tells the agent to read the PR's comments and fix what the review found. No marker, both markers, a timeout, or the
 # review session touching the workdir all collapse to no usable verdict, which always parks at Needs Review instead.
