@@ -6028,6 +6028,12 @@ mod tests {
         // pinned to the default branch (`shallow_clone` in
         // `src/provider/mod.rs`).
         crate::provider::shallow_clone(&url, Some("main"), &workdir, 50).unwrap();
+        // A clone never inherits `origin`'s local `user.name`/`user.email`
+        // (git identity is per-repo config, never copied by `clone`), and
+        // the CI container sets neither globally, so the local commit below
+        // needs its own.
+        git_in(&workdir, &["config", "user.name", "t"]);
+        git_in(&workdir, &["config", "user.email", "t@t.example"]);
 
         // The agent creates its feature branch locally, off the pinned
         // clone (CLAUDE.md step 3), and the runner pushes it to a
