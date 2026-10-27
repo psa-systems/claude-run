@@ -1209,8 +1209,20 @@ impl CliBackend {
     /// `git merge-base` fails with exit 128 ("not a valid commit name")
     /// rather than resolving ancestry. Authenticated per invocation via
     /// `token_url` (CLAUDE-395), same as [`Self::remote_branch_sha`].
+    ///
+    /// The refspec names the tracking ref explicitly (CLAUDE-464): the
+    /// runner's workdir is a `--single-branch` shallow clone
+    /// (`shallow_clone` in `src/provider/mod.rs`), whose configured refspec
+    /// covers only the cloned branch, so a bare `git fetch origin <branch>`
+    /// writes `FETCH_HEAD` only and creates no `refs/remotes/origin/<branch>`;
+    /// [`Self::merge_remote_branch`] then fails to resolve `origin/<branch>`.
+    /// No leading `+`: the ref never exists yet in a fresh workdir, so the
+    /// create succeeds without forcing it, and a rejected update (which can
+    /// only happen on a later call reusing the same workdir) is a real signal
+    /// worth surfacing rather than overwriting.
     fn fetch_branch(&self, workdir: &Path, branch: &str, token_url: Option<&str>) -> Result<()> {
-        let args = ["fetch", "origin", branch];
+        let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+        let args = ["fetch", "origin", refspec.as_str()];
         let secrets = token_url_secrets(token_url);
         let out =
             crate::provider::retry_git_network("fetch", &secrets, &self.git_retry_waits, || {
@@ -3744,7 +3756,15 @@ mod tests {
         );
         let runner = with_remote_state(runner, "feat/x", "newsha", "oldsha\trefs/heads/feat/x\n");
         let runner = with_open_pr_search(runner, "[]")
-            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                ],
+                "",
+            )
             .ok(
                 "git",
                 &["merge-base", "--is-ancestor", "oldsha", "newsha"],
@@ -3838,7 +3858,11 @@ mod tests {
             runner,
             r#"[{"number":165,"head_ref":"feat/yotun-96","html_url":"https://dev.a8n.run/a/y/pulls/165"}]"#,
         )
-        .ok("git", &["fetch", "origin", "feat/yotun-96"], "")
+        .ok(
+                "git",
+                &["fetch", "origin", "refs/heads/feat/yotun-96:refs/remotes/origin/feat/yotun-96"],
+                "",
+            )
         .fail(
             "git",
             &["merge-base", "--is-ancestor", "remotesha", "localsha"],
@@ -5081,7 +5105,15 @@ mod tests {
         let runner = with_open_pr_search(runner, "[]")
             // CLAUDE-382: fetched before the ancestry check, so the remote
             // tip's objects (oldsha) are present locally when it runs.
-            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                ],
+                "",
+            )
             // remote (oldsha) IS an ancestor of local (newsha) -> fast-forward.
             .ok(
                 "git",
@@ -5143,7 +5175,7 @@ mod tests {
         );
         let fetch_idx = calls
             .iter()
-            .position(|c| c == "git fetch origin feat/x")
+            .position(|c| c == "git fetch origin refs/heads/feat/x:refs/remotes/origin/feat/x")
             .expect("fetch must be called before the ancestry check");
         let ancestor_idx = calls
             .iter()
@@ -5182,7 +5214,11 @@ mod tests {
             runner,
             r#"[{"number":165,"head_ref":"feat/yotun-96","html_url":"https://dev.a8n.run/a/y/pulls/165"}]"#,
         )
-        .ok("git", &["fetch", "origin", "feat/yotun-96"], "")
+        .ok(
+                "git",
+                &["fetch", "origin", "refs/heads/feat/yotun-96:refs/remotes/origin/feat/yotun-96"],
+                "",
+            )
         // Neither commit is an ancestor of the other -> diverged (exit 1).
         .fail(
             "git",
@@ -5258,7 +5294,15 @@ mod tests {
             "remotesha\trefs/heads/feat/x\n",
         );
         let runner = with_open_pr_search(runner, "[]")
-            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                ],
+                "",
+            )
             .fail(
                 "git",
                 &["merge-base", "--is-ancestor", "remotesha", "localsha"],
@@ -5334,7 +5378,15 @@ mod tests {
             "remotesha\trefs/heads/feat/x\n",
         );
         let runner = with_open_pr_search(runner, "[]")
-            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                ],
+                "",
+            )
             .fail(
                 "git",
                 &["merge-base", "--is-ancestor", "remotesha", "localsha"],
@@ -5419,7 +5471,15 @@ mod tests {
             "remotesha\trefs/heads/feat/x\n",
         );
         let runner = with_open_pr_search(runner, "[]")
-            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                ],
+                "",
+            )
             .fail(
                 "git",
                 &["merge-base", "--is-ancestor", "remotesha", "localsha"],
@@ -5728,7 +5788,15 @@ mod tests {
             "remotesha\trefs/heads/fix/CLAUDE-206\n",
         );
         let runner = with_failed_open_pr_search(runner)
-            .ok("git", &["fetch", "origin", "fix/CLAUDE-206"], "")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/fix/CLAUDE-206:refs/remotes/origin/fix/CLAUDE-206",
+                ],
+                "",
+            )
             .fail(
                 "git",
                 &["merge-base", "--is-ancestor", "remotesha", "localsha"],
@@ -5901,7 +5969,11 @@ mod tests {
 
     #[test]
     fn fetch_branch_retries_once_and_succeeds_on_second_attempt() {
-        let args = ["fetch", "origin", "feature"];
+        let args = [
+            "fetch",
+            "origin",
+            "refs/heads/feature:refs/remotes/origin/feature",
+        ];
         let runner = Arc::new(
             StubRunner::new()
                 .fail_once("git", &args, 1, "connect timeout")
