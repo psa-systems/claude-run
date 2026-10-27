@@ -5985,6 +5985,159 @@ mod tests {
         assert_eq!(runner.calls.lock().unwrap().len(), 2);
     }
 
+    /// CLAUDE-464: reproduces the bug in a real `--single-branch` workdir
+    /// exactly like the runner's own (`shallow_clone`, pinned to the
+    /// *default* branch, CLAUDE.md step 3: the agent creates its feature
+    /// branch locally off that clone). The pinned clone's configured
+    /// refspec covers only `main`, never the locally created `feat/x`, so
+    /// before the fix `fetch_branch`'s bare `git fetch origin <branch>`
+    /// writes `FETCH_HEAD` only and leaves no `refs/remotes/origin/feat/x`;
+    /// the following `merge_remote_branch` then fails with "not something
+    /// we can merge". This test fails on that code with exactly that cause.
+    /// After the fix, the fetch creates the tracking ref, the merge
+    /// succeeds, and the subsequent push is a fast-forward (never
+    /// `--force`).
+    #[test]
+    fn fetch_branch_then_merge_succeeds_in_a_real_single_branch_workdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let git_in = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&origin, &["init", "-q", "-b", "main"]);
+        git_in(&origin, &["config", "user.name", "t"]);
+        git_in(&origin, &["config", "user.email", "t@t.example"]);
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-q", "-m", "init"]);
+
+        let url = format!("file://{}", origin.display());
+        let workdir = tmp.path().join("workdir");
+        // The runner's own clone shape for a fresh job: `--single-branch`,
+        // pinned to the default branch (`shallow_clone` in
+        // `src/provider/mod.rs`).
+        crate::provider::shallow_clone(&url, Some("main"), &workdir, 50).unwrap();
+
+        // The agent creates its feature branch locally, off the pinned
+        // clone (CLAUDE.md step 3), and the runner pushes it to a
+        // same-named branch on `origin` (the happy path, no fetch
+        // involved: `push_branch`'s `--set-upstream` creates the remote
+        // branch without needing a matching fetch refspec).
+        git_in(&workdir, &["checkout", "-q", "-b", "feat/x"]);
+        std::fs::write(workdir.join("g.txt"), "y").unwrap();
+        git_in(&workdir, &["add", "."]);
+        git_in(&workdir, &["commit", "-q", "-m", "feat commit"]);
+        git_in(&workdir, &["push", "-q", "origin", "feat/x:feat/x"]);
+
+        // The checkpoint watcher (CLAUDE-448) pushes another commit
+        // straight to the remote branch while the run keeps working;
+        // modeled here as a second worktree on `origin` committing directly
+        // to `feat/x` (a plain `checkout` of it in the non-bare `origin`
+        // repo would conflict with `main` already being checked out there).
+        let origin_feat = tmp.path().join("origin-feat-worktree");
+        git_in(
+            &origin,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                origin_feat.to_str().unwrap(),
+                "feat/x",
+            ],
+        );
+        std::fs::write(origin_feat.join("h.txt"), "z").unwrap();
+        git_in(&origin_feat, &["add", "."]);
+        git_in(&origin_feat, &["commit", "-q", "-m", "checkpoint push"]);
+        let remote_sha = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin_feat)
+                .args(["rev-parse", "feat/x"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        // Drop the worktree so `feat/x` is no longer "checked out" anywhere
+        // in `origin`, which would otherwise reject the fast-forward push
+        // this test makes to it at the end.
+        git_in(
+            &origin,
+            &["worktree", "remove", origin_feat.to_str().unwrap()],
+        );
+
+        // The agent rewrites its own local history (the PMCP-9 incident),
+        // diverging from the checkpoint commit it never fetched.
+        git_in(
+            &workdir,
+            &["commit", "--amend", "-q", "-m", "feat commit v2"],
+        );
+        let local_sha = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&workdir)
+                .args(["rev-parse", "feat/x"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_ne!(
+            local_sha, remote_sha,
+            "setup must diverge: neither side is an ancestor of the other"
+        );
+
+        let b = CliBackend::new(Arc::new(ProcessRunner::new()));
+        b.fetch_branch(&workdir, "feat/x", None).unwrap();
+        // The pre-fix bug surfaces exactly here: a fetch that wrote only
+        // `FETCH_HEAD` leaves `merge_remote_branch` unable to resolve
+        // `origin/feat/x`, so the merge fails before it starts with "not
+        // something we can merge" (the `unwrap` below panics with that
+        // message on the pre-fix code).
+        b.merge_remote_branch(&workdir, "feat/x", &local_sha, &remote_sha)
+            .unwrap();
+
+        // The merge leaves the remote tip as an ancestor, so the push the
+        // caller makes next is a plain fast-forward.
+        git_in(&workdir, &["push", "origin", "feat/x:feat/x"]);
+        let pushed_sha = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["rev-parse", "feat/x"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let merged_local_sha = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&workdir)
+                .args(["rev-parse", "feat/x"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(pushed_sha, merged_local_sha);
+    }
+
     #[test]
     fn push_branch_retries_once_and_succeeds_on_second_attempt() {
         let args = ["push", "--set-upstream", "origin", "feature:feature"];
