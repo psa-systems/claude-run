@@ -3151,10 +3151,14 @@ fn finalize(
                         // run was in flight, in which case it is left
                         // untouched rather than stomped back to Queued
                         // (mirrors the timeout arm's own re-read below).
-                        let current = backend
-                            .get_field(&job.key, &src.custom_field)
-                            .unwrap_or_default();
-                        let requeued = current.trim() == src.states.working;
+                        let current = backend.get_field(&job.key, &src.custom_field);
+                        let requeued = match &current {
+                            Ok(v) => v.trim() == src.states.working,
+                            Err(ge) => {
+                                error!(key = %job.key, error = %ge, "push/PR-create failure: AI Agent re-read failed, parking at Failed instead of requeuing");
+                                false
+                            }
+                        };
                         let body = if requeued {
                             push_failure_requeue_comment(
                                 claude_result,
@@ -3177,10 +3181,25 @@ fn finalize(
                         if let Err(ce) = backend.comment(&job.key, &body) {
                             warn!(key = %job.key, error = %ce, "issue comment failed (continuing to AI Agent write)");
                         }
-                        if requeued {
-                            backend.set_field(&job.key, &src.custom_field, &src.states.queued)?;
-                        } else {
-                            info!(key = %job.key, current = %current.trim(), "push/PR-create failure requeue skipped: AI Agent already advanced off Working");
+                        match &current {
+                            Ok(_) if requeued => {
+                                backend.set_field(
+                                    &job.key,
+                                    &src.custom_field,
+                                    &src.states.queued,
+                                )?;
+                            }
+                            Ok(v) => {
+                                info!(key = %job.key, current = %v.trim(), "push/PR-create failure requeue skipped: AI Agent already advanced off Working");
+                            }
+                            // Unknown state: Failed is the safe terminal, never a stuck Working.
+                            Err(_) => {
+                                backend.set_field(
+                                    &job.key,
+                                    &src.custom_field,
+                                    &src.states.failed,
+                                )?;
+                            }
                         }
                         Ok(Finalized::Failed {
                             cause: e.to_string(),
@@ -8368,6 +8387,95 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.contains("get-field")),
             "at the cap, the field is never re-read: {calls:?}"
+        );
+    }
+
+    /// CLAUDE-467 a failed AI Agent re-read is not read as "advanced":
+    /// it is logged and the issue parks at Failed, never left stuck at Working.
+    #[test]
+    fn finalize_push_failure_requeue_field_read_failure_sets_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    128,
+                    "no upstream",
+                )
+                .fail(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    1,
+                    "yt down",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+            Some("https://dev.a8n.run/contoso/claude-run/pulls/7"),
+            test_comment_run(),
+            None,
+            None,
+            1,
+            3,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    requeued: false,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("AI Agent Queued")),
+            "{calls:?}"
         );
     }
 
