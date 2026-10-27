@@ -910,11 +910,19 @@ straight to ready. `finalize` always opens it as a draft first, then `process_jo
 review session against the same workdir: a fresh `claude` invocation with `allowed_tools` forced to
 `Read,Glob,Grep,Bash` (Edit and Write are never granted, regardless of the action's own `claude.allowed_tools`), its
 own stream log, the run's remaining spend ceiling as its `--max-budget-usd`, and its own timeout,
-`limits.review_timeout_seconds` (default `1800`, rejected at load if set to `0`). The review session is told to write
-`.claude-run-review-pass` with its notes if the work looks done, or `.claude-run-review-fail` with its findings if not;
-writing neither, both, timing out, or touching the workdir (a new commit, or any tracked/untracked change beyond the
-two marker files) all collapse to no usable verdict. A pass promotes the draft PR to ready via `mark_pr_ready` and
-folds the verdict notes into the success comment's own "## Review" section. A fail leaves the PR a draft, posts the
+`limits.review_timeout_seconds` (default `1800`, rejected at load if set to `0`). Before the verdict (CLAUDE-471),
+the reviewer independently states the invariant the issue's Goal establishes as a one-sentence contract (from the
+Goal and the root cause in the Background, never from the criteria list, since a named file or backend is a lower
+bound, not the full scope), derives a search pattern for the SHAPE of code that invariant governs independent of
+the files the diff touched, sweeps the WHOLE repository with Glob/Grep, and classifies every hit as compliant,
+not-applicable (with the concrete reason), or violating, checking the matching `else`/failure branch whenever the
+fix touched an `if`/success branch. The review session is told to write `.claude-run-review-pass` with its notes
+and the classified table as evidence if the work looks done and the sweep found no violating or uncovered hit, or
+`.claude-run-review-fail` with its findings if not, even when every written criterion is satisfied: a violating or
+uncovered hit the sweep finds fails the review on its own; writing neither, both, timing out, or touching the
+workdir (a new commit, or any tracked/untracked change beyond the two marker files) all collapse to no usable
+verdict. A pass promotes the draft PR to ready via `mark_pr_ready` and folds the verdict notes, including the
+classified table, into the success comment's own "## Review" section. A fail leaves the PR a draft, posts the
 findings on both the PR and the issue, and counts the attempt: below `max_attempts_per_key` it requeues to `Queued`
 (the built-in prompt's resume step, same as a CLAUDE-379/CLAUDE-448 resumed run, tells the agent to read the PR's
 comments and fix what the review found) so the issue leaves the candidate set and must be re-queued by a human
