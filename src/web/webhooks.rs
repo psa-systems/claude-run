@@ -1890,6 +1890,7 @@ async fn reopen_resolved_failure(
     let regression_body = regression_comment_body(ev, &branch, &test_ids);
     let spend = spend.clone();
     let public_url = crate::run_footer::resolved_public_url();
+    let branch_for_triage = branch.clone();
     let bucket =
         tokio::task::spawn_blocking(move || -> crate::error::Result<triage::TriageBucket> {
             backend.set_state(&key2, &mint_cfg.target_state)?;
@@ -1910,9 +1911,16 @@ async fn reopen_resolved_failure(
                 log_available,
                 log_unavailable_reason,
                 has_open_pr,
+                branch: branch_for_triage,
                 log_token,
             };
-            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix, &spend);
+            let verdict = triage::triage(
+                &input,
+                classifier.as_ref(),
+                &mint_cfg.auto_fix,
+                &mint_cfg.bot_branch_prefixes,
+                &spend,
+            );
             let analysis = crate::run_footer::append_run(
                 &verdict.analysis,
                 public_url.as_deref(),
@@ -2211,6 +2219,7 @@ async fn analyze_and_comment_pr(
     log_available: bool,
     log_unavailable_reason: Option<String>,
     log_token: Option<String>,
+    branch: &str,
     pr_number: u64,
     host: &str,
     env: PrCommentEnv,
@@ -2222,6 +2231,7 @@ async fn analyze_and_comment_pr(
     let host_owned = host.to_string();
     let body_file = pr_comment_body_path(&ctx.paths, &ev.repo, pr_number);
     let spend = spend.clone();
+    let branch_owned = branch.to_string();
     let result = tokio::task::spawn_blocking(move || -> crate::error::Result<String> {
         let input = TriageInput {
             repo: event.repo.clone(),
@@ -2232,9 +2242,16 @@ async fn analyze_and_comment_pr(
             log_available,
             log_unavailable_reason,
             has_open_pr: true,
+            branch: branch_owned,
             log_token,
         };
-        let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix, &spend);
+        let verdict = triage::triage(
+            &input,
+            classifier.as_ref(),
+            &mint_cfg.auto_fix,
+            &mint_cfg.bot_branch_prefixes,
+            &spend,
+        );
         write_and_post_pr_comment(
             env.backend.as_ref(),
             &host_owned,
@@ -2434,9 +2451,16 @@ async fn route_agent_pr_failure(
                 log_available,
                 log_unavailable_reason,
                 has_open_pr: true,
+                branch: branch_owned.clone(),
                 log_token,
             };
-            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix, &spend);
+            let verdict = triage::triage(
+                &input,
+                classifier.as_ref(),
+                &mint_cfg.auto_fix,
+                &mint_cfg.bot_branch_prefixes,
+                &spend,
+            );
             let tests_display = if tests.is_empty() {
                 "(no test ids parsed)".to_string()
             } else {
@@ -2831,6 +2855,7 @@ async fn route_pr_matches_pr_only_failure(
         log_available,
         log_unavailable_reason,
         log_token,
+        branch,
         pr.number,
         host,
         env,
@@ -2913,9 +2938,16 @@ async fn mint_for_two_branch_pr_only_failure(
                 log_available,
                 log_unavailable_reason,
                 has_open_pr: true,
+                branch: branch_owned.clone(),
                 log_token,
             };
-            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix, &spend);
+            let verdict = triage::triage(
+                &input,
+                classifier.as_ref(),
+                &mint_cfg.auto_fix,
+                &mint_cfg.bot_branch_prefixes,
+                &spend,
+            );
             let req = MintRequest {
                 repo: &event.repo,
                 index_in_repo: event.index_in_repo,
@@ -3057,6 +3089,7 @@ async fn route_new_pr_only_failure(
         log_available,
         log_unavailable_reason,
         log_token,
+        branch,
         pr.number,
         host,
         env,
@@ -3412,6 +3445,7 @@ fn decide_mint(
         log_available,
         log_unavailable_reason,
         has_open_pr,
+        branch: branch.clone(),
         log_token,
     };
     // The classify stage only exists when the deterministic rules
@@ -3421,7 +3455,13 @@ fn decide_mint(
         inner: classifier,
         report: report_stage,
     };
-    let verdict = triage::triage(&input, &reporting, &mint_cfg.auto_fix, spend);
+    let verdict = triage::triage(
+        &input,
+        &reporting,
+        &mint_cfg.auto_fix,
+        &mint_cfg.bot_branch_prefixes,
+        spend,
+    );
     report_stage(STAGE_MINTING);
     let req = MintRequest {
         repo: &ev.repo,
