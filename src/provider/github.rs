@@ -2628,6 +2628,7 @@ mod tests {
                     &["auth", "token", "--hostname", "github.com"],
                     "ghp_from_login\n",
                 )
+                .ok("gh", &list_open_prs_args("octo/widget"), "[]")
                 .ok(
                     "gh",
                     &[
@@ -2679,11 +2680,13 @@ mod tests {
         for call in calls.iter() {
             assert!(!call.contains("ghp_from_login"), "{call}");
         }
-        // PR creation itself never consulted `gh`; the only other `gh` call
-        // is the CLAUDE-447 push comment posted after the push succeeded.
+        // PR creation itself never consulted `gh`; the only other `gh` calls
+        // are the CLAUDE-469 open-PR lookup (empty, so no adoption) and the
+        // CLAUDE-447 push comment posted after the push succeeded.
         assert!(
             !calls.iter().any(|c| c.starts_with("gh ")
                 && c != "gh auth token --hostname github.com"
+                && !c.starts_with("gh pr list")
                 && !c.starts_with("gh pr comment 11")),
             "{calls:?}"
         );
