@@ -187,6 +187,12 @@ pub struct TriageInput {
     /// Whether the failing branch has an open PR. Strong bucket-1-vs-2 signal
     /// passed to the classifier (bucket 1 needs a PR to fix).
     pub has_open_pr: bool,
+    /// The failing run's branch name, resolved by the caller (the log's
+    /// environment dump, or the run detail). Empty when unresolvable. Checked
+    /// against [`crate::config::MintConfig::bot_branch_prefixes`] so a failing
+    /// check on a bot-owned branch (e.g. Renovate's) never routes to a bucket
+    /// that would push a fix onto it.
+    pub branch: String,
     /// The resolved `log_token_ref` secret that authorized the log
     /// fetch, carried through so [`AnalysisClassifier`] can fetch the failing
     /// workflow YAML with the same credential. `None` reads it unauthenticated
@@ -285,6 +291,16 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
     None
 }
 
+/// Whether `branch` matches one of `prefixes` (case-sensitive, e.g.
+/// `renovate/`). An empty `branch` (unresolvable) never matches, since there is
+/// nothing to compare a prefix against.
+fn is_bot_owned_branch(branch: &str, prefixes: &[String]) -> bool {
+    !branch.is_empty()
+        && prefixes
+            .iter()
+            .any(|p| !p.is_empty() && branch.starts_with(p.as_str()))
+}
+
 /// The LLM pass, behind a trait so tests inject a stub and production shells out
 /// to `claude`. Implementations classify the residue into bucket 1 vs 2 and write
 /// the analysis; they must never panic and should degrade rather than propagate.
@@ -321,10 +337,25 @@ pub fn triage(
     input: &TriageInput,
     classifier: &dyn FailureClassifier,
     autofix_cfg: &AutoFixConfig,
+    bot_branch_prefixes: &[String],
     spend: &crate::usage::RunSpend,
 ) -> Triage {
     if let Some(verdict) = triage_rules(input) {
         return verdict;
+    }
+    // A branch owned by another bot that force-pushes / rebases it on every
+    // run (the canonical case is Renovate) must never be routed to a bucket
+    // that would queue a fix pushed onto that same branch: the owning bot's
+    // next run wipes it and the cycle repeats. Checked before auto-fix and the
+    // classifier so neither can route around it.
+    if is_bot_owned_branch(&input.branch, bot_branch_prefixes) {
+        return Triage::rules(
+            TriageBucket::HumanAction,
+            format!(
+                "branch `{}` matches a bot-owned prefix; that bot force-pushes/rebases this branch, so any fix pushed here would be wiped - fix this on the base branch instead",
+                input.branch
+            ),
+        );
     }
     // Auto-fix only failures on a branch with no open PR. A failing
     // check on an open, unmerged PR is that PR's own concern; minting a queued
@@ -735,8 +766,15 @@ mod tests {
             log: log.to_string(),
             log_available: true,
             has_open_pr: true,
+            branch: "feature/widget".to_string(),
             log_token: None,
         }
+    }
+
+    /// Default bot-owned branch prefix list for the hybrid-triage tests
+    /// (mirrors [`crate::config::MintConfig::default`]'s `["renovate/"]`).
+    fn bot_branch_prefixes() -> Vec<String> {
+        vec!["renovate/".to_string()]
     }
 
     /// Default auto-fix config for the hybrid-triage tests. The cargo-fmt
@@ -801,6 +839,7 @@ mod tests {
             &input_with_log("could not resolve host: index.crates.io"),
             &stub,
             &autofix_cfg(),
+            &bot_branch_prefixes(),
             &test_spend(),
         );
         assert_eq!(verdict.bucket, TriageBucket::HumanAction);
@@ -875,7 +914,13 @@ mod tests {
     fn hybrid_short_circuits_a_skipped_job_without_calling_classifier() {
         let stub = StubClassifier::new(Triage::llm(TriageBucket::CodeFix, "unused"));
         let log = "Skipping job 'release' due to 'startsWith(github.ref, refs/tags)'";
-        let verdict = triage(&input_with_log(log), &stub, &autofix_cfg(), &test_spend());
+        let verdict = triage(
+            &input_with_log(log),
+            &stub,
+            &autofix_cfg(),
+            &bot_branch_prefixes(),
+            &test_spend(),
+        );
         assert_eq!(verdict.bucket, TriageBucket::Transient);
         assert_eq!(stub.calls(), 0, "classifier untouched");
     }
@@ -892,6 +937,7 @@ mod tests {
             &input_with_log("test foo ... FAILED"),
             &stub,
             &autofix_cfg(),
+            &bot_branch_prefixes(),
             &test_spend(),
         );
         assert_eq!(verdict.bucket, TriageBucket::CodeFix);
@@ -907,11 +953,98 @@ mod tests {
             &input_with_log("fatal: connection reset by peer"),
             &stub,
             &autofix_cfg(),
+            &bot_branch_prefixes(),
             &test_spend(),
         );
         assert_eq!(verdict.bucket, TriageBucket::Transient);
         assert_eq!(verdict.classified_by, ClassifiedBy::Rules);
         assert_eq!(stub.calls(), 0, "the classifier must NOT be consulted");
+    }
+
+    // ---- AC: bot-owned branches (e.g. Renovate) never get a pushed fix ----
+
+    #[test]
+    fn renovate_branch_with_open_pr_routes_to_human_not_code_fix() {
+        // The classifier stub would otherwise return CodeFix; the bot-owned
+        // branch check must short-circuit before it is ever consulted, exactly
+        // like the rules short-circuits above.
+        let stub = StubClassifier::new(Triage::llm(
+            TriageBucket::CodeFix,
+            "the unit test on the PR branch is failing; fix the assertion",
+        ));
+        let mut input = input_with_log("test foo ... FAILED");
+        input.branch = "renovate/npm-widgets-1.x".to_string();
+        input.has_open_pr = true;
+        let verdict = triage(
+            &input,
+            &stub,
+            &autofix_cfg(),
+            &bot_branch_prefixes(),
+            &test_spend(),
+        );
+        assert_eq!(verdict.bucket, TriageBucket::HumanAction);
+        assert_eq!(verdict.classified_by, ClassifiedBy::Rules);
+        assert!(
+            verdict.analysis.contains("renovate/npm-widgets-1.x"),
+            "analysis names the branch: {}",
+            verdict.analysis
+        );
+        assert_eq!(stub.calls(), 0, "the classifier must NOT be consulted");
+    }
+
+    #[test]
+    fn normal_feature_branch_is_unaffected_by_the_bot_branch_rule() {
+        // A branch that does not match any configured bot prefix falls
+        // through to the classifier exactly as before.
+        let stub = StubClassifier::new(Triage::llm(
+            TriageBucket::CodeFix,
+            "the unit test on the PR branch is failing; fix the assertion",
+        ));
+        let verdict = triage(
+            &input_with_log("test foo ... FAILED"),
+            &stub,
+            &autofix_cfg(),
+            &bot_branch_prefixes(),
+            &test_spend(),
+        );
+        assert_eq!(verdict.bucket, TriageBucket::CodeFix);
+        assert_eq!(verdict.classified_by, ClassifiedBy::Llm);
+        assert_eq!(stub.calls(), 1, "the classifier must be consulted");
+    }
+
+    // ---- is_bot_owned_branch helper ----------------------------------------
+
+    #[test]
+    fn is_bot_owned_branch_matches_a_configured_prefix() {
+        assert!(is_bot_owned_branch(
+            "renovate/npm-widgets-1.x",
+            &bot_branch_prefixes()
+        ));
+    }
+
+    #[test]
+    fn is_bot_owned_branch_rejects_a_normal_branch() {
+        assert!(!is_bot_owned_branch(
+            "feature/widget",
+            &bot_branch_prefixes()
+        ));
+    }
+
+    #[test]
+    fn is_bot_owned_branch_rejects_the_prefix_as_a_mid_string_match() {
+        // The prefix must anchor at the start of the branch name, not appear
+        // anywhere within it.
+        assert!(!is_bot_owned_branch(
+            "feature/not-renovate/widget",
+            &bot_branch_prefixes()
+        ));
+    }
+
+    #[test]
+    fn is_bot_owned_branch_handles_empty_branch_and_prefix_list() {
+        assert!(!is_bot_owned_branch("", &bot_branch_prefixes()));
+        assert!(!is_bot_owned_branch("renovate/widget", &[]));
+        assert!(!is_bot_owned_branch("renovate/widget", &["".to_string()]));
     }
 
     // ---- Deterministic auto-fix routing -----------------------
@@ -928,7 +1061,13 @@ mod tests {
         );
         input.workflow_id = "check.yml".to_string();
         input.has_open_pr = false;
-        let verdict = triage(&input, &stub, &autofix_cfg(), &test_spend());
+        let verdict = triage(
+            &input,
+            &stub,
+            &autofix_cfg(),
+            &bot_branch_prefixes(),
+            &test_spend(),
+        );
         assert_eq!(verdict.bucket, TriageBucket::AutoFix);
         assert_eq!(verdict.classified_by, ClassifiedBy::Rules);
         assert_eq!(stub.calls(), 0, "auto-fix short-circuits before the LLM");
@@ -951,7 +1090,13 @@ mod tests {
         let mut input = input_with_log(log);
         input.workflow_id = "check.yml".to_string();
         input.has_open_pr = false;
-        let verdict = triage(&input, &stub, &autofix_cfg(), &test_spend());
+        let verdict = triage(
+            &input,
+            &stub,
+            &autofix_cfg(),
+            &bot_branch_prefixes(),
+            &test_spend(),
+        );
         assert_eq!(verdict.bucket, TriageBucket::AutoFix);
         assert_eq!(verdict.auto_fix.unwrap().kind, "checks-workflow");
         assert_eq!(stub.calls(), 0, "auto-fix short-circuits before the LLM");
@@ -961,7 +1106,13 @@ mod tests {
         let mut input = input_with_log(log);
         input.workflow_id = "check.yml".to_string();
         input.has_open_pr = true;
-        let verdict = triage(&input, &stub, &autofix_cfg(), &test_spend());
+        let verdict = triage(
+            &input,
+            &stub,
+            &autofix_cfg(),
+            &bot_branch_prefixes(),
+            &test_spend(),
+        );
         assert_eq!(verdict.bucket, TriageBucket::CodeFix);
         assert!(verdict.auto_fix.is_none());
         assert_eq!(
@@ -983,7 +1134,13 @@ mod tests {
         let mut input = input_with_log("Run cargo fmt --check\nDiff in src/main.rs at line 1:\n");
         input.workflow_id = "check.yml".to_string();
         input.has_open_pr = true;
-        let verdict = triage(&input, &stub, &autofix_cfg(), &test_spend());
+        let verdict = triage(
+            &input,
+            &stub,
+            &autofix_cfg(),
+            &bot_branch_prefixes(),
+            &test_spend(),
+        );
         assert_eq!(verdict.bucket, TriageBucket::CodeFix);
         assert!(verdict.auto_fix.is_none());
         assert_eq!(stub.calls(), 1);
@@ -997,7 +1154,13 @@ mod tests {
         let stub = StubClassifier::new(Triage::llm(TriageBucket::CodeFix, "unused"));
         let mut input = input_with_log("Error: No runner is available for this job");
         input.workflow_id = "check.yml".to_string();
-        let verdict = triage(&input, &stub, &autofix_cfg(), &test_spend());
+        let verdict = triage(
+            &input,
+            &stub,
+            &autofix_cfg(),
+            &bot_branch_prefixes(),
+            &test_spend(),
+        );
         assert_eq!(verdict.bucket, TriageBucket::Transient);
         assert!(verdict.auto_fix.is_none());
         assert_eq!(stub.calls(), 0);
@@ -1014,7 +1177,13 @@ mod tests {
         let stub = StubClassifier::new(Triage::llm(TriageBucket::HumanAction, "human"));
         let mut input = input_with_log("Run cargo fmt --check\nDiff in src/main.rs at line 1:\n");
         input.workflow_id = "check.yml".to_string();
-        let verdict = triage(&input, &stub, &disabled, &test_spend());
+        let verdict = triage(
+            &input,
+            &stub,
+            &disabled,
+            &bot_branch_prefixes(),
+            &test_spend(),
+        );
         assert_eq!(verdict.bucket, TriageBucket::HumanAction);
         assert_eq!(stub.calls(), 1, "classifier consulted when auto-fix is off");
     }
