@@ -8035,6 +8035,349 @@ mod tests {
         );
     }
 
+    /// CLAUDE-467 criterion 1: a push failure with a recorded open PR and
+    /// attempts below the cap re-queues onto that PR instead of parking at
+    /// a terminal Failed.
+    #[test]
+    fn finalize_push_failure_with_recorded_pr_below_cap_requeues() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    128,
+                    "no upstream",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Working",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Queued"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+            Some("https://dev.a8n.run/contoso/claude-run/pulls/7"),
+            test_comment_run(),
+            None,
+            None,
+            1,
+            3,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    requeued: true,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Queued"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("AI Agent Failed")),
+            "{calls:?}"
+        );
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .expect("requeue comment posted");
+        assert!(
+            comment.contains("https://dev.a8n.run/contoso/claude-run/pulls/7"),
+            "comment names the recorded PR: {comment}"
+        );
+        assert!(comment.contains("no upstream"), "{comment}");
+    }
+
+    /// CLAUDE-467 criterion 2: the same push failure at the attempt cap
+    /// parks at a terminal Failed instead of requeuing.
+    #[test]
+    fn finalize_push_failure_with_recorded_pr_at_cap_sets_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    128,
+                    "no upstream",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+            Some("https://dev.a8n.run/contoso/claude-run/pulls/7"),
+            test_comment_run(),
+            None,
+            None,
+            3,
+            3,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    requeued: false,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("get-field")),
+            "at the cap, the field is never re-read: {calls:?}"
+        );
+    }
+
+    /// CLAUDE-467 criterion 3: the same push failure with no recorded PR
+    /// keeps today's terminal Failed.
+    #[test]
+    fn finalize_push_failure_with_no_recorded_pr_sets_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    128,
+                    "no upstream",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            3,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    requeued: false,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("get-field")),
+            "with no recorded PR, the field is never re-read: {calls:?}"
+        );
+    }
+
+    /// CLAUDE-467 criterion 4: a push failure with a recorded PR and
+    /// attempts below the cap, but the AI Agent field already advanced off
+    /// Working (a concurrent human/agent edit) by requeue time, leaves the
+    /// field untouched rather than stomping it back to Queued.
+    #[test]
+    fn finalize_push_failure_requeue_leaves_an_already_advanced_field_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    128,
+                    "no upstream",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Needs Review",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+            Some("https://dev.a8n.run/contoso/claude-run/pulls/7"),
+            test_comment_run(),
+            None,
+            None,
+            1,
+            3,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    requeued: false,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("set-field")),
+            "the field is already advanced off Working, so no write happens: {calls:?}"
+        );
+    }
+
     #[test]
     fn finalize_agit_with_no_commits_fails_instead_of_code_review() {
         // Claude "succeeded" but produced no branch ahead of base.
