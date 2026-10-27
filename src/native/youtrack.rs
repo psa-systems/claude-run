@@ -1556,6 +1556,11 @@ async fn process_job(
     // ---- finalize (the native "post"): every external mutation lives here ----
     // Synchronous. Finalize no longer polls CI (that
     // wait is now driven by a webhook event), so it returns promptly.
+    // CLAUDE-466: `resume` already reflects any PR recorded for this issue,
+    // whether from a re-queue or a checkpoint push opened one mid-run, so a
+    // PR-step failure comment can say truthfully whether a re-queue resumes
+    // that PR's branch.
+    let recorded_pr_url = resume.as_ref().map(|r| r.pr_url.as_str());
     let finalize_res = crate::blocking::in_place(|| {
         finalize(
             backend,
@@ -1577,6 +1582,7 @@ async fn process_job(
             review.as_ref(),
             attempts + 1,
             limits.max_attempts_per_key,
+            recorded_pr_url,
         )
     });
     // ---- record a newly opened PR against its issue ----
@@ -2896,6 +2902,11 @@ fn finalize(
     // does for the ordinary attempt cap.
     attempts_after: u32,
     max_attempts_per_key: u32,
+    // CLAUDE-466: the PR URL `agent_pull_requests` already has recorded for
+    // this issue, if any (a re-queue's resume target, or a checkpoint push
+    // that opened one mid-run), so a PR-step failure comment can say
+    // truthfully whether a re-queue resumes that PR's branch.
+    recorded_pr_url: Option<&str>,
 ) -> Result<Finalized> {
     let public_url = crate::run_footer::resolved_public_url();
     // CLAUDE-448: appended to whichever outcome body this call produces, right
@@ -3115,7 +3126,8 @@ fn finalize(
                     WorkLocation::RemoteBranch { .. } => "pr_create",
                     _ => "push",
                 };
-                let body = pr_failure_comment(claude_result, &e, &location);
+                let body =
+                    pr_failure_comment(claude_result, &e, &location, pr_step, recorded_pr_url);
                 let body = note_checkpoint_rejection(body);
                 let body =
                     crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
@@ -3608,7 +3620,19 @@ fn post_review_findings_on_pr(
     result
 }
 
-fn pr_failure_comment(r: &ClaudeResult, err: &Error, work: &WorkLocation) -> String {
+// CLAUDE-466: `pr_step` is `"push"` or `"pr_create"`, the step `finalize`
+// determined actually failed, so the headline never blames PR creation for a
+// push failure. `recorded_pr_url`, when set, is the PR `agent_pull_requests`
+// already has recorded for this issue (a prior resume target, or one a
+// checkpoint push opened mid-run): a `RemoteBranch` failure on a recorded PR
+// means a re-queue resumes that PR's branch rather than opening a fresh one.
+fn pr_failure_comment(
+    r: &ClaudeResult,
+    err: &Error,
+    work: &WorkLocation,
+    pr_step: &str,
+    recorded_pr_url: Option<&str>,
+) -> String {
     // Name where the work actually is. Under the branch PR strategy the push
     // happens before the PR call, so a PR-only failure leaves the work on the
     // remote, not in a preserved workdir.
@@ -3622,13 +3646,22 @@ fn pr_failure_comment(r: &ClaudeResult, err: &Error, work: &WorkLocation) -> Str
             workdir.display(),
             paths.len()
         ),
-        WorkLocation::RemoteBranch { branch, sha } => format!(
-            "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before the PR call failed, so nothing was lost. No PR was ever opened here, so nothing was recorded for this issue (CLAUDE-275): re-queuing it (set AI Agent = Queued) clones the default branch again and opens a fresh PR, it does NOT resume this branch by name. Push the same branch again from a fresh clone, or open the PR for it by hand, if this exact work should not be redone. The workdir on the daemon host is not kept, because the forge holds the same commits."
-        ),
+        WorkLocation::RemoteBranch { branch, sha } => match recorded_pr_url {
+            Some(pr_url) => format!(
+                "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before this failure, so nothing was lost. This issue already has an open PR recorded against it ({pr_url}): re-queuing it (set AI Agent = Queued) resumes that PR's branch by name (CLAUDE-275), it does not open a fresh one."
+            ),
+            None => format!(
+                "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before this failure, so nothing was lost. No PR was ever opened here, so nothing was recorded for this issue (CLAUDE-275): re-queuing it (set AI Agent = Queued) clones the default branch again and opens a fresh PR, it does NOT resume this branch by name. Push the same branch again from a fresh clone, or open the PR for it by hand, if this exact work should not be redone. The workdir on the daemon host is not kept, because the forge holds the same commits."
+            ),
+        },
         WorkLocation::None => "No local commits were found to preserve.".to_string(),
     };
+    let headline = match pr_step {
+        "push" => "Claude AI agent run completed but pushing the branch FAILED:",
+        _ => "Claude AI agent run completed but opening the PR FAILED:",
+    };
     let mut body = [
-        "Claude AI agent run completed but PR creation FAILED:".to_string(),
+        headline.to_string(),
         String::new(),
         err.to_string(),
         String::new(),
@@ -6667,6 +6700,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6710,6 +6744,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6765,6 +6800,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6816,6 +6852,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6869,6 +6906,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6913,6 +6951,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -6983,6 +7022,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -7026,6 +7066,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -7139,6 +7180,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -7294,6 +7336,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -7356,6 +7399,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -7676,7 +7720,13 @@ mod tests {
         .trim()
         .to_string();
 
-        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone, None));
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "pr_create",
+            None,
+        );
 
         assert!(
             body.contains("fix/redact-env-vars-on-export"),
@@ -7691,6 +7741,112 @@ mod tests {
     }
 
     #[test]
+    fn pr_failure_comment_headline_names_push_for_a_push_failure() {
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "push",
+            None,
+        );
+
+        assert!(
+            body.contains("pushing the branch FAILED"),
+            "a push failure must name pushing, not PR creation: {body}"
+        );
+        assert!(
+            !body.contains("PR creation"),
+            "a push failure must never say \"PR creation\": {body}"
+        );
+    }
+
+    #[test]
+    fn pr_failure_comment_headline_names_pr_create_for_a_pr_create_failure() {
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "pr_create",
+            None,
+        );
+
+        assert!(
+            body.contains("opening the PR FAILED"),
+            "a pr_create failure must name opening the PR: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_failure_comment_with_a_recorded_pr_says_requeue_resumes_it() {
+        // CLAUDE-466 / PMCP-9 shape: the checkpoint watcher already opened and
+        // recorded a draft PR, then the final push failed on a divergence
+        // merge. The comment must point at that recorded PR, never claim no
+        // PR was ever opened.
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        git_in(&clone, &["checkout", "-b", "fix/divergence-merge"]);
+        std::fs::write(clone.join("new.txt"), "work").unwrap();
+        git_in(&clone, &["add", "."]);
+        git_in(&clone, &["commit", "-m", "fix: divergence"]);
+        git_in(&clone, &["push", "origin", "fix/divergence-merge"]);
+
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "push",
+            Some("https://dev.a8n.run/contoso/claude-run/pulls/9"),
+        );
+
+        assert!(
+            body.contains("https://dev.a8n.run/contoso/claude-run/pulls/9"),
+            "the comment must name the recorded PR: {body}"
+        );
+        assert!(
+            body.contains("resumes that PR's branch"),
+            "a recorded PR must say re-queuing resumes it: {body}"
+        );
+        assert!(
+            !body.contains("No PR was ever opened"),
+            "a recorded PR must never say no PR was ever opened: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_failure_comment_with_no_recorded_pr_keeps_the_fresh_pr_text() {
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        git_in(&clone, &["checkout", "-b", "fix/no-recorded-pr"]);
+        std::fs::write(clone.join("new.txt"), "work").unwrap();
+        git_in(&clone, &["add", "."]);
+        git_in(&clone, &["commit", "-m", "fix: no recorded pr"]);
+        git_in(&clone, &["push", "origin", "fix/no-recorded-pr"]);
+
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "pr_create",
+            None,
+        );
+
+        assert!(
+            body.contains("No PR was ever opened here"),
+            "with no recorded PR, the existing re-queue-starts-fresh text must survive: {body}"
+        );
+        assert!(
+            body.contains("does NOT resume this branch by name"),
+            "with no recorded PR, the existing re-queue-starts-fresh text must survive: {body}"
+        );
+    }
+
+    #[test]
     fn pr_failure_comment_names_the_preserved_workdir_when_unpushed() {
         // Unchanged path: an unpushed commit keeps the workdir, and
         // the comment is the recovery pointer to it.
@@ -7701,7 +7857,13 @@ mod tests {
         git_in(&clone, &["add", "."]);
         git_in(&clone, &["commit", "-m", "feat: y"]);
 
-        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone, None));
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "pr_create",
+            None,
+        );
 
         assert!(
             body.contains("PRESERVED on the daemon host at: `"),
@@ -7718,7 +7880,13 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let clone = origin_and_single_branch_clone(base.path());
 
-        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone, None));
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "pr_create",
+            None,
+        );
 
         assert!(body.contains("No local commits were found to preserve."));
     }
@@ -7744,7 +7912,7 @@ mod tests {
             "expected UncommittedChanges"
         );
 
-        let body = pr_failure_comment(&ok_result(), &pr_error(), &loc);
+        let body = pr_failure_comment(&ok_result(), &pr_error(), &loc, "pr_create", None);
         assert!(
             !body.contains("SAFE on the remote"),
             "an unpushed branch must never read as safe on the remote: {body}"
@@ -7875,6 +8043,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert!(
@@ -7960,6 +8129,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert!(matches!(res, Finalized::Failed { .. }), "{res:?}");
@@ -8069,6 +8239,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -8140,6 +8311,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));
@@ -8187,6 +8359,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert!(
@@ -8235,6 +8408,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert!(
@@ -8395,6 +8569,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -8453,6 +8628,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -8637,6 +8813,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -8801,6 +8978,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -8898,6 +9076,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -9049,6 +9228,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         // The PR still counts, even though the comment on it failed.
@@ -9271,6 +9451,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -9418,6 +9599,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -9580,6 +9762,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -9722,6 +9905,7 @@ mod tests {
             None,
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -11348,6 +11532,7 @@ mod tests {
             Some(&ReviewOutcome::Pass("all criteria check out".to_string())),
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -11476,6 +11661,7 @@ mod tests {
             Some(&ReviewOutcome::Pass("all criteria check out".to_string())),
             1,
             1000,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -11617,6 +11803,7 @@ mod tests {
             )),
             1,
             3,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -11774,6 +11961,7 @@ mod tests {
             )),
             3,
             3,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -11916,6 +12104,7 @@ mod tests {
                 )),
                 1,
                 1000,
+                None,
             ));
         });
         let res = res.into_inner().unwrap().unwrap();
