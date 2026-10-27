@@ -9482,7 +9482,11 @@ mod tests {
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .ok("git", &["log", "-1", "--format=%b", "feat/x"], "body\n")
-                .ok("git", &["fetch", "origin", "feat/x"], "")
+                .ok(
+                    "git",
+                    &["fetch", "origin", "refs/heads/feat/x:refs/remotes/origin/feat/x"],
+                    "",
+                )
                 .fail(
                     "git",
                     &["merge-base", "--is-ancestor", "remotesha", "localsha"],
