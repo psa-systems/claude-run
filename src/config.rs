@@ -617,6 +617,14 @@ pub struct MintConfig {
     /// deterministically to the auto-fix bucket (queued for a corrective PR)
     /// instead of to a human.
     pub auto_fix: AutoFixConfig,
+    /// Branch-name prefixes (matched case-sensitively, e.g. `renovate/`) owned by
+    /// another bot that rebases or force-pushes its branches on every run. A
+    /// failing check on a branch matching one of these prefixes never routes to
+    /// `code_fix` / `auto_fix` (which would queue a fix pushed onto that same
+    /// branch, only to have the owning bot wipe it on its next force-push); it
+    /// routes to `human_action` instead, naming the base branch as the place to
+    /// fix. Default `["renovate/"]`.
+    pub bot_branch_prefixes: Vec<String>,
 }
 
 impl Default for MintConfig {
@@ -631,6 +639,7 @@ impl Default for MintConfig {
             ai_agent_field: "AI Agent".to_string(),
             queued_value: "Queued".to_string(),
             auto_fix: AutoFixConfig::default(),
+            bot_branch_prefixes: vec!["renovate/".to_string()],
         }
     }
 }
