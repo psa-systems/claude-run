@@ -1556,11 +1556,10 @@ async fn process_job(
     // ---- finalize (the native "post"): every external mutation lives here ----
     // Synchronous. Finalize no longer polls CI (that
     // wait is now driven by a webhook event), so it returns promptly.
-    // CLAUDE-466: `resume` already reflects any PR recorded for this issue,
-    // whether from a re-queue or a checkpoint push opened one mid-run, so a
-    // PR-step failure comment can say truthfully whether a re-queue resumes
-    // that PR's branch.
-    let recorded_pr_url = resume.as_ref().map(|r| r.pr_url.as_str());
+    // CLAUDE-466 / CLAUDE-467: `resume` already reflects any PR recorded for
+    // this issue, whether from a re-queue or a checkpoint push opened one
+    // mid-run, so a PR-step failure comment can say truthfully whether a
+    // re-queue resumes that PR's branch.
     let finalize_res = crate::blocking::in_place(|| {
         finalize(
             backend,
@@ -1573,6 +1572,7 @@ async fn process_job(
             stream_log.as_deref(),
             limits.claude_timeout,
             resume.is_some(),
+            resume.as_ref().map(|r| r.pr_url.as_str()),
             crate::run_footer::CommentRun {
                 run_id,
                 attempt: attempts + 1,
@@ -1582,7 +1582,6 @@ async fn process_job(
             review.as_ref(),
             attempts + 1,
             limits.max_attempts_per_key,
-            recorded_pr_url,
         )
     });
     // ---- record a newly opened PR against its issue ----
@@ -1672,6 +1671,7 @@ async fn process_job(
     if let Ok(Finalized::Failed {
         cause,
         pr_step: Some(step),
+        ..
     }) = &finalize_res
     {
         if let Some(log_path) = stream_log.as_deref() {
@@ -2792,6 +2792,14 @@ enum Finalized {
         /// `None` for the claude-crash/pre-failure arm, whose cause is
         /// already inside that same stream log.
         pr_step: Option<&'static str>,
+        /// CLAUDE-467: `true` when a push or PR-create failure re-queued
+        /// the issue onto its recorded open PR instead of parking it at a
+        /// terminal Failed (below `max_attempts_per_key`, with a recorded
+        /// PR, and the field still `Working` at requeue time). Always
+        /// `false` for the claude-crash/pre-failure arm and for a push/PR
+        /// failure that has no recorded PR, is at the attempt cap, or finds
+        /// the field already advanced off `Working`.
+        requeued: bool,
     },
     /// Claude hit the wall-clock limit (exit 124). The work may be
     /// complete, partial, or absent, so the issue is NOT marked Failed: a
@@ -2825,7 +2833,10 @@ impl Finalized {
             Finalized::NeedsReview => "Needs Review",
             Finalized::NoCodeChange => "No Code Change",
             Finalized::CodeReview { .. } => "Code Review",
-            Finalized::Failed { .. } => "Failed",
+            Finalized::Failed { requeued: true, .. } => "Queued (push)",
+            Finalized::Failed {
+                requeued: false, ..
+            } => "Failed",
             Finalized::TimedOut { .. } => "Timed Out",
             Finalized::ReviewFailed { requeued: true, .. } => "Queued (review)",
             Finalized::ReviewFailed {
@@ -2886,6 +2897,12 @@ fn finalize(
     stream_log: Option<&Path>,
     claude_timeout: Duration,
     resumed: bool,
+    // CLAUDE-467 / CLAUDE-466: this issue's recorded open PR URL at finalize
+    // time (a CLAUDE-275 resume, or one the checkpoint-push watcher adopted
+    // mid-run), if any. Consulted in the push/PR-create failure arm below,
+    // both to decide whether a re-queue resumes a real PR instead of parking
+    // at a terminal Failed, and to say so truthfully in the failure comment.
+    resume_pr_url: Option<&str>,
     run: crate::run_footer::CommentRun,
     // CLAUDE-448: the reason the periodic checkpoint-push watcher stopped
     // checkpointing partway through this run (a rejected push), if any. Never
@@ -2902,11 +2919,6 @@ fn finalize(
     // does for the ordinary attempt cap.
     attempts_after: u32,
     max_attempts_per_key: u32,
-    // CLAUDE-466: the PR URL `agent_pull_requests` already has recorded for
-    // this issue, if any (a re-queue's resume target, or a checkpoint push
-    // that opened one mid-run), so a PR-step failure comment can say
-    // truthfully whether a re-queue resumes that PR's branch.
-    recorded_pr_url: Option<&str>,
 ) -> Result<Finalized> {
     let public_url = crate::run_footer::resolved_public_url();
     // CLAUDE-448: appended to whichever outcome body this call produces, right
@@ -3126,16 +3138,98 @@ fn finalize(
                     WorkLocation::RemoteBranch { .. } => "pr_create",
                     _ => "push",
                 };
-                let body =
-                    pr_failure_comment(claude_result, &e, &location, pr_step, recorded_pr_url);
-                let body = note_checkpoint_rejection(body);
-                let body =
-                    crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
-                comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
-                Ok(Finalized::Failed {
-                    cause: e.to_string(),
-                    pr_step: Some(pr_step),
-                })
+                // CLAUDE-467: a push or PR-create failure after the work is
+                // already safe (or recorded against an open PR) is not a
+                // hard failure of the work itself, so re-queue below the
+                // attempt cap when this issue has a recorded PR to resume.
+                // With no recorded PR, or at the cap, this degrades to the
+                // same terminal Failed as before.
+                match resume_pr_url {
+                    Some(pr_url) if attempts_after < max_attempts_per_key => {
+                        // Re-read first: a human or another agent may have
+                        // already advanced the field off Working while this
+                        // run was in flight, in which case it is left
+                        // untouched rather than stomped back to Queued
+                        // (mirrors the timeout arm's own re-read below).
+                        let current = backend.get_field(&job.key, &src.custom_field);
+                        let requeued = match &current {
+                            Ok(v) => v.trim() == src.states.working,
+                            Err(ge) => {
+                                error!(key = %job.key, error = %ge, "push/PR-create failure: AI Agent re-read failed, parking at Failed instead of requeuing");
+                                false
+                            }
+                        };
+                        let body = if requeued {
+                            push_failure_requeue_comment(
+                                claude_result,
+                                &e,
+                                pr_step,
+                                pr_url,
+                                attempts_after,
+                                max_attempts_per_key,
+                            )
+                        } else {
+                            pr_failure_comment(claude_result, &e, &location, pr_step, resume_pr_url)
+                        };
+                        let body = note_checkpoint_rejection(body);
+                        let body = crate::run_footer::append_job(
+                            &body,
+                            public_url.as_deref(),
+                            run,
+                            &job.key,
+                        );
+                        if let Err(ce) = backend.comment(&job.key, &body) {
+                            warn!(key = %job.key, error = %ce, "issue comment failed (continuing to AI Agent write)");
+                        }
+                        match &current {
+                            Ok(_) if requeued => {
+                                backend.set_field(
+                                    &job.key,
+                                    &src.custom_field,
+                                    &src.states.queued,
+                                )?;
+                            }
+                            Ok(v) => {
+                                info!(key = %job.key, current = %v.trim(), "push/PR-create failure requeue skipped: AI Agent already advanced off Working");
+                            }
+                            // Unknown state: Failed is the safe terminal, never a stuck Working.
+                            Err(_) => {
+                                backend.set_field(
+                                    &job.key,
+                                    &src.custom_field,
+                                    &src.states.failed,
+                                )?;
+                            }
+                        }
+                        Ok(Finalized::Failed {
+                            cause: e.to_string(),
+                            pr_step: Some(pr_step),
+                            requeued,
+                        })
+                    }
+                    _ => {
+                        let body = pr_failure_comment(
+                            claude_result,
+                            &e,
+                            &location,
+                            pr_step,
+                            resume_pr_url,
+                        );
+                        let body = note_checkpoint_rejection(body);
+                        let body = crate::run_footer::append_job(
+                            &body,
+                            public_url.as_deref(),
+                            run,
+                            &job.key,
+                        );
+                        comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
+                        Ok(Finalized::Failed {
+                            cause: e.to_string(),
+                            pr_step: Some(pr_step),
+                            requeued: false,
+                        })
+                    }
+                }
             }
         }
     } else if claude_result.timed_out {
@@ -3183,6 +3277,7 @@ fn finalize(
         Ok(Finalized::Failed {
             cause: claude_result.error.clone(),
             pr_step: None,
+            requeued: false,
         })
     }
 }
@@ -3666,6 +3761,42 @@ fn pr_failure_comment(
         err.to_string(),
         String::new(),
         location_line,
+        String::new(),
+        r.summary.clone(),
+        String::new(),
+        format!("Cost: ${} USD", r.cost),
+    ]
+    .join("\n");
+    body.push_str(&raw_event_details(&r.raw));
+    body
+}
+
+/// Issue comment for a push/PR-create failure (CLAUDE-467) that re-queues
+/// below `max_attempts_per_key` onto this issue's recorded open PR, rather
+/// than parking it at a terminal Failed: names the step that actually
+/// failed, the cause, the PR it will resume, and the attempt count.
+fn push_failure_requeue_comment(
+    r: &ClaudeResult,
+    err: &Error,
+    pr_step: &str,
+    pr_url: &str,
+    attempts_after: u32,
+    max_attempts_per_key: u32,
+) -> String {
+    let step_line = match pr_step {
+        "pr_create" => "but opening the PR FAILED",
+        _ => "but pushing the branch FAILED",
+    };
+    let mut body = [
+        format!("Claude AI agent run completed {step_line}:"),
+        String::new(),
+        err.to_string(),
+        String::new(),
+        format!(
+            "This issue has a recorded open PR: {pr_url}. AI Agent has been returned to Queued \
+             (attempt {attempts_after} of {max_attempts_per_key}); the next run resumes that \
+             PR's branch rather than opening a new one."
+        ),
         String::new(),
         r.summary.clone(),
         String::new(),
@@ -6695,12 +6826,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6739,12 +6870,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             Some("remote rejected non-fast-forward update"),
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6795,12 +6926,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6847,12 +6978,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6901,12 +7032,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6946,12 +7077,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -7017,12 +7148,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -7061,12 +7192,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -7175,12 +7306,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -7331,12 +7462,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -7394,12 +7525,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -8038,12 +8169,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert!(
@@ -8075,6 +8206,438 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.contains("-aA")),
             "branch failure must not fall back to AGit: {calls:?}"
+        );
+    }
+
+    /// CLAUDE-467 criterion 1: a push failure with a recorded open PR and
+    /// attempts below the cap re-queues onto that PR instead of parking at
+    /// a terminal Failed.
+    #[test]
+    fn finalize_push_failure_with_recorded_pr_below_cap_requeues() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    128,
+                    "no upstream",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Working",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Queued"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+            Some("https://dev.a8n.run/contoso/claude-run/pulls/7"),
+            test_comment_run(),
+            None,
+            None,
+            1,
+            3,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    requeued: true,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Queued"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("AI Agent Failed")),
+            "{calls:?}"
+        );
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .expect("requeue comment posted");
+        assert!(
+            comment.contains("https://dev.a8n.run/contoso/claude-run/pulls/7"),
+            "comment names the recorded PR: {comment}"
+        );
+        assert!(comment.contains("no upstream"), "{comment}");
+    }
+
+    /// CLAUDE-467 criterion 2: the same push failure at the attempt cap
+    /// parks at a terminal Failed instead of requeuing.
+    #[test]
+    fn finalize_push_failure_with_recorded_pr_at_cap_sets_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    128,
+                    "no upstream",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+            Some("https://dev.a8n.run/contoso/claude-run/pulls/7"),
+            test_comment_run(),
+            None,
+            None,
+            3,
+            3,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    requeued: false,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("get-field")),
+            "at the cap, the field is never re-read: {calls:?}"
+        );
+    }
+
+    /// CLAUDE-467 a failed AI Agent re-read is not read as "advanced":
+    /// it is logged and the issue parks at Failed, never left stuck at Working.
+    #[test]
+    fn finalize_push_failure_requeue_field_read_failure_sets_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    128,
+                    "no upstream",
+                )
+                .fail(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    1,
+                    "yt down",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+            Some("https://dev.a8n.run/contoso/claude-run/pulls/7"),
+            test_comment_run(),
+            None,
+            None,
+            1,
+            3,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    requeued: false,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("AI Agent Queued")),
+            "{calls:?}"
+        );
+    }
+
+    /// CLAUDE-467 criterion 3: the same push failure with no recorded PR
+    /// keeps today's terminal Failed.
+    #[test]
+    fn finalize_push_failure_with_no_recorded_pr_sets_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    128,
+                    "no upstream",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            3,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    requeued: false,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("get-field")),
+            "with no recorded PR, the field is never re-read: {calls:?}"
+        );
+    }
+
+    /// CLAUDE-467 criterion 4: a push failure with a recorded PR and
+    /// attempts below the cap, but the AI Agent field already advanced off
+    /// Working (a concurrent human/agent edit) by requeue time, leaves the
+    /// field untouched rather than stomping it back to Queued.
+    #[test]
+    fn finalize_push_failure_requeue_leaves_an_already_advanced_field_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    128,
+                    "no upstream",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Needs Review",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+            Some("https://dev.a8n.run/contoso/claude-run/pulls/7"),
+            test_comment_run(),
+            None,
+            None,
+            1,
+            3,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    requeued: false,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("set-field")),
+            "the field is already advanced off Working, so no write happens: {calls:?}"
         );
     }
 
@@ -8124,12 +8687,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert!(matches!(res, Finalized::Failed { .. }), "{res:?}");
@@ -8234,12 +8797,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -8306,12 +8869,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));
@@ -8354,12 +8917,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert!(
@@ -8403,12 +8966,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert!(
@@ -8417,6 +8980,7 @@ mod tests {
                 Finalized::Failed {
                     ref cause,
                     pr_step: None,
+                    requeued: false,
                 } if cause == "claude exited 1, see stream.jsonl"
             ),
             "{res:?}"
@@ -8441,6 +9005,7 @@ mod tests {
         let finalize_res: Result<Finalized> = Ok(Finalized::Failed {
             cause: "provider CLI `git push` failed (exit 128): no upstream".to_string(),
             pr_step: Some("push"),
+            requeued: false,
         });
         let (ok, summary) = record_finalize_outcome(&claude, &finalize_res, false);
         assert!(!ok, "a PR-path failure must never record ok = true");
@@ -8462,6 +9027,7 @@ mod tests {
         let finalize_res: Result<Finalized> = Ok(Finalized::Failed {
             cause: claude.error.clone(),
             pr_step: None,
+            requeued: false,
         });
         let (ok, summary) = record_finalize_outcome(&claude, &finalize_res, false);
         assert!(!ok);
@@ -8564,12 +9130,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -8623,12 +9189,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -8808,12 +9374,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -8973,12 +9539,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -9071,12 +9637,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -9223,12 +9789,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         // The PR still counts, even though the comment on it failed.
@@ -9446,12 +10012,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             true,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -9594,12 +10160,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             true,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -9761,12 +10327,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             true,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -9904,12 +10470,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             None,
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -11531,12 +12097,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             Some(&ReviewOutcome::Pass("all criteria check out".to_string())),
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -11660,12 +12226,12 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             Some(&ReviewOutcome::Pass("all criteria check out".to_string())),
             1,
             1000,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -11800,6 +12366,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             Some(&ReviewOutcome::Fail(
@@ -11807,7 +12374,6 @@ mod tests {
             )),
             1,
             3,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -11958,6 +12524,7 @@ mod tests {
             None,
             Duration::from_secs(1800),
             false,
+            None,
             test_comment_run(),
             None,
             Some(&ReviewOutcome::Fail(
@@ -11965,7 +12532,6 @@ mod tests {
             )),
             3,
             3,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -12101,6 +12667,7 @@ mod tests {
                 None,
                 Duration::from_secs(1800),
                 false,
+                None,
                 test_comment_run(),
                 None,
                 Some(&ReviewOutcome::NoVerdict(
@@ -12108,7 +12675,6 @@ mod tests {
                 )),
                 1,
                 1000,
-                None,
             ));
         });
         let res = res.into_inner().unwrap().unwrap();
