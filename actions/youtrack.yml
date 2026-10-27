@@ -28,7 +28,13 @@
 #                   auto-requeuing a timeout back to Queued instead, as a deliberately descoped follow-up of CLAUDE-448.
 #                   The post-success review session (below) also lands here when it gave no usable verdict, and when
 #                   a real fail verdict's attempt count has reached max_attempts_per_key
-#   Failed       -> claude or a step had a hard failure (finalize step)
+#   Failed       -> claude or a step had a hard failure (finalize step). A push or PR-create failure after a
+#                   successful run is the one exception (CLAUDE-467): when this issue has a recorded open PR (a
+#                   CLAUDE-275 resume, or one the checkpoint-push watcher above adopted mid-run) and the attempt
+#                   count is below max_attempts_per_key, it requeues to Queued instead, with a comment naming the
+#                   cause and that PR, so the next run resumes it rather than opening a new one; the re-read before
+#                   the revert checks the field is still Working first, same as the Working-to-Queued reverts
+#                   described below. With no recorded PR, or at the cap, it still lands here at Failed.
 #   Done         -> a run that deliberately produced tracker output rather than code and wrote
 #                   .claude-run-no-code-change; no PR is opened and State is left alone (CLAUDE-214, label configurable
 #                   as native.youtrack.states.no_code)
