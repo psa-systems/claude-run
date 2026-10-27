@@ -4329,6 +4329,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 badge: "next event",
                 note: "AI Agent value for a code-fix issue.",
             },
+            FieldDoc {
+                name: "bot_branch_prefixes",
+                badge: "next event",
+                note: "branch prefixes (e.g. renovate/) owned by another bot; a failing check there routes to human_action, never code_fix/auto_fix.",
+            },
         ],
         Webhook => vec![
             FieldDoc {
