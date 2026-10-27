@@ -1095,6 +1095,16 @@ pub fn retry_git_network<O: GitAttemptOutput>(
 /// with the URL's userinfo passed as a known secret. The URL itself never enters
 /// the error: the reason string is persisted to `run_events` and can reach a
 /// YouTrack comment.
+///
+/// `--single-branch --branch <branch>` (or, unpinned, `--single-branch` on
+/// whatever the remote's default is) configures `remote.origin.fetch` to
+/// cover only that one branch (CLAUDE-464): a later `git fetch origin
+/// <other-branch>` naming any other ref by its bare name does not match that
+/// refspec and writes `FETCH_HEAD` only, creating no
+/// `refs/remotes/origin/<other-branch>`. `CliBackend::fetch_branch`
+/// (`src/provider/cli.rs`) and `restore_default_branch_refs` below both name
+/// their destination tracking ref explicitly for exactly this reason; a new
+/// fetch call site in a single-branch workdir must do the same.
 pub fn shallow_clone(
     url: &str,
     branch: Option<&str>,
