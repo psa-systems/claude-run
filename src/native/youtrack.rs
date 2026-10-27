@@ -1556,6 +1556,10 @@ async fn process_job(
     // ---- finalize (the native "post"): every external mutation lives here ----
     // Synchronous. Finalize no longer polls CI (that
     // wait is now driven by a webhook event), so it returns promptly.
+    // CLAUDE-466 / CLAUDE-467: `resume` already reflects any PR recorded for
+    // this issue, whether from a re-queue or a checkpoint push opened one
+    // mid-run, so a PR-step failure comment can say truthfully whether a
+    // re-queue resumes that PR's branch.
     let finalize_res = crate::blocking::in_place(|| {
         finalize(
             backend,
@@ -2416,7 +2420,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "1. Run 'yt issue inspect {{key}}' to read the full description, acceptance criteria and every comment. Then decide, before you change any code, whether you can finish and verify ALL of it before the deadline. If you cannot, do not start: take the blocker path below immediately, with a reason that begins 'Task too large:', says why, proposes a split of {{key}} into PR-sized pieces (one line per piece naming the acceptance criteria it would own), and ends with the question 'Split {{key}} as proposed?'. If you can, commit to finishing: from this point the only ways to end the run are completing every acceptance criterion with evidence (step 8), the blocker path for a real blocker, or the no-code path. Running short on time is never a reason to stop; keep working until you are done or the runner kills the run, because your committed work is kept either way.",
         "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
         "3. If {{existing_branch}} is empty, create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, ALSO read that PR's own comments (a prior timed-out run may have left one explaining what it salvaged and why, e.g. a draft PR opened from uncommitted work at kill time, or a separate fresh-context review session may have left one listing findings that kept the PR a draft), then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
-        "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit whose body ends with the bare '#{{key}}' reference, so a kill leaves committed progress instead of none; the final commit still carries the full PR-description format from step 7 and stays the branch tip. The runner pushes your commits as WIP checkpoints automatically every 60 seconds while you work, from whatever feature branch is checked out, and opens a draft PR from the first one - this is not something you do, and a checkpoint landing is not a stopping point or a reason to wrap up early; keep working exactly as step 1 describes until you are done, blocked, or killed.",
+        "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit whose body ends with the bare '#{{key}}' reference, so a kill leaves committed progress instead of none; the final commit still carries the full PR-description format from step 7 and stays the branch tip. The runner pushes your commits as WIP checkpoints automatically every 60 seconds while you work, from whatever feature branch is checked out, and opens a draft PR from the first one - this is not something you do, and a checkpoint landing is not a stopping point or a reason to wrap up early; keep working exactly as step 1 describes until you are done, blocked, or killed. Because of those checkpoint pushes, a commit on this branch may already be on the remote before you notice a mistake in it: never run 'git reset', 'git commit --amend', 'git rebase', 'git filter-branch', or any force push on this branch to fix it - any of those rewrites history the runner has already published and orphans the checkpoint. Fix a mistake, including a wrong commit message, with a new commit on top instead.",
         "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (e.g. the repo's 'just check', tests, or build) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off.",
         "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
         "7. The runner uses this commit's SUBJECT as the PR title and its body as the PR description (if you make more than one commit, the LAST commit carries both, since the runner reads only the branch tip). The subject is a SEPARATE line from the body, not the body's first heading: write one short imperative line (about 72 characters or fewer, no leading '#', not a Markdown heading like '## Summary') that names the change itself, e.g. 'Fix the off-by-one in the retry budget'; confirm it with 'git log -1 --format=%s' before you stop - if that prints a Markdown heading, a bare issue reference, or anything else that is not a one-line summary of the change, the commit is wrong and the runner will refuse to open the PR from it. The body (what 'git log -1 --format=%b' prints) is the PR description; it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the literal line 'Closes', then the bare issue reference on the next line alone, with nothing after it on that line and no line after it; a 'Co-Authored-By:' trailer goes above the 'Closes' line, never after the reference. If the commit owns more than one issue, put each '#<KEY>-N' on its own line below the single 'Closes' line. NO 'State ...' command after the reference. Example of the tail:",
@@ -2893,11 +2897,11 @@ fn finalize(
     stream_log: Option<&Path>,
     claude_timeout: Duration,
     resumed: bool,
-    // CLAUDE-467: this issue's recorded open PR URL at finalize time (a
-    // CLAUDE-275 resume, or one the checkpoint-push watcher adopted
-    // mid-run), if any. Consulted only in the push/PR-create failure arm
-    // below, to decide whether a re-queue resumes a real PR instead of
-    // parking at a terminal Failed.
+    // CLAUDE-467 / CLAUDE-466: this issue's recorded open PR URL at finalize
+    // time (a CLAUDE-275 resume, or one the checkpoint-push watcher adopted
+    // mid-run), if any. Consulted in the push/PR-create failure arm below,
+    // both to decide whether a re-queue resumes a real PR instead of parking
+    // at a terminal Failed, and to say so truthfully in the failure comment.
     resume_pr_url: Option<&str>,
     run: crate::run_footer::CommentRun,
     // CLAUDE-448: the reason the periodic checkpoint-push watcher stopped
@@ -3161,7 +3165,7 @@ fn finalize(
                                 max_attempts_per_key,
                             )
                         } else {
-                            pr_failure_comment(claude_result, &e, &location)
+                            pr_failure_comment(claude_result, &e, &location, pr_step, resume_pr_url)
                         };
                         let body = note_checkpoint_rejection(body);
                         let body = crate::run_footer::append_job(
@@ -3185,7 +3189,13 @@ fn finalize(
                         })
                     }
                     _ => {
-                        let body = pr_failure_comment(claude_result, &e, &location);
+                        let body = pr_failure_comment(
+                            claude_result,
+                            &e,
+                            &location,
+                            pr_step,
+                            resume_pr_url,
+                        );
                         let body = note_checkpoint_rejection(body);
                         let body = crate::run_footer::append_job(
                             &body,
@@ -3686,7 +3696,19 @@ fn post_review_findings_on_pr(
     result
 }
 
-fn pr_failure_comment(r: &ClaudeResult, err: &Error, work: &WorkLocation) -> String {
+// CLAUDE-466: `pr_step` is `"push"` or `"pr_create"`, the step `finalize`
+// determined actually failed, so the headline never blames PR creation for a
+// push failure. `recorded_pr_url`, when set, is the PR `agent_pull_requests`
+// already has recorded for this issue (a prior resume target, or one a
+// checkpoint push opened mid-run): a `RemoteBranch` failure on a recorded PR
+// means a re-queue resumes that PR's branch rather than opening a fresh one.
+fn pr_failure_comment(
+    r: &ClaudeResult,
+    err: &Error,
+    work: &WorkLocation,
+    pr_step: &str,
+    recorded_pr_url: Option<&str>,
+) -> String {
     // Name where the work actually is. Under the branch PR strategy the push
     // happens before the PR call, so a PR-only failure leaves the work on the
     // remote, not in a preserved workdir.
@@ -3700,13 +3722,22 @@ fn pr_failure_comment(r: &ClaudeResult, err: &Error, work: &WorkLocation) -> Str
             workdir.display(),
             paths.len()
         ),
-        WorkLocation::RemoteBranch { branch, sha } => format!(
-            "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before the PR call failed, so nothing was lost. No PR was ever opened here, so nothing was recorded for this issue (CLAUDE-275): re-queuing it (set AI Agent = Queued) clones the default branch again and opens a fresh PR, it does NOT resume this branch by name. Push the same branch again from a fresh clone, or open the PR for it by hand, if this exact work should not be redone. The workdir on the daemon host is not kept, because the forge holds the same commits."
-        ),
+        WorkLocation::RemoteBranch { branch, sha } => match recorded_pr_url {
+            Some(pr_url) => format!(
+                "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before this failure, so nothing was lost. This issue already has an open PR recorded against it ({pr_url}): re-queuing it (set AI Agent = Queued) resumes that PR's branch by name (CLAUDE-275), it does not open a fresh one."
+            ),
+            None => format!(
+                "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before this failure, so nothing was lost. No PR was ever opened here, so nothing was recorded for this issue (CLAUDE-275): re-queuing it (set AI Agent = Queued) clones the default branch again and opens a fresh PR, it does NOT resume this branch by name. Push the same branch again from a fresh clone, or open the PR for it by hand, if this exact work should not be redone. The workdir on the daemon host is not kept, because the forge holds the same commits."
+            ),
+        },
         WorkLocation::None => "No local commits were found to preserve.".to_string(),
     };
+    let headline = match pr_step {
+        "push" => "Claude AI agent run completed but pushing the branch FAILED:",
+        _ => "Claude AI agent run completed but opening the PR FAILED:",
+    };
     let mut body = [
-        "Claude AI agent run completed but PR creation FAILED:".to_string(),
+        headline.to_string(),
         String::new(),
         err.to_string(),
         String::new(),
@@ -7801,7 +7832,13 @@ mod tests {
         .trim()
         .to_string();
 
-        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone, None));
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "pr_create",
+            None,
+        );
 
         assert!(
             body.contains("fix/redact-env-vars-on-export"),
@@ -7816,6 +7853,112 @@ mod tests {
     }
 
     #[test]
+    fn pr_failure_comment_headline_names_push_for_a_push_failure() {
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "push",
+            None,
+        );
+
+        assert!(
+            body.contains("pushing the branch FAILED"),
+            "a push failure must name pushing, not PR creation: {body}"
+        );
+        assert!(
+            !body.contains("PR creation"),
+            "a push failure must never say \"PR creation\": {body}"
+        );
+    }
+
+    #[test]
+    fn pr_failure_comment_headline_names_pr_create_for_a_pr_create_failure() {
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "pr_create",
+            None,
+        );
+
+        assert!(
+            body.contains("opening the PR FAILED"),
+            "a pr_create failure must name opening the PR: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_failure_comment_with_a_recorded_pr_says_requeue_resumes_it() {
+        // CLAUDE-466 / PMCP-9 shape: the checkpoint watcher already opened and
+        // recorded a draft PR, then the final push failed on a divergence
+        // merge. The comment must point at that recorded PR, never claim no
+        // PR was ever opened.
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        git_in(&clone, &["checkout", "-b", "fix/divergence-merge"]);
+        std::fs::write(clone.join("new.txt"), "work").unwrap();
+        git_in(&clone, &["add", "."]);
+        git_in(&clone, &["commit", "-m", "fix: divergence"]);
+        git_in(&clone, &["push", "origin", "fix/divergence-merge"]);
+
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "push",
+            Some("https://dev.a8n.run/contoso/claude-run/pulls/9"),
+        );
+
+        assert!(
+            body.contains("https://dev.a8n.run/contoso/claude-run/pulls/9"),
+            "the comment must name the recorded PR: {body}"
+        );
+        assert!(
+            body.contains("resumes that PR's branch"),
+            "a recorded PR must say re-queuing resumes it: {body}"
+        );
+        assert!(
+            !body.contains("No PR was ever opened"),
+            "a recorded PR must never say no PR was ever opened: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_failure_comment_with_no_recorded_pr_keeps_the_fresh_pr_text() {
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        git_in(&clone, &["checkout", "-b", "fix/no-recorded-pr"]);
+        std::fs::write(clone.join("new.txt"), "work").unwrap();
+        git_in(&clone, &["add", "."]);
+        git_in(&clone, &["commit", "-m", "fix: no recorded pr"]);
+        git_in(&clone, &["push", "origin", "fix/no-recorded-pr"]);
+
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "pr_create",
+            None,
+        );
+
+        assert!(
+            body.contains("No PR was ever opened here"),
+            "with no recorded PR, the existing re-queue-starts-fresh text must survive: {body}"
+        );
+        assert!(
+            body.contains("does NOT resume this branch by name"),
+            "with no recorded PR, the existing re-queue-starts-fresh text must survive: {body}"
+        );
+    }
+
+    #[test]
     fn pr_failure_comment_names_the_preserved_workdir_when_unpushed() {
         // Unchanged path: an unpushed commit keeps the workdir, and
         // the comment is the recovery pointer to it.
@@ -7826,7 +7969,13 @@ mod tests {
         git_in(&clone, &["add", "."]);
         git_in(&clone, &["commit", "-m", "feat: y"]);
 
-        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone, None));
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "pr_create",
+            None,
+        );
 
         assert!(
             body.contains("PRESERVED on the daemon host at: `"),
@@ -7843,7 +7992,13 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let clone = origin_and_single_branch_clone(base.path());
 
-        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone, None));
+        let body = pr_failure_comment(
+            &ok_result(),
+            &pr_error(),
+            &work_location(&clone, None),
+            "pr_create",
+            None,
+        );
 
         assert!(body.contains("No local commits were found to preserve."));
     }
@@ -7869,7 +8024,7 @@ mod tests {
             "expected UncommittedChanges"
         );
 
-        let body = pr_failure_comment(&ok_result(), &pr_error(), &loc);
+        let body = pr_failure_comment(&ok_result(), &pr_error(), &loc, "pr_create", None);
         assert!(
             !body.contains("SAFE on the remote"),
             "an unpushed branch must never read as safe on the remote: {body}"
@@ -9967,7 +10122,11 @@ mod tests {
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .ok("git", &["log", "-1", "--format=%b", "feat/x"], "body\n")
-                .ok("git", &["fetch", "origin", "feat/x"], "")
+                .ok(
+                    "git",
+                    &["fetch", "origin", "refs/heads/feat/x:refs/remotes/origin/feat/x"],
+                    "",
+                )
                 .fail(
                     "git",
                     &["merge-base", "--is-ancestor", "remotesha", "localsha"],
@@ -10133,6 +10292,28 @@ mod tests {
             p.contains("a separate fresh-context review session may have left one listing findings that kept the PR a draft"),
             "the default prompt must tell a resumed run to read and fix review findings:\n{p}"
         );
+    }
+
+    #[test]
+    fn default_prompt_forbids_history_rewriting_on_the_feature_branch() {
+        // CLAUDE-465: the checkpoint-push watcher (CLAUDE-448) publishes the
+        // agent's commits every 60 seconds, so a `reset`/`--amend`/`rebase`/
+        // force push to fix a mistake orphans an already-pushed checkpoint
+        // instead of just making a new commit on top.
+        let p = default_youtrack_prompt();
+        for needle in [
+            "git reset",
+            "git commit --amend",
+            "git rebase",
+            "git filter-branch",
+            "force push",
+            "Fix a mistake, including a wrong commit message, with a new commit on top instead",
+        ] {
+            assert!(
+                p.contains(needle),
+                "the default prompt must forbid history rewriting on the feature branch (missing {needle:?}):\n{p}"
+            );
+        }
     }
 
     // ---- automerge no longer polls from finalize -------------

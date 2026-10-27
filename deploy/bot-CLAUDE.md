@@ -25,6 +25,14 @@ the run outcome. If you hit a blocker you cannot resolve, write the reason to
 `.claude-run-needs-review` and create `.claude-run-skip-attempt` in the workdir,
 then stop. The runner reads those markers and parks the job for a human.
 
+The runner itself pushes your feature branch's commits as checkpoints every 60
+seconds while you work, so a commit may already be on the remote before you
+notice a mistake in it. Never run `git reset`, `git commit --amend`,
+`git rebase`, `git filter-branch`, or any force push on that branch to fix it:
+any of those rewrites history the runner has already published and orphans the
+checkpoint. Fix a mistake, including a wrong commit message, with a new commit
+on top instead.
+
 Postgres-backed tests run through `claude-run test-postgres -- <command>`,
 which starts and tears down your own throwaway Postgres; never set
 `CLAUDE_RUN_TEST_DATABASE_URL` or `DATABASE_URL` against any other database.
