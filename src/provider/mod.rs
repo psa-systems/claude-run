@@ -829,6 +829,61 @@ pub(crate) fn git_trace_test_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The create_pr "adopt-first" contract (CLAUDE-469): shared, backend-agnostic
+/// assertions exercised by BOTH `cli::CliBackend` and `github::GithubForge`'s
+/// own test suites, so a regression in either backend's adopt-or-create path
+/// fails against the same two assertions rather than two independently
+/// maintained (and potentially diverging) copies. Each backend's test module
+/// builds its own command-runner double (the two backends shell out to
+/// different CLIs with different argv), then hands the resulting
+/// already-opened `Forge` to these functions, which know nothing
+/// backend-specific.
+#[cfg(test)]
+pub(crate) mod contract {
+    use super::{Forge, Result};
+    use crate::action::PrStrategy;
+    use std::path::Path;
+
+    /// An open PR already exists for the branch `forge` would push: `create_pr`
+    /// must return it, not create a second one. `adopted_pr_number` is the
+    /// number the backend's double has stubbed as the ONLY open PR, so a
+    /// mismatch means the create path ran instead of the adopt path.
+    pub(crate) fn assert_adopts_existing_open_pr(
+        forge: &dyn Forge,
+        workdir: &Path,
+        host: &str,
+        adopted_pr_number: u64,
+    ) {
+        let pr = forge
+            .create_pr(workdir, host, PrStrategy::Branch)
+            .expect("create_pr must succeed by adopting the existing open PR");
+        assert_eq!(
+            pr.number,
+            Some(adopted_pr_number),
+            "must adopt the existing open PR rather than create a new one"
+        );
+    }
+
+    /// No open PR exists for the branch: `create_pr` must still succeed by
+    /// creating one, exactly as it did before CLAUDE-469 introduced the
+    /// lookup. `created_pr_number` is the number the backend's double has
+    /// stubbed its create call to return.
+    pub(crate) fn assert_creates_when_no_open_pr(
+        forge: &dyn Forge,
+        workdir: &Path,
+        host: &str,
+        created_pr_number: u64,
+    ) -> Result<()> {
+        let pr = forge.create_pr(workdir, host, PrStrategy::Branch)?;
+        assert_eq!(
+            pr.number,
+            Some(created_pr_number),
+            "with no open PR to adopt, create_pr must still create one"
+        );
+        Ok(())
+    }
+}
+
 /// Same per-invocation authentication as [`authed_git_output`], but through a
 /// [`CommandRunner`] so call sites built on it (notably [`cli::CliBackend`])
 /// stay testable against a [`cli::StubRunner`] instead of a real `git`.
@@ -2982,5 +3037,103 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(workdir.join("f").exists());
+    }
+
+    /// Every `impl Forge for <Type>` under `src/**`, found by a plain
+    /// textual scan rather than by maintaining a hand-written list that can
+    /// silently drift out of date. `ty` is the implementing type's name as it
+    /// appears after `Forge for` (before any generic params or the opening
+    /// brace).
+    fn every_impl_forge_for() -> Vec<String> {
+        fn scan(dir: &std::path::Path, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    scan(&path, found);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let content = std::fs::read_to_string(&path).unwrap();
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if !line.starts_with("impl") {
+                            continue;
+                        }
+                        // Matches `Forge for` after a space or a path separator, so a
+                        // qualified `impl crate::provider::Forge for X` is found too.
+                        if let Some(idx) = line.find("Forge for ").filter(|&i| {
+                            line[..i]
+                                .chars()
+                                .next_back()
+                                .is_some_and(|c| c == ' ' || c == ':')
+                        }) {
+                            let rest = &line[idx + "Forge for ".len()..];
+                            let ty = rest
+                                .split(['<', '{'])
+                                .next()
+                                .unwrap_or(rest)
+                                .trim()
+                                .to_string();
+                            found.push(ty);
+                        }
+                    }
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        scan(&root, &mut found);
+        found
+    }
+
+    /// Mechanical guard (CLAUDE-469 acceptance criterion 7): every real
+    /// `Forge` backend that can open a PR must be exercised by the shared
+    /// [`contract`] assertions (today: `CliBackend`, `GithubForge`); every
+    /// OTHER `impl Forge for <Type>` must be a named, test-only stub whose
+    /// `create_pr` never really opens one. A new backend that forgets to wire
+    /// in the adopt-first contract, or a new test stub that opens real PRs
+    /// without the contract covering it, fails here instead of silently
+    /// slipping through.
+    #[test]
+    fn every_forge_impl_is_contract_covered_or_allowlisted() {
+        const CONTRACT_COVERED: &[&str] = &["CliBackend", "GithubForge"];
+        /// Test-only stubs (`#[cfg(test)]`) whose `create_pr` is `unreachable!()`
+        /// or otherwise never opens a real PR, so the adopt-first contract does
+        /// not apply to them: `push_comment::tests::FailingForge`,
+        /// `native::youtrack::tests::FakeCheckpointForge`,
+        /// `web::webhooks::tests::StoreBackend`.
+        const TEST_ONLY_ALLOWLIST: &[&str] =
+            &["FailingForge", "FakeCheckpointForge", "StoreBackend"];
+
+        let found = every_impl_forge_for();
+        assert!(
+            !found.is_empty(),
+            "the scan found no `impl Forge for` at all; did Forge get renamed?"
+        );
+
+        let unaccounted: Vec<&String> = found
+            .iter()
+            .filter(|ty| {
+                !CONTRACT_COVERED.contains(&ty.as_str())
+                    && !TEST_ONLY_ALLOWLIST.contains(&ty.as_str())
+            })
+            .collect();
+        assert!(
+            unaccounted.is_empty(),
+            "new `impl Forge for {unaccounted:?}` found with no adopt-first contract coverage \
+             and no allowlist entry (CLAUDE-469): add a `contract::assert_adopts_existing_open_pr` \
+             test and list it in CONTRACT_COVERED, or, if its `create_pr` never really opens a PR \
+             (a test-only stub), list it in TEST_ONLY_ALLOWLIST"
+        );
+        // The scan must see a path-qualified impl, or a backend written that way escapes it.
+        assert!(
+            found.iter().any(|f| f == "StoreBackend"),
+            "the scan missed the path-qualified `impl crate::provider::Forge for StoreBackend`"
+        );
+        for ty in CONTRACT_COVERED {
+            assert!(
+                found.iter().any(|f| f == ty),
+                "expected to find `impl Forge for {ty}` under src/**, but the scan did not; \
+                 did it move or get renamed?"
+            );
+        }
     }
 }
