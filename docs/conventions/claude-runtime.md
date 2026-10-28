@@ -53,9 +53,21 @@ work it is judging could also edit away its own findings. It gets its own timeou
 (`limits.review_timeout_seconds`, default `1800`, rejected at load if set to `0`), its own stream log path (so it
 never interleaves with the main session's), and the run's remaining spend ceiling as its `--max-budget-usd`.
 
+Before the verdict, the prompt makes the reviewer independently derive the scope the issue should have covered
+(CLAUDE-471): state the invariant the issue's Goal establishes as a one-sentence contract, from the Goal and the
+root cause in the Background rather than the criteria list (a named file or backend is a lower bound, never the
+full scope); derive a search pattern for the SHAPE of code that invariant governs (every implementation of a trait,
+every call site of a kind, every consumer of a config key) independent of the files the diff touched; run it with
+Glob/Grep over the WHOLE repository; and classify every hit as compliant, not-applicable (with the concrete reason),
+or violating, checking the matching `else`/failure branch whenever the fix touched an `if`/success branch. This
+catches the CLAUDE-170/CLAUDE-206/CLAUDE-469 shape of gap, where criteria named only one backend of several sharing
+the same invariant and a diff-only review passed anyway.
+
 The verdict is read from the workdir, not from the invocation's own exit code: the review session is told to write
-`.claude-run-review-pass` with its notes if the work looks done, or `.claude-run-review-fail` with its findings
-otherwise. `run_review_session` removes any stale marker before invoking, then after a clean, non-timed-out return
+`.claude-run-review-pass` with its notes and the classified table as evidence if the work looks done and the sweep
+found no violating or uncovered hit, or `.claude-run-review-fail` with its findings otherwise, even when every
+written criterion is satisfied: a violating or uncovered hit the sweep finds fails the review on its own.
+`run_review_session` removes any stale marker before invoking, then after a clean, non-timed-out return
 compares `git rev-parse HEAD` before and after and re-reads `workdir::uncommitted_or_stashed`, filtering out the two
 marker paths themselves (an untracked marker file is an expected write, not evidence of the session having edited the
 work) before deciding anything else there counts as `workdir_touched`. Reading exactly one marker yields `Pass`/`Fail`
