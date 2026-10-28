@@ -1788,13 +1788,27 @@ async fn resolve_pr_resume(
 ) -> Result<Option<PrResume>> {
     use crate::ci_failure::store;
     let Some(rec) = store::agent_pr_for_issue(pool, &job.key).await? else {
+        warn!(key = %job.key, "CLAUDE-275: no recorded PR for this issue; starting from the default branch");
+        forge.note(format!(
+            "CLAUDE-275: no recorded PR found for {}; starting from the default branch",
+            job.key
+        ));
         return Ok(None);
     };
     if rec.state != "open" {
+        info!(key = %job.key, pr = rec.pr_number, state = %rec.state, "CLAUDE-275: recorded PR is already confirmed merged or closed; starting from the default branch");
+        forge.note(format!(
+            "CLAUDE-275: recorded PR #{} for {} is already `{}`; starting from the default branch",
+            rec.pr_number, job.key, rec.state
+        ));
         return Ok(None);
     }
     if matches!(pr_strategy, crate::action::PrStrategy::Agit) {
-        info!(key = %job.key, pr = rec.pr_number, "CLAUDE-275: recorded PR uses the AGit strategy, which has no server branch to resume; opening a new PR");
+        warn!(key = %job.key, pr = rec.pr_number, "CLAUDE-275: recorded PR uses the AGit strategy, which has no server branch to resume; opening a new PR");
+        forge.note(format!(
+            "CLAUDE-275: recorded PR #{} for {} uses the AGit strategy, which has no server branch to resume; opening a new PR",
+            rec.pr_number, job.key
+        ));
         return Ok(None);
     }
     let host = host_only(&job.repo_host);
@@ -1803,6 +1817,10 @@ async fn resolve_pr_resume(
         Ok(prs) => prs,
         Err(e) => {
             warn!(key = %job.key, pr = rec.pr_number, error = %e, "CLAUDE-275: could not confirm the recorded PR is still open; opening a new PR as before");
+            forge.note(format!(
+                "CLAUDE-275: could not confirm recorded PR #{} for {} is still open ({e}); opening a new PR as before",
+                rec.pr_number, job.key
+            ));
             return Ok(None);
         }
     };
@@ -1830,8 +1848,16 @@ async fn resolve_pr_resume(
     // record cannot cause another resume attempt.
     if let Err(e) = store::set_agent_pr_state(pool, rec.id, "closed", &state::now_iso()).await {
         warn!(key = %job.key, pr = rec.pr_number, error = %e, "CLAUDE-275: failed to mark the recorded PR closed (non-fatal)");
+        forge.note(format!(
+            "CLAUDE-275: recorded PR #{} for {} is no longer open but could not be marked closed in the store ({e}); it may be re-checked on a later re-queue",
+            rec.pr_number, job.key
+        ));
     }
     info!(key = %job.key, pr = rec.pr_number, "CLAUDE-275: recorded PR is no longer open; marked closed and starting from the default branch");
+    forge.note(format!(
+        "CLAUDE-275: recorded PR #{} for {} is no longer open (merged or closed); marked closed and starting from the default branch",
+        rec.pr_number, job.key
+    ));
     Ok(None)
 }
 
@@ -11215,6 +11241,97 @@ mod tests {
             resume.pr_url,
             "https://dev.a8n.run/contoso/claude-run/pulls/7"
         );
+        assert!(
+            forge.take_notices().is_empty(),
+            "a successful resume needs no operator-visible notice"
+        );
+    }
+
+    /// CLAUDE-472 reproduction: an issue that accumulated an earlier, now
+    /// `closed` PR (e.g. #24, superseded) before a checkpoint push opened its
+    /// current PR (#75) must still resume #75 on re-queue, even though the
+    /// older row's `updated_at` is now the newest of the two (a human closed
+    /// #24 well after #75 was recorded, mirroring the real CLAUDE-469 timeline
+    /// this issue was filed from). Before the CLAUDE-472 fix to
+    /// `agent_pr_for_issue`'s ordering, this returned `None` and the caller
+    /// opened a second PR for an issue that still had one open.
+    #[tokio::test]
+    async fn resolve_pr_resume_resumes_the_open_pr_despite_a_newer_closed_row() {
+        let pool = mem_pool().await;
+        crate::ci_failure::store::record_agent_pr(
+            &pool,
+            "act",
+            "MK-16",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            24,
+            "fix/MK-16-old-attempt",
+            "open",
+            false,
+            "2026-10-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        crate::ci_failure::store::record_agent_pr(
+            &pool,
+            "act",
+            "MK-16",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            75,
+            "fix/MK-16",
+            "open",
+            true,
+            "2026-10-27T22:14:19Z",
+        )
+        .await
+        .unwrap();
+        // `set_agent_pr_state` takes the row id, not the PR number.
+        let old =
+            crate::ci_failure::store::agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 24)
+                .await
+                .unwrap()
+                .unwrap();
+        crate::ci_failure::store::set_agent_pr_state(
+            &pool,
+            old.id,
+            "closed",
+            "2026-10-27T23:00:00Z",
+        )
+        .await
+        .unwrap();
+        let runner = Arc::new(
+            StubRunner::new().ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "search",
+                    "--repo",
+                    "contoso/claude-run",
+                    "--state",
+                    "open",
+                    "--json",
+                ],
+                &serde_json::json!({
+                    "total_count": 1,
+                    "pull_requests": [open_pr(75, "fix/MK-16")],
+                })
+                .to_string(),
+            ),
+        );
+        let forge = CliBackend::new(runner);
+
+        let resume = resolve_pr_resume(&pool, &forge, &job(), PrStrategy::Branch)
+            .await
+            .unwrap()
+            .expect("the genuinely open PR #75 must still resolve to a resume target");
+        assert_eq!(resume.branch, "fix/MK-16");
+        assert_eq!(
+            resume.pr_url,
+            "https://dev.a8n.run/contoso/claude-run/pulls/75"
+        );
     }
 
     /// A recorded PR that no longer shows up in the open-PR list is
@@ -11262,6 +11379,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rec.state, "closed");
+        let notices = forge.take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("MK-16"), "{}", notices[0]);
+        assert!(notices[0].contains("no longer open"), "{}", notices[0]);
     }
 
     /// The AGit strategy has no server branch to continue on, so an
@@ -11296,6 +11417,114 @@ mod tests {
             runner.calls.lock().unwrap().is_empty(),
             "AGit must never probe the open-PR list"
         );
+        let notices = forge.take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("AGit"), "{}", notices[0]);
+    }
+
+    /// CLAUDE-472: an issue with no recorded PR at all (the common case: a
+    /// first-ever run) emits an operator-visible notice naming the issue key
+    /// instead of returning `None` silently.
+    #[tokio::test]
+    async fn resolve_pr_resume_notes_when_no_recorded_pr_exists() {
+        let pool = mem_pool().await;
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+
+        let resume = resolve_pr_resume(&pool, &forge, &job(), PrStrategy::Branch)
+            .await
+            .unwrap();
+        assert!(resume.is_none());
+        let notices = forge.take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("MK-16"), "{}", notices[0]);
+        assert!(notices[0].contains("no recorded PR"), "{}", notices[0]);
+    }
+
+    /// CLAUDE-472: a recorded row already confirmed `merged`/`closed`
+    /// (CLAUDE-275's own earlier confirmation) still emits a notice naming the
+    /// issue key and PR number on a later re-queue, instead of silently
+    /// falling through to a fresh pickup with no operator-visible trace.
+    #[tokio::test]
+    async fn resolve_pr_resume_notes_when_recorded_row_is_already_closed() {
+        let pool = mem_pool().await;
+        crate::ci_failure::store::record_agent_pr(
+            &pool,
+            "act",
+            "MK-16",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            7,
+            "fix/MK-16",
+            "merged",
+            false,
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let runner = Arc::new(StubRunner::new());
+        let forge = CliBackend::new(runner.clone());
+
+        let resume = resolve_pr_resume(&pool, &forge, &job(), PrStrategy::Branch)
+            .await
+            .unwrap();
+        assert!(resume.is_none());
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "an already-confirmed row needs no further open-PR lookup"
+        );
+        let notices = forge.take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("MK-16"), "{}", notices[0]);
+        assert!(notices[0].contains('7'), "{}", notices[0]);
+        assert!(notices[0].contains("merged"), "{}", notices[0]);
+    }
+
+    /// CLAUDE-472: a failed open-PR lookup (the forge call itself erroring)
+    /// still emits a notice naming the issue key, PR number, and error,
+    /// instead of silently falling through to a fresh pickup.
+    #[tokio::test]
+    async fn resolve_pr_resume_notes_when_open_pr_lookup_fails() {
+        let pool = mem_pool().await;
+        crate::ci_failure::store::record_agent_pr(
+            &pool,
+            "act",
+            "MK-16",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            7,
+            "fix/MK-16",
+            "open",
+            false,
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let runner = Arc::new(StubRunner::new().fail(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "search",
+                "--repo",
+                "contoso/claude-run",
+                "--state",
+                "open",
+                "--json",
+            ],
+            1,
+            "network unreachable",
+        ));
+        let forge = CliBackend::new(runner);
+
+        let resume = resolve_pr_resume(&pool, &forge, &job(), PrStrategy::Branch)
+            .await
+            .unwrap();
+        assert!(resume.is_none());
+        let notices = forge.take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("MK-16"), "{}", notices[0]);
+        assert!(notices[0].contains('7'), "{}", notices[0]);
     }
 
     /// A fresh (non-resumed) success records the PR in the store.
@@ -11362,6 +11591,78 @@ mod tests {
             rec.salvaged,
             "a Finalized::TimedOut outcome must be flagged salvaged"
         );
+    }
+
+    /// CLAUDE-472 ACC #4: a checkpoint push mid-run (CLAUDE-448) records its
+    /// PR as `open` directly from `run_checkpoint_watcher`, independently of
+    /// `finalize`. In `process_job`, every post-finalize `agent_pull_requests`
+    /// write (`record_new_pr`, `clear_salvaged_for_resume`) is gated on
+    /// `Ok(finalize_res)` (src/native/youtrack.rs around line 1596 and 1633);
+    /// an `Err` - the `TimedOut`-without-a-tracked-PR case, or any other
+    /// finalize error - skips that whole block, so a finalize error after a
+    /// checkpoint already opened a PR leaves that PR's row untouched: still
+    /// `open`, and still resumable on the next re-queue. This test stands in
+    /// for that scenario by recording the row exactly as the checkpoint
+    /// watcher would, then simulating "finalize errored, nothing else wrote
+    /// to the store" by performing no further write before resuming.
+    #[tokio::test]
+    async fn a_checkpoint_opened_pr_stays_open_after_a_simulated_finalize_error() {
+        let pool = mem_pool().await;
+        crate::ci_failure::store::record_agent_pr(
+            &pool,
+            "act",
+            "MK-16",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            75,
+            "fix/MK-16",
+            "open",
+            true,
+            "2026-10-27T22:14:19Z",
+        )
+        .await
+        .unwrap();
+
+        // No further store write happens here: this is the point where
+        // `process_job` would have matched `Err(finalize_res)` and skipped
+        // both `record_new_pr` and `clear_salvaged_for_resume` entirely.
+
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+            .await
+            .unwrap()
+            .expect("the checkpoint-opened row must still exist");
+        assert_eq!(
+            rec.state, "open",
+            "a finalize error must leave the checkpoint-opened PR's row open"
+        );
+
+        let runner = Arc::new(
+            StubRunner::new().ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "search",
+                    "--repo",
+                    "contoso/claude-run",
+                    "--state",
+                    "open",
+                    "--json",
+                ],
+                &serde_json::json!({
+                    "total_count": 1,
+                    "pull_requests": [open_pr(75, "fix/MK-16")],
+                })
+                .to_string(),
+            ),
+        );
+        let forge = CliBackend::new(runner);
+        let resume = resolve_pr_resume(&pool, &forge, &job(), PrStrategy::Branch)
+            .await
+            .unwrap()
+            .expect("a re-queue must resume the still-open checkpoint PR");
+        assert_eq!(resume.branch, "fix/MK-16");
     }
 
     /// A resumed run that finishes successfully clears a prior timeout's

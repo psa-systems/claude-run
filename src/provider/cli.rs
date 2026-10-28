@@ -5090,6 +5090,98 @@ mod tests {
     }
 
     #[test]
+    fn contract_adopts_existing_open_pr() {
+        // CLAUDE-469: the shared `crate::provider::contract` assertion,
+        // exercised here with a `CliBackend` double, mirrors the same
+        // assertion run against `GithubForge` in `github.rs`'s own test
+        // module.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n")
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
+        let runner = with_open_pr_search(
+            runner,
+            r#"[{"number":777,"head_ref":"feat/x","html_url":"https://dev.a8n.run/n/c/pulls/777"}]"#,
+        );
+        let b = backend(runner);
+        crate::provider::contract::assert_adopts_existing_open_pr(
+            &b,
+            wd.path(),
+            "dev.a8n.run",
+            777,
+        );
+    }
+
+    #[test]
+    fn contract_creates_when_no_open_pr() {
+        // CLAUDE-469: the other half of the shared contract, run against
+        // `CliBackend`.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "newsha\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "newsha", "oldsha\trefs/heads/feat/x\n");
+        let runner = with_open_pr_search(runner, "[]")
+            .ok(
+                "git",
+                &[
+                    "fetch",
+                    "origin",
+                    "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                ],
+                "",
+            )
+            .ok(
+                "git",
+                &["merge-base", "--is-ancestor", "oldsha", "newsha"],
+                "",
+            )
+            .ok(
+                "git",
+                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                "",
+            )
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "#CLAUDE-469\n",
+            );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path_str = scratch
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = runner.ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "feat: x",
+                "--body-file",
+                body_path_str.as_str(),
+                "--head",
+                "feat/x",
+                "--json",
+            ],
+            r#"{"number":91,"html_url":"https://dev.a8n.run/n/c/pulls/91"}"#,
+        );
+        let b = backend(runner);
+        crate::provider::contract::assert_creates_when_no_open_pr(&b, wd.path(), "dev.a8n.run", 91)
+            .unwrap();
+    }
+
+    #[test]
     fn create_pr_branch_fast_forwards_then_creates_when_local_ahead() {
         // The remote branch exists and the local tip fast-forwards
         // it (remote is an ancestor of local). The push is an ordinary (never
