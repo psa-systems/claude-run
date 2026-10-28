@@ -4689,21 +4689,29 @@ mod tests {
     /// The Claude login needing renewal mid-run trips the readiness gate
     /// AFTER `run_pre` has already written AI Agent=Working and cloned, but
     /// BEFORE claude is invoked: the issue is reverted to Queued with a
-    /// comment, not finalized as Failed. The trip is raced against `run_pre`'s
-    /// real `git clone` subprocess on a multi-thread runtime (`in_place` only
-    /// yields the worker to other tasks there, never on the `#[tokio::test]`
-    /// default), with a short sleep chosen to land reliably after the
-    /// pre-mutation checkpoint's own (near-instant, in-memory) check and
-    /// before the clone completes; a sufficiently loaded test host could in
-    /// principle still flip the race, which would fail this test rather than
-    /// silently pass it.
+    /// comment, not finalized as Failed. The trip is landed deterministically
+    /// from inside `run_pre` itself (the `set_field` call that writes AI
+    /// Agent=Working, before the clone) via `FakeTracker::on_set_field`,
+    /// rather than racing a fixed sleep on a background task against
+    /// `run_pre`'s real `git clone` subprocess: that race depended on the
+    /// clone outliving the sleep, which a fast or idle host does not
+    /// guarantee.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_job_login_trip_between_pre_and_claude_requeues_not_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = make_origin_repo(tmp.path());
         let claude = ClaudeInvoker::new(Some("/nonexistent/claude-stub-should-never-run.sh"));
 
+        let readiness = crate::readiness::ReadinessGate::new(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            None,
+        );
+
         let tracker = FakeTracker::new("Queued");
+        *tracker.on_set_field.lock().unwrap() = Some(Box::new({
+            let readiness = readiness.clone();
+            move || readiness.trip_login_required("OAuth session expired", "test")
+        }));
         let forge = CliBackend::new(Arc::new(StubRunner::new()));
 
         let mut j = job();
@@ -4734,17 +4742,8 @@ mod tests {
         let cancel = CancellationToken::new();
         let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
 
-        let readiness = crate::readiness::ReadinessGate::new(
-            tempfile::tempdir().unwrap().path().to_path_buf(),
-            None,
-        );
-        let gate = crate::pause::PauseGate::new(pool.clone()).with_readiness(readiness.clone());
+        let gate = crate::pause::PauseGate::new(pool.clone()).with_readiness(readiness);
         let pause = gate.for_action_run("yt");
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            readiness.trip_login_required("OAuth session expired", "test");
-        });
 
         let outcome = process_job(
             &loaded,
@@ -5312,6 +5311,10 @@ mod tests {
         /// `set_field` errors instead of writing when the target value
         /// equals this; `None` means every write succeeds.
         fail_set_to: Option<String>,
+        /// Invoked synchronously inside `set_field`, before the value is
+        /// written, so a test can trip state deterministically from inside
+        /// `run_pre` instead of racing a background sleep against it.
+        on_set_field: Mutex<Option<Box<dyn FnMut() + Send>>>,
     }
 
     impl FakeTracker {
@@ -5346,6 +5349,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((field.to_string(), value.to_string()));
+            if let Some(hook) = self.on_set_field.lock().unwrap().as_mut() {
+                hook();
+            }
             if self.fail_set_to.as_deref() == Some(value) {
                 return Err(Error::Other(anyhow::anyhow!("set-field failed")));
             }
