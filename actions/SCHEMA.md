@@ -553,7 +553,7 @@ The probe is skipped entirely when the action sets no forge `token_ref`, and ski
 
 ##### Open-PR lookup degradation (CLAUDE-206, CLAUDE-469)
 
-The CLAUDE-170 idempotency reconcile asks the forge for an already-open PR on the branch before creating one (Forgejo: `fj pr search`, an issue-category call; GitHub: `gh pr list` / the MCP `list_open_prs` equivalent). That lookup is an optimization: the actual create call (Forgejo: `fj pr create`, repository-category; GitHub: `gh pr create` or the MCP `create_pull_request` tool) is what delivers the work, and the two can fail independently, so a failed lookup must not discard a paid Claude run. CLAUDE-469 ports this same behavior to the GitHub backend; it is not Forgejo-only.
+The CLAUDE-170 idempotency reconcile asks the forge for an already-open PR on the branch before creating one (Forgejo: `fj pr search`, an issue-category call; GitHub: `gh pr list`, which also backs the lookup before the MCP create). That lookup is an optimization: the actual create call (Forgejo: `fj pr create`, repository-category; GitHub: `gh pr create` or the MCP `create_pull_request` tool) is what delivers the work, and the two can fail independently, so a failed lookup must not discard a paid Claude run. CLAUDE-469 ports this same behavior to the GitHub backend; it is not Forgejo-only.
 
 On every create-capable arm (remote branch absent, remote equal to local, remote fast-forwardable, and - since CLAUDE-382 - remote diverged after a clean merge), a failed lookup is treated as "unknown, assume none": the runner logs a `warn`, records a `warn` run event naming the CLI error and the repo (visible on the action page under the issue key), and proceeds to create. The adopt path is unchanged when the lookup succeeds.
 

@@ -3054,11 +3054,18 @@ mod tests {
                     let content = std::fs::read_to_string(&path).unwrap();
                     for line in content.lines() {
                         let line = line.trim();
-                        if !line.starts_with("impl ") {
+                        if !line.starts_with("impl") {
                             continue;
                         }
-                        if let Some(idx) = line.find(" Forge for ") {
-                            let rest = &line[idx + " Forge for ".len()..];
+                        // Matches `Forge for` after a space or a path separator, so a
+                        // qualified `impl crate::provider::Forge for X` is found too.
+                        if let Some(idx) = line.find("Forge for ").filter(|&i| {
+                            line[..i]
+                                .chars()
+                                .next_back()
+                                .is_some_and(|c| c == ' ' || c == ':')
+                        }) {
+                            let rest = &line[idx + "Forge for ".len()..];
                             let ty = rest
                                 .split(['<', '{'])
                                 .next()
@@ -3115,6 +3122,11 @@ mod tests {
              and no allowlist entry (CLAUDE-469): add a `contract::assert_adopts_existing_open_pr` \
              test and list it in CONTRACT_COVERED, or, if its `create_pr` never really opens a PR \
              (a test-only stub), list it in TEST_ONLY_ALLOWLIST"
+        );
+        // The scan must see a path-qualified impl, or a backend written that way escapes it.
+        assert!(
+            found.iter().any(|f| f == "StoreBackend"),
+            "the scan missed the path-qualified `impl crate::provider::Forge for StoreBackend`"
         );
         for ty in CONTRACT_COVERED {
             assert!(
