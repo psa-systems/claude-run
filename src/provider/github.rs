@@ -3244,6 +3244,78 @@ mod tests {
     }
 
     #[test]
+    fn contract_adopts_existing_open_pr() {
+        // CLAUDE-469: the shared `crate::provider::contract` assertion,
+        // exercised here with a `GithubForge` double, mirrors the same
+        // assertion run against `CliBackend` in `cli.rs`'s own test module.
+        let open_pr = r#"[{"number":777,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/777"}]"#;
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-777-initial_push__PR_opened_.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .ok("gh", &list_open_prs_args("octo/widget"), open_pr)
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "777",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
+                    "",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(false, Value::Null));
+        let forge = GithubForge::with_transport(
+            runner,
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        crate::provider::contract::assert_adopts_existing_open_pr(
+            &forge,
+            Path::new("/tmp/wd"),
+            "github.com",
+            777,
+        );
+    }
+
+    #[test]
+    fn contract_creates_when_no_open_pr() {
+        // CLAUDE-469: the other half of the shared contract, run against
+        // `GithubForge`.
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .ok("gh", &list_open_prs_args("octo/widget"), "[]")
+                .ok("gh", &["--version"], "gh version 2.0.0")
+                .ok(
+                    "gh",
+                    &create_args(),
+                    "https://github.com/octo/widget/pull/5\n",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(false, Value::Null));
+        let forge = GithubForge::with_transport(
+            runner,
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        crate::provider::contract::assert_creates_when_no_open_pr(
+            &forge,
+            Path::new("/tmp/wd"),
+            "github.com",
+            5,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn create_pr_creates_when_the_open_pr_lookup_fails() {
         // (d) The lookup is an optimization: a failure degrades to "assume
         // no open PR", still creates the PR, and records an operator-visible
