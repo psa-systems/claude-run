@@ -245,6 +245,10 @@ pub struct GithubForge {
     /// with the `fj` read retry of CLAUDE-366). Defaults to
     /// [`DEFAULT_READ_RETRY_WAITS`]; overridable so tests run with no delay.
     gh_read_retry_waits: [std::time::Duration; 3],
+    /// Operator-visible notices accumulated while serving the job (CLAUDE-469:
+    /// a degraded open-PR lookup), mirroring `CliBackend::notices`. Drained by
+    /// [`Forge::take_notices`] and persisted as run events.
+    notices: std::sync::Mutex<Vec<String>>,
 }
 
 impl GithubForge {
@@ -271,6 +275,7 @@ impl GithubForge {
             resolved_token: std::sync::Mutex::new(None),
             git_retry_waits: crate::provider::GIT_NETWORK_RETRY_WAITS,
             gh_read_retry_waits: DEFAULT_READ_RETRY_WAITS,
+            notices: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -574,6 +579,35 @@ impl GithubForge {
             .ok()
         });
 
+        // Adopt an already-open PR for `branch` instead of creating a second
+        // one (CLAUDE-469), mirroring `CliBackend::find_or_create_pr`. A
+        // FAILED lookup is not fatal: it degrades to "unknown, assume none"
+        // with a warn plus an operator-visible notice, and the create below
+        // still runs. The degraded path can race a PR that already exists, so
+        // a create rejected as already-existing retries the lookup exactly
+        // once further down.
+        let lookup_err = match self.find_open_pr(host, &repo, &branch) {
+            Ok(Some(mut pr)) => {
+                self.post_push_comment(
+                    host,
+                    &repo,
+                    &issue_key,
+                    &mut pr,
+                    event,
+                    draft,
+                    old_sha.as_deref(),
+                    new_sha.as_deref(),
+                    &subjects,
+                );
+                return Ok(pr);
+            }
+            Ok(None) => None,
+            Err(e) => {
+                self.note_degraded_lookup(host, &repo, &branch, &e);
+                Some(e)
+            }
+        };
+
         // Walk [Mcp, Gh]: prefer the remote MCP, fall back to `gh`.
         let mut tried: Vec<String> = Vec::new();
         for kind in &self.priority {
@@ -587,9 +621,10 @@ impl GithubForge {
                         // possible-permission cause; the push succeeding
                         // proves nothing about the API identity's access.
                         Ok(()) => {
-                            return self
+                            return match self
                                 .open_via_mcp(&repo, &branch, &base, &title, &body, draft)
-                                .map(|mut pr| {
+                            {
+                                Ok(mut pr) => {
                                     // GitHub PRs are always branch-backed;
                                     // this is the branch just pushed above.
                                     pr.head_branch = Some(branch.clone());
@@ -604,18 +639,31 @@ impl GithubForge {
                                         new_sha.as_deref(),
                                         &subjects,
                                     );
-                                    pr
-                                })
-                                .map_err(|e| pr_create_error(&repo, host, &branch, e));
+                                    Ok(pr)
+                                }
+                                Err(e) => self.resolve_create_failure(
+                                    host,
+                                    &repo,
+                                    &branch,
+                                    &issue_key,
+                                    e,
+                                    lookup_err,
+                                    event,
+                                    draft,
+                                    old_sha.as_deref(),
+                                    new_sha.as_deref(),
+                                    &subjects,
+                                ),
+                            };
                         }
                         Err(e) => tried.push(format!("mcp: {e}")),
                     }
                 }
                 BackendKind::Gh => match self.runner.run(&self.gh, &["--version"]) {
                     Ok(out) if out.ok => {
-                        return self
-                            .open_via_gh(workdir, &branch, &base, &title, &body, draft)
-                            .map(|mut pr| {
+                        return match self.open_via_gh(workdir, &branch, &base, &title, &body, draft)
+                        {
+                            Ok(mut pr) => {
                                 pr.head_branch = Some(branch.clone());
                                 self.post_push_comment(
                                     host,
@@ -628,9 +676,22 @@ impl GithubForge {
                                     new_sha.as_deref(),
                                     &subjects,
                                 );
-                                pr
-                            })
-                            .map_err(|e| pr_create_error(&repo, host, &branch, e))
+                                Ok(pr)
+                            }
+                            Err(e) => self.resolve_create_failure(
+                                host,
+                                &repo,
+                                &branch,
+                                &issue_key,
+                                e,
+                                lookup_err,
+                                event,
+                                draft,
+                                old_sha.as_deref(),
+                                new_sha.as_deref(),
+                                &subjects,
+                            ),
+                        };
                     }
                     Ok(out) => tried.push(format!("gh: --version exited {}", out.exit_code)),
                     Err(e) => tried.push(format!("gh: {e}")),
@@ -639,6 +700,90 @@ impl GithubForge {
             }
         }
         Err(Error::NoBackend(tried.join("; ")))
+    }
+
+    /// An already-open PR whose head branch is `branch`, matched by
+    /// `head_ref` against [`Forge::list_open_prs`] (`gh pr list --json ...`).
+    /// Returns the first match (a repo has at most one open PR per head
+    /// branch) as an adoptable [`PullRequest`], else `None`. Mirrors
+    /// `CliBackend::find_open_pr`.
+    fn find_open_pr(&self, host: &str, repo: &str, branch: &str) -> Result<Option<PullRequest>> {
+        let prs = self.list_open_prs(host, repo)?;
+        Ok(prs
+            .into_iter()
+            .find(|p| p.head_ref == branch)
+            .map(|p| PullRequest {
+                number: Some(p.number),
+                url: p.html_url,
+                head_branch: Some(branch.to_string()),
+                push_comment_failure: None,
+            }))
+    }
+
+    /// Record a lookup failure that was degraded to a create, in the daemon
+    /// journal and as a notice the run surfaces on the action page. Mirrors
+    /// `CliBackend::note_degraded_lookup`.
+    fn note_degraded_lookup(&self, host: &str, repo: &str, branch: &str, e: &Error) {
+        tracing::warn!(
+            repo = %repo,
+            branch = %branch,
+            error = %e,
+            "open-PR lookup failed; assuming no open PR and creating one"
+        );
+        self.notices.lock().unwrap().push(format!(
+            "open-PR lookup for `{repo}` on {host} failed ({e}); assumed no open PR exists for \
+             `{branch}` and created one."
+        ));
+    }
+
+    /// Resolve a PR-create failure against the open-PR lookup (CLAUDE-469),
+    /// mirroring `CliBackend::find_or_create_pr`'s already-exists retry: a
+    /// create rejected because a PR for this head already exists retries the
+    /// lookup exactly once and adopts the result, posting the push comment
+    /// now that the PR number is known. If the retry also cannot produce a
+    /// PR, the returned error names both the lookup cause and the create
+    /// cause. A create that failed for any other reason is reported with the
+    /// first lookup's cause folded in when that lookup also failed.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_create_failure(
+        &self,
+        host: &str,
+        repo: &str,
+        branch: &str,
+        issue_key: &str,
+        create_err: Error,
+        lookup_err: Option<Error>,
+        event: crate::push_comment::PushEvent,
+        draft: bool,
+        old_sha: Option<&str>,
+        new_sha: Option<&str>,
+        subjects: &Option<String>,
+    ) -> Result<PullRequest> {
+        if is_pr_already_exists(&create_err) {
+            let retry = self.find_open_pr(host, repo, branch);
+            let retry_err = match retry {
+                Ok(Some(mut pr)) => {
+                    self.post_push_comment(
+                        host, repo, issue_key, &mut pr, event, draft, old_sha, new_sha, subjects,
+                    );
+                    return Ok(pr);
+                }
+                Ok(None) => None,
+                Err(e) => Some(e),
+            };
+            return Err(Error::Other(anyhow::anyhow!(
+                "creating the pull request for `{repo}` on {host} (head branch `{branch}`) \
+                 failed because a pull request for that head already exists ({create_err}), but \
+                 the open-PR lookup cannot return it, so there is nothing to adopt: the first \
+                 lookup {}, the retry {}. The branch is already pushed; fix the lookup and \
+                 re-run.",
+                lookup_outcome(lookup_err.as_ref()),
+                lookup_outcome(retry_err.as_ref()),
+            )));
+        }
+        Err(pr_create_error_with_lookup(
+            repo, host, branch, create_err, lookup_err,
+        ))
     }
 
     /// Post the CLAUDE-447 push comment for `create_pr_impl`'s push, folding
@@ -706,6 +851,16 @@ impl Forge for GithubForge {
         body: Option<&str>,
     ) -> Result<PullRequest> {
         self.create_pr_impl(workdir, host, draft, body)
+    }
+
+    /// Drain the notices accumulated by a degraded open-PR lookup
+    /// (CLAUDE-469). Mirrors `CliBackend::take_notices`.
+    fn take_notices(&self) -> Vec<String> {
+        std::mem::take(&mut *self.notices.lock().unwrap())
+    }
+
+    fn note(&self, message: String) {
+        self.notices.lock().unwrap().push(message);
     }
 
     /// `gh pr ready <number> --repo <repo>` clears the draft flag a
@@ -1281,6 +1436,53 @@ fn pr_create_error(repo: &str, host: &str, branch: &str, e: Error) -> Error {
          The GitHub token may lack access to `{repo}`: a repo the token cannot see answers 404 \
          `not found` here even though the push succeeded."
     ))
+}
+
+/// Does this PR-create failure (either `gh pr create`'s local validation or
+/// the MCP `create_pull_request` tool surfacing GitHub's REST error) mean
+/// "an open PR for this head already exists"? `gh` validates the head/base
+/// pair itself before calling the API and errors with `a pull request for
+/// branch "<head>" into branch "<base>" already exists: <url>` (cli/cli,
+/// `pkg/cmd/pr/create/create.go`); the REST `POST .../pulls` call the MCP
+/// tool wraps answers a 422 Validation Failed with `A pull request already
+/// exists for <owner>:<head>.` (GitHub REST API error reference). Both
+/// contain "already exists", matched the same way `cli.rs`'s
+/// `is_pr_already_exists` matches Forgejo's 409 text, rather than on a
+/// status code neither `gh` nor the MCP tool surfaces here.
+fn is_pr_already_exists(e: &Error) -> bool {
+    e.to_string().to_lowercase().contains("already exists")
+}
+
+/// How a lookup attempt ended, for an error message that has to name both
+/// causes. `None` is "the lookup ran and found no open PR". Mirrors
+/// `cli.rs`'s `lookup_outcome`.
+fn lookup_outcome(e: Option<&Error>) -> String {
+    match e {
+        Some(e) => format!("failed ({e})"),
+        None => "succeeded and found no open PR for the branch".to_string(),
+    }
+}
+
+/// A `pr create` failure where the open-PR lookup had ALSO failed.
+/// [`pr_create_error`] alone reads as "PR creation failed" when the run
+/// really could not check whether a PR already existed, so the lookup cause
+/// is named alongside it. Mirrors `cli.rs`'s `pr_create_error_with_lookup`.
+fn pr_create_error_with_lookup(
+    repo: &str,
+    host: &str,
+    branch: &str,
+    create_err: Error,
+    lookup_err: Option<Error>,
+) -> Error {
+    let base = pr_create_error(repo, host, branch, create_err);
+    match lookup_err {
+        None => base,
+        Some(l) => Error::Other(anyhow::anyhow!(
+            "{base} The open-PR lookup for `{repo}` had also {}, so the runner could not tell \
+             whether a PR already existed before creating one; both calls failed.",
+            lookup_outcome(Some(&l))
+        )),
+    }
 }
 
 fn unsupported(op: &str) -> Error {
@@ -1997,6 +2199,10 @@ mod tests {
     struct StubTransport {
         init_ok: bool,
         result: Value,
+        /// When set, `call_tool` errors with this message instead of
+        /// returning `result` (CLAUDE-469: simulates GitHub's REST 422
+        /// "already exists" on `create_pull_request`).
+        fail_call: Option<String>,
         pub calls: Mutex<Vec<String>>,
     }
 
@@ -2005,6 +2211,17 @@ mod tests {
             Self {
                 init_ok,
                 result,
+                fail_call: None,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A transport whose `call_tool` always fails with `message`.
+        fn failing_call(init_ok: bool, message: &str) -> Self {
+            Self {
+                init_ok,
+                result: Value::Null,
+                fail_call: Some(message.to_string()),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -2028,6 +2245,9 @@ mod tests {
             _arguments: Value,
         ) -> Result<Value> {
             self.calls.lock().unwrap().push(format!("call:{name}"));
+            if let Some(message) = &self.fail_call {
+                return Err(Error::Other(anyhow::anyhow!("{message}")));
+            }
             Ok(self.result.clone())
         }
     }
@@ -2426,6 +2646,7 @@ mod tests {
                     &["auth", "token", "--hostname", "github.com"],
                     "ghp_from_login\n",
                 )
+                .ok("gh", &list_open_prs_args("octo/widget"), "[]")
                 .ok(
                     "gh",
                     &[
@@ -2477,11 +2698,13 @@ mod tests {
         for call in calls.iter() {
             assert!(!call.contains("ghp_from_login"), "{call}");
         }
-        // PR creation itself never consulted `gh`; the only other `gh` call
-        // is the CLAUDE-447 push comment posted after the push succeeded.
+        // PR creation itself never consulted `gh`; the only other `gh` calls
+        // are the CLAUDE-469 open-PR lookup (empty, so no adoption) and the
+        // CLAUDE-447 push comment posted after the push succeeded.
         assert!(
             !calls.iter().any(|c| c.starts_with("gh ")
                 && c != "gh auth token --hostname github.com"
+                && !c.starts_with("gh pr list")
                 && !c.starts_with("gh pr comment 11")),
             "{calls:?}"
         );
@@ -2855,6 +3078,500 @@ mod tests {
                     .iter()
                     .any(|(k, v)| k == "CLAUDE_RUN_GIT_PASSWORD" && v == "ghp_secret")),
             "the configured token must reach the push via env, not argv: {envs:?}"
+        );
+    }
+
+    /// `gh pr create`'s args for the standard `with_git` fixture (branch
+    /// `feat/x`, base `main`, title `feat: x`, body `body text`).
+    fn create_args() -> Vec<&'static str> {
+        vec![
+            "pr",
+            "create",
+            "--head",
+            "feat/x",
+            "--base",
+            "main",
+            "--title",
+            "feat: x",
+            "--body",
+            "body text",
+        ]
+    }
+
+    #[test]
+    fn create_pr_adopts_an_existing_open_pr_on_the_gh_path_with_no_create_call() {
+        // (a) An open PR already exists for `feat/x`: adopted with no `gh pr
+        // create` call, even though the `gh` backend is the only one
+        // configured (proves adoption runs before the backend walk).
+        let open_pr = r#"[{"number":42,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#;
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-42-initial_push__PR_opened_.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .ok("gh", &list_open_prs_args("octo/widget"), open_pr)
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "42",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
+                    "",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(false, Value::Null));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_priority(vec![BackendKind::Gh]);
+        let pr = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
+        assert_eq!(pr.number, Some(42));
+        assert_eq!(pr.url, "https://github.com/octo/widget/pull/42");
+        assert_eq!(pr.head_branch, Some("feat/x".to_string()));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("gh pr create")),
+            "adoption must issue no create call: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("gh pr comment 42")),
+            "the push comment must still be posted: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_adopts_an_existing_open_pr_on_the_mcp_path_with_no_create_call() {
+        // (b) Same as (a), but with the MCP backend preferred: adoption runs
+        // before the backend walk regardless of which backend would have
+        // been used, so no `create_pull_request` call is issued either.
+        let open_pr = r#"[{"number":42,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#;
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-42-initial_push__PR_opened_.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .ok("gh", &list_open_prs_args("octo/widget"), open_pr)
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "42",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
+                    "",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(
+            true,
+            json!({"structuredContent": {"number": 999, "html_url": "https://github.com/octo/widget/pull/999"}}),
+        ));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_priority(vec![BackendKind::Mcp]);
+        let pr = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
+        assert_eq!(pr.number, Some(42), "the EXISTING pr is adopted, not 999");
+        let tcalls = transport.calls.lock().unwrap();
+        assert!(
+            !tcalls.iter().any(|c| c == "call:create_pull_request"),
+            "adoption must issue no create call: {tcalls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_creates_when_no_open_pr_exists() {
+        // (c) No existing open PR for `feat/x`: the create path runs
+        // unchanged, exactly as it did before CLAUDE-469.
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .ok("gh", &list_open_prs_args("octo/widget"), "[]")
+                .ok("gh", &["--version"], "gh version 2.0.0")
+                .ok(
+                    "gh",
+                    &create_args(),
+                    "https://github.com/octo/widget/pull/5\n",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(false, Value::Null));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        let pr = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
+        assert_eq!(pr.number, Some(5));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with("gh pr create")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn contract_adopts_existing_open_pr() {
+        // CLAUDE-469: the shared `crate::provider::contract` assertion,
+        // exercised here with a `GithubForge` double, mirrors the same
+        // assertion run against `CliBackend` in `cli.rs`'s own test module.
+        let open_pr = r#"[{"number":777,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/777"}]"#;
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-777-initial_push__PR_opened_.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .ok("gh", &list_open_prs_args("octo/widget"), open_pr)
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "777",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
+                    "",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(false, Value::Null));
+        let forge = GithubForge::with_transport(
+            runner,
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        crate::provider::contract::assert_adopts_existing_open_pr(
+            &forge,
+            Path::new("/tmp/wd"),
+            "github.com",
+            777,
+        );
+    }
+
+    #[test]
+    fn contract_creates_when_no_open_pr() {
+        // CLAUDE-469: the other half of the shared contract, run against
+        // `GithubForge`.
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .ok("gh", &list_open_prs_args("octo/widget"), "[]")
+                .ok("gh", &["--version"], "gh version 2.0.0")
+                .ok(
+                    "gh",
+                    &create_args(),
+                    "https://github.com/octo/widget/pull/5\n",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(false, Value::Null));
+        let forge = GithubForge::with_transport(
+            runner,
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        crate::provider::contract::assert_creates_when_no_open_pr(
+            &forge,
+            Path::new("/tmp/wd"),
+            "github.com",
+            5,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn create_pr_creates_when_the_open_pr_lookup_fails() {
+        // (d) The lookup is an optimization: a failure degrades to "assume
+        // no open PR", still creates the PR, and records an operator-visible
+        // notice naming the cause.
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .fail(
+                    "gh",
+                    &list_open_prs_args("octo/widget"),
+                    1,
+                    "HTTP 403: Resource not accessible by integration",
+                )
+                .ok("gh", &["--version"], "gh version 2.0.0")
+                .ok(
+                    "gh",
+                    &create_args(),
+                    "https://github.com/octo/widget/pull/5\n",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(false, Value::Null));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+        let pr = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
+        assert_eq!(pr.number, Some(5), "a failed lookup must not abort");
+        let notices = forge.take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("octo/widget"), "{}", notices[0]);
+        assert!(
+            notices[0].contains("Resource not accessible"),
+            "{}",
+            notices[0]
+        );
+        assert!(forge.take_notices().is_empty(), "drained");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with("gh pr create")),
+            "must fall through to create: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_retries_the_lookup_once_when_gh_says_a_pr_already_exists() {
+        // (e) The race the degraded path exposes: the first lookup fails, the
+        // create runs, and `gh` rejects it because a PR for this head
+        // already exists. Exactly one lookup retry follows, and it now
+        // succeeds, so the existing PR is adopted instead of the run
+        // failing.
+        let open_pr = r#"[{"number":42,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#;
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-42-initial_push__PR_opened_.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .fail_once(
+                    "gh",
+                    &list_open_prs_args("octo/widget"),
+                    1,
+                    "HTTP 403: Resource not accessible by integration",
+                )
+                .ok("gh", &list_open_prs_args("octo/widget"), open_pr)
+                .ok("gh", &["--version"], "gh version 2.0.0")
+                .fail(
+                    "gh",
+                    &create_args(),
+                    1,
+                    "GraphQL: a pull request for branch \"feat/x\" into branch \"main\" already \
+                     exists: octo/widget#42",
+                )
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "42",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
+                    "",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(false, Value::Null));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+        let pr = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
+        assert_eq!(pr.number, Some(42), "the retry adopts the existing PR");
+        let calls = runner.calls.lock().unwrap();
+        let searches = calls.iter().filter(|c| c.starts_with("gh pr list")).count();
+        assert_eq!(searches, 2, "exactly one retry: {calls:?}");
+    }
+
+    #[test]
+    fn create_pr_names_both_causes_when_the_lookup_and_the_already_exists_retry_both_fail() {
+        // (f) The lookup fails both times: once before the create, once on
+        // the already-exists retry. The error names BOTH causes, so "could
+        // not check whether a PR existed" is never reported as a bare "PR
+        // creation failed".
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .fail(
+                    "gh",
+                    &list_open_prs_args("octo/widget"),
+                    1,
+                    "HTTP 403: Resource not accessible by integration",
+                )
+                .ok("gh", &["--version"], "gh version 2.0.0")
+                .fail(
+                    "gh",
+                    &create_args(),
+                    1,
+                    "GraphQL: a pull request for branch \"feat/x\" into branch \"main\" already \
+                     exists: octo/widget#42",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(false, Value::Null));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+        let err = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("already exists"),
+            "names the create cause: {err}"
+        );
+        assert!(
+            err.contains("Resource not accessible"),
+            "names the lookup cause: {err}"
+        );
+    }
+
+    #[test]
+    fn create_pr_retries_the_lookup_once_when_the_mcp_tool_says_a_pr_already_exists() {
+        // (e)/(mcp variant): the MCP `create_pull_request` tool surfaces
+        // GitHub's REST 422 "already exists" text; the same retry-and-adopt
+        // path applies as the `gh` variant above.
+        let open_pr = r#"[{"number":42,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#;
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-42-initial_push__PR_opened_.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .fail_once(
+                    "gh",
+                    &list_open_prs_args("octo/widget"),
+                    1,
+                    "HTTP 403: Resource not accessible by integration",
+                )
+                .ok("gh", &list_open_prs_args("octo/widget"), open_pr)
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "42",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
+                    "",
+                ),
+        );
+        let transport = Arc::new(StubTransport::failing_call(
+            true,
+            "A pull request already exists for octo:feat/x.",
+        ));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+        let pr = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
+        assert_eq!(pr.number, Some(42), "the retry adopts the existing PR");
+    }
+
+    #[test]
+    fn create_pr_does_not_adopt_an_open_pr_for_a_different_head_branch() {
+        // (g) An open PR exists, but for a different head branch: not
+        // adopted, and the create path runs as if no PR had been found.
+        let other_branch_pr = r#"[{"number":9,"title":"other","headRefOid":"zzz","headRefName":"some/other-branch","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/9"}]"#;
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .ok("gh", &list_open_prs_args("octo/widget"), other_branch_pr)
+                .ok("gh", &["--version"], "gh version 2.0.0")
+                .ok(
+                    "gh",
+                    &create_args(),
+                    "https://github.com/octo/widget/pull/5\n",
+                ),
+        );
+        let transport = Arc::new(StubTransport::new(false, Value::Null));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        let pr = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
+        assert_eq!(
+            pr.number,
+            Some(5),
+            "PR #9 for a different branch is not adopted"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with("gh pr create")),
+            "{calls:?}"
         );
     }
 
