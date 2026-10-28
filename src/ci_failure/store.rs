@@ -491,9 +491,18 @@ pub async fn agent_pr(
     row.as_ref().map(agent_pr_from_row).transpose()
 }
 
-/// The most recently updated agent PR filed against `issue_key`, so a
-/// re-queued issue continues the same PR's branch rather than opening a new
-/// one.
+/// The agent PR filed against `issue_key` that a re-queue should continue:
+/// the `open` row when one exists (an issue carries at most one open agent PR
+/// at a time), falling back to the most recently updated row otherwise. Over
+/// an issue's lifetime more than one row can accumulate (an earlier PR closed
+/// or superseded, then a later one opened); ordering by `updated_at` alone
+/// picks whichever row was touched most recently regardless of `state`; a
+/// `closed`/`merged` row from an older PR can easily have a newer
+/// `updated_at` than a currently-`open` row that has not been touched since
+/// it was recorded (CLAUDE-472), so `resolve_pr_resume` would read that stale
+/// row, see `state != "open"`, and fall back to a fresh pickup - opening a
+/// second PR for an issue that still has one open. Preferring any `open` row
+/// first closes that gap.
 pub async fn agent_pr_for_issue(
     pool: &DbPool,
     issue_key: &str,
@@ -501,7 +510,8 @@ pub async fn agent_pr_for_issue(
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
         "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at \
-         FROM agent_pull_requests WHERE issue_key = ? ORDER BY updated_at DESC LIMIT 1",
+         FROM agent_pull_requests WHERE issue_key = ? \
+         ORDER BY CASE WHEN state = 'open' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1",
     ).into_owned()))
     .bind(issue_key)
     .fetch_optional(pool)
@@ -949,6 +959,63 @@ mod tests {
         assert_eq!(after.fix_attempts, 1);
         assert_eq!(after.state, "merged");
         assert_eq!(after.updated_at, "2026-09-03T00:00:00Z");
+    }
+
+    /// CLAUDE-472: an issue that has accumulated more than one
+    /// `agent_pull_requests` row over its lifetime (an earlier PR closed or
+    /// superseded, then a later one opened) must still resume its genuinely
+    /// `open` PR even when an older, now-`closed` row was touched more
+    /// recently (`updated_at`) than the open one - e.g. a human closing a
+    /// stale PR well after a fresh checkpoint PR was recorded. Before this
+    /// fix, `agent_pr_for_issue`'s plain `ORDER BY updated_at DESC` picked the
+    /// newer-but-closed row, so `resolve_pr_resume` fell back to a fresh
+    /// pickup and opened a second PR for an issue that still had one open.
+    #[tokio::test]
+    async fn agent_pr_for_issue_prefers_the_open_row_over_a_newer_closed_one() {
+        let pool = test_pool().await;
+        let old_id = record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-469",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            24,
+            "fix/claude-469-github-adopt-open-pr",
+            "open",
+            false,
+            "2026-10-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let open_id = record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-469",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            75,
+            "fix/claude-469-github-adopt-open-pr",
+            "open",
+            true,
+            "2026-10-27T22:14:19Z",
+        )
+        .await
+        .unwrap();
+        // The older PR #24 is closed well after #75 was recorded, so its
+        // `updated_at` is now the newest of the two.
+        set_agent_pr_state(&pool, old_id, "closed", "2026-10-27T23:00:00Z")
+            .await
+            .unwrap();
+
+        let by_issue = agent_pr_for_issue(&pool, "CLAUDE-469")
+            .await
+            .unwrap()
+            .expect("an open row exists for this issue");
+        assert_eq!(
+            by_issue.id, open_id,
+            "the open PR #75 row must win over the newer-but-closed PR #24 row"
+        );
+        assert_eq!(by_issue.state, "open");
     }
 
     #[tokio::test]
