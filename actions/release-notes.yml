@@ -1,0 +1,101 @@
+---
+# yaml-embedded-languages: nushell
+# https://github.com/harrydowning/vscode-yaml-embedded-languages
+# https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
+
+# Weekly release notes drafted into Mirzam (CLAUDE-474, MIRZAM-294).
+#
+# Every Monday the releases published in the last 7 days in the repos below become ONE draft edition on a Mirzam list,
+# written for customers. The action only ever creates a draft (`POST /api/v1/editions`): it never sends or schedules.
+# Switch on "Editions need approval" for that list in Mirzam, and Mirzam itself refuses any send or schedule, from the
+# pages or the API, until an administrator approves.
+#
+# Environment (the runner's, inherited by every snippet; scripted actions get no injected secrets):
+#   MIRZAM_URL        Mirzam site base URL, e.g. https://news.example.com
+#   MIRZAM_API_TOKEN  a Mirzam API token with read and write access (Mirzam admin: API)
+#   MIRZAM_LIST       optional, the list slug; default `product-updates`
+# The Forgejo releases are read with the token fj already holds for dev.a8n.run (its key store), so a private repo
+# needs no extra secret.
+#
+# One job per ISO week (`dedup_key: week`) and `max_attempts_per_key: 1`: a second trigger in the same week, manual or
+# not, does nothing. To redraft a week, `claude-run action reset-attempts release-notes <week>` and trigger again.
+# A week without releases yields no job; a week with nothing customer-facing yields no draft.
+
+name: release-notes
+kind: scripted
+input:
+  command: |
+    let host = "dev.a8n.run"
+    let repos = ["psa-systems/bunyip" "psa-systems/mirzam"]
+    let data_home = ($env.XDG_DATA_HOME? | default ($nu.home-dir | path join ".local" "share"))
+    let token = (open ($data_home | path join "forgejo-cli" "keys.json") | get hosts | get $host | get token)
+    let since = ((date now) - 7day)
+    let releases = ($repos | each {|repo|
+      http get --headers {Authorization: $"token ($token)"} $"https://($host)/api/v1/repos/($repo)/releases?limit=20"
+      | where {|r| (not $r.draft) and (not $r.prerelease) and (($r.published_at | into datetime) > $since) }
+      | each {|r| {repo: $repo, tag: $r.tag_name, name: $r.name, published_at: $r.published_at, body: $r.body} }
+    } | flatten)
+    if ($releases | is-empty) {
+      [] | to json
+    } else {
+      [{week: (date now | format date "%G-W%V"), releases: $releases}] | to json
+    }
+dedup_key: week
+pre:
+  - |
+    let path = ($workdir | path join "releases.json")
+    if ($path | path exists) { rm $path }
+    $job.releases | to json | save $path
+prompt: |
+  $"You draft the weekly product-updates newsletter of PSA Systems for week ($job.week).
+
+  Read `releases.json` in the current directory: the releases published this week. `psa-systems/bunyip` is the PSA
+  Systems account: sign-in, profile, billing and the app launcher at psa.systems. `psa-systems/mirzam` is the
+  newsletter system. Each release body is a changelog of pull requests.
+
+  Write `edition.json` in the current directory, and no other file, with this shape:
+  {\"subject\": string, \"preview_text\": string, \"body_md\": string}
+
+  - Readers are customers, not developers: say what changed for them and why it helps, in plain words.
+  - Leave out what a customer never sees: CI, tests, refactors, dependency bumps, docs, release commits.
+  - No ticket ids, pull request numbers, commit hashes, or links to dev.a8n.run, which is private.
+  - `body_md` is Markdown: a one-line intro, then a short section per product with bullets. Under 300 words.
+  - `subject` under 70 characters; `preview_text` one sentence, under 200 characters.
+
+  If nothing in these releases is customer-facing, write instead:
+  {\"skip\": true, \"reason\": string}"
+claude:
+  allowed_tools: "Read,Write"
+  model: sonnet
+  effort: medium
+post:
+  - |
+    if not $claude_result.ok {
+      error make {msg: $"no draft: claude failed: ($claude_result.error? | default $claude_result.summary)"}
+    }
+    let path = ($workdir | path join "edition.json")
+    if not ($path | path exists) {
+      error make {msg: "no draft: claude wrote no edition.json"}
+    }
+    let edition = (open $path)
+    if ($edition.skip? | default false) {
+      print $"no draft: nothing customer-facing: ($edition.reason? | default '')"
+    } else {
+      let body = ({list: ($env.MIRZAM_LIST? | default "product-updates"), subject: $edition.subject, body_md: $edition.body_md}
+        | merge (if ($edition.preview_text? | default "" | is-empty) { {} } else { {preview_text: $edition.preview_text} }))
+      let url = $"($env.MIRZAM_URL | str trim --right --char '/')/api/v1/editions"
+      let answer = (http post --full --allow-errors --content-type application/json
+        --headers {Authorization: $"Bearer ($env.MIRZAM_API_TOKEN)"} $url $body)
+      if $answer.status != 201 {
+        error make {msg: $"no draft: Mirzam answered ($answer.status): ($answer.body | to json --raw)"}
+      }
+      print $"draft edition ($answer.body.id? | default '?') created on ($body.list): ($body.subject)"
+    }
+limits:
+  max_attempts_per_key: 1
+  max_runs_per_day: 2
+  claude_timeout_seconds: 600
+  run_budget_usd: 1.00
+schedule:
+  kind: cron
+  spec: "0 9 * * MON"

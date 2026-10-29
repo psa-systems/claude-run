@@ -1774,6 +1774,30 @@ native:
         assert_eq!(reloaded.action.kind, action.kind);
     }
 
+    /// The shipped `actions/release-notes.yml` (CLAUDE-474): a scripted weekly
+    /// action, one job per ISO week that never repeats, and a claude block that
+    /// can only read the releases and write the draft.
+    #[test]
+    fn shipped_release_notes_action_is_scripted_and_weekly() {
+        const SHIPPED: &str = include_str!("../actions/release-notes.yml");
+        let loaded =
+            validate_str(SHIPPED, "actions/release-notes.yml").expect("shipped action valid");
+        let action = loaded.action;
+        assert_eq!(action.name, "release-notes");
+        assert_eq!(action.kind, ActionKind::Scripted);
+        assert!(action.native.is_none());
+        assert!(action.input.is_some());
+        assert!(action.prompt.is_some());
+        assert_eq!(action.pre.len(), 1);
+        assert_eq!(action.post.len(), 1);
+        assert_eq!(action.dedup_key.as_deref(), Some("week"));
+        assert_eq!(action.limits.max_attempts_per_key, Some(1));
+        assert_eq!(action.claude.allowed_tools.as_deref(), Some("Read,Write"));
+        let schedule = action.schedule.as_ref().expect("scheduled");
+        assert_eq!(schedule.kind, ScheduleKind::Cron);
+        crate::scheduler::parse_schedule(schedule).expect("cron spec parses");
+    }
+
     /// Query partition: the reporting action and the worker action
     /// must never gather the same issue. The worker pins the single `AI Agent`
     /// value `Queued`; the reporter ships with no query at all, and its
