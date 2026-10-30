@@ -30,7 +30,14 @@ kind: scripted
 input:
   command: |
     let host = "dev.a8n.run"
-    let repos = ["psa-systems/bunyip" "psa-systems/mirzam"]
+    # A product customers see as one thing may span repos: Mokosh is a UI and a server.
+    let repos = [
+      {repo: "psa-systems/bunyip", product: "PSA Systems account"}
+      {repo: "psa-systems/mokosh-apps", product: "Mokosh"}
+      {repo: "psa-systems/mokosh-server", product: "Mokosh"}
+      {repo: "psa-systems/lets-chat", product: "Let's Chat"}
+      {repo: "psa-systems/mirzam", product: "Newsletter"}
+    ]
     let data_home = ($env.XDG_DATA_HOME? | default ($nu.home-dir | path join ".local" "share"))
     let token = (open ($data_home | path join "forgejo-cli" "keys.json") | get hosts | get $host | get token)
     let now = (date now)
@@ -41,10 +48,10 @@ input:
       let last = (open --raw $marker | str trim | into datetime)
       if $last < $week_ago { $last } else { $week_ago }
     } else { $week_ago })
-    let releases = ($repos | each {|repo|
-      http get --headers {Authorization: $"token ($token)"} $"https://($host)/api/v1/repos/($repo)/releases?limit=50"
+    let releases = ($repos | each {|source|
+      http get --headers {Authorization: $"token ($token)"} $"https://($host)/api/v1/repos/($source.repo)/releases?limit=50"
       | where {|r| (not $r.draft) and (not $r.prerelease) and (($r.published_at | into datetime) > $since) }
-      | each {|r| {repo: $repo, tag: $r.tag_name, name: $r.name, published_at: $r.published_at, body: $r.body} }
+      | each {|r| {product: $source.product, repo: $source.repo, tag: $r.tag_name, name: $r.name, published_at: $r.published_at, body: $r.body} }
     } | flatten)
     if ($releases | is-empty) {
       [] | to json
@@ -60,10 +67,15 @@ pre:
 prompt: |
   $"You draft the product-updates newsletter of PSA Systems for week ($job.week).
 
-  Read `releases.json` in the current directory: the releases published since the last newsletter. `psa-systems/bunyip`
-  is the PSA Systems account: sign-in, profile, billing and the app launcher at psa.systems. `psa-systems/mirzam` is the
-  newsletter system itself, which customers only meet as the emails and subscription pages they receive. Each release
-  body is a changelog of pull requests.
+  Read `releases.json` in the current directory: the releases published since the last newsletter, each with its
+  `product`. Each release body is a changelog of pull requests.
+  - PSA Systems account: sign-in, profile, billing and the app launcher at psa.systems.
+  - Mokosh: the professional services automation app for MSPs: tickets, projects, contracts, assets, billing. It has two
+    repos, a UI and a server, but customers see one app. Write one section for both, describe a change once however many
+    repos it touched, and drop server changes with no visible effect.
+  - Let's Chat: team chat with rooms, direct messages and calls.
+  - Newsletter: the newsletter system itself, which customers only meet as the emails and subscription pages they
+    receive.
 
   Write `edition.json` in the current directory, and no other file, with this shape:
   {\"subject\": string, \"preview_text\": string, \"body_md\": string}
@@ -84,8 +96,9 @@ prompt: |
   - No ticket ids, pull request numbers, commit hashes, or links to dev.a8n.run, which is private.
   - `subject` names the single most useful change, under 70 characters. Never a generic \"This week\" or a list of topics.
   - `preview_text` adds to the subject in one sentence, under 200 characters, and does not repeat it.
-  - `body_md` is Markdown with no filler introduction. Bullets with a bold lead; a heading per product only when both
-    have something to say. Under 300 words. One or two items is a fine newsletter: do not pad.
+  - `body_md` is Markdown with no filler introduction. Bullets with a bold lead; a heading per product that has
+    something to say, the product with the biggest news first, and at most the three or four changes that matter most
+    per product. Under 300 words. One or two items is a fine newsletter: do not pad.
 
   If nothing in these releases qualifies, write instead:
   {\"skip\": true, \"reason\": string}"
