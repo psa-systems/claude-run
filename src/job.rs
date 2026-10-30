@@ -798,6 +798,8 @@ mod tests {
                 name: "t".into(),
                 kind: Default::default(),
                 workdir_base: None,
+                env: Default::default(),
+                secrets: Default::default(),
                 input: Some(crate::action::InputBlock {
                     command: "x".into(),
                 }),

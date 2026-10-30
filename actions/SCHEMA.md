@@ -661,6 +661,19 @@ workdir_base: ${CLAUDE_RUN_DATA_DIR}/workdirs    # literal, ${VAR} expanded
 A path outside `/data` is not on the volume the Docker sidecar shares, so bind mounts from the workdir will not
 resolve (see CLAUDE-325).
 
+### `env` and `secrets` (maps, optional, `kind: scripted` only)
+
+Environment for this action's snippets (CLAUDE-478), so a scripted action can be set up from the web UI alone. Both map a variable name (`A-Z`, `0-9`, `_`) to a value; a variable may be in only one of them, and a native kind rejects both (it uses `token_ref`).
+
+```yaml
+env:
+  MIRZAM_URL: https://news.example.com    # plain value, overrides the runner's environment
+secrets:
+  MIRZAM_API_TOKEN: mirzam-api-token      # the NAME of a secret on the Secrets page, never its value
+```
+
+`secrets` are decrypted when the run starts. An unknown name stops the run there, naming it, before any job is gathered or attempt counted. Values reach the snippet process as environment variables only: not the YAML, not the snippet or binding files, and not the `claude` child. A secret value printed by a snippet comes back as `[REDACTED]`, on stdout (so also a prompt or `input` JSON) and stderr. Anyone who can edit an action can run code as the runner, so this protects the value from logs and from the agent, not from an action's author.
+
 ### `input.command` (nu snippet, required for `kind: scripted`)
 
 A Nushell snippet executed by the runner with `nu --commands "$snippet"`. Must write a JSON array to stdout. Each

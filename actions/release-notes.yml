@@ -10,10 +10,11 @@
 # Switch on "Editions need approval" for that list in Mirzam, and Mirzam itself refuses any send or schedule, from the
 # pages or the API, until an administrator approves.
 #
-# Environment (the runner's, inherited by every snippet; scripted actions get no injected secrets):
-#   MIRZAM_URL        Mirzam site base URL, e.g. https://news.example.com
-#   MIRZAM_API_TOKEN  a Mirzam API token with read and write access (Mirzam admin: API)
-#   MIRZAM_LIST       optional, the list slug; default `product-updates`
+# Settings (`env` and `secrets` below, CLAUDE-478):
+#   MIRZAM_URL        Mirzam site base URL
+#   MIRZAM_LIST       the list slug
+#   MIRZAM_API_TOKEN  a Mirzam API token with read and write access (Mirzam admin: API), stored on the Secrets page as
+#                     `mirzam-api-token`; the run stops, naming it, until it exists
 # The Forgejo releases are read with the token fj already holds for dev.a8n.run (its key store), so a private repo
 # needs no extra secret.
 #
@@ -27,6 +28,11 @@
 
 name: release-notes
 kind: scripted
+env:
+  MIRZAM_URL: https://news.psa.systems
+  MIRZAM_LIST: psa-systems-news
+secrets:
+  MIRZAM_API_TOKEN: mirzam-api-token
 input:
   command: |
     let host = "dev.a8n.run"
@@ -125,7 +131,7 @@ post:
       if ($marker | path exists) { rm $marker }
       $job.gathered_at | save $marker
     } else {
-      let body = ({list: ($env.MIRZAM_LIST? | default "product-updates"), subject: $edition.subject, body_md: $edition.body_md}
+      let body = ({list: $env.MIRZAM_LIST, subject: $edition.subject, body_md: $edition.body_md}
         | merge (if ($edition.preview_text? | default "" | is-empty) { {} } else { {preview_text: $edition.preview_text} }))
       let url = $"($env.MIRZAM_URL | str trim --right --char '/')/api/v1/editions"
       let answer = (http post --full --allow-errors --content-type application/json

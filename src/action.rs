@@ -4,6 +4,7 @@
 //! code plus an optional interpreter; the runner shells out to that interpreter
 //! (default `nu`) to execute it (see `crate::snippet`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -744,6 +745,17 @@ pub struct Action {
 
     #[serde(default)]
     pub workdir_base: Option<String>,
+
+    /// `scripted` only (CLAUDE-478): plain environment variables for this
+    /// action's snippets, overriding the runner's own.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+
+    /// `scripted` only (CLAUDE-478): environment variable to the name of a
+    /// secret in the store, decrypted when the run starts. The snippets get the
+    /// value in their environment; the `claude` child does not.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, String>,
 
     /// Required for `scripted` actions; optional (and ignored) for native
     /// kinds, which produce their jobs in the Rust handler instead.
@@ -1774,6 +1786,42 @@ native:
         assert_eq!(reloaded.action.kind, action.kind);
     }
 
+    /// CLAUDE-478: `env` and `secrets` load on a scripted action, and are
+    /// refused on a native kind, with a bad name, or twice for one variable.
+    #[test]
+    fn env_and_secrets_blocks_are_scripted_only_and_checked() {
+        let scripted =
+            |extra: &str| format!("name: a\ninput:\n  command: \"[]\"\nprompt: \"x\"\n{extra}");
+        let ok = validate_str(
+            &scripted("env:\n  SITE: x\nsecrets:\n  TOKEN: my-token\n"),
+            "t",
+        )
+        .expect("valid");
+        assert_eq!(ok.action.env["SITE"], "x");
+        assert_eq!(ok.action.secrets["TOKEN"], "my-token");
+
+        for (extra, field) in [
+            ("env:\n  bad-name: x\n", "env"),
+            ("secrets:\n  1TOKEN: x\n", "secrets"),
+            ("secrets:\n  TOKEN: \"\"\n", "secrets"),
+            ("env:\n  X: a\nsecrets:\n  X: b\n", "secrets"),
+        ] {
+            let err = validate_str(&scripted(extra), "t").unwrap_err();
+            assert!(
+                matches!(&err, Error::ActionInvalidField { field: f, .. } if f == field),
+                "{extra}: {err:?}"
+            );
+        }
+
+        let native =
+            "name: n\nkind: closed-issue-summary\nnative:\n  projects: [A]\nsecrets:\n  T: s\n";
+        let err = validate_str(native, "t").unwrap_err();
+        assert!(
+            matches!(&err, Error::ActionInvalidField { field, .. } if field == "secrets"),
+            "{err:?}"
+        );
+    }
+
     /// The shipped `actions/release-notes.yml` (CLAUDE-474): a scripted weekly
     /// action, one job per ISO week that never repeats, and a claude block that
     /// can only read the releases and write the draft.
@@ -1793,6 +1841,8 @@ native:
         assert_eq!(action.dedup_key.as_deref(), Some("week"));
         assert_eq!(action.limits.max_attempts_per_key, Some(1));
         assert_eq!(action.claude.allowed_tools.as_deref(), Some("Read,Write"));
+        assert_eq!(action.env["MIRZAM_LIST"], "psa-systems-news");
+        assert_eq!(action.secrets["MIRZAM_API_TOKEN"], "mirzam-api-token");
         let schedule = action.schedule.as_ref().expect("scheduled");
         assert_eq!(schedule.kind, ScheduleKind::Cron);
         crate::scheduler::parse_schedule(schedule).expect("cron spec parses");
@@ -2140,6 +2190,7 @@ pub fn validate_str(raw: &str, label: &str) -> Result<LoadedAction> {
     } else {
         validate_scripted(&action, label)?;
     }
+    validate_action_env(&action, label)?;
 
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
@@ -2150,6 +2201,51 @@ pub fn validate_str(raw: &str, label: &str) -> Result<LoadedAction> {
         path: PathBuf::from(label),
         yaml_sha256,
     })
+}
+
+/// The `env` and `secrets` blocks (CLAUDE-478): scripted only, with shell-safe
+/// variable names, each named once.
+fn validate_action_env(action: &Action, label: &str) -> Result<()> {
+    let invalid = |field: &str, reason: String| Error::ActionInvalidField {
+        name: action.name.clone(),
+        field: field.to_string(),
+        reason,
+        path: label.to_string(),
+    };
+    for (field, block) in [("env", &action.env), ("secrets", &action.secrets)] {
+        if block.is_empty() {
+            continue;
+        }
+        if action.kind.is_native() {
+            return Err(invalid(
+                field,
+                "only `kind: scripted` takes this block; native kinds use `token_ref`".into(),
+            ));
+        }
+        for var in block.keys() {
+            let mut chars = var.chars();
+            let good = chars
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+                && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+            if !good {
+                return Err(invalid(
+                    field,
+                    format!("`{var}` is not a variable name: use A-Z, 0-9 and _"),
+                ));
+            }
+        }
+    }
+    if let Some(var) = action.env.keys().find(|v| action.secrets.contains_key(*v)) {
+        return Err(invalid(
+            "secrets",
+            format!("`{var}` is in both `env` and `secrets`"),
+        ));
+    }
+    if let Some((var, _)) = action.secrets.iter().find(|(_, s)| s.trim().is_empty()) {
+        return Err(invalid("secrets", format!("`{var}` names no secret")));
+    }
+    Ok(())
 }
 
 /// Validate the script-bearing fields a `scripted` action requires:
