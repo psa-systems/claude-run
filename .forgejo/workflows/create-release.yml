@@ -25,7 +25,7 @@ jobs:
     if: >-
       github.event.pull_request.merged == true
       && startsWith(github.event.pull_request.head.ref, 'release/v')
-    uses: psa-systems/common/.forgejo/workflows/create-release.yml@main
+    uses: https://dev.a8n.run/psa-systems/common/.forgejo/workflows/create-release.yml@main
     # MEDIUM: git and API calls only (see header).
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
     secrets: inherit
