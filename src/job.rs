@@ -495,6 +495,11 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
             post_failed = true;
             break;
         }
+        // A post step's stdout says what became of the job (CLAUDE-476).
+        let said = r.stdout.trim();
+        if !said.is_empty() {
+            info!(action = %action.name, key = %key, step = i, output = %said, "post step output");
+        }
     }
 
     // ---- skip-attempt marker (parked / blocker outcomes) ----
