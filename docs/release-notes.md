@@ -22,3 +22,11 @@ docker compose exec --user appuser claude-bot claude-run action reset-attempts r
 ```
 
 The draft then waits in Mirzam, Editions, for an editor to read, ask for review and an administrator to approve.
+
+## A failed week carries over
+
+The input looks back 7 days, or to the last draft or skip for this Mirzam site if that is earlier. The post step records that time in `$CLAUDE_RUN_DATA_DIR/release-notes/<host>.last-draft`, so a week that failed leaves its releases for the next draft. The file is per site, so a run against staging does not move production's window.
+
+## What the draft leaves out
+
+The prompt keeps only what a subscribed customer would notice and care about. It leaves out internal work, consent and mailing mechanics, signup promotion, fixes that make readers doubt past behaviour, and anything the changelog does not show from a customer's side. One or two items is a normal edition.
