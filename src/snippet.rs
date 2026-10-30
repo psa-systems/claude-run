@@ -14,6 +14,8 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
+use crate::action::Action;
+use crate::db::DbPool;
 use crate::error::Result;
 
 #[derive(Debug, Clone, Default)]
@@ -43,13 +45,57 @@ pub struct SnippetOutcome {
 
 pub struct SnippetRunner {
     nu_binary: String,
+    /// Environment from the action's `env` and `secrets` blocks (CLAUDE-478).
+    /// Set on the snippet process only, so the `claude` child never sees it.
+    env: Vec<(String, String)>,
+    /// Values of the action's `secrets`, scrubbed from snippet output.
+    secret_values: Vec<String>,
 }
 
 impl SnippetRunner {
     pub fn new(nu_binary: Option<&str>) -> Self {
         Self {
             nu_binary: nu_binary.unwrap_or("nu").to_string(),
+            env: Vec::new(),
+            secret_values: Vec::new(),
         }
+    }
+
+    /// A runner for `action`'s snippets, carrying its `env` and decrypted
+    /// `secrets`, or `None` when it declares neither. An unknown secret fails
+    /// here, before any job is gathered or attempt counted.
+    pub async fn for_action(&self, action: &Action, pool: &DbPool) -> Result<Option<Self>> {
+        if action.env.is_empty() && action.secrets.is_empty() {
+            return Ok(None);
+        }
+        let mut env: Vec<(String, String)> = action
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut secret_values = Vec::new();
+        if !action.secrets.is_empty() {
+            let key = crate::secrets::SecretsKey::load()?;
+            for (var, secret) in &action.secrets {
+                let value = crate::secrets::resolve_secret(pool, &key, secret).await?;
+                secret_values.push(value.clone());
+                env.push((var.clone(), value));
+            }
+        }
+        Ok(Some(Self {
+            nu_binary: self.nu_binary.clone(),
+            env,
+            secret_values,
+        }))
+    }
+
+    /// Replace every secret value in `text`, so a script that prints one
+    /// cannot put it in a log, an error or a prompt.
+    fn scrub(&self, text: String) -> String {
+        self.secret_values
+            .iter()
+            .filter(|s| !s.is_empty())
+            .fold(text, |t, s| t.replace(s.as_str(), "[REDACTED]"))
     }
 
     /// Write the snippet to `<snippet_dir>/<phase>.<ext>` and execute it with
@@ -114,6 +160,7 @@ impl SnippetRunner {
         let output = crate::blocking::in_place(|| {
             Command::new(interpreter)
                 .arg(&script_path)
+                .envs(self.env.iter().map(|(k, v)| (k, v)))
                 .envs(env_bindings)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -123,8 +170,8 @@ impl SnippetRunner {
 
         Ok(SnippetOutcome {
             ok: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stdout: self.scrub(String::from_utf8_lossy(&output.stdout).into_owned()),
+            stderr: self.scrub(String::from_utf8_lossy(&output.stderr).into_owned()),
             exit_code: output.status.code().unwrap_or(-1),
         })
     }
@@ -204,5 +251,36 @@ mod tests {
             .unwrap();
         assert!(out.ok, "stderr: {}", out.stderr);
         assert_eq!(out.stdout.trim(), r#"{"id":"hello"}"#);
+    }
+
+    /// CLAUDE-478: the snippet sees the action's env and secrets, a printed
+    /// secret comes back redacted on both streams, and it is on no file.
+    #[test]
+    fn action_env_reaches_the_snippet_and_secrets_are_scrubbed() {
+        let dir = tempdir().unwrap();
+        let runner = SnippetRunner {
+            nu_binary: "nu".into(),
+            env: vec![
+                ("SITE".into(), "news.example.com".into()),
+                ("TOKEN".into(), "mzm_supersecret".into()),
+            ],
+            secret_values: vec!["mzm_supersecret".into()],
+        };
+        let out = runner
+            .run(
+                r#"echo "$SITE $TOKEN"; echo "err $TOKEN" >&2"#,
+                &Bindings::new(),
+                dir.path(),
+                "test",
+                Some("bash"),
+            )
+            .unwrap();
+        assert!(out.ok, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout.trim(), "news.example.com [REDACTED]");
+        assert_eq!(out.stderr.trim(), "err [REDACTED]");
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let body = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            assert!(!body.contains("mzm_supersecret"), "{body}");
+        }
     }
 }

@@ -724,6 +724,54 @@ mod tests {
         }
     }
 
+    /// CLAUDE-478: an action's `secrets` resolve from the store into its
+    /// snippets' environment, redacted on the way out; an unknown one fails,
+    /// naming it, before anything runs.
+    #[tokio::test]
+    async fn an_action_secret_reaches_its_snippets_and_an_unknown_one_fails() {
+        let _guard = key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        use_temp_dirs(tmp.path());
+        let pool = mem_pool().await;
+        ensure_key(&pool).await.unwrap();
+        let key = SecretsKey::load().unwrap();
+        crate::state::secret_create(&pool, "my-token", &key.encrypt("mzm_value").unwrap())
+            .await
+            .unwrap();
+
+        let action = |secret: &str| {
+            let raw = format!(
+                "name: a\ninput:\n  command: \"[]\"\nprompt: \"x\"\nenv:\n  SITE: here\nsecrets:\n  TOKEN: {secret}\n"
+            );
+            crate::action::validate_str(&raw, "t").unwrap().action
+        };
+        let base = crate::snippet::SnippetRunner::new(None);
+
+        let runner = base
+            .for_action(&action("my-token"), &pool)
+            .await
+            .unwrap()
+            .expect("a scoped runner");
+        let out = runner
+            .run(
+                r#"echo "$SITE ${#TOKEN} $TOKEN""#,
+                &crate::snippet::Bindings::new(),
+                tmp.path(),
+                "t",
+                Some("bash"),
+            )
+            .unwrap();
+        assert_eq!(out.stdout.trim(), "here 9 [REDACTED]");
+
+        let err = base
+            .for_action(&action("missing"), &pool)
+            .await
+            .err()
+            .expect("an unknown secret fails")
+            .to_string();
+        assert!(err.contains("missing"), "{err}");
+    }
+
     /// The key is configuration: it belongs beside `config.toml`, not beside the
     /// `state.db` ciphertext it decrypts.
     #[tokio::test]

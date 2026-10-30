@@ -4,13 +4,20 @@
 
 ## Setup
 
-1. In Mirzam, on the target list (default `product-updates`), switch on "Editions need approval": Mirzam then refuses any send or schedule, from the pages or the API, until an administrator approves.
+Everything is done in the web UI; the deployment needs no change.
+
+1. In Mirzam, on the target list, switch on "Editions need approval": Mirzam then refuses any send or schedule, from the pages or the API, until an administrator approves.
 2. In Mirzam admin, API, create a read and write token named `claude-run`.
-3. Give the runner `MIRZAM_URL` (the site's base URL), `MIRZAM_API_TOKEN` and optionally `MIRZAM_LIST` in its environment (the container's `environment:` block, the token from a secret). Scripted actions see only the runner's environment; nothing is injected.
-4. Copy the file into the actions directory and try it:
+3. On the **Secrets** page, store the token as `mirzam-api-token`.
+4. **New action**, raw YAML (`/actions/new/raw`): paste `actions/release-notes.yml`. Its `env` block names the Mirzam site (`MIRZAM_URL`) and list (`MIRZAM_LIST`); its `secrets` block maps `MIRZAM_API_TOKEN` to the stored secret. Change the `env` values for another site.
+5. Trigger it once from the action's page and read the draft in Mirzam, Editions.
+
+To rotate the token, replace the secret on the Secrets page; the next run uses it, with no restart.
+
+To try it against another site without touching the stored action, run a copy of the file with its `env` values changed and `secrets` pointing at a secret for that site:
 
 ```nushell
-docker compose exec --user appuser claude-bot claude-run trigger release-notes
+docker compose exec --user appuser claude-bot claude-run run /tmp/release-notes.yml
 ```
 
 ## One draft per week

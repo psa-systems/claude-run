@@ -1498,6 +1498,13 @@ pub async fn run_action_inner(
         return Ok(spend.exit_code(crate::exit::OK));
     }
 
+    // The action's `env` and `secrets` (CLAUDE-478). An unknown secret stops
+    // the run here, before a job is gathered or an attempt counted.
+    let snippet = match snippet.for_action(&loaded.action, pool).await? {
+        Some(scoped) => Arc::new(scoped),
+        None => snippet,
+    };
+
     // Mark the action as gathering so the scheduler does not stack another
     // pickup on top of a slow `input.command`. Dropped right after the
     // gather; overlapping runs past this point stay allowed.
