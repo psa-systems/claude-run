@@ -139,6 +139,126 @@ stream log under `<state dir>/logs/<action>/streams/`. Exit code 124 from `timeo
 Each run appends one JSON record (tokens, estimated cost, duration, tool counts) to `<state dir>/logs/usage.jsonl`, and
 each invocation is recorded in `claude_invocations`.
 
+#### 3.2.1 Model, effort and autocompact resolution (`SPEC-3.2.1`)
+
+`--model` and `--effort` resolve action value, then the live `claude` settings section, then omission (the `claude`
+CLI's own default applies); `--autocompact` resolves the same way but falls back to a fixed window (200000 tokens)
+rather than omission, because the CLI's own `auto` scales to the model's whole context window, and on a large-context
+model a long tool-heavy session would then never compact, resending every completed tool payload on every turn so
+spend grows with the square of the tool-call count rather than linearly in it. A resolved effort level outside the
+CLI's documented set (`low`, `medium`, `high`, `xhigh`, `max`) is passed through unchanged after one warning naming the
+value and its source: the CLI itself only ignores an unknown level and falls back to its own default, so without the
+warning a typo would silently downgrade effort for every run.
+
+#### 3.2.2 Per-invocation spend ceiling (`SPEC-3.2.2`)
+
+The run's remaining budget (`limits.run_budget_usd`, see 3.1, minus what the run has already spent) is passed as
+`--max-budget-usd` on every invocation, so a single runaway session cannot overshoot the run's ceiling between the
+runner's own between-job checks; an unset remaining budget passes no flag. Each invocation's reported cost is folded
+into the run's shared ledger before any other branch can discard the result, including a cancelled invocation, so a
+cancelled run still bills what it actually spent. The ledger's ceiling is resolved once, before the run starts, and
+is immutable for the run's lifetime: no job can raise it mid-run.
+
+#### 3.2.3 Cancellation and the process group (`SPEC-3.2.3`)
+
+`claude` and the `timeout` wrapper around it run in a process group whose id equals the wrapped child's pid
+(`setpgid(0)`), so a cancellation or a timeout signals the whole tree (the wrapper, `claude`, and anything it spawned)
+at once rather than leaving a descendant orphaned. Termination is SIGTERM, then (if the group has not exited within a
+short grace window) SIGKILL. The wait for the child is a poll loop rather than a blocking `wait`, so an operator
+cancel is observed promptly without a dedicated thread per invocation.
+
+#### 3.2.4 Result-exit grace and the background-task backstop (`SPEC-3.2.4`)
+
+Once `claude`'s terminal `result` event appears in the stream log the turn is functionally done; the child gets a
+grace window (30 seconds) to exit on its own, after which the runner force-terminates the group and finalizes from
+the already-captured result rather than waiting out the job's full timeout. This is the backstop behind the
+disallowed-tools restriction below: a session is not expected to still be working once it has reported its result, so
+a result followed by a hang is treated as a leftover background task, not as more legitimate work in progress.
+
+A `claude` child always runs with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and `--disallowedTools=Monitor,ScheduleWakeup`,
+because a session run under `--print` is over the instant its turn ends: a turn that ends waiting on a background
+`Bash` task, a `Monitor`, or a `ScheduleWakeup` never resumes. As a further backstop, the stream log is scanned for a
+`system`/`task_updated` event with `patch.status: killed` that appears AFTER the terminal `result` event; a match
+means a background task outlived the session's own report of success, and the runner overrides that into a
+non-transient failure naming the task id rather than reporting it as a clean success.
+
+#### 3.2.5 Failure classification (`SPEC-3.2.5`)
+
+An invocation's outcome is one of: a normal result (`ok` from the terminal event's `is_error`), a non-transient
+failure (a nonzero exit with no authentication signal, or a terminal event present but marked an error), a transient
+failure (the terminal event's `api_error_status` or `error` names a rate limit; never a timeout), a timed-out run
+(`timeout`'s exit code 124), a killed run (exit code 137, SIGKILL, with no terminal result captured; typically an
+out-of-memory kill), or a login-required run.
+
+A run is login-required when the CLI reports a structured `authentication_failed`: either on a single event anywhere
+in the stream (checked against the nonzero-exit path), or via three or more `system`/`api_retry` events carrying that
+same structured error observed during the wait loop, which force-terminates the child well below the job's timeout
+rather than waiting it out. Detection keys only on the structured `error` field, never on human-readable text the CLI
+may reword between releases. A login-required outcome is always transient (no attempt spent) and trips the daemon's
+readiness gate (3.7) so no further Claude work starts until a fresh sign-in.
+
+#### 3.2.6 Stream-log relay and read failures (`SPEC-3.2.6`)
+
+The stream log is the only record of an invocation's events, written by a relay thread that copies the child's piped
+stdout line by line, stamping each parseable JSON event with an arrival-time `ts`; a line that fails to parse passes
+through unstamped rather than being dropped. A relay I/O failure (for example a full log partition) is carried out as
+an explicit error rather than discarded: if the terminal result was already captured before the relay died, the run
+still finalizes from it, with the truncation logged; if not, the run is reported as a transient failure naming the
+write error and the log path, so it spends no attempt rather than being blamed for an agent silence the runner itself
+produced. Reading the stream log back (to find the terminal result or the last assistant text) carries its own
+read failure out the same way: an unreadable log finalizes as a transient failure, while a log that reads fine but
+simply has no terminal `result` event is a real, non-transient claude-side outcome.
+
+#### 3.2.7 Usage, cost and rate-limit accounting (`SPEC-3.2.7`)
+
+Each invocation's stream log is replayed once to attribute tokens, tool-call counts and context growth per tool (a
+turn is attributed to the tool whose result most recently entered its context), and to capture the last-seen Claude
+plan rate-limit reading (`five_hour` / `seven_day` utilization) plus a count of `api_retry` events per reason; every
+rate-limit field stays absent rather than defaulting to zero when the CLI reported none. One `claude usage` log line
+is emitted per invocation, at `warn` instead of `info` when the plan status is not `allowed` or either window's
+utilization is at least 90%, so an operator sees a tightening limit before the next invocation is throttled outright.
+Each invocation is also persisted to `claude_invocations` (3.2's closing sentence) immediately after it returns,
+independent of the outcome, since the invocation already succeeded or failed on its own terms; a persistence failure
+is logged and never fails the job. Context growth that stays flat as the number of tool calls grows is linear
+accounting (3.2.1's fixed autocompact window doing its job); growth that rises with the tool-call count is quadratic.
+
+#### 3.2.8 Job pipeline orchestration (`SPEC-3.2.8`)
+
+A scripted job's per-job pipeline is: `filter` -> workdir creation -> `pre` steps -> `prompt` -> `claude` -> `post`
+steps -> outcome record -> guarded workdir cleanup (3.2.9). `post` runs on every path that reached the workdir,
+including a `filter`/`pre`/`prompt` failure or an operator cancel, with a synthesized `$claude_result` describing
+why `claude` did not run, so a `post` script always sees a uniform shape. A job's attempt is not counted, and its
+daily run/cost ledger does not advance, on three paths: a transient `claude` result (3.2.5), an operator cancel taken
+before or during the invocation, and a global pause (or a login-required stop) taken after the job started but
+before `claude` ran; a `post` script can additionally suppress attempt counting itself by writing
+`$workdir/.claude-run-skip-attempt` (a parked or blocked job). A job's key is its `dedup_key` field value, or a
+positional fallback when unset or absent; two jobs sharing a concurrency key (3.1) never overlap, computed by joining
+the configured key fields with a unit separator, falling back to the job's own key when none of those fields are
+present on it.
+
+#### 3.2.9 Workdir resolution and the local-only-work guard (`SPEC-3.2.9`)
+
+A job's workdir base resolves in order: the action's own `workdir_base` field, then `CLAUDE_RUN_WORKDIR_BASE`, then
+`<data dir>/workdirs`; the job's workdir is `<base>/<action name>/<job key>`. Every runner deletes a job's workdir
+through one guarded path that first checks whether it holds local-only work: a local branch tip the remote does not
+have under that same branch name (excluding a tip that merely equals the remote default branch's tip, which has no
+commits of its own), a tracked or staged modification, an untracked and non-ignored file, or a stash. Any local-only
+work, or a git or network failure while checking, preserves the workdir (after pruning gitignored build artifacts)
+rather than risking a wrong delete; only a clean check with nothing local-only found deletes it. A caller with a forge
+token in scope authenticates the one network call this check makes (`ls-remote origin`) per invocation via the
+token's own userinfo, since the clone's `origin` remote carries no embedded credential.
+
+#### 3.2.10 Snippet execution (`SPEC-3.2.10`)
+
+Each `filter` / `pre` / `prompt` / `post` step, and a native kind's own snippets, run as a separate interpreter
+process rather than in-process. For the `nu` interpreter (the default), bindings (`$job`, `$workdir`,
+`$claude_result`, ...) are each written to a sibling JSON tempfile and loaded by a generated `let`-binding prelude,
+avoiding any quoting issue from embedding a value directly in the script source; for any other declared interpreter,
+each binding is instead exposed as an environment variable holding its compact-JSON value. An action's `env` and
+`secrets` blocks (3.1) are set on the snippet's own process only, never on the `claude` child, and every secret value
+is replaced with a fixed placeholder in both the snippet's stdout and stderr before either is logged, returned, or
+folded into a later prompt, so a script that prints a secret cannot leak it.
+
 ### 3.3 YouTrack action (`kind: youtrack`)
 
 - Gather: query the tracker with `native.youtrack.query` (default `-Resolved AI Agent: Queued`, with the placeholder
@@ -290,7 +410,11 @@ callers to build one themselves:
 
 ### 4.1 CLI
 
-Global flags: `--actions-dir <dir>` (env `CLAUDE_RUN_ACTIONS_DIR`), `--color auto|always|never`.
+Global flags: `--actions-dir <dir>` (env `CLAUDE_RUN_ACTIONS_DIR`), `--color auto|always|never`. JSON printed to a
+terminal (`--color auto`, a TTY) or forced on is syntax-highlighted token by token (keys, strings, numbers,
+`true`/`false`/`null`) with the surrounding structure and whitespace copied through unchanged; stripping the color
+codes back out always yields byte-identical output to the plain `serde_json::to_string_pretty` form, so a scripted
+consumer piping the output (`claude-run status | from json`) is unaffected by color being on or off.
 
 | Command | Behavior |
 |---|---|
