@@ -1,4 +1,9 @@
-# claude-run daemon, containerized (CLAUDE-37, CLAUDE-247, CLAUDE-287).
+# SPEC-9: "`compose.yml`: the app service with three named volumes
+# (`/config`, `/data`, `/state`), a tmpfs at `/run/claude-run`, a privileged
+# Docker-in-Docker sidecar sharing the app's network namespace ..., and an
+# optional PostgreSQL service behind the `postgres` profile .... No host bind
+# mount is used. No port is published by default." claude-run daemon,
+# containerized (CLAUDE-37, CLAUDE-247, CLAUDE-287).
 #
 # The whole daemon runs in this container, so every `claude` child it spawns
 # inherits the container's clean $HOME and loads only the slim bot CLAUDE.md
@@ -63,14 +68,17 @@ services:
       # `claude` sessions the daemon spawns inherit this, since nothing in
       # src/ calls env_clear or env_remove.
       DOCKER_HOST: tcp://127.0.0.1:2375
-      # CLAUDE-383: the images CI's `runs-on: ${{ vars.RUNS_ON_* }}` resolves to,
-      # so the agent can run the same images CI runs instead of guessing a
-      # literal tag. In a workflow the same name is a Forgejo Actions variable
-      # that resolves to a RUNNER LABEL; here the value is the pullable IMAGE
-      # REFERENCE the label's runner advertises, so `docker run
-      # "$RUNS_ON_RUST_BUILDER_MUSL"` and a compose `image: ${RUNS_ON_RUST_BUILDER_MUSL}`
-      # work directly. The value is always a `dev.a8n.run` image, never from
-      # the GitHub Container Registry.
+      # SPEC-9: "`compose.yml` passes the same `RUNS_ON_*` image references
+      # the CI workflows resolve through `${{ vars.RUNS_ON_* }}` into the app
+      # service as environment variables, so a `claude` session the daemon
+      # spawns ... builds against the identical images CI uses instead of a
+      # guessed tag." (CLAUDE-383). In a workflow the same name is a Forgejo
+      # Actions variable that resolves to a RUNNER LABEL; here the value is
+      # the pullable IMAGE REFERENCE the label's runner advertises, so
+      # `docker run "$RUNS_ON_RUST_BUILDER_MUSL"` and a compose
+      # `image: ${RUNS_ON_RUST_BUILDER_MUSL}` work directly. The value is
+      # always a `dev.a8n.run` image, never from the GitHub Container
+      # Registry.
       RUNS_ON_OPENSUSE_BASE_HEAVY: dev.a8n.run/pandoras-box/opensuse-dev:v1.14.0-leap-16.0
       RUNS_ON_OPENSUSE_BASE_MASSIVE: dev.a8n.run/pandoras-box/opensuse-dev:v1.14.0-leap-16.0
       RUNS_ON_OPENSUSE_BASE_LIGHT: dev.a8n.run/pandoras-box/opensuse-base:v1.13.0-leap-16.0
@@ -166,6 +174,8 @@ services:
   # dockerd's own BuildKit session healthcheck ("healthcheck failed fatally",
   # "only one connection allowed"). That is an upstream Docker 29.x defect, not
   # fixable by any setting here; see docs/conventions/container.md.
+  # SPEC-9: "a privileged Docker-in-Docker sidecar sharing the app's network
+  # namespace (daemon on `tcp://127.0.0.1:2375`, healthcheck `nc -z`)."
   claude-bot-docker:
     container_name: claude-bot-docker
     image: docker.io/docker:29.6.2-dind
@@ -197,6 +207,8 @@ services:
   # existed; `docker compose --profile postgres up` adds the database. The first
   # start on this backend is a fresh instance: carry an existing state.db over
   # with `claude-run import` (CLAUDE-251) before starting the daemon on it.
+  # SPEC-9: "an optional PostgreSQL service behind the `postgres` profile
+  # (healthcheck `pg_isready`)."
   claude-bot-postgres:
     container_name: claude-bot-postgres
     image: docker.io/postgres:18.4-alpine3.23

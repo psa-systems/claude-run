@@ -1,5 +1,6 @@
 #!/bin/sh
-# Shared entrypoint, byte-identical in every image (CONTAINER_UID_GID.md). As root: remap, hooks, chown, gosu.
+# SPEC-9.1: shared entrypoint, byte-identical in every image (CONTAINER_UID_GID.md).
+# As root: remap, hooks, chown, gosu.
 # As non-root (compose `user:` pin): no remap, hooks or chown; fail unless every $DATA_DIRS entry is writable.
 set -eu
 
@@ -14,6 +15,10 @@ fi
 CURRENT_UID=$(id -u)
 CURRENT_GID=$(id -g)
 
+# SPEC-9.1: "Started as a non-root user ... the remap, hooks and chown below
+# are all skipped. Any `PUID`/`PGID` given must match the uid/gid the
+# container was actually started as ... Every path named in `DATA_DIRS` must
+# already exist and be writable ... or the entrypoint refuses to start."
 if [ "$CURRENT_UID" != "0" ]; then
     echo "entrypoint: started as ${CURRENT_UID}:${CURRENT_GID} (not root), skipping the PUID/PGID remap, hooks and chown" >&2
     if [ -n "${PUID:-}" ] && [ "$PUID" != "$CURRENT_UID" ]; then
@@ -34,7 +39,8 @@ if [ "$CURRENT_UID" != "0" ]; then
     exec "$@"
 fi
 
-# PUID/PGID must be numeric and non-zero: the workload never runs as root.
+# SPEC-9.1: "A non-numeric or zero `PUID`/`PGID` refuses to start rather than
+# run the workload as root."
 check_id() {
     case "$2" in
         ''|*[!0-9]*) echo "entrypoint: $1=$2 is not numeric, refusing to start" >&2; exit 1 ;;
@@ -42,7 +48,10 @@ check_id() {
     esac
 }
 
-# Unset PUID/PGID adopt the owner of the first data dir; a root owner, or no data dir, falls back to 1001.
+# SPEC-9.1: "`PUID`/`PGID` resolve to, in order, an explicit non-zero
+# environment value, else the owner of the first `DATA_DIRS` entry when that
+# owner is not root, else 1001/1001." Unset PUID/PGID adopt the owner of the
+# first data dir; a root owner, or no data dir, falls back to 1001.
 FIRST_DIR=""
 for dir in $DATA_DIRS; do FIRST_DIR=$dir; break; done
 OWNER_UID=0
@@ -68,11 +77,16 @@ else
 fi
 echo "entrypoint: resolved ${APP_USER} to ${RESOLVED_UID}:${RESOLVED_GID} (uid from ${UID_SOURCE}, gid from ${GID_SOURCE})" >&2
 
-# -o allows an id already present in the image.
+# SPEC-9.1: "The resolved uid/gid is applied to the image's `APP_USER`
+# (`usermod`/`groupmod -o`, allowing an id already present in the image)." -o
+# allows an id already present in the image.
 groupmod -o -g "$RESOLVED_GID" "$APP_USER"
 usermod -o -u "$RESOLVED_UID" -g "$RESOLVED_GID" "$APP_USER"
 
-# Image-specific root steps (e.g. joining the docker socket's group) live in hooks, never in this file.
+# SPEC-9.1: "the root hooks under `/etc/entrypoint.d/` run in filename order
+# and a non-zero exit from any hook aborts startup." Image-specific root
+# steps (e.g. joining the docker socket's group) live in hooks, never in this
+# file.
 export APP_USER RESOLVED_UID RESOLVED_GID
 for hook in /etc/entrypoint.d/*.sh; do
     [ -e "$hook" ] || continue
@@ -80,10 +94,13 @@ for hook in /etc/entrypoint.d/*.sh; do
     sh "$hook" || { rc=$?; echo "entrypoint: root hook ${hook} failed with exit ${rc}, refusing to start" >&2; exit "$rc"; }
 done
 
-# Chown only what is wrong, so a volume that already matches is untouched.
+# SPEC-9.1: "every `DATA_DIRS` entry is chowned recursively to the resolved
+# uid/gid, skipping paths that already match." Chown only what is wrong, so a
+# volume that already matches is untouched.
 for dir in $DATA_DIRS; do
     find "$dir" \( ! -user "$RESOLVED_UID" -o ! -group "$RESOLVED_GID" \) -exec chown "$RESOLVED_UID:$RESOLVED_GID" {} +
 done
 
-# User form, not uid:gid, so supplementary groups come from /etc/group.
+# SPEC-9.1: "execs under `gosu \"$APP_USER\" \"$@\"` (the user form, not
+# `uid:gid`, so supplementary groups come from `/etc/group`)."
 exec gosu "$APP_USER" "$@"

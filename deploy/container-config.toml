@@ -1,3 +1,4 @@
+# SPEC-9: "Seeded container config binds the web UI to `0.0.0.0:7321`."
 # Bootstrap config seeded into the config volume on a container's first start
 # (oci-build/entrypoint.sh copies it in only when none exists, so operator edits
 # and image upgrades never fight).
@@ -18,6 +19,7 @@ port = 7321
 # (Settings -> secrets, then this file) only if API clients need a bearer token
 # as well.
 
+# SPEC-9: "The MCP listener is off; when enabled it binds `0.0.0.0:7322`."
 # [mcp]
 # Off by default (CLAUDE-442): the troubleshooting MCP tools are read-only but
 # still worth gating behind an explicit opt-in. Uncomment to serve them over
