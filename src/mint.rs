@@ -1,5 +1,8 @@
 //! Triage-driven YouTrack issue mint.
 //!
+//! Implements SPEC-3.5 (the mint/route/guard outcomes) and the dedupe-marker
+//! half of SPEC-3.5.2.
+//!
 //! Turns a triaged failure ([`crate::triage::Triage`]) plus its
 //! `action_run_failure` metadata and redacted job log into a YouTrack task
 //! issue, routed to the repo's own YouTrack project (with `CLAUDE` as the
@@ -54,7 +57,7 @@ use crate::triage::{Triage, TriageBucket};
 /// calls. Refresh-on-miss shortens this for a genuinely new repo.
 pub const DEFAULT_VCS_MAP_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// Everything the mint needs about one triaged failure: the
+/// SPEC-3.5: everything the mint needs about one triaged failure: the
 /// `action_run_failure` metadata, the triage verdict, and the redacted log path.
 #[derive(Debug, Clone)]
 pub struct MintRequest<'a> {
@@ -116,7 +119,7 @@ pub struct MintRequest<'a> {
     pub auto_fix_enabled: bool,
 }
 
-/// The caps, reused (not re-derived) from the runner's existing
+/// SPEC-3.5: the caps, reused (not re-derived) from the runner's existing
 /// per-key attempt counter and daily run ledger ([`crate::state`]). The caller
 /// reads these from the DB and passes them in so the mint decision stays pure.
 #[derive(Debug, Clone, Copy)]
@@ -131,7 +134,7 @@ pub struct MintCaps {
     pub max_runs_per_day: u32,
 }
 
-/// The outcome of a mint attempt. Every non-`Created` variant names why nothing
+/// SPEC-3.5: the outcome of a mint attempt. Every non-`Created` variant names why nothing
 /// was minted, so the caller can log the decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MintOutcome {
@@ -160,7 +163,7 @@ struct Route {
     assign_human: bool,
 }
 
-/// Route a triage bucket. `None` for [`TriageBucket::Transient`] (mint nothing);
+/// SPEC-3.5: route a triage bucket. `None` for [`TriageBucket::Transient`] (mint nothing);
 /// `Some` for the two actionable buckets.
 fn route(bucket: TriageBucket) -> Option<Route> {
     match bucket {
@@ -179,7 +182,7 @@ fn route(bucket: TriageBucket) -> Option<Route> {
     }
 }
 
-/// Whether `bucket` routes to the queue-for-fix path (`code_fix` /
+/// SPEC-3.5: whether `bucket` routes to the queue-for-fix path (`code_fix` /
 /// `auto_fix`), i.e. whether a freshly-created issue of this bucket would get
 /// `AI Agent` set (subject to the webhook `auto_fix` toggle). Exposed so the
 /// webhook consumer's reopen-on-regression path can set `AI Agent` exactly as
@@ -188,7 +191,7 @@ pub(crate) fn queues_for_fix(bucket: TriageBucket) -> bool {
     route(bucket).is_some_and(|r| r.queue_for_fix)
 }
 
-/// How a mint's destination project was chosen, surfaced in the journal so a
+/// SPEC-3.5: how a mint's destination project was chosen, surfaced in the journal so a
 /// wrong destination is diagnosable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteSource {
@@ -226,7 +229,7 @@ fn forge_host(url: &str) -> String {
     norm_host(url).split('/').next().unwrap_or("").to_string()
 }
 
-/// The inverse VCS routing map: forge `(host, repo path)` -> project short name,
+/// SPEC-3.5: the inverse VCS routing map: forge `(host, repo path)` -> project short name,
 /// built from every non-archived project's enabled VCS processors. Lookups are
 /// case-insensitive on both host and path and ignore trailing slashes on the
 /// host.
@@ -253,7 +256,7 @@ impl VcsRouteMap {
         Self { entries }
     }
 
-    /// The project that claims `repo` on `host`, or `None` when no enabled VCS
+    /// SPEC-3.5: the project that claims `repo` on `host`, or `None` when no enabled VCS
     /// integration matches. When several projects claim the same repo, the match
     /// is deterministic (first by project short name, ascending) and all
     /// candidates are logged (ambiguity rule).
@@ -285,7 +288,7 @@ impl VcsRouteMap {
     }
 }
 
-/// Lazily-built, TTL-cached inverse VCS routing map shared across mints.
+/// SPEC-3.5: lazily-built, TTL-cached inverse VCS routing map shared across mints.
 /// The map is built on first use and rebuilt when older than the
 /// TTL; a lookup miss triggers one immediate refresh before falling back, so a
 /// just-added VCS integration routes without waiting out the TTL. A rebuild
@@ -309,7 +312,7 @@ impl VcsRouteCache {
         }
     }
 
-    /// Resolve the YouTrack project for `repo` on forge `host`, full order:
+    /// SPEC-3.5: resolve the YouTrack project for `repo` on forge `host`, full order:
     /// explicit `repo_project_map` override, then the cached VCS map (rebuilt if
     /// stale, refreshed once on a miss), then `fallback_project`. Returns the
     /// project short name and which rule chose it.
@@ -377,7 +380,7 @@ impl VcsRouteCache {
     }
 }
 
-/// A stable, single-token full-text dedupe marker over `parts`. Hex-only so
+/// SPEC-3.5.2: a stable, single-token full-text dedupe marker over `parts`. Hex-only so
 /// YouTrack indexes it as one searchable term (punctuation would fragment it).
 fn marker(parts: &[&str]) -> String {
     let mut h = Sha256::new();
@@ -389,13 +392,13 @@ fn marker(parts: &[&str]) -> String {
     format!("crdedupe{}", hex::encode(&digest[..8]))
 }
 
-/// Primary dedupe marker: `(repo, index_in_repo)`. Per-run: it collapses only a
+/// SPEC-3.5.2: primary dedupe marker: `(repo, index_in_repo)`. Per-run: it collapses only a
 /// webhook redelivery of the identical run (idempotency), never across commits.
 fn primary_marker(req: &MintRequest) -> String {
     marker(&[req.repo, &req.index_in_repo.to_string()])
 }
 
-/// Secondary dedupe marker: `(repo, commit_sha, workflow_id)`. Commit-scoped, so
+/// SPEC-3.5.2: secondary dedupe marker: `(repo, commit_sha, workflow_id)`. Commit-scoped, so
 /// retained only for back-compat with issues minted before the root-cause key
 /// (a resolved such issue must still not be reopened); the cross-run collapse is
 /// [`root_cause_marker`], not this.
@@ -403,7 +406,7 @@ fn secondary_marker(req: &MintRequest) -> String {
     marker(&[req.repo, req.commit_sha, req.workflow_id])
 }
 
-/// Root-cause dedupe marker: the cross-run collapsing key. Keyed on
+/// SPEC-3.5.2: root-cause dedupe marker: the cross-run collapsing key. Keyed on
 /// `(repo, branch, workflow_id, job_name, failure_signature)` so N commits that
 /// each fail the same job on the same branch with the same signature collapse
 /// onto ONE open issue, while a different signature (a different root cause)
@@ -421,7 +424,7 @@ fn root_cause_marker(req: &MintRequest) -> String {
     }
 }
 
-/// Infrastructure dedupe marker: the branch-agnostic collapsing key,
+/// SPEC-3.5.2: infrastructure dedupe marker: the branch-agnostic collapsing key,
 /// `(repo, workflow_id, job_name, infra_kind)`. `None` unless the consumer
 /// detected an infrastructure condition. It deliberately contains neither
 /// `branch` nor `commit_sha`, because a host condition (a full disk, an OOM
@@ -438,7 +441,7 @@ fn infra_marker(req: &MintRequest) -> Option<String> {
         .map(|kind| marker(&[req.repo, req.workflow_id, req.job_name, kind]))
 }
 
-/// The same collapse key [`root_cause_marker`] / [`infra_marker`]
+/// SPEC-3.5.2: the same collapse key [`root_cause_marker`] / [`infra_marker`]
 /// compute from a [`MintRequest`], but over plain arguments so the webhook
 /// consumer's legacy-adoption lookup (a `ci_failures` store miss, searched
 /// against YouTrack for an issue minted before the store existed) can build it
@@ -460,7 +463,7 @@ pub(crate) fn legacy_collapse_key(
     }
 }
 
-/// Extract a deterministic failure signature from a redacted log,
+/// SPEC-3.5.2: extract a deterministic failure signature from a redacted log,
 /// or `None` when the log carries no recognizable diagnostic line. Pure string
 /// work (no LLM, no I/O): the first diagnostic line, normalized so the same root
 /// cause across commits yields the same signature.
@@ -523,7 +526,7 @@ fn mask_digit_runs(s: &str) -> String {
     out
 }
 
-/// Mint (or decline to mint) a YouTrack issue from a triaged failure. Pure
+/// SPEC-3.5: mint (or decline to mint) a YouTrack issue from a triaged failure. Pure
 /// decision flow over the [`IssueTracker`] trait; see the module docs for the
 /// ordering (route -> caps -> create). Dedupe by failing-test
 /// overlap now happens in the caller (`src/web/webhooks.rs`, against the
@@ -601,7 +604,7 @@ pub fn mint(
     })
 }
 
-/// First matching issue's `idReadable` for `query`, or `None` when the query
+/// SPEC-3.5.2: first matching issue's `idReadable` for `query`, or `None` when the query
 /// matches nothing. Reuses the tracker's `yt list --query=<q> --json` surface.
 /// Kept `pub(crate)` for the webhook consumer's legacy adoption
 /// lookup (a `ci_failures` miss falls back to this one YouTrack full-text
@@ -614,7 +617,7 @@ pub(crate) fn find_first(tracker: &dyn IssueTracker, query: &str) -> Result<Opti
     }))
 }
 
-/// Short issue summary. The bare run metadata; the body carries the analysis.
+/// SPEC-3.5 / SPEC-3.5.1: short issue summary. The bare run metadata; the body carries the analysis.
 /// An auto-fix failure gets a directive summary naming the concrete
 /// problem (`Auto-fix: cargo fmt on ...`) instead of the generic `CI failure`.
 fn build_summary(req: &MintRequest) -> String {
@@ -639,7 +642,7 @@ fn short_sha(sha: &str) -> String {
     sha.chars().take(8).collect()
 }
 
-/// Human label for an auto-fix in the summary: the precise `cargo fmt` for the
+/// SPEC-3.5.1: human label for an auto-fix in the summary: the precise `cargo fmt` for the
 /// cargo-fmt detector, else the failing workflow filename.
 fn autofix_label<'a>(detail: &'a crate::autofix::AutoFix, workflow_id: &'a str) -> &'a str {
     if detail.kind == "cargo-fmt" {
@@ -649,7 +652,7 @@ fn autofix_label<'a>(detail: &'a crate::autofix::AutoFix, workflow_id: &'a str) 
     }
 }
 
-/// Markdown issue body: the triage analysis, the run metadata, and the hidden
+/// SPEC-3.5.2: Markdown issue body: the triage analysis, the run metadata, and the hidden
 /// `Dedupe-Key:` marker the legacy-adoption lookup searches for. `collapse` is
 /// the cross-run collapse key: the root-cause key, or the
 /// branch-agnostic infra key when an infrastructure condition was detected. It
@@ -698,7 +701,7 @@ fn build_description(req: &MintRequest, primary: &str, secondary: &str, collapse
     lines.join("\n")
 }
 
-/// The implementation-spec body for an auto-fixable failure. Names
+/// SPEC-3.5.1 / SPEC-3.5.2: the implementation-spec body for an auto-fixable failure. Names
 /// the concrete problem and the fix command(s), instructs the runner to deliver
 /// the fix on a fresh `chore/<kind>-<short-sha>` branch via a PR against `main`
 /// (never a direct push to main), and carries the same dedupe markers as the

@@ -1,6 +1,7 @@
 //! Async functions over [`DbPool`] for the CI-failure store
 //! (`ci_failures`, `ci_failure_tests`, `ci_failure_runs`,
-//! `agent_pull_requests`; `migrations/sqlite/0021_ci_failures.sql` and
+//! `agent_pull_requests`). Implements SPEC-3.5.2.
+//! (`migrations/sqlite/0021_ci_failures.sql` and
 //! `migrations/postgres/0002_ci_failures.sql`). Every statement goes through
 //! [`db::q`], the dialect chokepoint every other module in the tree uses, so
 //! this runs unchanged on either backend.
@@ -10,7 +11,7 @@ use sqlx::Row;
 use crate::db::{self, DbPool};
 use crate::error::Result;
 
-/// A `ci_failures` row a fingerprint matched, returned by [`find_match`].
+/// SPEC-3.5.2: a `ci_failures` row a fingerprint matched, returned by [`find_match`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureMatch {
     pub id: i64,
@@ -18,7 +19,7 @@ pub struct FailureMatch {
     pub state: String,
 }
 
-/// A `ci_failures` row's own fields, without the derived match ranking.
+/// SPEC-3.5.2: a `ci_failures` row's own fields, without the derived match ranking.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Failure {
     pub id: i64,
@@ -32,7 +33,7 @@ pub struct Failure {
     pub updated_at: String,
 }
 
-/// An `agent_pull_requests` row.
+/// SPEC-3.5.2: an `agent_pull_requests` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPullRequest {
     pub id: i64,
@@ -90,7 +91,7 @@ fn agent_pr_from_row(row: &sqlx::any::AnyRow) -> Result<AgentPullRequest> {
 const STATE_PRIORITY_CASE: &str =
     "CASE state WHEN 'open' THEN 0 WHEN 'resolved' THEN 1 WHEN 'pr_only' THEN 2 ELSE 3 END";
 
-/// Find the best `ci_failures` row that shares at least one test id with
+/// SPEC-3.5.2: find the best `ci_failures` row that shares at least one test id with
 /// `test_ids`, within the same `(repo, workflow_id, job_name)`. An `open`
 /// match wins over `resolved`, which wins over `pr_only`; ties go to the
 /// newest (`updated_at`).
@@ -132,7 +133,7 @@ pub async fn find_match(
     })
 }
 
-/// Fetch one `ci_failures` row by id.
+/// SPEC-3.5.2: fetch one `ci_failures` row by id.
 pub async fn get_failure(pool: &DbPool, id: i64) -> Result<Option<Failure>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
@@ -145,7 +146,7 @@ pub async fn get_failure(pool: &DbPool, id: i64) -> Result<Option<Failure>> {
     row.as_ref().map(failure_from_row).transpose()
 }
 
-/// Insert a new `ci_failures` row. Returns its id.
+/// SPEC-3.5.2: insert a new `ci_failures` row. Returns its id.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_failure(
     pool: &DbPool,
@@ -175,7 +176,7 @@ pub async fn record_failure(
     Ok(id)
 }
 
-/// Add every id in `test_ids` to `failure_id`'s fingerprint. Idempotent: an id
+/// SPEC-3.5.2: add every id in `test_ids` to `failure_id`'s fingerprint. Idempotent: an id
 /// already recorded on a repeat sighting is skipped rather than erroring.
 pub async fn add_tests(pool: &DbPool, failure_id: i64, test_ids: &[String]) -> Result<()> {
     for test_id in test_ids {
@@ -195,7 +196,7 @@ pub async fn add_tests(pool: &DbPool, failure_id: i64, test_ids: &[String]) -> R
     Ok(())
 }
 
-/// Record one sighting of `failure_id`. Returns the new `ci_failure_runs` id.
+/// SPEC-3.5.2: record one sighting of `failure_id`. Returns the new `ci_failure_runs` id.
 pub async fn attach_run(
     pool: &DbPool,
     failure_id: i64,
@@ -221,7 +222,7 @@ pub async fn attach_run(
     Ok(id)
 }
 
-/// Set `run_id`'s own failing-id fingerprint, newline-joined (fingerprint ids
+/// SPEC-3.5.2: set `run_id`'s own failing-id fingerprint, newline-joined (fingerprint ids
 /// never contain a newline; `find_match`'s test-id overlap match is unrelated
 /// and never queries this column). CLAUDE-371: only the agent-PR fix-attempt
 /// flow needs one sighting's own fingerprint (to compare it against the
@@ -244,7 +245,7 @@ pub async fn set_run_test_ids(pool: &DbPool, run_id: i64, test_ids: &[String]) -
     Ok(())
 }
 
-/// `failure_id`'s previous sighting on `pr_number` (the newest
+/// SPEC-3.5.2: `failure_id`'s previous sighting on `pr_number` (the newest
 /// `ci_failure_runs` row strictly older than `before_run_id`) whose recorded
 /// fingerprint is non-empty, as `(run_index, test_ids)`. `None` covers both
 /// "no earlier sighting on this PR" and "the earlier sighting's fingerprint
@@ -277,7 +278,7 @@ pub async fn previous_run_test_ids(
     }))
 }
 
-/// Point `failure_id` at `issue_key` (or clear it with `None`).
+/// SPEC-3.5.2: point `failure_id` at `issue_key` (or clear it with `None`).
 pub async fn set_issue(
     pool: &DbPool,
     failure_id: i64,
@@ -299,7 +300,7 @@ pub async fn set_issue(
     Ok(())
 }
 
-/// Transition `failure_id` to `state` (`open`, `resolved`, `pr_only`).
+/// SPEC-3.5.2: transition `failure_id` to `state` (`open`, `resolved`, `pr_only`).
 pub async fn set_failure_state(
     pool: &DbPool,
     failure_id: i64,
@@ -321,7 +322,7 @@ pub async fn set_failure_state(
     Ok(())
 }
 
-/// Every distinct branch `failure_id` has been seen on, sorted.
+/// SPEC-3.5.2: every distinct branch `failure_id` has been seen on, sorted.
 pub async fn distinct_branches(pool: &DbPool, failure_id: i64) -> Result<Vec<String>> {
     let branches: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
         db::q(
@@ -336,7 +337,7 @@ pub async fn distinct_branches(pool: &DbPool, failure_id: i64) -> Result<Vec<Str
     Ok(branches)
 }
 
-/// The `ci_failures` row currently claimed by `issue_key`, if any (CLAUDE-276:
+/// SPEC-3.5 / SPEC-3.5.2: the `ci_failures` row currently claimed by `issue_key`, if any (CLAUDE-276:
 /// used to find or lazily create the store row backing an agent's own PR, whose
 /// `ci_failures` row is addressed by issue key rather than by test overlap).
 pub async fn failure_for_issue(pool: &DbPool, issue_key: &str) -> Result<Option<Failure>> {
@@ -351,7 +352,7 @@ pub async fn failure_for_issue(pool: &DbPool, issue_key: &str) -> Result<Option<
     row.as_ref().map(failure_from_row).transpose()
 }
 
-/// Every distinct non-null PR number `failure_id` has been seen sighted on,
+/// SPEC-3.5 / SPEC-3.5.2: every distinct non-null PR number `failure_id` has been seen sighted on,
 /// sorted. CLAUDE-276: used to comment the same issue link onto every open
 /// PR a `pr_only` failure's two distinct branches turned out to be on.
 pub async fn pr_numbers_for_failure(pool: &DbPool, failure_id: i64) -> Result<Vec<i64>> {
@@ -369,7 +370,7 @@ pub async fn pr_numbers_for_failure(pool: &DbPool, failure_id: i64) -> Result<Ve
     Ok(numbers)
 }
 
-/// Every run index `failure_id` was sighted at on PR `pr_number`, sorted.
+/// SPEC-3.5 / SPEC-3.5.2: every run index `failure_id` was sighted at on PR `pr_number`, sorted.
 /// CLAUDE-276: used to list every fix attempt's run when an agent's own PR
 /// hits the `agent_pr_fix_attempts` ceiling and is flagged `Needs Review`.
 pub async fn run_indexes_for_failure_pr(
@@ -392,7 +393,7 @@ pub async fn run_indexes_for_failure_pr(
     Ok(indexes)
 }
 
-/// `ci_failures` rows for `mcp stdio`'s `list_ci_failures` tool, newest first.
+/// SPEC-3.5.2: `ci_failures` rows for `mcp stdio`'s `list_ci_failures` tool, newest first.
 /// `state` narrows to one `state` value (`open` / `resolved` / `pr_only`); with
 /// `None` every state is returned.
 pub async fn list_failures(pool: &DbPool, state: Option<&str>, limit: i64) -> Result<Vec<Failure>> {
@@ -416,7 +417,7 @@ pub async fn list_failures(pool: &DbPool, state: Option<&str>, limit: i64) -> Re
     rows.iter().map(failure_from_row).collect()
 }
 
-/// Record a PR the agent opened. `salvaged` is true for a timeout-salvage PR
+/// SPEC-3.5.2: record a PR the agent opened. `salvaged` is true for a timeout-salvage PR
 /// (`Finalized::TimedOut`), false otherwise (CLAUDE-429). Returns its
 /// `agent_pull_requests` id.
 #[allow(clippy::too_many_arguments)]
@@ -453,7 +454,7 @@ pub async fn record_agent_pr(
     Ok(id)
 }
 
-/// Clear `id`'s `salvaged` flag: called only from the resumed-success path
+/// SPEC-3.5.2: clear `id`'s `salvaged` flag: called only from the resumed-success path
 /// (CLAUDE-429), once a resumed run on a salvaged PR finishes successfully.
 pub async fn clear_salvaged(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
@@ -470,7 +471,7 @@ pub async fn clear_salvaged(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     Ok(())
 }
 
-/// The agent's PR at `(host, repo, pr_number)`, the unique key a PR is
+/// SPEC-3.5.2: the agent's PR at `(host, repo, pr_number)`, the unique key a PR is
 /// addressed by regardless of which issue currently claims it.
 pub async fn agent_pr(
     pool: &DbPool,
@@ -491,7 +492,7 @@ pub async fn agent_pr(
     row.as_ref().map(agent_pr_from_row).transpose()
 }
 
-/// The agent PR filed against `issue_key` that a re-queue should continue:
+/// SPEC-3.5.2: the agent PR filed against `issue_key` that a re-queue should continue:
 /// the `open` row when one exists (an issue carries at most one open agent PR
 /// at a time), falling back to the most recently updated row otherwise. Over
 /// an issue's lifetime more than one row can accumulate (an earlier PR closed
@@ -519,7 +520,7 @@ pub async fn agent_pr_for_issue(
     row.as_ref().map(agent_pr_from_row).transpose()
 }
 
-/// Every `agent_pull_requests` row still `open`, for the CLAUDE-328
+/// SPEC-3.3.1 / SPEC-3.5.2: every `agent_pull_requests` row still `open`, for the CLAUDE-328
 /// reconciler: a webhook is the low-latency trigger for automerge, but a
 /// missed delivery must not leave a green PR stuck at Code Review forever, so
 /// the reconciler walks this list on its own tick independent of any webhook.
@@ -534,7 +535,7 @@ pub async fn open_agent_prs(pool: &DbPool) -> Result<Vec<AgentPullRequest>> {
     rows.iter().map(agent_pr_from_row).collect()
 }
 
-/// Increment `id`'s `fix_attempts` by one.
+/// SPEC-3.5 / SPEC-3.5.2: increment `id`'s `fix_attempts` by one.
 pub async fn bump_fix_attempts(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
@@ -547,7 +548,7 @@ pub async fn bump_fix_attempts(pool: &DbPool, id: i64, now: &str) -> Result<()> 
     Ok(())
 }
 
-/// Transition `id` to `state` (`open`, `merged`, `closed`).
+/// SPEC-3.5.2: transition `id` to `state` (`open`, `merged`, `closed`).
 pub async fn set_agent_pr_state(pool: &DbPool, id: i64, state: &str, now: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         db::q(
