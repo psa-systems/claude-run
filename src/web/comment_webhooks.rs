@@ -1502,6 +1502,22 @@ fn serve_run(
         }
     }
 
+    let too_big_push = if matches!(decision, Decision::TooBig { .. }) {
+        match push_too_big_fix(backend, cmd, workdir) {
+            Ok(side_branch) => Some(TooBigPush::Pushed {
+                branch: side_branch,
+            }),
+            Err(e) => {
+                warn!(repo = %cmd.repo, pr = cmd.number, error = %e, "side-branch push failed for an over-cap change");
+                Some(TooBigPush::Failed {
+                    error: e.to_string(),
+                })
+            }
+        }
+    } else {
+        None
+    };
+
     // Written beside the checkout rather than into it, same as the instruction
     // and commit-message files: a successful clone always resolves the git
     // directory, and a clone that never happened has nothing tracked in
@@ -1516,6 +1532,7 @@ fn serve_run(
             &claude_result,
             push_err.as_deref(),
             push_comment_failure.as_deref(),
+            too_big_push.as_ref(),
         ),
     );
 
@@ -1528,6 +1545,7 @@ fn serve_run(
         summary,
         ok: claude_result.ok
             && push_err.is_none()
+            && !matches!(too_big_push, Some(TooBigPush::Failed { .. }))
             && !matches!(decision, Decision::MeasureFailed { .. }),
         claude_ran,
         claude_ok: claude_result.ok,
@@ -1766,6 +1784,15 @@ pub enum Decision {
     },
 }
 
+/// The result of pushing a [`Decision::TooBig`] change to its side branch
+/// (SPEC-3.3.1, SPEC-3.6): the commits still reach the forge, just not the PR
+/// head, since an over-cap diff is never pushed unattended onto a live PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TooBigPush {
+    Pushed { branch: String },
+    Failed { error: String },
+}
+
 impl Decision {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -1973,6 +2000,23 @@ fn push_fix(
 ) -> crate::error::Result<()> {
     let push_url = backend.clone_url(&cmd.host, &cmd.repo)?;
     git_push(workdir, &push_url, branch)
+}
+
+/// Push a [`Decision::TooBig`] change to a side branch instead of the PR head
+/// (SPEC-3.3.1, SPEC-3.6): an over-cap diff still gets its commits onto the
+/// forge, just not onto the live PR branch. The branch name is derived from
+/// [`VerifiedCommentCommand::key`] so a redelivery of the same comment lands
+/// on the same side branch rather than minting a new one each retry.
+fn push_too_big_fix(
+    backend: &dyn Backend,
+    cmd: &VerifiedCommentCommand,
+    workdir: &FsPath,
+) -> crate::error::Result<String> {
+    let side_branch = format!("claude-fix/{}", cmd.key());
+    let push_url = backend.clone_url(&cmd.host, &cmd.repo)?;
+    let refspec = format!("HEAD:refs/heads/{side_branch}");
+    git_push(workdir, &push_url, &refspec)?;
+    Ok(side_branch)
 }
 
 /// Post the CLAUDE-447 `comment-webhook fix push` comment after [`push_fix`]
@@ -2270,6 +2314,7 @@ pub fn outcome_comment(
     claude: &ClaudeResult,
     push_err: Option<&str>,
     push_comment_failure: Option<&str>,
+    too_big_push: Option<&TooBigPush>,
 ) -> String {
     match decision {
         Decision::ClaudeFailed => {
@@ -2313,17 +2358,30 @@ pub fn outcome_comment(
             "Nothing was pushed. See the runner journal for full context.".to_string(),
         ]
         .join("\n"),
-        Decision::TooBig { files, lines } => [
-            "**Claude produced a change too large for an unattended push.**".to_string(),
-            String::new(),
-            format!("Files: {files}, Lines: {lines}"),
-            String::new(),
-            "Summary:".to_string(),
-            claude.summary.clone(),
-            String::new(),
-            "Nothing was pushed; this needs human review.".to_string(),
-        ]
-        .join("\n"),
+        Decision::TooBig { files, lines } => {
+            let tail = match too_big_push {
+                Some(TooBigPush::Pushed { branch }) => format!(
+                    "The commits were pushed to `{branch}` (SPEC-3.3.1), not to this PR's \
+                     branch; this needs human review before it lands here."
+                ),
+                Some(TooBigPush::Failed { error }) => format!(
+                    "Pushing the commits to a side branch also FAILED: {error}\n\nThe commits \
+                     are still only in the runner's local checkout; this needs human review."
+                ),
+                None => "Nothing was pushed; this needs human review.".to_string(),
+            };
+            [
+                "**Claude produced a change too large for an unattended push.**".to_string(),
+                String::new(),
+                format!("Files: {files}, Lines: {lines}"),
+                String::new(),
+                "Summary:".to_string(),
+                claude.summary.clone(),
+                String::new(),
+                tail,
+            ]
+            .join("\n")
+        }
         Decision::Push { .. } => match push_err {
             Some(err) => [
                 "**Claude made the change but the push FAILED.**".to_string(),
@@ -3454,12 +3512,19 @@ mod tests {
             killed: false,
             exit_code: Some(0),
         };
-        let pushed = outcome_comment(&Decision::Push { files: 1, lines: 2 }, &ok, None, None);
+        let pushed = outcome_comment(
+            &Decision::Push { files: 1, lines: 2 },
+            &ok,
+            None,
+            None,
+            None,
+        );
         assert!(pushed.contains("Claude pushed a commit."));
         let push_failed = outcome_comment(
             &Decision::Push { files: 1, lines: 2 },
             &ok,
             Some("git push exited 1"),
+            None,
             None,
         );
         assert!(push_failed.contains("push FAILED"));
@@ -3469,10 +3534,12 @@ mod tests {
             &ok,
             None,
             Some("boom"),
+            None,
         );
         assert!(pushed_with_comment_failure.contains("Claude pushed a commit."));
         assert!(pushed_with_comment_failure.contains("Note: boom"));
-        assert!(outcome_comment(&Decision::NoChanges, &ok, None, None).contains("made no changes"));
+        assert!(outcome_comment(&Decision::NoChanges, &ok, None, None, None)
+            .contains("made no changes"));
         assert!(outcome_comment(
             &Decision::TooBig {
                 files: 99,
@@ -3480,16 +3547,48 @@ mod tests {
             },
             &ok,
             None,
-            None
+            None,
+            None,
         )
         .contains("too large"));
+        let too_big_pushed = outcome_comment(
+            &Decision::TooBig {
+                files: 99,
+                lines: 9,
+            },
+            &ok,
+            None,
+            None,
+            Some(&TooBigPush::Pushed {
+                branch: "claude-fix/abc123".to_string(),
+            }),
+        );
+        assert!(too_big_pushed.contains("claude-fix/abc123"));
+        assert!(!too_big_pushed.contains("Nothing was pushed"));
+        let too_big_push_failed = outcome_comment(
+            &Decision::TooBig {
+                files: 99,
+                lines: 9,
+            },
+            &ok,
+            None,
+            None,
+            Some(&TooBigPush::Failed {
+                error: "git push exited 1".to_string(),
+            }),
+        );
+        assert!(too_big_push_failed.contains("also FAILED"));
+        assert!(too_big_push_failed.contains("git push exited 1"));
         let failed = ClaudeResult::synthesized("claude exited 1", "tail");
-        assert!(outcome_comment(&Decision::ClaudeFailed, &failed, None, None).contains("FAILED"));
+        assert!(
+            outcome_comment(&Decision::ClaudeFailed, &failed, None, None, None).contains("FAILED")
+        );
         let unresolved = outcome_comment(
             &Decision::UnresolvedConflicts {
                 paths: vec!["a.txt".to_string()],
             },
             &ok,
+            None,
             None,
             None,
         );
@@ -3501,6 +3600,7 @@ mod tests {
                 reason: "git diff exited 1".to_string(),
             },
             &ok,
+            None,
             None,
             None,
         );
@@ -3518,23 +3618,23 @@ mod tests {
     fn claude_failed_comment_explains_recognized_exit_codes() {
         let mut timed_out = ClaudeResult::synthesized("claude exited 124, see stream.jsonl", "");
         timed_out.timed_out = true;
-        let body = outcome_comment(&Decision::ClaudeFailed, &timed_out, None, None);
+        let body = outcome_comment(&Decision::ClaudeFailed, &timed_out, None, None, None);
         assert!(body.contains("timeout"), "{body}");
         assert!(body.contains("claude_timeout_seconds"), "{body}");
 
         let mut killed = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
         killed.killed = true;
-        let body = outcome_comment(&Decision::ClaudeFailed, &killed, None, None);
+        let body = outcome_comment(&Decision::ClaudeFailed, &killed, None, None, None);
         assert!(body.contains("SIGKILL"), "{body}");
         assert!(body.contains("out-of-memory"), "{body}");
 
         let plain = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "tail");
-        let with_hint = outcome_comment(&Decision::ClaudeFailed, &plain, None, None);
+        let with_hint = outcome_comment(&Decision::ClaudeFailed, &plain, None, None, None);
         let without_hint_field = {
             let mut r = plain.clone();
             r.timed_out = false;
             r.killed = false;
-            outcome_comment(&Decision::ClaudeFailed, &r, None, None)
+            outcome_comment(&Decision::ClaudeFailed, &r, None, None, None)
         };
         assert_eq!(with_hint, without_hint_field);
         assert!(!with_hint.contains("timeout"), "{with_hint}");
@@ -3557,7 +3657,7 @@ mod tests {
         let mut killed = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
         killed.killed = true;
         killed.summary = summary;
-        let body = outcome_comment(&Decision::ClaudeFailed, &killed, None, None);
+        let body = outcome_comment(&Decision::ClaudeFailed, &killed, None, None, None);
         assert!(!body.contains("signature"), "{body}");
         assert!(!body.contains("secret reasoning"), "{body}");
     }
@@ -5137,5 +5237,79 @@ mod tests {
             1,
             "a failed write must never be retried: {calls:?}"
         );
+    }
+
+    /// SPEC-3.3.1 / SPEC-3.6: an over-cap diff still gets its commits onto the
+    /// forge, on a side branch keyed off the comment, instead of being left
+    /// local-only. `clone_url` is real `CliBackend` code (token read from
+    /// `keys.json`); the only test-only wiring is a `url.<bare>.insteadOf`
+    /// rule in the workdir's own git config, which redirects that exact
+    /// authenticated URL to a local bare repo so the push is a real `git
+    /// push`, not a stub.
+    #[test]
+    fn an_over_cap_diff_pushes_its_commits_to_a_side_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("origin.git");
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+
+        let workdir = tmp.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        repo_with_one_commit(&workdir);
+        std::fs::write(workdir.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(&workdir, &["add", "a.txt"]).unwrap();
+        git_in(
+            &workdir,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "a change too large to push unattended",
+            ],
+        )
+        .unwrap();
+        let local_tip = git_output(&workdir, &["rev-parse", "HEAD"]).unwrap();
+
+        let keys = tmp.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{"dev.a8n.run":{"token":"tok"}}}"#).unwrap();
+        let backend = CliBackend::new(Arc::new(StubRunner::new())).with_keys_path(&keys);
+        let cmd = gate_cmd();
+        let authed_url = backend.clone_url(&cmd.host, &cmd.repo).unwrap();
+        let plain_url = crate::provider::strip_userinfo(&authed_url);
+        git_in(
+            &workdir,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", bare_url(&bare)),
+                &plain_url,
+            ],
+        )
+        .unwrap();
+
+        let side_branch = push_too_big_fix(&backend, &cmd, &workdir).unwrap();
+        assert_eq!(side_branch, format!("claude-fix/{}", cmd.key()));
+
+        let remote_tip = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["rev-parse", &side_branch])
+            .output()
+            .unwrap();
+        assert!(
+            remote_tip.status.success(),
+            "side branch must exist on the remote: {remote_tip:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&remote_tip.stdout).trim(),
+            local_tip,
+            "the remote side branch must point at the local commit that was too big to push to the PR head"
+        );
+    }
+
+    fn bare_url(path: &FsPath) -> String {
+        format!("file://{}", path.display())
     }
 }

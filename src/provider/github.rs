@@ -2367,7 +2367,13 @@ mod tests {
         )
         .with_git_retry_waits(NO_WAIT);
         let err = forge
-            .push(Path::new("/tmp/wd"), "github.com", "octo/widget", "feat/x")
+            .push(
+                Path::new("/tmp/wd"),
+                "github.com",
+                "octo/widget",
+                "feat/x",
+                false,
+            )
             .unwrap_err()
             .to_string();
         assert!(err.contains("failed to push some refs"), "{err}");
@@ -2393,7 +2399,13 @@ mod tests {
         )
         .with_git_retry_waits(NO_WAIT);
         match forge
-            .push(Path::new("/tmp/wd"), "github.com", "octo/widget", "feat/x")
+            .push(
+                Path::new("/tmp/wd"),
+                "github.com",
+                "octo/widget",
+                "feat/x",
+                false,
+            )
             .unwrap_err()
         {
             Error::CliFailed { stderr, .. } => assert_eq!(stderr, "boom"),
