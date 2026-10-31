@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::AutoFixConfig;
 use crate::triage::TriageInput;
 
-/// A mechanically-fixable CI failure produced by a detector. Flows through the
+/// SPEC-3.5.1: a mechanically-fixable CI failure produced by a detector. Flows through the
 /// [`crate::triage::Triage`] verdict into the mint so the issue summary /
 /// description name the concrete problem and fix instead of the generic
 /// "CI failure" template.

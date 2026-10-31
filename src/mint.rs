@@ -51,7 +51,7 @@ use crate::error::Result;
 use crate::provider::{IssueTracker, VcsMapEntry};
 use crate::triage::{Triage, TriageBucket};
 
-/// Default time-to-live for the cached inverse VCS routing map: a
+/// SPEC-3.5: default time-to-live for the cached inverse VCS routing map: a
 /// just-added VCS integration is picked up within this window without a daemon
 /// restart, while steady-state mints reuse the cache and issue no extra `yt`
 /// calls. Refresh-on-miss shortens this for a genuinely new repo.

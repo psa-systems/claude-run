@@ -107,7 +107,7 @@ impl FromStr for TriageBucket {
     }
 }
 
-/// Which pass produced a [`Triage`].
+/// SPEC-3.5.1: which pass produced a [`Triage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClassifiedBy {
@@ -117,7 +117,7 @@ pub enum ClassifiedBy {
     Llm,
 }
 
-/// The typed triage result consumed by the issue-minting subtask.
+/// SPEC-3.5.1: the typed triage result consumed by the issue-minting subtask.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Triage {
     /// The bucket this failure was sorted into.
@@ -165,8 +165,8 @@ impl Triage {
     }
 }
 
-/// Everything the engine needs about one verified failure: the metadata from the
-/// `action_run_failure` event plus its redacted log.
+/// SPEC-3.5.1: everything the engine needs about one verified failure: the
+/// metadata from the `action_run_failure` event plus its redacted log.
 #[derive(Debug, Clone)]
 pub struct TriageInput {
     /// `owner/repo`.
