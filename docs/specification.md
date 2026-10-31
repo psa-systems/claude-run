@@ -1,7 +1,8 @@
 # claude-run Specification
 
-This document describes claude-run as implemented in the source tree. It is derived from the code (Rust crate, SQL
-migrations, templates, container build files), not from other documentation.
+This document is normative. It describes claude-run as implemented in the source tree (Rust crate, SQL migrations,
+templates, container build files), and code that disagrees with it is a defect. Requirements that code cites carry a
+`SPEC-<section>` identifier, for example `SPEC-3.3.1`.
 
 ## 1. Purpose and scope
 
@@ -137,21 +138,37 @@ each invocation is recorded in `claude_invocations`.
   by the configured verbs (defaults: `depends on`, `parent for`), leaves the issue queued, comments the blockers once,
   and re-evaluates after `recheck_timeout`.
 - Pre: set the field to working and `State` to the in-progress value, then `git clone --depth 50`.
-- Claude works locally only. The agent may create issues in `write_projects` (default: the triggering issue's project),
-  linked `relates to` / `depends on` / `is required for`, never as a subtask.
-- Finalize runs on every path and is the only place external mutations happen:
-  - marker file `.claude-run-needs-review`: field set to needs-review, no PR, `Needs-Info` tag added (name configurable
-    under `tags.needs_info`), attempt not counted.
+- Claude works in the local clone; the runner pushes the result (see 3.3.1). The agent may create issues in
+  `write_projects` (default: the triggering issue's project), linked `relates to` / `depends on` / `is required for`,
+  never as a subtask.
+- Finalize runs on every path and is the only place external mutations happen. Every path first applies 3.3.1, then:
+  - marker file `.claude-run-needs-review`: commits pushed, field set to needs-review, no PR, `Needs-Info` tag added (name
+    configurable under `tags.needs_info`), attempt not counted.
   - marker file `.claude-run-no-code-change`: field set to `states.no_code` (default: the done label), marker text posted
-    as a comment, no PR.
+    as a comment, no PR. Any commits the attempt made are pushed.
   - success with commits: a draft PR is created (branch strategy `branch` by default, `agit` opt-in), a fresh read-only
     review session runs, and a pass marker `.claude-run-review-pass` promotes the PR to ready and sets the field to
     code-review. A fail marker `.claude-run-review-fail` or no verdict keeps the PR draft, posts the findings on the PR and
     the issue, and sets the field to queued (below the attempt cap) or needs-review.
-  - hard failure: field set to failed. A push or PR-create failure with a recorded open PR below the attempt cap
-    requeues instead.
-  - timeout: a checkpoint push (every 60 seconds while `claude` runs) can salvage work into a draft PR; the issue lands in
-    needs-review.
+  - hard failure: commits pushed, field set to failed. A push or PR-create failure with a recorded open PR below the
+    attempt cap requeues instead.
+  - timeout or cancel: the final push in 3.3.1 runs; the checkpoint push (every 60 seconds while `claude` runs) is the
+    backstop if the runner dies first. A draft PR is opened and the issue lands in needs-review.
+
+#### 3.3.1 Push invariant (`SPEC-3.3.1`)
+
+- Every attempt that produces one or more commits ends with them on a branch on the forge, on every path: success, hard
+  failure, timeout, cancel, needs-review, no-code-change and failed review. A run is never recorded finished while its
+  commits exist only in the local clone.
+- The branch name is deterministic per issue, so a requeued issue continues the same branch. A pushed branch does not
+  imply a PR; PR creation follows the path rules above.
+- A failed final push is a failure: non-zero exit, field set to failed, a `run_events` row naming the branch and the
+  redacted git error. It is never reported as success.
+- When the repository's `pre-push` hook rejects the final push, the runner pushes the same commits with `--no-verify`,
+  opens the PR as a draft, and posts the hook output on the PR and the issue. The hook's verdict is reported, not used
+  to withhold the work. The checkpoint push already uses `--no-verify`.
+- A fresh clone carries the remote's tags (CLAUDE-484), so a repository check that reads tags gives the same verdict in a
+  run as on a developer machine.
 - The runner never sets `State` to done. A tracker-side workflow resolves the issue when its PR merges
   (`docs/yt-workflow-resolve-on-pr-merge.js`).
 - Optional `automerge` (default off): wait up to `wait_seconds` (1800) polling checks every `check_interval_seconds`
@@ -198,8 +215,8 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
 - The commenter's repository permission is read with the write-scoped token and must match `allowed_permissions`
   (default `write`, `admin`; a Forgejo level also admits every higher level).
 - Pull request: clone the head branch, run Claude with the instruction, commit, and push only when the diff is within
-  `max_files` (10) and `max_lines` (300) and has no unresolved conflicts; otherwise comment instead of pushing. The commit
-  carries `skip_marker` (default `[skip claude]`) and the configured bot identity. The outcome is posted as a PR reply.
+  `max_files` (10) and `max_lines` (300) and has no unresolved conflicts. Otherwise the commits are pushed to a side
+  branch (3.3.1), not to the PR head, and the reply says so. The commit carries `skip_marker` (default `[skip claude]`) and the configured bot identity. The outcome is posted as a PR reply.
 - Plain issue: create a tracker issue carrying the instruction and a back link, set it to queued, and reply with its key.
 - Throttling: synthetic action `webhook-comment` with `max_runs_per_day` (20); session timeout
   `claude_timeout_seconds` (600).
@@ -217,8 +234,8 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
 
 All sweeps are DB-backed settings, enabled by default flags in each section, and run at serve start and hourly:
 
-- Workdir GC: preserved or aside workdirs older than `retention_days` (14) are deleted; workdirs with unpushed local work
-  are kept until `unpushed_hard_cap_days` (60).
+- Workdir GC: preserved or aside workdirs older than `retention_days` (14) are deleted. A workdir holding unpushed
+  commits violates 3.3.1; it is kept until `unpushed_hard_cap_days` (60) and logged as a defect, never treated as normal.
 - Stream-log GC: stream logs older than `retention_days` (30); `daemon.log`, per-action `output.file` and `usage.jsonl`
   are bounded by size; snippets and `webhook-logs` have their own retention days.
 - DB retention: rows older than `retention_days` (180) are deleted from `job_outcomes`, `run_events`, `ci_failure_runs`
