@@ -101,7 +101,12 @@ GitHub MCP endpoint (GitHub), `git`, `claude`, `nu` (default interpreter for scr
   Parsing rejects unknown fields (`deny_unknown_fields`). A file that fails to parse is recorded with a parse error and
   never scheduled. The directory is rescanned every scheduler tick, so new files need no restart.
 - Action kinds: `scripted` (default), `youtrack`, `closed-issue-summary`. A native kind requires a matching `native`
-  block.
+  block. A retired kind (`forgejo-ci-fix`, `ci-failure-analysis`, `ci-failure-reconcile`) fails to load with an
+  error naming the retired kind, checked before the general YAML parse so it reads as "retired", not as an unknown
+  value.
+- An unknown `native.youtrack.prompt_preset` value fails to load with an error naming it and the valid presets,
+  checked before the general YAML parse so it reads as an invalid preset, not an untagged-enum mismatch naming no
+  field.
 - `scripted` runs `input.command` (emits a JSON array) -> `filter` -> `pre` -> `prompt` -> `claude` -> `post`; each
   script is a plain string or `{run, shell}`, with `nu` as the default interpreter.
 - Schedule: `kind: interval` (`humantime` duration, e.g. `30m`), `kind: cron` (5-field or 6-field expression), or
@@ -115,6 +120,13 @@ GitHub MCP endpoint (GitHub), `git`, `claude`, `nu` (default interpreter for scr
   falls back to a built-in default window instead).
 - The daemon refuses a daily run beyond `max_runs_per_day` (exit code 4) and a run over budget (exit code 6).
 - A per-key attempt counter parks a job once it reaches the cap; `action reset-attempts` clears it.
+- Optional `link_template` renders a job key as a clickable link in the web UI, substituting `{key}`; other `{...}`
+  tokens pass through unchanged.
+- Optional `output.file` (relative to the state dir) appends one JSON record per job outcome, the same shape the DB's
+  `job_outcomes` table stores; unset writes nothing. Bounded by size, see 3.8.
+- Optional `env` and `secrets` blocks (`scripted` only; a native kind uses `token_ref` instead): each key is a
+  shell-safe variable name (`A-Z0-9_`), named in at most one of the two blocks, and a `secrets` value names a
+  non-empty secret.
 
 ### 3.2 Claude invocation
 
@@ -137,7 +149,11 @@ each invocation is recorded in `claude_invocations`.
   must still equal the queued value, and the dependency gate must pass. The dependency gate blocks on open issues linked
   by the configured verbs (defaults: `depends on`, `parent for`), leaves the issue queued, comments the blockers once,
   and re-evaluates after `recheck_timeout`.
-- Pre: set the field to working and `State` to the in-progress value, then `git clone --depth 50`.
+- Pre: set the field to working and `State` to the in-progress value, optionally set `Assignee`, then
+  `git clone --depth 50` and install the repo's own git hooks (`just install-hooks`, when the clone has that
+  recipe) so a commit or push that fails the repo's local checks is blocked locally, not only caught later by CI
+  (A8N-69). Hook install is best-effort: a repo with no `install-hooks` recipe, or a host without `just`, is left
+  unchanged and pickup continues.
 - Claude works in the local clone; the runner pushes the result (see 3.3.1). The agent may create issues in
   `write_projects` (default: the triggering issue's project), linked `relates to` / `depends on` / `is required for`,
   never as a subtask.
@@ -170,10 +186,23 @@ each invocation is recorded in `claude_invocations`.
 - A fresh clone carries the remote's tags (CLAUDE-484), so a repository check that reads tags gives the same verdict in a
   run as on a developer machine.
 - The runner never sets `State` to done. A tracker-side workflow resolves the issue when its PR merges
-  (`docs/yt-workflow-resolve-on-pr-merge.js`).
-- Optional `automerge` (default off): wait up to `wait_seconds` (1800) polling checks every `check_interval_seconds`
-  (30), then merge, and set the field to done. A reconciler every 300 seconds and action-success webhooks drive the same
-  decision for recorded agent PRs.
+  (`docs/yt-workflow-resolve-on-pr-merge.js`). The legacy `states.state_done` key is deprecated and ignored (a
+  load-time warning names it); loading still succeeds so an existing action file keeps working.
+- Optional `automerge` (default off): merge and set the field to done once checks pass. Finalize never polls for this;
+  a reconciler every 300 seconds and action-success webhooks drive the decision for recorded agent PRs. The legacy
+  `wait_seconds` / `check_interval_seconds` keys are deprecated and ignored (a load-time warning names them); loading
+  still succeeds so an existing action file keeps working.
+- Automerge separates a behind-base PR (its branch is simply behind its base, `behind_base: true`) from a real
+  conflict: a green, behind-base PR is updated through the forge's update-branch endpoint, which retriggers CI, and a
+  later success event re-evaluates and merges once that run goes green; a PR whose checks are green but the forge
+  still reports it not mergeable for another reason (an actual conflict, still-checking, or WIP) is left at Code
+  Review for a human, as is a merge call that fails after the mergeable check passed. When the behind-base update
+  itself fails because of a merge conflict, the runner dispatches one `/claude` conflict-resolution run instead of
+  leaving it to a human on the first attempt per PR head commit; a second failure for the same head commit falls
+  back to leaving it at Code Review. When the forge reports no `behind_base` at all, automerge takes no merge action:
+  on Forgejo this means the runtime's `fj` predates FJ-99 and a human must act; on GitHub, `mergeStateStatus` is
+  still `UNKNOWN` (computed lazily after a push) and the reconciler re-checks on its next pass. Each of these
+  outcomes posts one comment naming the reason.
 - Targets: `forgejo` (`base_url`, `token_ref`, `pr_strategy`) and `github` (`hosts`, `mcp_endpoint`, `token_ref`). A job
   whose repository host is `github.com` or listed in `github.hosts` uses the GitHub backend; any other host uses `fj`.
 - Prompt: `prompt` overrides; otherwise `prompt_preset` is `default` or `audit`.
@@ -241,6 +270,21 @@ All sweeps are DB-backed settings, enabled by default flags in each section, and
 - DB retention: rows older than `retention_days` (180) are deleted from `job_outcomes`, `run_events`, `ci_failure_runs`
   and `claude_invocations`.
 - Docker GC: named Docker volumes unreferenced by any container and older than `volume_retention_days` (3) are removed.
+
+### 3.9 Run comment footer (`SPEC-3.9`)
+
+Every runner-posted comment (job-lifecycle comments on 3.3/3.3.1's paths, the closed-issue summary's marker comment,
+the dependency-gate blocker comment, the attempt-cap comment, webhook replies) appends a footer rather than relying on
+callers to build one themselves:
+
+- A `Run:` line linking back to the run: `<public_url>/runs/<id>` for a run-level comment, or
+  `<public_url>/runs/<id>/jobs/<key>/attempt/<n>` for a comment about one job's attempt. `public_url` is resolved
+  independently of SMTP configuration, so the footer still links out when SMTP is unset or broken; when it is unset
+  the line instead names `CLAUDE_RUN_PUBLIC_URL` as missing, with the run id and attempt still stated in words. When
+  no run id is available at all (a daemon-restart reconcile, or the run row itself failed to open) the line says so
+  explicitly rather than being omitted.
+- `Started:`, `Finished:` (RFC 3339, second precision) and `Duration:` (`<minutes>m <seconds>s`, or `<seconds>s` under
+  a minute) lines, computed from the attempt's or run's own start time and "now" as the finish time.
 
 ## 4. Interfaces
 
