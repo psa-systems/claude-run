@@ -735,7 +735,7 @@ mod tests {
         let pool = mem_pool().await;
         ensure_key(&pool).await.unwrap();
         let key = SecretsKey::load().unwrap();
-        crate::state::secret_create(&pool, "my-token", &key.encrypt("mzm_value").unwrap())
+        crate::state::secret_create(&pool, "my-token", &key.encrypt("tok_value").unwrap())
             .await
             .unwrap();
 
