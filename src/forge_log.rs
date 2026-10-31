@@ -1,4 +1,4 @@
-//! Forgejo Action log fetch with retry and secret redaction.
+//! SPEC-3.5: Forgejo Action log fetch with retry and secret redaction.
 //!
 //! A run's logs are read through the `fj` CLI:
 //!
@@ -100,7 +100,7 @@ pub struct JobLog {
 /// The [`JobLog::log_state`] value that means the log is gone for good.
 pub const LOG_STATE_MISSING: &str = "missing";
 
-/// `Some(reason)` when `fj` reports EVERY job's log as permanently
+/// SPEC-3.5: `Some(reason)` when `fj` reports EVERY job's log as permanently
 /// missing (the FJ-79 signal), so the run has no log to analyze and never will.
 /// `None` when any job carries a log, when the run has no jobs, or when the `fj`
 /// that answered predates FJ-79 and says nothing about the state: this may only
@@ -327,7 +327,7 @@ enum LastProbe {
     Fault(String),
 }
 
-/// Fetch every job's log for `target` through `fj actions logs`, retrying while
+/// SPEC-3.5: fetch every job's log for `target` through `fj actions logs`, retrying while
 /// the run is not visible yet, redact each job's log, and write the concatenated
 /// redacted text to an artifact file under `out_dir`. Returns
 /// [`LogOutcome::Fetched`] on success, [`LogOutcome::AuthDenied`] immediately on
@@ -620,6 +620,8 @@ const WORKFLOW_DIRS: &[&str] = &[
 /// and returns the first that resolves, redacted. `None` when none
 /// resolve (the analysis proceeds over the log alone and says the YAML was
 /// unavailable). Never errors on a miss.
+/// SPEC-3.5: redacted read of the failing workflow's YAML, used by the
+/// analysis pass alongside the fetched job logs.
 pub fn read_workflow_yaml<C: RepoFileClient + ?Sized>(
     client: &C,
     host: &str,
@@ -765,6 +767,7 @@ pub fn resolve_branch(run_detail_branch: Option<&str>, log: &str) -> Option<Stri
 /// logs` returned: the first job whose status denotes a failure, else the first
 /// job. `None` for a run with no jobs. The job's position in the slice is its
 /// job index in run order, so nothing has to assume index 0.
+/// SPEC-3.5: triage input, selecting which job's log/name backs the failure.
 pub fn resolve_failing_job(jobs: &[JobLog]) -> Option<&JobLog> {
     jobs.iter()
         .find(|j| is_failure_status(&j.status))
@@ -775,6 +778,7 @@ pub fn resolve_failing_job(jobs: &[JobLog]) -> Option<&JobLog> {
 /// [`resolve_failing_job`] (which always returns exactly one job, falling back
 /// to the first), this is empty when nothing failed, and carries every failing
 /// job of a run where several checks failed independently (CLAUDE-344).
+/// SPEC-3.5: every failing job, used by the CLAUDE-344 CI-diagnostic context.
 pub fn failing_jobs(jobs: &[JobLog]) -> Vec<&JobLog> {
     jobs.iter()
         .filter(|j| is_failure_status(&j.status))
@@ -818,6 +822,8 @@ const CI_FAILURE_RUN_PROBE_LIMIT: usize = 5;
 /// carries no failing job. Callers proceed without CI context on `None`, per
 /// the acceptance criteria: a fix request with no resolvable failing run still
 /// proceeds as if this were never called.
+/// SPEC-3.6: diagnostic context for a comment-command fix request, resolved
+/// from the PR head branch's most recent failing check run.
 pub fn ci_failure_context_for_branch(
     client: &dyn ForgeReads,
     host: &str,
@@ -910,6 +916,8 @@ const STOPPED_STATUSES: &[&str] = &["cancelled", "skipped"];
 /// failed. Forgejo reports run-level `failure` for a run whose jobs were merely
 /// cancelled (a newer push superseded it), so the payload status alone cannot
 /// tell a broken build from a stopped one.
+/// SPEC-3.5: distinguishes a broken build from a stopped run, so a superseded
+/// or skipped run never triages as `code_fix`/`auto_fix`/`human_action`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobsVerdict {
     /// At least one job matched [`is_failure_status`]; carries its name and its
@@ -973,6 +981,8 @@ impl JobsVerdict {
 /// Redact secrets from `input`: first mask each known secret value verbatim,
 /// then redact token *shapes* (known prefixes, and high-entropy values that
 /// follow an auth keyword). Pure; the unit of the AC's redaction test.
+/// SPEC-3.5: shared redaction applied to every log fetched here before it is
+/// stored, attached, or fed into a diagnostic context.
 pub fn redact(input: &str, known_secrets: &[String]) -> String {
     let mut text = input.to_string();
     for s in known_secrets {

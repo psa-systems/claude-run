@@ -246,6 +246,10 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
 - Pull request: clone the head branch, run Claude with the instruction, commit, and push only when the diff is within
   `max_files` (10) and `max_lines` (300) and has no unresolved conflicts. Otherwise the commits are pushed to a side
   branch (3.3.1), not to the PR head, and the reply says so. The commit carries `skip_marker` (default `[skip claude]`) and the configured bot identity. The outcome is posted as a PR reply.
+- Before the fix request runs, the head branch's most recent failing check run is resolved and its failing jobs' tailed
+  logs are written to a scratch file as delimited, clearly-marked-as-data diagnostic context (never an instruction) so
+  the fix addresses the actual CI failure; a PR with no resolvable failing run proceeds with no CI context rather than
+  failing the request.
 - Plain issue: create a tracker issue carrying the instruction and a back link, set it to queued, and reply with its key.
 - Throttling: synthetic action `webhook-comment` with `max_runs_per_day` (20); session timeout
   `claude_timeout_seconds` (600).
@@ -596,6 +600,140 @@ action's `token_ref`, which is injected per job.
   already present in the agent dir (logged as a `warn`, since it is left in place rather than replaced), and an agent
   config dir that resolves (after symlinks) to the same directory as `$HOME/.claude` (nothing to report; source and
   target are one path). On macOS this step does not run; credentials live in the Keychain instead.
+
+### 8.2 Provider abstraction and backend resolution (`SPEC-8.2`)
+
+- Two traits capture every operation a native handler needs: `IssueTracker` (list queued issues, read/write a custom
+  field, set state/assignee, comment, inspect, resolve/map VCS, create/attach/link/tag an issue, verify auth, run a
+  bounded query, read a project) and `Forge` (open or adopt a PR, mark it ready, refresh its text, checkpoint-push,
+  resolve a clone URL, probe repo access, read identity/permission/CI state/mergeability, comment on a PR or issue,
+  merge or update a PR branch, add labels). A `Backend` is both at once.
+- `resolve`/`resolve_runner` walk an ordered `BackendKind` priority list and return the first backend whose `probe()`
+  succeeds, erroring with every attempt's own failure when none is usable. The YouTrack/Forgejo path is `[Cli]`
+  (CLI-first, CLI-only for this phase); the GitHub `Forge` prefers the hosted MCP endpoint, falling back to the `gh`
+  CLI (`[Mcp, Gh]`).
+- `CliBackend` implements both traits over `yt`/`fj`; `GithubForge` implements `Forge` (and the subset of
+  `IssueTracker` that makes sense, each method erroring "not supported") over `gh`/MCP/git. A job whose repository
+  host is `github.com` or listed in `github.hosts` uses `GithubForge`; any other host uses `CliBackend` (also see
+  SPEC-3.3.1's Targets bullet).
+- A CI-failure webhook read (log fetch, run list/timing, workflow file) routes per-call by host (`github.com` or a
+  configured host uses the `gh`-backed reader, everything else the `fj`-backed one), not by a per-source config
+  lookup, so one reader pair serves every configured repository (see SPEC-3.5).
+
+### 8.3 Audited tracker writes (`SPEC-8.3`)
+
+- Every YouTrack write a run makes goes through one run-scoped wrapper, `AuditedTracker`, built from an
+  `IssueWriteAudit` and wrapped around whichever `IssueTracker` the run resolved (see
+  [convention](conventions/actions.md#audited-youtrack-writes-claude-234)).
+- `create_issue` spends one slot of a per-run ceiling (`limits.max_issues_per_run`, default 25) BEFORE the tracker is
+  invoked, and refuses with a typed error past the ceiling; a claimed slot is never released, even when the create
+  itself then fails. Reaching the ceiling logs a `warn` and leaves an operator-visible notice the caller persists as
+  a `run_events` row, so a truncated filing run never reads as clean.
+- Every create and every update is journaled with the run id (or "none" outside a run) and the issue key, win or
+  lose, so an unexpected issue resolves to a run in one query. Reads pass straight through uncounted and unlogged.
+- The ledger is per RUN, not per backend: several backends serving one run (the youtrack action builds one per job)
+  count against a single shared ceiling. `IssueTracker` exposes no delete, so no write path through this wrapper can
+  issue one.
+
+### 8.4 Forge and tracker read retries; writes never retry (`SPEC-8.4`)
+
+- Every read-only forge/tracker call (`fj`'s `repo view`/`pr search`/`pr status`/`whoami`/`repo collaborator
+  ... permission` and the CI-failure log/run/file reads; `gh`'s equivalents) is retried up to four attempts total on
+  a non-zero exit, never by classifying `stderr` wording, and never on a spawn failure (the binary is simply absent).
+  The schedule is `[0s, 2s, 5s]` between attempts 2-4 (worst case 7s added delay); a failed non-final attempt logs a
+  `warn` naming the command, attempt number and a redacted stderr tail, a recovery logs `info`, and a call that fails
+  every attempt returns the last attempt's error unchanged.
+- Every forge WRITE (`pr create`, `pr merge`, `pr update`, PR/issue comments, label edits) is excluded on purpose:
+  retrying a write risks a duplicate comment, PR, merge or branch update. The one deliberate exception is the git
+  `push` network call (SPEC-8.5), which is idempotent in a way an `fj`/`gh` write is not. The AGit `fj pr create -aA`
+  path is excluded from every retry, since it pushes and opens a PR in one write.
+- See [convention](conventions/forge.md#read-only-fj-retries-claude-366) for the full per-call-site mapping.
+
+### 8.5 Git network retries and per-invocation authentication (`SPEC-8.5`)
+
+- Every git network call the runner makes (clone, submodule update, the pinned-branch default-ref restore's
+  `ls-remote`/`fetch`, a feature branch's remote-sha read/fetch/push, and the comment-webhook's push) is retried up
+  to four attempts total on the same `[0s, 2s, 5s]` schedule as SPEC-8.4, retried only on a completed process with a
+  non-zero exit. `push` is the one WRITE that retries here: pushing a fixed commit to a fixed ref is idempotent, so a
+  retry landing after an earlier attempt already succeeded exits 0 ("Everything up-to-date") rather than duplicating
+  anything, and no site ever adds `--force` or a force-equivalent refspec. A clone retry removes whatever a failed
+  attempt left at the target directory first, since `git clone` refuses a non-empty directory.
+- Every git subprocess authenticates per invocation through an inline credential helper built from the resolved
+  clone URL's userinfo (`-c credential.helper=` to clear any inherited helper, then the inline helper), never a
+  token in argv or `.git/config`; a URL with no userinfo runs unauthenticated so a host-level credential helper still
+  applies. A fresh clone's remote URLs (origin, every `submodule.*.url`, and each submodule's own `origin`,
+  recursively) are stripped of userinfo immediately after cloning, so a token is never left sitting in a workdir's
+  git config; a scrub failure fails the clone outright rather than leaving a half-scrubbed tree behind a warning.
+- A shallow clone pins `--single-branch --branch <branch>` when given; a pinned clone's missing `origin/HEAD` (and
+  missing default-branch ref) is restored right after by resolving the remote's real default branch via
+  `ls-remote --symref` and fetching it, never assumed, so a base-branch lookup against a pinned-branch workdir
+  resolves exactly as it would against a default-branch clone.
+
+### 8.6 Git failure reporting and secret redaction (`SPEC-8.6`)
+
+- A failed git subprocess reports the exit code plus a bounded, redacted tail of its stderr (the last few non-empty
+  lines, skipping the `Cloning into ...` progress banner) instead of a bare exit code, so a missing credential, an
+  unknown host, a deleted branch, a rejected non-fast-forward and a protected branch are told apart. A redacted,
+  bounded tail of stdout is appended too (a `pre-push` hook's test report lands there, not in stderr).
+- Redaction (`forge_log::redact`) masks a clone URL's userinfo verbatim (passed as a known secret) on top of a
+  shape-based scan for well-known token prefixes (`ghp_`, `glpat-`, `xoxb-`, ...) and for a value following an auth
+  keyword (`Bearer`/`token`/`Basic`) above a minimum length, so ordinary prose is never masked. The redacted string
+  (never the raw URL) is what reaches `run_events` and, from there, a YouTrack comment.
+- The same `redact` function serves the CI-failure log fetch (SPEC-3.5) and every git-failure path here, so a secret
+  pattern recognized in one place is masked in both.
+
+### 8.7 PR subject and body integrity (`SPEC-8.7`)
+
+- `validate_pr_subject` rejects an empty subject or one starting with `#` (a template heading like `## Summary`, or
+  a bare issue reference, mistaken for the commit's one-line subject) before every push or PR-create call on every
+  path (branch, AGit, GitHub), naming the branch and the offending subject; a bad tip therefore opens no PR at all.
+- A commit body intended as a PR description is reflowed before it is used as one: a hard-wrapped paragraph is
+  rejoined onto one line (preserving fenced code blocks, headings, list items, block quotes and trailer lines as
+  their own lines), mirroring the join the runner's own posting path performs, so a PR body built from a commit
+  written with hard line breaks reads the same as one written as single long lines.
+- `refresh_pr_text` re-derives a PR's title and body from its branch's current tip (running the same subject
+  validation first) and overwrites the forge-side PR, used when a resumed run replaces a timeout-salvage
+  placeholder (CLAUDE-398) with the finished tip's own text; it is a no-op on a PR that is not a draft.
+- `bare_issue_key` reads the bare `#<KEY>-N` reference every runner-made commit body ends with out of arbitrary
+  text, for a push-comment call site with no YouTrack job key passed in directly.
+
+### 8.8 Push comments on every PR-branch write (`SPEC-8.8`)
+
+- Every runner-owned write to a PR's branch (the initial push, a resumed-run push, a push onto a diverged or merged
+  remote branch, a timeout-salvage push, a checkpoint push, the comment-webhook fix push, and the automerge
+  behind-base branch update) posts one PR comment naming the event, the issue key, the PR's resulting draft/ready
+  state, the old/new SHA range, and the pushed commits' subjects (capped at 20, with the remaining count named
+  beyond that), ending with the SPEC-3.9 run footer. A write with no local clone to read commit subjects from (the
+  automerge branch update) says so explicitly rather than omitting the line.
+- Posting is best-effort and never retried (forge writes do not retry, SPEC-8.4): a failed post is logged at `error`
+  and returned as a line the caller folds into whichever outcome comment it already owns, never a second, separate
+  comment; the push or branch update it reports on is already done and is never undone, failed, or rolled back
+  because the comment failed.
+
+### 8.9 Forge preflight access check (`SPEC-8.9`)
+
+- `Forge::repo_access` verifies the configured identity can read AND work with pull requests on a repository before
+  any clone or Claude session is paid for, covering both capability categories the PR path needs (a repository read
+  and a pull-request read) since a token scoped to only one passes a repository-only probe and then fails at the
+  first PR-related call. `identity` names which account is authenticated, read-only, never returning the token.
+- A denied probe is rendered naming which call failed, the exit status, and the scope or permission grant an
+  operator needs to add, distinguishing an HTTP 403 (visible but refused: a scope or unit-permission gap) from an
+  HTTP 404 (not visible at all: a missing grant) from a status-less failure (most likely transient or the same gap
+  as the 403 case), since `fj` and `gh` phrase these differently in their own stderr.
+
+### 8.10 Open-PR lookup degradation (`SPEC-8.10`)
+
+- `create_pr` looks up an already-open PR for the branch before creating one, on both backends, so a re-queued or
+  resumed run adopts the existing PR instead of a second one failing to open. A failed lookup degrades to "assume no
+  open PR" (a `warn` plus an operator-visible notice) rather than discarding the run; a create then rejected because
+  a PR for that head already exists retries the lookup exactly once and adopts the result, or names both the lookup
+  and create failures if the retry also fails. See
+  [convention](conventions/forge.md#open-pr-lookup-degradation-claude-206-claude-469).
+- A single-branch shallow clone's `remote.origin.fetch` refspec covers only the branch it was pinned to
+  (SPEC-8.5); a divergence check that merges in the remote tip of the job's OWN feature branch therefore fetches it
+  with an explicit destination tracking ref (`refs/heads/<branch>:refs/remotes/origin/<branch>`, no leading `+`,
+  since the ref does not exist yet in a fresh workdir) rather than a bare `git fetch origin <branch>`, which would
+  write `FETCH_HEAD` only and leave `origin/<branch>` unresolvable to the merge that follows.
 
 ## 9. Deployment and operations
 
