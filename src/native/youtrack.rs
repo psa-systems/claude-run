@@ -7021,6 +7021,189 @@ mod tests {
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
     }
 
+    /// A `StubRunner` stubbed to answer every `git` call `final_push` (and
+    /// the plumbing it calls into) makes while resolving and pushing a single
+    /// feature branch `feat/x`, ahead of `main`, not yet on the remote.
+    /// Shared by the SPEC-3.3.1 finalize-path push tests below, which differ
+    /// only in which marker file is present.
+    fn stub_runner_for_a_clean_final_push() -> StubRunner {
+        StubRunner::new()
+            .ok(
+                "git",
+                &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                "origin/main",
+            )
+            .ok(
+                "git",
+                &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                "main\nfeat/x\n",
+            )
+            .ok("git", &["rev-list", "origin/main..feat/x"], "deadbeef\n")
+            .ok(
+                "git",
+                &["remote", "get-url", "origin"],
+                "https://dev.a8n.run/contoso/claude-run.git",
+            )
+            .ok("git", &["rev-parse", "feat/x"], "localsha123\n")
+            .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+            .ok(
+                "git",
+                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                "",
+            )
+    }
+
+    /// SPEC-3.3.1: the needs-review path opens no PR, but it must still push
+    /// any commits the agent made before parking, rather than leaving them
+    /// local-only. Proven here by a real `git push` call reaching the stub.
+    #[test]
+    fn finalize_needs_review_pushes_the_feature_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        std::fs::write(wd.join(NEEDS_REVIEW_MARKER), "need a decision on X").unwrap();
+        let runner = Arc::new(stub_runner_for_a_clean_final_push().ok(
+            "yt",
+            &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+            "",
+        ));
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            wd,
+            &ClaudeResult::synthesized("e", "s"),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::NeedsReview);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+            "needs-review must still push the feature branch (SPEC-3.3.1): {calls:?}"
+        );
+        // Still no PR: needs-review opens none.
+        assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+    }
+
+    /// SPEC-3.3.1: a no-code-change run can still carry commits alongside the
+    /// marker (e.g. a leftover fix the agent made before realizing the issue
+    /// needed no code), and those must reach the forge too.
+    #[test]
+    fn finalize_no_code_marker_pushes_the_feature_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        std::fs::write(wd.join(NO_CODE_MARKER), "Filed MK-99 for the gap.\n").unwrap();
+        let runner = Arc::new(stub_runner_for_a_clean_final_push().ok(
+            "yt",
+            &["issue", "set-field", "MK-16", "AI Agent", "Done"],
+            "",
+        ));
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            wd,
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::NoCodeChange);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+            "no-code-change must still push any commits the agent made (SPEC-3.3.1): {calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+    }
+
+    /// SPEC-3.3.1: a failed push on a no-PR finalize path is itself a
+    /// failure, never reported as the ordinary outcome for that path (here,
+    /// Needs Review): the commits never reached the forge, so the run cannot
+    /// read as parked-but-fine.
+    #[test]
+    fn finalize_needs_review_final_push_failure_is_reported_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        std::fs::write(wd.join(NEEDS_REVIEW_MARKER), "need a decision on X").unwrap();
+        let runner = Arc::new(
+            stub_runner_for_a_clean_final_push()
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    1,
+                    "remote: permission denied",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            wd,
+            &ClaudeResult::synthesized("e", "s"),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "a failed final push must never be reported as Needs Review: {calls:?}"
+        );
+    }
+
     /// CLAUDE-448: a rejected checkpoint push must never fail the job, but it
     /// must be named in whichever outcome comment the run produces; proven
     /// here on the Needs-Review path and relied on to hold for every other
@@ -7261,14 +7444,13 @@ mod tests {
         assert_eq!(res, Finalized::NoCodeChange);
 
         let calls = runner.calls.lock().unwrap();
-        // No forge call at all, and no git branch resolution ahead of one.
+        // No forge call at all: no PR is opened for a no-code run. SPEC-3.3.1
+        // still probes for a feature branch to push (the `git` calls below),
+        // but finds none ahead of base in this bare workdir and pushes
+        // nothing.
         assert!(
             !calls.iter().any(|c| c.starts_with("fj ")),
             "no PR may be opened for a no-code run: {calls:?}"
-        );
-        assert!(
-            !calls.iter().any(|c| c.starts_with("git ")),
-            "the PR path is skipped entirely: {calls:?}"
         );
         // The marker text is the comment, verbatim.
         let comment = calls
@@ -9166,6 +9348,105 @@ mod tests {
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+    }
+
+    /// SPEC-3.3.1: the generic claude-failure arm (crash, empty prompt, pre
+    /// failure, operator cancel) opens no PR, but any commits the agent made
+    /// before failing must still be pushed rather than left local-only.
+    #[test]
+    fn finalize_claude_error_pushes_the_feature_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(stub_runner_for_a_clean_final_push().ok(
+            "yt",
+            &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+            "",
+        ));
+        let backend = CliBackend::new(runner.clone());
+        let claude = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "error tail");
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &claude,
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert!(
+            matches!(res, Finalized::Failed { pr_step: None, .. }),
+            "{res:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+            "a generic failure must still push the feature branch (SPEC-3.3.1): {calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+    }
+
+    /// SPEC-3.3.1: a final-push failure on the generic failure arm must be
+    /// folded into `pr_step` so it is distinguishable from the agent's own
+    /// failure, and the comment must say the commits are still only local.
+    #[test]
+    fn finalize_claude_error_final_push_failure_is_named_in_pr_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(
+            stub_runner_for_a_clean_final_push()
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    1,
+                    "remote: permission denied",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let claude = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "error tail");
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &claude,
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
     }
 
     /// CLAUDE-425 acceptance criterion: a push or PR-create failure after a
