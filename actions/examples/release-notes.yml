@@ -9,8 +9,10 @@
 # web UI (New action, raw YAML), replace the placeholders in `env` and store the token on the Secrets page. The run
 # stops with a message until `NEWSLETTER_URL` and `FORGE_HOST` are yours. See docs/release-notes.md.
 #
-# Every Monday the releases published in the last 7 days in the repos below become ONE draft edition, written for
-# customers. The action only ever creates a draft (`POST <NEWSLETTER_URL>/api/v1/editions`): it never sends or
+# On Mondays from 09:00 UTC the releases published in the last 7 days in the repos below become ONE draft edition, written
+# for customers. The daemon checks a scripted action every `regather_interval` (default 60s) whatever its `schedule.spec`
+# says, so the input itself is the gate: any other time it yields no job and makes no API call. Set `DRAFT_ANY_DAY` to
+# "true" to draft outside that window, for a test. The action only ever creates a draft (`POST <NEWSLETTER_URL>/api/v1/editions`): it never sends or
 # schedules. Adapt the post step if your newsletter system has a different API.
 #
 # The releases are read through the Forgejo API with the token fj already holds for `FORGE_HOST` (its key store), so a
@@ -36,6 +38,8 @@ env:
   SENDER_NAME: Your Company
   NEWSLETTER_URL: https://news.example.com
   NEWSLETTER_LIST: your-list-slug
+  # "true" drafts outside Mondays from 09:00 UTC, for a test. Set it back afterwards.
+  DRAFT_ANY_DAY: "false"
 secrets:
   # The name of a secret on the Secrets page, never the token itself.
   NEWSLETTER_API_TOKEN: newsletter-api-token
@@ -44,27 +48,33 @@ input:
     if ($env.FORGE_HOST | str ends-with "example.com") or ($env.NEWSLETTER_URL | str ends-with "example.com") {
       error make {msg: "release-notes: replace the placeholders in this action's env block first"}
     }
-    let host = $env.FORGE_HOST
-    let repos = ($env.RELEASE_SOURCES | from json)
-    let data_home = ($env.XDG_DATA_HOME? | default ($nu.home-dir | path join ".local" "share"))
-    let token = (open ($data_home | path join "forgejo-cli" "keys.json") | get hosts | get $host | get token)
     let now = (date now)
-    let site = ($env.NEWSLETTER_URL | url parse | get host)
-    let marker = ($env.CLAUDE_RUN_DATA_DIR | path join "release-notes" $"($site).last-draft")
-    let week_ago = ($now - 7day)
-    let since = (if ($marker | path exists) {
-      let last = (open --raw $marker | str trim | into datetime)
-      if $last < $week_ago { $last } else { $week_ago }
-    } else { $week_ago })
-    let releases = ($repos | each {|source|
-      http get --headers {Authorization: $"token ($token)"} $"https://($host)/api/v1/repos/($source.repo)/releases?limit=50"
-      | where {|r| (not $r.draft) and (not $r.prerelease) and (($r.published_at | into datetime) > $since) }
-      | each {|r| {product: $source.product, repo: $source.repo, tag: $r.tag_name, name: $r.name, published_at: $r.published_at, body: $r.body} }
-    } | flatten)
-    if ($releases | is-empty) {
+    let utc = ($now | date to-timezone UTC)
+    let due = (($utc | format date "%u") == "1") and (($utc | format date "%H" | into int) >= 9)
+    if not ($due or ($env.DRAFT_ANY_DAY? | default "false") == "true") {
       [] | to json
     } else {
-      [{week: ($now | format date "%G-W%V"), gathered_at: ($now | format date "%+"), releases: $releases}] | to json
+      let host = $env.FORGE_HOST
+      let repos = ($env.RELEASE_SOURCES | from json)
+      let data_home = ($env.XDG_DATA_HOME? | default ($nu.home-dir | path join ".local" "share"))
+      let token = (open ($data_home | path join "forgejo-cli" "keys.json") | get hosts | get $host | get token)
+      let site = ($env.NEWSLETTER_URL | url parse | get host)
+      let marker = ($env.CLAUDE_RUN_DATA_DIR | path join "release-notes" $"($site).last-draft")
+      let week_ago = ($now - 7day)
+      let since = (if ($marker | path exists) {
+        let last = (open --raw $marker | str trim | into datetime)
+        if $last < $week_ago { $last } else { $week_ago }
+      } else { $week_ago })
+      let releases = ($repos | each {|source|
+        http get --headers {Authorization: $"token ($token)"} $"https://($host)/api/v1/repos/($source.repo)/releases?limit=50"
+        | where {|r| (not $r.draft) and (not $r.prerelease) and (($r.published_at | into datetime) > $since) }
+        | each {|r| {product: $source.product, repo: $source.repo, tag: $r.tag_name, name: $r.name, published_at: $r.published_at, body: $r.body} }
+      } | flatten)
+      if ($releases | is-empty) {
+        [] | to json
+      } else {
+        [{week: ($now | format date "%G-W%V"), gathered_at: ($now | format date "%+"), releases: $releases}] | to json
+      }
     }
 dedup_key: week
 pre:
@@ -147,6 +157,7 @@ limits:
   max_runs_per_day: 2
   claude_timeout_seconds: 600
   run_budget_usd: 1.00
+# Any non-manual schedule only means "check every `regather_interval`"; the Monday gate is in `input.command`.
 schedule:
   kind: cron
   spec: "0 9 * * MON"

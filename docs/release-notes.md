@@ -1,6 +1,6 @@
 # Example action: weekly release notes into a newsletter system (CLAUDE-474)
 
-`actions/examples/release-notes.yml` turns the week's releases into a draft newsletter. Every Monday at 09:00 it reads the releases published in the last 7 days in the repos you list, through the Forgejo API (with the token fj already holds for your forge), has Claude write one customer-facing edition from them, and creates it as a **draft** with `POST <NEWSLETTER_URL>/api/v1/editions`. It never sends or schedules. A week without releases runs nothing; a week with nothing customer-facing creates no draft.
+`actions/examples/release-notes.yml` turns the week's releases into a draft newsletter. On Mondays from 09:00 UTC it reads the releases published in the last 7 days in the repos you list, through the Forgejo API (with the token fj already holds for your forge), has Claude write one customer-facing edition from them, and creates it as a **draft** with `POST <NEWSLETTER_URL>/api/v1/editions`. It never sends or schedules. A week without releases runs nothing; a week with nothing customer-facing creates no draft.
 
 It is an example, so a new install does not get it: `actions/examples/` is not seeded. The post step expects an API that takes `{"list", "subject", "preview_text", "body_md"}` with a bearer token and answers `201`; change that step for another newsletter system.
 
@@ -21,8 +21,17 @@ Everything is done in the web UI; the deployment needs no change.
 | `SENDER_NAME` | the name the newsletter goes out under |
 | `NEWSLETTER_URL` | your newsletter system's base URL |
 | `NEWSLETTER_LIST` | the list to draft into |
+| `DRAFT_ANY_DAY` | `"true"` to draft outside Mondays from 09:00 UTC, for a test; otherwise `"false"` |
 
 5. Trigger it once from the action's page and read the draft in your newsletter system.
+
+## When it runs
+
+The daemon checks a scripted action every `regather_interval` (default 60s), whatever its `schedule.spec` says, so the example's `input.command` holds the schedule: on Mondays from 09:00 UTC it reads the releases, and at any other time it yields no job and makes no API call. A Monday the instance was down carries over to the next one.
+
+To draft at another time, for a test, set `DRAFT_ANY_DAY` to `"true"` in the action's `env` block, trigger it, and set it back. Mind the one draft per week below.
+
+## Rotating the token
 
 To rotate the token, replace the secret on the Secrets page; the next run uses it, with no restart.
 
