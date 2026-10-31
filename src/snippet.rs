@@ -262,9 +262,9 @@ mod tests {
             nu_binary: "nu".into(),
             env: vec![
                 ("SITE".into(), "news.example.com".into()),
-                ("TOKEN".into(), "mzm_supersecret".into()),
+                ("TOKEN".into(), "tok_supersecret".into()),
             ],
-            secret_values: vec!["mzm_supersecret".into()],
+            secret_values: vec!["tok_supersecret".into()],
         };
         let out = runner
             .run(
@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(out.stderr.trim(), "err [REDACTED]");
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let body = std::fs::read_to_string(entry.unwrap().path()).unwrap();
-            assert!(!body.contains("mzm_supersecret"), "{body}");
+            assert!(!body.contains("tok_supersecret"), "{body}");
         }
     }
 }

@@ -464,7 +464,7 @@ action's `token_ref`, which is injected per job.
 - The app service defines no container healthcheck. Liveness is available from `GET /api/status` and the `status`
   command.
 - Shipped action files: `youtrack.yml` (interval 5m), `audit-run.yml` (interval 5m), `closed-issue-summary.yml` (interval
-  24h), `release-notes.yml` (cron weekly).
+  24h). `examples/release-notes.yml` (cron weekly) is an example and is not seeded into a new install.
 - Restart safety: `GET /api/status` and the About page expose a `quiet` flag that is true only when no run is open and
   no run is dispatched.
 

@@ -667,9 +667,9 @@ Environment for this action's snippets (CLAUDE-478), so a scripted action can be
 
 ```yaml
 env:
-  MIRZAM_URL: https://news.example.com    # plain value, overrides the runner's environment
+  SITE_URL: https://news.example.com      # plain value, overrides the runner's environment
 secrets:
-  MIRZAM_API_TOKEN: mirzam-api-token      # the NAME of a secret on the Secrets page, never its value
+  SITE_API_TOKEN: site-api-token          # the NAME of a secret on the Secrets page, never its value
 ```
 
 `secrets` are decrypted when the run starts. An unknown name stops the run there, naming it, before any job is gathered or attempt counted. Values reach the snippet process as environment variables only: not the YAML, not the snippet or binding files, and not the `claude` child. A secret value printed by a snippet comes back as `[REDACTED]`, on stdout (so also a prompt or `input` JSON) and stderr. Anyone who can edit an action can run code as the runner, so this protects the value from logs and from the agent, not from an action's author.

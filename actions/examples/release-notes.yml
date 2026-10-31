@@ -3,51 +3,53 @@
 # https://github.com/harrydowning/vscode-yaml-embedded-languages
 # https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
 
-# Weekly release notes drafted into Mirzam (CLAUDE-474, MIRZAM-294).
+# Weekly release notes drafted into a newsletter system: an example to adapt (CLAUDE-474, CLAUDE-501).
 #
-# Every Monday the releases published in the last 7 days in the repos below become ONE draft edition on a Mirzam list,
-# written for customers. The action only ever creates a draft (`POST /api/v1/editions`): it never sends or schedules.
-# Switch on "Editions need approval" for that list in Mirzam, and Mirzam itself refuses any send or schedule, from the
-# pages or the API, until an administrator approves.
+# Not installed by default: `actions/examples/` is not seeded into a new install. To use it, paste this file into the
+# web UI (New action, raw YAML), replace the placeholders in `env` and store the token on the Secrets page. The run
+# stops with a message until `NEWSLETTER_URL` and `FORGE_HOST` are yours. See docs/release-notes.md.
 #
-# Settings (`env` and `secrets` below, CLAUDE-478):
-#   MIRZAM_URL        Mirzam site base URL
-#   MIRZAM_LIST       the list slug
-#   MIRZAM_API_TOKEN  a Mirzam API token with read and write access (Mirzam admin: API), stored on the Secrets page as
-#                     `mirzam-api-token`; the run stops, naming it, until it exists
-# The Forgejo releases are read with the token fj already holds for dev.a8n.run (its key store), so a private repo
-# needs no extra secret.
+# Every Monday the releases published in the last 7 days in the repos below become ONE draft edition, written for
+# customers. The action only ever creates a draft (`POST <NEWSLETTER_URL>/api/v1/editions`): it never sends or
+# schedules. Adapt the post step if your newsletter system has a different API.
+#
+# The releases are read through the Forgejo API with the token fj already holds for `FORGE_HOST` (its key store), so a
+# private repo needs no extra secret.
 #
 # One job per ISO week (`dedup_key: week`) and `max_attempts_per_key: 1`: a second trigger in the same week, manual or
 # not, does nothing. To redraft a week, `claude-run action reset-attempts release-notes <week>` and trigger again.
 # A week without releases yields no job; a week with nothing customer-facing yields no draft.
 #
-# The input looks back 7 days, or to the last draft or skip for this Mirzam site if that is earlier (CLAUDE-476): the
+# The input looks back 7 days, or to the last draft or skip for this newsletter site if that is earlier (CLAUDE-476): the
 # post step records it in `$CLAUDE_RUN_DATA_DIR/release-notes/<host>.last-draft`, so the releases of a failed week carry
 # over to the next one. The file is per site, so a staging test does not move production's window.
 
 name: release-notes
 kind: scripted
 env:
-  MIRZAM_URL: https://news.psa.systems
-  MIRZAM_LIST: psa-systems-news
+  # Replace all of these.
+  FORGE_HOST: forge.example.com
+  # Which repos to read, and the product customers know each as. Repos sharing a product get one section.
+  RELEASE_SOURCES: '[{"repo": "your-org/your-app-ui", "product": "Your App"}, {"repo": "your-org/your-app-server", "product": "Your App"}]'
+  # One line per product: what it is, as a customer sees it.
+  PRODUCT_NOTES: "Your App: what it does for your customers."
+  SENDER_NAME: Your Company
+  NEWSLETTER_URL: https://news.example.com
+  NEWSLETTER_LIST: your-list-slug
 secrets:
-  MIRZAM_API_TOKEN: mirzam-api-token
+  # The name of a secret on the Secrets page, never the token itself.
+  NEWSLETTER_API_TOKEN: newsletter-api-token
 input:
   command: |
-    let host = "dev.a8n.run"
-    # A product customers see as one thing may span repos: Mokosh is a UI and a server.
-    let repos = [
-      {repo: "psa-systems/bunyip", product: "PSA Systems account"}
-      {repo: "psa-systems/mokosh-apps", product: "Mokosh"}
-      {repo: "psa-systems/mokosh-server", product: "Mokosh"}
-      {repo: "psa-systems/lets-chat", product: "Let's Chat"}
-      {repo: "psa-systems/mirzam", product: "Newsletter"}
-    ]
+    if ($env.FORGE_HOST | str ends-with "example.com") or ($env.NEWSLETTER_URL | str ends-with "example.com") {
+      error make {msg: "release-notes: replace the placeholders in this action's env block first"}
+    }
+    let host = $env.FORGE_HOST
+    let repos = ($env.RELEASE_SOURCES | from json)
     let data_home = ($env.XDG_DATA_HOME? | default ($nu.home-dir | path join ".local" "share"))
     let token = (open ($data_home | path join "forgejo-cli" "keys.json") | get hosts | get $host | get token)
     let now = (date now)
-    let site = ($env.MIRZAM_URL | url parse | get host)
+    let site = ($env.NEWSLETTER_URL | url parse | get host)
     let marker = ($env.CLAUDE_RUN_DATA_DIR | path join "release-notes" $"($site).last-draft")
     let week_ago = ($now - 7day)
     let since = (if ($marker | path exists) {
@@ -71,17 +73,14 @@ pre:
     if ($path | path exists) { rm $path }
     $job.releases | to json | save $path
 prompt: |
-  $"You draft the product-updates newsletter of PSA Systems for week ($job.week).
+  $"You draft the product-updates newsletter of ($env.SENDER_NAME) for week ($job.week).
 
   Read `releases.json` in the current directory: the releases published since the last newsletter, each with its
   `product`. Each release body is a changelog of pull requests.
-  - PSA Systems account: sign-in, profile, billing and the app launcher at psa.systems.
-  - Mokosh: the professional services automation app for MSPs: tickets, projects, contracts, assets, billing. It has two
-    repos, a UI and a server, but customers see one app. Write one section for both, describe a change once however many
-    repos it touched, and drop server changes with no visible effect.
-  - Let's Chat: team chat with rooms, direct messages and calls.
-  - Newsletter: the newsletter system itself, which customers only meet as the emails and subscription pages they
-    receive.
+  ($env.PRODUCT_NOTES)
+
+  Several repos with the same `product` are one app to customers: write one section for them, describe a change once
+  however many repos it touched, and drop server changes with no visible effect.
 
   Write `edition.json` in the current directory, and no other file, with this shape:
   {\"subject\": string, \"preview_text\": string, \"body_md\": string}
@@ -95,11 +94,11 @@ prompt: |
     are added to or kept on lists.
   - Signup forms and anything else that only matters to someone not yet subscribed.
   - Fixes that would make a reader doubt how things worked before, such as who gets re-subscribed.
-  - Mirzam changes a subscriber would not really notice.
+  - Changes to the newsletter system itself that a subscriber would not really notice.
   - Anything where the changelog does not show what a customer sees. Leave it out rather than guess.
 
   Writing:
-  - No ticket ids, pull request numbers, commit hashes, or links to dev.a8n.run, which is private.
+  - No ticket ids, pull request numbers, commit hashes, or links to ($env.FORGE_HOST).
   - `subject` names the single most useful change, under 70 characters. Never a generic \"This week\" or a list of topics.
   - `preview_text` adds to the subject in one sentence, under 200 characters, and does not repeat it.
   - `body_md` is Markdown with no filler introduction. Bullets with a bold lead; a heading per product that has
@@ -122,7 +121,7 @@ post:
       error make {msg: "no draft: claude wrote no edition.json"}
     }
     let edition = (open $path)
-    let site = ($env.MIRZAM_URL | url parse | get host)
+    let site = ($env.NEWSLETTER_URL | url parse | get host)
     let marker_dir = ($env.CLAUDE_RUN_DATA_DIR | path join "release-notes")
     let marker = ($marker_dir | path join $"($site).last-draft")
     mkdir $marker_dir
@@ -131,13 +130,13 @@ post:
       if ($marker | path exists) { rm $marker }
       $job.gathered_at | save $marker
     } else {
-      let body = ({list: $env.MIRZAM_LIST, subject: $edition.subject, body_md: $edition.body_md}
+      let body = ({list: $env.NEWSLETTER_LIST, subject: $edition.subject, body_md: $edition.body_md}
         | merge (if ($edition.preview_text? | default "" | is-empty) { {} } else { {preview_text: $edition.preview_text} }))
-      let url = $"($env.MIRZAM_URL | str trim --right --char '/')/api/v1/editions"
+      let url = $"($env.NEWSLETTER_URL | str trim --right --char '/')/api/v1/editions"
       let answer = (http post --full --allow-errors --content-type application/json
-        --headers {Authorization: $"Bearer ($env.MIRZAM_API_TOKEN)"} $url $body)
+        --headers {Authorization: $"Bearer ($env.NEWSLETTER_API_TOKEN)"} $url $body)
       if $answer.status != 201 {
-        error make {msg: $"no draft: Mirzam answered ($answer.status): ($answer.body | to json --raw)"}
+        error make {msg: $"no draft: the newsletter system answered ($answer.status): ($answer.body | to json --raw)"}
       }
       if ($marker | path exists) { rm $marker }
       $job.gathered_at | save $marker

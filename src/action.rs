@@ -1822,14 +1822,14 @@ native:
         );
     }
 
-    /// The shipped `actions/release-notes.yml` (CLAUDE-474): a scripted weekly
+    /// The example `actions/examples/release-notes.yml` (CLAUDE-474): a scripted weekly
     /// action, one job per ISO week that never repeats, and a claude block that
     /// can only read the releases and write the draft.
     #[test]
     fn shipped_release_notes_action_is_scripted_and_weekly() {
-        const SHIPPED: &str = include_str!("../actions/release-notes.yml");
-        let loaded =
-            validate_str(SHIPPED, "actions/release-notes.yml").expect("shipped action valid");
+        const SHIPPED: &str = include_str!("../actions/examples/release-notes.yml");
+        let loaded = validate_str(SHIPPED, "actions/examples/release-notes.yml")
+            .expect("shipped action valid");
         let action = loaded.action;
         assert_eq!(action.name, "release-notes");
         assert_eq!(action.kind, ActionKind::Scripted);
@@ -1841,8 +1841,11 @@ native:
         assert_eq!(action.dedup_key.as_deref(), Some("week"));
         assert_eq!(action.limits.max_attempts_per_key, Some(1));
         assert_eq!(action.claude.allowed_tools.as_deref(), Some("Read,Write"));
-        assert_eq!(action.env["MIRZAM_LIST"], "psa-systems-news");
-        assert_eq!(action.secrets["MIRZAM_API_TOKEN"], "mirzam-api-token");
+        assert_eq!(action.env["NEWSLETTER_LIST"], "your-list-slug");
+        assert_eq!(
+            action.secrets["NEWSLETTER_API_TOKEN"],
+            "newsletter-api-token"
+        );
         let schedule = action.schedule.as_ref().expect("scheduled");
         assert_eq!(schedule.kind, ScheduleKind::Cron);
         crate::scheduler::parse_schedule(schedule).expect("cron spec parses");
