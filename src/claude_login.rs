@@ -102,6 +102,8 @@ impl LoginBroker {
     /// means the old URL is stale, and leaving the old child running would leak
     /// a process. Blocking (spawn plus a bounded read), so callers on an async
     /// task must wrap it.
+    // SPEC-7.5: replaces any in-flight session; fails and kills the child if no
+    // authorize URL appears within `URL_TIMEOUT`.
     pub fn start(&self, binary: &str, config_dir: &PathBuf) -> Result<String> {
         self.cancel();
 
@@ -201,6 +203,8 @@ impl LoginBroker {
     /// `Ok(LoggedIn)` clears the session. `Ok(Retry)` keeps it, because the CLI
     /// re-arms its prompt after a bad code. Every error path terminates the
     /// child rather than leaving a half-dead session behind.
+    // SPEC-7.5: exit 0 is LoggedIn; a refused code keeps the session and
+    // returns the CLI's own wording as Retry rather than erroring.
     pub fn submit_code(&self, code: &str) -> Result<CodeOutcome> {
         let mut slot = self.lock()?;
         let Some(pending) = slot.as_mut() else {
@@ -304,6 +308,8 @@ impl LoginBroker {
     }
 
     /// The in-flight login for the page, dropping one that has aged out.
+    // SPEC-7.5: a session unclaimed longer than `SESSION_MAX_AGE` is dropped
+    // the next time it is viewed.
     pub fn view(&self) -> Option<PendingView> {
         let mut slot = self.pending.lock().ok()?;
         let expired = slot

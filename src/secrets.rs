@@ -50,6 +50,7 @@ impl SecretsKey {
     /// (`AGE-SECRET-KEY-1...`); blank lines and `#` comments are ignored, so a
     /// file written by `age-keygen` works as-is. Fails closed when the file is
     /// missing, unreadable, or carries no parseable key line.
+    // SPEC-7.1: key file resolution and fail-closed loading.
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| Error::Secret(format!("reading key file {}: {e}", path.display())))?;
@@ -68,11 +69,13 @@ impl SecretsKey {
     /// Read the key at [`key_file_path`]. One behaviour: the file is there or
     /// this fails. Creating it is [`ensure_key`]'s job, which runs at serve
     /// start and before the CLI stores anything.
+    // SPEC-7.1: the file is there or this fails; creating it is `ensure_key`'s job.
     pub fn load() -> Result<Self> {
         Self::load_from_file(&key_file_path()?)
     }
 
     /// Encrypt `plaintext` to this key's recipient, returning the age ciphertext.
+    // SPEC-7.1: age X25519 encryption under the loaded identity.
     pub fn encrypt(&self, plaintext: &str) -> Result<Vec<u8>> {
         let recipient = self.identity.to_public();
         let encryptor =
@@ -92,6 +95,7 @@ impl SecretsKey {
     }
 
     /// Decrypt an age `ciphertext` produced by [`SecretsKey::encrypt`].
+    // SPEC-7.1: age X25519 decryption under the loaded identity.
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<String> {
         let decryptor = age::Decryptor::new(ciphertext)
             .map_err(|e| Error::Secret(format!("decrypt init: {e}")))?;
@@ -123,6 +127,7 @@ pub const DEFAULT_KEY_FILE: &str = "secrets.key";
 /// secret store, which is what the config dir is for. The data dir holds what
 /// the runner generates and can rebuild (workdirs are literally garbage
 /// collected); the key is neither.
+// SPEC-7.1: key file path resolution (env override, else config-dir default).
 pub fn key_file_path() -> Result<PathBuf> {
     if let Ok(v) = std::env::var(KEY_FILE_ENV) {
         return Ok(PathBuf::from(crate::config::expand_path(&v)));
@@ -134,6 +139,7 @@ pub fn key_file_path() -> Result<PathBuf> {
 /// Where the key used to live: beside `state.db` under the data dir.
 /// [`ensure_key`] moves it to [`key_file_path`] on first start after the change,
 /// so an existing deployment keeps decrypting what it already stored.
+// SPEC-7.1: where an older key is migrated from, see `ensure_key`.
 fn legacy_key_file_path() -> Result<PathBuf> {
     Ok(crate::config::Paths::resolve()?
         .data_dir
@@ -151,6 +157,8 @@ fn legacy_key_file_path() -> Result<PathBuf> {
 ///
 /// Called once at serve start and by the CLI before it stores a secret, so
 /// [`SecretsKey::load`] elsewhere is a plain read with one behaviour.
+// SPEC-7.1: generate-only-when-nothing-to-lose key lifecycle, legacy migration,
+// and the hard refusal to replace a key while ciphertext still depends on it.
 pub async fn ensure_key(pool: &DbPool) -> Result<PathBuf> {
     let path = key_file_path()?;
     if path.exists() {
@@ -233,6 +241,7 @@ fn extract_key(raw: &str) -> Option<String> {
 /// than saying so. But every process in the container can then read the key that
 /// decrypts every stored token, including the agent, so it must not pass in
 /// silence.
+// SPEC-7.1: a key readable beyond its owner loads anyway but is warned about.
 fn warn_if_readable_by_others(path: &Path) {
     match std::fs::metadata(path) {
         Ok(meta) => {
@@ -255,6 +264,7 @@ fn warn_if_readable_by_others(path: &Path) {
 /// Create a new age identity at `path` with `0600` permissions, creating the
 /// parent directory. Fails rather than overwrites when the file already exists,
 /// so a race between two callers cannot destroy a key mid-flight.
+// SPEC-7.1: new key files are mode 0600 and never overwrite an existing key.
 fn generate_key_file(path: &Path) -> Result<()> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
@@ -293,6 +303,7 @@ fn generate_key_file(path: &Path) -> Result<()> {
 
 /// Decrypt the secret named `name`, bumping its `last_used_at`. Errors when the
 /// name is unknown or the ciphertext does not decrypt under the loaded key.
+// SPEC-7.1: unknown name or bad ciphertext fails closed, never an empty token.
 pub async fn resolve_secret(pool: &DbPool, key: &SecretsKey, name: &str) -> Result<String> {
     let ciphertext = state::secret_get_ciphertext(pool, name)
         .await?
@@ -328,6 +339,8 @@ impl ResolvedCredentials {
 /// Resolve a YouTrack action's `token_ref`s (under `youtrack` / `forgejo`) to
 /// decrypted credentials. The key file is loaded only when at least one block
 /// references a secret, so the host-auth path needs no key configured.
+// SPEC-7.2: the key is loaded only when a block references a secret, so the
+// host-auth path needs no key configured.
 pub async fn resolve_youtrack_credentials(
     pool: &DbPool,
     youtrack: &YoutrackSource,
@@ -382,6 +395,8 @@ impl JobCredentials {
     /// the temp `keys.json` is keyed by (the issue's resolved VCS host); pass
     /// `None` for a yt-only credential set (e.g. the gather step, which never
     /// invokes `fj`).
+    // SPEC-7.2: per-job credential files scoped to this job's lifetime; see
+    // `Drop` below for the removal side of that scope.
     pub fn materialize(
         dir: &Path,
         creds: &ResolvedCredentials,
@@ -430,6 +445,7 @@ impl JobCredentials {
     }
 }
 
+// SPEC-7.2: the whole per-job credential directory is scrubbed on drop.
 impl Drop for JobCredentials {
     fn drop(&mut self) {
         // Best-effort: scrub the plaintext credential files when the job ends.
@@ -447,6 +463,7 @@ impl Drop for JobCredentials {
 /// (``missing field `type` ``) before `fj` ever contacts the server. The entry
 /// is built complete, cloning the operator's real store entry when present so
 /// `fj`'s schema is never re-derived by hand.
+// SPEC-7.2: the written `keys.json` carries `host` -> `token` and nothing else.
 pub(crate) fn write_fj_keys(xdg_data_home: &Path, host: &str, token: &str) -> Result<PathBuf> {
     let fj_dir = xdg_data_home.join("forgejo-cli");
     std::fs::create_dir_all(&fj_dir)?;
@@ -464,6 +481,7 @@ pub(crate) fn write_fj_keys(xdg_data_home: &Path, host: &str, token: &str) -> Re
 /// CLAUDE-209: a process-wide unique path segment, `{pid}-{seq}`. The pid alone
 /// is NOT unique: two concurrent polls in one daemon would build the same path
 /// and the first guard to drop would `remove_dir_all` the other's live files.
+// SPEC-7.2: a process-wide unique path segment for a per-job/per-call temp dir.
 pub(crate) fn unique_suffix() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -483,6 +501,7 @@ pub(crate) struct TempFjKeys {
 
 impl TempFjKeys {
     /// Create the temp store for `host` -> `token`.
+    // SPEC-7.2: a throwaway single-host `fj` store, removed with its guard.
     pub(crate) fn create(host: &str, token: &str) -> Result<Self> {
         let dir = std::env::temp_dir().join(format!("claude-run-fj-{}", unique_suffix()));
         std::fs::create_dir_all(&dir)?;
@@ -504,6 +523,8 @@ impl Drop for TempFjKeys {
 }
 
 /// Write `bytes` to `path`, creating/truncating it mode `0600`.
+// SPEC-7.1 / SPEC-7.2 / SPEC-7.3: shared mode-0600 write primitive behind
+// every on-disk credential file this module group writes.
 pub(crate) fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
@@ -547,6 +568,8 @@ fn operator_fj_keys_path() -> PathBuf {
 /// "Application"`, `name = "claude-run"`. `fj` accepts a host entry of exactly
 /// `{type, name, token}` with no top-level `aliases`/`default_ssh` (both carry
 /// serde defaults), verified against the pinned `forgejo-cli`.
+// SPEC-7.2: clone the operator's template for `host` and substitute only the
+// token; with no template, synthesize a complete entry `fj` can parse.
 fn fj_host_entry(
     operator_keys_path: &Path,
     host: &str,

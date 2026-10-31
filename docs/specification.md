@@ -391,6 +391,7 @@ On-disk layout: `<config dir>` (`config.toml`, `actions/`, `secrets.key`, MCP ke
 | `[web] require_auth_on_loopback` | `false` | Force auth on a loopback bind |
 | `[web] auth_username` | unset | Legacy form-login username (used with the token while no account exists) |
 | `[daemon] log_filter` | unset | Tracing filter |
+| `[daemon] claude_config_dir` | unset (`<config dir>/claude-agent-home`) | Agent `CLAUDE_CONFIG_DIR`; see `SPEC-8.1` |
 | `[database] url` | unset (SQLite) | `sqlite://`, `postgres://` or `postgresql://`; any other scheme is a startup error |
 | `[webhook]`, `[mint]` | see 3.5 | Bootstrap copies of the DB-backed sections |
 | `[mcp] enabled` / `bind` / `public_url` / `admin_email` / `allowed_hosts` | `false` / `127.0.0.1:7322` / unset / unset / empty | MCP HTTP listener; `public_url` is required when enabled |
@@ -428,6 +429,93 @@ adds `allowed_permissions`, `max_files`, `max_lines`, `bot_author`, `bot_email`,
 - The agent may mutate only through the bounded tracker writes the prompt permits; the runner owns the `AI Agent` field
   and every write to the triggering issue except comments.
 
+### 7.1 Secrets store and key lifecycle (`SPEC-7.1`)
+
+- The symmetric key is an `age` X25519 identity read from a file: `CLAUDE_RUN_SECRETS_KEY_FILE` when set, else
+  `<config dir>/secrets.key`. The key is configuration, never written beside the `secrets` table's ciphertext. The key
+  line (`AGE-SECRET-KEY-...`) may sit anywhere on a line of the file, not only alone on one, so a SOPS-decrypted
+  document or an env-style line works unmodified; blank lines and `#` comments are skipped.
+- A missing key file is generated only when the instance has nothing to lose: no key file exists yet, no legacy
+  data-dir key file exists to migrate, and the `secrets` table is empty. The generated file is mode `0600`. A key file
+  readable beyond its owner loads anyway but logs a `warn` naming the mode, since every process able to read it can
+  decrypt every stored token.
+- An older key found at `<data dir>/secrets.key` is moved (not copied) to the config-dir path on first start after the
+  change, so an existing deployment keeps decrypting what it already stored.
+- A missing key file with one or more rows already in `secrets` is a hard error naming every secret at risk; a
+  replacement key is never generated in that case, since it would make the existing ciphertext permanently
+  undecryptable while the store kept listing it as present.
+- Resolving a secret by name decrypts its ciphertext under the loaded key and bumps `last_used_at`. An unknown name or
+  ciphertext that fails to decrypt under the loaded key is a closed failure, never an empty token.
+
+### 7.2 Per-job credential materialization (`SPEC-7.2`)
+
+- An action's `youtrack.token_ref` / `forgejo.token_ref` / `github.token_ref` are resolved to `ResolvedCredentials`
+  together; the key file is loaded only when at least one is set, so the host-auth path (no block sets a `token_ref`)
+  needs no key configured and resolves nothing. `youtrack.token_ref` additionally requires `youtrack.base_url`, needed
+  to build the single-file `yt` config.
+- `JobCredentials::materialize` writes the resolved credentials into a per-job directory (mode `0700`): a two-line
+  `yt-config.yml` (`url:` + `token:`, mode `0600`) pointed at by a `YOUTRACK_CLI_CONFIG` env entry for the `yt` child
+  only, and/or a `forgejo-cli/keys.json` (mode `0600`) keyed by the job's resolved forge host, pointed at by an
+  `XDG_DATA_HOME` env entry for the `fj` child only. A resolved `fj_token` with no host passed in (e.g. the gather step,
+  which never invokes `fj`) materializes nothing for `fj`. A decrypted GitHub token is carried in memory only, never
+  written to a file, so it leaves no on-disk plaintext to scrub. Dropping the guard removes the whole per-job directory,
+  scoping every materialized plaintext to that job's lifetime; concurrent jobs each get their own directory and never
+  share a credential file.
+- The `fj` host entry written for a per-job or daemon-service credential clones the operator's own key-store entry
+  for that host when one exists, keeping every non-token field (`type`, `name`, and any future addition) verbatim and
+  substituting only the token, so claude-run never re-derives `fj`'s store schema by hand; with no operator entry for
+  that host it synthesizes a complete `{type: "Application", name: "claude-run", token}` entry, since `fj` requires
+  `type` and `name` and rejects a token-only entry. The operator's own token for that host, if any, is never carried
+  into the per-job or service store.
+- A throwaway single-host `fj` key store (used for a decrypted `log_token_ref` around one `fj actions logs` call) lives
+  under its own temp `XDG_DATA_HOME` directory and is removed when its guard drops, so that credential's plaintext
+  lifetime is scoped to the one call that needs it.
+
+### 7.3 Daemon service logins (`SPEC-7.3`)
+
+- At serve start the daemon materializes its own logins to Claude, YouTrack, Forgejo and GitHub from the `auth`
+  settings document: for each of `anthropic_key_ref` / `youtrack_token_ref` (with `youtrack_base_url`) /
+  `forgejo_token_ref` (with `forgejo_host`) / `github_token_ref` (with `github_host`) that is fully configured, the
+  named secret is resolved and the credential materialized; a secret that fails to resolve, or resolves to an empty
+  value, is a `warn` naming it, and every other configured credential is still materialized. With none of the four
+  configured, every file this step would otherwise touch is left alone, so a login entered by hand inside the
+  container is never clobbered.
+- The git commit identity (`git_author_name` / `git_author_email`) is the one credential written unconditionally,
+  defaulted to `claude-run` / `claude-run@a8n.run` when unset, so a fresh deployment with nothing configured in
+  Settings -> Auth still has a working commit identity with no exec step. With a Forgejo host configured, the same
+  write adds a `credential "https://<host>"` stanza naming `fj auth git-credential` as the helper, scoped to that host
+  only; a host value that could close the quoted config subsection or start a new config line (whitespace, control
+  characters, `"`, `\`, `[`, `]`) is refused rather than written.
+- The materialized destinations are fixed paths under the config dir (the single-file `yt` config, `gh`'s own config
+  dir, the git identity config) so `YOUTRACK_CLI_CONFIG`, `GH_CONFIG_DIR` and `GIT_CONFIG_GLOBAL` can be exported once
+  at serve start, before any child is spawned, and a credential saved later in the web UI needs no restart to reach the
+  next child.
+- `gh auth login --hostname <host> --with-token --git-protocol https --insecure-storage` receives the token on stdin
+  from a throwaway `0600` file passed by explicit shell redirection (never a bare pipe, and never an argv value, which
+  would leak it into `ps`), under a `30s` timeout. A failing login's error carries the exit code and `gh`'s stderr with
+  the token redacted, so it never reaches a log line or a rendered page.
+
+### 7.4 Claude login status probe (`SPEC-7.4`)
+
+- `claude auth status --json` runs under the agent's own `CLAUDE_CONFIG_DIR` (plus `ANTHROPIC_API_KEY` when one is
+  stored) with a `30s` wall-clock timeout. Only `{"loggedIn": true}` and `{"loggedIn": false}` are decisive outcomes; a
+  spawn failure, a timeout, or output that does not parse as that shape is a third, indeterminate outcome that must
+  never be collapsed into either decided answer, so a transient probe failure never flips readiness in either
+  direction.
+
+### 7.5 Interactive Claude sign-in broker (`SPEC-7.5`)
+
+- Starting a broker-driven `claude auth login` replaces any session already in flight (an operator pressing the button
+  again means the old authorize URL is stale) and spawns the child with piped stdio under the agent's
+  `CLAUDE_CONFIG_DIR`. The child must print its authorize URL within `30s` or it is killed and the attempt fails; once
+  started, its combined output is drained continuously so the pipe never fills and blocks the child.
+- Submitting a code writes it to the child's stdin. The child exiting `0` is `LoggedIn`. The CLI answering a code it
+  rejects without exiting is a `Retry` carrying the CLI's own stderr wording, and the broker keeps the session so the
+  operator can paste another code into the same child, which still holds the PKCE verifier the first code was redeemed
+  against. Any I/O failure writing or flushing the code, or a wait error, terminates the session rather than leaving a
+  half-dead child. Submitting with no session in flight is an error, not a silent no-op. A session that waits longer
+  than 15 minutes between requests is dropped the next time it is viewed.
+
 ## 8. Integrations and dependencies
 
 | Role | Integration |
@@ -443,6 +531,24 @@ adds `allowed_permissions`, `max_files`, `max_lines`, `bot_author`, `bot_email`,
 
 Credentials for `yt`, `fj` and `gh` come from the `auth` settings (materialized into the CLIs' credential files) or an
 action's `token_ref`, which is injected per job.
+
+### 8.1 Agent config dir isolation (`SPEC-8.1`)
+
+- Every spawned `claude` child, scheduled or interactive, runs with `CLAUDE_CONFIG_DIR` pointed at a dedicated agent
+  config dir: the configured `[daemon].claude_config_dir` (`~`/`$VAR` expanded) when set, else
+  `<config dir>/claude-agent-home`. `HOME` stays inherited so git and ssh keep working; only the user-level
+  `CLAUDE.md`, `.credentials.json` and `settings.json` are relocated, and (unlike `--bare`) MCP servers, hooks and
+  skills stay enabled.
+- The dir is seeded before any `claude` child is spawned. `<dir>/CLAUDE.md` is overwritten on every start from the
+  binary's embedded copy of `deploy/bot-CLAUDE.md`, so a bot-file update ships with the binary with no separate sync
+  step.
+- On Linux, `<dir>/.credentials.json` is symlinked to `$HOME/.claude/.credentials.json` when that host file exists, so
+  an OAuth refresh the child writes persists back to the shared host login instead of silently diverging in a copy.
+  Three cases leave the agent dir's credentials file untouched, none of them an error: no host credentials file at
+  all (logged as a `warn`, since the agent then has no credential until one is supplied), a real (non-symlink) file
+  already present in the agent dir (logged as a `warn`, since it is left in place rather than replaced), and an agent
+  config dir that resolves (after symlinks) to the same directory as `$HOME/.claude` (nothing to report; source and
+  target are one path). On macOS this step does not run; credentials live in the Keychain instead.
 
 ## 9. Deployment and operations
 
