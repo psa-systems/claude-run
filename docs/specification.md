@@ -559,6 +559,9 @@ adds `allowed_permissions`, `max_files`, `max_lines`, `bot_author`, `bot_email`,
   against. Any I/O failure writing or flushing the code, or a wait error, terminates the session rather than leaving a
   half-dead child. Submitting with no session in flight is an error, not a silent no-op. A session that waits longer
   than 15 minutes between requests is dropped the next time it is viewed.
+- An operator can also abandon an in-flight session explicitly, killing its child immediately rather than waiting for
+  the staleness drop above; this is the manual counterpart to the automatic drop, triggered from the Settings Auth
+  card.
 
 ## 8. Integrations and dependencies
 

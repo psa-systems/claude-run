@@ -299,6 +299,9 @@ impl LoginBroker {
     }
 
     /// Abandon any in-flight login.
+    // SPEC-7.5: an operator can explicitly abandon an in-flight session,
+    // killing its child immediately rather than waiting for the staleness
+    // drop.
     pub fn cancel(&self) {
         if let Ok(mut slot) = self.pending.lock() {
             if let Some(mut p) = slot.take() {
