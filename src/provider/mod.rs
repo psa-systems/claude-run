@@ -1215,8 +1215,41 @@ fn shallow_clone_retrying(
     if let Some(pinned) = branch {
         restore_default_branch_refs_retrying(url, pinned, workdir, depth, waits)?;
     }
+    fetch_tags_retrying(url, workdir, waits)?;
     init_submodules_retrying(url, workdir, waits)?;
     scrub_workdir_credentials(url, workdir)?;
+    Ok(())
+}
+
+/// Fetch every tag the remote has into a shallow clone, at `--depth 1` so this
+/// never pulls the full history a repo's tags might otherwise drag in.
+///
+/// `git clone --depth N` implies `--single-branch`, which also caps which tags
+/// come along to only those reachable within the depth window: a repo whose
+/// oldest `v*` tag is older than that window ends up with a clone that has
+/// NO tags at all. A repo guard that reads tags (a release-window check, a
+/// changelog, `git describe`) then fails in the runner's clone while passing
+/// on a developer's full clone, a false negative that blocks every push
+/// (CLAUDE-484). `--tags` fetches every tag unconditionally, overwriting any
+/// that the clone itself already carried. An explicit `refs/tags/*:refs/tags/*`
+/// refspec was tried first and rejected: combined with `--depth`, git exits 1
+/// with no stderr at all on a remote with zero tags (verified against git
+/// 2.51.0), which would fail loudly on the common case of a tagless repo;
+/// `--tags` with no refspec has no such failure mode.
+fn fetch_tags_retrying(url: &str, workdir: &std::path::Path, waits: &[Duration; 3]) -> Result<()> {
+    let secrets = url_secrets(url);
+    let out = retry_git_network("fetch tags", &secrets, waits, || {
+        Ok(authed_git_command(Some(workdir), Some(url))
+            .arg("fetch")
+            .arg("--depth")
+            .arg("1")
+            .arg("--tags")
+            .arg("origin")
+            .output()?)
+    })?;
+    if !out.status.success() {
+        return Err(git_error("fetch tags", &out, Some(url)));
+    }
     Ok(())
 }
 
@@ -2008,6 +2041,94 @@ mod tests {
             rev_parse_abbrev(&clone, "origin/HEAD").as_deref(),
             Some("origin/main")
         );
+    }
+
+    // ---- tags survive a shallow clone (CLAUDE-484) -------------
+
+    /// A real origin repo (over `file://`) with `tag_count` commits on
+    /// `main`, each tagged `v1`..`v<tag_count>` in order, so the earliest
+    /// tags sit outside any clone depth smaller than `tag_count`.
+    fn origin_with_old_tags(base: &std::path::Path, tag_count: u32) -> String {
+        let origin = base.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let git_in = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&["init", "-q", "-b", "main"]);
+        git_in(&["config", "user.name", "t"]);
+        git_in(&["config", "user.email", "t@t.example"]);
+        for i in 1..=tag_count {
+            std::fs::write(origin.join("f.txt"), i.to_string()).unwrap();
+            git_in(&["add", "."]);
+            git_in(&["commit", "-q", "-m", &format!("c{i}")]);
+            git_in(&["tag", &format!("v{i}")]);
+        }
+        format!("file://{}", origin.display())
+    }
+
+    fn tag_list(workdir: &std::path::Path) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .args(["tag", "--list"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Before the CLAUDE-484 fix, a shallow clone at a depth shorter than the
+    /// tagged history carried none of the tags older than that window; this
+    /// fails against `shallow_clone_retrying` with the fetch-tags step
+    /// removed, and passes with it in place.
+    #[test]
+    fn shallow_clone_fetches_tags_older_than_the_depth_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_old_tags(tmp.path(), 30);
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, None, &clone, 5).unwrap();
+        let tags = tag_list(&clone);
+        assert_eq!(tags.len(), 30, "expected every tag, got {tags:?}");
+        assert!(tags.contains(&"v1".to_string()), "got {tags:?}");
+        assert!(tags.contains(&"v30".to_string()), "got {tags:?}");
+    }
+
+    /// Same as above, on the `branch: Some(..)` path the issue called out
+    /// separately: a pinned-branch clone must also end up with every tag.
+    #[test]
+    fn pinned_branch_clone_also_fetches_tags_older_than_the_depth_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_old_tags(tmp.path(), 30);
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, Some("main"), &clone, 5).unwrap();
+        let tags = tag_list(&clone);
+        assert_eq!(tags.len(), 30, "expected every tag, got {tags:?}");
+    }
+
+    /// A repo with no tags at all is the common case, and must not fail the
+    /// clone: `git fetch --depth 1 --tags` exits 0 on a tagless remote (an
+    /// equivalent explicit `refs/tags/*:refs/tags/*` refspec does not, see
+    /// `fetch_tags_retrying`'s doc comment).
+    #[test]
+    fn shallow_clone_of_a_tagless_repo_still_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_default_branch(tmp.path(), "main");
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, None, &clone, 50).unwrap();
+        assert!(tag_list(&clone).is_empty());
     }
 
     // ---- submodule init on clone -------------
