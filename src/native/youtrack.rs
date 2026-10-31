@@ -2906,6 +2906,69 @@ fn record_finalize_outcome(
     (ok, summary)
 }
 
+/// SPEC-3.3.1's final push for a finalize path that opens no PR
+/// (needs-review, no-code-change, and the generic hard-failure path below):
+/// those paths never call [`Forge::create_pr_with_draft`], which is the only
+/// other place a push happens, so without this call any commits the agent
+/// made would end the run local-only. `Ok(None)` means nothing to push (no
+/// commits, or the branch is already up to date); `Ok(Some(note))` means the
+/// push succeeded but only after a `pre-push` hook rejection fell back to
+/// `--no-verify`, which the caller folds into its outcome comment rather than
+/// leaving silent. A failed push is itself an error: per SPEC-3.3.1 ("a
+/// failed final push is a failure ... never reported as success"), the
+/// caller must turn whichever outcome it was about to report into a failure
+/// instead.
+fn final_push_note(forge: &dyn Forge, job: &YoutrackJob, workdir: &Path) -> Result<Option<String>> {
+    let host = host_only(&job.repo_host);
+    match forge.final_push(workdir, &host) {
+        Ok(None) => Ok(None),
+        Ok(Some(report)) => Ok(report.hook_rejected.map(|hook_output| {
+            format!(
+                "The final push to `{}` was rejected by the repository's pre-push hook; \
+                 the runner retried with `--no-verify` (SPEC-3.3.1) and the commits are pushed. \
+                 Hook output:\n\n{hook_output}",
+                report.branch
+            )
+        })),
+        Err(e) => Err(Error::Other(anyhow::anyhow!(
+            "final push failed (SPEC-3.3.1): {e}"
+        ))),
+    }
+}
+
+/// The outcome of a failed [`final_push_note`] call (SPEC-3.3.1): always
+/// Failed, whatever marker or result would otherwise have driven this
+/// finalize path, since the commits never reached the forge.
+fn final_push_failed(
+    backend: &dyn IssueTracker,
+    src: &YoutrackSource,
+    job: &YoutrackJob,
+    claude_result: &ClaudeResult,
+    err: &Error,
+    public_url: Option<&str>,
+    run: crate::run_footer::CommentRun,
+) -> Result<Finalized> {
+    let body = [
+        "**The final push failed (SPEC-3.3.1).**".to_string(),
+        String::new(),
+        claude_result.summary.clone(),
+        String::new(),
+        format!("Error: {err}"),
+        String::new(),
+        "The commits are still only in the preserved workdir on the runner host; nothing \
+         reached the forge."
+            .to_string(),
+    ]
+    .join("\n");
+    let body = crate::run_footer::append_job(&body, public_url, run, &job.key);
+    comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
+    Ok(Finalized::Failed {
+        cause: err.to_string(),
+        pr_step: Some("push"),
+        requeued: false,
+    })
+}
+
 /// The finalize state machine (the native "post"). Runs on every path. Mirrors
 /// the single finalize `post` step in `actions/youtrack.yml`: the comment is
 /// best-effort (a comment failure cannot strand the AI Agent field on Working),
@@ -2965,12 +3028,35 @@ fn finalize(
     let no_code = workdir.join(NO_CODE_MARKER);
 
     if needs_review.exists() {
+        // SPEC-3.3.1: push any commits before anything else, since this path
+        // opens no PR of its own and would otherwise leave them local-only.
+        // A failed push overrides this outcome with Failed, never Needs
+        // Review: SPEC-3.3.1 forbids reporting a failed push as anything
+        // else.
+        let push_note = match final_push_note(forge, job, workdir) {
+            Ok(note) => note,
+            Err(e) => {
+                return final_push_failed(
+                    backend,
+                    src,
+                    job,
+                    claude_result,
+                    &e,
+                    public_url.as_deref(),
+                    run,
+                );
+            }
+        };
         // Blocker: ensure the skip marker is present so this attempt is not
         // counted, surface the reason verbatim, AI Agent=Needs Review, no PR.
         if !skip_marker.exists() {
             std::fs::write(&skip_marker, b"")?;
         }
         let reason = std::fs::read_to_string(&needs_review)?.trim().to_string();
+        let reason = match push_note {
+            Some(note) => format!("{reason}\n\n{note}"),
+            None => reason,
+        };
         let reason = append_compaction_note(&reason, stream_log, &job.key);
         let reason = note_checkpoint_rejection(reason);
         let reason = crate::run_footer::append_job(&reason, public_url.as_deref(), run, &job.key);
@@ -2986,14 +3072,33 @@ fn finalize(
         backend.set_field(&job.key, &src.custom_field, &src.states.needs_review)?;
         Ok(Finalized::NeedsReview)
     } else if claude_result.ok && no_code.exists() {
-        // The run deliberately produced tracker output rather than
-        // code, so there are no commits and nothing to open a PR from. Skip the
-        // forge entirely, post the marker text verbatim, and finish on the
-        // no-code label. State is left alone, so the issue stays In Progress
-        // until a human closes it. Without the marker a zero-commit run keeps
-        // the behavior below: the ahead check fails and AI Agent goes
-        // to Failed.
+        // The run usually produced tracker output rather than code, with
+        // nothing to push, but an attempt can still leave commits alongside
+        // the marker (SPEC-3.3.1: "any commits the attempt made are
+        // pushed"), so push them now rather than assuming there are none.
+        // No PR either way: skip the forge beyond that push, post the marker
+        // text verbatim, and finish on the no-code label. State is left
+        // alone, so the issue stays In Progress until a human closes it. A
+        // failed push overrides this outcome with Failed, per SPEC-3.3.1.
+        let push_note = match final_push_note(forge, job, workdir) {
+            Ok(note) => note,
+            Err(e) => {
+                return final_push_failed(
+                    backend,
+                    src,
+                    job,
+                    claude_result,
+                    &e,
+                    public_url.as_deref(),
+                    run,
+                );
+            }
+        };
         let summary = std::fs::read_to_string(&no_code)?.trim().to_string();
+        let summary = match push_note {
+            Some(note) => format!("{summary}\n\n{note}"),
+            None => summary,
+        };
         let summary = note_checkpoint_rejection(summary);
         let summary = crate::run_footer::append_job(&summary, public_url.as_deref(), run, &job.key);
         let label = src.states.no_code_label().to_string();
@@ -3298,14 +3403,32 @@ fn finalize(
             head_branch: salvage.pr.as_ref().and_then(|p| p.head_branch.clone()),
         })
     } else {
-        // Failure: crash, empty prompt, or pre failure.
+        // Failure: crash, empty prompt, pre failure, or an operator cancel
+        // (synthesized by the caller as this same `ok: false, timed_out:
+        // false` shape). SPEC-3.3.1: push any commits before commenting,
+        // since this path opens no PR of its own; a failed push is folded
+        // into both the comment and `cause` rather than silently leaving the
+        // commits unpushed.
+        let push_result = final_push_note(forge, job, workdir);
         let body = failure_comment(claude_result);
+        let body = match &push_result {
+            Ok(Some(note)) => format!("{body}\n\n{note}"),
+            Ok(None) => body,
+            Err(e) => format!(
+                "{body}\n\n**The final push failed (SPEC-3.3.1): {e}.** The commits are still \
+                 only in the preserved workdir on the runner host."
+            ),
+        };
         let body = note_checkpoint_rejection(body);
         let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
+        let (cause, pr_step) = match &push_result {
+            Err(e) => (format!("final push failed: {e}"), Some("push")),
+            _ => (claude_result.error.clone(), None),
+        };
         Ok(Finalized::Failed {
-            cause: claude_result.error.clone(),
-            pr_step: None,
+            cause,
+            pr_step,
             requeued: false,
         })
     }

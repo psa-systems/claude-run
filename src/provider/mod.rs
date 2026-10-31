@@ -129,6 +129,19 @@ pub struct PrStatus {
     pub head_sha: Option<String>,
 }
 
+/// What [`Forge::final_push`] actually did, when it pushed anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalPushReport {
+    /// The feature branch that was pushed.
+    pub branch: String,
+    /// `Some(output)` when the plain push was rejected and the retry with
+    /// `--no-verify` is what actually landed the commits (SPEC-3.3.1): the
+    /// rejected attempt's own error text, so the caller can post the hook's
+    /// output rather than staying silent about the fallback. `None` when the
+    /// plain push succeeded outright.
+    pub hook_rejected: Option<String>,
+}
+
 /// A pull request opened by a [`Forge`] backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
@@ -517,6 +530,29 @@ pub trait Forge: Send + Sync {
         let _ = (workdir, host, body);
         Err(Error::Other(anyhow::anyhow!(
             "checkpoint_push not supported by this forge backend"
+        )))
+    }
+
+    /// Push the resolved feature branch (SPEC-3.3.1), with hooks enabled
+    /// (unlike [`Self::checkpoint_push`], which always bypasses them): this
+    /// runs once the agent has finished, so a `pre-push` hook sees a
+    /// finished tree rather than a half-edited one. Opens no PR; used by the
+    /// finalize paths that must never create one (needs-review,
+    /// no-code-change, hard failure). Returns `Ok(None)` when there is
+    /// nothing to push: no feature branch yet, or its tip already matches
+    /// the remote. On a hook rejection, retries once with `--no-verify`
+    /// (SPEC-3.3.1's fallback) and reports it via
+    /// [`FinalPushReport::hook_rejected`] so the caller can name it in the
+    /// outcome it posts; any other push failure (network, a real
+    /// non-fast-forward divergence, ...) is returned as `Err` and MUST be
+    /// treated as a failed run (SPEC-3.3.1: "a failed final push is a
+    /// failure... never reported as success"). The default errors so a
+    /// backend without support (every test-only stub) reports clearly rather
+    /// than silently no-op'ing.
+    fn final_push(&self, workdir: &std::path::Path, host: &str) -> Result<Option<FinalPushReport>> {
+        let _ = (workdir, host);
+        Err(Error::Other(anyhow::anyhow!(
+            "final_push not supported by this forge backend"
         )))
     }
 

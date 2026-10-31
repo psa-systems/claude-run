@@ -373,9 +373,20 @@ impl GithubForge {
     /// post-clone scrub, and the token must never appear in argv); otherwise
     /// fall back to an unauthenticated push against `origin` (host git auth),
     /// warning with both misses named rather than failing silently.
-    fn push(&self, workdir: &Path, host: &str, repo: &str, branch: &str) -> Result<()> {
+    fn push(
+        &self,
+        workdir: &Path,
+        host: &str,
+        repo: &str,
+        branch: &str,
+        no_verify: bool,
+    ) -> Result<()> {
         let refspec = format!("HEAD:{branch}");
-        let push_args = ["push", "origin", refspec.as_str()];
+        let push_args: Vec<&str> = if no_verify {
+            vec!["push", "--no-verify", "origin", refspec.as_str()]
+        } else {
+            vec!["push", "origin", refspec.as_str()]
+        };
         let token_url = match self.effective_token(host) {
             Ok(token) => Some(format!("https://x-access-token:{token}@{host}/{repo}.git")),
             Err(e) => {
@@ -560,7 +571,7 @@ impl GithubForge {
             .and_then(|out| out.split_whitespace().next().map(str::to_string))
             .filter(|s| !s.is_empty());
 
-        self.push(workdir, host, &repo, &branch)?;
+        self.push(workdir, host, &repo, &branch, false)?;
 
         let event = if draft {
             crate::push_comment::PushEvent::TimeoutSalvagePush
@@ -971,6 +982,47 @@ impl Forge for GithubForge {
             });
         }
         Ok(())
+    }
+
+    /// SPEC-3.3.1's final push: see [`Forge::final_push`]. GitHub has no
+    /// AGit equivalent, so `HEAD` is always the feature branch; "nothing to
+    /// push" degrades to `Ok(None)` when it carries no commit the base lacks.
+    fn final_push(
+        &self,
+        workdir: &Path,
+        host: &str,
+    ) -> Result<Option<crate::provider::FinalPushReport>> {
+        let branch = self.git(workdir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        let base = self.detect_base(workdir);
+        let ahead = self
+            .git(
+                workdir,
+                &["rev-list", "--count", &format!("origin/{base}..HEAD")],
+            )
+            .unwrap_or_default();
+        if ahead.trim().parse::<u64>().unwrap_or(0) == 0 {
+            return Ok(None);
+        }
+        let repo = parse_owner_repo(&self.git(workdir, &["remote", "get-url", "origin"])?)
+            .ok_or_else(|| {
+                Error::Other(anyhow::anyhow!(
+                    "cannot parse owner/repo from origin remote in {}",
+                    workdir.display()
+                ))
+            })?;
+        match self.push(workdir, host, &repo, &branch, false) {
+            Ok(()) => Ok(Some(crate::provider::FinalPushReport {
+                branch,
+                hook_rejected: None,
+            })),
+            Err(e) => {
+                self.push(workdir, host, &repo, &branch, true)?;
+                Ok(Some(crate::provider::FinalPushReport {
+                    branch,
+                    hook_rejected: Some(e.to_string()),
+                }))
+            }
+        }
     }
 
     fn clone_url(&self, host: &str, repo: &str) -> Result<String> {

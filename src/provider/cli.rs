@@ -2169,6 +2169,42 @@ impl Forge for CliBackend {
         Ok(Some(pr))
     }
 
+    /// SPEC-3.3.1's final push: see [`Forge::final_push`]. Shares
+    /// [`Self::resolve_feature_branch`] / [`Self::remote_branch_sha`] with
+    /// [`Self::checkpoint_push`] for the "nothing to push" degrade, but runs
+    /// hooks on the first attempt and opens no PR.
+    fn final_push(
+        &self,
+        workdir: &Path,
+        host: &str,
+    ) -> Result<Option<crate::provider::FinalPushReport>> {
+        let branch = match self.resolve_feature_branch(workdir) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let repo = self.origin_repo_path(workdir)?;
+        let token_url = self.clone_url(host, &repo).ok();
+        let token_url = token_url.as_deref();
+        let local_sha = self.rev_parse(workdir, &branch)?;
+        let remote_sha = self.remote_branch_sha(workdir, &branch, token_url)?;
+        if remote_sha.as_deref() == Some(local_sha.as_str()) {
+            return Ok(None);
+        }
+        match self.push_branch(workdir, &branch, token_url) {
+            Ok(()) => Ok(Some(crate::provider::FinalPushReport {
+                branch,
+                hook_rejected: None,
+            })),
+            Err(e) => {
+                self.push_branch_no_verify(workdir, &branch, token_url)?;
+                Ok(Some(crate::provider::FinalPushReport {
+                    branch,
+                    hook_rejected: Some(e.to_string()),
+                }))
+            }
+        }
+    }
+
     /// Strip the `WIP: ` title prefix a timeout-salvaged draft PR (CLAUDE-379)
     /// carries, when a re-queued run resumes onto it and now succeeds. A PR
     /// whose title already lacks the prefix (not a salvaged draft, or already
