@@ -5,6 +5,8 @@
 //! Settings-page form), so a changed environment applies on the next daemon
 //! restart. It is deliberately not `Debug`: it holds the plaintext SMTP
 //! credential for the lifetime of one send.
+//!
+//! SPEC-7.6: the SMTP transport invite-by-email sends through.
 
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -23,6 +25,7 @@ pub struct Mailer {
 }
 
 impl Mailer {
+    // SPEC-7.6: builds the SMTP transport an invite email is sent through.
     /// Build a transport from `cfg`, using its resolved [`EmailConfig::password`]
     /// (empty when no `smtp_username` is set). Fails when `cfg` is not
     /// "configured" ([`EmailConfig::configured`]) or `smtp_host`/`from` do not
@@ -65,6 +68,7 @@ impl Mailer {
         })
     }
 
+    // SPEC-7.6: sends the invite email.
     /// Send a plain-text message to `to`. The subject and body must never
     /// contain the invite token, the full invite link, or the SMTP password;
     /// the caller is responsible for that.

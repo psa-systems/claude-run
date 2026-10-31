@@ -453,22 +453,107 @@ adds `allowed_permissions`, `max_files`, `max_lines`, `bot_author`, `bot_email`,
 
 ## 7. Security
 
-- TCP surface authentication is required for any non-loopback bind (or `require_auth_on_loopback`). Credentials: bearer
-  token (constant-time compare) or a session cookie `claude_run_session` (HttpOnly, Secure, SameSite=Lax, 12-hour TTL,
-  HMAC-signed with the account's rotating session key). `/webhooks/`, the login, setup and invite routes are exempt;
-  webhooks authenticate by HMAC.
-- With no credential and no account, browsers are sent to `/setup` and other clients receive 503; the surface is never
-  served unauthenticated.
-- Accounts: argon2id password hashes, mandatory TOTP enrollment (an unenrolled session may only reach `/account/2fa/setup`
-  and static assets), one-time recovery codes, 5 wrong second-factor attempts per 5-minute pending cookie, invites that
-  expire after 72 hours and are stored as hashes. `access reset-2fa` rotates the session key.
+### 7.1 TCP surface authentication
+
+- TCP surface authentication is required for any non-loopback bind, or for a loopback bind with `require_auth_on_loopback`
+  set; a loopback bind with the flag unset serves unauthenticated, as before. An unparseable, non-`localhost` bind value
+  is treated as non-loopback, so the check fails safe (requires auth) rather than open.
+- Credentials: `Authorization: Bearer <token>` (constant-time compare, scheme match case-insensitive per RFC 7235)
+  naming the secret `auth_token_ref`, or the session cookie (7.3). A configured `auth_token_ref` that fails to resolve
+  (no key file, unknown secret, empty value) is a warning, not a fatal startup error: bearer auth is then unavailable
+  for the run, but the browser login or first-run setup still gets the operator in.
+- The legacy pair `auth_username` plus the `auth_token_ref` plaintext authenticates the login form only while no DB
+  account exists; once any account exists, only a DB account (7.4) can sign in through the form. The legacy pair's
+  session is signed with the bearer token as its HMAC key under the sentinel account id `0`; every other session signs
+  with that account's own rotating `session_key`, so rotating either invalidates exactly the sessions it signed.
+- `/webhooks/`, `/login`, `/login/2fa`, `/logout`, `/setup` and `/invite/*` are exempt from this gate: webhooks
+  authenticate by HMAC (4.4) and cannot carry a bearer header, and the auth routes themselves must stay reachable
+  unauthenticated or there is no way to obtain a credential. `/account/2fa/setup` still requires a valid credential; it
+  is exempt only from the enrollment check in 7.5, not from this gate.
+
+### 7.2 Unconfigured instance
+
+- With no credential and no account at all, a browser GET that accepts `text/html` is redirected to `/setup`; every
+  other request is refused with 503 naming the state (`claude-run has no account yet`). The surface is never served
+  unauthenticated by falling through to the protected routes.
+- `/setup` is a dead end once any account exists: a further GET or POST redirects to `/login` instead of minting a
+  second account, so setup runs exactly once and only an accepted invite (7.6) can add another account.
+
+### 7.3 Session and pending-2FA cookies
+
+- The session cookie (`claude_run_session`) carries plaintext claims `"<account id>.<expiry>.<hmac>"`, set HttpOnly,
+  Secure, SameSite=Lax, scoped to `/`, with a 12-hour TTL, HMAC-SHA256-signed with the key named in 7.1. An expired
+  cookie, or one whose recomputed signature does not match, is rejected.
+- The pending-2FA cookie proves a password check already passed and a second factor is still owed: the same claim
+  shape plus a wrong-attempt counter, a 5-minute TTL, and a cap of 5 wrong codes before the cookie is discarded and the
+  operator is sent back to `/login` to start over.
+
+### 7.4 Accounts
+
+- Any number of accounts live in `web_accounts`, each with its own argon2id password hash and its own rotating
+  `session_key`; there are no roles yet, so every account has full rights.
+- Username lookup and the uniqueness check are case-insensitive. Creating or accepting an invite refuses an empty
+  username, a password under `MIN_PASSWORD_LEN` (12) characters, or a username already in use, each surfaced as a
+  visible reason rather than a generic failure, and writes nothing on refusal.
+- Removing an account is refused for the last remaining account and for removing one's own account, both as visible
+  errors rather than a silent no-op; a successful removal also deletes that account's recovery codes.
+- Changing a password rotates the session key with it, signing every existing browser session for that account out
+  immediately.
+
+### 7.5 TOTP enrollment and login
+
+- TOTP enrollment is mandatory: an authenticated but unenrolled session may reach only `/account/2fa/setup` and
+  `/static/*`; every other route refuses it (a browser GET is redirected to the enrollment page, anything else gets a
+  plain refusal), so no other page loads until enrollment is confirmed.
+- Enrollment: beginning (or restarting) it generates a fresh RFC 6238 secret, stores it encrypted but unconfirmed, and
+  returns the `otpauth://` URI and its rendered QR code; reloading before confirmation just replaces the pending
+  secret. Confirming it with a valid current code marks the account enrolled and mints `RECOVERY_CODE_COUNT` (10)
+  single-use recovery codes, rendered once and never stored in the clear.
+- Login-time verification accepts the current or an adjacent TOTP time step, or an unused recovery code (consumed on
+  success); the same TOTP step is never accepted twice (replay refused). A wrong code bumps the pending cookie's
+  attempt counter (7.3); a corrupt stored secret is a surfaced error, never silently treated as "not enrolled" or as a
+  wrong code.
+- `access reset-2fa` clears enrollment and every recovery code and rotates the session key, forcing re-enrollment and
+  signing out every existing session for that account.
+
+### 7.6 Invites and email
+
+- An invite is a single-use token in `web_invites`, stored only as a hash, minted by a signed-in account and expiring
+  `INVITE_TTL_HOURS` (72) hours after creation. Accepting it creates the account and marks the invite used inside one
+  transaction, so a race between two acceptances of the same token can create at most one account; a used, expired or
+  unknown token resolves to nothing.
+- With no email address given, the invite link is shown once in the accounts UI. With an address, the link is emailed
+  instead through `src/mailer.rs` (CLAUDE-394), built from `CLAUDE_RUN_PUBLIC_URL` rather than any request's `Host`
+  header, and not displayed, unless the send fails, in which case the invite is kept (not discarded) and the link is
+  shown once as a fallback. The emailed body never carries the SMTP credential.
+- Sending by email requires SMTP to be configured: `CLAUDE_RUN_SMTP_HOST`, `_FROM` and `CLAUDE_RUN_PUBLIC_URL` must all
+  be set, and a `_USERNAME` without a password is refused (CLAUDE-428); the transport is built fresh from the process
+  environment on every send, never from a Settings-page form, so a changed environment applies on the next daemon
+  restart, not live. An invalid recipient address is refused with 400 and mints no invite; an unconfigured SMTP
+  environment is refused with 400 naming the missing variables rather than silently falling back to the link-only
+  flow.
+
+### 7.7 Secrets storage
+
 - Secrets are stored age-encrypted (X25519 identity) in `secrets`. The key file is created with mode 0600 on first start,
   a missing key with stored secrets refuses to generate a new one, and a key readable beyond its owner is warned about.
+
+### 7.8 Webhook hardening
+
 - Webhook hardening: per-source HMAC secret, rate limit before crypto, shared replay store, repository allow-list that
   denies by default, and a comment-command permission check plus decision-gate caps.
+
+### 7.9 CI log and run-summary rendering
+
 - Logs fetched from CI are redacted before storage or attachment. Run summaries rendered in the UI are Markdown with raw
   HTML demoted to text.
+
+### 7.10 Unix-socket API
+
 - The unix-socket API has no authentication and is disabled by `--no-socket` in the container image.
+
+### 7.11 Agent write boundary
+
 - The agent may mutate only through the bounded tracker writes the prompt permits; the runner owns the `AI Agent` field
   and every write to the triggering issue except comments.
 

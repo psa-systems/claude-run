@@ -37,6 +37,9 @@
 //! the id lets `require_token` look the account up fresh on every request
 //! rather than caching a single administrator, which is what makes multiple
 //! concurrently valid accounts (and multiple accounts mid-2FA at once) work.
+//!
+//! SPEC-7.1 (gate and credentials), SPEC-7.2 (unconfigured instance), SPEC-7.3
+//! (session and pending-2FA cookies), SPEC-7.5 (TOTP enrollment enforcement).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -63,12 +66,14 @@ use crate::config::WebConfig;
 use crate::error::Result;
 use crate::secrets::SecretsKey;
 
+// SPEC-7.3: session cookie name and 12-hour TTL.
 /// Session cookie name set on a successful form login and accepted by the gate
 /// in lieu of a bearer header.
 const SESSION_COOKIE: &str = "claude_run_session";
 /// How long a login session stays valid before the browser must sign in again.
 const SESSION_TTL_SECS: u64 = 12 * 3600;
 
+// SPEC-7.3: pending-2FA cookie name, 5-minute TTL and 5-attempt cap.
 /// Cookie proving a password check has already passed and a TOTP (or recovery)
 /// code is still owed before a session is granted.
 const PENDING_2FA_COOKIE: &str = "claude_run_2fa_pending";
@@ -79,13 +84,14 @@ const PENDING_2FA_TTL_SECS: u64 = 5 * 60;
 /// discarded and the operator is sent back to `/login`.
 const PENDING_2FA_MAX_ATTEMPTS: u32 = 5;
 
+// SPEC-7.1: the legacy pair's sentinel session account id.
 /// Sentinel session account id for the legacy `web.auth_username` plus
 /// `auth_token_ref` login, which has no row in `web_accounts`.
 const LEGACY_ACCOUNT_ID: i64 = 0;
 
-/// Holds whatever credentials this run has: the bearer token (when
-/// `auth_token_ref` resolved), the legacy form-login username, and the pool
-/// every account lookup reads through. Cheaply cloned into the middleware.
+/// SPEC-7.1/SPEC-7.4: holds whatever credentials this run has: the bearer token
+/// (when `auth_token_ref` resolved), the legacy form-login username, and the
+/// pool every account lookup reads through. Cheaply cloned into the middleware.
 #[derive(Clone)]
 pub struct TokenGate {
     /// `None` when no `auth_token_ref` is configured or it did not resolve.
@@ -103,6 +109,8 @@ pub struct TokenGate {
     secrets_key: Option<Arc<SecretsKey>>,
 }
 
+// SPEC-7.1: the gate's constructors cover every credential combination the
+// gate can hold (bearer-only, legacy form login, accounts, unconfigured).
 impl TokenGate {
     /// Bearer-only gate (no form login, no DB accounts). Used by tests and any
     /// caller that does not configure a username.
@@ -146,6 +154,8 @@ impl TokenGate {
         }
     }
 
+    // SPEC-7.2: an instance with no bearer token and no account is
+    // unconfigured.
     /// Whether any credential can authenticate a request. `false` means the
     /// instance still needs first-run setup.
     async fn configured(&self) -> bool {
@@ -158,6 +168,8 @@ impl TokenGate {
         }
     }
 
+    // SPEC-7.1: whether an unauthenticated browser GET goes to a form instead
+    // of a bare 401.
     /// Whether a browser should be sent to a form rather than a bare 401. True
     /// once there is any form to send them to: a configured legacy username, a
     /// pool that can hold accounts, or an unconfigured instance needing setup.
@@ -173,6 +185,8 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+// SPEC-7.3: session-cookie signing, parsing, verification and the
+// `Set-Cookie` value, all through this HMAC scheme.
 /// Sign a session for `account_id` and `expiry` (unix seconds) under `key`,
 /// returning the cookie value `"<account_id>.<expiry>.<hex-hmac>"`. The HMAC
 /// keys on the account's own `session_key` (or the bearer token for the legacy
@@ -218,6 +232,8 @@ fn session_set_cookie(key: &str, account_id: i64) -> String {
     )
 }
 
+// SPEC-7.3: the shared cookie-reading helper the session and pending-2FA
+// cookies are both read through.
 /// Read a named cookie's value out of a `Cookie` header, if present.
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
@@ -227,11 +243,14 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     })
 }
 
+// SPEC-7.3: reads the session cookie the gate verifies.
 /// Read the session cookie value from a request's `Cookie` header, if present.
 fn session_cookie(request: &Request) -> Option<String> {
     cookie_value(request.headers(), SESSION_COOKIE)
 }
 
+// SPEC-7.3: pending-2FA cookie signing, parsing, verification (including the
+// 5-minute TTL and 5-attempt cap) and the `Set-Cookie`/clear values.
 /// Sign a pending-2FA cookie: password already checked for `account_id`, a
 /// second factor is still owed. `attempts` is the number of wrong codes
 /// already tried against it, so a cap can be enforced without a DB round trip.
@@ -287,6 +306,8 @@ fn pending_2fa_clear_cookie() -> String {
     format!("{PENDING_2FA_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0")
 }
 
+// SPEC-7.1/SPEC-7.2: a browser navigation is redirected to a form instead of
+// answered with a bare 401/503.
 /// Whether the request looks like a browser navigation that should be redirected
 /// to the login page rather than answered with a bare 401.
 fn wants_html(request: &Request) -> bool {
@@ -297,12 +318,16 @@ fn wants_html(request: &Request) -> bool {
         .is_some_and(|a| a.contains("text/html"))
 }
 
+// SPEC-7.1: auth is required for any non-loopback bind, or a loopback bind
+// with `require_auth_on_loopback`.
 /// True when the TCP surface must require a token: any non-loopback bind, or an
 /// explicit `require_auth_on_loopback` for local testing of the gate.
 pub fn auth_required(web: &WebConfig) -> bool {
     web.require_auth_on_loopback || !is_loopback_bind(&web.bind)
 }
 
+// SPEC-7.1: an unparseable, non-`localhost` bind value fails safe as
+// non-loopback.
 /// Whether `bind` names a loopback-only address. `127.0.0.0/8`, `::1`, and the
 /// literal `localhost` are loopback; `0.0.0.0`, `::`, and any routable address
 /// are not. An unparseable, non-`localhost` value is treated as non-loopback so
@@ -318,6 +343,8 @@ pub fn is_loopback_bind(bind: &str) -> bool {
     }
 }
 
+// SPEC-7.1/SPEC-7.2: resolves which credential(s) this run's gate holds, and
+// that a failed bearer-token resolution is non-fatal.
 /// Resolve the gate for this daemon run from the web config, the secrets store
 /// and the DB accounts.
 ///
@@ -378,6 +405,7 @@ pub async fn resolve_gate(web: &WebConfig, pool: &DbPool) -> Result<Option<Token
     Ok(Some(gate))
 }
 
+// SPEC-7.1: a bearer-token secret that fails to resolve is non-fatal.
 /// Resolve the bearer token from `auth_token_ref`, or `None` with the reason
 /// logged. Never fatal: see [`resolve_gate`].
 async fn resolve_token(web: &WebConfig, pool: &DbPool) -> Option<String> {
@@ -415,6 +443,7 @@ async fn resolve_token(web: &WebConfig, pool: &DbPool) -> Option<String> {
     }
 }
 
+// SPEC-7.1: mounts the auth routes alongside the gated router.
 /// Wrap `router` so every request must carry either `Authorization: Bearer
 /// <token>` or a valid session cookie, except requests under the `/webhooks/`
 /// prefix, the login routes, and invite acceptance. When the gate has a
@@ -445,6 +474,9 @@ pub fn protect(router: Router, gate: TokenGate) -> Router {
         .layer(axum::middleware::from_fn_with_state(gate, require_token))
 }
 
+// SPEC-7.1/SPEC-7.2/SPEC-7.3/SPEC-7.5: the core gate. Exempt paths, the
+// unconfigured 503/redirect, bearer and session-cookie verification, and the
+// unenrolled-session TOTP-setup redirect all live here.
 /// Axum middleware enforcing a bearer token or a session cookie. Exempts the
 /// webhook prefix, the auth routes, and invite acceptance. An unauthenticated
 /// browser navigation (GET accepting HTML) is redirected to the form it needs
@@ -537,6 +569,7 @@ async fn require_token(State(gate): State<TokenGate>, request: Request, next: Ne
         .into_response()
 }
 
+// SPEC-7.5: the only paths an unenrolled session may still reach.
 /// Paths an unenrolled but authenticated session may still reach: the
 /// enrollment page itself and the static assets it renders with.
 fn totp_setup_exempt(path: &str) -> bool {
@@ -637,6 +670,7 @@ struct RevokeInviteForm {
     id: i64,
 }
 
+// SPEC-7.1: the login form is unreachable before the instance is configured.
 /// GET `/login`: render the sign-in form, or bounce to setup when the instance
 /// has no credential to sign in with.
 async fn login_page(State(gate): State<TokenGate>) -> Response {
@@ -646,6 +680,9 @@ async fn login_page(State(gate): State<TokenGate>) -> Response {
     render_login(None, StatusCode::OK)
 }
 
+// SPEC-7.1/SPEC-7.5: DB-account login (falling back to the legacy pair),
+// routed into the pending-2FA cookie flow when the matched account is
+// TOTP-enrolled.
 /// POST `/login`: verify the credentials, mint a session cookie, and redirect to
 /// the dashboard. A DB account matching the username wins when any account
 /// exists; otherwise the pre-setup pair (`web.auth_username` plus the
@@ -719,6 +756,8 @@ async fn login_submit(State(gate): State<TokenGate>, Form(form): Form<LoginForm>
     redirect_with_session("/", token, LEGACY_ACCOUNT_ID)
 }
 
+// SPEC-7.3/SPEC-7.5: the second-factor form requires a live pending-2FA
+// cookie for an enrolled account.
 /// GET `/login/2fa`: render the second-factor form, or bounce to `/login` when
 /// there is no live pending-2FA cookie to redeem (a direct visit, an expired
 /// cookie, or an account that is not enrolled).
@@ -735,6 +774,8 @@ async fn login_totp_page(State(gate): State<TokenGate>, request: Request) -> Res
     render_login_totp(None, StatusCode::OK)
 }
 
+// SPEC-7.3: resolves and verifies the pending-2FA cookie against the named
+// account's own session key.
 /// Resolve the account named by a live pending-2FA cookie, verifying its
 /// signature against that account's own key.
 async fn pending_2fa_account(gate: &TokenGate, headers: &HeaderMap) -> Option<Account> {
@@ -748,6 +789,8 @@ async fn pending_2fa_account(gate: &TokenGate, headers: &HeaderMap) -> Option<Ac
         .then_some(account)
 }
 
+// SPEC-7.3/SPEC-7.5: redeems the pending-2FA cookie and enforces its
+// 5-attempt cap, clearing the cookie on success or at the cap.
 /// POST `/login/2fa`: redeem the pending cookie against a TOTP or recovery
 /// code. A wrong code re-renders with the attempt count bumped in the
 /// re-issued cookie; hitting the cap or a missing/expired cookie sends the
@@ -822,6 +865,7 @@ async fn login_totp_submit(
     }
 }
 
+// SPEC-7.5: begins (or resumes) TOTP enrollment for the session's own account.
 /// GET `/account/2fa/setup`: begin (or resume) enrollment, showing the
 /// `otpauth://` URI, its QR code, and a confirmation form. Reachable only by
 /// an authenticated session (the `require_token` gate lets an unenrolled
@@ -856,6 +900,7 @@ async fn totp_setup_page(
     }
 }
 
+// SPEC-7.5: confirming enrollment issues the one-time recovery codes.
 /// POST `/account/2fa/setup`: confirm enrollment with a valid current code.
 /// On success, renders the one-time recovery codes directly rather than
 /// persisting them anywhere they could be re-displayed.
@@ -910,6 +955,7 @@ async fn totp_setup_submit(
     }
 }
 
+// SPEC-7.3: logout clears the session cookie.
 /// GET `/logout`: clear the session cookie and bounce back to the login form.
 async fn logout() -> Response {
     let mut resp = Redirect::to("/login").into_response();
@@ -920,6 +966,7 @@ async fn logout() -> Response {
     resp
 }
 
+// SPEC-7.2: setup is reachable only while the instance is unconfigured.
 /// GET `/setup`: the first-run account form. Once any account exists this is a
 /// dead end by design, so it redirects to the login form: setup runs exactly
 /// once and cannot be used to mint a second account (invites do that).
@@ -930,6 +977,8 @@ async fn setup_page(State(gate): State<TokenGate>) -> Response {
     render_setup(None, StatusCode::OK)
 }
 
+// SPEC-7.2/SPEC-7.4: creates the first account and signs the operator in with
+// a session cookie, deferring to TOTP enrollment.
 /// POST `/setup`: create the first account and sign the operator in.
 async fn setup_submit(State(gate): State<TokenGate>, Form(form): Form<SetupForm>) -> Response {
     if gate.configured().await {
@@ -968,6 +1017,7 @@ async fn setup_submit(State(gate): State<TokenGate>, Form(form): Form<SetupForm>
     redirect_with_session("/account/2fa/setup", account.session_key(), account.id)
 }
 
+// SPEC-7.6: an invite link is only usable while live (unexpired, unused).
 /// GET `/invite/<token>`: render the invite-acceptance form, or refuse once the
 /// token is unknown, expired, or already used.
 async fn invite_page(State(gate): State<TokenGate>, Path(token): Path<String>) -> Response {
@@ -992,6 +1042,8 @@ async fn invite_page(State(gate): State<TokenGate>, Path(token): Path<String>) -
     }
 }
 
+// SPEC-7.4/SPEC-7.6: accepting a live invite creates the account and signs it
+// in, deferring to TOTP enrollment like first-run setup.
 /// POST `/invite/<token>`: accept the invite, create the account, and send the
 /// new account straight to forced TOTP enrollment with a fresh session, the
 /// same as first-run setup.
@@ -1044,6 +1096,7 @@ async fn invite_submit(
     redirect_with_session("/account/2fa/setup", account.session_key(), account.id)
 }
 
+// SPEC-7.4/SPEC-7.6: lists every account and outstanding invite.
 /// GET `/settings/accounts`: list every account and outstanding invite.
 async fn accounts_page(
     State(gate): State<TokenGate>,
@@ -1060,6 +1113,8 @@ struct CreateInviteForm {
     email: String,
 }
 
+// SPEC-7.6: mints a single-use, 72-hour invite, optionally emailed through
+// the mailer when SMTP is configured, with a link-fallback on send failure.
 /// POST `/settings/accounts/invite`: mint a single-use invite. With `email`
 /// blank, shows its link once (unchanged). With `email` set, emails the link
 /// instead and does not display it, unless the send fails, in which case the
@@ -1200,6 +1255,7 @@ async fn create_invite_submit(
     }
 }
 
+// SPEC-7.6: resolves the SMTP transport config invite-by-email sends through.
 /// Resolve the SMTP transport config from the environment (CLAUDE-428).
 /// Warns and falls back to unconfigured on a bad environment rather than
 /// failing the request: the daemon's own startup validation
@@ -1213,6 +1269,7 @@ fn load_email_config() -> crate::config::EmailConfig {
     })
 }
 
+// SPEC-7.4: removal refuses the last account or self-removal.
 /// POST `/settings/accounts/remove`: remove an account, refusing the last
 /// account or self-removal (surfaced visibly, never a silent no-op).
 async fn remove_account_submit(
@@ -1245,6 +1302,7 @@ async fn remove_account_submit(
     }
 }
 
+// SPEC-7.6: revokes an outstanding invite.
 /// POST `/settings/accounts/revoke`: revoke an outstanding invite.
 async fn revoke_invite_submit(
     State(gate): State<TokenGate>,
@@ -1276,6 +1334,8 @@ async fn revoke_invite_submit(
     }
 }
 
+// SPEC-7.4/SPEC-7.6: renders the accounts/invites list the accounts page is
+// built from.
 /// Render the Accounts page. `error`/`status` travel together: `status` is
 /// `200` exactly when `error` is `None` for every caller above, so a refused
 /// request (bad address, SMTP unconfigured, last-account/self removal) or a
@@ -1327,6 +1387,8 @@ async fn render_accounts(
     }
 }
 
+// SPEC-7.3: mints the Set-Cookie session value a successful sign-in redirects
+// with.
 /// Redirect to `to`, carrying a fresh session cookie for `account_id` signed by
 /// `key`.
 fn redirect_with_session(to: &str, key: &str, account_id: i64) -> Response {
@@ -1402,6 +1464,7 @@ fn render_totp_setup(
     }
 }
 
+// SPEC-7.1: extracts the bearer-token credential the gate compares.
 /// Extract the token from an `Authorization: Bearer <token>` header, if present.
 /// The scheme match is case-insensitive per RFC 7235; the token is returned
 /// verbatim (trimmed of surrounding whitespace).
@@ -1421,6 +1484,7 @@ fn bearer_token(request: &Request) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
+// SPEC-7.1: the constant-time compare the bearer token is checked with.
 /// Length-checked constant-time byte comparison. Avoids a timing oracle on the
 /// token by folding every byte before deciding. The length comparison is not
 /// constant-time, which is the standard, accepted leak for a bearer token.
