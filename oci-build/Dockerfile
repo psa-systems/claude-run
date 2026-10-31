@@ -144,7 +144,8 @@ RUN set -eu; \
     gosu nobody true
 
 # SPEC-9: "this stage only creates the runtime user, copies the binary and
-# shipped config." claude-run itself, from the builder stage above.
+# shipped config." The `claude-run` binary itself, from the builder stage
+# above.
 COPY --from=builder /build/target/release/claude-run /usr/local/bin/claude-run
 
 # SPEC-9: "Entrypoint hooks seed `config.toml` and the shipped action files
