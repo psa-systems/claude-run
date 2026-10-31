@@ -1,4 +1,4 @@
-//! Native YouTrack action handler.
+//! Implements SPEC-3.3 and SPEC-3.3.1. Native YouTrack action handler.
 //!
 //! Ports the scripted `actions/youtrack.yml` pipeline to typed Rust on the
 //! dispatch seam ([`super`]) and the provider abstraction
@@ -117,6 +117,8 @@ struct YoutrackJob {
     clone_url: String,
 }
 
+/// SPEC-3.3: the `youtrack` kind's handler.
+///
 /// Built-in YouTrack handler. Routed to by [`super::handler_for`].
 pub struct YoutrackHandler;
 
@@ -126,6 +128,9 @@ impl NativeHandler for YoutrackHandler {
     }
 }
 
+/// SPEC-3.3: drives the whole gather / eligible / pre / claude / finalize
+/// pipeline this section describes.
+///
 /// Drive a full YouTrack run: caps/budget, gather, then the per-job pipeline,
 /// mirroring [`crate::daemon::run_action_inner`]'s run accounting (which native
 /// actions bypass) while substituting the typed YouTrack pipeline for the
@@ -590,6 +595,9 @@ fn concurrency_key(fields: &[String], job: &YoutrackJob) -> String {
     }
 }
 
+/// SPEC-3.3: the per-job tracker/forge backend every gather, pre and finalize
+/// call in this file uses, built from the job's own materialized credentials.
+///
 /// Build a [`CliBackend`] from `runner`, applying a job's materialized
 /// credentials (yt config env, fj store env, and the temp `keys.json` path so
 /// `clone_url` reads the same store). An empty credential set leaves host auth.
@@ -631,6 +639,8 @@ const RESTART_REQUEUE_COMMENT: &str =
 /// credential or tracker error) is logged and the row is left to
 /// [`state::reap_orphaned_runs`]'s unconditional delete; the daemon must
 /// finish starting either way.
+/// SPEC-2.2: "reconciles tracker issues stranded in the working state" left
+/// by a daemon that stopped or died mid-job.
 pub async fn reconcile_restart_inflight(
     pool: &DbPool,
     paths: &Paths,
@@ -849,6 +859,11 @@ fn forge_access_check(
     })
 }
 
+/// SPEC-3.3: "Gather: query the tracker with `native.youtrack.query` ...
+/// resolve each issue's repository from its project's enabled VCS
+/// integration, drop issues with no integration, and drop issues whose
+/// repository the forge token cannot read (they stay queued)."
+///
 /// gather: list queued issues, resolve each project's VCS once (cached), and
 /// drop issues whose project has no usable VCS integration. Mirrors the
 /// scripted `input.command`.
@@ -1034,6 +1049,10 @@ enum Eligibility {
     Blocked,
 }
 
+/// SPEC-3.3: "Eligibility, checked at gather time and again after winning the
+/// concurrency gate: the custom field (default `AI Agent`) must still equal
+/// the queued value, and the dependency gate must pass."
+///
 /// Run the two read-only eligibility checks for one gathered
 /// candidate BEFORE any executor item is built or the KeyGate acquired: the live
 /// `AI Agent` re-read (drop unless still Queued) then the dependency
@@ -1111,6 +1130,9 @@ async fn filter_eligible(
     eligible
 }
 
+/// SPEC-3.3: the per-job filter/pre/prompt/claude/finalize pipeline this
+/// whole section describes.
+///
 /// Process a single job through filter / pre / prompt / claude / finalize,
 /// returning the outcome record. Mirrors [`crate::job::process_job`]'s
 /// contracts: finalize runs on every path that reached the workdir, transient
@@ -1780,6 +1802,8 @@ struct PrResume {
 /// live confirmation (the record might be stale; a false resume is worse than
 /// a redundant PR, so this errs toward a fresh pickup exactly like the rest of
 /// this pipeline's read-then-degrade checks).
+/// SPEC-3.3.1: "The branch name is deterministic per issue, so a requeued
+/// issue continues the same branch."
 async fn resolve_pr_resume(
     pool: &DbPool,
     forge: &dyn Forge,
@@ -1996,6 +2020,9 @@ struct CheckpointOutcome {
 /// rejected non-fast-forward), logs at `error`, records the reason, and stops
 /// ticking for the rest of the run; keeps waiting on `stop_rx` so the thread
 /// still exits promptly when `claude` finishes.
+/// SPEC-3.3.1: "the checkpoint push (every 60 seconds while `claude` runs) is
+/// the backstop if the runner dies first." Runs off a plain OS thread, not a
+/// tokio task (`docs/conventions/claude-runtime.md#checkpoint-push-watcher-runs-off-a-plain-os-thread-not-a-tokio-task-claude-448`).
 #[allow(clippy::too_many_arguments)]
 fn run_checkpoint_watcher(
     forge: &dyn Forge,
@@ -2141,6 +2168,11 @@ fn blocked_comment(blockers: &[Blocker]) -> String {
     s
 }
 
+/// SPEC-3.3: "The dependency gate blocks on open issues linked by the
+/// configured verbs (defaults: `depends on`, `parent for`), leaves the issue
+/// queued, comments the blockers once, and re-evaluates after
+/// `recheck_timeout`."
+///
 /// The dependency gate. Returns [`GateDecision::Proceed`] when the
 /// issue has no unmet dependency (clear, none, or its backoff just re-evaluated
 /// clean), else [`GateDecision::Blocked`]. Side effects on the blocked path: post
@@ -2270,6 +2302,10 @@ fn log_held(action: &str, key: &str, signature: &str, blocked_since_ms: i64, now
     }
 }
 
+/// SPEC-3.3: "Pre: set the field to working and `State` to the in-progress
+/// value, optionally set `Assignee`, then `git clone --depth 50` and install
+/// the repo's own git hooks."
+///
 /// Pre steps: mark the issue Working + In Progress, then clone the repo into
 /// `workdir`. Returns the failure reason on any step error so the caller can
 /// synthesize a failed claude result and still finalize.
@@ -2303,6 +2339,11 @@ fn run_pre(
     Ok(())
 }
 
+/// SPEC-3.3: "install the repo's own git hooks (`just install-hooks`, when
+/// the clone has that recipe) ... best-effort: a repo with no
+/// `install-hooks` recipe, or a host without `just`, is left unchanged and
+/// pickup continues."
+///
 /// Install the repo's git hooks on a fresh clone so a
 /// commit or push that fails the repo's local checks is blocked locally instead of only
 /// being caught by CI (the gap that produced A8N-69). Detects a `just
@@ -2394,6 +2435,12 @@ fn clone_repo(clone_url: &str, workdir: &Path, branch: Option<&str>) -> Result<(
     provider::shallow_clone(clone_url, branch, workdir, 50)
 }
 
+/// SPEC-3.3: "Claude works in the local clone ... The agent may create
+/// issues in `write_projects` (default: the triggering issue's project),
+/// linked `relates to` / `depends on` / `is required for`, never as a
+/// subtask." SPEC-3.3.1: "Prompt: `prompt` overrides; otherwise
+/// `prompt_preset` is `default` or `audit`"; this is the `default` preset.
+///
 /// The built-in YouTrack agent prompt as a placeholder template.
 /// Returns the default instruction text - local-only code work (no push, no PR)
 /// plus the bounded tracker writes it permits - with the documented
@@ -2480,7 +2527,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
     .join("\n")
 }
 
-/// The built-in prompt template a preset names.
+/// SPEC-3.3.1: "`prompt_preset` is `default` or `audit`."
 pub(crate) fn preset_prompt(p: PromptPreset) -> String {
     match p {
         PromptPreset::Default => default_youtrack_prompt(),
@@ -2488,8 +2535,8 @@ pub(crate) fn preset_prompt(p: PromptPreset) -> String {
     }
 }
 
-/// The unrendered prompt template for an action: the `native.youtrack.prompt`
-/// override when set, otherwise the `prompt_preset` built-in.
+/// SPEC-3.3.1: "Prompt: `prompt` overrides; otherwise `prompt_preset` is
+/// `default` or `audit`."
 pub(crate) fn prompt_template(src: &YoutrackSource) -> String {
     match &src.prompt {
         Some(p) => p.clone(),
@@ -2689,6 +2736,10 @@ fn git_head_sha(workdir: &Path) -> Option<String> {
 /// overridden to a read-only set regardless of the action's own
 /// configuration, so the review can never itself change the work it is
 /// judging.
+/// SPEC-3.3: "a fresh read-only review session runs, and a pass marker
+/// `.claude-run-review-pass` promotes the PR to ready and sets the field to
+/// code-review. A fail marker `.claude-run-review-fail` or no verdict keeps
+/// the PR draft."
 #[allow(clippy::too_many_arguments)]
 fn run_review_session(
     claude: &ClaudeInvoker,
@@ -2886,6 +2937,9 @@ impl Finalized {
 /// `finalize` that errored) leaves both exactly as the agent's own result
 /// reported them, so a successful run's Summary stays byte-for-byte
 /// unchanged.
+/// SPEC-3.3: folds `finalize`'s external-mutation verdict into the run's own
+/// recorded ok/summary, so a job whose agent session "succeeded" but whose
+/// finalize outcome was Failed or ReviewFailed is not recorded as clean.
 fn record_finalize_outcome(
     claude_result: &ClaudeResult,
     finalize_res: &Result<Finalized>,
@@ -2906,6 +2960,10 @@ fn record_finalize_outcome(
     (ok, summary)
 }
 
+/// SPEC-3.3: "Finalize runs on every path and is the only place external
+/// mutations happen." Implements the whole "Finalize runs on every path ..."
+/// bullet list and, via [`complete_automerge`], SPEC-3.3.1's automerge bullet.
+///
 /// The finalize state machine (the native "post"). Runs on every path. Mirrors
 /// the single finalize `post` step in `actions/youtrack.yml`: the comment is
 /// best-effort (a comment failure cannot strand the AI Agent field on Working),
@@ -3339,6 +3397,11 @@ fn append_compaction_note(body: &str, stream_log: Option<&Path>, key: &str) -> S
     }
 }
 
+/// SPEC-3.3.1: "Optional `automerge` (default off): merge and set the field
+/// to done once checks pass. Finalize never polls for this; a reconciler
+/// every 300 seconds and action-success webhooks drive the decision for
+/// recorded agent PRs."
+///
 /// Complete automerge on a PR whose checks a `success`/`recover` Action-run
 /// webhook event has already confirmed are green and mergeable. Called from
 /// `crate::web::webhooks`'s success-event handler, not from `finalize` (which
@@ -3382,6 +3445,10 @@ fn merged_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
+/// SPEC-3.3.1: "a PR whose checks are green but the forge still reports it
+/// not mergeable for another reason (an actual conflict, still-checking, or
+/// WIP) is left at Code Review for a human."
+///
 /// The PR's checks went green but Forgejo reports it as not
 /// mergeable (a conflict, still being checked, or a WIP PR) - unrelated to
 /// whether it is behind its base, which is decided separately by
@@ -3400,6 +3467,10 @@ pub(crate) fn automerge_not_mergeable_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
+/// SPEC-3.3.1: "a green, behind-base PR is updated through the forge's
+/// update-branch endpoint, which retriggers CI, and a later success event
+/// re-evaluates and merges once that run goes green."
+///
 /// The PR's checks went green and its branch is behind its base
 /// (`behind_base: true`). The runner updated it through Forgejo's Update-branch
 /// endpoint, which retriggers CI; a later `success` event re-evaluates and
@@ -3416,6 +3487,9 @@ pub(crate) fn automerge_branch_updated_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
+/// SPEC-3.3.1: "a behind-base update that itself fails (for example a 409)
+/// ... is left at Code Review for a human."
+///
 /// The branch was behind its base, and updating it against the
 /// base failed (for example a 409 conflict). Left at Code Review for a human
 /// to resolve; `error` carries Forgejo's own reason when `fj` reports one.
@@ -3432,6 +3506,10 @@ pub(crate) fn automerge_update_failed_comment(pr_url: &str, error: &str) -> Stri
     .join("\n")
 }
 
+/// SPEC-3.3.1: "when the behind-base update itself fails because of a merge
+/// conflict, the runner dispatches one `/claude` conflict-resolution run
+/// instead of leaving it to a human on the first attempt per PR head commit."
+///
 /// The branch is behind its base and updating it failed because of a merge
 /// conflict; the runner dispatched a `/claude` conflict-resolution run
 /// instead of leaving it to a human (CLAUDE-380). Posted in place of
@@ -3450,6 +3528,10 @@ pub(crate) fn automerge_conflict_resolving_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
+/// SPEC-3.3.1: "when the forge reports no `behind_base` at all, automerge
+/// takes no merge action" - which forge decides the cause named in the
+/// comment and run event.
+///
 /// The forge backend that reported no `behind_base`, which decides the cause
 /// the comment and run event name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3458,6 +3540,8 @@ pub(crate) enum BehindBaseBackend {
     GitHub,
 }
 
+/// SPEC-3.3.1: the `behind_base` missing outcome text, one form per forge.
+///
 /// The `behind_base missing` outcome text for `backend`, shared by the
 /// `run_events` row and the issue-comment dedupe key.
 pub(crate) fn behind_base_missing_outcome(backend: BehindBaseBackend) -> String {
@@ -3469,6 +3553,11 @@ pub(crate) fn behind_base_missing_outcome(backend: BehindBaseBackend) -> String 
     }
 }
 
+/// SPEC-3.3.1: "on Forgejo this means the runtime's `fj` predates FJ-99 and a
+/// human must act; on GitHub, `mergeStateStatus` is still `UNKNOWN`
+/// (computed lazily after a push) and the reconciler re-checks on its next
+/// pass."
+///
 /// The forge reported no `behind_base`, so automerge cannot tell whether the
 /// branch is up to date and takes no merge action. Forgejo: the runtime's `fj`
 /// predates FJ-99, a human must act. GitHub: `mergeStateStatus` is still
@@ -3502,6 +3591,9 @@ pub(crate) fn automerge_behind_base_missing_comment(
     .join("\n")
 }
 
+/// SPEC-3.3.1: "a merge call that fails after the mergeable check passed"
+/// is left at Code Review for a human.
+///
 /// The merge itself was refused by Forgejo (for example a
 /// protected base blocking an outdated branch with a 405). Left at Code
 /// Review for a human to resolve; `error` carries Forgejo's own refusal
@@ -3648,6 +3740,8 @@ fn requeue_comment(r: &ClaudeResult) -> String {
     .join("\n")
 }
 
+/// SPEC-3.3: supports the `forgejo` target's `base_url`-driven `fj` calls.
+///
 /// Bare host of a forge server URL: `https://dev.a8n.run` -> `dev.a8n.run`,
 /// for `fj --host <host>`.
 pub(crate) fn host_only(repo_host: &str) -> String {
@@ -3861,6 +3955,9 @@ struct SalvageReport {
     pr_url: Option<String>,
 }
 
+/// SPEC-3.3: "timeout or cancel: the final push in 3.3.1 runs ... A draft PR
+/// is opened and the issue lands in needs-review."
+///
 /// Commit, push, and open a draft PR from a timed-out run's local work
 /// (CLAUDE-379). Reuses [`workdir::local_only_work`], the exact query the
 /// cleanup/preserve decision runs, so "is there anything to salvage" can
@@ -4211,6 +4308,10 @@ fn cleanup_workdir(workdir: &Path) {
     crate::workdir::force_remove(workdir);
 }
 
+/// SPEC-3.8: "A workdir holding unpushed commits violates 3.3.1; it is kept
+/// until `unpushed_hard_cap_days` (60) and logged as a defect, never treated
+/// as normal."
+///
 /// True when [`crate::workdir::local_only_work`]
 /// finds anything a delete would destroy: a local branch tip the remote does
 /// not have under its own name, a dirty tracked/untracked tree, or a stash.
@@ -4221,6 +4322,9 @@ pub(crate) fn has_local_only_work(workdir: &Path) -> bool {
     has_local_only_work_with_token(workdir, None)
 }
 
+/// SPEC-3.8: same unpushed-work check as [`has_local_only_work`], used by the
+/// per-job callers that have a forge token in scope.
+///
 /// Same check as [`has_local_only_work`], authenticating the `ls-remote
 /// origin` network call with `token_url` (CLAUDE-395) rather than relying on
 /// a credential embedded in `origin`'s URL, which the post-clone scrub now
@@ -4281,6 +4385,10 @@ fn work_location(workdir: &Path, token_url: Option<&str>) -> WorkLocation {
     }
 }
 
+/// SPEC-3.8: "Workdir GC: preserved or aside workdirs older than
+/// `retention_days` (14) are deleted. A workdir holding unpushed commits
+/// violates 3.3.1; it is kept."
+///
 /// Delete the workdir unless [`crate::workdir::local_only_work`] finds
 /// unpushed commits, a dirty tree, or a stash. The preserve branch is a
 /// data-loss guard: an earlier incident had a failed `create_pr` plus an
