@@ -46,6 +46,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - Builder: rust-builder-musl. Runtime image: FROM opensuse-dev, slim bot CLAUDE.md ([CLAUDE-37, CLAUDE-287, CLAUDE-94](docs/conventions/governance.md#runtime-images-claude-37-claude-287-claude-94))
 - Governance `.env.example`, HOST_IP/PORT split and fixed ports do not apply; UI binds `127.0.0.1:7321` ([CLAUDE-37](docs/conventions/governance.md#template-env-and-ports-do-not-apply-claude-37))
 - `actions/SCHEMA.md` is the authoritative action schema; a change updates runner and doc together ([details](docs/conventions/governance.md#action-schema))
+- `docs/specification.md` is normative: code cites `SPEC-<section>`, and every attempt with commits ends with a pushed branch ([CLAUDE-485](docs/conventions/specification.md))
 
 ### Web UI authentication
 
