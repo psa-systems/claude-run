@@ -18,6 +18,10 @@
 //!   `$workdir/.claude-run-skip-attempt` marker (blocker / parked jobs).
 //! - Daily Claude-invocation count + cost ledger advance only when claude
 //!   actually ran (real budget was spent).
+//!
+//! SPEC-3.2.8: "a scripted job's per-job pipeline is: `filter` -> workdir
+//! creation -> `pre` steps -> `prompt` -> `claude` -> `post` steps -> outcome
+//! record -> guarded workdir cleanup."
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -73,6 +77,9 @@ pub struct EffectiveLimits {
     /// This run's spend ceiling, resolved BEFORE the run starts.
     /// `EffectiveLimits` is `Copy` and is moved into each per-job task by value,
     /// so no job can raise the ceiling it runs under.
+    ///
+    /// SPEC-3.2.2: "the ceiling is resolved once, before the run starts, and
+    /// is immutable for the run's lifetime."
     pub run_budget_usd: f64,
     pub budget_warn_fraction: f64,
     /// This run's issue-creation ceiling, enforced at the provider boundary by
@@ -89,6 +96,8 @@ impl EffectiveLimits {
     }
 }
 
+/// SPEC-3.2.2: "an action with no per-run ceiling gets its own daily budget
+/// as one, so a single run can never spend more than the day allows."
 pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> EffectiveLimits {
     let l = &action.action.limits;
     let daily_budget_usd = l.daily_budget_usd.unwrap_or(defaults.daily_budget_usd);
@@ -126,6 +135,9 @@ pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> Eff
 /// Actions with no YAML at all (the synthetic webhook listeners) are absent by
 /// construction; they mint against `defaults`, which is what the caller passes
 /// as the fallback.
+///
+/// SPEC-3.2.8: surfaces the `max_attempts_per_key` cap used to decide when a
+/// job's key is "parked at its cap".
 pub fn attempt_caps(
     rows: &[state::ActionIndexRow],
     defaults: &RunnerDefaults,
@@ -151,6 +163,9 @@ pub fn attempt_caps(
     out
 }
 
+/// SPEC-3.2.8: carries the job pipeline's shared, run-scoped state: the
+/// cancel/pause gates and the spend ledger a job's attempt-counting decisions
+/// (and SPEC-3.2.2's budget billing) read from.
 pub struct JobContext<'a> {
     pub action: &'a LoadedAction,
     pub limits: EffectiveLimits,
@@ -176,6 +191,9 @@ pub struct JobContext<'a> {
 
 /// Compute the job key for a job. If `dedup_key` is set on the action, look
 /// it up; otherwise use a positional fallback.
+///
+/// SPEC-3.2.8: "a job's key is its `dedup_key` field value, or a positional
+/// fallback when unset or absent."
 pub fn job_key(action: &LoadedAction, job: &Value, idx: usize) -> String {
     let Some(field) = action.action.dedup_key.as_deref() else {
         return format!("job-{idx}");
@@ -194,6 +212,10 @@ pub fn job_key(action: &LoadedAction, job: &Value, idx: usize) -> String {
 /// scripted job whose JSON lacks `project`/`repo`/`workflow`), it falls back to
 /// the job's own key so each such job is treated as independent rather than all
 /// sharing one empty key.
+///
+/// SPEC-3.2.8: "two jobs sharing a concurrency key never overlap, computed by
+/// joining the configured key fields with a unit separator, falling back to
+/// the job's own key when none of those fields are present on it."
 pub fn concurrency_key(action: &LoadedAction, job: &Value, idx: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
     for field in &action.action.concurrency.key {
@@ -264,6 +286,10 @@ pub async fn gather_jobs(
 
 /// Process a single job. Returns the per-job outcome record that the runner
 /// will both write to the per-action JSONL and insert into `job_outcomes`.
+///
+/// SPEC-3.2.8: runs the filter -> workdir -> pre -> prompt -> claude -> post
+/// -> outcome -> cleanup pipeline, including the synthesized `$claude_result`
+/// on every early-exit path and the three paths that skip attempt counting.
 pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Result<ProcessedJob> {
     // Measure the full per-job pipeline elapsed (filter / pre / prompt /
     // claude / post) so the web UI can show a per-job duration. Started
@@ -424,10 +450,14 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                     &ctx.cancel,
                     // Cap the child at what the run has left, so one session
                     // cannot overshoot the ceiling between checks.
+                    // SPEC-3.2.2: "the run's remaining budget is passed to the
+                    // invocation as its ceiling."
                     Some(ctx.spend.remaining_usd()),
                 )?;
                 // Bill the run before any branch discards `r`, so a cancelled
                 // invocation still reports what it spent.
+                // SPEC-3.2.2: "billing happens before any branch discards the
+                // result."
                 ctx.spend.record(&r);
                 // Persist this invocation's plan usage before any branch
                 // discards `r`, mirroring the billing call above.
@@ -467,6 +497,8 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     };
 
     // Transient claude error: no post, no attempt counted, no daily count++.
+    // SPEC-3.2.8: a transient `claude` result is one of the three paths whose
+    // attempt is not counted and whose daily ledger does not advance.
     if claude_result.transient {
         info!(action = %action.name, key = %key, error = %claude_result.error, "transient claude error, not counting attempt");
         workdir::cleanup_or_preserve(&workdir_path, &action.name, &key);
@@ -506,6 +538,8 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     // A cancelled run also skips attempt counting: an operator cancel is not a
     // genuine attempt, so the job retries cleanly on the next firing.
     // A job the global pause stopped is not an attempt either.
+    // SPEC-3.2.8: "a `post` script can additionally suppress attempt
+    // counting itself by writing `$workdir/.claude-run-skip-attempt`."
     let skip_marker = workdir_path.join(".claude-run-skip-attempt");
     let cancelled = ctx.cancel.is_cancelled();
     let skip_attempt = skip_marker.exists() || cancelled || paused_before_claude;

@@ -410,11 +410,14 @@ callers to build one themselves:
 
 ### 4.1 CLI
 
-Global flags: `--actions-dir <dir>` (env `CLAUDE_RUN_ACTIONS_DIR`), `--color auto|always|never`. JSON printed to a
-terminal (`--color auto`, a TTY) or forced on is syntax-highlighted token by token (keys, strings, numbers,
-`true`/`false`/`null`) with the surrounding structure and whitespace copied through unchanged; stripping the color
-codes back out always yields byte-identical output to the plain `serde_json::to_string_pretty` form, so a scripted
-consumer piping the output (`claude-run status | from json`) is unaffected by color being on or off.
+Global flags: `--actions-dir <dir>` (env `CLAUDE_RUN_ACTIONS_DIR`), `--color auto|always|never`.
+
+#### 4.1.1 JSON syntax highlighting (`SPEC-4.1.1`)
+
+JSON printed to a terminal (`--color auto`, a TTY) or forced on is syntax-highlighted token by token (keys, strings,
+numbers, `true`/`false`/`null`) with the surrounding structure and whitespace copied through unchanged; stripping the
+color codes back out always yields byte-identical output to the plain `serde_json::to_string_pretty` form, so a
+scripted consumer piping the output (`claude-run status | from json`) is unaffected by color being on or off.
 
 | Command | Behavior |
 |---|---|
