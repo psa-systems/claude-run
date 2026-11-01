@@ -25,7 +25,7 @@ Operator and developer docs live in [`docs/`](docs/):
 - [auth.md](docs/auth.md) - web UI and API auth, service logins, the secrets store
 - [webhooks.md](docs/webhooks.md) - CI-failure webhooks, automerge, auto-fix, GitHub setup
 - [comment-commands.md](docs/comment-commands.md) - commands posted as pull request or issue comments
-- [release-notes.md](docs/release-notes.md) - the weekly release-notes draft into Mirzam
+- [release-notes.md](docs/release-notes.md) - an example action: a weekly release-notes draft into a newsletter system
 - [self-hosting.md](docs/self-hosting.md) - install: the container image and `compose.yml`
 - [ROADMAP.md](docs/ROADMAP.md) - planned work
 

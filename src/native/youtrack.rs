@@ -2392,6 +2392,66 @@ fn install_hooks(workdir: &Path) {
     }
 }
 
+/// SPEC-3.3.2: what the runner's own re-run of the repository's pre-push
+/// checks found, before any success outcome is recorded. `command` is the
+/// recipe the runner actually invoked (`"pre-push"` or `"check"`), or
+/// `None` when the clone has neither and the gate ran nothing. `failure`
+/// carries the redacted, bounded combined stdout/stderr of a non-zero exit;
+/// `None` means the chosen recipe passed, or there was no recipe to run.
+struct GateResult {
+    command: Option<&'static str>,
+    failure: Option<String>,
+}
+
+/// SPEC-3.3.2 "Verification gate": re-run the repository's own pre-push
+/// entrypoint in the clone before the runner records an attempt as
+/// successful, rather than trusting the agent's own report that checks
+/// passed (the gap that let two runs report passing checks while the
+/// repo's `pre-push` hook actually failed `cargo test --lib`). Tries `just
+/// pre-push`, then `just check`; mirrors `install_hooks`'s `just --show`
+/// presence probe, so a clone with neither recipe (or a host with no `just`)
+/// runs no command and is reported as such, never as a passed check.
+fn run_verification_gate(workdir: &Path) -> GateResult {
+    for recipe in ["pre-push", "check"] {
+        let probe = Command::new("just")
+            .current_dir(workdir)
+            .arg("--show")
+            .arg(recipe)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !matches!(probe, Ok(s) if s.success()) {
+            continue;
+        }
+        return match Command::new("just")
+            .current_dir(workdir)
+            .arg(recipe)
+            .output()
+        {
+            Ok(out) if out.status.success() => GateResult {
+                command: Some(recipe),
+                failure: None,
+            },
+            Ok(out) => GateResult {
+                command: Some(recipe),
+                failure: Some(provider::append_stdout_tail(
+                    &String::from_utf8_lossy(&out.stderr),
+                    &String::from_utf8_lossy(&out.stdout),
+                    &[],
+                )),
+            },
+            Err(e) => GateResult {
+                command: Some(recipe),
+                failure: Some(format!("running `just {recipe}` failed to start: {e}")),
+            },
+        };
+    }
+    GateResult {
+        command: None,
+        failure: None,
+    }
+}
+
 /// The URL to clone this job's repo from.
 ///
 /// Prefer the token-bearing URL the forge builds from its own key
@@ -2494,7 +2554,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
         "3. If {{existing_branch}} is empty, create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, ALSO read that PR's own comments (a prior timed-out run may have left one explaining what it salvaged and why, e.g. a draft PR opened from uncommitted work at kill time, or a separate fresh-context review session may have left one listing findings that kept the PR a draft), then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
         "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit whose body ends with the bare '#{{key}}' reference, so a kill leaves committed progress instead of none; the final commit still carries the full PR-description format from step 7 and stays the branch tip. The runner pushes your commits as WIP checkpoints automatically every 60 seconds while you work, from whatever feature branch is checked out, and opens a draft PR from the first one - this is not something you do, and a checkpoint landing is not a stopping point or a reason to wrap up early; keep working exactly as step 1 describes until you are done, blocked, or killed. Because of those checkpoint pushes, a commit on this branch may already be on the remote before you notice a mistake in it: never run 'git reset', 'git commit --amend', 'git rebase', 'git filter-branch', or any force push on this branch to fix it - any of those rewrites history the runner has already published and orphans the checkpoint. Fix a mistake, including a wrong commit message, with a new commit on top instead.",
-        "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (e.g. the repo's 'just check', tests, or build) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off.",
+        "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (e.g. the repo's 'just check', tests, or build) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off. The runner itself re-runs the repository's own pre-push entrypoint (`just pre-push`, else `just check`) in the clone after this attempt finishes and before recording it as successful (SPEC-3.3.2): it does not trust this report, so a report that checks passed must name the exact command you ran, and a failing check still needs fixing here rather than left for the gate to catch.",
         "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
         "7. The runner uses this commit's SUBJECT as the PR title and its body as the PR description (if you make more than one commit, the LAST commit carries both, since the runner reads only the branch tip). The subject is a SEPARATE line from the body, not the body's first heading: write one short imperative line (about 72 characters or fewer, no leading '#', not a Markdown heading like '## Summary') that names the change itself, e.g. 'Fix the off-by-one in the retry budget'; confirm it with 'git log -1 --format=%s' before you stop - if that prints a Markdown heading, a bare issue reference, or anything else that is not a one-line summary of the change, the commit is wrong and the runner will refuse to open the PR from it. The body (what 'git log -1 --format=%b' prints) is the PR description; it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the literal line 'Closes', then the bare issue reference on the next line alone, with nothing after it on that line and no line after it; a 'Co-Authored-By:' trailer goes above the 'Closes' line, never after the reference. If the commit owns more than one issue, put each '#<KEY>-N' on its own line below the single 'Closes' line. NO 'State ...' command after the reference. Example of the tail:",
         "     ## Verification",
@@ -3103,6 +3163,42 @@ fn finalize(
                         None => body,
                     }
                 };
+                // SPEC-3.3.2: the commits are already pushed and the draft PR
+                // above already exists, so a failed gate still satisfies
+                // SPEC-3.3.1; this only decides whether the attempt is
+                // recorded as a success or a failure. Runs before the
+                // post-success review session below: there is no point
+                // reviewing a diff whose own checks do not pass.
+                let gate = run_verification_gate(workdir);
+                if let Some(output) = &gate.failure {
+                    let command = gate.command.unwrap_or("none");
+                    if let Some(pr_number) = pr.number {
+                        if let Err(e) = post_gate_failure_on_pr(
+                            forge,
+                            &host,
+                            &job.repo_path,
+                            pr_number,
+                            &job.key,
+                            command,
+                            output,
+                        ) {
+                            error!(key = %job.key, pr_number, error = %e, "posting the verification gate failure on the PR failed (continuing)");
+                        }
+                    }
+                    let body = gate_failure_comment(claude_result, &url, command, output);
+                    let body = text_refresh_note(body);
+                    let body = push_comment_note(body);
+                    let body = append_compaction_note(&body, stream_log, &job.key);
+                    let body = note_checkpoint_rejection(body);
+                    let body =
+                        crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+                    comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
+                    return Ok(Finalized::Failed {
+                        cause: format!("SPEC-3.3.2 verification gate failed (`just {command}`)"),
+                        pr_step: Some("verify"),
+                        requeued: false,
+                    });
+                }
                 match review {
                     None | Some(ReviewOutcome::Pass(_)) => {
                         // Best-effort: a failed promotion does not block the
@@ -3123,7 +3219,7 @@ fn finalize(
                                 Some("the PR number is unknown".to_string())
                             }
                         };
-                        let body = success_comment(claude_result, &url);
+                        let body = success_comment(claude_result, &url, gate.command);
                         let body = match &promote_error {
                             Some(e) => {
                                 format!("{body}\n\nPR could not be promoted from draft: {e}")
@@ -3771,7 +3867,16 @@ fn pr_url(job: &YoutrackJob, pr: &PullRequest) -> String {
     }
 }
 
-fn success_comment(r: &ClaudeResult, pr_url: &str) -> String {
+/// SPEC-3.3.2: "a report that the checks passed must name the command that
+/// actually ran"; `gate_command` is `None` only when the clone had neither a
+/// `pre-push` nor a `check` recipe, so the comment says so rather than
+/// naming a command that never ran.
+fn success_comment(r: &ClaudeResult, pr_url: &str, gate_command: Option<&str>) -> String {
+    let verification = match gate_command {
+        Some(cmd) => format!("Verification: `just {cmd}` passed."),
+        None => "Verification: the clone has no `pre-push` or `check` recipe; no command ran."
+            .to_string(),
+    };
     [
         "Claude AI agent run summary:".to_string(),
         String::new(),
@@ -3779,9 +3884,62 @@ fn success_comment(r: &ClaudeResult, pr_url: &str) -> String {
         String::new(),
         format!("PR: {pr_url}"),
         String::new(),
+        verification,
+        String::new(),
         format!("Cost: ${} USD", r.cost),
     ]
     .join("\n")
+}
+
+/// SPEC-3.3.2: the issue comment for a verification-gate failure. The PR
+/// already exists (pushed as a draft before the gate ran), so the comment
+/// names it and says the gate, not the agent's own work, decided this.
+fn gate_failure_comment(r: &ClaudeResult, pr_url: &str, command: &str, output: &str) -> String {
+    [
+        format!(
+            "Claude AI agent run completed, but the runner's own re-run of `just {command}` \
+             failed. This is recorded as a failure regardless of what the agent itself \
+             reported; the draft PR is left open with the agent's commits:"
+        ),
+        String::new(),
+        format!("Draft PR: {pr_url}"),
+        String::new(),
+        format!("`just {command}` output:"),
+        String::new(),
+        output.to_string(),
+        String::new(),
+        r.summary.clone(),
+        String::new(),
+        format!("Cost: ${} USD", r.cost),
+    ]
+    .join("\n")
+}
+
+/// Post a [`gate_failure_comment`]-shaped notice naming `output` as a
+/// comment on PR `pr_number`, through a scratch file since
+/// [`Forge::pr_comment`] reads its body from disk (mirrors
+/// `post_review_findings_on_pr`).
+fn post_gate_failure_on_pr(
+    forge: &dyn Forge,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    key: &str,
+    command: &str,
+    output: &str,
+) -> Result<()> {
+    let body = format!(
+        "SPEC-3.3.2 verification gate: the runner's own `just {command}` failed:\n\n{output}"
+    );
+    let scratch = std::env::temp_dir().join(format!("claude-run-gate-pr-comment-{key}.md"));
+    std::fs::write(&scratch, &body)?;
+    let result = forge.pr_comment(host, repo, pr_number, &scratch);
+    if let Err(e) = std::fs::remove_file(&scratch) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            error!(path = %scratch.display(), error = %e, "removing the gate-failure PR comment scratch file failed");
+        }
+    }
+    result
 }
 
 /// Issue comment for a [`Finalized::ReviewFailed`] outcome: the PR stays a
@@ -7495,6 +7653,313 @@ mod tests {
             calls
                 .iter()
                 .any(|c| c == "yt issue set-field MK-16 AI Agent Code Review"),
+            "{calls:?}"
+        );
+    }
+
+    /// SPEC-3.3.2: a clone whose `pre-push` recipe passes proceeds exactly as
+    /// before, and the success comment names the command the gate actually ran.
+    #[test]
+    fn finalize_verification_gate_pass_proceeds_as_before() {
+        if !just_available() {
+            eprintln!("skipping: `just` not available in this environment");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("justfile"), "pre-push:\n    @true\n").unwrap();
+        let git_dir = dir.path().join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: feat: x",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
+                )
+                .ok_prefix("yt issue comment MK-16", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::CodeReview {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                pr_number: Some(7),
+                head_branch: Some("feat/x".into()),
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        let comment_call = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .unwrap_or_else(|| panic!("no issue comment call found: {calls:?}"));
+        assert!(
+            comment_call.contains("Verification: `just pre-push` passed."),
+            "{comment_call}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Code Review"),
+            "{calls:?}"
+        );
+    }
+
+    /// SPEC-3.3.2: a clone whose `pre-push` recipe fails is recorded as a
+    /// failure, with the redacted output attached to both the issue and the
+    /// PR, and the draft PR the push already opened stays a draft.
+    #[test]
+    fn finalize_verification_gate_failure_records_failed_and_keeps_the_draft_pr() {
+        if !just_available() {
+            eprintln!("skipping: `just` not available in this environment");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("justfile"),
+            "pre-push:\n    #!/usr/bin/env sh\n    echo 'test result::FAIL some_test'\n    exit 1\n",
+        )
+        .unwrap();
+        let git_dir = dir.path().join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let gate_comment_path = std::env::temp_dir()
+            .join("claude-run-gate-pr-comment-MK-16.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: feat: x",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "comment",
+                        "contoso/claude-run#7",
+                        "--body-file",
+                        gate_comment_path.as_str(),
+                    ],
+                    "",
+                )
+                .ok_prefix("yt issue comment MK-16", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::Failed {
+                cause: "SPEC-3.3.2 verification gate failed (`just pre-push`)".into(),
+                pr_step: Some("verify"),
+                requeued: false,
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.contains("pr create")),
+            "the draft PR from the push must still be created: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("pr edit")),
+            "a gate failure must never promote the draft PR: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.contains("pr comment")),
+            "the gate failure must be posted on the PR: {calls:?}"
+        );
+        let comment_call = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .unwrap_or_else(|| panic!("no issue comment call found: {calls:?}"));
+        assert!(comment_call.contains("FAIL some_test"), "{comment_call}");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
             "{calls:?}"
         );
     }
