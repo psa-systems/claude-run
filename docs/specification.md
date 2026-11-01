@@ -45,8 +45,9 @@ directory and runs these concurrent tasks:
   is in flight, and the action's `concurrency.max_parallel` cap has a free slot. The scheduler does nothing while the
   daemon is globally paused or while the Claude credential is not ready. An action's own schedule (3.1) decides
   whether it is due at all: `interval` fires once that duration has elapsed since its last run's `started_at` (or
-  immediately if it has never run), `cron` fires at the next matching instant after that same timestamp, and
-  `manual` never auto-fires. The re-gather cadence itself is tracked by the scheduler's own last-fire time in
+  immediately if it has never run), `cron` fires at the next matching instant (UTC) after that same timestamp (or,
+  if it has never run, after the scheduler first saw it), and `manual` never auto-fires. A re-gather that finds no
+  work creates no run, so a due action keeps re-gathering at the cadence until one starts. The re-gather cadence itself is tracked by the scheduler's own last-fire time in
   memory, per action, not by run rows, since a re-gather that finds only already-in-flight work creates no run row.
   The "no gather in flight" check is advisory and scheduler-only: a manual trigger always gathers regardless, and a
   scheduled pickup that narrowly loses the race still gathers rather than erroring.
