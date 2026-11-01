@@ -1,4 +1,4 @@
-//! Native cross-project closed-issue reporter.
+//! Implements SPEC-3.4. Native cross-project closed-issue reporter.
 //!
 //! Uses the automation as a reporting tool rather than an issue worker: count
 //! the issues closed in a rolling window across a named set of projects, write
@@ -44,6 +44,7 @@ use crate::state;
 /// the marker comment posted on the parent.
 const MARKER_FENCE: &str = "<!-- claude-run closed-issue-summary; do not edit -->";
 
+/// SPEC-3.4: the `closed-issue-summary` kind's handler.
 pub struct ClosedIssueSummaryHandler;
 
 impl NativeHandler for ClosedIssueSummaryHandler {
@@ -52,6 +53,8 @@ impl NativeHandler for ClosedIssueSummaryHandler {
     }
 }
 
+/// SPEC-3.4: "it lists issues resolved in the last `window_days`."
+///
 /// The reporting window: an inclusive `[start, end]` date range, `days` long.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Window {
@@ -121,6 +124,8 @@ enum Filing {
     AlreadyFiled,
 }
 
+/// SPEC-3.4: "Starts no Claude session and clones nothing." Drives the whole
+/// per-parent gather/render/file pipeline below.
 async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
     let action = &ctx.action.action;
     let pool = ctx.pool;
@@ -248,6 +253,8 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
 /// with the issues `query` selects, plus the subset that came from the query.
 /// Only that subset is ever field-written; a parent nominated by id is left
 /// alone entirely.
+/// SPEC-3.4: "For each nominated parent issue (`parents`, plus issues
+/// matching `query`)."
 fn resolve_targets(
     backend: &dyn IssueTracker,
     cfg: &ClosedIssueSummaryConfig,
@@ -297,6 +304,9 @@ fn advance(
 /// The marker comment is posted LAST, so a failure anywhere earlier leaves the
 /// window unmarked and the next run retries rather than recording a report that
 /// was never linked.
+/// SPEC-3.4: "files the report as a new issue in `report_project` (default:
+/// the parent's project), links it with `link_type`, and posts a hidden
+/// marker comment (`Report-Window:`) on the parent."
 fn file_report(
     backend: &dyn IssueTracker,
     cfg: &ClosedIssueSummaryConfig,
@@ -336,6 +346,7 @@ fn file_report(
 /// True when the parent's description or any of its comments already carries
 /// this window's marker. An unreadable parent errs toward filing: a duplicate
 /// report is visible and fixable, a silently skipped window is not.
+/// SPEC-3.4: "so one report is filed per window."
 fn already_filed(backend: &dyn IssueTracker, parent: &str, window: Window) -> bool {
     let marker = window.marker();
     match backend.inspect_issue(parent) {
@@ -350,6 +361,8 @@ fn already_filed(backend: &dyn IssueTracker, parent: &str, window: Window) -> bo
 /// Every issue in `project` resolved inside `window`. The query is the tracker's
 /// own `resolved date:` range, so the window is applied server-side and the row
 /// set is exact rather than filtered from a truncated page.
+/// SPEC-3.4: "it lists issues resolved in the last `window_days` across
+/// `projects`."
 fn gather_closed(
     backend: &dyn IssueTracker,
     project: &str,
@@ -367,6 +380,8 @@ fn gather_closed(
 
 /// The report issue's summary line, with `{start}` / `{end}` / `{days}` /
 /// `{total}` / `{parent}` substituted.
+/// SPEC-3.4: the report issue's title, part of "files the report as a new
+/// issue."
 pub fn render_summary_line(template: &str, window: Window, total: usize, parent: &str) -> String {
     template
         .replace("{start}", &window.start.to_string())
@@ -382,6 +397,7 @@ pub fn render_summary_line(template: &str, window: Window, total: usize, parent:
 ///
 /// `max_listed` caps the LISTING only; every count is the true total, and a
 /// capped section states how many rows it did not print.
+/// SPEC-3.4: "renders counts and a per-project listing."
 pub fn render_report(
     window: Window,
     gathered: &[(String, Vec<ClosedIssue>)],

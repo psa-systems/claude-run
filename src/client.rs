@@ -4,6 +4,10 @@
 //! HTTP/1.1 via `hyper`, and parses the JSON response. CLI commands fall back
 //! to operating directly on the DB when no daemon is reachable, so the binary
 //! is useful both standalone and as a daemon control plane.
+//!
+//! SPEC-4.1 / SPEC-4.2: the unix-socket side of "CLI mutations delegate to
+//! the daemon over the unix socket when it is reachable ... otherwise
+//! operate on the database"; served at the socket root (4.2).
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +19,7 @@ use serde_json::Value;
 
 use crate::error::Result;
 
+/// SPEC-4.1 / SPEC-4.2: CLI-side client for the daemon's unix-socket API.
 pub struct DaemonClient {
     socket_path: PathBuf,
     client: Client<hyperlocal::UnixConnector, Full<Bytes>>,
@@ -30,6 +35,8 @@ impl DaemonClient {
         }
     }
 
+    /// SPEC-4.1: "reachable" means a bare `connect()` to the socket path
+    /// succeeds; this does not confirm the daemon answers HTTP.
     pub fn is_reachable(socket_path: &Path) -> bool {
         std::os::unix::net::UnixStream::connect(socket_path).is_ok()
     }
@@ -38,6 +45,7 @@ impl DaemonClient {
         hyperlocal::Uri::new(&self.socket_path, path).into()
     }
 
+    /// SPEC-4.2: parses the JSON API's HTTP response.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let req = hyper::Request::builder()
             .method("GET")
@@ -52,6 +60,7 @@ impl DaemonClient {
         read_json(resp).await
     }
 
+    /// SPEC-4.2: parses the JSON API's HTTP response.
     pub async fn post<T: DeserializeOwned>(&self, path: &str, body: Option<&Value>) -> Result<T> {
         let bytes = match body {
             Some(b) => Bytes::from(serde_json::to_vec(b)?),
@@ -71,6 +80,9 @@ impl DaemonClient {
         read_json(resp).await
     }
 
+    /// SPEC-4.1 / SPEC-4.2: surfaces raw status so callers map 404/409 to the
+    /// exit-code table in 4.1.
+    ///
     /// POST that surfaces the HTTP status alongside the parsed JSON
     /// body, instead of collapsing every non-2xx into an opaque error. The CLI
     /// uses it to translate the delete handler's 404 / 409 into the matching
@@ -107,6 +119,7 @@ impl DaemonClient {
     }
 }
 
+/// SPEC-4.2: parses the JSON API's HTTP response.
 async fn read_json<T: DeserializeOwned>(resp: hyper::Response<hyper::body::Incoming>) -> Result<T> {
     let status = resp.status();
     let body = resp

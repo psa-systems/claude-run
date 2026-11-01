@@ -7,6 +7,9 @@
 //!
 //! Matches the semantics of the old `snippet-run` / `snippet-write` defs in
 //! `scripts/claude-run.nu`.
+//!
+//! SPEC-3.2.10: "each `filter` / `pre` / `prompt` / `post` step ... runs as
+//! a separate interpreter process rather than in-process."
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -64,6 +67,9 @@ impl SnippetRunner {
     /// A runner for `action`'s snippets, carrying its `env` and decrypted
     /// `secrets`, or `None` when it declares neither. An unknown secret fails
     /// here, before any job is gathered or attempt counted.
+    ///
+    /// SPEC-3.2.10: "an action's `env` and `secrets` blocks are set on the
+    /// snippet's own process only, never on the `claude` child."
     pub async fn for_action(&self, action: &Action, pool: &DbPool) -> Result<Option<Self>> {
         if action.env.is_empty() && action.secrets.is_empty() {
             return Ok(None);
@@ -91,6 +97,10 @@ impl SnippetRunner {
 
     /// Replace every secret value in `text`, so a script that prints one
     /// cannot put it in a log, an error or a prompt.
+    ///
+    /// SPEC-3.2.10: "every secret value is replaced with a fixed placeholder
+    /// in both the snippet's stdout and stderr before either is logged,
+    /// returned, or folded into a later prompt."
     fn scrub(&self, text: String) -> String {
         self.secret_values
             .iter()
@@ -109,6 +119,12 @@ impl SnippetRunner {
     /// exposed instead as an environment variable named after the binding,
     /// holding the compact-JSON value (e.g. `$job`, `$workdir` in a bash
     /// snippet, decode with `jq`).
+    ///
+    /// SPEC-3.2.10: "for the `nu` interpreter ... bindings are each written
+    /// to a sibling JSON tempfile and loaded by a generated `let`-binding
+    /// prelude ...; for any other declared interpreter, each binding is
+    /// instead exposed as an environment variable holding its compact-JSON
+    /// value."
     pub fn run(
         &self,
         body: &str,
@@ -262,9 +278,9 @@ mod tests {
             nu_binary: "nu".into(),
             env: vec![
                 ("SITE".into(), "news.example.com".into()),
-                ("TOKEN".into(), "mzm_supersecret".into()),
+                ("TOKEN".into(), "tok_supersecret".into()),
             ],
-            secret_values: vec!["mzm_supersecret".into()],
+            secret_values: vec!["tok_supersecret".into()],
         };
         let out = runner
             .run(
@@ -280,7 +296,7 @@ mod tests {
         assert_eq!(out.stderr.trim(), "err [REDACTED]");
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let body = std::fs::read_to_string(entry.unwrap().path()).unwrap();
-            assert!(!body.contains("mzm_supersecret"), "{body}");
+            assert!(!body.contains("tok_supersecret"), "{body}");
         }
     }
 }
