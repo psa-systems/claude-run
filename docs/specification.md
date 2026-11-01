@@ -323,20 +323,78 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
 
 ### 3.8 Garbage collection and retention
 
-All sweeps are DB-backed settings, enabled by default flags in each section, and run at serve start and hourly:
+All sweeps are DB-backed settings, enabled by default flags in each section, and run at serve start and hourly.
 
-- Workdir GC: preserved or aside workdirs older than `retention_days` (14) are deleted. A workdir holding unpushed
-  commits violates 3.3.1; it is kept until `unpushed_hard_cap_days` (60) and logged as a defect, never treated as normal.
-  A `target/` directory inside any workdir older than one day is removed even when the workdir itself is kept
+#### 3.8.1 Workdir GC (`SPEC-3.8.1`)
+
+- Preserved or aside workdirs under `workdirs/<source>/<key>` older than `retention_days` (14), measured from the
+  directory's last-modified time, are deleted. A workdir whose mtime is unreadable or newer than "now" is treated as
+  age zero (kept).
+- A workdir holding unpushed commits, a dirty tracked/untracked tree, or a stash violates 3.3.1; it is kept past
+  `retention_days` until the longer `unpushed_hard_cap_days` (60), and logged as a defect, never treated as normal.
+  Past the hard cap it is deleted even with local-only work still inside it.
+- A filesystem error deleting one directory is logged and that directory is skipped; the pass continues sweeping the
+  rest rather than aborting.
+- A `target/` directory inside any workdir older than one day is removed even when the workdir itself is kept
   (`SPEC-3.10` item 5).
-- Cargo cache GC: a per-repo shared target directory over `cargo_cache.max_bytes_per_repo` is deleted once no run for
-  that repo is in flight (`SPEC-3.10` item 6).
-- Stream-log GC: stream logs older than `retention_days` (30); `daemon.log`, per-action `output.file` and `usage.jsonl`
-  are bounded by size; snippets and `webhook-logs` have their own retention days.
-- DB retention: rows older than `retention_days` (180) are deleted from `job_outcomes`, `run_events`, `ci_failure_runs`
-  and `claude_invocations`.
-- Docker GC: named Docker volumes unreferenced by any container and older than `volume_retention_days` (3) are removed.
-  The sidecar's total Docker storage is also bounded by `docker_gc.max_bytes` (`SPEC-3.11`).
+- A per-repo shared Cargo target directory over `cargo_cache.max_bytes_per_repo` is deleted once no run for that repo
+  is in flight (`SPEC-3.10` item 6).
+
+#### 3.8.2 Stream-log, snippet and webhook-log age sweeps (`SPEC-3.8.2`)
+
+- Per-attempt stream logs under `logs/<action>/streams/*.jsonl` older than `retention_days` (30) are deleted. A log
+  whose `(action, job_key)` pair is still in flight (joined from `run_inflight_jobs` to runs that have not ended) is
+  kept regardless of age, because age alone is not evidence a run has finished. A file not shaped
+  `<key>-attempt-<n>.jsonl` is not a stream log and is swept on age alone without the in-flight check.
+- `snippets/<action>/<job_key>/` directories older than `snippet_retention_days` are deleted the same way, reusing the
+  exact in-flight set the stream-log sweep reads; a failed read of that set skips both sweeps, since sweeping with an
+  empty set would delete a live run's own stream log or snippet directory.
+- Files directly under `webhook-logs/` older than `webhook_log_retention_days` are deleted by age alone, with no
+  in-flight guard: a webhook run is not a scheduled job and never appears in `run_inflight_jobs`. Only files directly
+  under the directory are considered; a subdirectory (the mint classifier's own per-event working directory) is never
+  descended into or deleted by this sweep.
+
+#### 3.8.3 Size-bounded logs (`SPEC-3.8.3`)
+
+- `logs/daemon.log`, each `logs/<action>/<output.file>`, and `logs/usage.jsonl` are append-forever files with no
+  per-unit-of-work age to expire, so each is bounded by SIZE instead: past its configured ceiling (`daemon_log_max_bytes`,
+  `output_file_max_bytes`, `usage_log_max_bytes`; `0` disables a ceiling) the file is rolled to one `<name>.1`
+  predecessor holding the full prior content, then truncated in place back to its newest half, cut at the first line
+  boundary inside that half so every retained line is whole.
+- The truncation is in place, never a rename: `daemon.log` is held open for append, and a rename would leave new
+  writes landing in the predecessor while the live file stayed empty.
+- A predecessor (`<name>.1`) is itself never rolled over into a second generation.
+- A missing file is silent and uncounted (the daemon may not have run yet, or an action may have logged no output);
+  any other error bounding a file is logged and that file is left as-is, and the pass continues to the rest.
+
+#### 3.8.4 DB retention (`SPEC-3.8.4`)
+
+- Rows older than `retention_days` (180), by their stored `ts`, are deleted from `job_outcomes`, `run_events`,
+  `ci_failure_runs` and `claude_invocations`. Each pruned table has a single-column index on `ts` so the cutoff
+  predicate seeks rather than scans.
+- `ci_failures`, `ci_failure_tests` and `agent_pull_requests` are never pruned by this sweep: a resolved failure or a
+  merged PR must still be matchable against a regression months later, so only the per-sighting/per-invocation
+  history tables above are bounded by age.
+- The default `retention_days` stays `>=` the longest reporting range the web UI exposes (90 days), so a bounded
+  report is never silently truncated by the prune running ahead of it. A save that enables the sweep with
+  `retention_days` below that same 90-day floor is rejected outright, not just defaulted away from, so the floor
+  holds for every saved value, not only the shipped default.
+
+#### 3.8.5 Docker volume GC (`SPEC-3.8.5`)
+
+- A named volume in the sidecar's Docker daemon that no container currently references and that is older than
+  `volume_retention_days` (3), measured from Docker's own `CreatedAt` (Docker records no last-used time), is removed.
+  A `buildx_buildkit_*` state volume is kept at any age; recreating buildkit's own cache costs far more than the disk
+  it uses.
+- When the Docker daemon cannot be reached (including `DOCKER_HOST` unset), the pass is skipped and logged, and
+  nothing is removed; this is never reported as a clean sweep.
+- A remove Docker refuses because the volume is now in use (a race between listing and removing it) is logged and the
+  volume is left in place; any other remove failure is logged and the pass continues to the rest. Neither `--force`
+  nor `--all` is ever passed: Docker's own in-use refusal is the safety net this sweep relies on, and `--all` has no
+  age filter.
+- A save setting `volume_retention_days` below 1 is rejected: Docker records no last-used time, so a 0-day window
+  would remove a volume a session created moments ago while its container sat between restarts.
+- The sidecar's total Docker storage is also bounded by `docker_gc.max_bytes` (`SPEC-3.11`).
 
 ### 3.9 Run comment footer (`SPEC-3.9`)
 

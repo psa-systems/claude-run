@@ -1,4 +1,4 @@
-//! Age-based retention prune for the unbounded history tables.
+//! SPEC-3.8.4: age-based retention prune for the unbounded history tables.
 //!
 //! `job_outcomes` (and `run_events`) grow without bound: every
 //! job outcome and every poll-phase diagnostic is appended and nothing ever
@@ -22,10 +22,11 @@ use chrono::{DateTime, Duration, Utc};
 use crate::config::DbRetentionConfig;
 use crate::error::Result;
 
-/// One history table pruned by the retention sweep: its name and the RFC3339
-/// `ts` column the cutoff compares against. Both are compile-time `&'static str`
-/// constants drawn only from [`RETENTION_TABLES`] (never user input), so
-/// interpolating them into the DELETE statement carries no injection risk.
+/// SPEC-3.8.4: one history table pruned by the retention sweep: its name and
+/// the RFC3339 `ts` column the cutoff compares against. Both are compile-time
+/// `&'static str` constants drawn only from [`RETENTION_TABLES`] (never user
+/// input), so interpolating them into the DELETE statement carries no
+/// injection risk.
 #[derive(Debug, Clone, Copy)]
 pub struct RetentionTable {
     /// SQL table name.
@@ -34,7 +35,7 @@ pub struct RetentionTable {
     pub ts_col: &'static str,
 }
 
-/// The tables the daemon retention sweep prunes. `job_outcomes` is the driver;
+/// SPEC-3.8.4: the tables the daemon retention sweep prunes. `job_outcomes` is the driver;
 /// `run_events` joins the same list, each with its
 /// own single-column `ts` index (`idx_job_outcomes_ts` from migration 0017,
 /// `idx_run_events_ts` from migration 0018) so both share this exact helper,
@@ -67,16 +68,17 @@ pub const RETENTION_TABLES: &[RetentionTable] = &[
     },
 ];
 
-/// Tally of one [`sweep`] pass.
+/// SPEC-3.8.4: tally of one [`sweep`] pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RetentionStats {
     /// Rows deleted across every pruned table this pass.
     pub deleted: u64,
 }
 
-/// Delete every row of `t` whose `ts` is strictly older than `cutoff` (an
-/// RFC3339 string). Returns the number of rows deleted. The predicate is a range
-/// on the indexed `ts` column, so it seeks rather than scans.
+/// SPEC-3.8.4: delete every row of `t` whose `ts` is strictly older than
+/// `cutoff` (an RFC3339 string). Returns the number of rows deleted. The
+/// predicate is a range on the indexed `ts` column, so it seeks rather than
+/// scans.
 pub async fn prune_older_than(pool: &DbPool, t: &RetentionTable, cutoff: &str) -> Result<u64> {
     // `t.table` / `t.ts_col` are `&'static str` constants from RETENTION_TABLES,
     // not user input, so this format! cannot inject. The cutoff is bound.
@@ -88,9 +90,10 @@ pub async fn prune_older_than(pool: &DbPool, t: &RetentionTable, cutoff: &str) -
     Ok(res.rows_affected())
 }
 
-/// Prune every table in [`RETENTION_TABLES`] to the retention window, using
-/// `now` to compute the cutoff (`now - retention_days`). A disabled config is a
-/// no-op. `now` is injected so a test can age rows by passing a future instant.
+/// SPEC-3.8.4: prune every table in [`RETENTION_TABLES`] to the retention
+/// window, using `now` to compute the cutoff (`now - retention_days`). A
+/// disabled config is a no-op. `now` is injected so a test can age rows by
+/// passing a future instant.
 pub async fn sweep(
     pool: &DbPool,
     cfg: &DbRetentionConfig,
