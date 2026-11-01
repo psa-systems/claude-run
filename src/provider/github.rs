@@ -2447,6 +2447,107 @@ mod tests {
         assert_eq!(push_calls, 2, "{calls:?}");
     }
 
+    /// CLAUDE-486 (SPEC-3.3.1): `GithubForge::final_push` pushes HEAD when it
+    /// is ahead of the detected base, reporting no hook rejection on a clean
+    /// push.
+    #[test]
+    fn final_push_pushes_ahead_commits_with_no_hook_rejection() {
+        let runner = Arc::new(with_git(StubRunner::new(), "feat/x", "origin").ok(
+            "git",
+            &["rev-list", "--count", "origin/main..HEAD"],
+            "2\n",
+        ));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_git_retry_waits(NO_WAIT);
+        let report = forge
+            .final_push(Path::new("/tmp/wd"), "github.com")
+            .unwrap()
+            .expect("a branch ahead of base should push");
+        assert_eq!(report.branch, "feat/x");
+        assert!(report.hook_rejected.is_none(), "{report:?}");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c == "git push origin HEAD:feat/x"),
+            "{calls:?}"
+        );
+    }
+
+    /// `final_push` degrades to `Ok(None)` ("nothing to push") when HEAD
+    /// carries no commit the base lacks, without attempting a push.
+    #[test]
+    fn final_push_is_a_noop_when_head_is_not_ahead_of_base() {
+        let runner = Arc::new(with_git(StubRunner::new(), "feat/x", "origin").ok(
+            "git",
+            &["rev-list", "--count", "origin/main..HEAD"],
+            "0\n",
+        ));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_git_retry_waits(NO_WAIT);
+        let report = forge
+            .final_push(Path::new("/tmp/wd"), "github.com")
+            .unwrap();
+        assert!(report.is_none(), "{report:?}");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("push")),
+            "no push should be attempted: {calls:?}"
+        );
+    }
+
+    /// A `pre-push` hook rejection on the first push retries with
+    /// `--no-verify`, exactly as `CliBackend::final_push` does, and the
+    /// report names the hook's own failure text.
+    #[test]
+    fn final_push_retries_no_verify_on_hook_rejection() {
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .ok("git", &["rev-list", "--count", "origin/main..HEAD"], "2\n")
+                .fail(
+                    "git",
+                    &["push", "origin", "HEAD:feat/x"],
+                    1,
+                    "pre-push hook declined",
+                )
+                .ok("git", &["push", "--no-verify", "origin", "HEAD:feat/x"], ""),
+        );
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_git_retry_waits(NO_WAIT);
+        let report = forge
+            .final_push(Path::new("/tmp/wd"), "github.com")
+            .unwrap()
+            .expect("a hook-rejected push still reports a push attempt");
+        assert_eq!(report.branch, "feat/x");
+        let hook_rejected = report
+            .hook_rejected
+            .expect("hook rejection should be recorded");
+        assert!(
+            hook_rejected.contains("pre-push hook declined"),
+            "{hook_rejected}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git push --no-verify origin HEAD:feat/x"),
+            "{calls:?}"
+        );
+    }
+
     #[test]
     fn create_pr_refuses_a_template_heading_subject_before_any_push() {
         // CLAUDE-398: GitHub's create path must reject a tip subject that is
