@@ -162,10 +162,12 @@ each invocation is recorded in `claude_invocations`.
     configurable under `tags.needs_info`), attempt not counted.
   - marker file `.claude-run-no-code-change`: field set to `states.no_code` (default: the done label), marker text posted
     as a comment, no PR. Any commits the attempt made are pushed.
-  - success with commits: a draft PR is created (branch strategy `branch` by default, `agit` opt-in), a fresh read-only
-    review session runs, and a pass marker `.claude-run-review-pass` promotes the PR to ready and sets the field to
-    code-review. A fail marker `.claude-run-review-fail` or no verdict keeps the PR draft, posts the findings on the PR and
-    the issue, and sets the field to queued (below the attempt cap) or needs-review.
+  - success with commits: a draft PR is created (branch strategy `branch` by default, `agit` opt-in), then the
+    verification gate (`SPEC-3.3.2`) runs; a gate failure sets the field to failed and leaves the PR draft instead of
+    reaching the review session below. Otherwise a fresh read-only review session runs, and a pass marker
+    `.claude-run-review-pass` promotes the PR to ready and sets the field to code-review. A fail marker
+    `.claude-run-review-fail` or no verdict keeps the PR draft, posts the findings on the PR and the issue, and sets
+    the field to queued (below the attempt cap) or needs-review.
   - hard failure: commits pushed, field set to failed. A push or PR-create failure with a recorded open PR below the
     attempt cap requeues instead.
   - timeout or cancel: the final push in 3.3.1 runs; the checkpoint push (every 60 seconds while `claude` runs) is the
@@ -206,6 +208,22 @@ each invocation is recorded in `claude_invocations`.
 - Targets: `forgejo` (`base_url`, `token_ref`, `pr_strategy`) and `github` (`hosts`, `mcp_endpoint`, `token_ref`). A job
   whose repository host is `github.com` or listed in `github.hosts` uses the GitHub backend; any other host uses `fj`.
 - Prompt: `prompt` overrides; otherwise `prompt_preset` is `default` or `audit`.
+
+#### 3.3.2 Verification gate (`SPEC-3.3.2`)
+
+- Before the runner records an attempt as successful, it re-runs the repository's own pre-push entrypoint in the
+  clone itself, rather than trusting the agent's own report that checks passed: `just pre-push` when the clone has
+  that recipe, else `just check`, else no command at all. This runs after the final push (`SPEC-3.3.1`), so the
+  commits this run produced are already on the branch before the gate's own verdict is known.
+- A non-zero exit from the chosen command is recorded as a failure, with its redacted, bounded output attached to the
+  run and posted on the PR and the issue, never reported as success. The PR the push already opened stays a draft.
+- A report that the checks passed must name the command that actually ran (`just pre-push`, `just check`, or that
+  neither recipe exists and no command ran); a report naming no command is not evidence the checks passed.
+- A file change a failing check requires is allowed in the diff and is justified in the PR body; the gate checks the
+  state of the clone after the agent's own commits, not whether the agent's diff was minimal.
+- The clone's own hooks (`SPEC-3.3`'s `just install-hooks` step) already run locally on every commit and on the final
+  push itself; this gate is independent of them and runs even when the clone has no hooks installed, or the host has
+  no `just install-hooks` recipe to run.
 
 ### 3.4 Closed-issue summary action (`kind: closed-issue-summary`)
 
