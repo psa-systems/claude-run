@@ -1311,7 +1311,7 @@ async fn process_job(
 
     // A preserved workdir from a failed finalize (unpushed commits)
     // must not be clobbered by this attempt's clone; move it aside first.
-    preserve_aside(&workdir_path);
+    preserve_aside(&workdir_path, &action.name, key);
     std::fs::create_dir_all(&workdir_path)?;
 
     // ---- pre: mark Working / In Progress, then clone ----
@@ -4553,20 +4553,29 @@ fn work_location(workdir: &Path, token_url: Option<&str>) -> WorkLocation {
 /// unconditional cleanup destroy a run's only copy of the committed work, and
 /// the guard was later extended past committed-but-unpushed branches to the
 /// uncommitted and stashed work a branch-only check would miss.
+///
+/// `target/` is stripped first (`SPEC-3.10` item 5), before the preserve
+/// decision runs: whether the workdir ends up kept or deleted, its build
+/// output never survives this call.
 fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str, token_url: Option<&str>) {
+    crate::gc::remove_target(action, key, workdir);
     crate::workdir::cleanup_or_preserve_with_token(workdir, action, key, token_url);
 }
 
 /// Move a leftover (preserved) workdir out of the way of a fresh
 /// attempt's clone, to the first free `<dir>.kept-<n>` sibling. An empty
 /// leftover directory is left in place (the clone tolerates it).
-fn preserve_aside(workdir: &Path) {
+///
+/// `target/` is stripped first (`SPEC-3.10` item 5), so the directory this
+/// moves aside never carries its build output into the `.kept-<n>` sibling.
+fn preserve_aside(workdir: &Path, action: &str, key: &str) {
     let occupied = std::fs::read_dir(workdir)
         .map(|mut d| d.next().is_some())
         .unwrap_or(false);
     if !occupied {
         return;
     }
+    crate::gc::remove_target(action, key, workdir);
     for n in 1u32.. {
         let aside = workdir.with_file_name(format!(
             "{}.kept-{n}",
@@ -8718,20 +8727,61 @@ mod tests {
     }
 
     #[test]
+    fn preserved_workdir_loses_target_even_when_not_gitignored() {
+        // SPEC-3.10 item 5: `target/` is stripped by this path explicitly, not
+        // only as a side effect of `git clean -fdX` pruning gitignored
+        // artifacts, so a repo with no `target/` entry in `.gitignore` (or a
+        // build that writes outside the clean's reach) still loses it.
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        git_in(&clone, &["checkout", "-b", "feat/z"]);
+        std::fs::create_dir_all(clone.join("target")).unwrap();
+        std::fs::write(clone.join("target/build.o"), "binary").unwrap();
+        std::fs::write(clone.join("src.txt"), "source").unwrap();
+        git_in(&clone, &["add", "src.txt"]);
+        git_in(&clone, &["commit", "-m", "feat: z"]);
+
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
+
+        assert!(clone.exists(), "unpushed work must be preserved");
+        assert!(
+            !clone.join("target").exists(),
+            "target/ must be removed even with no .gitignore entry for it"
+        );
+        assert!(clone.join("src.txt").exists(), "source must remain");
+    }
+
+    #[test]
     fn preserve_aside_moves_a_leftover_workdir() {
         let base = tempfile::tempdir().unwrap();
         let wd = base.path().join("MK-16");
         std::fs::create_dir_all(&wd).unwrap();
         std::fs::write(wd.join("leftover.txt"), "kept work").unwrap();
-        preserve_aside(&wd);
+        preserve_aside(&wd, "YouTrack", "MK-16");
         assert!(!wd.exists(), "original path freed for the fresh clone");
         let aside = base.path().join("MK-16.kept-1");
         assert!(aside.join("leftover.txt").exists(), "content moved aside");
 
         // An empty leftover is left in place (the clone tolerates it).
         std::fs::create_dir_all(&wd).unwrap();
-        preserve_aside(&wd);
+        preserve_aside(&wd, "YouTrack", "MK-16");
         assert!(wd.exists());
+    }
+
+    #[test]
+    fn preserve_aside_strips_target_before_moving() {
+        let base = tempfile::tempdir().unwrap();
+        let wd = base.path().join("MK-16");
+        std::fs::create_dir_all(wd.join("target")).unwrap();
+        std::fs::write(wd.join("target/build.o"), "binary").unwrap();
+        std::fs::write(wd.join("src.txt"), "source").unwrap();
+        preserve_aside(&wd, "YouTrack", "MK-16");
+        let aside = base.path().join("MK-16.kept-1");
+        assert!(
+            !aside.join("target").exists(),
+            "target/ must not survive into the .kept-<n> sibling"
+        );
+        assert!(aside.join("src.txt").exists(), "non-target content kept");
     }
 
     #[test]
