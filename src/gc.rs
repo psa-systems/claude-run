@@ -5,17 +5,21 @@
 //! ([`sweep_webhook_logs`]). All are scheduled by the daemon on the same tick
 //! and read their own DB-backed retention window.
 //!
-//! The YouTrack runner intentionally keeps some workdirs rather than deleting
-//! them: [`crate::native::youtrack`] preserves a directory that holds
-//! local-only work (unpushed commits, a dirty tree, or a stash), and moves a
-//! leftover workdir aside (`<key>.kept-<n>`) out of the way of a fresh
+//! The runner intentionally keeps some workdirs rather than deleting them:
+//! every caller of [`crate::workdir::cleanup_or_preserve_with_token`] (the
+//! native YouTrack action, scripted-action jobs, the comment webhook)
+//! preserves a directory that holds local-only work (unpushed commits, a
+//! dirty tree, or a stash), and [`crate::native::youtrack`] separately moves
+//! a leftover workdir aside (`<key>.kept-<n>`) out of the way of a fresh
 //! attempt. Nothing else ever deletes these, so preserved and aside workdirs
 //! accumulate without bound under `$CLAUDE_RUN_DATA_DIR/workdirs/<source>/<key>`.
-//! The preserve and set-aside paths (`crate::native::youtrack`) already strip a
-//! kept workdir's `target/` before keeping it, and [`sweep`] strips it again
-//! from any workdir older than one day regardless of the kept/deleted
-//! decision (`SPEC-3.10` item 5), so a kept workdir no longer holds its
-//! multi-GB build output for weeks.
+//! Both of those preserve paths already strip a kept workdir's `target/`
+//! before keeping it ([`remove_target`], called from
+//! `crate::workdir::cleanup_or_preserve_with_token` and from
+//! `crate::native::youtrack`'s set-aside), and [`sweep`] strips it again from
+//! any workdir older than one day regardless of the kept/deleted decision
+//! (`SPEC-3.10` item 5), so a kept workdir no longer holds its multi-GB build
+//! output for weeks.
 //!
 //! [`sweep`] walks `<base>/*/*` and deletes any directory older than the
 //! configured retention window. A directory that still holds local-only work
@@ -651,9 +655,11 @@ fn whole_secs(d: Duration) -> Duration {
 
 /// Remove `<workdir>/target` in place (`SPEC-3.10` item 5), covering a
 /// `target/` left behind despite `CARGO_TARGET_DIR` (for example a project
-/// that sets its own `build.target-dir`). Used both by [`sweep`] on any
-/// workdir older than one day and by the preserve / set-aside paths in
-/// [`crate::native::youtrack`] before they keep a workdir.
+/// that sets its own `build.target-dir`). Used by [`sweep`] on any workdir
+/// older than one day, by the shared guarded delete
+/// (`crate::workdir::cleanup_or_preserve_with_token`) before it keeps a
+/// workdir, and by [`crate::native::youtrack`]'s set-aside path before it
+/// moves a leftover workdir out of the way.
 ///
 /// A missing `target/` is not an error: it reclaims zero bytes and is not
 /// logged. A successful removal is logged at `info` with the key, path and

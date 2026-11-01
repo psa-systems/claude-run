@@ -4677,11 +4677,12 @@ fn work_location(workdir: &Path, token_url: Option<&str>) -> WorkLocation {
 /// the guard was later extended past committed-but-unpushed branches to the
 /// uncommitted and stashed work a branch-only check would miss.
 ///
-/// `target/` is stripped first (`SPEC-3.10` item 5), before the preserve
-/// decision runs: whether the workdir ends up kept or deleted, its build
-/// output never survives this call.
+/// `target/` is stripped before the preserve decision keeps `workdir`
+/// (`SPEC-3.10` item 5); that happens inside
+/// [`crate::workdir::cleanup_or_preserve_with_token`] itself, so every other
+/// caller of that shared guarded delete (scripted-action jobs, the comment
+/// webhook) gets the same removal, not just this native action.
 fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str, token_url: Option<&str>) {
-    crate::gc::remove_target(action, key, workdir);
     crate::workdir::cleanup_or_preserve_with_token(workdir, action, key, token_url);
 }
 
