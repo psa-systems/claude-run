@@ -608,6 +608,7 @@ impl Daemon {
             pause: crate::pause::PauseGate::new(pool.clone()).with_readiness(readiness.clone()),
             readiness: readiness.clone(),
             last_fire: Mutex::new(HashMap::new()),
+            first_seen: Mutex::new(HashMap::new()),
         });
 
         let scheduler_task = tokio::spawn(scheduler_loop(dispatch.clone(), trigger_tx.clone()));
@@ -1379,6 +1380,9 @@ struct Dispatcher {
     /// whose re-gather finds no fresh work (and thus creates no run row) is
     /// still not re-fired every 5s tick.
     last_fire: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// SPEC-2.2: when the scheduler first saw a `cron` action with no run yet, which
+    /// is where counting toward its next matching instant starts.
+    first_seen: Mutex<HashMap<String, DateTime<Utc>>>,
 }
 
 impl Dispatcher {
@@ -2273,6 +2277,11 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
         if !scheduler::regather_due(last_fire, now, interval) {
             continue;
         }
+        // SPEC-2.2: the action's own schedule decides whether it is due at all.
+        // Checked after the cadence so an idle action queries once per re-gather.
+        if !schedule_due(dispatch, &r, kind, now).await {
+            continue;
+        }
         // A gather still running from the previous fire means this
         // pickup would re-run the same query against the same source. Skip it
         // WITHOUT advancing `last_fire` (same contract as `can_admit` below), so
@@ -2291,6 +2300,51 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
         dispatch.clone().dispatch(r.name.clone(), "scheduler").await;
     }
     Ok(())
+}
+
+/// SPEC-2.2: whether an action's own schedule makes it due, measured from its last
+/// run's `started_at`. An empty re-gather creates no run, so an action with nothing
+/// to do stays due and keeps re-gathering at the cadence. Never run, `interval` is
+/// due at once, and `cron` counts from when the scheduler first saw it.
+async fn schedule_due(
+    dispatch: &Arc<Dispatcher>,
+    r: &state::ActionIndexRow,
+    kind: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    let kind_parsed = match kind {
+        "interval" => crate::action::ScheduleKind::Interval,
+        "cron" => crate::action::ScheduleKind::Cron,
+        _ => return false,
+    };
+    let schedule = crate::action::Schedule {
+        kind: kind_parsed,
+        spec: r.schedule_spec.clone(),
+    };
+    let parsed = match scheduler::parse_schedule(&schedule) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(action = %r.name, error = %e, "schedule does not parse; not firing");
+            return false;
+        }
+    };
+    let last_run = match state::action_last_run_started(&dispatch.pool, &r.name).await {
+        Ok(started) => started
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| t.with_timezone(&Utc)),
+        Err(e) => {
+            warn!(action = %r.name, error = %e, "last run read failed; skipping this pickup");
+            return false;
+        }
+    };
+    let anchor = match (last_run, kind) {
+        (None, "cron") => {
+            let mut seen = dispatch.first_seen.lock().await;
+            Some(*seen.entry(r.name.clone()).or_insert(now))
+        }
+        (last, _) => last,
+    };
+    scheduler::next_fire_due(&parsed, anchor, now).is_some()
 }
 
 /// SPEC-2.2: the trigger consumer task; runs actions requested by `trigger`.
@@ -2719,6 +2773,88 @@ mod tests {
         );
     }
 
+    /// SPEC-2.2: an action's own schedule decides whether it is due, measured from
+    /// its last run's `started_at`.
+    #[tokio::test]
+    async fn schedules_are_measured_from_the_last_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
+        let dispatch = test_dispatcher(&paths, &pool);
+        let row = |name: &str, kind: &str, spec: &str| state::ActionIndexRow {
+            name: name.to_string(),
+            file_path: format!("/x/{name}.yml"),
+            yaml_sha256: String::new(),
+            enabled: true,
+            schedule_kind: Some(kind.to_string()),
+            schedule_spec: Some(spec.to_string()),
+            last_seen_at: "2026-01-01T00:00:00+00:00".to_string(),
+            parse_error: None,
+            link_template: None,
+            max_parallel: 1,
+        };
+        let now = Utc::now();
+        let mins = |m: i64| now + chrono::Duration::minutes(m);
+
+        // interval: never run, due at once; after a run, only once `spec` has passed.
+        let every = row("every", "interval", "5m");
+        assert!(schedule_due(&dispatch, &every, "interval", now).await);
+        let run = state::run_begin(&pool, "every", "scheduler").await.unwrap();
+        state::run_finish(&pool, run, 0, 0).await.unwrap();
+        assert!(!schedule_due(&dispatch, &every, "interval", mins(4)).await);
+        assert!(schedule_due(&dispatch, &every, "interval", mins(6)).await);
+
+        // cron: never run, it counts from first sight rather than firing at once,
+        // and a matching minute since then makes it due.
+        let cron = row("cron", "cron", "* * * * *");
+        assert!(!schedule_due(&dispatch, &cron, "cron", now).await);
+        assert!(schedule_due(&dispatch, &cron, "cron", mins(2)).await);
+        // It stays due until a run starts: an empty re-gather creates no run row.
+        assert!(schedule_due(&dispatch, &cron, "cron", mins(3)).await);
+        let run = state::run_begin(&pool, "cron", "scheduler").await.unwrap();
+        state::run_finish(&pool, run, 0, 0).await.unwrap();
+
+        // A far-off cron time is not due after a run, and is once it has passed.
+        let yearly = row("cron", "cron", "0 0 1 1 *");
+        assert!(!schedule_due(&dispatch, &yearly, "cron", mins(10)).await);
+        assert!(
+            schedule_due(
+                &dispatch,
+                &yearly,
+                "cron",
+                now + chrono::Duration::days(370)
+            )
+            .await
+        );
+
+        // A bad expression never fires.
+        assert!(!schedule_due(&dispatch, &row("bad", "cron", "not cron"), "cron", mins(10)).await);
+    }
+
+    /// SPEC-2.2: the scheduler tick honours the schedule: a recent run holds an
+    /// `interval` action back even though the re-gather cadence has elapsed.
+    #[tokio::test]
+    async fn a_recent_run_holds_an_interval_action_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        std::fs::create_dir_all(paths.actions_dir()).unwrap();
+        std::fs::write(
+            paths.actions_dir().join("act.yml"),
+            "name: act\nkind: youtrack\nnative: {}\nschedule:\n  kind: interval\n  spec: 5m\n",
+        )
+        .unwrap();
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
+        let dispatch = test_dispatcher(&paths, &pool);
+        let run = state::run_begin(&pool, "act", "scheduler").await.unwrap();
+        state::run_finish(&pool, run, 0, 0).await.unwrap();
+
+        scheduler_tick(&dispatch).await.unwrap();
+        assert!(
+            dispatch.last_fire.lock().await.get("act").is_none(),
+            "not due yet, so the tick must not fire"
+        );
+    }
+
     /// The three pause-read outcomes. The `Err` arm is the fix: it
     /// used to be a `?` that aborted the whole tick, so one transient pool
     /// timeout stopped EVERY action from firing, not just this one.
@@ -2801,6 +2937,7 @@ mod tests {
             pause: crate::pause::PauseGate::new(pool.clone()),
             readiness: crate::readiness::ReadinessGate::always(),
             last_fire: Mutex::new(HashMap::new()),
+            first_seen: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2839,6 +2976,7 @@ mod tests {
             pause: crate::pause::PauseGate::new(pool.clone()),
             readiness: crate::readiness::ReadinessGate::always(),
             last_fire: Mutex::new(HashMap::new()),
+            first_seen: Mutex::new(HashMap::new()),
         });
 
         scheduler_tick(&dispatch).await.unwrap();
