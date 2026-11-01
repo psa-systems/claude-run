@@ -587,12 +587,13 @@ impl Default for CommentWebhookSource {
 }
 
 /// Settings for minting (or updating) a YouTrack issue from a triaged
-/// failure. Lives in `config.toml` because the daemon's webhook consumer needs it
-/// at startup. Routing sends an issue to the project whose enabled VCS
+/// failure. DB-backed (settings key `config.mint`, SPEC-6.3); `config.toml`'s
+/// `[mint]` is only a bootstrap copy, one-time imported into the DB per
+/// SPEC-6.5. Routing sends an issue to the project whose enabled VCS
 /// integration claims the failing repo; `repo_project_map` is an optional override
 /// consulted first, and `fallback_project` catches any unclaimed repo.
 ///
-/// SPEC-6.2.
+/// SPEC-6.2, SPEC-6.3.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MintConfig {
