@@ -30,6 +30,7 @@ pub const BOT_CLAUDE_MD: &str = include_str!("../deploy/bot-CLAUDE.md");
 /// `[daemon].claude_config_dir` (with `~`/`$VAR` expansion) when set, else
 /// defaults to `<config_dir>/claude-agent-home`, self-contained under
 /// claude-run's own config tree.
+// SPEC-8.1: configured override, else `<config dir>/claude-agent-home`.
 pub fn resolve_config_dir(paths: &Paths, configured: Option<&str>) -> PathBuf {
     match configured {
         Some(raw) => PathBuf::from(expand_path(raw)),
@@ -40,6 +41,7 @@ pub fn resolve_config_dir(paths: &Paths, configured: Option<&str>) -> PathBuf {
 /// Ensure the agent config dir exists and is seeded. Writes `<dir>/CLAUDE.md`
 /// from [`BOT_CLAUDE_MD`] (overwritten each start) and, on Linux, links
 /// `<dir>/.credentials.json` to the host login when the host has one.
+// SPEC-8.1: seeds the dir before any `claude` child is spawned.
 pub fn ensure(dir: &Path) -> Result<()> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -49,6 +51,7 @@ pub fn ensure(dir: &Path) -> Result<()> {
 
 /// Testable core of [`ensure`]: `home` is injected so the credential-link step
 /// can be exercised without touching the process environment.
+// SPEC-8.1: CLAUDE.md is overwritten from the embedded bot file every start.
 fn ensure_seeded(dir: &Path, home: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join("CLAUDE.md"), BOT_CLAUDE_MD)?;
@@ -73,6 +76,8 @@ fn ensure_seeded(dir: &Path, home: &Path) -> Result<()> {
 /// come up so there is a container to log into, and `claude` fails loudly at
 /// invocation if no credential ever arrives. The first two log a `warn`; the
 /// third is an ordinary `claude_config_dir` setting with nothing to report.
+// SPEC-8.1: symlinks (never copies) the host credential when one exists; the
+// three "leave it alone" cases below are not errors.
 #[cfg(target_os = "linux")]
 fn link_credentials(dir: &Path, home: &Path) -> Result<()> {
     let src = home.join(".claude").join(".credentials.json");
