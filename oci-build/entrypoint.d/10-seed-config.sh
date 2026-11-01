@@ -1,6 +1,8 @@
 #!/bin/sh
-# Root hook, run by gosu-entrypoint.sh before the chown. Seeds the config
-# volume on its first boot; never overwrites an operator edit afterwards.
+# SPEC-9: "Entrypoint hooks seed `config.toml` and the shipped action files
+# into an empty config volume." Root hook, run by gosu-entrypoint.sh before
+# the chown. Seeds the config volume on its first boot; never overwrites an
+# operator edit afterwards.
 set -eu
 
 # The image ships a bootstrap config.toml that binds 0.0.0.0 (a loopback bind

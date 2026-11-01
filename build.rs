@@ -1,5 +1,7 @@
-//! Bake build metadata into the binary so two `0.1.0` artifacts built from
-//! different commits are distinguishable (see CLAUDE-2).
+//! SPEC-2.1: "`build.rs` embeds the 12-character git SHA and the UTC build
+//! date ... or a local probe, else `unknown`." Bake build metadata into the
+//! binary so two `0.1.0` artifacts built from different commits are
+//! distinguishable (see CLAUDE-2).
 //!
 //! Emits two compile-time env vars consumed by `claude_run::VERSION`:
 //!   - `CLAUDE_RUN_GIT_SHA`   : short (12-char) commit hash
@@ -11,6 +13,8 @@
 
 use std::process::Command;
 
+// SPEC-2.1: resolves and emits `CLAUDE_RUN_GIT_SHA` / `CLAUDE_RUN_BUILD_DATE`
+// as `cargo:rustc-env`, which `claude_run::VERSION` consumes.
 fn main() {
     let git_sha = env_or_else("CLAUDE_RUN_GIT_SHA", || {
         probe("git", &["rev-parse", "--short=12", "HEAD"])
@@ -27,7 +31,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CLAUDE_RUN_BUILD_DATE");
 }
 
-/// Use `$var` when set and non-empty, else fall back to `f`.
+/// SPEC-2.1: "an explicit build env var ... else a local probe." Use `$var`
+/// when set and non-empty, else fall back to `f`.
 fn env_or_else(var: &str, f: impl FnOnce() -> String) -> String {
     match std::env::var(var) {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
@@ -35,7 +40,8 @@ fn env_or_else(var: &str, f: impl FnOnce() -> String) -> String {
     }
 }
 
-/// Run a command, returning its trimmed stdout, or `"unknown"` on any failure.
+/// SPEC-2.1: the local-probe fallback (`git rev-parse` / `date`), returning
+/// `"unknown"` on any failure so a tarball build with no `.git` still compiles.
 fn probe(cmd: &str, args: &[&str]) -> String {
     Command::new(cmd)
         .args(args)

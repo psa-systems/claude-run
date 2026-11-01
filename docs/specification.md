@@ -43,7 +43,13 @@ directory and runs these concurrent tasks:
 - Scheduler: a 5-second tick. For each enabled, unpaused, non-`manual` action it fires a pickup run when the
   re-gather interval (setting `concurrency.regather_interval_secs`, default 60) has elapsed, no gather for that action
   is in flight, and the action's `concurrency.max_parallel` cap has a free slot. The scheduler does nothing while the
-  daemon is globally paused or while the Claude credential is not ready.
+  daemon is globally paused or while the Claude credential is not ready. An action's own schedule (3.1) decides
+  whether it is due at all: `interval` fires once that duration has elapsed since its last run's `started_at` (or
+  immediately if it has never run), `cron` fires at the next matching instant after that same timestamp, and
+  `manual` never auto-fires. The re-gather cadence itself is tracked by the scheduler's own last-fire time in
+  memory, per action, not by run rows, since a re-gather that finds only already-in-flight work creates no run row.
+  The "no gather in flight" check is advisory and scheduler-only: a manual trigger always gathers regardless, and a
+  scheduled pickup that narrowly loses the race still gathers rather than erroring.
 - Trigger consumer: runs actions requested by `trigger`.
 - HTTP servers: an optional unix-socket API server (disabled by `--no-socket`), a TCP server (web UI, `/api`,
   webhook routes), and an optional MCP listener.
@@ -51,9 +57,22 @@ directory and runs these concurrent tasks:
 - Background loops: automerge reconciler (300-second tick), garbage-collection sweeps (hourly tick), history-table
   retention sweep, Claude login status probe (every 600 seconds when ready, every 60 seconds when login is required).
 - On start the daemon reaps run rows left open by a dead process (closed with the `UNEXPECTED` exit code), reconciles
-  tracker issues stranded in the working state, scans the actions directory, and records the serve start time.
-- On SIGTERM the daemon shuts down gracefully with a 30-second grace window. Runs found open at shutdown are closed
+  tracker issues stranded in the working state, scans the actions directory, and records the serve start time. A scan
+  also prunes the action index of rows whose backing YAML file no longer exists (run history is kept), and flags two
+  enabled actions doing redundant work (a case-insensitive name collision, or the same native kind and effective
+  source) with a WARN log and a persisted `run_events` notice on each; detection is observability-only and never
+  disables either action.
+- On SIGTERM the daemon shuts down gracefully with a 30-second grace window, driven by tripping every in-flight run's
+  cancellation token (3.7) at once and waiting for the run registry to drain. Runs found open at shutdown are closed
   with exit code 130 (cancelled).
+- `serve --detach` forks into the background before any tokio runtime is built (forking after would hand the child a
+  corrupted scheduler), and keeps the daemonize dependency from managing the pidfile itself so it never races the
+  daemon's own `flock` (sole authority: the pidfile lock taken above). It also writes a marker file next to the
+  pidfile for the run's lifetime (removed on clean shutdown and recreated at the next `serve` start). A CLI command
+  with no reachable daemon socket classifies daemon presence from the pidfile's liveness and this marker: a live
+  pidfile with the marker present reads as running with the socket disabled, a live pidfile with no marker reads as
+  undetermined (starting up, or its socket listener crashed) rather than guessing not-running, and no live pidfile
+  reads as not running.
 
 The TCP bind retries every 5 seconds while the address is not yet assigned. Any other bind failure disables the TCP
 surface for that run and is logged.
@@ -114,7 +133,9 @@ GitHub MCP endpoint (GitHub), `git`, `claude`, `nu` (default interpreter for scr
 - Per-action `limits`: `max_attempts_per_key` (default 3), `max_runs_per_day` (20), `claude_timeout_seconds` (600),
   `daily_budget_usd` (5.00), `run_budget_usd`, `budget_warn_fraction`, `max_issues_per_run`, `review_timeout_seconds`
   (1800). `concurrency` has `max_parallel` and a `key` list; two jobs sharing a concurrency key never overlap, across
-  scheduled runs and manual triggers.
+  scheduled runs and manual triggers. The key is the literal joined value of those fields, not prefixed by the
+  action name, and is held in one process-wide gate: two jobs from *different* actions that resolve to the same key
+  value also never overlap, not only two jobs of the same action.
 - `claude` block: `cwd`, `allowed_tools`, `permission_mode`, `model`, `effort`, `autocompact`. Precedence for model,
   effort and autocompact: action value, then the `claude` settings section, then the Claude CLI default (autocompact
   falls back to a built-in default window instead).
@@ -254,6 +275,8 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
   The redacted log is attached.
 - Throttling uses the synthetic action `webhook-triage`: `webhook.max_runs_per_day` (default 20) and a per-key attempt
   counter.
+- The whole mint pipeline degrades to log-only (no tracker issue created) when no YouTrack/Forgejo/GitHub backend is
+  usable, or its on-disk analysis directory cannot be created.
 
 ### 3.6 Comment-command webhook
 
@@ -275,11 +298,25 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
 ### 3.7 Pause, cancel and readiness
 
 - Global and per-action pause are stored in the database and survive restart. Paused webhook deliveries are acknowledged
-  with 2xx and dropped; paused scheduling skips pickup.
-- `cancel` stops an in-flight run by id through the daemon.
-- Readiness has two not-ready kinds: `no_credential` and `login_required`. While login is required, scheduling stops,
-  webhook deliveries are acknowledged and dropped with a `run_events` row, and runs stop picking up jobs (exit code 8).
-  The Settings page can run an interactive Claude sign-in through the daemon.
+  with 2xx and dropped; paused scheduling skips pickup. A run already dispatched re-checks the global-pause flag at
+  each per-job checkpoint (TTL-cached, ~1.5s), separately from the up-front scheduler check, so a pause taken mid-run
+  stops it from picking up further new jobs without waiting for the whole run to drain; the job already executing
+  finishes normally. A read failure of that flag is treated as not-paused and logged, so a transient DB error never
+  silently halts the daemon. When a run is stopped mid-flight, its exit code names which axis stopped it: `exit::PAUSED`
+  (1) when a global pause tripped it, `exit::LOGIN_REQUIRED` (8) when only the login-required axis did; an operator
+  cancel (130) wins over both, and a global pause wins over a login-required trip when both hold during the same run.
+- `cancel` stops an in-flight run by id through the daemon: it trips a per-run cancellation token held in a
+  process-wide registry (no cross-process cancellation; only a run inside the same daemon process can be cancelled).
+  Tripping it, in order: the in-flight `claude` child is sent SIGTERM then, after a grace period, SIGKILL to its whole
+  process group (3.2); the job still in flight runs its `post` phase with a synthesized cancelled result; the run loop
+  stops dispatching further jobs and finalizes with exit code 130.
+- Readiness has two not-ready kinds: `no_credential` and `login_required`. A credential counts, in this order: an
+  agent-config-dir `.credentials.json` file (the host login, or one a container `/setup` sign-in wrote), a stored
+  Anthropic API key (Settings -> Auth), or `ANTHROPIC_API_KEY` in the daemon's own environment; none of the three
+  present is the `no_credential` kind. The login-required axis, once tripped, overrides a credential that is
+  otherwise still present on disk, since an expired or revoked login does not delete `.credentials.json`. While login
+  is required, scheduling stops, webhook deliveries are acknowledged and dropped with a `run_events` row, and runs
+  stop picking up jobs (exit code 8). The Settings page can run an interactive Claude sign-in through the daemon.
 
 ### 3.8 Garbage collection and retention
 
@@ -336,7 +373,22 @@ Global flags: `--actions-dir <dir>` (env `CLAUDE_RUN_ACTIONS_DIR`), `--color aut
 Exit codes: 0 ok, 1 paused, 2 locked, 3 config error, 4 daily cap, 5 unexpected, 6 over budget, 7 conflict, 8 login
 required, 130 cancelled.
 
-CLI mutations delegate to the daemon over the unix socket when it is reachable and otherwise operate on the database.
+CLI mutations delegate to the daemon over the unix socket when it is reachable (a bare `connect()` to the socket path
+succeeds; this does not confirm the daemon answers HTTP) and otherwise operate on the database. `trigger` and
+`cancel` are the two exceptions: a scheduled pickup or an in-flight run exists only inside the daemon process, so
+with no reachable socket both fail outright rather than falling back to the database. A socket-dependent command
+that finds the socket unreachable but the daemon's pidfile alive and `serve --no-socket`'s marker present (2.2) tells
+the operator to use the TCP web UI / `/api` instead of reporting the daemon as not running. `action list` / `action
+show` rescan the actions directory themselves first when no daemon is reachable (3.1's rescan never happens
+otherwise); `action delete` / `action reset-attempts` apply the same guards (in-flight-run refusal, missing-row 404)
+directly against the database that the daemon's own handlers enforce. `stop`'s own poll grace (5s) is the CLI's
+patience waiting for the daemon to finish its separate 30-second shutdown grace (2.2); timing out reports failure
+without ever sending SIGKILL. `restart` is implemented as stop, then `exec()` into a fresh `serve` invocation (not an
+in-process restart); a stop that times out aborts the restart without execing. `migrate`'s source defaults to
+`~/.local/share/claude-run/state` when `--from` is unset; its target is always the configured database, never
+SQLite-only. `import` refuses a self-import (its resolved source and target are the same store) independent of the
+`--allow-nonempty` guard. `secret set` never accepts an empty value; piped input has exactly one trailing newline
+(`\n` or `\r\n`) stripped, and interactive input is prompted twice with echo disabled and must match.
 
 ### 4.2 JSON API
 
@@ -476,25 +528,6 @@ adds `allowed_permissions`, `max_files`, `max_lines`, `bot_author`, `bot_email`,
 
 ## 7. Security
 
-- TCP surface authentication is required for any non-loopback bind (or `require_auth_on_loopback`). Credentials: bearer
-  token (constant-time compare) or a session cookie `claude_run_session` (HttpOnly, Secure, SameSite=Lax, 12-hour TTL,
-  HMAC-signed with the account's rotating session key). `/webhooks/`, the login, setup and invite routes are exempt;
-  webhooks authenticate by HMAC.
-- With no credential and no account, browsers are sent to `/setup` and other clients receive 503; the surface is never
-  served unauthenticated.
-- Accounts: argon2id password hashes, mandatory TOTP enrollment (an unenrolled session may only reach `/account/2fa/setup`
-  and static assets), one-time recovery codes, 5 wrong second-factor attempts per 5-minute pending cookie, invites that
-  expire after 72 hours and are stored as hashes. `access reset-2fa` rotates the session key.
-- Secrets are stored age-encrypted (X25519 identity) in `secrets`. The key file is created with mode 0600 on first start,
-  a missing key with stored secrets refuses to generate a new one, and a key readable beyond its owner is warned about.
-- Webhook hardening: per-source HMAC secret, rate limit before crypto, shared replay store, repository allow-list that
-  denies by default, and a comment-command permission check plus decision-gate caps.
-- Logs fetched from CI are redacted before storage or attachment. Run summaries rendered in the UI are Markdown with raw
-  HTML demoted to text.
-- The unix-socket API has no authentication and is disabled by `--no-socket` in the container image.
-- The agent may mutate only through the bounded tracker writes the prompt permits; the runner owns the `AI Agent` field
-  and every write to the triggering issue except comments.
-
 ### 7.1 Secrets store and key lifecycle (`SPEC-7.1`)
 
 - The symmetric key is an `age` X25519 identity read from a file: `CLAUDE_RUN_SECRETS_KEY_FILE` when set, else
@@ -584,6 +617,105 @@ adds `allowed_permissions`, `max_files`, `max_lines`, `bot_author`, `bot_email`,
 - An operator can also abandon an in-flight session explicitly, killing its child immediately rather than waiting for
   the staleness drop above; this is the manual counterpart to the automatic drop, triggered from the Settings Auth
   card.
+
+### 7.6 TCP surface authentication (`SPEC-7.6`)
+
+- TCP surface authentication is required for any non-loopback bind, or for a loopback bind with `require_auth_on_loopback`
+  set; a loopback bind with the flag unset serves unauthenticated, as before. An unparseable, non-`localhost` bind value
+  is treated as non-loopback, so the check fails safe (requires auth) rather than open.
+- Credentials: `Authorization: Bearer <token>` (constant-time compare, scheme match case-insensitive per RFC 7235)
+  naming the secret `auth_token_ref`, or the session cookie (7.8). A configured `auth_token_ref` that fails to resolve
+  (no key file, unknown secret, empty value) is a warning, not a fatal startup error: bearer auth is then unavailable
+  for the run, but the browser login or first-run setup still gets the operator in.
+- The legacy pair `auth_username` plus the `auth_token_ref` plaintext authenticates the login form only while no DB
+  account exists; once any account exists, only a DB account (7.9) can sign in through the form. The legacy pair's
+  session is signed with the bearer token as its HMAC key under the sentinel account id `0`; every other session signs
+  with that account's own rotating `session_key`, so rotating either invalidates exactly the sessions it signed.
+- `/webhooks/`, `/login`, `/login/2fa`, `/logout`, `/setup` and `/invite/*` are exempt from this gate: webhooks
+  authenticate by HMAC (4.4) and cannot carry a bearer header, and the auth routes themselves must stay reachable
+  unauthenticated or there is no way to obtain a credential. `/account/2fa/setup` still requires a valid credential; it
+  is exempt only from the enrollment check in 7.10, not from this gate.
+
+### 7.7 Unconfigured instance (`SPEC-7.7`)
+
+- With no credential and no account at all, a browser GET that accepts `text/html` is redirected to `/setup`; every
+  other request is refused with 503 naming the state (`claude-run has no account yet`). The surface is never served
+  unauthenticated by falling through to the protected routes.
+- `/setup` is a dead end once any account exists: a further GET or POST redirects to `/login` instead of minting a
+  second account, so setup runs exactly once and only an accepted invite (7.11) can add another account.
+
+### 7.8 Session and pending-2FA cookies (`SPEC-7.8`)
+
+- The session cookie (`claude_run_session`) carries plaintext claims `"<account id>.<expiry>.<hmac>"`, set HttpOnly,
+  Secure, SameSite=Lax, scoped to `/`, with a 12-hour TTL, HMAC-SHA256-signed with the key named in 7.6. An expired
+  cookie, or one whose recomputed signature does not match, is rejected.
+- The pending-2FA cookie proves a password check already passed and a second factor is still owed: the same claim
+  shape plus a wrong-attempt counter, a 5-minute TTL, and a cap of 5 wrong codes before the cookie is discarded and the
+  operator is sent back to `/login` to start over.
+
+### 7.9 Accounts (`SPEC-7.9`)
+
+- Any number of accounts live in `web_accounts`, each with its own argon2id password hash and its own rotating
+  `session_key`; there are no roles yet, so every account has full rights.
+- Username lookup and the uniqueness check are case-insensitive. Creating or accepting an invite refuses an empty
+  username, a password under `MIN_PASSWORD_LEN` (12) characters, or a username already in use, each surfaced as a
+  visible reason rather than a generic failure, and writes nothing on refusal.
+- Removing an account is refused for the last remaining account and for removing one's own account, both as visible
+  errors rather than a silent no-op; a successful removal also deletes that account's recovery codes.
+- Changing a password rotates the session key with it, signing every existing browser session for that account out
+  immediately.
+
+### 7.10 TOTP enrollment and login (`SPEC-7.10`)
+
+- TOTP enrollment is mandatory: an authenticated but unenrolled session may reach only `/account/2fa/setup` and
+  `/static/*`; every other route refuses it (a browser GET is redirected to the enrollment page, anything else gets a
+  plain refusal), so no other page loads until enrollment is confirmed.
+- Enrollment: beginning (or restarting) it generates a fresh RFC 6238 secret, stores it encrypted but unconfirmed, and
+  returns the `otpauth://` URI and its rendered QR code; reloading before confirmation just replaces the pending
+  secret. Confirming it with a valid current code marks the account enrolled and mints `RECOVERY_CODE_COUNT` (10)
+  single-use recovery codes, rendered once and never stored in the clear.
+- Login-time verification accepts the current or an adjacent TOTP time step, or an unused recovery code (consumed on
+  success); the same TOTP step is never accepted twice (replay refused). A wrong code bumps the pending cookie's
+  attempt counter (7.8); a corrupt stored secret is a surfaced error, never silently treated as "not enrolled" or as a
+  wrong code.
+- `access reset-2fa` clears enrollment and every recovery code and rotates the session key, forcing re-enrollment and
+  signing out every existing session for that account.
+
+### 7.11 Invites and email (`SPEC-7.11`)
+
+- An invite is a single-use token in `web_invites`, stored only as a hash, minted by a signed-in account and expiring
+  `INVITE_TTL_HOURS` (72) hours after creation. Accepting it creates the account and marks the invite used inside one
+  transaction, so a race between two acceptances of the same token can create at most one account; a used, expired or
+  unknown token resolves to nothing.
+- With no email address given, the invite link is shown once in the accounts UI. With an address, the link is emailed
+  instead through `src/mailer.rs` (CLAUDE-394), built from `CLAUDE_RUN_PUBLIC_URL` rather than any request's `Host`
+  header, and not displayed, unless the send fails, in which case the invite is kept (not discarded) and the link is
+  shown once as a fallback. The emailed body never carries the SMTP credential.
+- Sending by email requires SMTP to be configured: `CLAUDE_RUN_SMTP_HOST`, `_FROM` and `CLAUDE_RUN_PUBLIC_URL` must all
+  be set, and a `_USERNAME` without a password is refused (CLAUDE-428); the transport is built fresh from the process
+  environment on every send, never from a Settings-page form, so a changed environment applies on the next daemon
+  restart, not live. An invalid recipient address is refused with 400 and mints no invite; an unconfigured SMTP
+  environment is refused with 400 naming the missing variables rather than silently falling back to the link-only
+  flow.
+
+### 7.12 Webhook hardening (`SPEC-7.12`)
+
+- Webhook hardening: per-source HMAC secret, rate limit before crypto, shared replay store, repository allow-list that
+  denies by default, and a comment-command permission check plus decision-gate caps.
+
+### 7.13 CI log and run-summary rendering (`SPEC-7.13`)
+
+- Logs fetched from CI are redacted before storage or attachment. Run summaries rendered in the UI are Markdown with raw
+  HTML demoted to text.
+
+### 7.14 Unix-socket API (`SPEC-7.14`)
+
+- The unix-socket API has no authentication and is disabled by `--no-socket` in the container image.
+
+### 7.15 Agent write boundary (`SPEC-7.15`)
+
+- The agent may mutate only through the bounded tracker writes the prompt permits; the runner owns the `AI Agent` field
+  and every write to the triggering issue except comments.
 
 ## 8. Integrations and dependencies
 
@@ -759,8 +891,13 @@ action's `token_ref`, which is injected per job.
   build. The runtime stage is a Linux image carrying `claude`, `yt`, `fj`, `gh`, `nu`, `just`, Docker CLI, git and Rust
   tooling, plus `gosu` and `catatonit`. Entrypoint: `catatonit -- gosu-entrypoint.sh claude-run`, default command
   `serve --no-socket`. The image starts as root and drops to uid/gid 1001 through the entrypoint.
+- The runtime stage smoke-checks the base image's toolchain at build time (a version/help invocation of every CLI the
+  image is expected to carry); a base image that lost a tool fails the image build there instead of failing the first
+  job that needs it.
+- `gosu` has no openSUSE Leap package: the runtime stage downloads the upstream per-architecture release binary and
+  verifies it against that release's published SHA256SUMS before installing it.
 - Entrypoint hooks seed `config.toml` and the shipped action files into an empty config volume and chown the data
-  directory.
+  directory. See 9.1 for the entrypoint's own root/non-root and UID/GID behavior.
 - Image environment: `CLAUDE_RUN_CONFIG_DIR=/config`, `CLAUDE_RUN_DATA_DIR=/data`, `CLAUDE_RUN_STATE_DIR=/state`,
   `CLAUDE_RUN_RUNTIME_DIR=/run/claude-run`, `CLAUDE_CONFIG_DIR=/config/claude-agent-home`. The agent's `CLAUDE.md` is baked
   from `deploy/bot-CLAUDE.md`.
@@ -770,6 +907,10 @@ action's `token_ref`, which is injected per job.
   privileged Docker-in-Docker sidecar sharing the app's network namespace (daemon on `tcp://127.0.0.1:2375`, healthcheck
   `nc -z`), and an optional PostgreSQL service behind the `postgres` profile (healthcheck `pg_isready`). No host bind
   mount is used. No port is published by default.
+- `compose.yml` passes the same `RUNS_ON_*` image references the CI workflows resolve through `${{ vars.RUNS_ON_* }}`
+  into the app service as environment variables, so a `claude` session the daemon spawns (running `just check-docker` or
+  `just pre-commit` against the Docker-in-Docker sidecar) builds against the identical images CI uses instead of a
+  guessed tag.
 - The app service defines no container healthcheck. Liveness is available from `GET /api/status` and the `status`
   command.
 - Shipped action files: `youtrack.yml` (interval 5m), `audit-run.yml` (interval 5m), `closed-issue-summary.yml` (interval
@@ -777,15 +918,66 @@ action's `token_ref`, which is injected per job.
 - Restart safety: `GET /api/status` and the About page expose a `quiet` flag that is true only when no run is open and
   no run is dispatched.
 
+### 9.1 Entrypoint and UID/GID remap (`SPEC-9.1`)
+
+`oci-build/gosu-entrypoint.sh` is the shared, byte-identical entrypoint; image-specific root steps run as hooks under
+`/etc/entrypoint.d/` instead of being added to this file.
+
+- Started as a non-root user (for example a compose `user:` pin): the remap, hooks and chown below are all skipped. Any
+  `PUID`/`PGID` given must match the uid/gid the container was actually started as, or the entrypoint refuses to start.
+  Every path named in `DATA_DIRS` must already exist and be writable by that uid/gid, or the entrypoint refuses to
+  start naming the unwritable path; it then execs the command directly.
+- Started as root: `PUID`/`PGID` resolve to, in order, an explicit non-zero environment value, else the owner of the
+  first `DATA_DIRS` entry when that owner is not root, else 1001/1001. A non-numeric or zero `PUID`/`PGID` refuses to
+  start rather than run the workload as root.
+- The resolved uid/gid is applied to the image's `APP_USER` (`usermod`/`groupmod -o`, allowing an id already present in
+  the image), the root hooks under `/etc/entrypoint.d/` run in filename order and a non-zero exit from any hook aborts
+  startup, then every `DATA_DIRS` entry is chowned recursively to the resolved uid/gid, skipping paths that already
+  match. The command then execs under `gosu "$APP_USER" "$@"` (the user form, not `uid:gid`, so supplementary groups
+  come from `/etc/group`).
+- `CLAUDE_RUN_DATA_DIR` (`/data`) is deliberately not a member of `DATA_DIRS`: it holds `workdirs/`, a tree of job git
+  clones the runtime user populates itself, which a recursive chown on every boot would walk. It gets its own shallow
+  chown from the `20-data-dir.sh` hook instead: the directory itself, every entry directly under it except `workdirs`
+  (chowned recursively), and the `workdirs` directory entry itself (not its contents).
+
+### 9.2 Image publish trains (`SPEC-9.2`)
+
+The CI image-publish workflow resolves a single publish train from its own trigger (`oci-build/get-tags.nu`), never
+from `git describe`, because a release commit is simultaneously a push to `main` and a `v*` tag push and both workflow
+runs fire:
+
+- `release` train (an exact `v*` tag push): publishes only the immutable `<version>` artifact.
+- `latest` train (a push to `main`): publishes only the rolling `latest` artifact.
+- `dry-run` (a `workflow_dispatch`): builds and prints without mutating the registry; it resolves to the `release` train
+  when given a `--simulate-tag` version to exercise, else to the `latest` train.
+
+The two real trains publish disjoint tag sets, so the branch-push run and the tag-push run of the same release commit
+never write the same registry destination.
+
 ## 10. Non-functional behavior
 
 - Logging: JSON lines through `tracing`. Default filter `info,claude_run=info,sqlx=warn`. Destination is stdout, except
   `mcp stdio` which logs to stderr so stdout carries only protocol frames. `serve --detach` redirects both to
-  `<state dir>/logs/daemon.log`. The first line of `serve` is `Server started` with version and pid.
+  `<state dir>/logs/daemon.log`. The first line of `serve` is `Server started` with version and pid. The container
+  image runs its default command foregrounded (`serve --no-socket`, no `--detach`), so its logs are its stdout, left
+  for the container runtime's own log driver to capture rather than redirected to a file. Two argv pre-scans run
+  before clap parses the real CLI (`mcp stdio` detection for the trace writer, and `--color`): clap colors its own
+  help/usage/error output as part of parsing itself, so the color choice must be known before that call, not read
+  back from its result.
 - Diagnostics: warnings and errors that concern a run or delivery are also stored in `run_events` and shown on `/logs`.
 - Error handling: invalid action YAML, unknown config keys and unsupported database schemes fail with a message naming the
   value. API errors carry a JSON message and a non-2xx status for conflicts, unknown names and unavailable queues.
 - Database connection to PostgreSQL retries for a bounded deadline, then fails naming the host.
-- Concurrency: a global permit cap plus per-action caps; a key gate serializes jobs that share a concurrency key.
+- Concurrency: a global permit cap plus per-action caps, each floored to 1 even when configured as 0; a key gate
+  serializes jobs that share a concurrency key. Changing a cap at runtime (global resize, or an action's
+  `max_parallel` edited on disk) swaps in a new semaphore sized to the new cap, and permits already held continue
+  draining against the old one, so the new size is only exactly enforced once those in-flight jobs finish. No
+  fairness or ordering is guaranteed among jobs waiting on the same key or a saturated cap: a deferred job is simply
+  left queued for the next pickup, and which deferred job wins the key or a permit next is undetermined.
+- Blocking: every synchronous subprocess exec or blocking sleep reached from async code runs through a
+  `block_in_place` wrapper, so a long-running child (`yt`/`fj`/`git`/`claude`/`nu`, or a poll loop) never pins a
+  multi-thread tokio worker or holds a pooled DB connection unpollable for its duration; the wrapper falls through to
+  a direct call under a current-thread runtime (e.g. `#[tokio::test]`), which `block_in_place` would otherwise panic
+  on.
 - Timeouts: per-job `claude` wall clock (default 600 seconds), review session (1800), CI-failure analysis (600).
 - Time rendering: stored UTC timestamps are rendered through the `preferences` timezone, locale and format.

@@ -33,6 +33,11 @@
 //! logged solely by [`ReadinessGate::trip_login_required`] /
 //! [`ReadinessGate::clear_login_required`], guarded so a repeated trip (or a
 //! probe re-confirming an already-tripped state) writes nothing further.
+//!
+//! SPEC-3.7: the three credential sources, checked in priority order
+//! (`.credentials.json` file, then a stored API key, then `ANTHROPIC_API_KEY`),
+//! and the rule that a login-required trip overrides a present-but-expired
+//! credential.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +51,8 @@ use crate::service_auth::ApiKeyHandle;
 pub const NOT_READY_REASON: &str =
     "no Claude credential: sign in at Settings -> Auth (or store an API key) to start running actions";
 
+/// SPEC-3.7: which of the two not-ready axes is active.
+///
 /// Which of the two not-ready axes is active. `no_credential` and
 /// `login_required` are also the exact `/api/status` `not_ready_kind` strings
 /// ([`NotReadyKind::as_str`]).
@@ -107,6 +114,9 @@ impl Readiness {
     }
 }
 
+/// SPEC-3.7: the gate the scheduler, dispatcher, and trigger endpoint consult
+/// before running an agent.
+///
 /// Shared readiness check. Cheap enough (one `stat` plus a lock read) to call
 /// per tick and per dispatch, so there is no cache to go stale: a sign-in
 /// completed in the web UI takes effect on the next tick.
@@ -150,6 +160,9 @@ impl ReadinessGate {
         }
     }
 
+    /// SPEC-3.7: checks the three credential sources in priority order
+    /// (`.credentials.json` file, stored API key, `ANTHROPIC_API_KEY`).
+    ///
     /// Credential-only readiness, ignoring the login-required overlay. This is
     /// what backs the credential axis's once-per-direction log in [`Self::ready`]
     /// so that axis is never disturbed by a login-required trip/clear.
@@ -204,6 +217,9 @@ impl ReadinessGate {
         }
     }
 
+    /// SPEC-3.7: a login-required trip overrides a present-but-expired
+    /// credential.
+    ///
     /// Current readiness, without logging. The login-required axis (an
     /// expired/revoked login observed after a credential was once present)
     /// takes priority: `.credentials.json` stays on disk when a login expires,
@@ -234,6 +250,8 @@ impl ReadinessGate {
         self.credential_readiness()
     }
 
+    /// SPEC-3.7: the scheduler's gating readiness check.
+    ///
     /// Readiness for a scheduling decision, logging each CREDENTIAL-axis
     /// transition once. The login-required axis is logged separately, exactly
     /// once per transition, by [`Self::trip_login_required`] /
@@ -260,6 +278,8 @@ impl ReadinessGate {
         cred.ready && !self.is_login_required()
     }
 
+    /// SPEC-7.4 / SPEC-7.5: read-side check for the login-required axis.
+    ///
     /// Whether the login-required axis is currently tripped, with no logging.
     pub fn is_login_required(&self) -> bool {
         self.login_required
@@ -275,6 +295,8 @@ impl ReadinessGate {
     /// Logs once, at `error`, the first time this trips; a repeated trip (a
     /// second invocation failing, or the probe re-confirming) updates the
     /// message/time silently.
+    /// SPEC-7.4 / SPEC-7.5: write-side primitive that trips the login-required
+    /// axis.
     pub fn trip_login_required(&self, message: impl Into<String>, source: &'static str) {
         let message = message.into();
         let mut guard = self
@@ -300,6 +322,8 @@ impl ReadinessGate {
     /// Clear the login-required state (a brokered sign-in completed, an API key
     /// was saved, or the status probe reported `loggedIn: true`). Logs once, at
     /// `info`, only when the state was actually set.
+    /// SPEC-7.4 / SPEC-7.5: write-side primitive that clears the
+    /// login-required axis.
     pub fn clear_login_required(&self) {
         let mut guard = self
             .login_required
@@ -312,6 +336,9 @@ impl ReadinessGate {
     }
 }
 
+/// SPEC-3.7: the `.credentials.json` file check, the first credential source
+/// in priority order.
+///
 /// Whether a usable credential file sits in `dir`. `exists()` follows symlinks,
 /// so the host install's link to `~/.claude/.credentials.json` counts and a
 /// dangling link correctly does not.
