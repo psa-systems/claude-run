@@ -19,8 +19,8 @@
 //! and the plain shape of `web_accounts` leave room for a role column later
 //! without a further migration.
 //!
-//! SPEC-7.4 (accounts), SPEC-7.5 (TOTP enrollment and recovery codes),
-//! SPEC-7.6 (invites).
+//! SPEC-7.9 (accounts), SPEC-7.10 (TOTP enrollment and recovery codes),
+//! SPEC-7.11 (invites).
 
 use crate::db::DbPool;
 use argon2::password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier};
@@ -113,7 +113,7 @@ pub struct PendingEnrollment {
     pub qr_svg: String,
 }
 
-// SPEC-7.3/SPEC-7.4/SPEC-7.5: the session-signing key, TOTP-enrolled check and
+// SPEC-7.8/SPEC-7.9/SPEC-7.10: the session-signing key, TOTP-enrolled check and
 // argon2id password verification an account is authenticated against.
 impl Account {
     /// The session-cookie signing key.
@@ -169,7 +169,7 @@ fn row_to_account(row: AccountRow) -> Account {
     }
 }
 
-// SPEC-7.4: loads an account, as the gate does to verify a session cookie.
+// SPEC-7.9: loads an account, as the gate does to verify a session cookie.
 /// Load an account by id, or `None` when it does not exist (removed, or never
 /// created).
 pub async fn load_by_id(pool: &DbPool, id: i64) -> Result<Option<Account>> {
@@ -186,7 +186,7 @@ pub async fn load_by_id(pool: &DbPool, id: i64) -> Result<Option<Account>> {
     Ok(row.map(row_to_account))
 }
 
-// SPEC-7.4: loads the account login is attempted against, by username.
+// SPEC-7.9: loads the account login is attempted against, by username.
 /// Load an account by username, case-insensitively.
 pub async fn load_by_username(pool: &DbPool, username: &str) -> Result<Option<Account>> {
     let row: Option<AccountRow> = sqlx::query_as(sqlx::AssertSqlSafe(
@@ -202,7 +202,7 @@ pub async fn load_by_username(pool: &DbPool, username: &str) -> Result<Option<Ac
     Ok(row.map(row_to_account))
 }
 
-// SPEC-7.2/SPEC-7.4: whether the instance is configured, as `/setup` and the
+// SPEC-7.7/SPEC-7.9: whether the instance is configured, as `/setup` and the
 // gate ask it.
 /// Whether any account already exists. Cheaper than loading one, and what the
 /// setup page and the gate ask to decide whether `/setup` is still live.
@@ -215,7 +215,7 @@ pub async fn exists(pool: &DbPool) -> Result<bool> {
     Ok(n > 0)
 }
 
-// SPEC-7.4: the accounts list the accounts page renders.
+// SPEC-7.9: the accounts list the accounts page renders.
 /// List every account for the accounts-management page, newest first.
 pub async fn list(pool: &DbPool) -> Result<Vec<AccountSummary>> {
     let rows: Vec<(i64, String, String, i64, Option<String>)> =
@@ -245,7 +245,7 @@ pub async fn list(pool: &DbPool) -> Result<Vec<AccountSummary>> {
         .collect())
 }
 
-// SPEC-7.2/SPEC-7.4: the account first-run setup creates, refused once any
+// SPEC-7.7/SPEC-7.9: the account first-run setup creates, refused once any
 // account exists.
 /// Create the very first account from `/setup`. Fails when any account
 /// already exists.
@@ -258,7 +258,7 @@ pub async fn create_first(pool: &DbPool, username: &str, password: &str) -> Resu
     create_account(pool, username, password, None).await
 }
 
-// SPEC-7.6: the account an accepted invite creates.
+// SPEC-7.11: the account an accepted invite creates.
 /// Create an account from an accepted invite, attributing it to `created_by`.
 pub async fn create_invited(
     pool: &DbPool,
@@ -269,7 +269,7 @@ pub async fn create_invited(
     create_account(pool, username, password, Some(created_by)).await
 }
 
-// SPEC-7.4: creates the account row, refusing a duplicate username.
+// SPEC-7.9: creates the account row, refusing a duplicate username.
 async fn create_account(
     pool: &DbPool,
     username: &str,
@@ -316,7 +316,7 @@ async fn create_account(
     })
 }
 
-// SPEC-7.4: account removal, refusing the last account or self-removal.
+// SPEC-7.9: account removal, refusing the last account or self-removal.
 /// Remove an account. Refused when it is the last remaining account, or when
 /// `actor_id` is removing themselves: both must be visible refusals, not a
 /// silent no-op.
@@ -363,7 +363,7 @@ pub async fn remove(pool: &DbPool, actor_id: i64, target_id: i64) -> Result<()> 
     Ok(())
 }
 
-// SPEC-7.3/SPEC-7.4: a password change rotates the session key, which is what
+// SPEC-7.8/SPEC-7.9: a password change rotates the session key, which is what
 // signs out every existing session for the account.
 /// Replace the password (and rotate the session key with it, signing out every
 /// browser for this account).
@@ -392,7 +392,7 @@ pub async fn set_password(pool: &DbPool, id: i64, password: &str) -> Result<Acco
     })
 }
 
-// SPEC-7.4: the username/password rules setup and invite-accept enforce.
+// SPEC-7.9: the username/password rules setup and invite-accept enforce.
 /// Reject the credentials the setup and invite-accept forms must not accept.
 /// Returned as an error the page renders verbatim, so the operator is told
 /// which rule they broke.
@@ -439,7 +439,7 @@ fn decode_stored_secret(key: &SecretsKey, ciphertext: &[u8]) -> Result<Secret> {
         .map_err(|e| Error::Secret(format!("the stored TOTP secret is not valid base32: {e:?}")))
 }
 
-// SPEC-7.5: generates and stores the pending (unenrolled) TOTP secret and its
+// SPEC-7.10: generates and stores the pending (unenrolled) TOTP secret and its
 // QR code; `build_totp`/`decode_stored_secret` are its shared helpers.
 /// Begin (or restart) TOTP enrollment for `id`: generate a fresh secret, store
 /// it encrypted but NOT yet enrolled, and return the `otpauth://` URI plus its
@@ -477,7 +477,7 @@ pub async fn begin_totp_enrollment(
     })
 }
 
-// SPEC-7.5: confirming enrollment marks the account enrolled and mints its
+// SPEC-7.10: confirming enrollment marks the account enrolled and mints its
 // one-time recovery codes.
 /// Confirm a pending enrollment for `id` with a valid current code. On
 /// success, marks the account enrolled and mints the one-time set of recovery
@@ -542,7 +542,7 @@ pub async fn confirm_totp_enrollment(
     Ok(codes)
 }
 
-// SPEC-7.5: verifies a login-time TOTP or recovery code, refusing a replayed
+// SPEC-7.10: verifies a login-time TOTP or recovery code, refusing a replayed
 // TOTP step; `try_consume_recovery_code` is its recovery-code path.
 /// Verify a login-time code for `account`: either the current/adjacent-window
 /// TOTP code, or an unused recovery code (consumed on success). Replay of the
@@ -622,7 +622,7 @@ async fn try_consume_recovery_code(pool: &DbPool, account_id: i64, code: &str) -
     Ok(false)
 }
 
-// SPEC-7.5: mints the one-time recovery codes issued at enrollment
+// SPEC-7.10: mints the one-time recovery codes issued at enrollment
 // confirmation.
 fn generate_recovery_codes() -> Result<Vec<String>> {
     let mut codes = Vec::with_capacity(RECOVERY_CODE_COUNT);
@@ -636,7 +636,7 @@ fn generate_recovery_codes() -> Result<Vec<String>> {
     Ok(codes)
 }
 
-// SPEC-7.5: renders the enrollment QR code; `render_qr_svg` is its drawing
+// SPEC-7.10: renders the enrollment QR code; `render_qr_svg` is its drawing
 // helper.
 /// Render `text` (an `otpauth://` URI) as an inline SVG QR code, with no XML
 /// prologue, ready to embed directly in a template.
@@ -666,7 +666,7 @@ fn render_qr_svg(qr: &qrcodegen::QrCode) -> String {
     )
 }
 
-// SPEC-7.3/SPEC-7.5: `access reset-2fa` clears enrollment and recovery codes
+// SPEC-7.8/SPEC-7.10: `access reset-2fa` clears enrollment and recovery codes
 // and rotates the session key.
 /// Clear TOTP enrollment and every recovery code for `id`, forcing
 /// re-enrollment at the next login. Rotates the session key too, so an
@@ -708,7 +708,7 @@ pub async fn reset_totp(pool: &DbPool, id: i64) -> Result<Account> {
     })
 }
 
-// SPEC-7.6: mints a single-use invite with a 72-hour expiry, storing only its
+// SPEC-7.11: mints a single-use invite with a 72-hour expiry, storing only its
 // hash.
 /// Mint a new single-use invite created by `created_by`, returning the plain
 /// token (shown to the inviter exactly once) and the row id. Only the hash of
@@ -740,7 +740,7 @@ pub async fn create_invite(
     Ok((token, id))
 }
 
-// SPEC-7.6: the outstanding invites list the accounts page renders.
+// SPEC-7.11: the outstanding invites list the accounts page renders.
 /// List outstanding (unused, unexpired) invites for the management page.
 pub async fn list_invites(pool: &DbPool) -> Result<Vec<InviteSummary>> {
     let now = chrono::Utc::now().to_rfc3339();
@@ -771,7 +771,7 @@ pub async fn list_invites(pool: &DbPool) -> Result<Vec<InviteSummary>> {
         .collect())
 }
 
-// SPEC-7.6: revokes an unused invite.
+// SPEC-7.11: revokes an unused invite.
 /// Revoke an unused invite by id. A no-op (not an error) when it is already
 /// used or gone, since the caller's intent (this invite must not work) is
 /// already satisfied.
@@ -789,7 +789,7 @@ pub async fn revoke_invite(pool: &DbPool, id: i64) -> Result<()> {
     Ok(())
 }
 
-// SPEC-7.6: resolves an invite link to a live invite, or none.
+// SPEC-7.11: resolves an invite link to a live invite, or none.
 /// Look up a live (unused, unexpired) invite by its plaintext token, checking
 /// the hash of every candidate row rather than looking it up by a derived key,
 /// since the hash is a salted argon2id PHC string, not a lookup index.
@@ -826,7 +826,7 @@ pub async fn find_live_invite_by_token(pool: &DbPool, token: &str) -> Result<Opt
     Ok(None)
 }
 
-// SPEC-7.4/SPEC-7.6: creates the account and marks the invite used atomically.
+// SPEC-7.9/SPEC-7.11: creates the account and marks the invite used atomically.
 /// Accept `invite`: create the account and mark the invite used in one
 /// transaction, so a race between two acceptances of the same token can only
 /// ever create one account.
