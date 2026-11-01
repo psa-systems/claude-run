@@ -21,6 +21,9 @@
 //! [`crate::claude`]) holds per-turn context under that window, so cumulative
 //! spend grows linearly. `context_per_tool_call` is that ratio, and it is what
 //! the per-run record makes comparable across runs.
+//!
+//! SPEC-3.2.2 (the per-run spend ceiling) and SPEC-3.2.7 (usage, cost and
+//! rate-limit accounting) are both implemented here.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
@@ -93,6 +96,10 @@ pub struct ToolUsage {
 }
 
 /// What one `claude` invocation spent, recovered from its stream log.
+///
+/// SPEC-3.2.7: "tokens, tool-call counts and context growth per tool" and
+/// "the last-seen Claude plan rate-limit reading ... plus a count of
+/// `api_retry` events per reason."
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct StreamUsage {
     /// Billed assistant turns seen in the log.
@@ -118,6 +125,8 @@ pub struct StreamUsage {
 /// `rate_limit_event` stream events. Every field is `Option`: an absent field
 /// means the event did not carry it, and must never be read as zero or
 /// "allowed" by default.
+/// SPEC-3.2.7: "every rate-limit field stays absent rather than defaulting
+/// to zero when the CLI reported none."
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct RateLimitSnapshot {
     pub status: Option<String>,
@@ -216,6 +225,10 @@ impl StreamUsage {
 /// context. Turns before any tool result land in [`NO_TOOL`]. An unreadable or
 /// absent log yields an empty [`StreamUsage`]; usage accounting must never turn
 /// a completed run into a failed one.
+///
+/// SPEC-3.2.7: "each invocation's stream log is replayed once to attribute
+/// tokens, tool-call counts and context growth per tool (a turn is
+/// attributed to the tool whose result most recently entered its context)."
 pub fn parse_stream_usage(stream_log: &Path) -> StreamUsage {
     let file = match std::fs::File::open(stream_log) {
         Ok(f) => f,
@@ -348,6 +361,10 @@ fn parse_rate_limit_event(event: &Value) -> RateLimitSnapshot {
 }
 
 /// A run's spend ceiling, frozen before the run starts.
+///
+/// SPEC-3.2.2: "the ledger's ceiling is resolved once, before the run
+/// starts, and is immutable for the run's lifetime: no job can raise it
+/// mid-run."
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RunBudget {
     /// Dollars this ONE run may spend. Reached or exceeded, the run stops.
@@ -464,6 +481,11 @@ impl RunSpend {
 
     /// Fold one completed invocation into the run's ledger and report where the
     /// run now stands against its ceiling.
+    ///
+    /// SPEC-3.2.2: "each invocation's reported cost is folded into the run's
+    /// shared ledger before any other branch can discard the result,
+    /// including a cancelled invocation, so a cancelled run still bills what
+    /// it actually spent."
     pub fn record(&self, result: &ClaudeResult) -> Verdict {
         let (verdict, cost, warn_once) = {
             let mut inner = self.lock();
@@ -508,6 +530,10 @@ impl RunSpend {
     /// (OK / PAUSED / CANCELLED); an over-budget stop only overrides a run that
     /// would otherwise have finished cleanly, so a cancel still reads as a
     /// cancel.
+    ///
+    /// SPEC-3.2.2: "the run stops" once the ceiling is reached; this is
+    /// where that exit is surfaced, without overriding an already-non-OK
+    /// base outcome.
     pub fn exit_code(&self, base: i32) -> i32 {
         if base == crate::exit::OK && self.exceeded() {
             crate::exit::OVER_BUDGET
@@ -522,6 +548,11 @@ impl RunSpend {
 
     /// Emit the end-of-run summary and append the machine-readable record.
     /// Idempotent: a driver that finishes twice reports once.
+    ///
+    /// SPEC-3.2: "each run appends one JSON record ... and each invocation
+    /// is recorded in `claude_invocations`" (closing sentence); see also
+    /// SPEC-3.2.7 for the per-tool and rate-limit figures this record
+    /// carries, and [`record_invocation`] for the per-invocation half.
     pub fn finish(&self, run_id: Option<i64>, exit_code: i32) {
         let (usage, calls, cost) = {
             let mut inner = self.lock();
@@ -630,6 +661,10 @@ fn append_record(path: &Path, record: &Value) {
 /// failure is logged at `error` and swallowed: the invocation already
 /// happened and its own outcome must not be lost because the usage record
 /// could not be saved.
+///
+/// SPEC-3.2.7: "each invocation is also persisted to `claude_invocations`
+/// ... immediately after it returns, independent of the outcome ... a
+/// persistence failure is logged and never fails the job."
 pub async fn record_invocation(
     pool: &DbPool,
     action: &str,
