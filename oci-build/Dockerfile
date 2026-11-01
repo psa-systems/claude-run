@@ -1,6 +1,8 @@
-# Build a static `claude-run` binary against the musl rust-builder image and
-# assemble a self-contained runtime image around it. The image is the only
-# supported distribution; no standalone binary is published.
+# SPEC-9: "multi-stage. The builder compiles a static musl binary with a
+# locked dependency build." Build a static `claude-run` binary against the
+# musl rust-builder image and assemble a self-contained runtime image around
+# it. The image is the only supported distribution; no standalone binary is
+# published.
 #
 # The `runtime` stage (CLAUDE-37) exists so the daemon, and every `claude`
 # child it spawns, runs inside a container with a clean `$HOME`. The container
@@ -60,8 +62,8 @@ COPY assets ./assets
 COPY deploy ./deploy
 COPY build.rs ./
 
-# Bake build metadata into the binary. build.rs reads these env vars; the
-# workflow passes the real values via --build-arg (CLAUDE-2).
+# SPEC-2.1: the `CLAUDE_RUN_GIT_SHA` / `CLAUDE_RUN_BUILD_DATE` build.rs reads;
+# the workflow passes the real values via --build-arg (CLAUDE-2).
 ARG GIT_SHA=unknown
 ARG BUILD_DATE=unknown
 ENV CLAUDE_RUN_GIT_SHA=${GIT_SHA}
@@ -72,12 +74,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --release --locked
 
-# Runtime stage (CLAUDE-37, rebased onto opensuse-dev in CLAUDE-287): the daemon
-# plus its full runtime toolchain in one image. The base carries the whole
-# toolchain already (nu, claude, yt, fj, gh, just, kingfisher, docker, git,
-# coreutils, cargo/rustc), so this stage only creates the runtime user, copies
-# the binary and shipped config, and smoke-checks the tools it did not install.
-# Moving a tool means bumping the base image tag, not editing a RUN block here.
+# SPEC-9: "The runtime stage is a Linux image carrying `claude`, `yt`, `fj`,
+# `gh`, `nu`, `just`, Docker CLI, git and Rust tooling, plus `gosu` and
+# `catatonit`." (CLAUDE-37, rebased onto opensuse-dev in CLAUDE-287). The base
+# carries the whole toolchain already (nu, claude, yt, fj, gh, just,
+# kingfisher, docker, git, coreutils, cargo/rustc), so this stage only creates
+# the runtime user, copies the binary and shipped config, and smoke-checks the
+# tools it did not install. Moving a tool means bumping the base image tag,
+# not editing a RUN block here.
 #
 # CLAUDE-287: the base also carries Docker, so `claude` sessions the daemon
 # spawns can run `docker`, `docker compose` and `docker buildx` against the
@@ -99,8 +103,9 @@ FROM dev.a8n.run/pandoras-box/opensuse-dev:v1.14.0-leap-16.0 AS runtime
 
 USER root
 
-# Smoke-check the toolchain the base image is expected to carry. A base that
-# loses a tool fails the image build here instead of the first job.
+# SPEC-9: "smoke-checks the base image's toolchain at build time ... a base
+# image that lost a tool fails the image build there instead of ... the first
+# job that needs it."
 RUN nu --version \
     && claude --version \
     && yt --version \
@@ -119,10 +124,11 @@ RUN nu --version \
     && usermod --help >/dev/null \
     && groupmod --help >/dev/null
 
-# gosu (CLAUDE-443): Leap has no `gosu` package, so install the upstream
-# release binary and verify it against the checksums published in that
-# release's SHA256SUMS. `setpriv` stays installed by the base (nothing else
-# in this image uses it; it is simply not removed).
+# SPEC-9: "`gosu` has no openSUSE Leap package: the runtime stage downloads
+# the upstream per-architecture release binary and verifies it against that
+# release's published SHA256SUMS before installing it." (CLAUDE-443). `setpriv`
+# stays installed by the base (nothing else in this image uses it; it is
+# simply not removed).
 ARG GOSU_VERSION=1.19
 ARG TARGETARCH
 RUN set -eu; \
@@ -137,33 +143,39 @@ RUN set -eu; \
     gosu --version; \
     gosu nobody true
 
-# claude-run itself, from the builder stage above.
+# SPEC-9: "this stage only creates the runtime user, copies the binary and
+# shipped config." The `claude-run` binary itself, from the builder stage
+# above.
 COPY --from=builder /build/target/release/claude-run /usr/local/bin/claude-run
 
-# CLAUDE-247: the shipped action YAML, baked read-only. The entrypoint seeds it
-# into the config volume the first time that volume has no actions, so a fresh
-# container starts with the actions this repo ships instead of an empty dir (the
-# `./actions` bind that used to supply them is gone with the host mounts). It
-# never overwrites afterwards, so edits made in the web UI survive an image
-# upgrade; a changed shipped action reaches an existing deployment through that
-# same editor.
+# SPEC-9: "Entrypoint hooks seed `config.toml` and the shipped action files
+# into an empty config volume." (CLAUDE-247). Baked read-only here; the
+# entrypoint seeds it into the config volume the first time that volume has no
+# actions, so a fresh container starts with the actions this repo ships
+# instead of an empty dir (the `./actions` bind that used to supply them is
+# gone with the host mounts). It never overwrites afterwards, so edits made in
+# the web UI survive an image upgrade; a changed shipped action reaches an
+# existing deployment through that same editor.
 COPY actions/*.yml /usr/share/claude-run/actions/
 
-# Bootstrap config seeded the same way, and for the same reason the actions are:
-# the container binds 0.0.0.0 because a loopback bind is reachable from nothing
-# outside the container, and the operator owns the file once it lands on the
-# volume.
+# SPEC-9: "Seeded container config binds the web UI to `0.0.0.0:7321`."
+# Bootstrap config seeded the same way, and for the same reason the actions
+# are: the container binds 0.0.0.0 because a loopback bind is reachable from
+# nothing outside the container, and the operator owns the file once it lands
+# on the volume.
 COPY deploy/container-config.toml /usr/share/claude-run/config.toml
 
-# Runtime user (CLAUDE-443): uid/gid 1001, the id every first-party image's
-# gosu-entrypoint.sh falls back to when PUID/PGID are unset and the first data
-# dir has no owner to adopt. Home directory path kept at /home/claudebot
-# (CLAUDE-287's name) even though the user is now `appuser`, so ENV HOME below
-# and every store under it keep their paths. $HOME is deliberately NOT where
-# anything persists (CLAUDE-253): it is scratch, and every store the operator
-# cares about lives under the three volumes below.
+# SPEC-9 / SPEC-9.1: "The image starts as root and drops to uid/gid 1001
+# through the entrypoint" ... "else 1001/1001" is the default `PUID`/`PGID`
+# resolution gosu-entrypoint.sh falls back to when unset and the first data
+# dir has no non-root owner to adopt (CLAUDE-443). Home directory path kept at
+# /home/claudebot (CLAUDE-287's name) even though the user is now `appuser`,
+# so ENV HOME below and every store under it keep their paths. $HOME is
+# deliberately NOT where anything persists (CLAUDE-253): it is scratch, and
+# every store the operator cares about lives under the three volumes below.
 RUN groupadd --gid 1001 appuser \
     && useradd --uid 1001 --gid 1001 --create-home --home-dir /home/claudebot appuser
+# SPEC-9: "The agent's `CLAUDE.md` is baked from `deploy/bot-CLAUDE.md`."
 COPY deploy/bot-CLAUDE.md /home/claudebot/.claude/CLAUDE.md
 
 # CLAUDE-253: three flat mounts instead of seven XDG paths under a home
@@ -184,11 +196,15 @@ COPY deploy/bot-CLAUDE.md /home/claudebot/.claude/CLAUDE.md
 # GIT_CONFIG_GLOBAL. Outside the container (tests, local development) none of
 # these variables is set and XDG defaults apply.
 #
-# CLAUDE_CONFIG_DIR names the SAME directory the daemon seeds and points its
-# agent children at (`<config dir>/claude-agent-home`, CLAUDE-165), so an
-# operator running `claude auth login` through `docker compose exec` writes the
-# credential exactly where the agent reads it. Two Claude config dirs is the
-# failure this avoids: a login that reports success and leaves the runner still
+# SPEC-9: "Image environment: `CLAUDE_RUN_CONFIG_DIR=/config`,
+# `CLAUDE_RUN_DATA_DIR=/data`, `CLAUDE_RUN_STATE_DIR=/state`,
+# `CLAUDE_RUN_RUNTIME_DIR=/run/claude-run`,
+# `CLAUDE_CONFIG_DIR=/config/claude-agent-home`." CLAUDE_CONFIG_DIR names the
+# SAME directory the daemon seeds and points its agent children at
+# (`<config dir>/claude-agent-home`, CLAUDE-165), so an operator running
+# `claude auth login` through `docker compose exec` writes the credential
+# exactly where the agent reads it. Two Claude config dirs is the failure this
+# avoids: a login that reports success and leaves the runner still
 # unauthenticated.
 ENV CLAUDE_RUN_CONFIG_DIR=/config \
     CLAUDE_RUN_DATA_DIR=/data \
@@ -203,7 +219,8 @@ RUN mkdir -p /config/actions /config/claude-agent-home /config/git /config/youtr
     && chown -R appuser:appuser /config /data /state /run/claude-run \
     && chown -R appuser:appuser /home/claudebot
 
-# CLAUDE-443: gosu-entrypoint.sh's PUID/PGID remap and chown apply only to
+# SPEC-9.1: "`CLAUDE_RUN_DATA_DIR` (`/data`) is deliberately not a member of
+# `DATA_DIRS`." gosu-entrypoint.sh's PUID/PGID remap and chown apply only to
 # these three (config, state, runtime dir, in that order); /data is excluded
 # because it holds workdirs/, a tree of job git clones the runtime user made
 # itself, which a recursive chown every boot would walk (handled instead by
@@ -218,29 +235,37 @@ ENV APP_USER=appuser \
 ENV HOME=/home/claudebot
 WORKDIR /home/claudebot
 
-# CLAUDE-443: the shared, byte-identical entrypoint (CONTAINER_UID_GID.md).
-# The image-specific root steps that used to live in entrypoint.sh (config
-# seeding, the data-dir chown) now run as hooks under /etc/entrypoint.d/.
+# SPEC-9.1: "the shared, byte-identical entrypoint; image-specific root steps
+# run as hooks under `/etc/entrypoint.d/` instead of being added to this
+# file." (CLAUDE-443, CONTAINER_UID_GID.md). The image-specific root steps
+# that used to live in entrypoint.sh (config seeding, the data-dir chown) now
+# run as hooks under /etc/entrypoint.d/.
 COPY oci-build/gosu-entrypoint.sh /usr/local/bin/gosu-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/gosu-entrypoint.sh
 COPY oci-build/entrypoint.d/ /etc/entrypoint.d/
 RUN chmod 0755 /etc/entrypoint.d/*.sh
 
-# The container starts as root so gosu-entrypoint.sh can run the hooks above
-# and chown the mounted volumes, then drops to appuser with gosu. A compose
-# `user:` pin disables the remap and chown; see gosu-entrypoint.sh for what it
-# requires instead (every DATA_DIRS entry already writable).
+# SPEC-9.1: "Started as root ... every `DATA_DIRS` entry is chowned
+# recursively to the resolved uid/gid" and "started as a non-root user ...
+# the remap, hooks and chown ... are all skipped." The container starts as
+# root so gosu-entrypoint.sh can run the hooks above and chown the mounted
+# volumes, then drops to appuser with gosu. A compose `user:` pin disables the
+# remap and chown; see gosu-entrypoint.sh for what it requires instead (every
+# DATA_DIRS entry already writable).
 #
 # catatonit is PID 1 so orphaned processes an agent session leaves behind are
 # reaped instead of accumulating as zombies for the life of the container
 # (CLAUDE-310); it execs gosu-entrypoint.sh as its only child and forwards
 # signals.
 #
-# Foreground daemon (no --detach), and no unix-socket API. That socket is the
-# CLI's control plane; this image has no CLI operator (the web
-# UI and its /api routes are the whole interface), so binding it would only leave
-# an unauthenticated second copy of the control plane inside the container,
-# reachable by the agent the daemon spawns. Override the command to `serve` if a
-# deployment really does want it.
+# SPEC-9: "Entrypoint: `catatonit -- gosu-entrypoint.sh claude-run`, default
+# command `serve --no-socket`." SPEC-10: "The container image runs its default
+# command foregrounded (`serve --no-socket`, no `--detach`), so its logs are
+# its stdout." No unix-socket API either: that socket is the CLI's control
+# plane; this image has no CLI operator (the web UI and its /api routes are
+# the whole interface), so binding it would only leave an unauthenticated
+# second copy of the control plane inside the container, reachable by the
+# agent the daemon spawns. Override the command to `serve` if a deployment
+# really does want it.
 ENTRYPOINT ["/usr/bin/catatonit", "--", "/usr/local/bin/gosu-entrypoint.sh", "/usr/local/bin/claude-run"]
 CMD ["serve", "--no-socket"]

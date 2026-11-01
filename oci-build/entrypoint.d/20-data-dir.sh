@@ -1,8 +1,12 @@
 #!/bin/sh
-# Root hook, run by gosu-entrypoint.sh before the chown. CLAUDE_RUN_DATA_DIR
-# is not in DATA_DIRS (it holds workdirs/, a tree of job git clones the
-# runtime user created itself, which a recursive chown every boot would walk),
-# so it gets its own shallow chown here instead of the generic DATA_DIRS loop.
+# SPEC-9.1: "It gets its own shallow chown from the `20-data-dir.sh` hook
+# instead: the directory itself, every entry directly under it except
+# `workdirs` (chowned recursively), and the `workdirs` directory entry itself
+# (not its contents)." Root hook, run by gosu-entrypoint.sh before the chown.
+# CLAUDE_RUN_DATA_DIR is not in DATA_DIRS (it holds workdirs/, a tree of job
+# git clones the runtime user created itself, which a recursive chown every
+# boot would walk), so it gets its own shallow chown here instead of the
+# generic DATA_DIRS loop.
 set -eu
 
 if [ -d "${CLAUDE_RUN_DATA_DIR:-}" ]; then

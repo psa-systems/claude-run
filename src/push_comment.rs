@@ -1,12 +1,12 @@
-//! The PR comment posted after every runner push or branch update to a PR
-//! branch (CLAUDE-447), so the PR's own timeline explains how the branch
+//! SPEC-8.8: the PR comment posted after every runner push or branch update to
+//! a PR branch (CLAUDE-447), so the PR's own timeline explains how the branch
 //! reached its current state, not just the title/body `refresh_pr_text`
 //! rewrites on a resumed run.
 //!
-//! The body reuses the CLAUDE-446 run footer ([`crate::run_footer`]). A
-//! failed [`crate::provider::Forge::pr_comment`] call never fails, retries,
+//! The body reuses the CLAUDE-446 run footer ([`crate::run_footer`], SPEC-3.9).
+//! A failed [`crate::provider::Forge::pr_comment`] call never fails, retries,
 //! or rolls back the push it is reporting on (writes are never retried,
-//! CLAUDE-366): [`post`] logs it at `error` and returns a human-readable
+//! SPEC-8.4): [`post`] logs it at `error` and returns a human-readable
 //! cause for the caller to fold into its own run outcome comment, naming the
 //! event (`PR comment for <event> failed: <cause>`).
 
@@ -14,12 +14,11 @@ use std::path::Path;
 
 use crate::provider::Forge;
 
-/// The cap on commit subjects listed in a push comment body (proposed
-/// approach step 1): beyond this, the remaining count is named instead of
-/// listed.
+/// SPEC-8.8: the cap on commit subjects listed in a push comment body;
+/// beyond this, the remaining count is named instead of listed.
 pub const MAX_COMMIT_LINES: usize = 20;
 
-/// Which runner-owned write to a PR branch this comment reports on
+/// SPEC-8.8: which runner-owned write to a PR branch this comment reports on
 /// (CLAUDE-447's enumerated table, plus CLAUDE-448's `CheckpointPush`: one of
 /// the periodic WIP pushes a checkpoint watcher makes while the agent is
 /// still running, hooks disabled, CLAUDE-448 step 1/2).
@@ -104,8 +103,8 @@ pub struct PushCommentContext<'a> {
     pub started: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Render the push comment body (event, issue key, PR state, commit range,
-/// capped commit subjects, then the CLAUDE-446 run footer).
+/// SPEC-8.8: render the push comment body (event, issue key, PR state, commit
+/// range, capped commit subjects, then the SPEC-3.9 run footer).
 pub fn build_body(ctx: &PushCommentContext<'_>) -> String {
     let state = if ctx.draft { "draft" } else { "ready" };
     let old = ctx.old_sha.map(short).unwrap_or("none");
@@ -119,8 +118,8 @@ pub fn build_body(ctx: &PushCommentContext<'_>) -> String {
     crate::run_footer::append_run(&body, ctx.public_url, ctx.run_id, ctx.started)
 }
 
-/// Post the push comment through `forge.pr_comment`, body written to a
-/// scratch file under `scratch_dir` (the caller's choice of
+/// SPEC-8.8: post the push comment through `forge.pr_comment`, body written to
+/// a scratch file under `scratch_dir` (the caller's choice of
 /// [`crate::provider::cli::CliBackend::git_dir_scratch`]-style git-directory
 /// scratch, or a temp directory when no workdir exists) and removed
 /// afterward. Returns `None` on success, or the failure line the caller
