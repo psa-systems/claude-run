@@ -1333,7 +1333,7 @@ pub struct DaemonConfig {
 /// Precedence decision for the post-config-load log-filter swap,
 /// extracted as a pure function so the `CLAUDE_RUN_LOG` > `[daemon].log_filter`
 /// > default ordering is unit-testable without a live tracing subscriber.
-/// SPEC-6.1, SPEC-6.2.
+/// > SPEC-6.1, SPEC-6.2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogFilterChoice {
     /// `CLAUDE_RUN_LOG` is set; it already seeded the initial filter and wins.

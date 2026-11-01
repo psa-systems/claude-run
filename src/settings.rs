@@ -827,7 +827,7 @@ impl LiveSettings {
 
     /// Validate `json` against the section's struct, persist it, and apply it
     /// live. On an invalid payload nothing is persisted and the serde error is
-    /// returned in [`SaveError::Invalid`].
+    /// returned in [`SaveError::Invalid`]. SPEC-6.3, SPEC-6.4.
     pub async fn save_section(
         &self,
         section: Section,
@@ -940,7 +940,7 @@ impl LiveSettings {
 /// Read the shared [`ClaudeConfig`] handle, recovering the value a
 /// panicking writer poisoned rather than propagating the panic: a stale-but-real
 /// default is better than killing the run that is reading it. The poisoning is
-/// logged so the panic that caused it is never silent.
+/// logged so the panic that caused it is never silent. SPEC-6.4.
 pub fn read_claude(handle: &ClaudeConfigHandle) -> std::sync::RwLockReadGuard<'_, ClaudeConfig> {
     handle.read().unwrap_or_else(|poisoned| {
         tracing::error!("claude settings lock poisoned; reading the last stored value");
