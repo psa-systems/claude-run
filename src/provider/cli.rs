@@ -1,4 +1,4 @@
-//! CLI backend: implements [`IssueTracker`] + [`Forge`] over the host `yt` /
+//! SPEC-8.2: CLI backend: implements [`IssueTracker`] + [`Forge`] over the host `yt` /
 //! `fj` binaries, parsing their `--json` output and mapping failures to typed
 //! errors. No raw REST.
 //!
@@ -30,6 +30,7 @@ struct PrSearchResponse {
 /// 5s, for a worst-case added delay of 7s across four attempts total. Shared
 /// by every binary-neutral read-retry caller (`fj` and `gh` reads alike) so
 /// there is one copy of the schedule.
+/// SPEC-8.4: read-only CLI retry schedule, shared by `fj` and `gh` reads.
 pub(crate) const DEFAULT_READ_RETRY_WAITS: [Duration; 3] = [
     Duration::from_secs(0),
     Duration::from_secs(2),
@@ -56,7 +57,7 @@ fn stderr_tail(stderr: &str) -> &str {
         .unwrap_or("no stderr")
 }
 
-/// Run a read-only CLI invocation with up to four attempts total, waiting
+/// SPEC-8.4: run a read-only CLI invocation with up to four attempts total, waiting
 /// `waits[0]` / `waits[1]` / `waits[2]` before attempts 2, 3 and 4 (CLAUDE-366,
 /// generalized beyond `fj` in CLAUDE-407). A failed attempt is a runner
 /// `Ok(out)` with `!out.ok`: any non-zero exit is retried on the exit code
@@ -314,6 +315,7 @@ fn accepts_continuation(line: &str) -> bool {
 /// ending in a hard break (two or more trailing spaces, or a backslash) is
 /// never joined to by the line after it. Infallible, introduces no new error
 /// path.
+/// SPEC-8.7: rejoin a hard-wrapped PR body back to one line per paragraph.
 fn unwrap_prose(body: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut in_fence = false;
@@ -853,6 +855,7 @@ impl CliBackend {
     /// outcome, because `cleanup_or_preserve` makes the keep-or-delete
     /// decision later, from its own check of the workdir, and can legitimately
     /// delete the directory.
+    /// SPEC-8.7: validates the tip subject before any push or PR-create call.
     fn create_pr_branch(
         &self,
         workdir: &Path,
@@ -981,6 +984,8 @@ impl CliBackend {
     /// if any, is recorded on `pr` rather than propagated: a failed comment
     /// must never fail, retry, or roll back the push it reports on
     /// (CLAUDE-366).
+    /// SPEC-8.8: the shared push-comment call every runner write to a PR
+    /// branch makes.
     #[allow(clippy::too_many_arguments)]
     fn post_branch_push_comment(
         &self,
@@ -1220,6 +1225,7 @@ impl CliBackend {
     /// create succeeds without forcing it, and a rejected update (which can
     /// only happen on a later call reusing the same workdir) is a real signal
     /// worth surfacing rather than overwriting.
+    /// SPEC-8.5: a retried, per-invocation-authenticated git network call.
     fn fetch_branch(&self, workdir: &Path, branch: &str, token_url: Option<&str>) -> Result<()> {
         let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
         let args = ["fetch", "origin", refspec.as_str()];
@@ -1340,6 +1346,7 @@ impl CliBackend {
     /// `HEAD`, so the server branch carries the feature name regardless of the
     /// current checkout. Never forced: a rejected non-fast-forward push is a
     /// real-divergence signal the caller has already ruled out before calling.
+    /// SPEC-8.5: a retried, per-invocation-authenticated git network call.
     fn push_branch(&self, workdir: &Path, branch: &str, token_url: Option<&str>) -> Result<()> {
         let refspec = format!("{branch}:{branch}");
         let push_args = ["push", "--set-upstream", "origin", refspec.as_str()];
@@ -1418,6 +1425,8 @@ impl CliBackend {
     /// none" with a warn plus an operator-visible notice. The degraded path can
     /// race a PR that already exists, so a create rejected as already-existing
     /// retries the lookup exactly once and adopts what it finds.
+    /// SPEC-8.10: adopt an open PR when the lookup resolves one, degrade to
+    /// create on a failed lookup, and retry the lookup once on "already exists".
     fn find_or_create_pr(
         &self,
         workdir: &Path,
@@ -1560,6 +1569,8 @@ impl CliBackend {
     /// branch ahead of base. Without that guard a run with no commits still
     /// succeeded here (`-aA` pushes the base tip and autofills from an unrelated
     /// commit), and the issue was moved to `AI Agent = Code Review`.
+    /// SPEC-8.7: validates the tip subject before AGit pushes anything;
+    /// SPEC-8.8: posts the push comment on success.
     fn create_pr_agit(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
         // The subject guard (CLAUDE-398) runs before `fj` pushes anything.
         let subject = self.tip_subject(workdir, "HEAD")?;
@@ -1606,6 +1617,7 @@ impl CliBackend {
     /// Probe that both CLIs are invokable (`<bin> --version`). Used by the
     /// factory to decide whether this backend is usable. A missing binary
     /// surfaces as [`Error::CliNotFound`].
+    /// SPEC-8.2: the probe [`super::resolve`] uses to decide this backend is usable.
     pub fn probe(&self) -> Result<()> {
         self.runner.run(&self.yt, &["--version"])?;
         self.runner.run(&self.fj, &["--version"])?;
@@ -1783,7 +1795,7 @@ impl CliBackend {
         Self::checked_redacting(binary, out, args, &[])
     }
 
-    /// [`Self::checked`] for a call that ran with credentials: `secrets` are
+    /// SPEC-8.6: [`Self::checked`] for a call that ran with credentials: `secrets` are
     /// masked out of the failure text. A failure carries the tail of stdout after
     /// stderr (CLAUDE-422), because a `pre-push` hook writes its test report there.
     fn checked_redacting(
@@ -2118,6 +2130,7 @@ impl Forge for CliBackend {
     /// checkpointing for the rest of the run. This also means the default
     /// branch itself is never a push target: `resolve_feature_branch` only
     /// ever resolves to a branch strictly ahead of it.
+    /// SPEC-8.8: posts the push comment after the checkpoint push lands.
     fn checkpoint_push(
         &self,
         workdir: &Path,
@@ -2205,6 +2218,7 @@ impl Forge for CliBackend {
     /// `fj pr edit <id> title` then `fj pr edit <id> body` (CLAUDE-398,
     /// CLAUDE-456: `fj` has no `--title`/`--body-file` flags on `pr edit`).
     /// A failed body edit after a successful title edit names the body step.
+    /// SPEC-8.7: re-derives title/body from the branch's current tip.
     fn refresh_pr_text(
         &self,
         workdir: &Path,
@@ -2256,7 +2270,7 @@ impl Forge for CliBackend {
         self.notices.lock().unwrap().push(message);
     }
 
-    /// Two probes, one per scope category the PR path
+    /// SPEC-8.9: two probes, one per scope category the PR path
     /// crosses (`actions/SCHEMA.md`, "Forgejo token scopes").
     ///
     /// 1. `fj --host <host> repo view <owner/repo> --json` (repository read). A
@@ -2533,7 +2547,7 @@ impl Backend for CliBackend {
     }
 }
 
-/// Every forge read the CI-failure actions make, all
+/// SPEC-3.5: every forge read the CI-failure actions make, all
 /// through `fj`, so each action holds ONE client:
 ///
 /// - [`ActionLogClient`] -> `fj actions logs`, the ONE path a run's logs are read
