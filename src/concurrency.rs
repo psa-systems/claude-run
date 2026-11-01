@@ -44,6 +44,11 @@
 //! lock-order inversion: the key is only ever taken by a non-blocking try, so no
 //! job waits on a permit while another waits on that key, and the pipeline stays
 //! deadlock-free.
+//!
+//! SPEC-3.1 / SPEC-10: concurrency keys are process-wide, not scoped per
+//! action; each cap floors to 1 even when configured 0; a resize swaps in a
+//! new semaphore with in-flight permits draining against the old one; no
+//! fairness or ordering guarantee holds among deferred jobs.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -62,6 +67,8 @@ use crate::pause::RunPause;
 /// (e.g. a pre-launch cap/budget check tripped), or `Err` on a hard error.
 pub type JobFuture = Pin<Box<dyn Future<Output = Result<bool>> + Send>>;
 
+/// SPEC-3.1: concurrency keys are process-wide, not scoped per action.
+///
 /// Process-wide map of concurrency-key -> a per-key async mutex. Cloning shares
 /// the same map (it lives behind an `Arc`), so the daemon hands the same gate to
 /// every run; two jobs resolving to the same key serialize against each other
@@ -105,6 +112,8 @@ impl KeyGate {
     }
 }
 
+/// SPEC-2.2: advisory, scheduler-only gather marker.
+///
 /// CLAUDE-228: a per-action marker for "this action is gathering right now".
 ///
 /// Overlapping RUNS are deliberate (CLAUDE-162); overlapping GATHERS are not. A
@@ -160,6 +169,9 @@ impl Drop for GatherGuard {
     }
 }
 
+/// SPEC-10: the global + per-action semaphore permits; see SPEC-6.3 for the
+/// resolved effective cap this is built from.
+///
 /// CLAUDE-162: the daemon-wide concurrency limiter. Holds a global semaphore
 /// (total concurrent jobs across all actions) plus one semaphore per action name
 /// (concurrent jobs for that action). Shared behind an `Arc`, so the daemon hands
@@ -258,6 +270,9 @@ impl Limiter {
         (gp, ap)
     }
 
+    /// SPEC-2.2: a racy, best-effort admission check; the executor's real
+    /// `acquire` is the authority.
+    ///
     /// CLAUDE-162: true when a job for `action` could acquire a permit right now
     /// under both caps, without taking one. A best-effort admission gate the
     /// scheduler consults before starting an overlapping run so it does not pile
@@ -302,6 +317,9 @@ pub struct Executor {
 }
 
 impl Executor {
+    /// SPEC-10 / SPEC-3.1: no fairness or ordering guarantee holds among
+    /// deferred jobs.
+    ///
     /// Run all `items` concurrently under the key gate and the daemon-wide caps,
     /// returning one result per item in input order. A panicked task surfaces as
     /// an `Err` rather than aborting the whole run.
@@ -333,17 +351,27 @@ impl Executor {
                     None => return Ok(false),
                 };
                 let global = limiter.global();
-                let _global_permit = match global.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => return Ok(false),
+                // A queued job can wait as long as the jobs ahead of it run, so
+                // a cancel must not wait for a permit (SPEC-3.7, CLAUDE-507).
+                let _global_permit = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Ok(false),
+                    p = global.acquire_owned() => match p {
+                        Ok(p) => p,
+                        Err(_) => return Ok(false),
+                    },
                 };
                 if cancel.is_cancelled() || pause.stop().await {
                     return Ok(false);
                 }
                 let action_sem = limiter.action(&action, max_parallel);
-                let _action_permit = match action_sem.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => return Ok(false),
+                let _action_permit = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Ok(false),
+                    p = action_sem.acquire_owned() => match p {
+                        Ok(p) => p,
+                        Err(_) => return Ok(false),
+                    },
                 };
                 if cancel.is_cancelled() || pause.stop().await {
                     return Ok(false);
@@ -691,6 +719,48 @@ mod tests {
         // Pre-cancelled: every job skips before its body runs.
         assert!(results.iter().all(|r| matches!(r, Ok(false))));
         assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
+    /// CLAUDE-507: a job queued for a permit stops as soon as its run is
+    /// cancelled, whether it waits on the global or the per-action cap, without
+    /// waiting for the job holding the permit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_stops_a_job_queued_for_a_permit() {
+        for hold_global in [true, false] {
+            let limiter = Limiter::new(2);
+            let _held = if hold_global {
+                limiter.set_global_max(1);
+                limiter.global().acquire_owned().await.unwrap()
+            } else {
+                limiter.action("a", 1).acquire_owned().await.unwrap()
+            };
+            let cancel = CancellationToken::new();
+            let ran = Arc::new(AtomicUsize::new(0));
+            let counted = ran.clone();
+            let fut: JobFuture = Box::pin(async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            });
+            let exec = Executor {
+                action: "a".into(),
+                max_parallel: 1,
+                limiter,
+                gate: KeyGate::new(),
+                cancel: cancel.clone(),
+                pause: RunPause::never(),
+            };
+            let run = tokio::spawn(async move { exec.run(vec![("k".into(), fut)]).await });
+            // Let it get past the pre-acquire check and queue for the permit:
+            // cancelling earlier would pass even without the fix.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            cancel.cancel();
+            let results = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+                .await
+                .expect("the cancelled job does not wait for the permit")
+                .unwrap();
+            assert!(matches!(results[0], Ok(false)), "{hold_global}");
+            assert_eq!(ran.load(Ordering::SeqCst), 0, "{hold_global}");
+        }
     }
 
     // CLAUDE-162: the per-action cap holds across two OVERLAPPING runs (two

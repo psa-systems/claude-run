@@ -4,6 +4,13 @@
 //!
 //! Process model: single daemon per machine, enforced by a pidfile lock.
 //! `--detach` forks via the `daemonize` crate before binding the listener.
+//!
+//! SPEC-2.2: the single daemon per machine, its pidfile lock, its concurrent
+//! tasks (scheduler, trigger consumer, HTTP servers, webhook consumers,
+//! background loops), its startup sequence (reap, reconcile, scan, record
+//! serve start), its SIGTERM shutdown (30s grace, cancel-then-drain, exit
+//! 130), `serve --detach`'s fork-before-runtime and no-socket marker, and the
+//! TCP bind retry.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -62,6 +69,11 @@ pub struct Daemon {
 }
 
 impl Daemon {
+    /// SPEC-2.2: the startup sequence (pidfile lock, reap orphaned runs,
+    /// reconcile restart-stranded issues, scan actions, bind sockets,
+    /// materialize service logins, spawn background tasks) and the SIGTERM
+    /// shutdown sequence (trip every in-flight run's cancellation token,
+    /// wait for the registry to drain within the 30s grace window, exit 130).
     pub async fn run(mut self) -> Result<()> {
         let unix_socket = self.unix_socket;
         std::fs::create_dir_all(&self.paths.runtime_dir)?;
@@ -596,6 +608,7 @@ impl Daemon {
             pause: crate::pause::PauseGate::new(pool.clone()).with_readiness(readiness.clone()),
             readiness: readiness.clone(),
             last_fire: Mutex::new(HashMap::new()),
+            first_seen: Mutex::new(HashMap::new()),
         });
 
         let scheduler_task = tokio::spawn(scheduler_loop(dispatch.clone(), trigger_tx.clone()));
@@ -744,6 +757,9 @@ impl Daemon {
     }
 }
 
+/// SPEC-3.5: the mint pipeline degrades to log-only (returns `None`) when no
+/// provider backend is usable or the analysis directory cannot be created.
+///
 /// Build the webhook [`crate::web::webhooks::MintContext`]: resolve a provider
 /// backend (CLI-first), wrap the shared `claude` invoker in an at-ingest
 /// [`crate::triage::AnalysisClassifier`], and bundle the on-disk mint config +
@@ -832,6 +848,8 @@ fn build_mint_context(
     })
 }
 
+/// SPEC-2.2: the single-instance pidfile lock (`flock`, non-blocking) held
+/// for the daemon's lifetime.
 fn pidfile_lock(pidfile: &Path) -> Result<std::fs::File> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -905,6 +923,9 @@ fn rename_webhook_log_dir(paths: &Paths) {
     }
 }
 
+/// SPEC-2.2: the TCP bind retries every 5 seconds while the address is not
+/// yet assigned; any other bind failure disables the TCP surface for the run.
+///
 /// Classified web-UI bind failure. Carries a stable `kind` tag, a one-line
 /// operator hint, and whether the daemon should retry. Only the boot-race
 /// `AddrNotAvailable` retries; every other kind disables the web UI for the
@@ -916,6 +937,8 @@ pub struct BindFailure {
     pub retry: bool,
 }
 
+/// SPEC-2.2: classifies a bind failure into the retry decision above.
+///
 /// Map a bind [`std::io::ErrorKind`] to its classified [`BindFailure`]. Pure (no
 /// logging, no I/O) so the classification is unit-testable without a socket.
 pub fn classify_bind_error(kind: std::io::ErrorKind) -> BindFailure {
@@ -944,6 +967,9 @@ pub fn classify_bind_error(kind: std::io::ErrorKind) -> BindFailure {
     }
 }
 
+/// SPEC-2.2: retries the TCP bind every 5 seconds while the address is not
+/// yet assigned.
+///
 /// Bind `tcp_bind`, retrying indefinitely on the boot-race `AddrNotAvailable`
 /// and giving up (web UI disabled this run) on every other classified kind.
 /// Generic over the bind closure so the retry loop is testable with an
@@ -1026,6 +1052,8 @@ async fn bind_and_serve_tcp(tcp_bind: String, config_path: PathBuf, app: axum::R
     }
 }
 
+/// SPEC-2.2: the optional unix-socket API server task (disabled by
+/// `--no-socket`).
 async fn serve_unix(listener: UnixListener, app: axum::Router) -> Result<()> {
     // axum::serve doesn't take a UnixListener directly; loop accept + handle.
     loop {
@@ -1045,8 +1073,9 @@ async fn serve_unix(listener: UnixListener, app: axum::Router) -> Result<()> {
     }
 }
 
-/// One enabled, successfully-parsed action's identity, collected during a
-/// scan so the guardrail can spot two actions doing identical work.
+/// SPEC-2.2: one enabled, successfully-parsed action's identity, collected
+/// during a scan so the collision guardrail can spot two actions doing
+/// identical work.
 struct ScannedAction {
     /// The action `name:` as written (case preserved).
     name: String,
@@ -1058,9 +1087,10 @@ struct ScannedAction {
     source_key: Option<String>,
 }
 
-/// A detected redundant-configuration collision between two or more enabled
-/// actions. `members` are the action names whose pages carry the notice;
-/// `message` is the operator-facing warning naming every colliding file.
+/// SPEC-2.2: a detected collision (case-insensitive name collision, or same
+/// native kind and effective source) flagged with a WARN log and a persisted
+/// `run_events` notice; detection is observability-only and never disables
+/// either action.
 struct Collision {
     members: Vec<String>,
     message: String,
@@ -1072,6 +1102,8 @@ struct Collision {
 /// jobs it gathers, so two actions with equal keys provably poll the same
 /// source. `\u{1f}` (unit separator) joins the parts so no field value can forge
 /// a boundary.
+/// SPEC-2.2: the same-native-source half of the enabled-action collision
+/// check.
 fn native_source_key(action: &crate::action::Action) -> Option<String> {
     use crate::action::NativeConfig;
     match action.native.as_ref()? {
@@ -1100,6 +1132,9 @@ fn native_source_key(action: &crate::action::Action) -> Option<String> {
     }
 }
 
+/// SPEC-2.2: flags two enabled actions doing redundant work (case-insensitive
+/// name collision, or same native kind and effective source).
+///
 /// Detect enabled actions that do redundant work. Two conditions,
 /// each a distinct acceptance criterion: (1) names equal ignoring case
 /// (`youtrack` vs `YouTrack`), almost always the same intended action split by a
@@ -1165,6 +1200,9 @@ fn detect_collisions(scanned: &[ScannedAction]) -> Vec<Collision> {
     collisions
 }
 
+/// SPEC-2.2: scans the actions directory, upserts the index, prunes rows
+/// whose backing YAML no longer exists (run history is kept), and flags
+/// redundant-work collisions.
 pub async fn scan_actions(pool: &DbPool, actions_dir: &Path) -> Result<()> {
     if !actions_dir.is_dir() {
         info!(dir = %actions_dir.display(), "actions dir does not exist; nothing to index");
@@ -1303,6 +1341,10 @@ fn schedule_kind_str(k: &crate::action::ScheduleKind) -> &'static str {
     }
 }
 
+/// SPEC-3.1 / SPEC-3.7: holds the daemon-wide concurrency primitives
+/// (`KeyGate`, `Limiter`, `GatherGate`), the run registry, the pause gate and
+/// the readiness gate every dispatched run consults, and the in-memory
+/// `last_fire` cadence map SPEC-2.2's scheduler relies on.
 struct Dispatcher {
     paths: Paths,
     pool: DbPool,
@@ -1338,9 +1380,15 @@ struct Dispatcher {
     /// whose re-gather finds no fresh work (and thus creates no run row) is
     /// still not re-fired every 5s tick.
     last_fire: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// SPEC-2.2: when the scheduler first saw a `cron` action with no run yet, which
+    /// is where counting toward its next matching instant starts.
+    first_seen: Mutex<HashMap<String, DateTime<Utc>>>,
 }
 
 impl Dispatcher {
+    /// SPEC-2.2: overlapping runs are allowed; the scheduler and the trigger
+    /// consumer both dispatch through this path.
+    ///
     /// Start an (overlapping) run for `action_name`. Unlike the previous
     /// dispatch, a run is NOT rejected because another run for the same
     /// action is in flight; overlap is the point. The in-flight refcount is
@@ -1366,6 +1414,8 @@ impl Dispatcher {
         });
     }
 
+    /// SPEC-3.7: checks readiness, then the global pause, then the
+    /// per-action pause, in that order, before a run is allowed to start.
     async fn execute(&self, action_name: &str, trigger_source: &'static str) -> Result<()> {
         // Readiness first: an unconfigured instance cannot spawn an agent, and a
         // run dispatched anyway would fail at the `claude` call and consume an
@@ -1427,6 +1477,13 @@ impl Dispatcher {
     }
 }
 
+/// SPEC-6.3 / DEV-705 / DEV-707: resolves the run's spend ceiling and checks
+/// the daily run-count cap and daily budget for every kind before any work
+/// starts, refusing with `exit::DAILY_CAP` (4) or `exit::OVER_BUDGET` (6).
+/// SPEC-3.1: the concurrency-key admission check drops a gathered job whose
+/// key is already in flight in an overlapping run, and dedupes by
+/// concurrency key rather than issue id.
+///
 /// Shared by the daemon and the standalone CLI `run` subcommand.
 ///
 /// `registry` is `Some` only on the daemon path, where a run can be
@@ -1724,6 +1781,9 @@ pub async fn run_action_inner(
     Ok(exit_code)
 }
 
+/// SPEC-10: an explicit cap wins; auto (0) resolves to the max enabled
+/// action's `max_parallel`, floored to 1.
+///
 /// Resolve the effective global concurrency cap. An explicit
 /// `max_parallel_global > 0` wins; `0` (auto) resolves to the maximum
 /// `max_parallel` among enabled actions, so a single action still reaches its
@@ -1743,6 +1803,9 @@ pub fn resolve_global_cap(cfg: &ConcurrencyConfig, actions: &[ActionIndexRow]) -
         .max(1)
 }
 
+/// SPEC-2.2: the drain wait after SIGTERM trips every in-flight run's
+/// cancellation token, bounded by the caller's 30s grace timeout.
+///
 /// Resolve once every in-flight run has unregistered, i.e. all the
 /// cancellations issued at shutdown have torn down and finalized. Polls the
 /// registry rather than holding task handles, since runs dispatch on detached
@@ -1753,6 +1816,8 @@ async fn wait_for_runs_drain(runs: &RunRegistry) {
     }
 }
 
+/// SPEC-3.8: periodic workdir GC on the hourly tick.
+///
 /// Periodic workdir GC. The `tokio::time::interval` fires its first
 /// tick immediately, so this both performs the serve-start sweep and the hourly
 /// sweeps thereafter. The sweep is blocking filesystem work (a recursive walk
@@ -1790,6 +1855,8 @@ async fn gc_loop(paths: Paths, cfg: Arc<tokio::sync::RwLock<crate::config::Workd
     }
 }
 
+/// SPEC-3.8: periodic DB retention sweep on the hourly tick.
+///
 /// Periodic DB retention sweep. Prunes the unbounded history tables
 /// past the configured window on the [`GC_TICK_SECS`] cadence, reading the live
 /// config off the shared handle so a Settings save applies on the next tick. The
@@ -1815,6 +1882,8 @@ async fn retention_loop(
     }
 }
 
+/// SPEC-3.8: periodic Docker volume GC on the hourly tick.
+///
 /// Periodic Docker sidecar volume GC, on the [`GC_TICK_SECS`] cadence the
 /// other sweeps use. The interval's first tick fires immediately, so a sweep
 /// runs on serve start; the config is read off the shared handle per tick so a
@@ -1842,6 +1911,9 @@ async fn docker_gc_loop(cfg: Arc<tokio::sync::RwLock<crate::config::DockerGcConf
     }
 }
 
+/// SPEC-3.8: the in-flight evidence the stream-log sweep uses to protect a
+/// running job's log from deletion.
+///
 /// The `(action_name, job_key)` pairs whose job is running right
 /// now, from `run_inflight_jobs` joined to the runs that have not ended. This is
 /// the evidence the stream-log sweep needs that a log is finished with: the
@@ -1867,6 +1939,9 @@ async fn inflight_stream_log_jobs(
     Ok(rows.into_iter().collect())
 }
 
+/// SPEC-3.8: periodic stream-log, snippet, size-bounded log, and
+/// webhook-log GC on the hourly tick.
+///
 /// Periodic log GC, on the [`GC_TICK_SECS`] cadence the other two
 /// sweeps use. The interval's first tick fires immediately, so a sweep runs on
 /// serve start; the config is read off the shared handle per tick so a Settings
@@ -1976,6 +2051,9 @@ async fn stream_log_gc_loop(
     }
 }
 
+/// SPEC-2.2: the automerge reconciler's 300-second tick, the backstop for a
+/// missed, dropped, or too-early Action Run success webhook.
+///
 /// The automerge reconciler's own tick. Independent of both the
 /// scheduler's [`TICK_SECS`] (too chatty: every open agent PR would take a
 /// forge `pr_status` call five times a minute) and the hourly [`GC_TICK_SECS`]
@@ -2022,6 +2100,9 @@ const LOGIN_PROBE_INTERVAL_READY_SECS: u64 = 600;
 /// than the ready-state cadence.
 const LOGIN_PROBE_INTERVAL_LOGIN_REQUIRED_SECS: u64 = 60;
 
+/// SPEC-7.4 / SPEC-2.2: the login status probe loop, every 600 seconds while
+/// ready and every 60 seconds while login-required.
+///
 /// Periodically probe whether the agent's own Claude login is
 /// still usable, independent of whether any action happens to invoke `claude`
 /// right now. Runs once immediately at serve start, then on a cadence that
@@ -2051,6 +2132,9 @@ async fn login_probe_loop(
     }
 }
 
+/// SPEC-7.4: one probe pass; trips or clears the login-required axis per the
+/// probe outcome, leaving readiness unchanged on an indeterminate result.
+///
 /// One pass of [`login_probe_loop`], factored out so it is unit-testable
 /// without driving an infinite loop. Skips the probe (and touches nothing)
 /// while the gate is unready for the no-credential reason: there is no login
@@ -2097,6 +2181,7 @@ async fn login_probe_tick(
     }
 }
 
+/// SPEC-2.2: the scheduler's 5-second tick.
 async fn scheduler_loop(
     dispatch: Arc<Dispatcher>,
     _trigger_tx: mpsc::Sender<String>,
@@ -2110,6 +2195,9 @@ async fn scheduler_loop(
     }
 }
 
+/// SPEC-2.2: a failed pause read skips only that action's pickup for this
+/// tick rather than aborting the whole tick.
+///
 /// What one action's pause read means for this tick's fire decision.
 /// An unreadable pause state skips the action: it cannot prove the action is NOT
 /// paused, and the next tick retries 5s later. Pure so the error branch is
@@ -2122,6 +2210,11 @@ fn pause_read_skips_pickup<T>(status: &Result<Option<T>>) -> bool {
     }
 }
 
+/// SPEC-2.2: one scheduler tick: rescans actions, refreshes global pause and
+/// readiness, resolves the effective concurrency cap, then fires a pickup
+/// per enabled, unpaused, non-manual action whose schedule (SPEC-3.1) is due,
+/// gated on the in-memory re-gather cadence, no gather in flight, and a free
+/// concurrency slot.
 async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
     // Refresh on-disk action index so newly-added files become schedulable
     // without a daemon restart.
@@ -2184,6 +2277,11 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
         if !scheduler::regather_due(last_fire, now, interval) {
             continue;
         }
+        // SPEC-2.2: the action's own schedule decides whether it is due at all.
+        // Checked after the cadence so an idle action queries once per re-gather.
+        if !schedule_due(dispatch, &r, kind, now).await {
+            continue;
+        }
         // A gather still running from the previous fire means this
         // pickup would re-run the same query against the same source. Skip it
         // WITHOUT advancing `last_fire` (same contract as `can_admit` below), so
@@ -2204,6 +2302,52 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
     Ok(())
 }
 
+/// SPEC-2.2: whether an action's own schedule makes it due, measured from its last
+/// run's `started_at`. An empty re-gather creates no run, so an action with nothing
+/// to do stays due and keeps re-gathering at the cadence. Never run, `interval` is
+/// due at once, and `cron` counts from when the scheduler first saw it.
+async fn schedule_due(
+    dispatch: &Arc<Dispatcher>,
+    r: &state::ActionIndexRow,
+    kind: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    let kind_parsed = match kind {
+        "interval" => crate::action::ScheduleKind::Interval,
+        "cron" => crate::action::ScheduleKind::Cron,
+        _ => return false,
+    };
+    let schedule = crate::action::Schedule {
+        kind: kind_parsed,
+        spec: r.schedule_spec.clone(),
+    };
+    let parsed = match scheduler::parse_schedule(&schedule) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(action = %r.name, error = %e, "schedule does not parse; not firing");
+            return false;
+        }
+    };
+    let last_run = match state::action_last_run_started(&dispatch.pool, &r.name).await {
+        Ok(started) => started
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| t.with_timezone(&Utc)),
+        Err(e) => {
+            warn!(action = %r.name, error = %e, "last run read failed; skipping this pickup");
+            return false;
+        }
+    };
+    let anchor = match (last_run, kind) {
+        (None, "cron") => {
+            let mut seen = dispatch.first_seen.lock().await;
+            Some(*seen.entry(r.name.clone()).or_insert(now))
+        }
+        (last, _) => last,
+    };
+    scheduler::next_fire_due(&parsed, anchor, now).is_some()
+}
+
+/// SPEC-2.2: the trigger consumer task; runs actions requested by `trigger`.
 async fn trigger_consumer(dispatch: Arc<Dispatcher>, mut rx: mpsc::Receiver<String>) -> Result<()> {
     while let Some(name) = rx.recv().await {
         info!(action = %name, "trigger received");
@@ -2221,6 +2365,9 @@ pub fn daemon_pidfile_path(paths: &Paths) -> PathBuf {
     paths.runtime_dir.join("daemon.pid")
 }
 
+/// SPEC-2.2 / SPEC-4.1: the `serve --no-socket` marker a daemonless caller
+/// uses, alongside the pidfile's liveness, to classify daemon presence.
+///
 /// Marker written next to the pidfile for the lifetime of a `serve
 /// --no-socket` run, and removed on both a clean shutdown and the next
 /// `serve` start (whichever mode it starts in). A daemonless `status` reads
@@ -2237,6 +2384,9 @@ pub fn read_pidfile(paths: &Paths) -> Option<i32> {
     contents.trim().parse::<i32>().ok()
 }
 
+/// SPEC-2.2 / SPEC-4.1: the three-way classification (running-no-socket /
+/// undetermined / not-running) a daemonless caller resolves to.
+///
 /// What a daemonless caller (one that could not reach the unix socket) can
 /// conclude about the daemon from the pidfile and the `--no-socket` marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2255,6 +2405,10 @@ pub enum DaemonPresence {
     Undetermined(String),
 }
 
+/// SPEC-2.2 / SPEC-4.1: never guesses "not running" from a missing socket
+/// alone; derives presence from the pidfile lock's liveness and the
+/// `--no-socket` marker.
+///
 /// Classify the daemon's presence for a daemonless caller. Never guesses
 /// "not running" from a missing socket alone: it is derived from the pidfile
 /// lock's liveness and the `--no-socket` marker written at `serve` start.
@@ -2619,6 +2773,88 @@ mod tests {
         );
     }
 
+    /// SPEC-2.2: an action's own schedule decides whether it is due, measured from
+    /// its last run's `started_at`.
+    #[tokio::test]
+    async fn schedules_are_measured_from_the_last_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
+        let dispatch = test_dispatcher(&paths, &pool);
+        let row = |name: &str, kind: &str, spec: &str| state::ActionIndexRow {
+            name: name.to_string(),
+            file_path: format!("/x/{name}.yml"),
+            yaml_sha256: String::new(),
+            enabled: true,
+            schedule_kind: Some(kind.to_string()),
+            schedule_spec: Some(spec.to_string()),
+            last_seen_at: "2026-01-01T00:00:00+00:00".to_string(),
+            parse_error: None,
+            link_template: None,
+            max_parallel: 1,
+        };
+        let now = Utc::now();
+        let mins = |m: i64| now + chrono::Duration::minutes(m);
+
+        // interval: never run, due at once; after a run, only once `spec` has passed.
+        let every = row("every", "interval", "5m");
+        assert!(schedule_due(&dispatch, &every, "interval", now).await);
+        let run = state::run_begin(&pool, "every", "scheduler").await.unwrap();
+        state::run_finish(&pool, run, 0, 0).await.unwrap();
+        assert!(!schedule_due(&dispatch, &every, "interval", mins(4)).await);
+        assert!(schedule_due(&dispatch, &every, "interval", mins(6)).await);
+
+        // cron: never run, it counts from first sight rather than firing at once,
+        // and a matching minute since then makes it due.
+        let cron = row("cron", "cron", "* * * * *");
+        assert!(!schedule_due(&dispatch, &cron, "cron", now).await);
+        assert!(schedule_due(&dispatch, &cron, "cron", mins(2)).await);
+        // It stays due until a run starts: an empty re-gather creates no run row.
+        assert!(schedule_due(&dispatch, &cron, "cron", mins(3)).await);
+        let run = state::run_begin(&pool, "cron", "scheduler").await.unwrap();
+        state::run_finish(&pool, run, 0, 0).await.unwrap();
+
+        // A far-off cron time is not due after a run, and is once it has passed.
+        let yearly = row("cron", "cron", "0 0 1 1 *");
+        assert!(!schedule_due(&dispatch, &yearly, "cron", mins(10)).await);
+        assert!(
+            schedule_due(
+                &dispatch,
+                &yearly,
+                "cron",
+                now + chrono::Duration::days(370)
+            )
+            .await
+        );
+
+        // A bad expression never fires.
+        assert!(!schedule_due(&dispatch, &row("bad", "cron", "not cron"), "cron", mins(10)).await);
+    }
+
+    /// SPEC-2.2: the scheduler tick honours the schedule: a recent run holds an
+    /// `interval` action back even though the re-gather cadence has elapsed.
+    #[tokio::test]
+    async fn a_recent_run_holds_an_interval_action_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        std::fs::create_dir_all(paths.actions_dir()).unwrap();
+        std::fs::write(
+            paths.actions_dir().join("act.yml"),
+            "name: act\nkind: youtrack\nnative: {}\nschedule:\n  kind: interval\n  spec: 5m\n",
+        )
+        .unwrap();
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
+        let dispatch = test_dispatcher(&paths, &pool);
+        let run = state::run_begin(&pool, "act", "scheduler").await.unwrap();
+        state::run_finish(&pool, run, 0, 0).await.unwrap();
+
+        scheduler_tick(&dispatch).await.unwrap();
+        assert!(
+            dispatch.last_fire.lock().await.get("act").is_none(),
+            "not due yet, so the tick must not fire"
+        );
+    }
+
     /// The three pause-read outcomes. The `Err` arm is the fix: it
     /// used to be a `?` that aborted the whole tick, so one transient pool
     /// timeout stopped EVERY action from firing, not just this one.
@@ -2701,6 +2937,7 @@ mod tests {
             pause: crate::pause::PauseGate::new(pool.clone()),
             readiness: crate::readiness::ReadinessGate::always(),
             last_fire: Mutex::new(HashMap::new()),
+            first_seen: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2739,6 +2976,7 @@ mod tests {
             pause: crate::pause::PauseGate::new(pool.clone()),
             readiness: crate::readiness::ReadinessGate::always(),
             last_fire: Mutex::new(HashMap::new()),
+            first_seen: Mutex::new(HashMap::new()),
         });
 
         scheduler_tick(&dispatch).await.unwrap();

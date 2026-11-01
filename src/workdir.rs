@@ -12,6 +12,11 @@
 //! 3. `<data_dir>/workdirs`.
 //!
 //! The final per-job workdir is `<workdir_base>/<action_name>/<job_key>`.
+//!
+//! SPEC-3.2.9: "a job's workdir base resolves in order: the action's own
+//! `workdir_base` field, then `CLAUDE_RUN_WORKDIR_BASE`, then
+//! `<data dir>/workdirs`; the job's workdir is
+//! `<base>/<action name>/<job key>`."
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,6 +26,7 @@ use tracing::{error, warn};
 
 use crate::config::{expand_path, Paths};
 
+/// SPEC-3.2.9: the workdir-base resolution order, per the module doc comment.
 pub fn resolve_workdir_base(action_workdir_base: Option<&str>, paths: &Paths) -> PathBuf {
     if let Some(raw) = action_workdir_base {
         return PathBuf::from(expand_path(raw));
@@ -31,6 +37,7 @@ pub fn resolve_workdir_base(action_workdir_base: Option<&str>, paths: &Paths) ->
     paths.workdirs_dir()
 }
 
+/// SPEC-3.2.9: "the job's workdir is `<base>/<action name>/<job key>`."
 pub fn job_workdir(base: &Path, action_name: &str, job_key: &str) -> PathBuf {
     base.join(action_name).join(job_key)
 }
@@ -191,6 +198,11 @@ pub fn uncommitted_or_stashed(workdir: &Path) -> Result<DirtyState, WorkCheckErr
 /// YouTrack job cleanup, the comment webhook) should call
 /// [`local_only_work_with_token`] instead, since `origin` itself no longer
 /// carries the token after CLAUDE-395's post-clone scrub.
+///
+/// SPEC-3.2.9: "a local branch tip the remote does not have under that same
+/// branch name (excluding a tip that merely equals the remote default
+/// branch's tip), a tracked or staged modification, an untracked and
+/// non-ignored file, or a stash" are each local-only work.
 pub fn local_only_work(workdir: &Path) -> Result<LocalWork, WorkCheckError> {
     local_only_work_with_token(workdir, None)
 }
@@ -200,6 +212,9 @@ pub fn local_only_work(workdir: &Path) -> Result<LocalWork, WorkCheckError> {
 /// [`crate::provider::authed_git_output`], never by writing the token into
 /// `origin`'s URL. `token_url` is only ever read for its userinfo; a `None`
 /// falls back to the prior unauthenticated call.
+///
+/// SPEC-3.2.9: the token-authenticated `ls-remote origin` variant of the
+/// same local-only-work check.
 pub fn local_only_work_with_token(
     workdir: &Path,
     token_url: Option<&str>,
@@ -320,6 +335,10 @@ pub fn force_remove(workdir: &Path) {
 /// only when [`local_only_work`] proves nothing exists solely in `workdir`;
 /// any local-only work, or a failed check, preserves instead (pruning
 /// gitignored build artifacts first) and logs what was found.
+///
+/// SPEC-3.2.9: "any local-only work, or a git or network failure while
+/// checking, preserves the workdir rather than risking a wrong delete; only
+/// a clean check with nothing local-only found deletes it."
 pub fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
     cleanup_or_preserve_with_token(workdir, action, key, None)
 }
@@ -329,6 +348,10 @@ pub fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
 /// (CLAUDE-395). Callers with a forge token in scope (native YouTrack job
 /// cleanup, the comment webhook) should call this instead, since `origin`
 /// carries no credential after the post-clone scrub.
+///
+/// SPEC-3.2.9: "a caller with a forge token in scope authenticates the one
+/// network call this check makes (`ls-remote origin`) per invocation via
+/// the token's own userinfo."
 pub fn cleanup_or_preserve_with_token(
     workdir: &Path,
     action: &str,
