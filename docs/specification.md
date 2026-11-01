@@ -408,6 +408,25 @@ Served at the root of the unix socket (unless `--no-socket`) and under `/api` on
 | `GET /report/summary`, `/report/daily`, `/report/weekly`, `/report/by-weekday`, `/report/by-hour` | Aggregations; query `range` (`30d`, `90d`, other values mean all time) and `action` |
 | `POST /access/check` | Same typed report as `access check` |
 
+A trigger is refused before it is queued, never accepted and silently dropped: a synthetic action (event-driven, no
+`prompt`/`input`) 400s by name from the one shared predicate the web UI also uses; an unknown name 404s; a global
+pause or a not-ready daemon 409s naming the reason (the pause's own annotation, or the readiness gate's message), so
+the caller is never told a run was queued when the dispatcher would have dropped it; a full trigger queue 503s. Delete
+refuses (409) a name with a run in flight, checked both in the daemon's in-memory dispatch set (a run dispatched
+before its `runs` row exists) and the database (a recorded run with no `ended_at`); otherwise it removes the YAML
+file (tolerating one already gone), the action index row, and derived control state (`paused_actions`,
+`attempt_counters`, `daily_ledger`), keeping run history (`runs`, `job_outcomes`, stream logs) for audit. An
+attempt-counter reset 404s a key with no counter, otherwise clears it and records a `warn`-level `run_events` row
+naming the discarded count, so the mutation is never invisible. A pause reason is read from either `{"reason":...}`
+JSON or the `reason=...` urlencoded body htmx's Pause form posts; an unparseable body is logged at `warn` and the
+pause proceeds with no reason rather than being refused. A settings `PUT` validates the body against the section's
+config struct before persisting anything: a validation failure 400s with the message and nothing is saved; a secret
+field in the response names only its `*_ref`, never its value. `/status`'s `activity` field is the same `Activity`
+snapshot (9) the `status` command and the About page's quiet indicator read, so the three cannot disagree about
+whether a restart is safe; its `stale_gates` and `attempt_cap_hits` are the dependency-gate (3.3) and per-key
+attempt-cap (3.1) backlogs an operator without the web UI would otherwise have no machine-readable view of.
+`/access/check` is the typed report defined in 4.6.
+
 ### 4.3 Web UI (TCP, default port 7321)
 
 Pages: `/` dashboard; `/actions/new`, `/actions/new/raw`, `/actions/new/youtrack`, `/actions/new/closed-issue-summary`;
@@ -440,10 +459,72 @@ configured for a different provider, or a disabled listener returns 404. Pipelin
 ### 4.5 MCP tools
 
 Seven read-only tools, served over stdio (`mcp stdio`) and, when enabled, Streamable HTTP at `/mcp`: `get_status`,
-`list_runs`, `get_run`, `get_attempts`, `get_stream_log`, `list_ci_failures`, `get_ci_failure`. Limits above the maximum are
-rejected, not clamped. `get_stream_log` rejects paths that resolve outside the logs directory. The HTTP listener adds the
-`mcp-web` crate's account, OAuth 2.1 and bearer layer, serves OAuth discovery under `/.well-known/`, and restricts the
-`Host` header to the authority of `public_url` plus `allowed_hosts`.
+`list_runs`, `get_run`, `get_attempts`, `get_stream_log`, `list_ci_failures`, `get_ci_failure`. Each is annotated
+`read_only_hint = true, destructive_hint = false`; none writes anything. `list_runs` / `list_ci_failures`'s `limit`
+defaults to 20, capped at 100; `get_stream_log`'s `tail_lines` defaults to 200, capped at 2000. Limits above the
+maximum are rejected, not clamped, so a caller is told its request was too large rather than silently handed a
+truncated answer it could mistake for the whole picture. `get_status`'s result carries `"source": "database"` and
+makes no claim about whether the daemon process itself is running, distinguishing it from the CLI `status` command's
+daemonless path (same `state::status_blocks` assembly, with its own `daemon` / `socket_expected_at` keys layered on
+top) and from `/api/status` (4.2).
+
+`get_stream_log` rejects a recorded path that, canonicalized, resolves outside the canonicalized logs directory,
+the same symlink-escape defense a write path would need. It returns one of three distinct error cases: no job
+outcome recorded for the run/job/attempt, a recorded path with no stream log, or a file the retention sweep has
+since removed; none of the three is a bare "not found". A successful read tails the content to `tail_lines` lines
+and then, if still over the whole-response cap (256 KiB), trims further from the front to the nearest UTF-8
+character boundary; the result states `total_lines`, `returned_lines` and whether either step truncated. Stream
+logs are returned unredacted (the caller already has full container access via `docker compose exec`, over stdio) or
+is otherwise relying on the authenticated bearer grant below standing in for that access, over HTTP.
+
+The HTTP listener (`[mcp].enabled`) wraps the same tool set behind the `mcp-web` crate's own local-account, OAuth 2.1
+and bearer layer, a separate account store from the web UI's `web_admin`/`web_accounts` (7.9): granting MCP access is
+a narrower, read-only grant that must not share credentials or sessions with a full dashboard login. It serves OAuth
+discovery under `/.well-known/`, and restricts the `Host` header to the authority of `public_url` plus
+`[mcp].allowed_hosts`. Two key files (`mcp-master.key` encrypting its own `mcp-web.db`, `mcp-session.key` signing its
+sessions) are generated once under the config directory on first start with the listener enabled, mode `0600`,
+`create_new` so a concurrent first start cannot race a second generation; a present but corrupt file fails loudly
+rather than silently regenerating, the same discipline `secrets.key` follows (7.1) applied to an unrelated key pair.
+Its account/session/OAuth state lives in its own `mcp-web.db` under the data directory, entirely separate from
+`state.db` or the configured `[database]` backend. A missing `public_url` or a corrupt key file fails only this
+listener, logged at `error`; the rest of the daemon runs unaffected. See `docs/conventions/mcp.md` for the full
+narrative (dependency footprint, the `AlwaysConnected` upstream-directory trivial implementation, TOTP being
+optional for this account store where it is mandatory for the dashboard's).
+
+### 4.6 On-demand access check
+
+One service answers, without queueing a job, whether the runner has the access it would need, behind three surfaces
+that cannot drift because they call the same function: the `/access` page, `POST /api/access/check` (4.2), and
+`claude-run access check` (4.1, non-zero exit on any failed probe). No secret value ever leaves the module: a row
+names the secret, the probe and the failure text only, never a token.
+
+A request names zero or more of `secret`, `host`, `repo`, `project`; naming neither `repo` nor `project` is the
+aggregate form, checking every enabled `youtrack` action's credential, the projects its own query reaches (capped at
+10 projects per action; reaching more adds its own row saying so, rather than truncating silently, and names a
+project to check the rest), and the repos those projects' VCS bindings resolve to. Each row's `kind` is one of
+`identity` (is the credential still valid), `project` (a YouTrack project reads), `vcs` (a project's VCS binding
+resolves to a host and repo path), `query` (the action's own query executes under the credential), `repo` (a forge
+repo passes both read-scope categories `Forge::repo_access` checks), `write` (a capability only a mutation could
+prove), or `setup` (the check itself could not be set up). Its `outcome` is `pass`, `fail`, or `unverifiable`:
+`unverifiable` is deliberately not a failure, since it is the honest answer for a capability (opening a PR, writing
+the tracker's `AI Agent` field, a `State` transition, a pickup comment) that only a real write would prove, and a
+write probe would leave a real issue or PR behind. A missing `yt` / `fj` binary is reported as a `setup` row rather
+than a 500; with no enabled `youtrack` action to check at all, that "nothing to check" row wins over reporting the
+CLI absent, since it is the more useful answer.
+
+Credentials are materialized into their own scratch directory exactly as a job's `JobCredentials::materialize`
+does (7.2), keyed by the resolved host, and scrubbed when the probe's guard drops, so the check exercises the real
+per-job credential path rather than falling back to ambient host auth by accident. A repo probe auto-routes to the
+GitHub or Forgejo backend by host, the same routing a job's own forge selection uses (3.3.1): `github.com` or a
+listed `github.hosts` entry uses the GitHub token, any other host uses the Forgejo token. The probe order per
+action is identity, then the write row, then (aggregate) the project list, then per project: project read, VCS
+binding, and the project-scoped query; discovered repos are probed last. A YouTrack project the token cannot read
+and one that does not exist are reported identically by the tracker (HTTP 400 `invalid_query`, not 401/403); the
+row's remediation says so explicitly rather than leaving the raw text to read as a query syntax error.
+
+Recovery markers: `retain_access_recoveries` drops a poll-time access-recovery event when the repo it names is not
+currently in an open failure, so a success marker is recorded only on a fail-to-pass transition (3.3) instead of
+once per poll forever, while still clearing the dashboard's open-failure banner.
 
 ## 5. Data model
 
