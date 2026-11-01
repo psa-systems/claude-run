@@ -44,6 +44,11 @@
 //! lock-order inversion: the key is only ever taken by a non-blocking try, so no
 //! job waits on a permit while another waits on that key, and the pipeline stays
 //! deadlock-free.
+//!
+//! SPEC-3.1 / SPEC-10: concurrency keys are process-wide, not scoped per
+//! action; each cap floors to 1 even when configured 0; a resize swaps in a
+//! new semaphore with in-flight permits draining against the old one; no
+//! fairness or ordering guarantee holds among deferred jobs.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -62,6 +67,8 @@ use crate::pause::RunPause;
 /// (e.g. a pre-launch cap/budget check tripped), or `Err` on a hard error.
 pub type JobFuture = Pin<Box<dyn Future<Output = Result<bool>> + Send>>;
 
+/// SPEC-3.1: concurrency keys are process-wide, not scoped per action.
+///
 /// Process-wide map of concurrency-key -> a per-key async mutex. Cloning shares
 /// the same map (it lives behind an `Arc`), so the daemon hands the same gate to
 /// every run; two jobs resolving to the same key serialize against each other
@@ -105,6 +112,8 @@ impl KeyGate {
     }
 }
 
+/// SPEC-2.2: advisory, scheduler-only gather marker.
+///
 /// CLAUDE-228: a per-action marker for "this action is gathering right now".
 ///
 /// Overlapping RUNS are deliberate (CLAUDE-162); overlapping GATHERS are not. A
@@ -160,6 +169,9 @@ impl Drop for GatherGuard {
     }
 }
 
+/// SPEC-10: the global + per-action semaphore permits; see SPEC-6.3 for the
+/// resolved effective cap this is built from.
+///
 /// CLAUDE-162: the daemon-wide concurrency limiter. Holds a global semaphore
 /// (total concurrent jobs across all actions) plus one semaphore per action name
 /// (concurrent jobs for that action). Shared behind an `Arc`, so the daemon hands
@@ -258,6 +270,9 @@ impl Limiter {
         (gp, ap)
     }
 
+    /// SPEC-2.2: a racy, best-effort admission check; the executor's real
+    /// `acquire` is the authority.
+    ///
     /// CLAUDE-162: true when a job for `action` could acquire a permit right now
     /// under both caps, without taking one. A best-effort admission gate the
     /// scheduler consults before starting an overlapping run so it does not pile
@@ -302,6 +317,9 @@ pub struct Executor {
 }
 
 impl Executor {
+    /// SPEC-10 / SPEC-3.1: no fairness or ordering guarantee holds among
+    /// deferred jobs.
+    ///
     /// Run all `items` concurrently under the key gate and the daemon-wide caps,
     /// returning one result per item in input order. A panicked task surfaces as
     /// an `Err` rather than aborting the whole run.
