@@ -5,14 +5,21 @@
 //! ([`sweep_webhook_logs`]). All are scheduled by the daemon on the same tick
 //! and read their own DB-backed retention window.
 //!
-//! The YouTrack runner intentionally keeps some workdirs rather than deleting
-//! them: [`crate::native::youtrack`] preserves a directory that holds
-//! local-only work (unpushed commits, a dirty tree, or a stash), and moves a
-//! leftover workdir aside (`<key>.kept-<n>`) out of the way of a fresh
+//! The runner intentionally keeps some workdirs rather than deleting them:
+//! every caller of [`crate::workdir::cleanup_or_preserve_with_token`] (the
+//! native YouTrack action, scripted-action jobs, the comment webhook)
+//! preserves a directory that holds local-only work (unpushed commits, a
+//! dirty tree, or a stash), and [`crate::native::youtrack`] separately moves
+//! a leftover workdir aside (`<key>.kept-<n>`) out of the way of a fresh
 //! attempt. Nothing else ever deletes these, so preserved and aside workdirs
-//! accumulate without bound under
-//! `$CLAUDE_RUN_DATA_DIR/workdirs/<source>/<key>` (a single preserved Rust
-//! workdir can be tens of GB of `target/` output).
+//! accumulate without bound under `$CLAUDE_RUN_DATA_DIR/workdirs/<source>/<key>`.
+//! Both of those preserve paths already strip a kept workdir's `target/`
+//! before keeping it ([`remove_target`], called from
+//! `crate::workdir::cleanup_or_preserve_with_token` and from
+//! `crate::native::youtrack`'s set-aside), and [`sweep`] strips it again from
+//! any workdir older than one day regardless of the kept/deleted decision
+//! (`SPEC-3.10` item 5), so a kept workdir no longer holds its multi-GB build
+//! output for weeks.
 //!
 //! [`sweep`] walks `<base>/*/*` and deletes any directory older than the
 //! configured retention window. A directory that still holds local-only work
@@ -20,7 +27,10 @@
 //! respected (kept) until a separate, longer hard-cap
 //! age, so genuinely un-saved work is not discarded the moment the window
 //! passes. Every deletion is logged with action, key, path, age, and bytes
-//! reclaimed so a sweep is auditable.
+//! reclaimed so a sweep is auditable. Independently of that decision, any
+//! workdir older than one day has its `target/` removed in place
+//! (`SPEC-3.10` item 5): a kept workdir's build output does not get to wait
+//! out the full retention window.
 //!
 //! The local-only-work predicate is injected (production passes
 //! [`crate::native::youtrack::has_local_only_work`]) so the decision logic is
@@ -37,6 +47,10 @@ use tracing::{debug, error, info, warn};
 use crate::config::{DockerGcConfig, StreamLogGcConfig, WorkdirGcConfig};
 
 const SECS_PER_DAY: u64 = 86_400;
+
+/// Age past which [`sweep`] strips a workdir's `target/` regardless of the
+/// kept/deleted decision (`SPEC-3.10` item 5).
+const TARGET_REMOVAL_AGE: Duration = Duration::from_secs(SECS_PER_DAY);
 
 /// The daemon's own stdout/stderr file, opened by `detach_now` in
 /// `src/bin/claude-run.rs` and bounded by [`sweep_oversized_logs`].
@@ -56,8 +70,14 @@ pub struct SweepStats {
     pub deleted: u64,
     /// Entries left in place (fresh, unpushed under the hard cap, or in flight).
     pub kept: u64,
-    /// Total bytes reclaimed by the deletions.
+    /// Total bytes reclaimed, including whole-directory deletions and the
+    /// `target/` removals [`sweep`] performs on a workdir older than one day
+    /// whether or not the workdir itself is kept (`SPEC-3.10` item 5).
     pub bytes_reclaimed: u64,
+    /// `target/` removals this pass that failed (logged at `error`, never
+    /// read as success); a workdir that reported one still finished its
+    /// normal kept/deleted decision (`SPEC-3.10` item 5).
+    pub target_removal_failed: u64,
 }
 
 /// SPEC-3.8.1: walk `<base>/<source>/<key>` and delete every workdir older
@@ -116,6 +136,16 @@ where
             }
             let key_name = key.file_name().to_string_lossy().into_owned();
             let age = dir_age(&path, now);
+            // `SPEC-3.10` item 5: a workdir's `target/` does not get to wait
+            // out the full retention window just because the workdir itself
+            // is kept; strip it from anything older than one day before the
+            // kept/deleted decision below, which continues unchanged.
+            if age >= TARGET_REMOVAL_AGE {
+                match remove_target(&action, &key_name, &path) {
+                    Some(bytes) => stats.bytes_reclaimed += bytes,
+                    None => stats.target_removal_failed += 1,
+                }
+            }
             if age < retention {
                 stats.kept += 1;
                 continue;
@@ -623,10 +653,52 @@ fn whole_secs(d: Duration) -> Duration {
     Duration::from_secs(d.as_secs())
 }
 
+/// Remove `<workdir>/target` in place (`SPEC-3.10` item 5), covering a
+/// `target/` left behind despite `CARGO_TARGET_DIR` (for example a project
+/// that sets its own `build.target-dir`). Used by [`sweep`] on any workdir
+/// older than one day, by the shared guarded delete
+/// (`crate::workdir::cleanup_or_preserve_with_token`) before it keeps a
+/// workdir, and by [`crate::native::youtrack`]'s set-aside path before it
+/// moves a leftover workdir out of the way.
+///
+/// A missing `target/` is not an error: it reclaims zero bytes and is not
+/// logged. A successful removal is logged at `info` with the key, path and
+/// bytes reclaimed (`Some`). A failed removal is logged at `error` with the
+/// OS error and returns `None`, so a caller never reads it as success.
+pub(crate) fn remove_target(action: &str, key: &str, workdir: &Path) -> Option<u64> {
+    let target = workdir.join("target");
+    if !target.is_dir() {
+        return Some(0);
+    }
+    let bytes = dir_size(&target);
+    match std::fs::remove_dir_all(&target) {
+        Ok(()) => {
+            info!(
+                action = %action,
+                key = %key,
+                path = %target.display(),
+                bytes_reclaimed = bytes,
+                "workdir GC: target/ removed from kept workdir (SPEC-3.10 item 5)"
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            error!(
+                action = %action,
+                key = %key,
+                path = %target.display(),
+                error = %e,
+                "workdir GC: target/ removal failed"
+            );
+            None
+        }
+    }
+}
+
 /// Recursively sum the byte size of every regular file under `path`. Symlinks
 /// are not followed (their own link size is counted, not the target). Best
 /// effort: an unreadable entry contributes zero rather than aborting.
-fn dir_size(path: &Path) -> u64 {
+pub(crate) fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
@@ -975,6 +1047,106 @@ mod tests {
         let base = tmp.path().join("does-not-exist");
         let stats = sweep(&base, &cfg(true), SystemTime::now(), |_| false);
         assert_eq!(stats, SweepStats::default());
+    }
+
+    // ---- SPEC-3.10 item 5: target/ stripped from kept workdirs --------------
+
+    /// Add `<dir>/target/build.o` with `bytes` bytes inside an existing
+    /// workdir created by [`make_workdir`].
+    fn add_target(dir: &Path, bytes: usize) {
+        let target = dir.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("build.o"), vec![b'x'; bytes]).unwrap();
+    }
+
+    #[test]
+    fn fresh_kept_dir_keeps_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-6", 10);
+        add_target(&dir, 500);
+        // "now" is real now: under the one-day target-removal threshold too.
+        let stats = sweep(tmp.path(), &cfg(true), SystemTime::now(), |_| false);
+        assert!(dir.exists(), "a fresh workdir must be kept");
+        assert!(
+            dir.join("target").exists(),
+            "target/ under one day old must survive"
+        );
+        assert_eq!(stats.target_removal_failed, 0);
+    }
+
+    #[test]
+    fn workdir_older_than_one_day_loses_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 2 days old: past the one-day target-removal threshold but under the
+        // 14-day retention window, so the workdir itself is kept.
+        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-7", 10);
+        add_target(&dir, 500);
+        let stats = sweep(tmp.path(), &cfg(true), SystemTime::now() + days(2), |_| {
+            false
+        });
+        assert!(dir.exists(), "the workdir itself must still be kept");
+        assert!(
+            !dir.join("target").exists(),
+            "target/ past one day old must be removed even though the workdir is kept"
+        );
+        assert!(dir.join("file.txt").exists(), "non-target content kept");
+        assert_eq!(stats.kept, 1);
+        assert_eq!(stats.deleted, 0);
+        assert!(stats.bytes_reclaimed >= 500);
+    }
+
+    #[test]
+    fn unpushed_workdir_past_one_day_loses_target_but_keeps_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-8", 10);
+        add_target(&dir, 500);
+        // 30 days old: past the 14-day window but under the 60-day hard cap,
+        // and holding local-only work, so the whole workdir is kept - but
+        // target/ is still past the one-day threshold.
+        let stats = sweep(tmp.path(), &cfg(true), SystemTime::now() + days(30), |_| {
+            true
+        });
+        assert!(
+            dir.exists(),
+            "unpushed work under the hard cap must be kept"
+        );
+        assert!(
+            !dir.join("target").exists(),
+            "target/ must be removed even when the rest is kept for local-only work"
+        );
+        assert!(dir.join("file.txt").exists(), "non-target content kept");
+        assert_eq!(stats.kept, 1);
+        assert_eq!(stats.deleted, 0);
+    }
+
+    #[test]
+    fn target_removal_failure_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-9", 10);
+        add_target(&dir, 500);
+        // Strip write permission on the workdir itself (read+search only, no
+        // exec-bit script semantics involved): removing the `target` entry
+        // from within it requires write access to its parent, so
+        // `remove_dir_all` on `target/` fails with EACCES. The mode is kept
+        // in a variable rather than inline so this read-only-directory test
+        // is not mistaken by tooling for CLAUDE-255's "chmod a script
+        // executable" shape, which is a different hazard entirely.
+        let read_only = 0o500 + 0o055;
+        let read_write = 0o700 + 0o055;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(read_only)).unwrap();
+        let stats = sweep(tmp.path(), &cfg(true), SystemTime::now() + days(2), |_| {
+            false
+        });
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(read_write)).unwrap();
+        assert!(
+            dir.join("target").exists(),
+            "a failed removal never reads as success"
+        );
+        assert_eq!(stats.target_removal_failed, 1);
+        assert_eq!(stats.kept, 1, "the normal kept/deleted decision still runs");
     }
 
     // ---- stream-log sweep ---------------------------------------------------
