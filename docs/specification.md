@@ -154,7 +154,8 @@ GitHub MCP endpoint (GitHub), `git`, `claude`, `nu` (default interpreter for scr
 Each job runs `timeout <seconds>s claude --print --verbose --output-format=stream-json --permission-mode=... --allowed-tools=... [--model] [--effort] --autocompact=... [--max-budget-usd] --disallowedTools=Monitor,ScheduleWakeup
 <prompt>` with stdin closed, in its own process group (cancellation signals the group). Environment for the child sets
 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and sets `BASH_DEFAULT_TIMEOUT_MS` / `BASH_MAX_TIMEOUT_MS` to the invocation's
-timeout. `CLAUDE_RUN_DATABASE_URL`, `CLAUDE_RUN_DATABASE_URL_FILE`, `CLAUDE_RUN_SMTP_PASSWORD` and
+timeout. For a repo workdir it also sets `CARGO_TARGET_DIR` to that repo's shared target directory (`SPEC-3.10`).
+`CLAUDE_RUN_DATABASE_URL`, `CLAUDE_RUN_DATABASE_URL_FILE`, `CLAUDE_RUN_SMTP_PASSWORD` and
 `CLAUDE_RUN_SMTP_PASSWORD_FILE` are removed from the child environment. Stdout events are timestamped into a per-attempt
 stream log under `<state dir>/logs/<action>/streams/`. Exit code 124 from `timeout` is recorded as a timed-out outcome.
 Each run appends one JSON record (tokens, estimated cost, duration, tool counts) to `<state dir>/logs/usage.jsonl`, and
@@ -325,11 +326,16 @@ All sweeps are DB-backed settings, enabled by default flags in each section, and
 
 - Workdir GC: preserved or aside workdirs older than `retention_days` (14) are deleted. A workdir holding unpushed
   commits violates 3.3.1; it is kept until `unpushed_hard_cap_days` (60) and logged as a defect, never treated as normal.
+  A `target/` directory inside any workdir older than one day is removed even when the workdir itself is kept
+  (`SPEC-3.10` item 5).
+- Cargo cache GC: a per-repo shared target directory over `cargo_cache.max_bytes_per_repo` is deleted once no run for
+  that repo is in flight (`SPEC-3.10` item 6).
 - Stream-log GC: stream logs older than `retention_days` (30); `daemon.log`, per-action `output.file` and `usage.jsonl`
   are bounded by size; snippets and `webhook-logs` have their own retention days.
 - DB retention: rows older than `retention_days` (180) are deleted from `job_outcomes`, `run_events`, `ci_failure_runs`
   and `claude_invocations`.
 - Docker GC: named Docker volumes unreferenced by any container and older than `volume_retention_days` (3) are removed.
+  The sidecar's total Docker storage is also bounded by `docker_gc.max_bytes` (`SPEC-3.11`).
 
 ### 3.9 Run comment footer (`SPEC-3.9`)
 
@@ -345,6 +351,68 @@ callers to build one themselves:
   explicitly rather than being omitted.
 - `Started:`, `Finished:` (RFC 3339, second precision) and `Duration:` (`<minutes>m <seconds>s`, or `<seconds>s` under
   a minute) lines, computed from the attempt's or run's own start time and "now" as the finish time.
+
+### 3.10 Shared Cargo target directory (`SPEC-3.10`)
+
+A run clones its repo into a fresh workdir, so a Rust repo starts with an empty `target/` and rebuilds every
+dependency. Runs of the same repo share one compiled-dependency cache instead.
+
+1. **Purpose.** Cargo keys each dependency artifact by package, version, features, profile and compiler version, so two
+   clones using the same dependency versions reuse the same compiled output in one target directory.
+2. **Location.** For each repo the runner owns `<data dir>/cache/cargo-target/<repo-slug>`. `<repo-slug>` is
+   `<owner>__<repo>` taken from the clone URL path, lowercased, with every character outside `[a-z0-9._-]` replaced by
+   `_`. Two repos never share a directory. The directory is outside `workdirs/`, so workdir GC (3.8) never reaches it.
+3. **Injection.** Every `claude` child spawned for a repo workdir, and every runner-spawned build subprocess in that
+   workdir, gets `CARGO_TARGET_DIR` set to that repo's directory. A repo that is not Rust is unaffected. If the
+   directory cannot be created or written, the attempt fails with the path and the OS error; the runner never falls
+   back to a per-workdir `target/`.
+4. **Incremental builds.** Incremental compilation stays enabled; the runner does not set `CARGO_INCREMENTAL`.
+5. **Workdir `target/`.** A workdir's `target/` is removed when the workdir is preserved or set aside, and by the
+   workdir sweep (3.8) from any workdir older than one day, including one kept for local-only work. This covers a
+   `target/` left by a build that ignored the variable (for example a project that sets its own `build.target-dir`).
+   Each removal is logged at `info` with the key, path and bytes reclaimed.
+6. **Bound.** Each repo directory has a size ceiling, `cargo_cache.max_bytes_per_repo` (default 60 GB; assume this
+   value and revise if measurement shows otherwise). A directory over its ceiling is deleted once no run for that repo
+   is in flight, on the existing GC tick, with a `warn` naming the repo, size and ceiling. The next run for that repo
+   rebuilds cold.
+7. **Concurrency.** Cargo serializes builds on one target directory, so simultaneous runs of one repo take turns
+   compiling; waiting is not a failure. Runs of different repos do not wait on each other.
+8. **Scope.** Docker builds the agent starts through `just check-docker` run in the Docker-in-Docker sidecar with their
+   own build cache (9). This requirement does not change them.
+9. **Visibility.** A run's start log line names the `CARGO_TARGET_DIR` it was given. The Status page (4.3) lists each
+   repo directory with its size and last-used time.
+10. **Management.** The Status page has a Management part listing each directory with its size, last-used time and
+    whether a run for that repo is in flight. Each row has a Delete button, and a Delete all button covers every row;
+    both ask for confirmation naming the directory and its size. A delete is a `POST` (`/status/cargo-cache/{repo-slug}/delete`
+    and `/status/cargo-cache/delete`, mirrored under `/api` as the UI's own buttons use it, 4.2). While a run for the repo
+    is in flight the delete is refused with `409` and the page shows the refusal where the person clicked. Each delete
+    is logged at `info` with the repo, path and bytes reclaimed; an I/O failure is logged at `error` and shown on the
+    page. The controls need the same authentication as the other Status page controls and add no route to the unix
+    socket.
+
+### 3.11 Sidecar Docker storage (`SPEC-3.11`)
+
+The Docker-in-Docker sidecar keeps its images, containers, build cache and named volumes in the `/var/lib/docker`
+volume (9). Only unreferenced named volumes were bounded before this requirement.
+
+1. **Measure.** The runner reads the sidecar's usage by category (images, containers, local volumes, build cache)
+   through the Docker CLI against the sidecar daemon (`tcp://127.0.0.1:2375`). A failed read is logged at `error` and
+   shown as "unknown", never as zero.
+2. **Ceiling.** The setting `docker_gc.max_bytes` (default 250 GB; assume this value and revise if measurement shows
+   otherwise) bounds the total. When it is exceeded on the Docker GC tick and no run is in flight, the runner reclaims
+   in this order and stops once under the ceiling: stopped containers older than 1 day, dangling images, build cache
+   older than 7 days, unused images older than 7 days, then unreferenced named volumes older than
+   `volume_retention_days` (3.8). A pass with a run in flight is skipped and logged.
+3. **Logging.** Each step logs the category, bytes reclaimed, and the size before and after. A failed step logs at
+   `error` and the pass continues with the next step; a failed pass is never reported as clean.
+4. **Management.** The Status page's Management part (3.10 item 10) has one row per category with its size and a Prune
+   button. A prune is a `POST` (`/status/docker/{category}/prune`, mirrored under `/api` as the UI's own buttons use it,
+   4.2), refused with `409` while any run is in flight because any run may be using the sidecar, and shown where the
+   person clicked. It logs bytes reclaimed at `info`; a failure is logged at `error` and shown. It needs the same
+   authentication as the other Status controls and adds no route to the unix socket.
+5. **Scope.** The runner never removes an image, container or volume that a running container references, never uses a
+   prune command that needs a force flag to skip its confirmation (removal is by explicit id from a listing), and never
+   touches the app's own `/data`, `/config` or `/state` volumes.
 
 ## 4. Interfaces
 
@@ -423,7 +491,7 @@ JSON or the `reason=...` urlencoded body htmx's Pause form posts; an unparseable
 pause proceeds with no reason rather than being refused. A settings `PUT` validates the body against the section's
 config struct before persisting anything: a validation failure 400s with the message and nothing is saved; a secret
 field in the response names only its `*_ref`, never its value. `/status`'s `activity` field is the same `Activity`
-snapshot (9) the `status` command and the About page's quiet indicator read, so the three cannot disagree about
+snapshot (9) the `status` command and the Status page's quiet indicator read, so the three cannot disagree about
 whether a restart is safe; its `stale_gates` and `attempt_cap_hits` are the dependency-gate (3.3) and per-key
 attempt-cap (3.1) backlogs an operator without the web UI would otherwise have no machine-readable view of.
 `/access/check` is the typed report defined in 4.6.
@@ -433,10 +501,15 @@ attempt-cap (3.1) backlogs an operator without the web UI would otherwise have n
 Pages: `/` dashboard; `/actions/new`, `/actions/new/raw`, `/actions/new/youtrack`, `/actions/new/closed-issue-summary`;
 `/actions/{name}` with `/durations`, `/events` (redirect), `/edit`, `/form`, `/export`, `/delete`; `/logs`; `/secrets` with
 rotate, delete and check; `/access`; `/settings` with per-section saves and the Claude, YouTrack, Forgejo, GitHub and git
-auth cards; `/reports`; `/about` and `/about/activity`; `/runs/{id}`; `/runs/{id}/jobs/{key}/attempt/{attempt}`;
+auth cards; `/reports`; `/status` and `/status/activity`, with `/about` and `/about/activity` redirecting permanently to
+them; `/status/cargo-cache/{repo-slug}/delete` and `/status/cargo-cache/delete`; `/status/docker/{category}/prune`; `/runs/{id}`; `/runs/{id}/jobs/{key}/attempt/{attempt}`;
 `/sse/runs/{id}/jobs/{key}/attempt/{attempt}` (live stream); `/static/htmx.min.js`, `/static/idiomorph-ext.min.js`.
 Auth routes: `/login`, `/login/2fa`, `/logout`, `/setup`, `/account/2fa/setup`, `/invite/{token}`, `/settings/accounts` with
 invite, remove and revoke.
+
+The Status page (`/status`, the former About page) carries build and version information, the quiet indicator, the
+global Pause and Resume control, the activity list, and the Management part (3.10 item 10). The nav entry "About" is
+"Status".
 
 ### 4.4 Webhooks
 
@@ -605,7 +678,7 @@ requires `secret_ref` and `write_token_ref` on every source.
 Edited on the Settings page or through `PUT /api/settings/{section}`; changes apply without restart. Fields not listed in
 3.x: `webhook.analysis_timeout_secs` (600), `webhook.analysis_concurrency` (2); `concurrency.max_parallel_global` (0 =
 largest enabled action cap); `preferences` (`locale`, `timezone`, `datetime_format`); `claude` (`model`, `effort`,
-`autocompact`); `auth` (service base URLs, secret names, git author name and email). `webhook_comment.sources.<name>`
+`autocompact`); `cargo_cache` (`enabled`, `max_bytes_per_repo`, 3.10); `docker_gc.max_bytes` (250 GB, 3.11); `auth` (service base URLs, secret names, git author name and email). `webhook_comment.sources.<name>`
 adds `allowed_permissions`, `max_files`, `max_lines`, `bot_author`, `bot_email`, `skip_marker`.
 
 ## 7. Security
@@ -997,7 +1070,8 @@ action's `token_ref`, which is injected per job.
   command.
 - Shipped action files: `youtrack.yml` (interval 5m), `audit-run.yml` (interval 5m), `closed-issue-summary.yml` (interval
   24h). `examples/release-notes.yml` (weekly, gated in its input) is an example and is not seeded into a new install.
-- Restart safety: `GET /api/status` and the About page expose a `quiet` flag that is true only when no run is open and
+- The shared Cargo target directories (`SPEC-3.10`) live under the `/data` volume, which is disk-backed.
+- Restart safety: `GET /api/status` and the Status page expose a `quiet` flag that is true only when no run is open and
   no run is dispatched.
 
 ### 9.1 Entrypoint and UID/GID remap (`SPEC-9.1`)
