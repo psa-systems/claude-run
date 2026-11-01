@@ -10,9 +10,9 @@
 # stops with a message until `NEWSLETTER_URL` and `FORGE_HOST` are yours. See docs/release-notes.md.
 #
 # On Mondays from 09:00 UTC the releases published in the last 7 days in the repos below become ONE draft edition, written
-# for customers. The daemon checks a scripted action every `regather_interval` (default 60s) whatever its `schedule.spec`
-# says, so the input itself is the gate: any other time it yields no job and makes no API call. Set `DRAFT_ANY_DAY` to
-# "true" to draft outside that window, for a test. The action only ever creates a draft (`POST <NEWSLETTER_URL>/api/v1/editions`): it never sends or
+# for customers. The cron line alone is not enough: a Monday with no releases starts no run, so the action stays due and
+# would draft when the first release of the week appears (SPEC-2.2). The input therefore also gates on the time: any other
+# time it yields no job and makes no API call. Set `DRAFT_ANY_DAY` to "true" to draft outside that window, for a test. The action only ever creates a draft (`POST <NEWSLETTER_URL>/api/v1/editions`): it never sends or
 # schedules. Adapt the post step if your newsletter system has a different API.
 #
 # The releases are read through the Forgejo API with the token fj already holds for `FORGE_HOST` (its key store), so a
@@ -157,7 +157,7 @@ limits:
   max_runs_per_day: 2
   claude_timeout_seconds: 600
   run_budget_usd: 1.00
-# Any non-manual schedule only means "check every `regather_interval`"; the Monday gate is in `input.command`.
+# With no run, the action stays due after this time; the Monday gate in `input.command` keeps it to Mondays.
 schedule:
   kind: cron
   spec: "0 9 * * MON"

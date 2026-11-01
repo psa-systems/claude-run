@@ -83,7 +83,8 @@ Edits apply live (the dashboard, run and action detail pages, the secrets table,
 ## Continuous pickup and concurrency caps (CLAUDE-162)
 
 The daemon does not serialize runs per action. An issue queued while a run is in flight is picked up by a new,
-**overlapping** run within `regather_interval` (default 60s) rather than waiting for the in-flight run to drain, and it is
+**overlapping** run once the action's `schedule` makes it due (SPEC-2.2: for `interval`, once `spec` has passed since the
+last run started) and `regather_interval` (default 60s) has elapsed, rather than waiting for the in-flight run to drain, and it is
 never blocked behind an unrelated in-flight run of another action. A manual `trigger` during an in-flight run likewise
 starts an overlapping pickup run instead of being silently dropped. Concurrency is bounded by four limits:
 
