@@ -335,6 +335,7 @@ All sweeps are DB-backed settings, enabled by default flags in each section, and
 - DB retention: rows older than `retention_days` (180) are deleted from `job_outcomes`, `run_events`, `ci_failure_runs`
   and `claude_invocations`.
 - Docker GC: named Docker volumes unreferenced by any container and older than `volume_retention_days` (3) are removed.
+  The sidecar's total Docker storage is also bounded by `docker_gc.max_bytes` (`SPEC-3.11`).
 
 ### 3.9 Run comment footer (`SPEC-3.9`)
 
@@ -388,6 +389,30 @@ dependency. Runs of the same repo share one compiled-dependency cache instead.
     is logged at `info` with the repo, path and bytes reclaimed; an I/O failure is logged at `error` and shown on the
     page. The controls need the same authentication as the other Status page controls and add no route to the unix
     socket.
+
+### 3.11 Sidecar Docker storage (`SPEC-3.11`)
+
+The Docker-in-Docker sidecar keeps its images, containers, build cache and named volumes in the `/var/lib/docker`
+volume (9). Only unreferenced named volumes were bounded before this requirement.
+
+1. **Measure.** The runner reads the sidecar's usage by category (images, containers, local volumes, build cache)
+   through the Docker CLI against the sidecar daemon (`tcp://127.0.0.1:2375`). A failed read is logged at `error` and
+   shown as "unknown", never as zero.
+2. **Ceiling.** The setting `docker_gc.max_bytes` (default 250 GB; assume this value and revise if measurement shows
+   otherwise) bounds the total. When it is exceeded on the Docker GC tick and no run is in flight, the runner reclaims
+   in this order and stops once under the ceiling: stopped containers older than 1 day, dangling images, build cache
+   older than 7 days, unused images older than 7 days, then unreferenced named volumes older than
+   `volume_retention_days` (3.8). A pass with a run in flight is skipped and logged.
+3. **Logging.** Each step logs the category, bytes reclaimed, and the size before and after. A failed step logs at
+   `error` and the pass continues with the next step; a failed pass is never reported as clean.
+4. **Management.** The Status page's Management part (3.10 item 10) has one row per category with its size and a Prune
+   button. A prune is a `POST` (`/status/docker/{category}/prune`, mirrored under `/api` as the UI's own buttons use it,
+   4.2), refused with `409` while any run is in flight because any run may be using the sidecar, and shown where the
+   person clicked. It logs bytes reclaimed at `info`; a failure is logged at `error` and shown. It needs the same
+   authentication as the other Status controls and adds no route to the unix socket.
+5. **Scope.** The runner never removes an image, container or volume that a running container references, never uses a
+   prune command that needs a force flag to skip its confirmation (removal is by explicit id from a listing), and never
+   touches the app's own `/data`, `/config` or `/state` volumes.
 
 ## 4. Interfaces
 
@@ -477,7 +502,7 @@ Pages: `/` dashboard; `/actions/new`, `/actions/new/raw`, `/actions/new/youtrack
 `/actions/{name}` with `/durations`, `/events` (redirect), `/edit`, `/form`, `/export`, `/delete`; `/logs`; `/secrets` with
 rotate, delete and check; `/access`; `/settings` with per-section saves and the Claude, YouTrack, Forgejo, GitHub and git
 auth cards; `/reports`; `/status` and `/status/activity`, with `/about` and `/about/activity` redirecting permanently to
-them; `/status/cargo-cache/{repo-slug}/delete` and `/status/cargo-cache/delete`; `/runs/{id}`; `/runs/{id}/jobs/{key}/attempt/{attempt}`;
+them; `/status/cargo-cache/{repo-slug}/delete` and `/status/cargo-cache/delete`; `/status/docker/{category}/prune`; `/runs/{id}`; `/runs/{id}/jobs/{key}/attempt/{attempt}`;
 `/sse/runs/{id}/jobs/{key}/attempt/{attempt}` (live stream); `/static/htmx.min.js`, `/static/idiomorph-ext.min.js`.
 Auth routes: `/login`, `/login/2fa`, `/logout`, `/setup`, `/account/2fa/setup`, `/invite/{token}`, `/settings/accounts` with
 invite, remove and revoke.
@@ -653,7 +678,7 @@ requires `secret_ref` and `write_token_ref` on every source.
 Edited on the Settings page or through `PUT /api/settings/{section}`; changes apply without restart. Fields not listed in
 3.x: `webhook.analysis_timeout_secs` (600), `webhook.analysis_concurrency` (2); `concurrency.max_parallel_global` (0 =
 largest enabled action cap); `preferences` (`locale`, `timezone`, `datetime_format`); `claude` (`model`, `effort`,
-`autocompact`); `cargo_cache` (`enabled`, `max_bytes_per_repo`, 3.10); `auth` (service base URLs, secret names, git author name and email). `webhook_comment.sources.<name>`
+`autocompact`); `cargo_cache` (`enabled`, `max_bytes_per_repo`, 3.10); `docker_gc.max_bytes` (250 GB, 3.11); `auth` (service base URLs, secret names, git author name and email). `webhook_comment.sources.<name>`
 adds `allowed_permissions`, `max_files`, `max_lines`, `bot_author`, `bot_email`, `skip_marker`.
 
 ## 7. Security
