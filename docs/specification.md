@@ -310,7 +310,8 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
   process-wide registry (no cross-process cancellation; only a run inside the same daemon process can be cancelled).
   Tripping it, in order: the in-flight `claude` child is sent SIGTERM then, after a grace period, SIGKILL to its whole
   process group (3.2); the job still in flight runs its `post` phase with a synthesized cancelled result; the run loop
-  stops dispatching further jobs and finalizes with exit code 130.
+  stops dispatching further jobs, and a job still waiting for a concurrency permit stops without waiting for one, and
+  finalizes with exit code 130.
 - Readiness has two not-ready kinds: `no_credential` and `login_required`. A credential counts, in this order: an
   agent-config-dir `.credentials.json` file (the host login, or one a container `/setup` sign-in wrote), a stored
   Anthropic API key (Settings -> Auth), or `ANTHROPIC_API_KEY` in the daemon's own environment; none of the three
