@@ -380,8 +380,8 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
 - Accepts Action-run deliveries (Forgejo `action_run_*`, GitHub `workflow_run`). Only a failure for an allow-listed
   repository is processed. A `success` or `recover` action goes to the automerge pipeline. A `pull_request` delivery
   with action `closed` reconciles recorded agent PRs; other PR actions are acknowledged and dropped.
-- Processing: fetch the job logs (`fj actions logs`), redact secrets, fingerprint the failure, store it in
-  `ci_failures`, then triage into a bucket and act:
+- Processing: fetch the job logs (`fj actions logs`), redact secrets, fingerprint the failure (3.5.2), match or store it
+  in `ci_failures`, then triage into a bucket (3.5.1) and act:
   - `code_fix`: create a tracker issue; set the queued value only when `webhook.auto_fix` is true.
   - `auto_fix`: set only by deterministic detectors (`cargo-fmt` signature; failing workflows named in
     `mint.auto_fix.checks_workflows`, default `check.yml`) when the failing branch has no open PR; skipped when
@@ -389,9 +389,12 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
   - `human_action`: create an issue assigned to `mint.human_assignee` when set, no queue.
   - `transient`: no issue. An infrastructure failure kind is stored on the failure row.
 - Branches matching `mint.bot_branch_prefixes` (default `renovate/`) never route to `code_fix` or `auto_fix`.
-- Failures from logins listed in `mint.bot_logins` do not mint (loop safety). Open-PR routing: a failure on the agent's own
-  open PR requeues its issue until `webhook.agent_pr_fix_attempts` (default 3) is reached, then the issue is set to
-  needs-review; a failure on a human's PR is commented on that PR.
+- `mint.bot_logins` is not a mint-time loop guard: loop safety is the open-PR routing below, decided from the
+  `agent_pull_requests` store (3.5.2) before a failure on the agent's own PR ever reaches the mint. `bot_logins` is
+  read only by the comment-command webhook (3.6). Open-PR routing: a failure on the agent's own open PR requeues its
+  issue until `webhook.agent_pr_fix_attempts` (default 3) is reached, then the issue is set to needs-review; a
+  failure on a human's PR is commented on that PR; a resolved match reopens as a regression, comments the run and
+  its failing tests, and is re-triaged so `AI Agent` is set exactly as a freshly minted issue of that bucket would.
 - Issues are created in the project whose VCS integration claims the repository, with `mint.repo_project_map` consulted
   first and `mint.fallback_project` (default `CLAUDE`) last. State on creation is `mint.target_state` (default `To do`).
   The redacted log is attached.
@@ -399,6 +402,59 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
   counter.
 - The whole mint pipeline degrades to log-only (no tracker issue created) when no YouTrack/Forgejo/GitHub backend is
   usable, or its on-disk analysis directory cannot be created.
+
+#### 3.5.1 Triage classification (`SPEC-3.5.1`)
+
+Hybrid: a cheap deterministic pass runs first and only the residue it cannot label reaches the LLM.
+
+- Deterministic rules, in order: a log that could not be fetched at all routes to `human_action` (never silently
+  dropped as transient), naming the reason; a job the runner skipped (`Skipping job '...' due to '...'`, its
+  workflow `if` guard evaluated false) routes to `transient`, since nothing ran; a `runner-unavailable` infrastructure
+  condition (below) routes to `human_action`; a curated set of transient/infra log substrings (no runner available,
+  registry 401/429/manifest-unknown, connection reset/refused, DNS/TLS timeouts, 502/503/504) routes to `transient`
+  with no LLM call.
+- A branch matching `mint.bot_branch_prefixes` always routes to `human_action` before auto-fix or the classifier run:
+  the owning bot force-pushes/rebases that branch on its own schedule, so a fix pushed there would be wiped.
+- Deterministic auto-fix detectors (cargo-fmt signature; a failing workflow named in `mint.auto_fix.checks_workflows`)
+  run next, only when the failing branch has no open PR, and only when `mint.auto_fix.enabled`; a match routes to
+  `auto_fix` with no LLM call.
+- The residue goes to one tool-using `claude` session (`Read,Grep,Bash`) over the complete redacted log plus the
+  failing workflow YAML, ending with a fenced JSON verdict: `code_defect` maps to `code_fix`, `needs_human` to
+  `human_action`, and `flaky` / `infra` both to `transient`. An unparseable or missing verdict, or a session that does
+  not complete, degrades to `human_action` and is logged; it must never become `code_fix` on its own. The session's
+  Markdown report becomes the minted issue's analysis text, capped at 24 KiB.
+- Infrastructure-failure detection (a full disk, an out-of-memory kill, or an unreachable package/container registry)
+  is deterministic phrase matching over the complete log, most-specific-first, case-insensitive, with cargo's own
+  test-result and `failures:` lines stripped first so a test NAMED after a detector phrase can never match. The
+  matched `kind` id (not the matched line or its wording) is what downstream dedupe hashes, so two differently-worded
+  reports of the same host condition collapse identically; an undetected condition is the deliberately preferred
+  failure mode over a false positive that would merge two unrelated code failures across branches.
+
+#### 3.5.2 CI-failure store and dedupe (`SPEC-3.5.2`)
+
+- `ci_failures` (one row per distinct failure, keyed on `(repo, workflow_id, job_name)`), `ci_failure_tests` (its
+  failing-test fingerprint), `ci_failure_runs` (one row per sighting: commit, branch, PR number, timestamp), and
+  `agent_pull_requests` (every PR the runner's own `youtrack` action opens, carrying `fix_attempts` and a `salvaged`
+  flag) replace a YouTrack full-text search for dedupe: an unindexed issue is invisible to that search, and a
+  failure every PR inherits from `main` would otherwise mint one issue per PR.
+- The fingerprint is the sorted, deduplicated `<target>::<test>` ids parsed from cargo test output (a target that
+  failed to build or run at all, with no parsed test, contributes a bare `<target>` id), or `infra:<kind>` when the
+  infrastructure detector (3.5.1) matches, or a single normalized first-diagnostic-line signature when neither
+  parses anything.
+- A failure matches an existing `ci_failures` row by failing-test id overlap within the same `(repo, workflow_id,
+  job_name)`, preferring `open` over `resolved` over `pr_only` and the newest on a tie.
+- A hidden `Dedupe-Key:` marker in the issue body (searched only by the legacy-adoption lookup, for an issue minted
+  before this store existed; nothing else searches YouTrack for it) carries three hashed markers: a primary key
+  `(repo, run index)` for webhook-redelivery idempotency, a secondary key `(repo, commit, workflow)` kept for
+  back-compat with issues minted before the root-cause key existed, and the cross-run collapse key, which is either
+  the root-cause key `(repo, branch, workflow, job, failure signature)` (falling back to `(repo, branch, workflow,
+  job)` when no signature is derivable) or, when an infrastructure condition was detected, the branch-agnostic
+  `(repo, workflow, job, infra kind)` key in its place: a host condition is identical on every branch and is not
+  fixable on any of them, so it must collapse onto one issue across every PR branch it hits, while two unrelated code
+  failures on two branches must never merge.
+- `agent_pull_requests` tracks every PR the runner's own `youtrack` action opens so a re-queued issue continues that
+  same branch (3.3.1) instead of opening a second PR, and so the open-PR loop-safety routing (3.5) can bump and read
+  back a fix-attempt counter keyed on the PR rather than on a login.
 
 ### 3.6 Comment-command webhook
 
