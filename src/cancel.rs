@@ -18,12 +18,19 @@
 //! A `std::sync::Mutex` (not the tokio one) guards the map: every operation is
 //! a trivial, non-blocking map lookup, so no lock is ever held across an
 //! `.await`, and [`RegistryGuard`] can unregister from a `Drop` impl.
+//!
+//! SPEC-3.7: process-wide cancellation tokens, no cross-process cancellation;
+//! SIGTERM then grace then SIGKILL on the whole process group; a synthesized
+//! cancelled `post` result; exit 130.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub use tokio_util::sync::CancellationToken;
 
+/// SPEC-3.7: process-wide, in-memory cancellation registry; no cross-process
+/// cancellation.
+///
 /// Process-wide map of in-flight `run_id` -> its cancellation token. Cheap to
 /// clone (the map lives behind an `Arc`); the daemon hands the same handle to
 /// both the dispatcher (registers) and the API state (cancels).
@@ -64,6 +71,9 @@ impl RunRegistry {
         }
     }
 
+    /// SPEC-2.2: the shutdown path trips every in-flight run's token before
+    /// waiting for the run registry to drain.
+    ///
     /// Trip every in-flight run's token at once, for graceful
     /// shutdown. Returns the run ids that were signalled (arbitrary order).
     /// Each tripped run tears down through the same path as a single cancel:
@@ -78,6 +88,9 @@ impl RunRegistry {
         map.keys().copied().collect()
     }
 
+    /// SPEC-2.2: the drain check the shutdown path polls after
+    /// [`Self::cancel_all`].
+    ///
     /// True when no run is registered, i.e. every in-flight run has finalized
     /// and unregistered. The shutdown path polls this to know the cancel
     /// requests it issued have drained.
