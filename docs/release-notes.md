@@ -27,7 +27,7 @@ Everything is done in the web UI; the deployment needs no change.
 
 ## When it runs
 
-The daemon checks a scripted action every `regather_interval` (default 60s), whatever its `schedule.spec` says, so the example's `input.command` holds the schedule: on Mondays from 09:00 UTC it reads the releases, and at any other time it yields no job and makes no API call. A Monday the instance was down carries over to the next one.
+The cron line makes the action due at Monday 09:00 UTC, but a Monday with no releases starts no run, so the action stays due and is checked every `regather_interval` (default 60s). So that it does not draft when the first release of the week appears, the example's `input.command` also gates on the time: on Mondays from 09:00 UTC it reads the releases, and at any other time it yields no job and makes no API call. A Monday the instance was down carries over to the next one.
 
 To draft at another time, for a test, set `DRAFT_ANY_DAY` to `"true"` in the action's `env` block, trigger it, and set it back. Mind the one draft per week below.
 
