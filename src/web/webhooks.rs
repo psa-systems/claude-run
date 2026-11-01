@@ -1303,7 +1303,7 @@ async fn source_log_token(
     }
 }
 
-/// Open the `runs` row for one webhook event and stamp its
+/// SPEC-4.4.1: shared primitive opening the `runs` row for one webhook event and stamping its
 /// single planned job key. Also registers the job in-flight (so the
 /// run-detail badge reads `running`, not `queued`, for the whole pipeline) and
 /// sets the initial stage. Stores the event's `html_url` as the
@@ -5051,7 +5051,8 @@ async fn mark_agent_pr_merged(
     }
 }
 
-/// The reconciler backstop for a missed, dropped, or too-early
+/// SPEC-3.3.1: the 300-second reconciler that "drive[s] the decision for recorded agent PRs"
+/// alongside action-success webhooks, backstopping a missed, dropped, or too-early
 /// Action Run success webhook. Runs on its own tick (`daemon::automerge_reconciler_loop`),
 /// independent of any webhook delivery: lists every `agent_pull_requests` row
 /// still `open` and, for each, calls the exact same [`apply_automerge_decision`]

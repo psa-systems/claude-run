@@ -39,7 +39,7 @@ pub mod comment_webhooks;
 pub mod native_forms;
 pub mod webhooks;
 
-/// Custom Askama filters. `{{ ts | datetime }}` renders a stored
+/// SPEC-6.3: custom Askama filters. `{{ ts | datetime }}` renders a stored
 /// RFC3339 UTC timestamp string through the live display preferences (timezone +
 /// strftime format). Askama filters are free functions, so the preferences come
 /// from the process-global snapshot kept current by `LiveSettings`. Malformed

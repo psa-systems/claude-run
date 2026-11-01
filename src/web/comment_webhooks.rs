@@ -194,7 +194,7 @@ pub enum CommandKind {
     Run { instruction: String },
 }
 
-/// The typed command emitted downstream for a verified, allow-listed, triggered
+/// SPEC-4.4.5: the typed command emitted downstream for a verified, allow-listed, triggered
 /// comment. Everything the consumer needs; no request state travels with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedCommentCommand {
@@ -968,7 +968,7 @@ async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
     }
 }
 
-/// True when serving this command consumes an attempt / daily-ledger slot. Help
+/// SPEC-4.4.5: true when serving this command consumes an attempt / daily-ledger slot. Help
 /// and the oversize refusal reply and stop: no clone, no Claude run, and no
 /// attempt counted. Only a real instruction runs work.
 pub fn counts_attempt(kind: &CommandKind) -> bool {
@@ -2512,7 +2512,7 @@ async fn finish_comment_run(
     spend.finish(Some(run_id), exit_code);
 }
 
-/// Root the per-command credential dirs live under. One directory per command,
+/// SPEC-4.4.5: root the per-command credential dirs live under. One directory per command,
 /// removed when its [`secrets::JobCredentials`] guard drops.
 pub fn creds_root(paths: &Paths) -> PathBuf {
     paths.runtime_dir.join("comment-creds")
