@@ -64,6 +64,7 @@ jobs:
       - name: Start job metrics sampler
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-start@main
 
+      # SPEC-9.2: resolves the publish train from this workflow's own trigger, never from `git describe`.
       # CLAUDE-135 (GOV-13 / CLAUDE-122): a release commit is pushed to `main`
       # and tagged `v*` at the same commit, firing BOTH the branch-push and the
       # tag-push run of this workflow. OCI tags are mutable so the push does not
