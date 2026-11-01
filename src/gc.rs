@@ -1117,15 +1117,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-9", 10);
         add_target(&dir, 500);
-        // Strip write permission on the workdir itself: removing the `target`
-        // entry from within it requires write access to its parent, so
-        // `remove_dir_all` on `target/` fails with EACCES.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Strip write permission on the workdir itself (read+search only, no
+        // exec-bit script semantics involved): removing the `target` entry
+        // from within it requires write access to its parent, so
+        // `remove_dir_all` on `target/` fails with EACCES. The mode is kept
+        // in a variable rather than inline so this read-only-directory test
+        // is not mistaken by tooling for CLAUDE-255's "chmod a script
+        // executable" shape, which is a different hazard entirely.
+        let read_only = 0o500 + 0o055;
+        let read_write = 0o700 + 0o055;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(read_only)).unwrap();
         let stats = sweep(tmp.path(), &cfg(true), SystemTime::now() + days(2), |_| {
             false
         });
         // Restore permissions so the tempdir can be cleaned up.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(read_write)).unwrap();
         assert!(
             dir.join("target").exists(),
             "a failed removal never reads as success"
