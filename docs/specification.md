@@ -360,7 +360,136 @@ rotate, delete and check; `/access`; `/settings` with per-section saves and the 
 auth cards; `/reports`; `/about` and `/about/activity`; `/runs/{id}`; `/runs/{id}/jobs/{key}/attempt/{attempt}`;
 `/sse/runs/{id}/jobs/{key}/attempt/{attempt}` (live stream); `/static/htmx.min.js`, `/static/idiomorph-ext.min.js`.
 Auth routes: `/login`, `/login/2fa`, `/logout`, `/setup`, `/account/2fa/setup`, `/invite/{token}`, `/settings/accounts` with
-invite, remove and revoke.
+invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src/auth.rs` are specified separately
+(`SPEC-7`), this section's subsections cover only the pages owned by `src/web/mod.rs`, `src/web/native_forms.rs`,
+`src/report.rs` and `src/paint.rs`.
+
+#### 4.3.1 Dashboard and run search (`SPEC-4.3.1`)
+
+- The dashboard lists every configured action plus the two always-present synthetic rows (`audit-run`,
+  `closed-issue-summary` reporting), each annotated with its live pause/readiness/dependency-gate state and its most
+  recent run; a synthetic row that resolves disabled hides itself rather than rendering a dead trigger button.
+- Job search matches a free-text needle against job keys and, when given, the matching portion of the job's stream log
+  (a short snippet around the first match), filterable by action, trigger source and a recent-run window.
+- The duration and plan-usage charts on the dashboard are built from the same `report::` series the Reports page uses,
+  scaled to the widget's own bar/line geometry rather than the page's full chart.
+
+#### 4.3.2 Action detail, durations and events (`SPEC-4.3.2`)
+
+- `/actions/{name}/events` is a redirect to the dashboard's events view scoped to that action, not a page of its own.
+- The events view's level/action/context filters are populated from the distinct values actually present in
+  `run_events`, not a fixed list, so a filter never offers a value with zero matching rows.
+- `/actions/{name}/durations` charts one action's own run-duration history; an action with no runs yet renders the page
+  with an empty chart rather than 404ing.
+
+#### 4.3.3 Action create, edit, export and delete (`SPEC-4.3.3`)
+
+- `/actions/new/raw` and `/actions/{name}/edit` both validate the submitted YAML with the same `validate_str` path the
+  loader uses and re-index the action on a successful save; a rejected save re-renders the editor with the validation
+  message instead of discarding the submission.
+- `/actions/{name}/delete` and `/actions/{name}/export` operate on the file indexed for that action name, resolved
+  through the action index rather than a path built from the name directly, so a deleted or renamed file on disk cannot
+  be reached through a stale name.
+- A synthetic action (`audit-run`, `closed-issue-summary` reporting) rejects edit, export and delete: there is no file
+  backing it to touch.
+
+#### 4.3.4 Native action editor forms (`SPEC-4.3.4`)
+
+- A kind with a structured editor (`youtrack`, `closed-issue-summary`) is edited through `GET`/`POST
+  /actions/{name}/form` and created through `GET`/`POST /actions/new/{kind}`, instead of the raw YAML editor; a kind
+  with no structured editor (`scripted`) has no `/form` route and uses the raw editor only.
+- Every submitted form is serialized to YAML and run through the same `validate_str` + write + re-index path the raw
+  editor uses, so a structured save can never write a file the raw editor would reject; a rejected save re-renders the
+  form inline with the validation message rather than discarding the submission.
+- An edit overlays only the fields the form owns onto the existing YAML mapping: every key the structured editor does
+  not expose (for example `dedup_key`, `concurrency`, or a hand-written `claude:` block on a kind that runs no agent
+  session) is left untouched.
+- A checkbox absent from the submitted body is a false value, never a fallback to the loaded action's or the kind's
+  default; a cleared text field whose config key has a documented default is written back as that default rather than
+  as an empty string, and a cleared field with no default removes the key instead.
+- The new-action filename is derived from the posted name through `safe_action_stem` (letters, digits, `-`, `_`, `.`
+  only); a save is rejected if that file already exists rather than silently overwritten.
+- If the on-disk YAML for an action being edited fails to parse, the save is rejected with a message pointing at the
+  raw editor rather than silently treated as an empty mapping.
+
+#### 4.3.5 Logs page (`SPEC-4.3.5`)
+
+- `/logs` renders `run_events` filtered by level, action and context, windowed to a configurable recent period, newest
+  first.
+
+#### 4.3.6 Secrets page (`SPEC-4.3.6`)
+
+- A secret name is restricted to a safe identifier charset; `/secrets` create, rotate and delete all reject a name
+  outside that charset before touching the store.
+- Rotating or deleting a secret still in use by an action's `token_ref` or the `auth` settings is allowed; the page
+  does not track or block on referential use.
+- The secrets page never renders a stored secret's value, only its name and `last_used_at`; `check` (`SPEC-7.1`)
+  reports whether a name resolves, not what it resolves to.
+
+#### 4.3.7 Access page (`SPEC-4.3.7`)
+
+- `/access` runs the same typed report as `access check` / `POST /api/access/check` (`SPEC-4.2`) and renders it as a
+  page instead of JSON.
+
+#### 4.3.8 Settings page and service auth cards (`SPEC-4.3.8`)
+
+- Each settings section (`SPEC-6.3`) saves independently; saving one section never touches another section's stored
+  value, and a save takes effect without a daemon restart.
+- The Claude, YouTrack, Forgejo, GitHub and git auth cards each validate and materialize their own credential
+  (`SPEC-7.3`) on save; a card left blank clears that credential's configured secret reference rather than leaving a
+  stale reference pointed at a deleted secret.
+- The email test action (`auth_test_email`) sends a real test message through the configured SMTP settings and
+  reports delivery failure inline, without persisting anything.
+- The Claude login card starts, submits a code to, and can cancel, the interactive broker session (`SPEC-7.5`); the
+  rendered banner reflects the broker's own session state, not a separate poll of `claude auth status`.
+
+#### 4.3.9 About and activity pages (`SPEC-4.3.9`)
+
+- `/about` and `/about/activity` render the version, build metadata and the same `quiet` restart-safety flag `GET
+  /api/status` exposes (`SPEC-9`), plus a recent-activity feed across all actions.
+
+#### 4.3.10 Run detail, job stream and live SSE (`SPEC-4.3.10`)
+
+- `/runs/{id}` 404s an unknown run id, otherwise lists its jobs sortable by key, outcome, duration and cost, each
+  linked through the action's configured `link_template` (falling back to a bare issue-key heuristic when none is
+  set) so a job key that looks like a tracker issue becomes a clickable link.
+- `/runs/{id}/jobs/{key}/attempt/{attempt}` resolves the attempt's on-disk stream-log path and renders it with the
+  run's blocker signature, if any, rendered through the same link-template resolution.
+- `/sse/runs/{id}/jobs/{key}/attempt/{attempt}` is a server-sent-events feed over that same on-disk `.jsonl` log: it
+  404s an unknown run, waits briefly for the file to appear on a still-running job, reports a permanently absent file
+  as `stream-log-gone` on an ended run versus `no-stream-yet` on a live one, resumes from `Last-Event-ID` (or a
+  `lastEventId` query parameter on a manual reconnect) by line index, and closes with a `done` event on a `type:
+  result` line or a matching `job_outcomes` row.
+- Each SSE line carries a server-formatted `ts_fmt` alongside its raw `ts` (the browser cannot run the daemon's
+  strftime), honoring the operator's configured locale/timezone/datetime format (`SPEC-6.3`); a line that is not a JSON
+  object, or carries no string `ts`, passes through unchanged.
+
+#### 4.3.11 Static assets (`SPEC-4.3.11`)
+
+- `/static/htmx.min.js` and `/static/idiomorph-ext.min.js` are served from the binary's own embedded copy, not fetched
+  from a CDN, with a one-year immutable cache-control header so the browser never re-requests them.
+
+#### 4.3.12 Web error responses (`SPEC-4.3.12`)
+
+- Every fallible page handler returns one `WebError` type: a status code plus a plain message, with `From`
+  conversions from the error types handlers actually hit (the crate's own error, a database error, a filesystem
+  error, a template error), so a stray `?` can never bypass the page's error rendering. A `WebError` renders as a
+  plain-text response at its status code.
+
+#### 4.3.13 Reports page and aggregation (`SPEC-4.3.13`)
+
+- `/reports` and its JSON siblings `GET /report/{summary,daily,weekly,by-weekday,by-hour}` (`SPEC-4.2`) share one
+  aggregation layer (`src/report.rs`); the `range` (`30d`, `90d`, other values mean all time) and `action` query
+  parameters filter every series identically.
+- `daily_ledger` is already local-dated and is the source for the daily and weekly spend/run-count series;
+  `job_outcomes.ts` and `runs.started_at`/`ended_at` are UTC and are converted to the daemon's local timezone before
+  weekday/hour bucketing.
+- `by-weekday` and `by-hour` always return a fixed 7- or 24-bucket series (Sunday first, respectively `0..=23`), even
+  when a bucket has no data, rather than omitting an empty bucket.
+- The top-line `summary` totals spend and run count from `daily_ledger` and run minutes from `runs` (the only table
+  with both a start and an end timestamp; a run with a NULL `ended_at` is excluded from the minutes total).
+- The Claude plan-usage chart reads its series oldest first (so the chart draws left to right); the most-recent-
+  invocations table is a separate newest-first query capped at 20 rows, not a reverse-and-slice of the chart's rows.
 
 ### 4.4 Webhooks
 
@@ -380,6 +509,92 @@ configured for a different provider, or a disabled listener returns 404. Pipelin
    `replay_window_secs` (default 300, shared across both listeners): 409.
 5. Event type header (`X-Forgejo-Event` / `X-GitHub-Event`) selects the handler. Unparseable payload: 400.
 6. Accepted failure events: 202. Authenticated events that are not actionable: 200 and dropped.
+7. Two gates run between replay (point 4) and event dispatch (point 5), both accept-and-drop (2xx) rather than reject:
+   a hit on global pause, the action's own pause, or a failed pause read; and a configured Claude login that needs
+   renewing. Both still record the delivery id as seen, since a retry could not help either way.
+
+#### 4.4.1 Ingress pipeline, types and shared primitives (`SPEC-4.4.1`)
+
+- `WebhookProvider` (`forgejo` or `github`, the `{provider}` path segment) owns its own signature header, delivery-id
+  header, event-type header and signature-verification scheme; both providers share the pipeline in SPEC-4.4 (auth,
+  replay, rate limit, pause) and converge on the same internal event types downstream.
+- A GitHub delivery sent with GitHub's default content type arrives form-encoded (`payload=<url-encoded JSON>`); it is
+  decoded back to raw JSON only after signature verification, since the signature covers the original raw body.
+- A GitHub `workflow_run` delivery is mapped onto the same internal action-run payload shape a Forgejo Action-run
+  delivery produces, so one dispatch path serves both forges.
+- One fixed-window rate limiter is built per configured source, so one source exhausting its budget never 429s
+  another.
+
+#### 4.4.2 CI-failure triage and mint dispatch (`SPEC-4.4.2`)
+
+- Before triage runs, a failing run's fingerprinted tests are checked against the `ci_failures` store: a match on an
+  `open` row attaches a new sighting with no `claude` call and no mint; a match on a `resolved` row reopens it and
+  re-triages it as a regression; no match falls through to classification, after one legacy-adoption lookup (an issue
+  minted before the store existed).
+- Whether the failing commit sits on an open PR is resolved before the store-match dispatch; a lookup failure here is
+  a routing failure, never silently folded into "no open PR" the way the advisory open-PR check fed to the classifier
+  degrades to `false` on a lookup failure or an underivable forge host.
+- An issue's live YouTrack `State` is re-checked before treating an `open` store row's reappearance as a regression,
+  so the store never reopens an issue the resolve-on-merge workflow (`SPEC-3.3.1`) already closed; a `State` read
+  failure is never read as "still open".
+- A fresh mint or a legacy adoption records a new `ci_failures` row together with its failing tests and the
+  triggering run; the caps/attempt ledger advances only on a genuine new mint, never on an attach or a reopen.
+
+#### 4.4.3 PR-comment routing and automerge (`SPEC-4.4.3`)
+
+- A PR comment is posted through credentials materialized and scoped to the call (`SPEC-7.2`), using the GitHub or
+  Forgejo backend the source is configured for.
+- A failure on the agent's own open PR either re-queues the issue or, past a fix-attempt ceiling, flags it `Needs
+  Review`; a re-queue is suppressed in favor of `Needs Review` when the new failure's fingerprint set repeats the
+  immediately preceding attempt (the loop-breaker).
+- A failure on a human-authored open PR routes by whether its tests overlap an existing `ci_failures` row: an open
+  match attaches (after re-checking the issue is not already resolved); a resolved match reopens and comments; a
+  `pr_only` match on a second distinct branch promotes to a real minted issue, pointing the existing row at the new
+  issue rather than duplicating it, and comments the issue link onto every open PR the failure was sighted on; a
+  first sighting records a `pr_only` row and always comments the PR, minting no issue yet.
+- On an automerge conflict (an `update_pr_branch` failure), a configured conflict-auto-resolve dispatch sends a
+  synthetic command to the comment listener (`SPEC-4.4.5`) instead of leaving a "needs a human" comment.
+- An automerge outcome (conflict dispatch, behind-base update/merge, or clean merge) is recorded and its comment
+  posted exactly once per decision, guarded against double-posting.
+
+#### 4.4.4 Action-run success and pull-request delivery consumption (`SPEC-4.4.4`)
+
+- A verified terminal (`closed`) pull-request delivery and a verified `success`/`recover` Action-run delivery are
+  each dispatched onto their own channel; with no channel configured the handler acks and drops with a log rather than
+  failing the delivery.
+- A merged agent PR records the outcome and leaves the issue `State` to the YouTrack resolve-on-merge workflow
+  (`SPEC-3.3.1`); a closed-but-unmerged agent PR records the outcome so it stops counting toward open-PR routing.
+- A success/recover event resolves to its agent PR, if any, and re-triggers the SPEC-4.4.3 automerge decision now
+  that a check just went green.
+- A repository-level fault (for example an unreachable forge) notifies every open agent PR tracked for that
+  repository rather than failing silently per event.
+
+#### 4.4.5 Comment-command webhooks (`SPEC-4.4.5`)
+
+`POST /webhooks/{provider}/comment/{source}` is a second, independent listener sharing the pipeline mechanics in
+SPEC-4.4 (provider/source resolution, rate limit, HMAC verify, delivery/replay, pause gate) and the same replay store,
+rate-limiter type and allow-list matcher as the triage listener, but its own write token and pause switch. A GitHub
+delivery that is not `issue_comment` (except `ping`) is acked and dropped before parsing.
+
+- A comment is a command only when its first line opens with the configured `trigger` followed by whitespace or
+  end-of-line; an empty or `help` instruction is a help request, and one over `max_instruction_chars` is refused by
+  name. A delivery is dropped (2xx, logged, never a command) when its action is not `created`, its repository is not
+  allow-listed, or its author is a configured bot login.
+- Authorization is a live read of the commenter's repository permission against the forge, never cached; the read
+  failing, or ranking below `allowed_permissions`, denies (fail closed). A synthetic (runner-dispatched) command skips
+  only this check. At most one denial reply is sent per (repository, commenter) per window.
+- A comment command is one-shot: its effective per-key attempt cap is one, and that same counter is the redelivery
+  guard, keyed by a hash of (repository, PR/issue number, comment id). Admission also checks the shared daily run
+  ledger. A refusal before admission (login required, over cap) advances no counter and runs no `claude`, and replies
+  naming the reason. At most one comment job per thread runs at a time; a second command is told so and dropped.
+- A pull-request command clones the PR's head branch, writes the instruction verbatim to a file outside the work
+  tree, runs Claude, then a decision gate classifies the result as no changes, unresolved conflicts, a measurement
+  failure, too big (over `max_files` / `max_lines`), or a push; only a push pushes and posts a push comment
+  (`SPEC-4.4.4`-adjacent, `CLAUDE-447`).
+- A plain-issue command clones nothing and runs no agent: it mints a YouTrack issue carrying the instruction verbatim,
+  sets `State` then the `AI Agent` field to the queued value last, and replies naming the minted key.
+- Every outcome replies on the originating thread; a served command records one `job_outcomes` row and finalizes
+  through the run guard.
 
 ### 4.5 MCP tools
 
