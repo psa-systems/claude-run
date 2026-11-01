@@ -596,7 +596,7 @@ impl Daemon {
             pool: pool.clone(),
             snippet: Arc::new(snippet),
             claude: claude.clone(),
-            in_flight,
+            in_flight: in_flight.clone(),
             keygate,
             gather: GatherGate::new(),
             runs,
@@ -639,10 +639,18 @@ impl Daemon {
         ));
 
         // Sweep unused named volumes from the sidecar's Docker daemon older
-        // than the configured window. Nothing ever removed them, and a
-        // deployment can fill its Docker data directory this way (CLAUDE-433).
-        // Same cadence and live-config shape as the sweeps above.
-        let docker_gc_task = tokio::spawn(docker_gc_loop(settings.docker_gc_handle()));
+        // than the configured window, and (SPEC-3.11, CLAUDE-516) reclaim the
+        // rest of the sidecar's storage (stopped containers, images, build
+        // cache) once the measured total exceeds `docker_gc.max_bytes`.
+        // Nothing ever removed any of this, and a deployment can fill its
+        // Docker data directory this way (CLAUDE-433). Same cadence and
+        // live-config shape as the sweeps above; skipped while any run is in
+        // flight since a run may be using the sidecar.
+        let docker_gc_task = tokio::spawn(docker_gc_loop(
+            pool.clone(),
+            in_flight.clone(),
+            settings.docker_gc_handle(),
+        ));
 
         // The status probe. Detects an expired/revoked login even between
         // invocations (a quiet action, or an invalid API key, which never trips
@@ -1878,14 +1886,25 @@ async fn retention_loop(
     }
 }
 
-/// SPEC-3.8: periodic Docker volume GC on the hourly tick.
+/// SPEC-3.8 / SPEC-3.11: periodic Docker volume GC and storage-ceiling
+/// reclaim on the hourly tick.
 ///
-/// Periodic Docker sidecar volume GC, on the [`GC_TICK_SECS`] cadence the
-/// other sweeps use. The interval's first tick fires immediately, so a sweep
-/// runs on serve start; the config is read off the shared handle per tick so a
+/// Periodic Docker sidecar GC, on the [`GC_TICK_SECS`] cadence the other
+/// sweeps use. The interval's first tick fires immediately, so a pass runs on
+/// serve start; the config is read off the shared handle per tick so a
 /// Settings save applies on the next pass. Talking to the Docker daemon is
 /// blocking I/O (subprocess calls), so it runs on a blocking thread.
-async fn docker_gc_loop(cfg: Arc<tokio::sync::RwLock<crate::config::DockerGcConfig>>) {
+///
+/// SPEC-3.11's reclaim pass is skipped (logged, never silently) while any run
+/// is in flight, since a run may be using the sidecar; the named-volume sweep
+/// alone was already safe to run regardless (it only ever removes a volume no
+/// container references), so [`crate::gc::reclaim_docker_storage`] folds that
+/// existing sweep in as its own last step rather than running it twice.
+async fn docker_gc_loop(
+    pool: crate::db::DbPool,
+    in_flight: api::InFlight,
+    cfg: Arc<tokio::sync::RwLock<crate::config::DockerGcConfig>>,
+) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(GC_TICK_SECS));
     loop {
         ticker.tick().await;
@@ -1893,16 +1912,24 @@ async fn docker_gc_loop(cfg: Arc<tokio::sync::RwLock<crate::config::DockerGcConf
         if !snapshot.enabled {
             continue;
         }
+        let run_in_flight = match api::activity(&pool, &in_flight).await {
+            Ok(a) => !a.quiet,
+            Err(e) => {
+                warn!(error = %e, "docker storage GC: cannot read run activity; treating as in flight this pass");
+                true
+            }
+        };
         let result = tokio::task::spawn_blocking(move || {
-            crate::gc::sweep_docker_volumes(
+            crate::gc::reclaim_docker_storage(
                 &crate::gc::CliDockerVolumeClient,
                 &snapshot,
                 std::time::SystemTime::now(),
+                run_in_flight,
             )
         })
         .await;
         if let Err(e) = result {
-            warn!(error = %e, "docker volume GC sweep task failed");
+            warn!(error = %e, "docker storage GC reclaim task failed");
         }
     }
 }

@@ -124,6 +124,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - `logs/` stream logs are bounded by their own age sweep ([CLAUDE-245](docs/conventions/retention.md#stream-log-sweep-claude-245))
 - `daemon.log`, `output.file` and `usage.jsonl` are bounded by SIZE on the same tick ([CLAUDE-257, CLAUDE-268](docs/conventions/retention.md#size-bounded-log-files-claude-257-claude-268))
 - `snippets/` and `webhook-logs/` are bounded by AGE on the same tick ([CLAUDE-262](docs/conventions/retention.md#snippet-and-webhook-log-sweeps-claude-262))
+- Over `docker_gc.max_bytes`, storage is reclaimed in a fixed order until under it; a run in flight skips the pass ([CLAUDE-516](docs/conventions/retention.md#docker-storage-ceiling-reclaim-spec-311-claude-516))
 
 ## Phases
 

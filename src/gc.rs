@@ -676,10 +676,57 @@ pub enum VolumeRemoveError {
     Other(String),
 }
 
-/// Talks to the sidecar's Docker daemon on behalf of [`sweep_docker_volumes`].
-/// Injected so the sweep's decision logic (age, in-use, buildx-prefix) is
-/// testable without a real Docker daemon; production passes
-/// [`CliDockerVolumeClient`].
+/// SPEC-3.11 item 1: the sidecar's total Docker storage usage by category, in
+/// bytes. Read once before a [`reclaim_docker_storage`] pass decides whether
+/// the ceiling is exceeded, and the running total each step's before/after
+/// log is computed from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DockerUsage {
+    pub containers_bytes: u64,
+    pub images_bytes: u64,
+    pub volumes_bytes: u64,
+    pub build_cache_bytes: u64,
+}
+
+impl DockerUsage {
+    pub fn total_bytes(&self) -> u64 {
+        self.containers_bytes
+            .saturating_add(self.images_bytes)
+            .saturating_add(self.volumes_bytes)
+            .saturating_add(self.build_cache_bytes)
+    }
+}
+
+/// One stopped (exited, created, or dead) container, as reported by
+/// [`DockerVolumeClient::list_stopped_containers`].
+#[derive(Debug, Clone)]
+pub struct StoppedContainer {
+    pub id: String,
+    /// Time the container last stopped. Age is measured from this, not from
+    /// creation, so a container that ran for weeks before exiting an hour ago
+    /// is not removed as "stale" from when it was first created.
+    pub finished_at: SystemTime,
+    pub size_bytes: Option<u64>,
+}
+
+/// One Docker image, as reported by
+/// [`DockerVolumeClient::list_dangling_images`] /
+/// [`DockerVolumeClient::list_unused_images`].
+#[derive(Debug, Clone)]
+pub struct DockerImage {
+    pub id: String,
+    pub created_at: SystemTime,
+    pub size_bytes: Option<u64>,
+    /// True when a container (running or stopped) still references this
+    /// image. Age alone never overrides this, the same rule
+    /// [`DockerVolume::in_use`] follows for a named volume.
+    pub in_use: bool,
+}
+
+/// Talks to the sidecar's Docker daemon on behalf of [`sweep_docker_volumes`]
+/// and [`reclaim_docker_storage`]. Injected so the decision logic (age,
+/// in-use, buildx-prefix, reclaim order) is testable without a real Docker
+/// daemon; production passes [`CliDockerVolumeClient`].
 pub trait DockerVolumeClient {
     /// Every named volume the daemon knows about. `Err` signals the daemon
     /// could not be reached (including `DOCKER_HOST` unset); the sweep treats
@@ -688,6 +735,37 @@ pub trait DockerVolumeClient {
     /// Remove one volume by name. Never passes `--force`: Docker's own refusal
     /// of an in-use volume is exactly the safety net this sweep relies on.
     fn remove_volume(&self, name: &str) -> Result<(), VolumeRemoveError>;
+
+    /// SPEC-3.11 item 1: the sidecar's total usage by category. `Err` means
+    /// the daemon could not be reached; [`reclaim_docker_storage`] treats that
+    /// as "skip this pass, remove nothing" rather than guessing the total is
+    /// zero, which would read as always-under-the-ceiling and never reclaim.
+    fn usage(&self) -> Result<DockerUsage, String>;
+
+    /// Every stopped container. Order is the reclaim function's job, not the
+    /// client's.
+    fn list_stopped_containers(&self) -> Result<Vec<StoppedContainer>, String>;
+    /// Remove one container by id. Never `--force`: a container this listed
+    /// as stopped may have been restarted between the list and this call, and
+    /// Docker's own refusal of a running container is the safety net.
+    fn remove_container(&self, id: &str) -> Result<(), String>;
+
+    /// Every dangling (untagged, unreferenced by any tagged image) image.
+    fn list_dangling_images(&self) -> Result<Vec<DockerImage>, String>;
+    /// Every tagged image no container (running or stopped) references.
+    fn list_unused_images(&self) -> Result<Vec<DockerImage>, String>;
+    /// Remove one image by id.
+    fn remove_image(&self, id: &str) -> Result<(), String>;
+
+    /// SPEC-3.11: build cache cannot be removed by id with the `docker` CLI
+    /// (there is no `docker builder rm <id>`), so this is the one exception
+    /// to "remove by explicit id from a listing": it shells out to `docker
+    /// builder prune`, scoped to `older_than` with a `--filter until=` so it
+    /// never touches cache newer than that, and the force flag it needs to
+    /// skip its confirmation prompt is safe here because the filter, not the
+    /// confirmation, is what bounds its blast radius. Returns bytes
+    /// reclaimed.
+    fn prune_build_cache(&self, older_than: Duration) -> Result<u64, String>;
 }
 
 /// Production [`DockerVolumeClient`], talking to whichever daemon
@@ -768,6 +846,234 @@ impl DockerVolumeClient for CliDockerVolumeClient {
             Err(VolumeRemoveError::Other(stderr))
         }
     }
+
+    fn usage(&self) -> Result<DockerUsage, String> {
+        if std::env::var_os("DOCKER_HOST").is_none() {
+            return Err("DOCKER_HOST is not set".to_string());
+        }
+        let out = run_docker(&["system", "df", "--format", "{{json .}}"])?;
+        let mut usage = DockerUsage::default();
+        for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .map_err(|e| format!("cannot parse `docker system df` output: {e}"))?;
+            let kind = v.get("Type").and_then(|t| t.as_str()).unwrap_or_default();
+            let bytes = v
+                .get("Size")
+                .and_then(|s| s.as_str())
+                .map(parse_docker_size)
+                .unwrap_or(0);
+            match kind {
+                "Images" => usage.images_bytes = bytes,
+                "Containers" => usage.containers_bytes = bytes,
+                "Local Volumes" => usage.volumes_bytes = bytes,
+                "Build Cache" => usage.build_cache_bytes = bytes,
+                _ => {}
+            }
+        }
+        Ok(usage)
+    }
+
+    fn list_stopped_containers(&self) -> Result<Vec<StoppedContainer>, String> {
+        if std::env::var_os("DOCKER_HOST").is_none() {
+            return Err("DOCKER_HOST is not set".to_string());
+        }
+        let ids_out = run_docker(&[
+            "ps",
+            "-a",
+            "--filter",
+            "status=exited",
+            "--filter",
+            "status=dead",
+            "--filter",
+            "status=created",
+            "-q",
+        ])?;
+        let ids: Vec<&str> = ids_out
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec!["container", "inspect", "--size"];
+        args.extend(ids.iter().copied());
+        let inspect_out = run_docker(&args)?;
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&inspect_out)
+            .map_err(|e| format!("cannot parse `docker container inspect` output: {e}"))?;
+        Ok(parsed
+            .into_iter()
+            .map(|c| {
+                let id = c
+                    .get("Id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let finished_at = c
+                    .get("State")
+                    .and_then(|s| s.get("FinishedAt"))
+                    .and_then(|f| f.as_str())
+                    .and_then(parse_rfc3339)
+                    // An unparseable/missing FinishedAt is treated as "now"
+                    // (age zero, kept this pass) rather than guessed old.
+                    .unwrap_or_else(SystemTime::now);
+                let size_bytes = c.get("SizeRootFs").and_then(|s| s.as_u64());
+                StoppedContainer {
+                    id,
+                    finished_at,
+                    size_bytes,
+                }
+            })
+            .collect())
+    }
+
+    fn remove_container(&self, id: &str) -> Result<(), String> {
+        run_docker(&["rm", id]).map(|_| ())
+    }
+
+    fn list_dangling_images(&self) -> Result<Vec<DockerImage>, String> {
+        self.list_images(true)
+    }
+
+    fn list_unused_images(&self) -> Result<Vec<DockerImage>, String> {
+        self.list_images(false)
+    }
+
+    fn remove_image(&self, id: &str) -> Result<(), String> {
+        run_docker(&["rmi", id]).map(|_| ())
+    }
+
+    fn prune_build_cache(&self, older_than: Duration) -> Result<u64, String> {
+        if std::env::var_os("DOCKER_HOST").is_none() {
+            return Err("DOCKER_HOST is not set".to_string());
+        }
+        let filter = format!("until={}h", older_than.as_secs() / 3600);
+        // SPEC-3.11: the one exception to "remove by explicit id from a
+        // listing, never a prune command that needs a force flag" - there is
+        // no `docker builder rm <id>`, so the engine's own prune call is the
+        // only way to remove build cache at all. The `--filter` bounds its
+        // blast radius the same way an explicit id list would elsewhere, so
+        // the force flag only skips a confirmation prompt, not a safety
+        // check.
+        let out = run_docker(&["builder", "prune", "--force", "--filter", &filter])?;
+        Ok(out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Total reclaimed space:"))
+            .map(|s| parse_docker_size(s.trim()))
+            .unwrap_or(0))
+    }
+}
+
+impl CliDockerVolumeClient {
+    /// Shared listing for [`DockerVolumeClient::list_dangling_images`] and
+    /// [`DockerVolumeClient::list_unused_images`]: `dangling` selects the
+    /// Docker filter, and `in_use` is computed separately by cross-
+    /// referencing every container's image id, since the dangling filter
+    /// alone says nothing about container use.
+    fn list_images(&self, dangling: bool) -> Result<Vec<DockerImage>, String> {
+        if std::env::var_os("DOCKER_HOST").is_none() {
+            return Err("DOCKER_HOST is not set".to_string());
+        }
+        let filter = format!("dangling={dangling}");
+        let ids_out = run_docker(&["images", "-f", &filter, "-q"])?;
+        let ids: Vec<&str> = ids_out
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let referenced = referenced_image_ids()?;
+        let mut args = vec!["image", "inspect"];
+        args.extend(ids.iter().copied());
+        let inspect_out = run_docker(&args)?;
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&inspect_out)
+            .map_err(|e| format!("cannot parse `docker image inspect` output: {e}"))?;
+        Ok(parsed
+            .into_iter()
+            .map(|img| {
+                let id = img
+                    .get("Id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let created_at = img
+                    .get("Created")
+                    .and_then(|c| c.as_str())
+                    .and_then(parse_rfc3339)
+                    .unwrap_or_else(SystemTime::now);
+                let size_bytes = img.get("Size").and_then(|s| s.as_u64());
+                let in_use = referenced.contains(&id);
+                DockerImage {
+                    id,
+                    created_at,
+                    size_bytes,
+                    in_use,
+                }
+            })
+            .collect())
+    }
+}
+
+/// Image ids (`docker inspect --format '{{.Image}}'`) referenced by any
+/// container, running or stopped, so the image listings above can mark an
+/// image `in_use` regardless of its own tag/dangling status.
+fn referenced_image_ids() -> Result<HashSet<String>, String> {
+    let ids_out = run_docker(&["ps", "-a", "-q"])?;
+    let ids: Vec<&str> = ids_out
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut args = vec!["inspect", "--format", "{{.Image}}"];
+    args.extend(ids.iter().copied());
+    let out = run_docker(&args)?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Parse an RFC3339 timestamp (as Docker's JSON fields report it) into a
+/// [`SystemTime`]. `None` on anything unparseable, left to the caller's own
+/// "treat as now" fallback rather than guessed as old.
+fn parse_rfc3339(s: &str) -> Option<SystemTime> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().and_then(|dt| {
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(dt.timestamp().try_into().unwrap_or(0)))
+    })
+}
+
+/// Parse a Docker-formatted size string (e.g. `"7.904GB"`, `"512MB"`,
+/// `"0B"`) into bytes. Docker's own `go-units` formats these with decimal
+/// (1000-based) multiples. An unparseable or unrecognized unit yields 0
+/// rather than guessing, since this only ever feeds a reclaim decision
+/// (never a removal target), so undercounting is the safe direction.
+fn parse_docker_size(s: &str) -> u64 {
+    let s = s.trim();
+    let Some(idx) = s.find(|c: char| c.is_ascii_alphabetic()) else {
+        return s.parse::<f64>().unwrap_or(0.0) as u64;
+    };
+    let (num, unit) = (s[..idx].trim(), s[idx..].trim());
+    let Ok(num) = num.parse::<f64>() else {
+        return 0;
+    };
+    let multiplier: f64 = match unit.to_ascii_uppercase().as_str() {
+        "B" => 1.0,
+        "KB" => 1_000.0,
+        "MB" => 1_000_000.0,
+        "GB" => 1_000_000_000.0,
+        "TB" => 1_000_000_000_000.0,
+        "PB" => 1_000_000_000_000_000.0,
+        _ => return 0,
+    };
+    (num * multiplier) as u64
 }
 
 /// Run `docker <args>` against whatever `DOCKER_HOST` points at, returning
@@ -860,6 +1166,250 @@ pub fn sweep_docker_volumes(
         bytes_reclaimed = stats.bytes_reclaimed,
         "docker volume GC sweep complete"
     );
+    stats
+}
+
+// ---- Docker sidecar storage ceiling (SPEC-3.11, CLAUDE-516) ---------------
+
+/// One SPEC-3.11 reclaim step's result, for the "category, bytes reclaimed,
+/// size before and after" line each step logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimStep {
+    pub category: &'static str,
+    pub bytes_reclaimed: u64,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+}
+
+/// Result of a [`reclaim_docker_storage`] pass. An empty `steps` list means
+/// nothing was reclaimed, which is a CLEAN pass only when `usage_read_failed`
+/// is also `false` (disabled, skipped for an in-flight run, or already under
+/// the ceiling); a failed usage read is never reported as clean.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReclaimStats {
+    pub steps: Vec<ReclaimStep>,
+    pub usage_read_failed: bool,
+}
+
+fn record_step(
+    stats: &mut ReclaimStats,
+    total: &mut u64,
+    category: &'static str,
+    bytes_reclaimed: u64,
+) {
+    let before = *total;
+    let after = before.saturating_sub(bytes_reclaimed);
+    info!(
+        category,
+        bytes_reclaimed,
+        before_bytes = before,
+        after_bytes = after,
+        "docker storage GC: reclaim step complete"
+    );
+    stats.steps.push(ReclaimStep {
+        category,
+        bytes_reclaimed,
+        before_bytes: before,
+        after_bytes: after,
+    });
+    *total = after;
+}
+
+/// SPEC-3.11 step 1: stopped containers older than 1 day. Skipped entirely
+/// (logged at `error`, zero reclaimed) when the listing cannot be read.
+fn reclaim_stopped_containers(client: &dyn DockerVolumeClient, now: SystemTime) -> u64 {
+    let containers = match client.list_stopped_containers() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "docker storage GC: cannot list stopped containers; step reclaimed nothing");
+            return 0;
+        }
+    };
+    let retention = Duration::from_secs(SECS_PER_DAY);
+    let mut reclaimed = 0u64;
+    for c in containers {
+        let age = now.duration_since(c.finished_at).unwrap_or(Duration::ZERO);
+        if age < retention {
+            continue;
+        }
+        match client.remove_container(&c.id) {
+            Ok(()) => {
+                info!(
+                    id = %c.id,
+                    age = %humantime::format_duration(whole_secs(age)),
+                    bytes_reclaimed = ?c.size_bytes,
+                    "docker storage GC: removed stopped container older than 1 day"
+                );
+                reclaimed += c.size_bytes.unwrap_or(0);
+            }
+            Err(e) => error!(id = %c.id, error = %e, "docker storage GC: container remove failed"),
+        }
+    }
+    reclaimed
+}
+
+/// SPEC-3.11 step 2: dangling images, no age filter. An image a running or
+/// stopped container still references is kept regardless.
+fn reclaim_dangling_images(client: &dyn DockerVolumeClient) -> u64 {
+    let images = match client.list_dangling_images() {
+        Ok(i) => i,
+        Err(e) => {
+            error!(error = %e, "docker storage GC: cannot list dangling images; step reclaimed nothing");
+            return 0;
+        }
+    };
+    reclaim_images(client, images, None, SystemTime::now())
+}
+
+/// SPEC-3.11 step 4: tagged images no container references, older than 7
+/// days.
+fn reclaim_unused_images(client: &dyn DockerVolumeClient, now: SystemTime) -> u64 {
+    let images = match client.list_unused_images() {
+        Ok(i) => i,
+        Err(e) => {
+            error!(error = %e, "docker storage GC: cannot list unused images; step reclaimed nothing");
+            return 0;
+        }
+    };
+    reclaim_images(
+        client,
+        images,
+        Some(Duration::from_secs(7 * SECS_PER_DAY)),
+        now,
+    )
+}
+
+fn reclaim_images(
+    client: &dyn DockerVolumeClient,
+    images: Vec<DockerImage>,
+    retention: Option<Duration>,
+    now: SystemTime,
+) -> u64 {
+    let mut reclaimed = 0u64;
+    for img in images {
+        if img.in_use {
+            continue;
+        }
+        if let Some(retention) = retention {
+            let age = now.duration_since(img.created_at).unwrap_or(Duration::ZERO);
+            if age < retention {
+                continue;
+            }
+        }
+        match client.remove_image(&img.id) {
+            Ok(()) => {
+                info!(
+                    id = %img.id,
+                    bytes_reclaimed = ?img.size_bytes,
+                    "docker storage GC: removed image"
+                );
+                reclaimed += img.size_bytes.unwrap_or(0);
+            }
+            Err(e) => error!(id = %img.id, error = %e, "docker storage GC: image remove failed"),
+        }
+    }
+    reclaimed
+}
+
+/// SPEC-3.11 step 3: build cache older than 7 days, through the one
+/// prune-call exception [`DockerVolumeClient::prune_build_cache`] documents.
+fn reclaim_build_cache(client: &dyn DockerVolumeClient) -> u64 {
+    match client.prune_build_cache(Duration::from_secs(7 * SECS_PER_DAY)) {
+        Ok(bytes) => {
+            info!(
+                bytes_reclaimed = bytes,
+                "docker storage GC: pruned build cache older than 7 days"
+            );
+            bytes
+        }
+        Err(e) => {
+            error!(error = %e, "docker storage GC: build cache prune failed");
+            0
+        }
+    }
+}
+
+/// SPEC-3.11: when the sidecar's total Docker storage exceeds
+/// `cfg.max_bytes`, reclaim in order (stopped containers older than 1 day,
+/// dangling images, build cache older than 7 days, unused images older than 7
+/// days, then the existing unreferenced-volume sweep) and stop as soon as the
+/// running total is back under the ceiling. Nothing runs when `cfg.enabled`
+/// is `false`, when `run_in_flight` is `true` (any run may be using the
+/// sidecar), or when the initial usage read fails - the last case sets
+/// [`ReclaimStats::usage_read_failed`] so the pass is never read as clean. A
+/// failed category read or removal is logged at `error` and the pass
+/// continues with the next category.
+pub fn reclaim_docker_storage(
+    client: &dyn DockerVolumeClient,
+    cfg: &DockerGcConfig,
+    now: SystemTime,
+    run_in_flight: bool,
+) -> ReclaimStats {
+    let mut stats = ReclaimStats::default();
+    if !cfg.enabled {
+        return stats;
+    }
+    if run_in_flight {
+        info!("docker storage GC: skipped this pass, a run is in flight");
+        return stats;
+    }
+    let usage = match client.usage() {
+        Ok(u) => u,
+        Err(e) => {
+            error!(error = %e, "docker storage GC: cannot read sidecar Docker usage; nothing was reclaimed this pass");
+            stats.usage_read_failed = true;
+            return stats;
+        }
+    };
+    let mut total = usage.total_bytes();
+    if total <= cfg.max_bytes {
+        info!(
+            total_bytes = total,
+            max_bytes = cfg.max_bytes,
+            "docker storage GC: under the ceiling, nothing reclaimed"
+        );
+        return stats;
+    }
+
+    record_step(
+        &mut stats,
+        &mut total,
+        "stopped containers",
+        reclaim_stopped_containers(client, now),
+    );
+    if total > cfg.max_bytes {
+        record_step(
+            &mut stats,
+            &mut total,
+            "dangling images",
+            reclaim_dangling_images(client),
+        );
+    }
+    if total > cfg.max_bytes {
+        record_step(
+            &mut stats,
+            &mut total,
+            "build cache",
+            reclaim_build_cache(client),
+        );
+    }
+    if total > cfg.max_bytes {
+        record_step(
+            &mut stats,
+            &mut total,
+            "unused images",
+            reclaim_unused_images(client, now),
+        );
+    }
+    if total > cfg.max_bytes {
+        let vol_stats = sweep_docker_volumes(client, cfg, now);
+        record_step(
+            &mut stats,
+            &mut total,
+            "unreferenced volumes",
+            vol_stats.bytes_reclaimed,
+        );
+    }
     stats
 }
 
@@ -1563,9 +2113,14 @@ mod tests {
     // ---- docker volume sweep --------------------------------------------------
 
     fn docker_cfg(enabled: bool) -> DockerGcConfig {
+        docker_cfg_with_ceiling(enabled, u64::MAX)
+    }
+
+    fn docker_cfg_with_ceiling(enabled: bool, max_bytes: u64) -> DockerGcConfig {
         DockerGcConfig {
             enabled,
             volume_retention_days: 3,
+            max_bytes,
         }
     }
 
@@ -1581,11 +2136,20 @@ mod tests {
     /// Fake [`DockerVolumeClient`]: `list` is the fixed set of volumes to
     /// report, `removed` records every name [`remove_volume`] was called
     /// with, and `remove_result` maps a name to the outcome to return (missing
-    /// = success).
+    /// = success). The SPEC-3.11 fields (`usage`, the three listings, the
+    /// build-cache result) each default to an empty/zero `Ok`, so a test only
+    /// sets the ones its scenario needs.
     struct FakeDockerClient {
         list: std::result::Result<Vec<DockerVolume>, String>,
         removed: std::sync::Mutex<Vec<String>>,
         remove_result: std::collections::HashMap<String, VolumeRemoveErrorKind>,
+        usage: std::result::Result<DockerUsage, String>,
+        stopped_containers: std::result::Result<Vec<StoppedContainer>, String>,
+        dangling_images: std::result::Result<Vec<DockerImage>, String>,
+        unused_images: std::result::Result<Vec<DockerImage>, String>,
+        build_cache_bytes: std::result::Result<u64, String>,
+        removed_containers: std::sync::Mutex<Vec<String>>,
+        removed_images: std::sync::Mutex<Vec<String>>,
     }
 
     #[derive(Clone)]
@@ -1600,19 +2164,49 @@ mod tests {
                 list: Ok(volumes),
                 removed: std::sync::Mutex::new(Vec::new()),
                 remove_result: std::collections::HashMap::new(),
+                usage: Ok(DockerUsage::default()),
+                stopped_containers: Ok(Vec::new()),
+                dangling_images: Ok(Vec::new()),
+                unused_images: Ok(Vec::new()),
+                build_cache_bytes: Ok(0),
+                removed_containers: std::sync::Mutex::new(Vec::new()),
+                removed_images: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn unreachable(reason: &str) -> Self {
-            Self {
-                list: Err(reason.to_string()),
-                removed: std::sync::Mutex::new(Vec::new()),
-                remove_result: std::collections::HashMap::new(),
-            }
+            let mut c = Self::new(Vec::new());
+            c.list = Err(reason.to_string());
+            c
         }
 
         fn with_remove_failure(mut self, name: &str, kind: VolumeRemoveErrorKind) -> Self {
             self.remove_result.insert(name.to_string(), kind);
+            self
+        }
+
+        fn with_usage(mut self, usage: DockerUsage) -> Self {
+            self.usage = Ok(usage);
+            self
+        }
+
+        fn with_usage_err(mut self, reason: &str) -> Self {
+            self.usage = Err(reason.to_string());
+            self
+        }
+
+        fn with_stopped_containers(mut self, containers: Vec<StoppedContainer>) -> Self {
+            self.stopped_containers = Ok(containers);
+            self
+        }
+
+        fn with_dangling_images(mut self, images: Vec<DockerImage>) -> Self {
+            self.dangling_images = Ok(images);
+            self
+        }
+
+        fn with_unused_images(mut self, images: Vec<DockerImage>) -> Self {
+            self.unused_images = Ok(images);
             self
         }
     }
@@ -1633,6 +2227,36 @@ mod tests {
                 }
                 None => Ok(()),
             }
+        }
+
+        fn usage(&self) -> std::result::Result<DockerUsage, String> {
+            self.usage.clone()
+        }
+
+        fn list_stopped_containers(&self) -> std::result::Result<Vec<StoppedContainer>, String> {
+            self.stopped_containers.clone()
+        }
+
+        fn remove_container(&self, id: &str) -> std::result::Result<(), String> {
+            self.removed_containers.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+
+        fn list_dangling_images(&self) -> std::result::Result<Vec<DockerImage>, String> {
+            self.dangling_images.clone()
+        }
+
+        fn list_unused_images(&self) -> std::result::Result<Vec<DockerImage>, String> {
+            self.unused_images.clone()
+        }
+
+        fn remove_image(&self, id: &str) -> std::result::Result<(), String> {
+            self.removed_images.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+
+        fn prune_build_cache(&self, _older_than: Duration) -> std::result::Result<u64, String> {
+            self.build_cache_bytes.clone()
         }
     }
 
@@ -1721,5 +2345,208 @@ mod tests {
         let stats = sweep_docker_volumes(&client, &docker_cfg(false), SystemTime::now());
         assert_eq!(stats, SweepStats::default());
         assert!(client.removed.lock().unwrap().is_empty());
+    }
+
+    // ---- SPEC-3.11 docker storage ceiling reclaim ------------------------
+
+    fn stopped_container(id: &str, age_days: u64, size: u64) -> StoppedContainer {
+        StoppedContainer {
+            id: id.to_string(),
+            finished_at: SystemTime::now() - Duration::from_secs(age_days * SECS_PER_DAY),
+            size_bytes: Some(size),
+        }
+    }
+
+    fn docker_image(id: &str, in_use: bool, age_days: u64, size: u64) -> DockerImage {
+        DockerImage {
+            id: id.to_string(),
+            created_at: SystemTime::now() - Duration::from_secs(age_days * SECS_PER_DAY),
+            size_bytes: Some(size),
+            in_use,
+        }
+    }
+
+    /// AC: under the ceiling, the pass reclaims nothing and touches no
+    /// category.
+    #[test]
+    fn under_ceiling_reclaims_nothing() {
+        let client = FakeDockerClient::new(Vec::new()).with_usage(DockerUsage {
+            containers_bytes: 10,
+            images_bytes: 10,
+            volumes_bytes: 10,
+            build_cache_bytes: 10,
+        });
+        let stats = reclaim_docker_storage(
+            &client,
+            &docker_cfg_with_ceiling(true, 1_000),
+            SystemTime::now(),
+            false,
+        );
+        assert!(stats.steps.is_empty());
+        assert!(!stats.usage_read_failed);
+    }
+
+    /// AC: over the ceiling, reclaim runs in the SPEC-3.11 order and stops
+    /// as soon as the running total is back under the ceiling.
+    #[test]
+    fn over_ceiling_reclaims_in_order_and_stops_early() {
+        let client = FakeDockerClient::new(vec![volume("dev-untouched", false, 10)])
+            .with_usage(DockerUsage {
+                containers_bytes: 100,
+                images_bytes: 0,
+                volumes_bytes: 0,
+                build_cache_bytes: 0,
+            })
+            .with_stopped_containers(vec![stopped_container("c1", 2, 100)])
+            .with_dangling_images(vec![docker_image("img-dangling", false, 10, 999)]);
+        let stats = reclaim_docker_storage(
+            &client,
+            &docker_cfg_with_ceiling(true, 50),
+            SystemTime::now(),
+            false,
+        );
+        assert_eq!(stats.steps.len(), 1);
+        assert_eq!(stats.steps[0].category, "stopped containers");
+        assert_eq!(stats.steps[0].bytes_reclaimed, 100);
+        assert_eq!(stats.steps[0].before_bytes, 100);
+        assert_eq!(stats.steps[0].after_bytes, 0);
+        assert_eq!(
+            *client.removed_containers.lock().unwrap(),
+            vec!["c1".to_string()]
+        );
+        assert!(
+            client.removed_images.lock().unwrap().is_empty(),
+            "later steps never run once the pass is back under the ceiling"
+        );
+        assert!(client.removed.lock().unwrap().is_empty());
+    }
+
+    /// AC: a failed usage read reclaims nothing and is flagged, never read
+    /// as a clean pass.
+    #[test]
+    fn unreadable_usage_reclaims_nothing() {
+        let client = FakeDockerClient::new(Vec::new()).with_usage_err("DOCKER_HOST is not set");
+        let stats = reclaim_docker_storage(
+            &client,
+            &docker_cfg_with_ceiling(true, 10),
+            SystemTime::now(),
+            false,
+        );
+        assert!(stats.steps.is_empty());
+        assert!(stats.usage_read_failed);
+    }
+
+    /// AC: an image a container still references is kept regardless of age
+    /// or category order.
+    #[test]
+    fn referenced_image_is_kept() {
+        let client = FakeDockerClient::new(Vec::new())
+            .with_usage(DockerUsage {
+                containers_bytes: 0,
+                images_bytes: 1_000,
+                volumes_bytes: 0,
+                build_cache_bytes: 0,
+            })
+            .with_dangling_images(vec![docker_image("img-in-use", true, 10, 1_000)]);
+        let stats = reclaim_docker_storage(
+            &client,
+            &docker_cfg_with_ceiling(true, 1),
+            SystemTime::now(),
+            false,
+        );
+        let dangling = stats
+            .steps
+            .iter()
+            .find(|s| s.category == "dangling images")
+            .expect("dangling images step runs since stopped containers alone did not clear the ceiling");
+        assert_eq!(dangling.bytes_reclaimed, 0);
+        assert!(client.removed_images.lock().unwrap().is_empty());
+    }
+
+    /// AC: a run in flight skips the pass entirely, even over the ceiling.
+    #[test]
+    fn run_in_flight_skips_the_pass() {
+        let client = FakeDockerClient::new(Vec::new()).with_usage(DockerUsage {
+            containers_bytes: 1_000,
+            images_bytes: 0,
+            volumes_bytes: 0,
+            build_cache_bytes: 0,
+        });
+        let stats = reclaim_docker_storage(
+            &client,
+            &docker_cfg_with_ceiling(true, 1),
+            SystemTime::now(),
+            true,
+        );
+        assert!(stats.steps.is_empty());
+        assert!(!stats.usage_read_failed);
+        assert!(client.removed_containers.lock().unwrap().is_empty());
+    }
+
+    /// AC: a disabled section reclaims nothing.
+    #[test]
+    fn disabled_reclaim_removes_nothing() {
+        let client = FakeDockerClient::new(Vec::new()).with_usage(DockerUsage {
+            containers_bytes: 1_000,
+            images_bytes: 0,
+            volumes_bytes: 0,
+            build_cache_bytes: 0,
+        });
+        let stats = reclaim_docker_storage(
+            &client,
+            &docker_cfg_with_ceiling(false, 1),
+            SystemTime::now(),
+            false,
+        );
+        assert_eq!(stats, ReclaimStats::default());
+    }
+
+    /// AC: an unused image older than 7 days is reclaimed when the earlier
+    /// steps alone do not clear the ceiling; a fresh unused image is kept.
+    #[test]
+    fn unused_images_step_reclaims_stale_and_keeps_fresh() {
+        let client = FakeDockerClient::new(Vec::new())
+            .with_usage(DockerUsage {
+                containers_bytes: 0,
+                images_bytes: 2_000,
+                volumes_bytes: 0,
+                build_cache_bytes: 0,
+            })
+            .with_unused_images(vec![
+                docker_image("img-stale", false, 10, 1_500),
+                docker_image("img-fresh", false, 1, 500),
+            ]);
+        let stats = reclaim_docker_storage(
+            &client,
+            &docker_cfg_with_ceiling(true, 1),
+            SystemTime::now(),
+            false,
+        );
+        let unused = stats
+            .steps
+            .iter()
+            .find(|s| s.category == "unused images")
+            .expect("unused images step runs since the earlier steps reclaimed nothing");
+        assert_eq!(unused.bytes_reclaimed, 1_500);
+        assert_eq!(*client.removed_images.lock().unwrap(), vec!["img-stale"]);
+    }
+
+    #[test]
+    fn docker_usage_total_bytes_sums_every_category() {
+        let usage = DockerUsage {
+            containers_bytes: 1,
+            images_bytes: 2,
+            volumes_bytes: 3,
+            build_cache_bytes: 4,
+        };
+        assert_eq!(usage.total_bytes(), 10);
+    }
+
+    #[test]
+    fn parse_docker_size_handles_docker_df_units() {
+        assert_eq!(parse_docker_size("0B"), 0);
+        assert_eq!(parse_docker_size("512MB"), 512_000_000);
+        assert_eq!(parse_docker_size("1.2GB"), 1_200_000_000);
+        assert_eq!(parse_docker_size("bogus"), 0);
     }
 }
