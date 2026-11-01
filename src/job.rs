@@ -456,6 +456,11 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                     // SPEC-3.2.2: "the run's remaining budget is passed to the
                     // invocation as its ceiling."
                     Some(ctx.spend.remaining_usd()),
+                    // Scripted actions are not a native-handler repo workdir
+                    // clone (SPEC-3.10 scopes the shared cache to those); a
+                    // scripted action's own `pre`/`post` snippets set
+                    // `CARGO_TARGET_DIR` themselves if they need it.
+                    None,
                 )?;
                 // Bill the run before any branch discards `r`, so a cancelled
                 // invocation still reports what it spent.

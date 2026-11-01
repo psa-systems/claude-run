@@ -1409,6 +1409,11 @@ fn serve_run(
                             &cancel,
                             // Cap the child at this run's remaining ceiling.
                             Some(spend.remaining_usd()),
+                            // CLAUDE-510 scopes the shared Cargo cache to the
+                            // native youtrack handler's repo clones; the
+                            // comment-webhook command session's own workdir
+                            // is not yet covered (tracked separately).
+                            None,
                         ) {
                             Ok(r) => {
                                 claude_ran = true;
