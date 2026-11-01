@@ -1502,21 +1502,7 @@ fn serve_run(
         }
     }
 
-    let too_big_push = if matches!(decision, Decision::TooBig { .. }) {
-        match push_too_big_fix(backend, cmd, workdir) {
-            Ok(side_branch) => Some(TooBigPush::Pushed {
-                branch: side_branch,
-            }),
-            Err(e) => {
-                warn!(repo = %cmd.repo, pr = cmd.number, error = %e, "side-branch push failed for an over-cap change");
-                Some(TooBigPush::Failed {
-                    error: e.to_string(),
-                })
-            }
-        }
-    } else {
-        None
-    };
+    let too_big_push = push_side_branch_if_needed(backend, cmd, workdir, &decision);
 
     // Written beside the checkout rather than into it, same as the instruction
     // and commit-message files: a successful clone always resolves the git
@@ -2019,6 +2005,38 @@ fn push_too_big_fix(
     Ok(side_branch)
 }
 
+/// Push any commit [`run_decision_gate`] already made to the same kind of
+/// side branch [`push_too_big_fix`] uses, for every decision that can be
+/// reached with a local commit already sitting on top of `cloned_head` but
+/// whose diff was never cleared for the live PR head (SPEC-3.3.1).
+/// `Decision::MeasureFailed` qualifies: `run_decision_gate` commits the
+/// leftovers before it measures them, so a failure in that measurement step
+/// (the `rev-list`/`show --numstat` calls) still leaves a commit behind.
+fn push_side_branch_if_needed(
+    backend: &dyn Backend,
+    cmd: &VerifiedCommentCommand,
+    workdir: &FsPath,
+    decision: &Decision,
+) -> Option<TooBigPush> {
+    if !matches!(
+        decision,
+        Decision::TooBig { .. } | Decision::MeasureFailed { .. }
+    ) {
+        return None;
+    }
+    match push_too_big_fix(backend, cmd, workdir) {
+        Ok(side_branch) => Some(TooBigPush::Pushed {
+            branch: side_branch,
+        }),
+        Err(e) => {
+            warn!(repo = %cmd.repo, pr = cmd.number, error = %e, "side-branch push failed for an over-cap or unmeasurable change");
+            Some(TooBigPush::Failed {
+                error: e.to_string(),
+            })
+        }
+    }
+}
+
 /// Post the CLAUDE-447 `comment-webhook fix push` comment after [`push_fix`]
 /// succeeds. The issue key is read out of the pushed tip's commit body
 /// (CLAUDE-398's bare `#<KEY>-N` reference) rather than threaded through
@@ -2350,14 +2368,28 @@ pub fn outcome_comment(
             "Nothing was staged, committed, or pushed; this needs human review.".to_string(),
         ]
         .join("\n"),
-        Decision::MeasureFailed { reason } => [
-            "**Measuring the change failed.**".to_string(),
-            String::new(),
-            reason.clone(),
-            String::new(),
-            "Nothing was pushed. See the runner journal for full context.".to_string(),
-        ]
-        .join("\n"),
+        Decision::MeasureFailed { reason } => {
+            let tail = match too_big_push {
+                Some(TooBigPush::Pushed { branch }) => format!(
+                    "Any commits made before the measurement failed were pushed to `{branch}` \
+                     (SPEC-3.3.1), not to this PR's branch; this needs human review."
+                ),
+                Some(TooBigPush::Failed { error }) => format!(
+                    "Pushing any commits made before the measurement failed also FAILED: \
+                     {error}\n\nThey are still only in the runner's local checkout; this needs \
+                     human review."
+                ),
+                None => "Nothing was pushed. See the runner journal for full context.".to_string(),
+            };
+            [
+                "**Measuring the change failed.**".to_string(),
+                String::new(),
+                reason.clone(),
+                String::new(),
+                tail,
+            ]
+            .join("\n")
+        }
         Decision::TooBig { files, lines } => {
             let tail = match too_big_push {
                 Some(TooBigPush::Pushed { branch }) => format!(
@@ -3606,6 +3638,33 @@ mod tests {
         );
         assert!(measure_failed.contains("Measuring the change failed"));
         assert!(measure_failed.contains("git diff exited 1"));
+        assert!(measure_failed.contains("Nothing was pushed"));
+        let measure_failed_pushed = outcome_comment(
+            &Decision::MeasureFailed {
+                reason: "git diff exited 1".to_string(),
+            },
+            &ok,
+            None,
+            None,
+            Some(&TooBigPush::Pushed {
+                branch: "claude-fix/abc123".to_string(),
+            }),
+        );
+        assert!(measure_failed_pushed.contains("claude-fix/abc123"));
+        assert!(!measure_failed_pushed.contains("Nothing was pushed"));
+        let measure_failed_push_failed = outcome_comment(
+            &Decision::MeasureFailed {
+                reason: "git diff exited 1".to_string(),
+            },
+            &ok,
+            None,
+            None,
+            Some(&TooBigPush::Failed {
+                error: "git push exited 1".to_string(),
+            }),
+        );
+        assert!(measure_failed_push_failed.contains("also FAILED"));
+        assert!(measure_failed_push_failed.contains("git push exited 1"));
         // Usage and busy replies are distinct and name what happened.
         assert!(help_comment("/claude", true).contains("/claude help"));
         assert!(busy_comment(true).contains("already running"));
@@ -5306,6 +5365,110 @@ mod tests {
             String::from_utf8_lossy(&remote_tip.stdout).trim(),
             local_tip,
             "the remote side branch must point at the local commit that was too big to push to the PR head"
+        );
+    }
+
+    /// SPEC-3.3.1: `run_decision_gate` commits the leftovers before it
+    /// measures them, so a `Decision::MeasureFailed` can be reached with a
+    /// local commit already sitting on top of `cloned_head`. That commit
+    /// must still reach the forge, on the same side branch an over-cap diff
+    /// uses, via [`push_side_branch_if_needed`].
+    #[test]
+    fn a_measure_failed_decision_pushes_its_commits_to_a_side_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("origin.git");
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+
+        let workdir = tmp.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        repo_with_one_commit(&workdir);
+        std::fs::write(workdir.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(&workdir, &["add", "a.txt"]).unwrap();
+        git_in(
+            &workdir,
+            &["commit", "-q", "-m", "leftovers committed before measuring"],
+        )
+        .unwrap();
+        let local_tip = git_output(&workdir, &["rev-parse", "HEAD"]).unwrap();
+
+        let keys = tmp.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{"dev.a8n.run":{"token":"tok"}}}"#).unwrap();
+        let backend = CliBackend::new(Arc::new(StubRunner::new())).with_keys_path(&keys);
+        let cmd = gate_cmd();
+        let authed_url = backend.clone_url(&cmd.host, &cmd.repo).unwrap();
+        let plain_url = crate::provider::strip_userinfo(&authed_url);
+        git_in(
+            &workdir,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", bare_url(&bare)),
+                &plain_url,
+            ],
+        )
+        .unwrap();
+
+        let decision = Decision::MeasureFailed {
+            reason: "git rev-list exited 1".to_string(),
+        };
+        let push = push_side_branch_if_needed(&backend, &cmd, &workdir, &decision);
+        let side_branch = match push {
+            Some(TooBigPush::Pushed { branch }) => branch,
+            other => panic!("expected a successful side-branch push, got {other:?}"),
+        };
+        assert_eq!(side_branch, format!("claude-fix/{}", cmd.key()));
+
+        let remote_tip = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["rev-parse", &side_branch])
+            .output()
+            .unwrap();
+        assert!(
+            remote_tip.status.success(),
+            "side branch must exist on the remote: {remote_tip:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&remote_tip.stdout).trim(),
+            local_tip,
+            "the remote side branch must point at the local commit made before the measurement failed"
+        );
+    }
+
+    /// `Decision::Push` and `Decision::UnresolvedConflicts` never need a side
+    /// branch: the former already pushes straight to the PR head, and the
+    /// latter is returned before any commit is made.
+    #[test]
+    fn push_side_branch_if_needed_is_a_noop_for_other_decisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        repo_with_one_commit(&workdir);
+        let keys = tmp.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{"dev.a8n.run":{"token":"tok"}}}"#).unwrap();
+        let backend = CliBackend::new(Arc::new(StubRunner::new())).with_keys_path(&keys);
+        let cmd = gate_cmd();
+
+        assert_eq!(
+            push_side_branch_if_needed(
+                &backend,
+                &cmd,
+                &workdir,
+                &Decision::Push { files: 1, lines: 1 }
+            ),
+            None
+        );
+        assert_eq!(
+            push_side_branch_if_needed(
+                &backend,
+                &cmd,
+                &workdir,
+                &Decision::UnresolvedConflicts { paths: vec![] }
+            ),
+            None
         );
     }
 
