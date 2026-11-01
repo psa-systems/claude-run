@@ -6499,6 +6499,10 @@ mod tests {
     /// concurrency rather than inferring it from timing.
     struct SlowClassifier {
         delay: Duration,
+        /// Hold each call until this many overlap, so a test of overlap does not
+        /// depend on the second call starting within `delay` (CLAUDE-507). A
+        /// deadline keeps a real failure a failed assertion, not a hang.
+        hold_for_peak: usize,
         live: std::sync::atomic::AtomicUsize,
         peak: std::sync::atomic::AtomicUsize,
         calls: std::sync::atomic::AtomicUsize,
@@ -6508,6 +6512,7 @@ mod tests {
         fn new(delay: Duration) -> Self {
             Self {
                 delay,
+                hold_for_peak: 0,
                 live: std::sync::atomic::AtomicUsize::new(0),
                 peak: std::sync::atomic::AtomicUsize::new(0),
                 calls: std::sync::atomic::AtomicUsize::new(0),
@@ -6531,6 +6536,12 @@ mod tests {
             self.calls.fetch_add(1, SeqCst);
             let now = self.live.fetch_add(1, SeqCst) + 1;
             self.peak.fetch_max(now, SeqCst);
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            while self.peak.load(SeqCst) < self.hold_for_peak
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             std::thread::sleep(self.delay);
             self.live.fetch_sub(1, SeqCst);
             Ok(Triage {
@@ -6549,7 +6560,10 @@ mod tests {
     async fn run_two_distinct_jobs_at_concurrency(analysis_concurrency: usize) -> usize {
         let pool = crate::db::test_pool().await;
         let backend = Arc::new(StoreBackend::new());
-        let slow = Arc::new(SlowClassifier::new(Duration::from_millis(150)));
+        let slow = Arc::new(SlowClassifier {
+            hold_for_peak: analysis_concurrency,
+            ..SlowClassifier::new(Duration::from_millis(150))
+        });
         let classifier: Arc<dyn FailureClassifier> = slow.clone();
 
         let mut logs = HashMap::new();
@@ -8244,8 +8258,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        // Wait on the outcome, not a short budget (CLAUDE-507).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut ended: Option<String> = None;
-        for _ in 0..200 {
+        while std::time::Instant::now() < deadline {
             ended = sqlx::query_scalar(sqlx::AssertSqlSafe(
                 crate::db::q(&pool, "SELECT ended_at FROM runs WHERE id = ?").into_owned(),
             ))
@@ -8348,8 +8364,11 @@ mod tests {
             .unwrap();
         drop(parked);
 
+        // Wait on the outcome, not a short budget: on a busy runner the retry can
+        // take far longer than it does locally (CLAUDE-507).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut ended: Option<String> = None;
-        for _ in 0..200 {
+        while std::time::Instant::now() < deadline {
             ended = sqlx::query_scalar(sqlx::AssertSqlSafe(
                 crate::db::q(&pool, "SELECT ended_at FROM runs WHERE id = ?").into_owned(),
             ))
