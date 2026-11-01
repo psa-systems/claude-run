@@ -1,6 +1,8 @@
 #!/usr/bin/env nu
 
-# Resolve the single publish tag and train for the build workflow.
+# SPEC-9.2: "The CI image-publish workflow resolves a single publish train
+# from its own trigger ... never from `git describe`." Resolve the single
+# publish tag and train for the build workflow.
 #
 # The publish MODE is derived from the workflow TRIGGER (not from `git
 # describe`) and passed in via --mode:
@@ -32,6 +34,9 @@
 # When used as a module (`use get-tags.nu`) it returns the record. When run as a
 # script for a workflow step, pass --json to serialize the record for capture
 # (e.g. `^nu oci-build/get-tags.nu --mode latest --json | from json`).
+# SPEC-9.2: "`release` train ... `latest` train ... `dry-run` ... resolves to
+# the `release` train when given a `--simulate-tag` version to exercise, else
+# to the `latest` train."
 export def main [
     --mode: string                  # release | latest | dry-run (from the trigger)
     --ref-name: string = ""         # tag ref name for release mode (e.g. v1.2.3)

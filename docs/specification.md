@@ -753,8 +753,13 @@ action's `token_ref`, which is injected per job.
   build. The runtime stage is a Linux image carrying `claude`, `yt`, `fj`, `gh`, `nu`, `just`, Docker CLI, git and Rust
   tooling, plus `gosu` and `catatonit`. Entrypoint: `catatonit -- gosu-entrypoint.sh claude-run`, default command
   `serve --no-socket`. The image starts as root and drops to uid/gid 1001 through the entrypoint.
+- The runtime stage smoke-checks the base image's toolchain at build time (a version/help invocation of every CLI the
+  image is expected to carry); a base image that lost a tool fails the image build there instead of failing the first
+  job that needs it.
+- `gosu` has no openSUSE Leap package: the runtime stage downloads the upstream per-architecture release binary and
+  verifies it against that release's published SHA256SUMS before installing it.
 - Entrypoint hooks seed `config.toml` and the shipped action files into an empty config volume and chown the data
-  directory.
+  directory. See 9.1 for the entrypoint's own root/non-root and UID/GID behavior.
 - Image environment: `CLAUDE_RUN_CONFIG_DIR=/config`, `CLAUDE_RUN_DATA_DIR=/data`, `CLAUDE_RUN_STATE_DIR=/state`,
   `CLAUDE_RUN_RUNTIME_DIR=/run/claude-run`, `CLAUDE_CONFIG_DIR=/config/claude-agent-home`. The agent's `CLAUDE.md` is baked
   from `deploy/bot-CLAUDE.md`.
@@ -764,6 +769,10 @@ action's `token_ref`, which is injected per job.
   privileged Docker-in-Docker sidecar sharing the app's network namespace (daemon on `tcp://127.0.0.1:2375`, healthcheck
   `nc -z`), and an optional PostgreSQL service behind the `postgres` profile (healthcheck `pg_isready`). No host bind
   mount is used. No port is published by default.
+- `compose.yml` passes the same `RUNS_ON_*` image references the CI workflows resolve through `${{ vars.RUNS_ON_* }}`
+  into the app service as environment variables, so a `claude` session the daemon spawns (running `just check-docker` or
+  `just pre-commit` against the Docker-in-Docker sidecar) builds against the identical images CI uses instead of a
+  guessed tag.
 - The app service defines no container healthcheck. Liveness is available from `GET /api/status` and the `status`
   command.
 - Shipped action files: `youtrack.yml` (interval 5m), `audit-run.yml` (interval 5m), `closed-issue-summary.yml` (interval
@@ -771,14 +780,52 @@ action's `token_ref`, which is injected per job.
 - Restart safety: `GET /api/status` and the About page expose a `quiet` flag that is true only when no run is open and
   no run is dispatched.
 
+### 9.1 Entrypoint and UID/GID remap (`SPEC-9.1`)
+
+`oci-build/gosu-entrypoint.sh` is the shared, byte-identical entrypoint; image-specific root steps run as hooks under
+`/etc/entrypoint.d/` instead of being added to this file.
+
+- Started as a non-root user (for example a compose `user:` pin): the remap, hooks and chown below are all skipped. Any
+  `PUID`/`PGID` given must match the uid/gid the container was actually started as, or the entrypoint refuses to start.
+  Every path named in `DATA_DIRS` must already exist and be writable by that uid/gid, or the entrypoint refuses to
+  start naming the unwritable path; it then execs the command directly.
+- Started as root: `PUID`/`PGID` resolve to, in order, an explicit non-zero environment value, else the owner of the
+  first `DATA_DIRS` entry when that owner is not root, else 1001/1001. A non-numeric or zero `PUID`/`PGID` refuses to
+  start rather than run the workload as root.
+- The resolved uid/gid is applied to the image's `APP_USER` (`usermod`/`groupmod -o`, allowing an id already present in
+  the image), the root hooks under `/etc/entrypoint.d/` run in filename order and a non-zero exit from any hook aborts
+  startup, then every `DATA_DIRS` entry is chowned recursively to the resolved uid/gid, skipping paths that already
+  match. The command then execs under `gosu "$APP_USER" "$@"` (the user form, not `uid:gid`, so supplementary groups
+  come from `/etc/group`).
+- `CLAUDE_RUN_DATA_DIR` (`/data`) is deliberately not a member of `DATA_DIRS`: it holds `workdirs/`, a tree of job git
+  clones the runtime user populates itself, which a recursive chown on every boot would walk. It gets its own shallow
+  chown from the `20-data-dir.sh` hook instead: the directory itself, every entry directly under it except `workdirs`
+  (chowned recursively), and the `workdirs` directory entry itself (not its contents).
+
+### 9.2 Image publish trains (`SPEC-9.2`)
+
+The CI image-publish workflow resolves a single publish train from its own trigger (`oci-build/get-tags.nu`), never
+from `git describe`, because a release commit is simultaneously a push to `main` and a `v*` tag push and both workflow
+runs fire:
+
+- `release` train (an exact `v*` tag push): publishes only the immutable `<version>` artifact.
+- `latest` train (a push to `main`): publishes only the rolling `latest` artifact.
+- `dry-run` (a `workflow_dispatch`): builds and prints without mutating the registry; it resolves to the `release` train
+  when given a `--simulate-tag` version to exercise, else to the `latest` train.
+
+The two real trains publish disjoint tag sets, so the branch-push run and the tag-push run of the same release commit
+never write the same registry destination.
+
 ## 10. Non-functional behavior
 
 - Logging: JSON lines through `tracing`. Default filter `info,claude_run=info,sqlx=warn`. Destination is stdout, except
   `mcp stdio` which logs to stderr so stdout carries only protocol frames. `serve --detach` redirects both to
-  `<state dir>/logs/daemon.log`. The first line of `serve` is `Server started` with version and pid. Two argv
-  pre-scans run before clap parses the real CLI (`mcp stdio` detection for the trace writer, and `--color`): clap
-  colors its own help/usage/error output as part of parsing itself, so the color choice must be known before that
-  call, not read back from its result.
+  `<state dir>/logs/daemon.log`. The first line of `serve` is `Server started` with version and pid. The container
+  image runs its default command foregrounded (`serve --no-socket`, no `--detach`), so its logs are its stdout, left
+  for the container runtime's own log driver to capture rather than redirected to a file. Two argv pre-scans run
+  before clap parses the real CLI (`mcp stdio` detection for the trace writer, and `--color`): clap colors its own
+  help/usage/error output as part of parsing itself, so the color choice must be known before that call, not read
+  back from its result.
 - Diagnostics: warnings and errors that concern a run or delivery are also stored in `run_events` and shown on `/logs`.
 - Error handling: invalid action YAML, unknown config keys and unsupported database schemes fail with a message naming the
   value. API errors carry a JSON message and a non-2xx status for conflicts, unknown names and unavailable queues.
