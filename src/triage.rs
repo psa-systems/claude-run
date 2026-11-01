@@ -1,5 +1,7 @@
 //! Failure triage engine.
 //!
+//! Implements SPEC-3.5.1 (and the bucket meanings in SPEC-3.5).
+//!
 //! A verified `action_run_failure` event plus its redacted job log
 //! ([`crate::forge_log`]) is sorted into one of three buckets:
 //!
@@ -52,7 +54,7 @@ use crate::forge_log::ForgeReads;
 /// Default cap (bytes) for the log text inlined into the classifier prompt.
 pub const DEFAULT_MAX_LOG_BYTES: usize = 48 * 1024;
 
-/// The three triage buckets. Lowercase `snake_case` is the stable wire form
+/// SPEC-3.5: the triage buckets. Lowercase `snake_case` is the stable wire form
 /// (used in the classifier reply and any persistence).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,7 +107,7 @@ impl FromStr for TriageBucket {
     }
 }
 
-/// Which pass produced a [`Triage`].
+/// SPEC-3.5.1: which pass produced a [`Triage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClassifiedBy {
@@ -115,7 +117,7 @@ pub enum ClassifiedBy {
     Llm,
 }
 
-/// The typed triage result consumed by the issue-minting subtask.
+/// SPEC-3.5.1: the typed triage result consumed by the issue-minting subtask.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Triage {
     /// The bucket this failure was sorted into.
@@ -163,8 +165,8 @@ impl Triage {
     }
 }
 
-/// Everything the engine needs about one verified failure: the metadata from the
-/// `action_run_failure` event plus its redacted log.
+/// SPEC-3.5.1: everything the engine needs about one verified failure: the
+/// metadata from the `action_run_failure` event plus its redacted log.
 #[derive(Debug, Clone)]
 pub struct TriageInput {
     /// `owner/repo`.
@@ -200,7 +202,7 @@ pub struct TriageInput {
     pub log_token: Option<String>,
 }
 
-/// Infra / transient signatures (lowercased substrings) that mark a bucket-3
+/// SPEC-3.5.1: infra / transient signatures (lowercased substrings) that mark a bucket-3
 /// failure unambiguously enough to skip the LLM. Curated to stay clear of
 /// ordinary test-failure output.
 const TRANSIENT_SIGNATURES: &[&str] = &[
@@ -228,7 +230,7 @@ const TRANSIENT_SIGNATURES: &[&str] = &[
     "dial tcp",
 ];
 
-/// Deterministic first pass. Returns `Some` only for a clear transient/infra
+/// SPEC-3.5.1: deterministic first pass. Returns `Some` only for a clear transient/infra
 /// failure (bucket 3), so the caller skips the LLM; `None` for everything else,
 /// which the caller hands to the [`FailureClassifier`].
 pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
@@ -291,7 +293,7 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
     None
 }
 
-/// Whether `branch` matches one of `prefixes` (case-sensitive, e.g.
+/// SPEC-3.5.1: whether `branch` matches one of `prefixes` (case-sensitive, e.g.
 /// `renovate/`). An empty `branch` (unresolvable) never matches, since there is
 /// nothing to compare a prefix against.
 fn is_bot_owned_branch(branch: &str, prefixes: &[String]) -> bool {
@@ -301,7 +303,7 @@ fn is_bot_owned_branch(branch: &str, prefixes: &[String]) -> bool {
             .any(|p| !p.is_empty() && branch.starts_with(p.as_str()))
 }
 
-/// The LLM pass, behind a trait so tests inject a stub and production shells out
+/// SPEC-3.5.1: the LLM pass, behind a trait so tests inject a stub and production shells out
 /// to `claude`. Implementations classify the residue into bucket 1 vs 2 and write
 /// the analysis; they must never panic and should degrade rather than propagate.
 pub trait FailureClassifier: Send + Sync {
@@ -319,7 +321,7 @@ pub trait FailureClassifier: Send + Sync {
     fn classify(&self, input: &TriageInput, spend: &crate::usage::RunSpend) -> Result<Triage>;
 }
 
-/// Hybrid triage: deterministic rules first, then the deterministic auto-fix
+/// SPEC-3.5.1: hybrid triage: deterministic rules first, then the deterministic auto-fix
 /// detectors, and only then the `classifier` for the residue. A classifier error
 /// degrades to [`TriageBucket::HumanAction`] (a human looks) rather than failing
 /// the pipeline.
@@ -441,14 +443,14 @@ fn extract_last_json_object(s: &str) -> Option<Value> {
     serde_json::from_str(&s[start..=end]).ok()
 }
 
-/// The four verdicts [`AnalysisClassifier`]'s prompt asks for, and
+/// SPEC-3.5.1: the four verdicts [`AnalysisClassifier`]'s prompt asks for, and
 /// how each routes.
 const VERDICT_CODE_DEFECT: &str = "code_defect";
 const VERDICT_NEEDS_HUMAN: &str = "needs_human";
 const VERDICT_FLAKY: &str = "flaky";
 const VERDICT_INFRA: &str = "infra";
 
-/// Parse an [`AnalysisClassifier`] reply into a [`Triage`]. Reads the LAST
+/// SPEC-3.5.1: parse an [`AnalysisClassifier`] reply into a [`Triage`]. Reads the LAST
 /// JSON object in the reply (the fenced verdict [`analysis::build_prompt`]
 /// asks for at the end): `{"verdict": "code_defect"|"needs_human"|"flaky"|
 /// "infra", "failing_tests": [...], "summary": "..."}`. `code_defect` maps to
@@ -494,7 +496,7 @@ pub fn parse_analysis_verdict(reply: &str) -> Triage {
     )
 }
 
-/// Production [`FailureClassifier`]: one tool-using `claude`
+/// SPEC-3.5.1: production [`FailureClassifier`]: one tool-using `claude`
 /// session per failure, over the COMPLETE log (not the bounded copy the old
 /// [`bound_log`]-based classifier used) plus the failing workflow YAML, ending
 /// with a fenced JSON verdict ([`parse_analysis_verdict`]) that routes the
@@ -558,6 +560,9 @@ impl AnalysisClassifier {
     }
 }
 
+/// SPEC-3.5.1: the production classifier session, run over the complete
+/// redacted log plus the failing workflow YAML, ending in the fenced verdict
+/// [`parse_analysis_verdict`] maps into a bucket.
 impl FailureClassifier for AnalysisClassifier {
     fn classify(&self, input: &TriageInput, spend: &crate::usage::RunSpend) -> Result<Triage> {
         let Some(index_in_repo) = analysis::run_index_from_url(&input.html_url) else {

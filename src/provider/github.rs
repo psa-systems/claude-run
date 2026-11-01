@@ -375,9 +375,20 @@ impl GithubForge {
     /// fall back to an unauthenticated push against `origin` (host git auth),
     /// warning with both misses named rather than failing silently.
     /// SPEC-8.5: pushes authenticated per invocation via the credential-helper mechanism.
-    fn push(&self, workdir: &Path, host: &str, repo: &str, branch: &str) -> Result<()> {
+    fn push(
+        &self,
+        workdir: &Path,
+        host: &str,
+        repo: &str,
+        branch: &str,
+        no_verify: bool,
+    ) -> Result<()> {
         let refspec = format!("HEAD:{branch}");
-        let push_args = ["push", "origin", refspec.as_str()];
+        let push_args: Vec<&str> = if no_verify {
+            vec!["push", "--no-verify", "origin", refspec.as_str()]
+        } else {
+            vec!["push", "origin", refspec.as_str()]
+        };
         let token_url = match self.effective_token(host) {
             Ok(token) => Some(format!("https://x-access-token:{token}@{host}/{repo}.git")),
             Err(e) => {
@@ -563,7 +574,7 @@ impl GithubForge {
             .and_then(|out| out.split_whitespace().next().map(str::to_string))
             .filter(|s| !s.is_empty());
 
-        self.push(workdir, host, &repo, &branch)?;
+        self.push(workdir, host, &repo, &branch, false)?;
 
         let event = if draft {
             crate::push_comment::PushEvent::TimeoutSalvagePush
@@ -976,6 +987,47 @@ impl Forge for GithubForge {
             });
         }
         Ok(())
+    }
+
+    /// SPEC-3.3.1's final push: see [`Forge::final_push`]. GitHub has no
+    /// AGit equivalent, so `HEAD` is always the feature branch; "nothing to
+    /// push" degrades to `Ok(None)` when it carries no commit the base lacks.
+    fn final_push(
+        &self,
+        workdir: &Path,
+        host: &str,
+    ) -> Result<Option<crate::provider::FinalPushReport>> {
+        let branch = self.git(workdir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        let base = self.detect_base(workdir);
+        let ahead = self
+            .git(
+                workdir,
+                &["rev-list", "--count", &format!("origin/{base}..HEAD")],
+            )
+            .unwrap_or_default();
+        if ahead.trim().parse::<u64>().unwrap_or(0) == 0 {
+            return Ok(None);
+        }
+        let repo = parse_owner_repo(&self.git(workdir, &["remote", "get-url", "origin"])?)
+            .ok_or_else(|| {
+                Error::Other(anyhow::anyhow!(
+                    "cannot parse owner/repo from origin remote in {}",
+                    workdir.display()
+                ))
+            })?;
+        match self.push(workdir, host, &repo, &branch, false) {
+            Ok(()) => Ok(Some(crate::provider::FinalPushReport {
+                branch,
+                hook_rejected: None,
+            })),
+            Err(e) => {
+                self.push(workdir, host, &repo, &branch, true)?;
+                Ok(Some(crate::provider::FinalPushReport {
+                    branch,
+                    hook_rejected: Some(e.to_string()),
+                }))
+            }
+        }
     }
 
     fn clone_url(&self, host: &str, repo: &str) -> Result<String> {
@@ -2326,7 +2378,13 @@ mod tests {
         )
         .with_git_retry_waits(NO_WAIT);
         let err = forge
-            .push(Path::new("/tmp/wd"), "github.com", "octo/widget", "feat/x")
+            .push(
+                Path::new("/tmp/wd"),
+                "github.com",
+                "octo/widget",
+                "feat/x",
+                false,
+            )
             .unwrap_err()
             .to_string();
         assert!(err.contains("failed to push some refs"), "{err}");
@@ -2352,7 +2410,13 @@ mod tests {
         )
         .with_git_retry_waits(NO_WAIT);
         match forge
-            .push(Path::new("/tmp/wd"), "github.com", "octo/widget", "feat/x")
+            .push(
+                Path::new("/tmp/wd"),
+                "github.com",
+                "octo/widget",
+                "feat/x",
+                false,
+            )
             .unwrap_err()
         {
             Error::CliFailed { stderr, .. } => assert_eq!(stderr, "boom"),
@@ -2392,6 +2456,107 @@ mod tests {
             .filter(|c| c.as_str() == "git push origin HEAD:feat/x")
             .count();
         assert_eq!(push_calls, 2, "{calls:?}");
+    }
+
+    /// CLAUDE-486 (SPEC-3.3.1): `GithubForge::final_push` pushes HEAD when it
+    /// is ahead of the detected base, reporting no hook rejection on a clean
+    /// push.
+    #[test]
+    fn final_push_pushes_ahead_commits_with_no_hook_rejection() {
+        let runner = Arc::new(with_git(StubRunner::new(), "feat/x", "origin").ok(
+            "git",
+            &["rev-list", "--count", "origin/main..HEAD"],
+            "2\n",
+        ));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_git_retry_waits(NO_WAIT);
+        let report = forge
+            .final_push(Path::new("/tmp/wd"), "github.com")
+            .unwrap()
+            .expect("a branch ahead of base should push");
+        assert_eq!(report.branch, "feat/x");
+        assert!(report.hook_rejected.is_none(), "{report:?}");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c == "git push origin HEAD:feat/x"),
+            "{calls:?}"
+        );
+    }
+
+    /// `final_push` degrades to `Ok(None)` ("nothing to push") when HEAD
+    /// carries no commit the base lacks, without attempting a push.
+    #[test]
+    fn final_push_is_a_noop_when_head_is_not_ahead_of_base() {
+        let runner = Arc::new(with_git(StubRunner::new(), "feat/x", "origin").ok(
+            "git",
+            &["rev-list", "--count", "origin/main..HEAD"],
+            "0\n",
+        ));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_git_retry_waits(NO_WAIT);
+        let report = forge
+            .final_push(Path::new("/tmp/wd"), "github.com")
+            .unwrap();
+        assert!(report.is_none(), "{report:?}");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("push")),
+            "no push should be attempted: {calls:?}"
+        );
+    }
+
+    /// A `pre-push` hook rejection on the first push retries with
+    /// `--no-verify`, exactly as `CliBackend::final_push` does, and the
+    /// report names the hook's own failure text.
+    #[test]
+    fn final_push_retries_no_verify_on_hook_rejection() {
+        let runner = Arc::new(
+            with_git(StubRunner::new(), "feat/x", "origin")
+                .ok("git", &["rev-list", "--count", "origin/main..HEAD"], "2\n")
+                .fail(
+                    "git",
+                    &["push", "origin", "HEAD:feat/x"],
+                    1,
+                    "pre-push hook declined",
+                )
+                .ok("git", &["push", "--no-verify", "origin", "HEAD:feat/x"], ""),
+        );
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_git_retry_waits(NO_WAIT);
+        let report = forge
+            .final_push(Path::new("/tmp/wd"), "github.com")
+            .unwrap()
+            .expect("a hook-rejected push still reports a push attempt");
+        assert_eq!(report.branch, "feat/x");
+        let hook_rejected = report
+            .hook_rejected
+            .expect("hook rejection should be recorded");
+        assert!(
+            hook_rejected.contains("pre-push hook declined"),
+            "{hook_rejected}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git push --no-verify origin HEAD:feat/x"),
+            "{calls:?}"
+        );
     }
 
     #[test]

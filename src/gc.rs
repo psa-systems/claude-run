@@ -1,6 +1,6 @@
-//! GC sweepers for the unbounded on-disk trees: preserved and aside workdirs
-//! ([`sweep`]), per-attempt stream logs ([`sweep_stream_logs`]), the two
-//! size-bounded files under `logs/` ([`sweep_oversized_logs`]), per-job
+//! SPEC-3.8: GC sweepers for the unbounded on-disk trees: preserved and aside
+//! workdirs ([`sweep`]), per-attempt stream logs ([`sweep_stream_logs`]), the
+//! two size-bounded files under `logs/` ([`sweep_oversized_logs`]), per-job
 //! snippet directories ([`sweep_snippets`]), and redacted webhook CI logs
 //! ([`sweep_webhook_logs`]). All are scheduled by the daemon on the same tick
 //! and read their own DB-backed retention window.
@@ -57,7 +57,9 @@ const DAEMON_LOG: &str = "daemon.log";
 /// over into a second generation.
 const ROTATED_SUFFIX: &str = ".1";
 
-/// Tally of one [`sweep`] or [`sweep_stream_logs`] pass.
+/// SPEC-3.8: tally of one age- or in-use-based sweep pass ([`sweep`],
+/// [`sweep_stream_logs`], [`sweep_snippets`], [`sweep_webhook_logs`],
+/// [`sweep_docker_volumes`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepStats {
     /// Entries deleted this pass (workdirs, or stream logs).
@@ -74,9 +76,9 @@ pub struct SweepStats {
     pub target_removal_failed: u64,
 }
 
-/// Walk `<base>/<source>/<key>` and delete every workdir older than the
-/// retention window, keeping workdirs holding local-only work (unpushed
-/// commits, a dirty tree, or a stash) until the longer hard cap.
+/// SPEC-3.8.1: walk `<base>/<source>/<key>` and delete every workdir older
+/// than the retention window, keeping workdirs holding local-only work
+/// (unpushed commits, a dirty tree, or a stash) until the longer hard cap.
 ///
 /// `now` is injected (production passes [`SystemTime::now`]) so a test can age a
 /// directory by passing a future instant rather than mutating its mtime. A
@@ -181,8 +183,8 @@ where
     stats
 }
 
-/// Walk `<logs_dir>/<action>/streams/*.jsonl` and delete every stream log
-/// older than the retention window.
+/// SPEC-3.8.2: walk `<logs_dir>/<action>/streams/*.jsonl` and delete every
+/// stream log older than the retention window.
 ///
 /// `in_flight` is the set of `(action, job_key)` pairs whose job is still
 /// running, read by the caller from `run_inflight_jobs` joined to the runs that
@@ -293,9 +295,9 @@ fn stream_log_key(file_name: &str) -> Option<String> {
     Some(key.to_string())
 }
 
-/// Walk `<state_dir>/snippets/<action>/<job_key>/` and delete every snippet
-/// directory older than `cfg.snippet_retention_days`, keeping one whose job
-/// is still in flight regardless of age.
+/// SPEC-3.8.2: walk `<state_dir>/snippets/<action>/<job_key>/` and delete
+/// every snippet directory older than `cfg.snippet_retention_days`, keeping
+/// one whose job is still in flight regardless of age.
 ///
 /// The shape is the per-source/per-key walk [`sweep`] already does for
 /// workdirs, but with the stream-log sweep's in-flight guard rather than the
@@ -391,8 +393,8 @@ pub fn sweep_snippets(
     stats
 }
 
-/// Walk the files directly under `<state_dir>/webhook-logs/` and delete every
-/// one older than `cfg.webhook_log_retention_days`.
+/// SPEC-3.8.2: walk the files directly under `<state_dir>/webhook-logs/` and
+/// delete every one older than `cfg.webhook_log_retention_days`.
 ///
 /// Only files DIRECTLY under `webhook-logs/` are considered: `write_artifact`
 /// ([`crate::forge_log`]) is the only writer that puts one there, one per
@@ -453,7 +455,7 @@ pub fn sweep_webhook_logs(dir: &Path, cfg: &StreamLogGcConfig, now: SystemTime) 
     stats
 }
 
-/// Tally of one [`sweep_oversized_logs`] pass.
+/// SPEC-3.8.3: tally of one [`sweep_oversized_logs`] pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BoundStats {
     /// Files rolled over and truncated back under their ceiling this pass.
@@ -466,8 +468,8 @@ pub struct BoundStats {
     pub bytes_reclaimed: u64,
 }
 
-/// Bound the append-forever files under `<logs_dir>` by SIZE: `daemon.log`,
-/// `usage.jsonl`, and every `logs/<action>/<output.file>`.
+/// SPEC-3.8.3: bound the append-forever files under `<logs_dir>` by SIZE:
+/// `daemon.log`, `usage.jsonl`, and every `logs/<action>/<output.file>`.
 ///
 /// None is a per-run artifact, so the age window [`sweep_stream_logs`] uses
 /// does not apply: each is one file that a long-lived daemon appends to for the
@@ -708,12 +710,13 @@ pub(crate) fn dir_size(path: &Path) -> u64 {
 
 // ---- Docker sidecar named-volume sweep (CLAUDE-433) -----------------------
 
-/// Name prefix of a buildx state volume. Never removed: it is buildkit's own
-/// cache, not a stack artifact, and recreating it is far more expensive than
-/// the disk it costs.
+/// SPEC-3.8.5: name prefix of a buildx state volume. Never removed: it is
+/// buildkit's own cache, not a stack artifact, and recreating it is far more
+/// expensive than the disk it costs.
 pub const BUILDX_VOLUME_PREFIX: &str = "buildx_buildkit_";
 
-/// One Docker named volume as reported by [`DockerVolumeClient::list_volumes`].
+/// SPEC-3.8.5: one Docker named volume as reported by
+/// [`DockerVolumeClient::list_volumes`].
 #[derive(Debug, Clone)]
 pub struct DockerVolume {
     pub name: String,
@@ -730,7 +733,7 @@ pub struct DockerVolume {
     pub size_bytes: Option<u64>,
 }
 
-/// Why [`DockerVolumeClient::remove_volume`] failed, so the sweep can log a
+/// SPEC-3.8.5: why [`DockerVolumeClient::remove_volume`] failed, so the sweep can log a
 /// volume Docker refused because it is in use at `info` (routine) and any
 /// other failure at `error` (actionable).
 #[derive(Debug)]
@@ -742,10 +745,10 @@ pub enum VolumeRemoveError {
     Other(String),
 }
 
-/// Talks to the sidecar's Docker daemon on behalf of [`sweep_docker_volumes`].
-/// Injected so the sweep's decision logic (age, in-use, buildx-prefix) is
-/// testable without a real Docker daemon; production passes
-/// [`CliDockerVolumeClient`].
+/// SPEC-3.8.5: talks to the sidecar's Docker daemon on behalf of
+/// [`sweep_docker_volumes`]. Injected so the sweep's decision logic (age,
+/// in-use, buildx-prefix) is testable without a real Docker daemon;
+/// production passes [`CliDockerVolumeClient`].
 pub trait DockerVolumeClient {
     /// Every named volume the daemon knows about. `Err` signals the daemon
     /// could not be reached (including `DOCKER_HOST` unset); the sweep treats
@@ -756,7 +759,7 @@ pub trait DockerVolumeClient {
     fn remove_volume(&self, name: &str) -> Result<(), VolumeRemoveError>;
 }
 
-/// Production [`DockerVolumeClient`], talking to whichever daemon
+/// SPEC-3.8.5: production [`DockerVolumeClient`], talking to whichever daemon
 /// `DOCKER_HOST` points the `docker` CLI at (the sidecar, in the deployed
 /// container). Never passes `--all` to a list or prune call, which has no age
 /// filter and would remove a volume a session created moments ago.
@@ -854,9 +857,9 @@ fn run_docker(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Remove every named volume in the sidecar's Docker daemon that no container
-/// references and that is older than `cfg.volume_retention_days`, keeping a
-/// `buildx_buildkit_*` state volume regardless of age.
+/// SPEC-3.8.5: remove every named volume in the sidecar's Docker daemon that
+/// no container references and that is older than `cfg.volume_retention_days`,
+/// keeping a `buildx_buildkit_*` state volume regardless of age.
 ///
 /// `client` is injected ([`CliDockerVolumeClient`] in production) so the
 /// decision logic is testable without a real Docker daemon. `now` is injected

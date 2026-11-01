@@ -1,5 +1,9 @@
 //! Deterministic infrastructure-failure detector.
 //!
+//! Implements the infrastructure-detection half of SPEC-3.5.1 and the
+//! branch-agnostic `infra:<kind>` fingerprint/dedupe key it feeds into
+//! SPEC-3.5.2.
+//!
 //! A CI failure caused by the RUNNER rather than the commit (a full disk, an
 //! OOM kill, an unreachable package registry) is identical on every branch and
 //! is not fixable on any of them. The root-cause dedupe key contains
@@ -8,9 +12,9 @@
 //! `kind` id to key on instead (see [`crate::mint`]).
 //!
 //! Modelled on [`crate::autofix`]: pure string work over the FULL redacted log,
-//! no LLM and no I/O, so it sees the whole log rather than the bounded copy the
-//! classifier prompt gets ([`crate::triage`] bounds that to 48 KB, which for a
-//! post-steps capacity abort is exactly the evidence that gets cut).
+//! no LLM and no I/O, so it sees the whole log, same as the classifier's own
+//! session ([`crate::triage::AnalysisClassifier`] writes the complete redacted
+//! log to the per-event workdir and reads it with no truncation).
 //!
 //! Nothing about triage buckets or routing changes: an infra failure is still
 //! classified and routed as it was, because reclaiming disk is a human action.
@@ -20,7 +24,8 @@
 //! worse than leaving a host condition ungrouped, so each detector requires an
 //! unambiguous phrase and an undetected condition is the preferred failure mode.
 
-/// An infrastructure / runner condition recognized in a job log. Same shape as
+/// SPEC-3.5.1 / SPEC-3.5.2: an infrastructure / runner condition recognized in
+/// a job log. Same shape as
 /// [`crate::autofix::AutoFix`]: a stable `kind` id (what the dedupe key is built
 /// from, so the same condition keys identically however the message is worded)
 /// plus a human-readable statement of the problem.
@@ -34,9 +39,9 @@ pub struct InfraFailure {
     pub problem: String,
 }
 
-/// Run the infrastructure detectors against a full redacted job log, most
-/// specific first. `None` when no detector matches, which is the common case: a
-/// code failure must never match here.
+/// SPEC-3.5.1: run the infrastructure detectors against a full redacted job
+/// log, most specific first. `None` when no detector matches, which is the
+/// common case: a code failure must never match here.
 ///
 /// Cargo test-result lines (`test <name> ... ok` / `FAILED` / `ignored[, ...]`)
 /// and the bare `<target>::<test>` paths cargo lists under `failures:` are
