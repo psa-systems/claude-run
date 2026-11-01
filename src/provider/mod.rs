@@ -2096,6 +2096,13 @@ mod tests {
     /// removed, and passes with it in place.
     #[test]
     fn shallow_clone_fetches_tags_older_than_the_depth_window() {
+        // This test and its helpers resolve `git` off `PATH`; without the
+        // lock, a concurrent test that temporarily prepends a stub `git` to
+        // the process-wide `PATH` (CLAUDE-410) can interleave its own
+        // mutation into these calls, intermittently pointing them at a stub
+        // binary that no longer exists (observed in CI as ENOENT on a
+        // `/tmp/.tmpXXXX/bin/git` path).
+        let _path_guard = git_stub_path_test_lock();
         let tmp = tempfile::tempdir().unwrap();
         let url = origin_with_old_tags(tmp.path(), 30);
         let clone = tmp.path().join("clone");
@@ -2110,6 +2117,8 @@ mod tests {
     /// separately: a pinned-branch clone must also end up with every tag.
     #[test]
     fn pinned_branch_clone_also_fetches_tags_older_than_the_depth_window() {
+        // See the lock comment on `shallow_clone_fetches_tags_older_than_the_depth_window`.
+        let _path_guard = git_stub_path_test_lock();
         let tmp = tempfile::tempdir().unwrap();
         let url = origin_with_old_tags(tmp.path(), 30);
         let clone = tmp.path().join("clone");
@@ -2124,6 +2133,8 @@ mod tests {
     /// `fetch_tags_retrying`'s doc comment).
     #[test]
     fn shallow_clone_of_a_tagless_repo_still_succeeds() {
+        // See the lock comment on `shallow_clone_fetches_tags_older_than_the_depth_window`.
+        let _path_guard = git_stub_path_test_lock();
         let tmp = tempfile::tempdir().unwrap();
         let url = origin_with_default_branch(tmp.path(), "main");
         let clone = tmp.path().join("clone");
