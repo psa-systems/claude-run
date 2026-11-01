@@ -369,7 +369,9 @@ All sweeps are DB-backed settings, enabled by default flags in each section, and
   merged PR must still be matchable against a regression months later, so only the per-sighting/per-invocation
   history tables above are bounded by age.
 - The default `retention_days` stays `>=` the longest reporting range the web UI exposes (90 days), so a bounded
-  report is never silently truncated by the prune running ahead of it.
+  report is never silently truncated by the prune running ahead of it. A save that enables the sweep with
+  `retention_days` below that same 90-day floor is rejected outright, not just defaulted away from, so the floor
+  holds for every saved value, not only the shipped default.
 
 #### 3.8.5 Docker volume GC (`SPEC-3.8.5`)
 
@@ -383,6 +385,8 @@ All sweeps are DB-backed settings, enabled by default flags in each section, and
   volume is left in place; any other remove failure is logged and the pass continues to the rest. Neither `--force`
   nor `--all` is ever passed: Docker's own in-use refusal is the safety net this sweep relies on, and `--all` has no
   age filter.
+- A save setting `volume_retention_days` below 1 is rejected: Docker records no last-used time, so a 0-day window
+  would remove a volume a session created moments ago while its container sat between restarts.
 
 ### 3.9 Run comment footer (`SPEC-3.9`)
 
