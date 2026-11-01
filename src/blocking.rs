@@ -7,7 +7,13 @@
 //! connection that cannot be polled holds that connection too. That is how a
 //! saturated host turned into `pool timed out while waiting for an open
 //! connection` and dropped scheduler ticks, with no statement itself slow.
+//!
+//! SPEC-10: "every synchronous subprocess exec or blocking sleep reached from
+//! async code runs through a `block_in_place` wrapper."
 
+/// SPEC-10: the `block_in_place` wrapper every sync subprocess exec or
+/// blocking sleep from async code runs through.
+///
 /// Run `f`, releasing this worker's core to the runtime for its duration.
 ///
 /// [`tokio::task::block_in_place`] is used rather than

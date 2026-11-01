@@ -10,6 +10,10 @@
 //!
 //! `parse_schedule` validates the action's stored fields; `next_fire` decides
 //! whether an action is due now.
+//!
+//! SPEC-3.1: "`schedule.kind` is `interval`, `cron`, or `manual`"; SPEC-2.2:
+//! the scheduler computes a due time per schedule kind and tracks regather
+//! cadence in memory, not from DB rows.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -19,6 +23,8 @@ use chrono::{DateTime, Utc};
 use crate::action::{Schedule, ScheduleKind};
 use crate::error::Result;
 
+/// SPEC-3.1: the parsed form of an action's `schedule:` block (`interval`,
+/// `cron`, or `manual`).
 #[derive(Debug, Clone)]
 pub enum ParsedSchedule {
     Interval(Duration),
@@ -28,6 +34,7 @@ pub enum ParsedSchedule {
     Manual,
 }
 
+/// SPEC-3.1: validates an action's stored `schedule.kind` / `schedule.spec`.
 pub fn parse_schedule(s: &Schedule) -> Result<ParsedSchedule> {
     match s.kind {
         ScheduleKind::Manual => Ok(ParsedSchedule::Manual),
@@ -60,6 +67,8 @@ pub fn parse_schedule(s: &Schedule) -> Result<ParsedSchedule> {
     }
 }
 
+/// SPEC-2.2: computes the due time for an action's schedule kind.
+///
 /// Decide whether an action is due to fire now, given when it last started.
 pub fn next_fire_due(
     schedule: &ParsedSchedule,
@@ -86,6 +95,9 @@ pub fn next_fire_due(
     }
 }
 
+/// SPEC-2.2: tracks regather cadence in memory (the dispatcher's `last_fire`
+/// map), not from DB-row state.
+///
 /// The continuous-pickup cadence check. Replaces the old
 /// `should_fire` in-flight suppressor: overlapping runs are now allowed, so the
 /// scheduler no longer refuses to fire while a prior run is in flight. Instead an

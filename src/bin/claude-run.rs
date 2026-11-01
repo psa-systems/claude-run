@@ -6,6 +6,12 @@
 //! pause, resume) delegate to the daemon when its socket is reachable, else
 //! operate on the DB directly so the binary is useful both standalone and as
 //! a daemon control plane.
+//!
+//! SPEC-4.1: the command table, the daemon-reachable definition, the
+//! `trigger`/`cancel` exceptions, the socket-vs-pidfile-marker distinction,
+//! action self-rescan, `stop`/`restart` grace windows, and `migrate`/`import`
+//! defaults. SPEC-10: the two argv pre-scans that must run before clap parses
+//! the real CLI.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -246,6 +252,9 @@ enum SecretCmd {
     Delete { name: String },
 }
 
+/// SPEC-10: the two argv pre-scans (mcp-stdio detection, `--color`) run
+/// before clap parses `Cli::cmd`, and `--detach` forks before any tokio
+/// runtime is built.
 fn main() -> ExitCode {
     // Pre-scan argv before building the tracing subscriber: `mcp stdio`'s
     // stdout must carry only MCP frames, so its logs are routed to stderr
@@ -314,6 +323,9 @@ fn parse_cli(color: ColorWhen) -> Cli {
     Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
 }
 
+/// SPEC-10: one of the two argv pre-scans that must resolve before clap
+/// parses the real CLI, since clap colors its own output during parsing.
+///
 /// Best-effort scan of argv for `--color <v>` / `--color=<v>`, used only to seed
 /// the renderer before full parse. Invalid values fall back to `Auto` here and
 /// surface as a proper clap error during [`parse_cli`].
@@ -356,6 +368,10 @@ fn clap_choice(color: ColorWhen) -> clap::ColorChoice {
     }
 }
 
+/// SPEC-2.2: `serve --detach` forks before any tokio runtime is built, and
+/// never lets `daemonize` manage the pidfile, since the daemon's own `flock`
+/// is the sole authority.
+///
 /// Fork into the background with `logs/daemon.log` as the daemon's stdout and
 /// stderr. Nothing rotates that file here; the daemon's own log GC
 /// pass (`crate::gc::sweep_oversized_logs`, first tick at serve start) keeps it
@@ -384,6 +400,8 @@ fn detach_now() -> claude_run::error::Result<()> {
     Ok(())
 }
 
+/// SPEC-10: the "Server started" line, the first logged on `serve`.
+///
 /// First log line of a `serve` process, emitted before config load, the pool and
 /// the migrations. `recorded serve start` (`daemon.rs`) is a different line: it
 /// stamps the DB-backed diagnostics window and must stay after the pool opens.
@@ -395,6 +413,9 @@ fn log_server_started() {
     );
 }
 
+/// SPEC-10: JSON lines through `tracing`, stdout by default, stderr only for
+/// `mcp stdio` so its stdout carries only protocol frames.
+///
 /// Build the tracing subscriber and return a reload handle for its `EnvFilter`.
 /// The initial filter is `CLAUDE_RUN_LOG` if set, else the built-in default,
 /// so every line emitted before config load
@@ -430,6 +451,9 @@ fn init_tracing(to_stderr: bool) -> reload::Handle<EnvFilter, Registry> {
     reload_handle
 }
 
+/// SPEC-10: the other of the two argv pre-scans that must run before clap
+/// parses `Cli::cmd`.
+///
 /// Best-effort scan of argv for the `mcp stdio` subcommand, used only to pick
 /// `init_tracing`'s writer before clap has parsed `Cli::cmd`. Ignores any
 /// token starting with `-` (global flags and their values) and looks at the
@@ -442,7 +466,7 @@ fn argv_is_mcp_stdio(args: &[String]) -> bool {
         && positional.next().map(String::as_str) == Some("stdio")
 }
 
-/// Apply `[daemon].log_filter` after config load, honoring the
+/// SPEC-10: apply `[daemon].log_filter` after config load, honoring the
 /// `CLAUDE_RUN_LOG` > file > default precedence (see [`cfg::log_filter_choice`]).
 /// An unparseable directive logs a warning and keeps the active filter rather
 /// than aborting the daemon.
@@ -474,6 +498,10 @@ fn apply_config_log_filter(
     }
 }
 
+/// SPEC-4.1: dispatches every CLI subcommand per the command table; `migrate`
+/// defaults its source to `~/.local/share/claude-run/state` and always
+/// targets the configured database, and `import` always targets the
+/// configured database too.
 async fn real_main(
     cli: Cli,
     log_reload: reload::Handle<EnvFilter, Registry>,
@@ -570,6 +598,10 @@ async fn real_main(
     }
 }
 
+/// SPEC-4.1: `run <action>` holds the per-action cross-process lock
+/// ([`lock::ActionLock`]) the daemon path no longer takes, so a standalone
+/// run and a daemon-scheduled run of the same action are unsupported
+/// concurrent use.
 async fn run_action(
     arg: &str,
     actions_dir: &std::path::Path,
@@ -658,6 +690,7 @@ async fn run_action(
     .await
 }
 
+/// SPEC-4.1: `serve [--detach] [--no-socket]` starts the daemon.
 async fn serve(
     _detach: bool, // already actioned in main() before the tokio runtime started
     unix_socket: bool,
@@ -716,9 +749,10 @@ fn cleanup_stale_socket(paths: &cfg::Paths) {
     }
 }
 
-/// Send SIGTERM to the daemon (if any) and poll for it to exit. Never escalates
-/// to SIGKILL - per the repo safety rule, a stuck daemon is left for the
-/// operator to deal with.
+/// SPEC-4.1: `stop`'s own poll grace is the CLI's patience waiting for the
+/// daemon to finish its separate 30-second shutdown grace (SPEC-2.2); never
+/// escalates to SIGKILL, per the repo safety rule, so a stuck daemon is left
+/// for the operator to deal with.
 async fn stop_daemon(paths: &cfg::Paths) -> claude_run::error::Result<StopOutcome> {
     let pid = match daemon::read_pidfile(paths) {
         Some(p) if daemon::process_alive(p) => p,
@@ -748,6 +782,7 @@ async fn stop_daemon(paths: &cfg::Paths) -> claude_run::error::Result<StopOutcom
     }
 }
 
+/// SPEC-4.1: `stop` never force-kills a daemon that outlives its grace window.
 async fn stop(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     match stop_daemon(paths).await? {
         StopOutcome::NotRunning => {
@@ -769,6 +804,9 @@ async fn stop(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     }
 }
 
+/// SPEC-4.1: `restart` is stop-then-`exec()` into a fresh `serve`, never an
+/// in-process restart, so the detach-before-tokio-runtime ordering in
+/// `main()` applies the same way it does to a cold start.
 async fn restart(
     detach: bool,
     no_socket: bool,
@@ -806,10 +844,11 @@ async fn restart(
     Err(anyhow::anyhow!("failed to exec `serve` on restart: {err}").into())
 }
 
-/// The error for "the daemon socket is not answering", told apart from "no
-/// daemon is running". With `serve --no-socket` the daemon is healthy and the
-/// socket is absent by design, and reporting that as "not running" sends the
-/// operator to restart a daemon that is working fine.
+/// SPEC-2.2 / SPEC-4.1: the error for "the daemon socket is not answering",
+/// told apart from "no daemon is running". With `serve --no-socket` the
+/// daemon is healthy and the socket is absent by design, and reporting that
+/// as "not running" sends the operator to restart a daemon that is working
+/// fine.
 fn daemon_unreachable(
     paths: &cfg::Paths,
     sock: &std::path::Path,
@@ -830,6 +869,8 @@ fn daemon_unreachable(
     }
 }
 
+/// SPEC-4.1: `trigger` is one of the two commands that fail outright naming
+/// the daemon-unreachable reason instead of falling back to a DB-direct path.
 async fn trigger(action: &str, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     let sock = daemon::daemon_socket_path(paths);
     if !DaemonClient::is_reachable(&sock) {
@@ -847,6 +888,9 @@ async fn trigger(action: &str, paths: &cfg::Paths) -> claude_run::error::Result<
     Ok(exit::OK)
 }
 
+/// SPEC-4.1: `cancel` is the other command that fails outright with no
+/// DB-direct fallback, since an in-flight run's cancellation token only
+/// exists inside the daemon process (SPEC-3.7).
 async fn cancel_run(run_id: i64, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     let sock = daemon::daemon_socket_path(paths);
     if !DaemonClient::is_reachable(&sock) {
@@ -862,6 +906,9 @@ async fn cancel_run(run_id: i64, paths: &cfg::Paths) -> claude_run::error::Resul
     Ok(exit::OK)
 }
 
+/// SPEC-4.1: `pause` (global or per-action) prefers the daemon API when
+/// reachable and falls back to a DB-direct write otherwise, unlike
+/// `trigger`/`cancel` which have no such fallback.
 async fn pause(
     action: Option<String>,
     reason: Option<String>,
@@ -890,6 +937,7 @@ async fn pause(
     Ok(exit::OK)
 }
 
+/// SPEC-4.1: `resume` mirrors `pause`'s daemon-API-or-DB-direct fallback.
 async fn resume(
     action: Option<String>,
     paths: &cfg::Paths,
@@ -915,6 +963,8 @@ async fn resume(
     Ok(exit::OK)
 }
 
+/// SPEC-4.1: `status` prefers the daemon's own `/status` route when
+/// reachable and falls back to the daemonless report otherwise.
 async fn status(
     paths: &cfg::Paths,
     db_target: &cfg::DatabaseTarget,
@@ -931,9 +981,11 @@ async fn status(
     Ok(exit::OK)
 }
 
-/// The report `status` prints with no daemon running, or running with the
-/// unix socket disabled. Split out of [`status`] so the blocks it must carry
-/// are testable without a live daemon or captured stdout.
+/// SPEC-4.1 / SPEC-2.2: the report `status` prints with no daemon running, or
+/// running with the unix socket disabled; the `daemon` field distinguishes
+/// `RunningNoSocket`, `NotRunning`, and `Undetermined` per
+/// [`daemon::DaemonPresence`]. Split out of [`status`] so the blocks it must
+/// carry are testable without a live daemon or captured stdout.
 async fn daemonless_status(
     pool: &crate::db::DbPool,
     paths: &cfg::Paths,
@@ -1015,6 +1067,12 @@ impl ActionShow {
     }
 }
 
+/// SPEC-4.1: `action list`/`show` self-rescan the index (via
+/// [`daemon::scan_actions`]) when no daemon is reachable to do it for them;
+/// `delete` and `reset-attempts` delegate to the daemon when it is up (so
+/// the active-run guard and the `run_events` journal stay DB-pool-consistent
+/// with the daemon's own writes) and otherwise apply the same guards
+/// directly against the DB.
 async fn action_cmd(
     cmd: ActionCmd,
     paths: &cfg::Paths,
@@ -1148,7 +1206,7 @@ async fn action_cmd(
     Ok(exit::OK)
 }
 
-/// `claude-run access check`. Delegates to the daemon over the unix
+/// SPEC-4.1: `claude-run access check`. Delegates to the daemon over the unix
 /// socket when it is up (so the check runs as the daemon's identity, with its
 /// PATH and env) and runs the same service directly against the DB when it is
 /// not. Prints the typed report as JSON either way, and exits `CONFIG_ERROR`
@@ -1222,6 +1280,9 @@ async fn access_cmd(
     }
 }
 
+/// SPEC-4.1: `secret set` masks interactive input with double-entry
+/// confirmation and reads piped stdin as a single line with its trailing
+/// newline stripped; an empty value is rejected rather than stored.
 async fn secret_cmd(
     cmd: SecretCmd,
     db_target: &cfg::DatabaseTarget,

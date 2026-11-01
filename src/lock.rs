@@ -1,11 +1,15 @@
 //! Per-action cross-process advisory lock.
 //!
-//! Both the daemon's worker pool and a standalone `claude-run run <action>`
-//! invocation acquire this lock before processing jobs, so they serialize even
-//! when running in different processes. Held only for the duration of one
-//! run; released on drop.
+//! The standalone `claude-run run <action>` invocation acquires this lock
+//! before processing jobs. The daemon's own dispatch path no longer takes it
+//! (see `daemon.rs`'s `Limiter`/`KeyGate` instead); running standalone `run`
+//! for an action the daemon also schedules is unsupported concurrent use.
+//! Held only for the duration of one run; released on drop.
 //!
 //! `flock(LOCK_EX | LOCK_NB)` semantics: try-lock, fail fast if held.
+//!
+//! SPEC-4.1: "`run <action>` | Run one action once, holding the per-action
+//! lock."
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -15,6 +19,7 @@ use fs2::FileExt;
 
 use crate::error::Result;
 
+/// SPEC-4.1: the per-action lock `run <action>` holds for its duration.
 pub struct ActionLock {
     _file: File,
     path: PathBuf,
@@ -24,6 +29,10 @@ impl ActionLock {
     /// Try to acquire an exclusive non-blocking lock on
     /// `<lock_dir>/<action>.lock`. Returns `Ok(None)` if another process holds
     /// it, `Ok(Some(_))` on success.
+    ///
+    /// SPEC-4.1: "`run <action>` | Run one action once, holding the
+    /// per-action lock"; exit code `exit::LOCKED` (2) when another process
+    /// holds it.
     pub fn try_acquire(lock_dir: &Path, action: &str) -> Result<Option<Self>> {
         std::fs::create_dir_all(lock_dir)?;
         let path = lock_dir.join(format!("{action}.lock"));
