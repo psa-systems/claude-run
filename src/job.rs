@@ -238,6 +238,9 @@ pub fn concurrency_key(action: &LoadedAction, job: &Value, idx: usize) -> String
     }
 }
 
+/// SPEC-3.1: runs the `input.command` gather step ("`scripted` runs
+/// `input.command` (emits a JSON array) -> `filter` -> ...") and enforces the
+/// JSON-array shape the specification requires of its stdout.
 pub async fn gather_jobs(
     action: &LoadedAction,
     ctx_snippet: &SnippetRunner,
@@ -635,6 +638,10 @@ impl ProcessedJob {
 
 /// Append a job-outcome record to the action's per-action JSONL log (the
 /// `output.file` field on the action). Best-effort; logs but does not fail.
+///
+/// SPEC-3.1: "Optional `output.file` (relative to the state dir) appends one
+/// JSON record per job outcome, the same shape the DB's `job_outcomes` table
+/// stores; unset writes nothing."
 ///
 /// This file is append-only and lives for the life of the install,
 /// so the daemon bounds it by SIZE (`config.stream_log_gc.output_file_max_bytes`,
