@@ -1,3 +1,5 @@
+//! SPEC-4.2: the JSON API.
+//!
 //! HTTP API exposed by the daemon. Phase 2 serves it over a unix socket at
 //! `$RUNTIME_DIR/daemon.sock`. Phase 3 binds the same router to TCP for the
 //! web UI.
@@ -42,6 +44,8 @@ use tokio::sync::mpsc;
 use crate::cancel::RunRegistry;
 use crate::state;
 
+/// SPEC-4.2: the in-memory half of the delete/trigger in-flight check.
+///
 /// The daemon's in-memory set of action names with a dispatched run.
 /// Shared between the dispatcher (which bumps/drops a per-action refcount as runs
 /// start and finish) and the API delete handler (which consults it for the
@@ -51,6 +55,8 @@ use crate::state;
 /// positive count means "in flight".
 pub type InFlight = Arc<tokio::sync::Mutex<std::collections::HashMap<String, usize>>>;
 
+/// SPEC-4.2: the state every JSON API handler runs against.
+///
 /// Shared state injected into every handler. `Clone` is trivial because the
 /// fields are already cheap-clone (`DbPool` is `Arc`-shaped, `Sender`
 /// is `Clone`, version is `&'static`).
@@ -98,6 +104,8 @@ pub struct AppState {
     pub agent_config_dir: Option<std::path::PathBuf>,
 }
 
+/// SPEC-4.2: the route table.
+///
 /// JSON API router. Phase 2 mounted it at root over the unix socket;
 /// Phase 3 mounts it under `/api/` over TCP (alongside the web UI). The
 /// unix socket continues to serve it at root for cheaper CLI calls.
@@ -135,6 +143,9 @@ pub fn router(state: AppState) -> Router {
         .with_state(Arc::new(state))
 }
 
+/// SPEC-4.2: `GET /status`'s body; `stale_gates` is SPEC-3.3's dependency
+/// gate, `attempt_cap_hits` SPEC-3.1's per-key cap, `not_ready_*`/
+/// `login_required_since` SPEC-3.7's readiness axes.
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     version: String,
@@ -167,6 +178,8 @@ struct StatusResponse {
     actions: Vec<ActionStatus>,
 }
 
+/// SPEC-9: the `quiet` flag the restart-safety bullet names.
+///
 /// The daemon's live-work snapshot. One type behind `/api/status`,
 /// `claude-run status`, and the About page's quiet indicator, so the three
 /// surfaces cannot disagree about whether a restart is safe.
@@ -184,6 +197,8 @@ pub struct Activity {
     pub dispatched_actions: Vec<String>,
 }
 
+/// SPEC-9: builds the shared `quiet` snapshot.
+///
 /// Build the [`Activity`] snapshot. A DB failure propagates rather
 /// than degrading to an empty list: reporting "idle, safe to restart" because
 /// the query failed is exactly the mistake this indicator exists to prevent.
@@ -226,6 +241,7 @@ struct ActionStatus {
     parse_error: Option<String>,
 }
 
+/// SPEC-4.2: `GET /status`.
 async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusResponse>, AppError> {
     let global = state::global_pause_status(&s.pool)
         .await?
@@ -296,6 +312,7 @@ async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusRespons
     }))
 }
 
+/// SPEC-4.2: `GET /actions`.
 async fn list_actions(
     State(s): State<Arc<AppState>>,
 ) -> Result<Json<Vec<state::ActionIndexRow>>, AppError> {
@@ -308,6 +325,7 @@ struct AckResponse {
     message: String,
 }
 
+/// SPEC-4.2: `POST /actions/{name}/trigger` and its 400/404/409/503 reasons.
 async fn trigger_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
@@ -376,6 +394,7 @@ struct PauseRequest {
     reason: Option<String>,
 }
 
+/// SPEC-4.2 / SPEC-3.7: `POST /actions/{name}/pause`.
 async fn pause_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
@@ -389,6 +408,7 @@ async fn pause_action(
     }))
 }
 
+/// SPEC-4.2 / SPEC-3.7: `POST /actions/{name}/resume`.
 async fn resume_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
@@ -400,6 +420,8 @@ async fn resume_action(
     }))
 }
 
+/// SPEC-4.2: `POST /actions/{name}/attempts/{key}/reset`.
+///
 /// Clear one key's attempt counter so a job parked at the cap can
 /// be retried. 404s a key with no counter row rather than a silent no-op on a
 /// mistyped key, and records the reset at `warn` (naming the discarded count)
@@ -433,6 +455,8 @@ async fn reset_attempts(
     }))
 }
 
+/// SPEC-4.2: `POST /actions/{name}/delete`.
+///
 /// Delete an action from every surface. Refuses (409) when a run is
 /// in flight, 404s an unknown action, otherwise removes the YAML file, the
 /// `actions` index row, and the control state (`paused_actions`,
@@ -473,6 +497,8 @@ async fn delete_action(
     }))
 }
 
+/// SPEC-4.2: the delete semantics shared by the API, web and CLI paths.
+///
 /// Remove an indexed action's YAML file (tolerating an already-gone
 /// file) and purge its derived index + control state. Run history is kept.
 /// Returns `false` when `name` is not in the index (unknown action). Shared by
@@ -492,6 +518,8 @@ pub async fn delete_indexed_action(pool: &DbPool, name: &str) -> Result<bool, cr
     Ok(true)
 }
 
+/// SPEC-4.2 / SPEC-3.7: `POST /runs/{id}/cancel`.
+///
 /// Cancel an in-flight run. Tripping the token tears the run down:
 /// the claude child is terminated, the in-flight job runs its `post` phase
 /// with a synthesized cancelled result, and the run finalizes with
@@ -515,6 +543,8 @@ async fn cancel_run(
     }
 }
 
+/// SPEC-4.2: the dual-encoding pause reason.
+///
 /// The optional pause reason, from either encoding. The CLI and
 /// API clients send `{"reason": "..."}`; the About page's Pause form posts
 /// `reason=...` urlencoded, which is what htmx serializes a form to without an
@@ -543,6 +573,7 @@ fn pause_reason(headers: &axum::http::HeaderMap, body: &str) -> Option<String> {
     }
 }
 
+/// SPEC-4.2 / SPEC-3.7: `POST /pause`.
 async fn global_pause_handler(
     State(s): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -556,6 +587,7 @@ async fn global_pause_handler(
     }))
 }
 
+/// SPEC-4.2 / SPEC-3.7: `POST /resume`.
 async fn global_resume_handler(
     State(s): State<Arc<AppState>>,
 ) -> Result<Json<AckResponse>, AppError> {
@@ -566,7 +598,7 @@ async fn global_resume_handler(
     }))
 }
 
-/// Resolve the URL path segment into a settings section or 404.
+/// SPEC-4.2: resolves the `{section}` path segment for the settings routes.
 fn parse_section(section: &str) -> Result<crate::settings::Section, AppError> {
     crate::settings::Section::from_path(section).ok_or_else(|| AppError {
         status: StatusCode::NOT_FOUND,
@@ -574,8 +606,8 @@ fn parse_section(section: &str) -> Result<crate::settings::Section, AppError> {
     })
 }
 
-/// `GET /api/settings/<section>` returns the section's current JSON document.
-/// Secrets appear as their `*_ref` names only.
+/// SPEC-4.2: `GET /settings/{section}`. Secrets appear as their `*_ref`
+/// names only.
 async fn get_settings_section(
     State(s): State<Arc<AppState>>,
     AxumPath(section): AxumPath<String>,
@@ -590,9 +622,8 @@ async fn get_settings_section(
         .into_response())
 }
 
-/// `PUT /api/settings/<section>` validates the JSON body against the section's
-/// config struct, persists it, and applies it live. A serde error 400s with the
-/// message; nothing is persisted on rejection.
+/// SPEC-4.2: `PUT /settings/{section}`. A serde error 400s with the message;
+/// nothing is persisted on rejection.
 async fn put_settings_section(
     State(s): State<Arc<AppState>>,
     AxumPath(section): AxumPath<String>,
@@ -617,6 +648,8 @@ async fn put_settings_section(
 
 // ---- reporting endpoints ---------------------------------------------------
 
+/// SPEC-4.2: `range`/`action` query params shared by every report endpoint.
+///
 /// Query params shared by every `/api/report/*` endpoint. Both fields are
 /// optional: `range` defaults to all-time, an empty / absent `action` means
 /// global totals across all actions.
@@ -640,6 +673,7 @@ impl ReportQuery {
     }
 }
 
+/// SPEC-4.2: `GET /report/summary`.
 async fn report_summary(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -649,6 +683,7 @@ async fn report_summary(
     ))
 }
 
+/// SPEC-4.2: `GET /report/daily`.
 async fn report_daily(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -658,6 +693,7 @@ async fn report_daily(
     ))
 }
 
+/// SPEC-4.2: `GET /report/weekly`.
 async fn report_weekly(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -667,6 +703,7 @@ async fn report_weekly(
     ))
 }
 
+/// SPEC-4.2: `GET /report/by-weekday`.
 async fn report_by_weekday(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -676,6 +713,7 @@ async fn report_by_weekday(
     ))
 }
 
+/// SPEC-4.2: `GET /report/by-hour`.
 async fn report_by_hour(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -687,6 +725,8 @@ async fn report_by_hour(
 
 // ---- access check -----------------------------------------------------------
 
+/// SPEC-4.6 / SPEC-7.2: the credential base an access check materializes into.
+///
 /// The credential base directory every access check materializes into: the same
 /// `credentials` tree the per-job path uses, under its own `access` namespace.
 /// Each probe still gets a unique subdirectory and scrubs it on drop.
@@ -694,6 +734,8 @@ pub fn access_cred_base(paths: &crate::config::Paths) -> std::path::PathBuf {
     paths.runtime_dir.join("credentials").join("access")
 }
 
+/// SPEC-4.2 / SPEC-4.6: `POST /access/check`.
+///
 /// `POST /access/check`: run the on-demand access check and return the typed
 /// report. An absent / empty body checks everything. No secret value is ever
 /// part of the response (see `crate::access`).
@@ -714,6 +756,7 @@ async fn access_check(
     Ok(Json(report))
 }
 
+/// SPEC-10: API errors carry a JSON message and a non-2xx status.
 #[derive(Debug)]
 struct AppError {
     status: StatusCode,

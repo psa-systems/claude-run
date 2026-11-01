@@ -1,4 +1,4 @@
-//! On-demand access check.
+//! SPEC-4.6: the on-demand access check.
 //!
 //! Answers, without queueing a job, whether the runner has the access it needs:
 //! every configured credential's identity and validity, and whether a NAMED repo
@@ -31,11 +31,15 @@ use crate::provider::{self, CommandRunner, Forge, IssueTracker};
 use crate::secrets::{self, JobCredentials, ResolvedCredentials};
 use crate::state;
 
+/// SPEC-4.6: the aggregate check's project cap, truncation never silent.
+///
 /// Ceiling on the projects an aggregate check probes per action. A run of the
 /// action's own query can reach any number of projects; the cap keeps a "Check
 /// all" bounded. Truncation is never silent: it emits its own row.
 const MAX_PROJECTS: usize = 10;
 
+/// SPEC-4.6: the check-kind taxonomy.
+///
 /// What a row probed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -70,6 +74,8 @@ impl CheckKind {
     }
 }
 
+/// SPEC-4.6: `Unverifiable` is distinct from a failure.
+///
 /// A row's verdict. `Unverifiable` is distinct from `Pass` on purpose: it is the
 /// honest answer for a capability (opening a PR, writing a tracker field) that
 /// only a mutating probe could prove.
@@ -100,6 +106,8 @@ impl Outcome {
     }
 }
 
+/// SPEC-4.6: a check row; no secret value is ever carried in any field.
+///
 /// One typed check row. `detail` carries the probe's own output or, on failure,
 /// the CLI's error text verbatim (for a repo probe that is the
 /// `provider::probe_denied` message, which already names the scope or grant to
@@ -119,13 +127,15 @@ pub struct CheckRow {
     pub remediation: Option<String>,
 }
 
-/// The report all three surfaces render.
+/// SPEC-4.6: the report all three surfaces render.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessReport {
     pub rows: Vec<CheckRow>,
 }
 
 impl AccessReport {
+    /// SPEC-4.6: a missing `yt`/`fj` is reported as a row, never a 500.
+    ///
     /// Render a setup error (no usable `yt` / `fj`, an unreadable DB) as the
     /// report itself. A surface that 500s instead would hide the answer: "the
     /// runner cannot even invoke its CLIs" IS an access finding.
@@ -146,6 +156,8 @@ impl AccessReport {
         }
     }
 
+    /// SPEC-4.6: `Unverifiable` rows never count against the overall verdict.
+    ///
     /// True when no row failed. `Unverifiable` is not a failure: it is a stated
     /// limit of a read-only check, not a missing grant.
     pub fn ok(&self) -> bool {
@@ -160,6 +172,8 @@ impl AccessReport {
     }
 }
 
+/// SPEC-4.6: the request shape shared by all three surfaces.
+///
 /// What to check. Every field absent is the aggregate check: every enabled
 /// YouTrack action's credentials, the projects its query reaches, and the repos
 /// those projects bind to.
@@ -182,11 +196,15 @@ pub struct AccessRequest {
 }
 
 impl AccessRequest {
+    /// SPEC-4.6: no `repo` and no `project` is the aggregate form.
+    ///
     /// True when the request names no target: check everything.
     fn is_aggregate(&self) -> bool {
         self.repo.is_none() && self.project.is_none()
     }
 
+    /// SPEC-4.6: the empty-string-means-untouched contract the three surfaces share.
+    ///
     /// Normalize the empty strings a form POST sends for untouched fields.
     pub fn normalized(mut self) -> Self {
         fn clean(v: &mut Option<String>) {
@@ -218,6 +236,8 @@ impl AccessRequest {
     }
 }
 
+/// SPEC-4.6: the unit a check runs against.
+///
 /// One enabled YouTrack action's typed config, the unit a check runs against.
 #[derive(Debug, Clone)]
 struct ActionTargets {
@@ -239,6 +259,8 @@ impl ActionTargets {
     }
 }
 
+/// SPEC-4.6: a row's credential label.
+///
 /// Label a credential for a row: the secret name, or the host-auth fallback.
 fn credential_label(token_ref: Option<&str>, tool: &str) -> String {
     match token_ref {
@@ -247,6 +269,8 @@ fn credential_label(token_ref: Option<&str>, tool: &str) -> String {
     }
 }
 
+/// SPEC-4.6: the "nothing to check" row wins over a CLI-absent error.
+///
 /// The row for "there is nothing to check": no enabled `youtrack` action, so
 /// the check has no credential and no query to work from.
 fn no_actions_row(req: &AccessRequest) -> CheckRow {
@@ -265,6 +289,8 @@ fn no_actions_row(req: &AccessRequest) -> CheckRow {
     }
 }
 
+/// SPEC-4.6: `claude-run access check` / `POST /access/check` / `/access`'s entry point.
+///
 /// Run the access check with the real process runner.
 ///
 /// A missing `yt` / `fj` is reported as a row rather than propagated, so no
@@ -285,7 +311,7 @@ pub async fn check(pool: &DbPool, cred_base: &Path, req: &AccessRequest) -> Resu
     }
 }
 
-/// [`check`] with an injectable [`CommandRunner`] (tests).
+/// SPEC-4.6: [`check`] with an injectable [`CommandRunner`] (tests).
 pub async fn check_with(
     pool: &DbPool,
     cred_base: &Path,
@@ -340,6 +366,8 @@ pub async fn check_with(
     Ok(AccessReport { rows })
 }
 
+/// SPEC-4.6: never silently skips an action whose YAML no longer loads.
+///
 /// Load the enabled YouTrack actions to check from the action index, plus a row
 /// per action whose YAML no longer loads (a check that silently skipped it would
 /// report "all good" for an action it never probed).
@@ -390,6 +418,8 @@ async fn action_targets(
     Ok((targets, rows))
 }
 
+/// SPEC-4.6: the identity -> write -> project -> vcs -> query probe order.
+///
 /// Probe one action's credentials. Blocking: it shells out to `yt` / `fj`.
 fn probe_action(
     target: &ActionTargets,
@@ -629,6 +659,9 @@ fn probe_action(
     rows
 }
 
+/// SPEC-4.6 / SPEC-3.3.1: routes to the GitHub or Forgejo backend by host,
+/// mirroring the per-job forge selection.
+///
 /// Probe one `host`/`repo` with the credential the job would use for it: the
 /// GitHub PAT for a GitHub host (auto-routed exactly as the per-job forge
 /// selection is), the Forgejo token otherwise.
@@ -753,6 +786,8 @@ fn probe_repo(
     rows
 }
 
+/// SPEC-4.6: the row suffix naming a pinned `base_url`, never the token.
+///
 /// `" on <base_url>"` when the action pins one, else empty. The URL is public
 /// config, never the token.
 fn base_url_suffix(target: &ActionTargets) -> String {
@@ -762,6 +797,8 @@ fn base_url_suffix(target: &ActionTargets) -> String {
     }
 }
 
+/// SPEC-4.6: reinterprets YouTrack's HTTP 400 `invalid_query` as a read-grant gap.
+///
 /// Turn a failed `yt list` into operator guidance. YouTrack answers a query that
 /// names a project the token cannot read with HTTP 400 `invalid_query`, not a
 /// 401/403, so the raw text reads as a syntax error; say what it really is.
@@ -787,6 +824,8 @@ fn query_remediation(detail: &str, project: Option<&str>) -> String {
     }
 }
 
+/// SPEC-4.6: suppresses a recovery marker except on a fail-to-pass transition.
+///
 /// Drop the poll's recovery markers for repos that were not failing,
 /// so the success marker is recorded only on a fail -> pass transition. Without
 /// this every poll would append one info row per repo forever; with it, the
