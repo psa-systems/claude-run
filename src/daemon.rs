@@ -191,7 +191,7 @@ impl Daemon {
         // The global pause is DB-persisted, so it survives a restart and the
         // daemon can come up already paused. Say so at `info`, otherwise a
         // daemon that schedules nothing looks broken rather than paused. The
-        // dashboard banner and the About Activity card are the visual reminder.
+        // dashboard banner and the Status page's Activity card are the visual reminder.
         if let Some((paused_at, reason)) = state::global_pause_status(&pool).await? {
             info!(
                 paused_at = %paused_at,
