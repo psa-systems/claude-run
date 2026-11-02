@@ -479,13 +479,18 @@ pub fn validate_db_retention(cfg: &DbRetentionConfig) -> std::result::Result<(),
     Ok(())
 }
 
-/// SPEC-3.8.5, SPEC-6.3: validate a [`DockerGcConfig`] before it is persisted:
-/// `volume_retention_days` must be at least 1, since Docker records no
-/// last-used time and a 0-day window would remove a volume a session created
-/// moments ago while its container was between restarts.
+/// SPEC-3.8.5, SPEC-3.11, SPEC-6.3: validate a [`DockerGcConfig`] before it is
+/// persisted: `volume_retention_days` must be at least 1, since Docker records
+/// no last-used time and a 0-day window would remove a volume a session created
+/// moments ago while its container was between restarts. `max_bytes`
+/// (SPEC-3.11) must be at least 1, since 0 would read as "always over the
+/// ceiling" on the very first usage read rather than as a disabled bound.
 pub fn validate_docker_gc(cfg: &DockerGcConfig) -> std::result::Result<(), String> {
     if cfg.volume_retention_days < 1 {
         return Err("volume_retention_days must be >= 1".to_string());
+    }
+    if cfg.max_bytes < 1 {
+        return Err("max_bytes must be >= 1".to_string());
     }
     Ok(())
 }
@@ -1553,6 +1558,39 @@ mod tests {
         assert_eq!(
             unchanged.volume_retention_days, 7,
             "a rejected save persists nothing"
+        );
+    }
+
+    /// SPEC-3.11: `max_bytes` defaults to 250 GB, round-trips, and rejects 0.
+    #[tokio::test]
+    async fn docker_gc_max_bytes_defaults_round_trips_and_rejects_zero() {
+        let pool = pool().await;
+        let live = LiveSettings::new(pool.clone(), eff_default(), None);
+
+        let default: DockerGcConfig =
+            serde_json::from_str(&live.section_json(Section::DockerGc).await).unwrap();
+        assert_eq!(default.max_bytes, 250 * 1024 * 1024 * 1024);
+
+        live.save_section(
+            Section::DockerGc,
+            r#"{"enabled":true,"volume_retention_days":3,"max_bytes":1000}"#,
+        )
+        .await
+        .expect("a >= 1-byte ceiling is valid");
+        assert_eq!(live.docker_gc_handle().read().await.max_bytes, 1000);
+
+        let err = live
+            .save_section(
+                Section::DockerGc,
+                r#"{"enabled":true,"volume_retention_days":3,"max_bytes":0}"#,
+            )
+            .await
+            .expect_err("a 0-byte ceiling must be rejected");
+        assert!(matches!(err, SaveError::Invalid(_)), "{err}");
+        assert_eq!(
+            live.docker_gc_handle().read().await.max_bytes,
+            1000,
+            "a rejected save leaves the live handle unchanged"
         );
     }
 

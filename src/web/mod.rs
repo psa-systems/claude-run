@@ -4756,6 +4756,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 badge: "next sweep",
                 note: "age past which an unused named volume in the sidecar is removed, measured from Docker's CreatedAt; must be >= 1.",
             },
+            FieldDoc {
+                name: "max_bytes",
+                badge: "next sweep",
+                note: "total ceiling across every Docker storage category (images, containers, local volumes, build cache); over it with no run in flight, storage is reclaimed in the SPEC-3.11 order until under it again; must be >= 1.",
+            },
         ],
     }
 }

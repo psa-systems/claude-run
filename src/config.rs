@@ -867,25 +867,38 @@ impl Default for DbRetentionConfig {
     }
 }
 
-/// Retention window for the sidecar's Docker named volumes (settings key
-/// `config.docker_gc`, editable on the web Settings page). NOT a `config.toml`
-/// key. The sweep ([`crate::gc::sweep_docker_volumes`]) runs on the same GC tick
-/// as the sweeps above, removing a named volume that no container references
-/// once it is older than `volume_retention_days`. CLAUDE-433: nothing removed
-/// these before; one deployment held 139 named volumes totalling about 206 GB,
-/// 138 of them referenced by no container, and the sidecar's data directory
-/// filled to 100%. SPEC-6.3.
+/// Retention window and overall ceiling for the sidecar's Docker storage
+/// (settings key `config.docker_gc`, editable on the web Settings page). NOT a
+/// `config.toml` key. The named-volume sweep
+/// ([`crate::gc::sweep_docker_volumes`]) and the SPEC-3.11 ceiling reclaim
+/// ([`crate::gc::reclaim_docker_storage`]) both run on the same GC tick,
+/// reading this section off the shared handle so a Settings save applies on
+/// the next pass. CLAUDE-433: nothing removed unreferenced named volumes
+/// before; one deployment held 139 named volumes totalling about 206 GB, 138
+/// of them referenced by no container, and the sidecar's data directory filled
+/// to 100%. CLAUDE-516 (SPEC-3.11) extends the bound to the sidecar's images,
+/// stopped containers and build cache, which were still unmeasured and
+/// unbounded. SPEC-6.3.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DockerGcConfig {
-    /// Master enable toggle. When `false`, the sweep removes nothing, so an
-    /// operator can park the feature without losing the configured window.
+    /// Master enable toggle. When `false`, neither the volume sweep nor the
+    /// ceiling reclaim removes anything, so an operator can park the feature
+    /// without losing the configured window.
     pub enabled: bool,
     /// Age, in days, past which an unused named volume is removed, measured
     /// from Docker's own `CreatedAt` (Docker records no last-used time, so age
     /// means time since creation). Default 3 days. Validated on save as an
     /// integer `>= 1`.
     pub volume_retention_days: u64,
+    /// SPEC-3.11: total ceiling, in bytes, across every category of the
+    /// sidecar's Docker storage (images, containers, local volumes, build
+    /// cache). When the sidecar's measured total exceeds this and no run is
+    /// in flight, [`crate::gc::reclaim_docker_storage`] reclaims storage in
+    /// the SPEC-3.11 order until the total is back under the ceiling. Default
+    /// 250 GB (assumed; revise if measurement shows otherwise). Validated on
+    /// save as an integer `>= 1`.
+    pub max_bytes: u64,
 }
 
 impl Default for DockerGcConfig {
@@ -893,6 +906,8 @@ impl Default for DockerGcConfig {
         Self {
             enabled: true,
             volume_retention_days: 3,
+            // 250 GB, SPEC-3.11's assumed default.
+            max_bytes: 250 * 1024 * 1024 * 1024,
         }
     }
 }
