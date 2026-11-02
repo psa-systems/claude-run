@@ -113,4 +113,53 @@
   {% endif %}
 </div>
 
+{# SPEC-3.11 item 4: the sidecar Docker storage categories, one row per
+   category, each with its size (or "unknown" plus the error when the usage
+   read failed) and a Prune button. Posts to the Docker storage prune route,
+   mirrored under /api the way the Pause and cargo-cache forms are, and
+   confirms with the category's name and size so a click cannot prune the
+   wrong thing by accident. A run in flight refuses with 409; the banner
+   below warns before that round trip. #}
+<h3>Docker storage</h3>
+
+<div class="card" style="margin-top: 16px;">
+  {% if docker_run_in_flight %}
+    <div class="dim" style="margin-bottom: 12px;">
+      <span class="badge warn">run in flight</span>
+      Pruning is refused until every run finishes.
+    </div>
+  {% endif %}
+  <table>
+    <thead>
+      <tr>
+        <th>Category</th>
+        <th>Size</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in docker_storage %}
+      <tr>
+        <td>{{ row.label }}</td>
+        <td>
+          {{ row.size_human }}
+          {% if let Some(e) = row.error %}
+            <span class="badge warn" title="{{ e }}">error</span>
+          {% endif %}
+        </td>
+        <td>
+          <form hx-post="/api/status/docker/{{ row.slug }}/prune"
+                hx-swap="none"
+                hx-disabled-elt="find button"
+                hx-on::after-request="if (event.detail.successful) window.location.reload()"
+                onsubmit="return confirm('Prune {{ row.label }} ({{ row.size_human }})? This removes every item in the category now.');">
+            <button class="btn" type="submit">Prune</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
 {% endblock %}

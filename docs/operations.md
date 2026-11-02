@@ -163,3 +163,26 @@ Scripting a reboot instead of clicking: `/api/status` (and `claude-run status`) 
 `quiet`, `active_runs`, and `dispatched_actions`. `quiet` is true only when BOTH signals are clear: the daemon's
 in-flight map is empty AND no `runs` row has `ended_at IS NULL`. Neither alone is sufficient, because the map catches a
 run dispatched before its row exists and the row catches a run started by a daemonless `claude-run run`.
+
+## Docker storage prune from the Status page (SPEC-3.11 item 4, CLAUDE-517)
+
+The **Management** part of `/status` also lists the sidecar's Docker storage by category: stopped containers, images,
+build cache, and unreferenced volumes (the same four categories [Docker storage ceiling reclaim](conventions/retention.md#docker-storage-ceiling-reclaim-spec-311-claude-516)
+reads for its ceiling check). Each row's size comes from one `DockerVolumeClient::usage()` read shared across all four
+rows, so a single unreachable daemon shows the same "unknown" plus the read's error on every row rather than querying
+per category; a Prune button next to each row removes everything currently in that category, with a confirmation
+naming the category and its size.
+
+Unlike the age-gated automatic sweep and reclaim passes above, a manual prune has no age filter: the operator has
+already confirmed removing the whole category. It reuses the same category-specific `crate::gc::prune_*` functions
+(`prune_stopped_containers`, `prune_images`, `prune_build_cache_now`, `prune_unreferenced_volumes`) built on the same
+injected `DockerVolumeClient`, so it needs no real Docker daemon to unit test. A single item's own remove failing
+(e.g. Docker refusing an in-use volume) is logged and the pass continues; only the category's own listing call (or, for
+build cache, the one `docker builder prune` call) failing fails the whole prune, which is then shown as a `500` naming
+the category and the error rather than reported as a reclaimed zero.
+
+The route is `POST /api/status/docker/{category}/prune`, mirrored under `/api` the same way the Pause form posts to
+`/api/pause` and the cargo-cache delete routes do, but defined in `src/web/mod.rs`'s own router rather than
+`api::router`, so it adds no route to the unix socket. It is refused with `409` and a visible message while any run is
+in flight, the same activity check the automatic reclaim loop already uses, since a run may be using the sidecar
+concurrently. A successful prune is logged at `info` with the category and bytes reclaimed.
