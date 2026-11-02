@@ -8417,9 +8417,9 @@ mod tests {
             .join(".claude-run-pr-body.md")
             .to_string_lossy()
             .to_string();
-        let push_comment_path = git_dir
+        let push_comment_prefix = git_dir
             .join("claude-run")
-            .join("claude-run-push-comment-7-initial_push__PR_opened_.md")
+            .join("claude-run-push-comment-7-initial_push__PR_opened_-")
             .to_string_lossy()
             .to_string();
         let runner = Arc::new(
@@ -8494,17 +8494,10 @@ mod tests {
                     &["log", "-1", "--format=%B", "feat/x"],
                     "feat: x\n\nbody\n\n#MK-16\n",
                 )
-                .fail(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "comment",
-                        "contoso/claude-run#7",
-                        "--body-file",
-                        push_comment_path.as_str(),
-                    ],
+                .fail_prefix(
+                    &format!(
+                        "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {push_comment_prefix}"
+                    ),
                     1,
                     "network error",
                 )
