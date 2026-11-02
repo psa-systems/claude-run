@@ -21,7 +21,7 @@
 - **Per-run usage accounting** (DEV-707): every run ends with a `run usage` summary line and appends one newline-delimited JSON record to `$STATE_DIR/logs/usage.jsonl` carrying tokens by category, estimated cost against the budget, wall-clock duration, tool call counts, and per-tool attribution, so "what did this run cost, and which tool dominated it" is answerable without a provider console.
 - **Skip-attempt marker**: an action's post step can write `$workdir/.claude-run-skip-attempt` for outcomes that park a
   job pending human input (so the attempt cap doesn't trip).
-- **Pause / resume**: globally or per-action; persisted in SQLite, takes effect on the next scheduler tick. The global switch is also on the **About** page's Activity card, next to a live quiet indicator (see [Global pause and the restart-safety workflow](operations.md#global-pause-and-the-restart-safety-workflow-claude-223)).
+- **Pause / resume**: globally or per-action; persisted in SQLite, takes effect on the next scheduler tick. The global switch is also on the **Status** page's Activity card, next to a live quiet indicator (see [Global pause and the restart-safety workflow](operations.md#global-pause-and-the-restart-safety-workflow-claude-223)).
 - **Duplicate-source guardrail**: at scan time the daemon flags (but never merges or disables) two enabled actions that
   do redundant work - names that differ only by case, or two native actions of the same `kind` polling the same source.
   Both would gather the same jobs and silently compete on the shared concurrency caps; you get a WARN log and a notice
