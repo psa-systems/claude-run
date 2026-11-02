@@ -2664,20 +2664,19 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        let mut ended: Option<String> = None;
-        for _ in 0..200 {
-            ended = sqlx::query_scalar(sqlx::AssertSqlSafe(
-                crate::db::q(&pool, "SELECT ended_at FROM runs WHERE id = ?").into_owned(),
-            ))
-            .bind(run_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            if ended.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        // CLAUDE-504: a fixed, short poll window flaked on Postgres under
+        // heavy I/O contention, so this backs off over a much wider budget.
+        let ended: Option<String> =
+            crate::testutil::poll_until(std::time::Duration::from_secs(20), || async {
+                sqlx::query_scalar(sqlx::AssertSqlSafe(
+                    crate::db::q(&pool, "SELECT ended_at FROM runs WHERE id = ?").into_owned(),
+                ))
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            })
+            .await;
         assert!(
             ended.is_some(),
             "a panicking webhook-comment handler must not leave its run row open"

@@ -2178,14 +2178,12 @@ mod tests {
         assert!(handler(&pool, run).await.is_err());
 
         // `Drop` cannot await, so the close is spawned; wait for it to land.
-        let mut ended = None;
-        for _ in 0..100 {
-            ended = ended_at_of(&pool, run).await;
-            if ended.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        // CLAUDE-504: a fixed, short poll window flaked on Postgres under
+        // heavy I/O contention, so this backs off over a much wider budget.
+        let ended = crate::testutil::poll_until(std::time::Duration::from_secs(20), || {
+            ended_at_of(&pool, run)
+        })
+        .await;
         assert!(
             ended.is_some(),
             "an errored handler must not leave its run row open"
