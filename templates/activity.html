@@ -4,7 +4,7 @@
    operator "safe to restart" because the query failed is how a reboot lands
    mid-run. #}
 <div id="activity-indicator"
-     hx-get="/about/activity"
+     hx-get="/status/activity"
      hx-trigger="every 2s, refreshNow from:body"
      hx-select="#activity-indicator"
      hx-swap="morph:outerHTML">
