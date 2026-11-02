@@ -36,15 +36,17 @@ use crate::config::DatabaseTarget;
 use crate::error::Result;
 
 /// The pool every module threads. One type, whichever backend is configured.
+/// SPEC-5.1.
 pub type DbPool = sqlx::AnyPool;
 
 /// The SQLite chain, twenty files, unchanged since before CLAUDE-250 so an
 /// existing `state.db` matches the versions and checksums already in its
-/// `_sqlx_migrations` table and re-runs nothing.
+/// `_sqlx_migrations` table and re-runs nothing. SPEC-5.4.
 pub static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
 /// The Postgres schema, squashed into one file. A Postgres database is new by
 /// definition here, so it needs the end state rather than the history.
+/// SPEC-5.4.
 pub static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
 /// How long [`open`] keeps retrying an unreachable Postgres before giving up.
@@ -54,7 +56,7 @@ pub static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrat
 const CONNECT_RETRY_DEADLINE: Duration = Duration::from_secs(60);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Which SQL dialect the open pool speaks.
+/// Which SQL dialect the open pool speaks. SPEC-5.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     Sqlite,
@@ -65,6 +67,7 @@ impl Dialect {
     /// The dialect a connection URL scheme selects. `sqlite`, `postgres` and
     /// `postgresql` are the whole accepted set; anything else is a startup
     /// error naming the scheme rather than a silent fallback to SQLite.
+    /// SPEC-5.1.
     pub fn from_scheme(scheme: &str) -> Result<Self> {
         match scheme {
             "sqlite" => Ok(Dialect::Sqlite),
@@ -78,6 +81,7 @@ impl Dialect {
 
 /// The dialect an open pool speaks, read back off the URL it was built from.
 /// Cheap enough to call per statement: an `Arc` clone plus a scheme slice.
+/// SPEC-5.1.
 pub fn dialect(pool: &DbPool) -> Dialect {
     let opts = pool.connect_options();
     // The pool cannot exist unless `open` already accepted this scheme.
@@ -90,7 +94,7 @@ pub fn dialect(pool: &DbPool) -> Dialect {
 /// `migrations/postgres/0001_init.sql` for why), and the `Any` driver reports
 /// integers and booleans as different kinds with no coercion between them, so
 /// deriving `FromRow` onto a `bool` field would fail to decode. Row structs
-/// with flag columns implement `FromRow` by hand through this.
+/// with flag columns implement `FromRow` by hand through this. SPEC-5.1.
 pub fn flag(row: &sqlx::any::AnyRow, column: &str) -> std::result::Result<bool, sqlx::Error> {
     use sqlx::Row;
     Ok(row.try_get::<i64, _>(column)? != 0)
@@ -109,12 +113,13 @@ const NEUTRAL_ELAPSED: &str = "elapsed_seconds";
 /// The one chokepoint every query string passes through on its way to sqlx.
 /// Borrows unchanged in the common case: a SQLite statement with neither
 /// neutral function in it is already exactly what the backend wants.
+/// SPEC-5.1.
 pub fn q<'a>(pool: &DbPool, sql: &'a str) -> Cow<'a, str> {
     rewrite(dialect(pool), sql)
 }
 
 /// [`q`] with the dialect supplied directly, so the rewrites are testable with
-/// no database of either kind.
+/// no database of either kind. SPEC-5.1.
 pub fn rewrite(dialect: Dialect, sql: &str) -> Cow<'_, str> {
     let needs_functions = sql.contains(NEUTRAL_STRPOS) || sql.contains(NEUTRAL_ELAPSED);
     match dialect {
@@ -341,7 +346,7 @@ fn is_ident_start(c: u8) -> bool {
     c.is_ascii_alphabetic() || c == b'_'
 }
 
-/// Open the pool for `target` and run the matching migration set.
+/// Open the pool for `target` and run the matching migration set. SPEC-5.4.
 pub async fn open(target: &DatabaseTarget) -> Result<DbPool> {
     // Registers the sqlite and postgres backends behind the `Any` driver. Idempotent.
     sqlx::any::install_default_drivers();
@@ -351,7 +356,8 @@ pub async fn open(target: &DatabaseTarget) -> Result<DbPool> {
     }
 }
 
-/// Convenience for the many tests and CLI paths that just want the SQLite file.
+/// Convenience for the many tests and CLI paths that just want the SQLite
+/// file. SPEC-5.4.
 pub async fn open_sqlite(db_path: &Path) -> Result<DbPool> {
     sqlx::any::install_default_drivers();
     if let Some(parent) = db_path.parent() {

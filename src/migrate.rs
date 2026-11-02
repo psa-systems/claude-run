@@ -30,6 +30,7 @@ struct LegacyAttempt {
     last_at: String,
 }
 
+/// Backs the `migrate [--from]` CLI command. SPEC-4.1.
 pub async fn import_legacy_state(pool: &DbPool, legacy_dir: &Path) -> Result<MigrationReport> {
     let mut report = MigrationReport::default();
     if !legacy_dir.is_dir() {
@@ -117,6 +118,7 @@ pub async fn import_legacy_state(pool: &DbPool, legacy_dir: &Path) -> Result<Mig
     Ok(report)
 }
 
+/// SPEC-4.1.
 #[derive(Debug, Default)]
 pub struct MigrationReport {
     pub actions: usize,

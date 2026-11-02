@@ -1,4 +1,7 @@
 //! State operations against the SQLite DB.
+//!
+//! Row lifecycle for each table defaults to `SPEC-5.2` (the schema reference),
+//! unless a function's own doc comment below names a more specific requirement.
 
 use crate::db::DbPool;
 use chrono::{Local, NaiveDate, Utc};
@@ -7,22 +10,24 @@ use tracing::{error, warn};
 
 use crate::error::Result;
 
+/// Today's date in local time, the key column of `daily_ledger` rows. SPEC-3.1 (`max_runs_per_day`).
 pub fn today_local() -> NaiveDate {
     Local::now().date_naive()
 }
 
+/// Current UTC time as an RFC 3339 timestamp, the format every `*_at` / `ts` column stores. SPEC-5.2.
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// Current time as epoch milliseconds. Matches the unit `yt issue inspect --json`
 /// reports linked-issue `resolved` timestamps in, so the dependency gate's
-/// `blocked_until` backoff is directly comparable.
+/// `blocked_until` backoff is directly comparable. SPEC-3.3.
 pub fn now_epoch_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-/// Persisted dependency-gate backoff state for one (action, issue).
+/// Persisted dependency-gate backoff state for one (action, issue). SPEC-3.3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyGateState {
     /// Epoch ms before which the gate does not re-evaluate the issue.
@@ -36,7 +41,7 @@ pub struct DependencyGateState {
     pub signature: String,
 }
 
-/// Read the dependency-gate backoff row for `(action, key)`, if any.
+/// Read the dependency-gate backoff row for `(action, key)`, if any. SPEC-3.3.
 pub async fn dependency_gate_get(
     pool: &DbPool,
     action: &str,
@@ -63,7 +68,7 @@ pub async fn dependency_gate_get(
     ))
 }
 
-/// Record (or refresh) the dependency-gate backoff for `(action, key)`.
+/// Record (or refresh) the dependency-gate backoff for `(action, key)`. SPEC-3.3.
 ///
 /// `blocked_since` is stamped with now on insert and deliberately
 /// NOT touched by the conflict branch, so re-arming the backoff (or commenting a
@@ -103,7 +108,7 @@ pub async fn dependency_gate_upsert(
 }
 
 /// Keep only the gate rows whose issue is still a candidate for
-/// `action`, dropping the rest. `keys` is the key set the action's query matched
+/// `action`, dropping the rest (SPEC-3.3). `keys` is the key set the action's query matched
 /// this poll (filters aside), so a row outside it holds nothing: the issue left
 /// the candidate set and its row is dead state that would otherwise sit in the
 /// stale-gate banner forever. An empty `keys` means the query matched nothing,
@@ -135,11 +140,11 @@ pub async fn dependency_gate_retain(pool: &DbPool, action: &str, keys: &[String]
 /// Queued forever with nothing on the dashboard, in the run history, or in the
 /// journal. One hour is the assumed threshold (an order of magnitude above the
 /// 5m default `recheck_timeout`, so a normally-cycling gate never trips it);
-/// revise once the normal poll cadence is confirmed.
+/// revise once the normal poll cadence is confirmed. SPEC-3.3.
 pub const STALE_GATE_AFTER_MS: i64 = 60 * 60 * 1000;
 
 /// One dependency gate that has held its issue longer than the
-/// staleness threshold, as the dashboard banner and `/api/status` report it.
+/// staleness threshold, as the dashboard banner and `/api/status` report it (SPEC-3.3, SPEC-4.2).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
 pub struct StaleGate {
     pub action_name: String,
@@ -159,7 +164,7 @@ pub struct StaleGate {
 /// Gates blocked for at least `threshold_ms`, longest-held first.
 /// Reads the live gate table rather than an event trail, so it needs no
 /// acknowledgement and clears itself: the gate deletes the row the moment the
-/// blockers resolve.
+/// blockers resolve. SPEC-3.3.
 pub async fn dependency_gates_stale(
     pool: &DbPool,
     now_ms: i64,
@@ -192,7 +197,7 @@ pub async fn dependency_gates_stale(
     Ok(rows)
 }
 
-/// Drop the dependency-gate row for `(action, key)` (its dependencies cleared).
+/// Drop the dependency-gate row for `(action, key)` (its dependencies cleared). SPEC-3.3.
 pub async fn dependency_gate_clear(pool: &DbPool, action: &str, key: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -209,11 +214,11 @@ pub async fn dependency_gate_clear(pool: &DbPool, action: &str, key: &str) -> Re
 }
 
 /// How many rows the parked-at-cap read returns, matching the
-/// stale-gate banner's window.
+/// stale-gate banner's window. SPEC-3.3.
 pub const ATTEMPT_CAP_HITS_LIMIT: usize = 20;
 
 /// One job parked at its action's per-key attempt cap, as the
-/// dashboard banner and `/api/status` report it.
+/// dashboard banner and `/api/status` report it (SPEC-3.3, SPEC-4.2).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CappedKey {
     pub action_name: String,
@@ -243,7 +248,7 @@ pub struct CappedKey {
 ///
 /// Unlike a dependency gate, nothing deletes the row when the operator resolves
 /// the parked issue: the counter is the durable record of the attempts. A key
-/// stays listed until its action's control state is cleared.
+/// stays listed until its action's control state is cleared. SPEC-3.3.
 pub async fn attempt_cap_hits(
     pool: &DbPool,
     caps: &std::collections::BTreeMap<String, u32>,
@@ -285,6 +290,7 @@ pub async fn attempt_cap_hits(
     Ok(out)
 }
 
+/// Current attempt count for `(action, key)`, or 0 when uncounted. SPEC-3.3 (per-key attempt cap).
 pub async fn attempts_get(pool: &DbPool, action: &str, key: &str) -> Result<u32> {
     let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -300,6 +306,7 @@ pub async fn attempts_get(pool: &DbPool, action: &str, key: &str) -> Result<u32>
     Ok(row.map(|(c,)| c as u32).unwrap_or(0))
 }
 
+/// Increment and return the attempt count for `(action, key)`. SPEC-3.3.
 pub async fn attempts_increment(pool: &DbPool, action: &str, key: &str) -> Result<u32> {
     let now = now_iso();
     sqlx::query(sqlx::AssertSqlSafe(
@@ -327,6 +334,7 @@ pub async fn attempts_increment(pool: &DbPool, action: &str, key: &str) -> Resul
 /// be retried under the same key. Returns whether a row was removed, so the
 /// caller (the API handler) can 404 an unknown counter instead of a silent
 /// no-op on a mistyped key.
+/// SPEC-3.3.
 pub async fn attempts_clear(pool: &DbPool, action: &str, key: &str) -> Result<bool> {
     let result = sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -342,6 +350,7 @@ pub async fn attempts_clear(pool: &DbPool, action: &str, key: &str) -> Result<bo
     Ok(result.rows_affected() > 0)
 }
 
+/// Today's run count for `action` from `daily_ledger`. SPEC-3.1 (`max_runs_per_day`).
 pub async fn daily_count_get(pool: &DbPool, action: &str) -> Result<u32> {
     let today = today_local().to_string();
     let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
@@ -358,6 +367,7 @@ pub async fn daily_count_get(pool: &DbPool, action: &str) -> Result<u32> {
     Ok(row.map(|(c,)| c as u32).unwrap_or(0))
 }
 
+/// SPEC-3.1.
 pub async fn daily_count_increment(pool: &DbPool, action: &str) -> Result<()> {
     let today = today_local().to_string();
     sqlx::query(sqlx::AssertSqlSafe(
@@ -379,6 +389,7 @@ pub async fn daily_count_increment(pool: &DbPool, action: &str) -> Result<()> {
     Ok(())
 }
 
+/// Today's accumulated cost for `action` from `daily_ledger`. SPEC-3.1 (`daily_budget_usd`).
 pub async fn daily_cost_get(pool: &DbPool, action: &str) -> Result<f64> {
     let today = today_local().to_string();
     let row: Option<(f64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
@@ -395,6 +406,7 @@ pub async fn daily_cost_get(pool: &DbPool, action: &str) -> Result<f64> {
     Ok(row.map(|(c,)| c).unwrap_or(0.0))
 }
 
+/// SPEC-3.1 (`daily_budget_usd`).
 pub async fn daily_cost_add(pool: &DbPool, action: &str, amount: f64) -> Result<()> {
     let today = today_local().to_string();
     sqlx::query(sqlx::AssertSqlSafe(
@@ -417,6 +429,7 @@ pub async fn daily_cost_add(pool: &DbPool, action: &str, amount: f64) -> Result<
     Ok(())
 }
 
+/// Insert the `runs` row for a new run and return its id. SPEC-5.2.
 pub async fn run_begin(pool: &DbPool, action: &str, triggered_by: &str) -> Result<i64> {
     let now = now_iso();
     let id = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(
@@ -441,7 +454,7 @@ pub async fn run_begin(pool: &DbPool, action: &str, triggered_by: &str) -> Resul
 /// Record the planned job keys for a run as soon as input.command
 /// has produced them, so the web UI can show what's queued / in-flight
 /// before any outcome record exists. Stored as a JSON array of strings on
-/// the `runs.job_keys` column.
+/// the `runs.job_keys` column. SPEC-5.2.
 pub async fn run_set_job_keys(pool: &DbPool, run_id: i64, keys: &[String]) -> Result<()> {
     let payload = serde_json::to_string(keys)?;
     sqlx::query(sqlx::AssertSqlSafe(
@@ -457,7 +470,7 @@ pub async fn run_set_job_keys(pool: &DbPool, run_id: i64, keys: &[String]) -> Re
 /// Record per-job outbound links for a run as a JSON object mapping
 /// job key to URL (`runs.job_links`). The webhook stores the failure
 /// event's `html_url` so the run-detail tables can link the job key straight
-/// to the Forgejo Actions run.
+/// to the Forgejo Actions run. SPEC-5.2.
 pub async fn run_set_job_links(
     pool: &DbPool,
     run_id: i64,
@@ -475,7 +488,7 @@ pub async fn run_set_job_links(
 }
 
 /// The per-job link map for a run. Empty for legacy rows (NULL
-/// column) and for runs that link via the action's `link_template` instead.
+/// column) and for runs that link via the action's `link_template` instead. SPEC-5.2.
 pub async fn run_job_links(
     pool: &DbPool,
     run_id: i64,
@@ -497,7 +510,7 @@ pub async fn run_job_links(
 /// Mark which planned job a run is currently processing, so the web
 /// UI can show exactly the one in-flight job as "running" instead of inferring
 /// it from gaps in `job_outcomes`. Pass `Some(key)` before processing a job;
-/// `run_finish` clears it back to NULL when the run ends.
+/// `run_finish` clears it back to NULL when the run ends. SPEC-5.2.
 pub async fn run_set_current_job(pool: &DbPool, run_id: i64, key: Option<&str>) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(pool, "UPDATE runs SET current_job_key = ? WHERE id = ?").into_owned(),
@@ -512,7 +525,7 @@ pub async fn run_set_current_job(pool: &DbPool, run_id: i64, key: Option<&str>) 
 /// Set (or clear, with `None`) the live pipeline stage of a run, so
 /// the run-detail page can show what an in-flight run is doing (the webhook
 /// fast-path advances it through download / triage / classify / mint).
-/// `run_finish` clears it together with `current_job_key`.
+/// `run_finish` clears it together with `current_job_key`. SPEC-5.2.
 pub async fn run_stage_set(pool: &DbPool, run_id: i64, stage: Option<&str>) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(pool, "UPDATE runs SET stage = ? WHERE id = ?").into_owned(),
@@ -531,7 +544,7 @@ pub async fn run_stage_set(pool: &DbPool, run_id: i64, stage: Option<&str>) -> R
 /// Also records the job's `concurrency_key` so the admission dedup
 /// can drop gathered jobs whose concurrency key (project / repo) is already in
 /// flight, not just those whose issue id is. For a path with one job per key
-/// (webhook) the concurrency key equals `key`.
+/// (webhook) the concurrency key equals `key`. SPEC-3.1 (concurrency keys).
 pub async fn run_inflight_add(
     pool: &DbPool,
     run_id: i64,
@@ -554,7 +567,7 @@ pub async fn run_inflight_add(
     Ok(())
 }
 
-/// Clear one job's in-flight marker when it finishes.
+/// Clear one job's in-flight marker when it finishes. SPEC-5.2.
 pub async fn run_inflight_remove(pool: &DbPool, run_id: i64, key: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -570,7 +583,7 @@ pub async fn run_inflight_remove(pool: &DbPool, run_id: i64, key: &str) -> Resul
     Ok(())
 }
 
-/// The set of job keys currently in flight for a run.
+/// The set of job keys currently in flight for a run. SPEC-5.2.
 pub async fn run_inflight_keys(pool: &DbPool, run_id: i64) -> Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -585,6 +598,7 @@ pub async fn run_inflight_keys(pool: &DbPool, run_id: i64) -> Result<Vec<String>
     Ok(rows.into_iter().map(|(k,)| k).collect())
 }
 
+/// The planned job keys recorded for a run via [`run_set_job_keys`]. SPEC-5.2.
 pub async fn run_job_keys(pool: &DbPool, run_id: i64) -> Result<Vec<String>> {
     let row: Option<(Option<String>,)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(pool, "SELECT job_keys FROM runs WHERE id = ?").into_owned(),
@@ -604,7 +618,7 @@ pub async fn run_job_keys(pool: &DbPool, run_id: i64) -> Result<Vec<String>> {
 /// run row exists (e.g. a VCS probe failure, or a "no VCS integration" drop).
 /// Collected during gather and persisted to `run_events`, then surfaced in the
 /// web UI so the skipped issues and their reason are visible without reading the
-/// daemon journal.
+/// daemon journal. SPEC-10 (diagnostics stored in `run_events`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputEvent {
     /// `warn` / `error` / `info`. Errors are rendered visually distinct.
@@ -614,7 +628,7 @@ pub struct InputEvent {
     pub message: String,
 }
 
-/// One persisted `run_events` row, as read back for the web UI.
+/// One persisted `run_events` row, as read back for the web UI. SPEC-10.
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct RunEventRecord {
     /// The run this event was attached to, or `None` for a poll whose events
@@ -629,7 +643,7 @@ pub struct RunEventRecord {
 /// One persisted `run_events` row as read back for the error-log
 /// page. The sibling of [`RunEventRecord`] that also carries `action_name`, so
 /// the log's Action column can render once the filter is widened past the action
-/// the page was entered from.
+/// the page was entered from. SPEC-10.
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct RunEventLogRecord {
     pub run_id: Option<i64>,
@@ -641,7 +655,7 @@ pub struct RunEventLogRecord {
 }
 
 /// One row of the Logs page's grouped 24h summary: a `context` or an
-/// `action_name` and how many `warn`/`error` events carry it.
+/// `action_name` and how many `warn`/`error` events carry it. SPEC-10.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
 pub struct RunEventCount {
     /// The grouped value. Empty for the rows whose `context` is NULL or empty,
@@ -654,7 +668,7 @@ pub struct RunEventCount {
 /// `poll_ts`, with a NULL `run_id` (the run row does not exist yet, since
 /// `gather()` runs before `run_begin`). [`run_events_attach`] backfills the run
 /// id once it is created. Called before `run_begin` so the events survive even
-/// if the run row is never created.
+/// if the run row is never created. SPEC-10.
 pub async fn run_events_record(
     pool: &DbPool,
     action: &str,
@@ -686,7 +700,7 @@ pub async fn run_events_record(
 /// Persist run-phase events that already know their run row (the
 /// forge notices a job accumulates, e.g. a degraded open-PR lookup). Unlike
 /// [`run_events_record`] these need no [`run_events_attach`] backfill, so a
-/// concurrent poll's NULL-`run_id` rows can never be attached by mistake.
+/// concurrent poll's NULL-`run_id` rows can never be attached by mistake. SPEC-10.
 pub async fn run_events_record_for_run(
     pool: &DbPool,
     run_id: i64,
@@ -721,7 +735,7 @@ pub async fn run_events_record_for_run(
 /// `run_begin` has created the run row, so the run-detail / action pages can tie
 /// them to the run. Matches on `action_name` + the poll `ts` used at record
 /// time; a zero-job poll that never reaches here keeps its events with a NULL
-/// `run_id`, and they still surface on the action page under that timestamp.
+/// `run_id`, and they still surface on the action page under that timestamp. SPEC-10.
 pub async fn run_events_attach(
     pool: &DbPool,
     run_id: i64,
@@ -746,7 +760,7 @@ pub async fn run_events_attach(
 /// The most recent input-phase events for an action, newest first,
 /// for the action-detail "Input errors / warnings" region. Queried by
 /// `action_name` independent of any run row, so a zero-job poll's events (NULL
-/// `run_id`) are returned too. Bounds display with `limit`.
+/// `run_id`) are returned too. Bounds display with `limit`. SPEC-10.
 pub async fn run_events_for_action(
     pool: &DbPool,
     action: &str,
@@ -774,7 +788,7 @@ pub async fn run_events_for_action(
 
 /// The newest message an action recorded that contains `needle`,
 /// so a caller can tell whether a fault it is about to report repeats the one
-/// it reported last time.
+/// it reported last time. SPEC-10.
 pub async fn run_events_last_message_containing(
     pool: &DbPool,
     action: &str,
@@ -798,7 +812,7 @@ pub async fn run_events_last_message_containing(
 /// `started_at` is the current serve's stamp ([`crate::settings::serve_started_at`]).
 /// `None` means "no lower bound": every `ts` is a non-empty ISO string, so the
 /// empty-string bind matches all rows. That is the degraded path for a DB no
-/// serve has stamped yet, not the daemon's normal path.
+/// serve has stamped yet, not the daemon's normal path. SPEC-10.
 pub async fn run_events_count_for_action(
     pool: &DbPool,
     action: &str,
@@ -820,11 +834,11 @@ pub async fn run_events_count_for_action(
 
 /// Levels the Logs summary and the dashboard banner count. `info`
 /// rows (the access-recovery markers among them) are diagnostics of
-/// record, not conditions to act on, so they stay out of the counts.
+/// record, not conditions to act on, so they stay out of the counts. SPEC-10.
 const DIAGNOSTIC_LEVELS: &str = "('warn', 'error')";
 
 /// Total `warn`/`error` events recorded at or after `since`, for the
-/// dashboard banner's headline count.
+/// dashboard banner's headline count. SPEC-10.
 pub async fn run_events_count_since(pool: &DbPool, since: &str) -> Result<i64> {
     let sql =
         format!("SELECT COUNT(*) FROM run_events WHERE ts >= ? AND level IN {DIAGNOSTIC_LEVELS}");
@@ -839,7 +853,7 @@ pub async fn run_events_count_since(pool: &DbPool, since: &str) -> Result<i64> {
 /// `warn`/`error` events at or after `since` grouped by `context`,
 /// busiest first, for the Logs page's summary card. A NULL or empty `context`
 /// groups under the empty string rather than being dropped, so the rows account
-/// for every counted event.
+/// for every counted event. SPEC-10.
 pub async fn run_events_grouped_by_context(
     pool: &DbPool,
     since: &str,
@@ -849,7 +863,7 @@ pub async fn run_events_grouped_by_context(
 }
 
 /// `warn`/`error` events at or after `since` grouped by
-/// `action_name`, busiest first, for the Logs page's summary card.
+/// `action_name`, busiest first, for the Logs page's summary card. SPEC-10.
 pub async fn run_events_grouped_by_action(
     pool: &DbPool,
     since: &str,
@@ -859,7 +873,7 @@ pub async fn run_events_grouped_by_action(
 }
 
 /// Shared body of the two grouped reads. `column` is a fixed SQL fragment chosen
-/// by the caller, never user input; `since` and `limit` are bound parameters.
+/// by the caller, never user input; `since` and `limit` are bound parameters. SPEC-10.
 async fn run_events_grouped_by(
     pool: &DbPool,
     column: &str,
@@ -888,13 +902,13 @@ async fn run_events_grouped_by(
 
 /// Message prefix of the poll-time forge repo-access preflight
 /// failure (`src/native/youtrack.rs`). The dashboard banner and the recovery
-/// filter both key off it, so the two agree on what counts as an access event.
+/// filter both key off it, so the two agree on what counts as an access event. SPEC-8.9.
 pub const ACCESS_FAILURE_PREFIX: &str = "forge repo-access preflight failed";
 /// Message prefix of the recovery marker recorded when a repo that
-/// was failing passes the preflight again. It clears the banner.
+/// was failing passes the preflight again. It clears the banner. SPEC-8.9.
 pub const ACCESS_RECOVERY_PREFIX: &str = "forge repo-access preflight passed";
 
-/// One still-open access failure, as the dashboard banner shows it.
+/// One still-open access failure, as the dashboard banner shows it. SPEC-8.9.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
 pub struct AccessFailure {
     pub action_name: String,
@@ -913,7 +927,7 @@ pub struct AccessFailure {
 /// `limit` is `None` for "every match": the dashboard banner counts an outage
 /// rather than rendering a bounded table, and a silently truncated count would
 /// understate it. The clause is dropped rather than given a negative bound,
-/// which only SQLite reads as unlimited.
+/// which only SQLite reads as unlimited. SPEC-8.9.
 pub async fn access_failures_recent(
     pool: &DbPool,
     since: &str,
@@ -958,7 +972,7 @@ pub async fn access_failures_recent(
 /// True when the newest access event recorded for `(action,
 /// context)` is a failure, i.e. a passing preflight now is a recovery worth
 /// recording. Keeps the success marker off the event log in the normal case,
-/// where every poll passes and nothing changed.
+/// where every poll passes and nothing changed. SPEC-8.9.
 pub async fn access_failure_is_open(
     pool: &DbPool,
     action: &str,
@@ -990,6 +1004,7 @@ pub async fn access_failure_is_open(
         .unwrap_or(false))
 }
 
+/// Close a `runs` row with its end state. SPEC-5.2.
 pub async fn run_finish(
     pool: &DbPool,
     run_id: i64,
@@ -1043,7 +1058,7 @@ pub async fn run_finish(
 /// closes the row as [`crate::exit::UNEXPECTED`]. [`reap_orphaned_runs`] (at
 /// serve start) and [`cancel_orphaned_runs`] (at shutdown) are the backstop for
 /// a row this cannot reach, but a long-lived daemon reaches neither, which is
-/// why the guard exists.
+/// why the guard exists. SPEC-5.2.
 pub struct RunGuard {
     pool: DbPool,
     run_id: i64,
@@ -1106,7 +1121,7 @@ impl Drop for RunGuard {
 /// action name (the table itself carries no action, only `run_id`). Read by
 /// [`crate::native::youtrack::reconcile_restart_inflight`] at `serve` startup
 /// BEFORE [`reap_orphaned_runs`] deletes the table, since that delete is the
-/// only place these rows are otherwise lost.
+/// only place these rows are otherwise lost. SPEC-5.2.
 #[derive(Debug, Clone)]
 pub struct InflightJobRow {
     pub action_name: String,
@@ -1118,7 +1133,7 @@ pub struct InflightJobRow {
 /// row here belongs to a process that died mid-job: `run_inflight_remove`
 /// clears a job's own row the instant it finishes, so a live run leaves none
 /// behind for its finished jobs, and the single-instance lock guarantees no
-/// other process is adding rows concurrently.
+/// other process is adding rows concurrently. SPEC-5.2.
 pub async fn run_inflight_rows_all(pool: &DbPool) -> Result<Vec<InflightJobRow>> {
     let rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -1146,7 +1161,7 @@ pub async fn run_inflight_rows_all(pool: &DbPool) -> Result<Vec<InflightJobRow>>
 /// grace elapsed. Those runs were stopped by this process, so they close as
 /// `exit::CANCELLED`, the same sentinel the live-cancel path uses.
 /// The startup sweep is [`reap_orphaned_runs`], which closes with a different
-/// code because nothing cancelled those rows. Returns the number reconciled.
+/// code because nothing cancelled those rows. Returns the number reconciled. SPEC-5.2.
 pub async fn cancel_orphaned_runs(pool: &DbPool) -> Result<u64> {
     close_open_runs(pool, crate::exit::CANCELLED).await
 }
@@ -1164,7 +1179,7 @@ pub async fn cancel_orphaned_runs(pool: &DbPool) -> Result<u64> {
 /// [`run_inflight_rows_all`] before calling this: this function's own
 /// `DELETE FROM run_inflight_jobs` is unconditional and carries no tracker
 /// call, so it is the last chance to read which issue keys a dead process had
-/// moved to `Working` and never finished (CLAUDE-440).
+/// moved to `Working` and never finished (CLAUDE-440). SPEC-5.2.
 pub async fn reap_orphaned_runs(pool: &DbPool) -> Result<u64> {
     close_open_runs(pool, crate::exit::UNEXPECTED).await
 }
@@ -1173,7 +1188,7 @@ pub async fn reap_orphaned_runs(pool: &DbPool) -> Result<u64> {
 /// is left untouched: a job either has an outcome or it does not, and no
 /// synthetic outcomes are invented. This is a pure DB reconcile: the run's
 /// process is already gone, so there is no child to terminate or `post` phase to
-/// run.
+/// run. SPEC-5.2.
 async fn close_open_runs(pool: &DbPool, exit_code: i32) -> Result<u64> {
     let now = now_iso();
     // A dead process reports no stage; clear it with the end state.
@@ -1198,6 +1213,7 @@ async fn close_open_runs(pool: &DbPool, exit_code: i32) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
+/// A `job_outcomes` row to insert. SPEC-5.2.
 #[derive(Debug)]
 pub struct JobOutcome<'a> {
     pub run_id: i64,
@@ -1219,6 +1235,7 @@ pub struct JobOutcome<'a> {
     pub timed_out: bool,
 }
 
+/// SPEC-5.2.
 pub async fn job_outcome_insert(pool: &DbPool, r: &JobOutcome<'_>) -> Result<()> {
     let now = now_iso();
     sqlx::query(sqlx::AssertSqlSafe(
@@ -1255,6 +1272,7 @@ pub async fn job_outcome_insert(pool: &DbPool, r: &JobOutcome<'_>) -> Result<()>
 
 // ---- Phase 2: pause + action index --------------------------------------
 
+/// The global pause row, if set. SPEC-3.7.
 pub async fn global_pause_status(pool: &DbPool) -> Result<Option<(String, Option<String>)>> {
     let row: Option<(String, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -1268,6 +1286,7 @@ pub async fn global_pause_status(pool: &DbPool) -> Result<Option<(String, Option
     Ok(row)
 }
 
+/// Set (or refresh) the global pause. SPEC-3.7.
 pub async fn global_pause_set(pool: &DbPool, reason: Option<&str>) -> Result<()> {
     let now = now_iso();
     sqlx::query(sqlx::AssertSqlSafe(
@@ -1287,6 +1306,7 @@ pub async fn global_pause_set(pool: &DbPool, reason: Option<&str>) -> Result<()>
     Ok(())
 }
 
+/// SPEC-3.7.
 pub async fn global_pause_clear(pool: &DbPool) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(pool, "DELETE FROM global_pause WHERE id = 1").into_owned(),
@@ -1296,6 +1316,7 @@ pub async fn global_pause_clear(pool: &DbPool) -> Result<()> {
     Ok(())
 }
 
+/// The per-action pause row for `action`, if set. SPEC-3.7.
 pub async fn action_pause_status(
     pool: &DbPool,
     action: &str,
@@ -1313,6 +1334,7 @@ pub async fn action_pause_status(
     Ok(row)
 }
 
+/// Set (or refresh) the pause for one action. SPEC-3.7.
 pub async fn action_pause_set(pool: &DbPool, action: &str, reason: Option<&str>) -> Result<()> {
     let now = now_iso();
     sqlx::query(sqlx::AssertSqlSafe(crate::db::q(pool,
@@ -1329,6 +1351,7 @@ pub async fn action_pause_set(pool: &DbPool, action: &str, reason: Option<&str>)
     Ok(())
 }
 
+/// SPEC-3.7.
 pub async fn action_pause_clear(pool: &DbPool, action: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(pool, "DELETE FROM paused_actions WHERE action_name = ?").into_owned(),
@@ -1339,6 +1362,7 @@ pub async fn action_pause_clear(pool: &DbPool, action: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `actions` table: a derived index of each loaded action YAML. SPEC-3.1.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ActionIndexRow {
     pub name: String,
@@ -1378,6 +1402,7 @@ impl sqlx::FromRow<'_, sqlx::any::AnyRow> for ActionIndexRow {
     }
 }
 
+/// SPEC-3.1.
 pub async fn action_index_upsert(pool: &DbPool, row: &ActionIndexRow) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -1416,6 +1441,7 @@ pub async fn action_index_upsert(pool: &DbPool, row: &ActionIndexRow) -> Result<
     Ok(())
 }
 
+/// Every action index row, alphabetical by name. SPEC-3.1.
 pub async fn action_index_list(pool: &DbPool) -> Result<Vec<ActionIndexRow>> {
     let rows = sqlx::query_as::<_, ActionIndexRow>(sqlx::AssertSqlSafe(crate::db::q(pool,
         "SELECT name, file_path, yaml_sha256, enabled, schedule_kind, schedule_spec, last_seen_at, parse_error, link_template, max_parallel FROM actions ORDER BY name",
@@ -1425,6 +1451,7 @@ pub async fn action_index_list(pool: &DbPool) -> Result<Vec<ActionIndexRow>> {
     Ok(rows)
 }
 
+/// The most recent `runs.started_at` for `action`. SPEC-5.2.
 pub async fn action_last_run_started(pool: &DbPool, action: &str) -> Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -1441,7 +1468,7 @@ pub async fn action_last_run_started(pool: &DbPool, action: &str) -> Result<Opti
 
 /// Delete the `actions` index row for `name`. Returns `false` when
 /// no row matched, mirroring [`secret_delete`]. Only touches the derived index;
-/// the caller is responsible for the on-disk YAML and the runtime purge.
+/// the caller is responsible for the on-disk YAML and the runtime purge. SPEC-3.1.
 pub async fn action_index_delete(pool: &DbPool, name: &str) -> Result<bool> {
     let res = sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(pool, "DELETE FROM actions WHERE name = ?").into_owned(),
@@ -1456,7 +1483,7 @@ pub async fn action_index_delete(pool: &DbPool, name: &str) -> Result<bool> {
 /// and `daily_ledger` rows keyed on `action_name`. The `paused_actions` row is
 /// cleared separately via [`action_pause_clear`]. Run history (`runs`,
 /// `job_outcomes`) and on-disk stream logs are intentionally left intact so a
-/// re-created same-name action re-associates its audit trail.
+/// re-created same-name action re-associates its audit trail. SPEC-3.1.
 pub async fn action_runtime_purge(pool: &DbPool, name: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(pool, "DELETE FROM attempt_counters WHERE action_name = ?").into_owned(),
@@ -1477,7 +1504,7 @@ pub async fn action_runtime_purge(pool: &DbPool, name: &str) -> Result<()> {
 /// the `actions` index row, the `paused_actions` row, and the
 /// `attempt_counters` / `daily_ledger` rows. Returns the index row's prior
 /// existence (`true` = a row was deleted), so callers can distinguish a real
-/// delete from an unknown action. History (`runs`, `job_outcomes`) is kept.
+/// delete from an unknown action. History (`runs`, `job_outcomes`) is kept. SPEC-3.1.
 pub async fn action_purge_state(pool: &DbPool, name: &str) -> Result<bool> {
     let existed = action_index_delete(pool, name).await?;
     action_pause_clear(pool, name).await?;
@@ -1488,7 +1515,7 @@ pub async fn action_purge_state(pool: &DbPool, name: &str) -> Result<bool> {
 /// True when a run for `action` is still in flight in the DB (a
 /// `runs` row with no `ended_at`). The delete flow refuses with a conflict when
 /// this holds. The daemon additionally consults its in-memory in-flight set for
-/// a job dispatched but not yet recorded as a run.
+/// a job dispatched but not yet recorded as a run. SPEC-4.2 (action delete refusal).
 pub async fn action_has_active_run(pool: &DbPool, action: &str) -> Result<bool> {
     let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -1504,7 +1531,7 @@ pub async fn action_has_active_run(pool: &DbPool, action: &str) -> Result<bool> 
 }
 
 /// One still-open run, for the About page's quiet indicator and the
-/// `/api/status` activity block.
+/// `/api/status` activity block. SPEC-4.2.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ActiveRun {
     pub id: i64,
@@ -1520,7 +1547,7 @@ pub struct ActiveRun {
 ///
 /// This is only HALF the quiet signal: it misses a run dispatched but not yet
 /// past `run_begin`. The daemon's in-flight map covers that, and the two are
-/// combined in `crate::api::activity`.
+/// combined in `crate::api::activity`. SPEC-4.2.
 pub async fn active_runs(pool: &DbPool) -> Result<Vec<ActiveRun>> {
     let rows: Vec<(i64, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(crate::db::q(
         pool,
@@ -1543,6 +1570,7 @@ pub async fn active_runs(pool: &DbPool) -> Result<Vec<ActiveRun>> {
 /// working an issue dedups its gathered jobs against this set, so an overlapping
 /// pickup run never re-claims work another open run already holds. Joins
 /// `run_inflight_jobs` (per-job markers, migration 0007) to the open `runs` rows.
+/// SPEC-3.1 (dedup against in-flight work).
 pub async fn action_inflight_keys(pool: &DbPool, action: &str) -> Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -1568,6 +1596,7 @@ pub async fn action_inflight_keys(pool: &DbPool, action: &str) -> Result<Vec<Str
 /// gathers a second same-key job while that key is already in flight and could
 /// only park on the KeyGate. NULL `concurrency_key` values (rows written before
 /// migration 0016) are ignored. Joins `run_inflight_jobs` to the open `runs`.
+/// SPEC-3.1 (concurrency keys).
 pub async fn action_inflight_concurrency_keys(pool: &DbPool, action: &str) -> Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -1591,7 +1620,7 @@ pub async fn action_inflight_concurrency_keys(pool: &DbPool, action: &str) -> Re
 // ---- Encrypted secrets ---------------------------------------
 
 /// Metadata for one stored secret. The ciphertext is never carried in this
-/// view, so the listing the web UI renders can never leak a value.
+/// view, so the listing the web UI renders can never leak a value. SPEC-7.1.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct SecretMeta {
     pub name: String,
@@ -1599,7 +1628,7 @@ pub struct SecretMeta {
     pub last_used_at: Option<String>,
 }
 
-/// List stored secrets (names + timestamps only), alphabetical by name.
+/// List stored secrets (names + timestamps only), alphabetical by name. SPEC-7.1.
 pub async fn secret_list(pool: &DbPool) -> Result<Vec<SecretMeta>> {
     let rows = sqlx::query_as::<_, SecretMeta>(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -1613,7 +1642,7 @@ pub async fn secret_list(pool: &DbPool) -> Result<Vec<SecretMeta>> {
     Ok(rows)
 }
 
-/// True when a secret with `name` already exists.
+/// True when a secret with `name` already exists. SPEC-7.1.
 pub async fn secret_exists(pool: &DbPool, name: &str) -> Result<bool> {
     let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(pool, "SELECT id FROM secrets WHERE name = ?").into_owned(),
@@ -1625,7 +1654,7 @@ pub async fn secret_exists(pool: &DbPool, name: &str) -> Result<bool> {
 }
 
 /// Create a new secret. Errors via the UNIQUE constraint when `name` is taken;
-/// callers should check [`secret_exists`] first for a friendly message.
+/// callers should check [`secret_exists`] first for a friendly message. SPEC-7.1.
 pub async fn secret_create(pool: &DbPool, name: &str, ciphertext: &[u8]) -> Result<()> {
     let now = now_iso();
     sqlx::query(sqlx::AssertSqlSafe(
@@ -1644,7 +1673,7 @@ pub async fn secret_create(pool: &DbPool, name: &str, ciphertext: &[u8]) -> Resu
 }
 
 /// Rotate an existing secret's value in place (keeps `created_at`). Returns
-/// `false` when no secret with `name` exists.
+/// `false` when no secret with `name` exists. SPEC-7.1.
 pub async fn secret_rotate(pool: &DbPool, name: &str, ciphertext: &[u8]) -> Result<bool> {
     let res = sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(pool, "UPDATE secrets SET ciphertext = ? WHERE name = ?").into_owned(),
@@ -1656,7 +1685,7 @@ pub async fn secret_rotate(pool: &DbPool, name: &str, ciphertext: &[u8]) -> Resu
     Ok(res.rows_affected() > 0)
 }
 
-/// Delete a secret. Returns `false` when no secret with `name` exists.
+/// Delete a secret. Returns `false` when no secret with `name` exists. SPEC-7.1.
 pub async fn secret_delete(pool: &DbPool, name: &str) -> Result<bool> {
     let res = sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(pool, "DELETE FROM secrets WHERE name = ?").into_owned(),
@@ -1667,7 +1696,7 @@ pub async fn secret_delete(pool: &DbPool, name: &str) -> Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
-/// Fetch a secret's raw ciphertext for decryption at run time.
+/// Fetch a secret's raw ciphertext for decryption at run time. SPEC-7.1.
 pub async fn secret_get_ciphertext(pool: &DbPool, name: &str) -> Result<Option<Vec<u8>>> {
     let row: Option<(Vec<u8>,)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(pool, "SELECT ciphertext FROM secrets WHERE name = ?").into_owned(),
@@ -1678,7 +1707,7 @@ pub async fn secret_get_ciphertext(pool: &DbPool, name: &str) -> Result<Option<V
     Ok(row.map(|(c,)| c))
 }
 
-/// Bump a secret's `last_used_at` to now (best-effort run-time audit).
+/// Bump a secret's `last_used_at` to now (best-effort run-time audit). SPEC-7.1.
 pub async fn secret_touch(pool: &DbPool, name: &str) -> Result<()> {
     let now = now_iso();
     sqlx::query(sqlx::AssertSqlSafe(
@@ -1697,6 +1726,7 @@ pub async fn secret_touch(pool: &DbPool, name: &str) -> Result<()> {
 /// `get_status` MCP tool both report, assembled once here so the two surfaces
 /// cannot drift. The CLI adds its own `daemon` / `socket_expected_at` keys on
 /// top; the MCP tool adds `"source": "database"` instead.
+/// SPEC-4.2 (`GET /status`).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StatusBlocks {
     pub global_paused: Option<(String, Option<String>)>,
@@ -1710,7 +1740,7 @@ pub struct StatusBlocks {
 /// stale dependency gates, keys parked at their action's attempt cap, and the
 /// action index. Reads the same tables [`crate::job::attempt_caps`] and the
 /// constants here already governed before this function existed; see
-/// `daemonless_status` in `src/bin/claude-run.rs` for the original inline form.
+/// `daemonless_status` in `src/bin/claude-run.rs` for the original inline form. SPEC-4.2.
 pub async fn status_blocks(pool: &DbPool) -> Result<StatusBlocks> {
     let global_paused = global_pause_status(pool).await?;
     let actions = action_index_list(pool).await?;
@@ -1738,7 +1768,7 @@ pub async fn status_blocks(pool: &DbPool) -> Result<StatusBlocks> {
 /// tools. Mirrors `RunRow` in `src/web/mod.rs` (kept private there, per
 /// CLAUDE-437's instruction not to touch that module) but is its own type:
 /// the two surfaces render differently enough (JSON tool result vs HTML) that
-/// sharing a struct would couple them for no benefit.
+/// sharing a struct would couple them for no benefit. SPEC-4.5.
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct RunRecord {
     pub id: i64,
@@ -1755,7 +1785,7 @@ pub struct RunRecord {
 const RUN_RECORD_COLUMNS: &str = "id, action_name, started_at, ended_at, exit_code, \
     jobs_processed, triggered_by, current_job_key, stage";
 
-/// One `runs` row by id, or `None` when no run has that id.
+/// One `runs` row by id, or `None` when no run has that id. SPEC-4.5 (`get_run`).
 pub async fn run_get(pool: &DbPool, run_id: i64) -> Result<Option<RunRecord>> {
     let sql = format!("SELECT {RUN_RECORD_COLUMNS} FROM runs WHERE id = ?");
     let row =
@@ -1769,7 +1799,7 @@ pub async fn run_get(pool: &DbPool, run_id: i64) -> Result<Option<RunRecord>> {
 /// Newest-first `runs` rows for `mcp stdio`'s `list_runs` tool. `action`
 /// narrows to one action name; `failed_only` keeps only runs with at least one
 /// job whose latest attempt hard-failed (mirrors `JOB_FAILED` in
-/// `src/web/mod.rs`, duplicated here for the same reason as [`RunRecord`]).
+/// `src/web/mod.rs`, duplicated here for the same reason as [`RunRecord`]). SPEC-4.5.
 pub async fn runs_list(
     pool: &DbPool,
     action: Option<&str>,
@@ -1803,7 +1833,7 @@ pub async fn runs_list(
     Ok(rows)
 }
 
-/// One `job_outcomes` row, as read back for `mcp stdio`'s `get_run` tool.
+/// One `job_outcomes` row, as read back for `mcp stdio`'s `get_run` tool. SPEC-4.5.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct JobOutcomeRecord {
     pub job_key: String,
@@ -1842,7 +1872,7 @@ impl sqlx::FromRow<'_, sqlx::any::AnyRow> for JobOutcomeRecord {
     }
 }
 
-/// Every `job_outcomes` row for one run, oldest attempt first.
+/// Every `job_outcomes` row for one run, oldest attempt first. SPEC-4.5 (`get_run`).
 pub async fn job_outcomes_for_run(pool: &DbPool, run_id: i64) -> Result<Vec<JobOutcomeRecord>> {
     let rows = sqlx::query_as::<_, JobOutcomeRecord>(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -1860,7 +1890,7 @@ pub async fn job_outcomes_for_run(pool: &DbPool, run_id: i64) -> Result<Vec<JobO
 }
 
 /// This run's `run_events`, warn/error diagnostics first (then newest first
-/// within each group), for `mcp stdio`'s `get_run` tool.
+/// within each group), for `mcp stdio`'s `get_run` tool. SPEC-4.5, SPEC-10.
 pub async fn run_events_for_run(pool: &DbPool, run_id: i64) -> Result<Vec<RunEventRecord>> {
     let rows = sqlx::query_as::<_, RunEventRecord>(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -1880,7 +1910,7 @@ pub async fn run_events_for_run(pool: &DbPool, run_id: i64) -> Result<Vec<RunEve
 /// job's attempt in one run. `attempt = None` resolves to that job's latest
 /// attempt. Returns `None` when no `job_outcomes` row matches at all (unknown
 /// run/job/attempt), distinct from a matching row whose `stream_log_path` is
-/// itself `NULL`.
+/// itself `NULL`. SPEC-4.5 (`get_stream_log`).
 pub async fn job_outcome_stream_log(
     pool: &DbPool,
     run_id: i64,
