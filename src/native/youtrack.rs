@@ -2539,7 +2539,7 @@ fn clone_repo(clone_url: &str, workdir: &Path, branch: Option<&str>) -> Result<(
 /// `user@host:owner/repo[.git]`, and a bare local path, since tests and a
 /// host install's own credential helper can hand any of the three to `git
 /// clone`.
-fn repo_slug(clone_url: &str) -> String {
+pub(crate) fn repo_slug(clone_url: &str) -> String {
     let path = match clone_url.split_once("://") {
         // Drop the scheme and the host that follows it; what is left is the
         // URL's path.
@@ -2566,7 +2566,7 @@ fn repo_slug(clone_url: &str) -> String {
 
 /// `<data dir>/cache/cargo-target/<repo-slug>` (`SPEC-3.10` item 2): outside
 /// `workdirs/`, so workdir GC (`SPEC-3.8`) never reaches it.
-fn cargo_target_dir(paths: &Paths, clone_url: &str) -> PathBuf {
+pub(crate) fn cargo_target_dir(paths: &Paths, clone_url: &str) -> PathBuf {
     paths
         .data_dir
         .join("cache")
@@ -2580,7 +2580,7 @@ fn cargo_target_dir(paths: &Paths, clone_url: &str) -> PathBuf {
 /// must fail the attempt instead of silently degrading. `create_dir_all`
 /// alone would not catch an existing, unwritable directory, so this also
 /// writes and removes a probe file.
-fn ensure_cargo_target_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn ensure_cargo_target_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let probe = dir.join(".claude-run-write-probe");
     std::fs::write(&probe, b"")?;
@@ -2892,7 +2892,6 @@ fn git_head_sha(workdir: &Path) -> Option<String> {
 /// `.claude-run-review-pass` promotes the PR to ready and sets the field to
 /// code-review. A fail marker `.claude-run-review-fail` or no verdict keeps
 /// the PR draft."
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn run_review_session(
     claude: &ClaudeInvoker,
