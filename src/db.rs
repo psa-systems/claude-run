@@ -521,18 +521,47 @@ async fn refuse_live_database(pool: &DbPool, schema: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-/// A Postgres pool whose every connection sees only a schema of its own, so
-/// `cargo test`'s parallel tests do not share tables. Nothing is dropped: the
-/// server this points at is a disposable CI service container.
+/// The Postgres migration set as one script, built once per test process.
+/// A fixture runs it in a single transaction instead of replaying the
+/// migrator per test. SPEC-5.6.2.
 #[cfg(test)]
-async fn test_pg_pool_at(url: &str, max_connections: u32) -> DbPool {
+fn fixture_script() -> &'static str {
+    static SCRIPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        let mut script = String::new();
+        for migration in POSTGRES_MIGRATOR.iter() {
+            // A no-transaction migration cannot join the single transaction.
+            assert!(
+                !migration.no_tx,
+                "postgres migration {} is no-transaction and cannot be part of the fixture script",
+                migration.version
+            );
+            script.push_str(migration.sql.as_str());
+            script.push('\n');
+        }
+        script
+    })
+}
+
+/// A schema name no other fixture in this process or on this server uses.
+/// SPEC-5.6.1.
+#[cfg(test)]
+fn next_fixture_schema() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let schema = format!(
+    format!(
         "cr_test_{}_{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
-    );
+    )
+}
+
+/// A pool whose every connection selects `schema`; the schema itself is not
+/// created here. Refuses a live runner database on the first call of the
+/// process. SPEC-5.6.1, SPEC-5.6.6.
+#[cfg(test)]
+async fn pg_pool_in_schema(url: &str, schema: &str, max_connections: u32) -> DbPool {
+    static LIVE_CHECK: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     sqlx::any::install_default_drivers();
     let set_path = format!("SET search_path TO {schema}");
     let pool = AnyPoolOptions::new()
@@ -547,18 +576,107 @@ async fn test_pg_pool_at(url: &str, max_connections: u32) -> DbPool {
         .connect(url)
         .await
         .expect("connect to CLAUDE_RUN_TEST_DATABASE_URL");
-    refuse_live_database(&pool, "public")
+    LIVE_CHECK
+        .get_or_try_init(|| refuse_live_database(&pool, "public"))
         .await
         .expect("refuse a live runner database");
-    pool.execute(sqlx::AssertSqlSafe(format!(
-        "CREATE SCHEMA IF NOT EXISTS {schema}"
+    pool
+}
+
+/// Drops `schema` once `pool` is dropped or closed. One worker thread per
+/// process does all the dropping over a single connection, so cleanup adds one
+/// server connection however many tests run in parallel, and runs on a runtime
+/// of its own because the test's runtime is gone by then. A failure goes to
+/// stderr naming the schema. SPEC-5.6.4, SPEC-5.6.5.
+#[cfg(test)]
+fn drop_schema_when_closed(pool: &DbPool, url: &str, schema: &str) {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+    use futures_util::FutureExt;
+    use sqlx::pool::CloseEvent;
+    use sqlx::Connection;
+    use std::sync::OnceLock;
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+
+    type Job = (CloseEvent, String, String);
+    static WORKER: OnceLock<UnboundedSender<Job>> = OnceLock::new();
+
+    let sender = WORKER.get_or_init(|| {
+        let (sender, mut jobs) = unbounded_channel::<Job>();
+        std::thread::Builder::new()
+            .name("test-schema-cleanup".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build the test schema cleanup runtime");
+                runtime.block_on(async move {
+                    let mut waiting = FuturesUnordered::new();
+                    let mut conn: Option<sqlx::AnyConnection> = None;
+                    loop {
+                        tokio::select! {
+                            Some((closed, url, schema)) = jobs.recv() => {
+                                waiting.push(async move {
+                                    closed.await;
+                                    (url, schema)
+                                });
+                            }
+                            Some((url, schema)) = waiting.next(), if !waiting.is_empty() => {
+                                // Every closed pool already waiting joins this drop: one commit
+                                // clears a backlog that single drops could not keep up with.
+                                let mut schemas = vec![schema];
+                                while schemas.len() < 16 {
+                                    match waiting.next().now_or_never() {
+                                        Some(Some((_, more))) => schemas.push(more),
+                                        _ => break,
+                                    }
+                                }
+                                let schemas = schemas.join(", ");
+                                let dropped = async {
+                                    if conn.is_none() {
+                                        conn = Some(sqlx::AnyConnection::connect(&url).await?);
+                                    }
+                                    let conn = conn.as_mut().expect("connected above");
+                                    conn.execute(sqlx::AssertSqlSafe(format!(
+                                        "DROP SCHEMA IF EXISTS {schemas} CASCADE"
+                                    )))
+                                    .await
+                                }
+                                .await;
+                                if let Err(e) = dropped {
+                                    // Reconnect on the next drop rather than reuse a broken connection.
+                                    conn = None;
+                                    eprintln!("test schemas {schemas} not dropped: {e}");
+                                }
+                            }
+                        }
+                    }
+                });
+            })
+            .expect("spawn the test schema cleanup thread");
+        sender
+    });
+    sender
+        .send((pool.close_event(), url.to_owned(), schema.to_owned()))
+        .expect("the test schema cleanup worker is running");
+}
+
+/// A Postgres pool whose every connection sees only a schema of its own, so
+/// `cargo test`'s parallel tests do not share tables. The schema and the whole
+/// migration script go in one transaction (one commit per fixture), and the
+/// schema is dropped when the pool is. SPEC-5.6.1, SPEC-5.6.3.
+#[cfg(test)]
+async fn test_pg_pool_at(url: &str, max_connections: u32) -> DbPool {
+    let schema = next_fixture_schema();
+    let pool = pg_pool_in_schema(url, &schema, max_connections).await;
+    // Register the drop first so a failed setup still cleans up.
+    drop_schema_when_closed(&pool, url, &schema);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA {schema};\n{}",
+        fixture_script()
     )))
+    .execute(&pool)
     .await
-    .expect("create the test schema");
-    POSTGRES_MIGRATOR
-        .run(&pool)
-        .await
-        .expect("run postgres migrations");
+    .expect("create the test schema and apply the migrations");
     pool
 }
 
@@ -786,6 +904,73 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pg_indexes, lite_indexes);
+    }
+
+    /// SPEC-5.6.3, SPEC-5.6.4: a fixture schema holds the tables but no
+    /// migration bookkeeping, and is gone once its pool is dropped.
+    #[tokio::test]
+    async fn a_fixture_schema_has_no_bookkeeping_and_is_dropped_with_its_pool() {
+        use sqlx::Connection;
+        let pool = skip_without_postgres!();
+        let schema: String = sqlx::query_scalar("SELECT current_schema()::text")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = 'settings'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tables, 1, "the migration script ran in {schema}");
+        let bookkeeping: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = '_sqlx_migrations'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bookkeeping, 0, "no bookkeeping rows in a fixture schema");
+
+        drop(pool);
+        let url = std::env::var("CLAUDE_RUN_TEST_DATABASE_URL").unwrap();
+        let mut conn = sqlx::AnyConnection::connect(&url).await.unwrap();
+        let mut remaining = 1_i64;
+        for _ in 0..300 {
+            remaining = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = $1",
+            )
+            .bind(&schema)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            if remaining == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(remaining, 0, "schema {schema} survived its pool");
+    }
+
+    /// SPEC-5.6.7: fixtures bypass the migrator, so this keeps the production
+    /// path (and the checksums it records) exercised.
+    #[tokio::test]
+    async fn the_production_migrator_applies_every_postgres_migration() {
+        let _ = skip_without_postgres!();
+        let url = std::env::var("CLAUDE_RUN_TEST_DATABASE_URL").unwrap();
+        let schema = next_fixture_schema();
+        let pool = pg_pool_in_schema(&url, &schema, 2).await;
+        drop_schema_when_closed(&pool, &url, &schema);
+        pool.execute(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .await
+            .unwrap();
+        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(applied as usize, POSTGRES_MIGRATOR.iter().count());
     }
 
     #[tokio::test]
