@@ -352,6 +352,11 @@ pub fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
 /// SPEC-3.2.9: "a caller with a forge token in scope authenticates the one
 /// network call this check makes (`ls-remote origin`) per invocation via
 /// the token's own userinfo."
+///
+/// Every caller of this guarded delete shares the same preserve decision, so
+/// `target/` is stripped here (`SPEC-3.10` item 5) rather than in each
+/// caller: whichever branch below keeps `workdir`, its build output does
+/// not survive into the kept directory.
 pub fn cleanup_or_preserve_with_token(
     workdir: &Path,
     action: &str,
@@ -364,6 +369,7 @@ pub fn cleanup_or_preserve_with_token(
     match local_only_work_with_token(workdir, token_url) {
         Ok(work) if work.is_clean() => force_remove(workdir),
         Ok(work) => {
+            crate::gc::remove_target(action, key, workdir);
             prune_ignored_artifacts(workdir);
             warn!(
                 action = %action,
@@ -376,6 +382,7 @@ pub fn cleanup_or_preserve_with_token(
             );
         }
         Err(e) => {
+            crate::gc::remove_target(action, key, workdir);
             error!(
                 action = %action,
                 key = %key,
@@ -482,6 +489,26 @@ mod tests {
 
         cleanup_or_preserve(&clone, "test", "K-1");
         assert!(clone.exists(), "dirty tree must survive cleanup");
+    }
+
+    /// `SPEC-3.10` item 5: the shared guarded delete strips a non-gitignored
+    /// `target/` before it keeps a workdir for local-only work, so every
+    /// caller of `cleanup_or_preserve*` (not just the native YouTrack
+    /// action's own wrapper) gets this for free.
+    #[test]
+    fn preserve_path_strips_non_gitignored_target() {
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        std::fs::write(clone.join("f.txt"), "changed").unwrap();
+        std::fs::create_dir_all(clone.join("target/debug")).unwrap();
+        std::fs::write(clone.join("target/debug/build.o"), "binary").unwrap();
+
+        cleanup_or_preserve(&clone, "test", "K-1");
+        assert!(clone.exists(), "dirty tree must survive cleanup");
+        assert!(
+            !clone.join("target").exists(),
+            "target/ must not survive into a kept workdir"
+        );
     }
 
     #[test]
@@ -668,9 +695,16 @@ mod tests {
             &["remote", "add", "origin", "/nonexistent/repo.git"],
         );
 
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/build.o"), "binary").unwrap();
+
         assert!(local_only_work(dir.path()).is_err());
 
         cleanup_or_preserve(dir.path(), "test", "K-1");
+        assert!(
+            !dir.path().join("target").exists(),
+            "target/ must be stripped even when the preserve is a failed-check guess"
+        );
         assert!(
             dir.path().exists(),
             "a failed ls-remote must preserve rather than guess"
