@@ -60,6 +60,34 @@ pub fn pr_web_url(host: &str, repo: &str, pr_number: i64, extra: &[String]) -> S
     format!("https://{host}/{repo}/{segment}/{pr_number}")
 }
 
+/// CLAUDE-521: write `body` to a scratch file under `std::env::temp_dir()`
+/// for a `gh` call that reads its PR body from disk, named uniquely per call
+/// (not just per `prefix`) via `tempfile`'s atomic create-with-random-suffix.
+/// Two concurrent callers racing on the same logical key (a PR number)
+/// therefore never write, read, or remove the same path, unlike a fixed
+/// `<prefix>-<key>.md` name.
+fn scratch_file(prefix: &str, body: &str) -> Result<tempfile::TempPath> {
+    use std::io::Write as _;
+    let mut f = tempfile::Builder::new()
+        .prefix(&format!("{prefix}-"))
+        .suffix(".md")
+        .tempfile_in(std::env::temp_dir())?;
+    f.write_all(body.as_bytes())?;
+    Ok(f.into_temp_path())
+}
+
+/// Remove a [`scratch_file`] path, logging anything but a benign
+/// already-gone file, exactly like the pre-CLAUDE-521 `remove_file` calls
+/// this replaces.
+fn remove_scratch_file(scratch: tempfile::TempPath, what: &str) {
+    let path = scratch.to_path_buf();
+    if let Err(e) = scratch.close() {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::error!(path = %path.display(), error = %e, "removing the {what} scratch file failed");
+        }
+    }
+}
+
 /// Run `gh auth token --hostname <host>`, returning the trimmed token or a
 /// formatted error naming the failure. Shared by [`GithubForge`] (its own
 /// PR/comment push fallback) and [`GhForgeReads`] (its CI-failure log reads),
@@ -956,8 +984,7 @@ impl Forge for GithubForge {
             Some(t) => vec![("GH_TOKEN", t.as_str())],
             None => Vec::new(),
         };
-        let scratch = std::env::temp_dir().join(format!("claude-run-pr-refresh-{pr_number}.md"));
-        std::fs::write(&scratch, &body)?;
+        let scratch = scratch_file(&format!("claude-run-pr-refresh-{pr_number}"), &body)?;
         let scratch_arg = scratch.to_string_lossy().to_string();
         let number_str = pr_number.to_string();
         let args = [
@@ -972,11 +999,7 @@ impl Forge for GithubForge {
             scratch_arg.as_str(),
         ];
         let out = self.runner.run_in_env(None, &self.gh, &args, &envs);
-        if let Err(e) = std::fs::remove_file(&scratch) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::error!(path = %scratch.display(), error = %e, "removing the PR refresh scratch file failed");
-            }
-        }
+        remove_scratch_file(scratch, "PR refresh");
         let out = out?;
         if !out.ok {
             return Err(Error::CliFailed {
@@ -2255,7 +2278,33 @@ mod tests {
     use super::*;
     use crate::forge_log::ActionLogClient;
     use crate::provider::cli::testutil::StubRunner;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+
+    /// CLAUDE-521: two concurrent scratch-file writers racing on the exact
+    /// same logical key (here, a fixed prefix standing in for a PR number)
+    /// must never land on the same path. Before the fix, `scratch_file`
+    /// built a fixed `<prefix>.md` name, so both threads wrote, and one
+    /// clobbered the other's body; `tempfile`'s atomic random-suffix
+    /// creation makes every call land on a distinct path.
+    #[test]
+    fn scratch_file_is_unique_for_concurrent_calls_with_the_same_prefix() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            scratch_file("claude-run-race-test-7", "one").unwrap()
+        });
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            scratch_file("claude-run-race-test-7", "two").unwrap()
+        });
+        let p1 = t1.join().unwrap();
+        let p2 = t2.join().unwrap();
+        assert_ne!(p1.to_path_buf(), p2.to_path_buf());
+        assert_eq!(std::fs::read_to_string(&p1).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(&p2).unwrap(), "two");
+    }
 
     /// Stub transport recording calls; `initialize` succeeds/fails per config and
     /// `call_tool` returns a canned result.
@@ -2661,22 +2710,13 @@ mod tests {
                     &["log", "-1", "--pretty=format:%b"],
                     "Finished.\n\n#MK-16",
                 )
-                .ok(
-                    "gh",
-                    &[
-                        "pr",
-                        "edit",
-                        "7",
-                        "--repo",
-                        "octo/widget",
-                        "--title",
-                        "feat: the real thing",
-                        "--body-file",
+                .ok_prefix(
+                    &format!(
+                        "gh pr edit 7 --repo octo/widget --title feat: the real thing --body-file {}",
                         std::env::temp_dir()
-                            .join("claude-run-pr-refresh-7.md")
-                            .to_string_lossy()
-                            .as_ref(),
-                    ],
+                            .join("claude-run-pr-refresh-7-")
+                            .display()
+                    ),
                     "",
                 ),
         );
@@ -4640,22 +4680,13 @@ mod tests {
                     &["log", "-1", "--pretty=format:%b"],
                     "Finished.\n\n#MK-16",
                 )
-                .fail(
-                    "gh",
-                    &[
-                        "pr",
-                        "edit",
-                        "7",
-                        "--repo",
-                        "octo/widget",
-                        "--title",
-                        "feat: the real thing",
-                        "--body-file",
+                .fail_prefix(
+                    &format!(
+                        "gh pr edit 7 --repo octo/widget --title feat: the real thing --body-file {}",
                         std::env::temp_dir()
-                            .join("claude-run-pr-refresh-7.md")
-                            .to_string_lossy()
-                            .as_ref(),
-                    ],
+                            .join("claude-run-pr-refresh-7-")
+                            .display()
+                    ),
                     1,
                     "boom",
                 ),
