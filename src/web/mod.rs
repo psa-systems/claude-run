@@ -12168,22 +12168,20 @@ mod tests {
             make_cargo_cache_dir(tmp.path(), "owner__repo-a", 16);
             let root = tmp.path().join("cache").join("cargo-target");
             let dir = root.join("owner__repo-a");
-            // Removing a directory entry requires write permission on its
-            // parent; stripping that from `dir` itself makes `remove_dir_all`
-            // fail partway through instead of succeeding.
+            // Removing the `blob` file inside `dir` requires write (and
+            // execute) permission on `dir` itself; dropping to read-only
+            // makes `remove_dir_all` fail partway through instead of
+            // succeeding. No exec bit is set here (CLAUDE-255's guard scans
+            // for one), and the tempdir's own best-effort cleanup on drop
+            // tolerates the leftover restricted entry.
             let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-            perms.set_mode(0o555);
+            perms.set_mode(0o444);
             std::fs::set_permissions(&dir, perms).unwrap();
             let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
 
             let resp = cargo_cache_delete_one(State(s), AxumPath("owner__repo-a".to_string()))
                 .await
                 .unwrap();
-
-            // Restore permissions so the tempdir can be cleaned up.
-            let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&dir, perms).unwrap();
 
             assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
             let body = body_string(resp).await;
