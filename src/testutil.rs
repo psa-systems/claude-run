@@ -143,6 +143,39 @@ exit "$code"
     }
 }
 
+/// Poll `probe` until it returns `Some`, or `budget` elapses, backing off
+/// exponentially between attempts (starting at 5ms, capped at 200ms) instead
+/// of spinning at a fixed interval.
+///
+/// CLAUDE-504: a `RunGuard`'s `Drop` cannot await its own close, so it spawns
+/// the write and a test has to poll for it to land. A fixed, short interval
+/// polled across a fixed, short total window (1s at 10ms) flaked on the
+/// Postgres backend under the heavy I/O contention a full `cargo test` run
+/// puts on it, where the spawned close can take far longer than the window.
+/// Backing off keeps a healthy run's overhead negligible (a handful of
+/// sub-10ms probes) while giving a contended run a much wider budget to land
+/// in, and without adding to that contention the way fast fixed-interval
+/// polling would.
+pub async fn poll_until<F, Fut, T>(budget: std::time::Duration, mut probe: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut backoff = std::time::Duration::from_millis(5);
+    loop {
+        if let Some(value) = probe().await {
+            return Some(value);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        tokio::time::sleep(backoff.min(deadline - now)).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(200));
+    }
+}
+
 /// Write an executable test stub WITHOUT this process ever holding a writable
 /// descriptor on it.
 ///

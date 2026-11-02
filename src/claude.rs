@@ -341,6 +341,10 @@ impl ClaudeInvoker {
     /// SPEC-3.2.2: "The run's remaining budget ... is passed as
     /// `--max-budget-usd` on every invocation, so a single runaway session
     /// cannot overshoot the run's ceiling."
+    ///
+    /// `cargo_target_dir` is the repo's shared Cargo target directory
+    /// (`SPEC-3.10` item 3) for a child spawned over a repo workdir; `None`
+    /// for an invocation with no repo workdir (unaffected).
     #[allow(clippy::too_many_arguments)]
     pub fn invoke(
         &self,
@@ -351,6 +355,7 @@ impl ClaudeInvoker {
         stream_log: &Path,
         cancel: &CancellationToken,
         budget_usd: Option<f64>,
+        cargo_target_dir: Option<&Path>,
     ) -> Result<ClaudeResult> {
         if let Some(parent) = stream_log.parent() {
             std::fs::create_dir_all(parent)?;
@@ -454,6 +459,14 @@ impl ClaudeInvoker {
             .env("BASH_MAX_TIMEOUT_MS", &timeout_ms);
         strip_database_url_env(&mut command);
         strip_smtp_password_env(&mut command);
+        // SPEC-3.10 item 3: every `claude` child spawned for a repo workdir
+        // shares that repo's compiled-dependency cache instead of rebuilding
+        // every dependency into an empty `target/`. SPEC-3.10 item 4:
+        // incremental compilation stays enabled, so `CARGO_INCREMENTAL` is
+        // never set here.
+        if let Some(dir) = cargo_target_dir {
+            command.env("CARGO_TARGET_DIR", dir);
+        }
         // Point the agent at its dedicated user-level config dir
         // (slim bot CLAUDE.md + linked host credentials). HOME is left inherited.
         if let Some(dir) = &self.config_dir {
@@ -1638,6 +1651,7 @@ mod tests {
                 &log,
                 &cancel,
                 None,
+                None,
             )
             .unwrap();
         assert!(res.timed_out, "exit 124 should set timed_out");
@@ -1672,6 +1686,7 @@ mod tests {
                 dir.path(),
                 &log,
                 &cancel,
+                None,
                 None,
             )
             .unwrap();
@@ -1718,6 +1733,7 @@ mod tests {
                 &log,
                 &cancel,
                 None,
+                None,
             )
             .unwrap();
         assert!(res.ok, "a clean immediate exit is ok");
@@ -1759,6 +1775,7 @@ mod tests {
                 dir.path(),
                 &log,
                 &cancel,
+                None,
                 None,
             )
             .unwrap();
@@ -1812,6 +1829,7 @@ mod tests {
                 &log,
                 &cancel,
                 None,
+                None,
             )
             .unwrap();
         let elapsed = start.elapsed();
@@ -1861,6 +1879,7 @@ mod tests {
                 &log,
                 &cancel,
                 None,
+                None,
             )
             .unwrap();
         assert!(res.ok, "stub run succeeds");
@@ -1909,6 +1928,7 @@ mod tests {
                 &log,
                 &cancel,
                 None,
+                None,
             )
             .unwrap();
         assert!(res.ok, "a success result event finalizes as ok");
@@ -1949,6 +1969,7 @@ mod tests {
                 dir.path(),
                 &log,
                 &cancel,
+                None,
                 None,
             )
             .unwrap();
@@ -2001,6 +2022,7 @@ mod tests {
                 dir.path(),
                 &log,
                 &cancel,
+                None,
                 None,
             )
             .unwrap();
@@ -2060,6 +2082,7 @@ mod tests {
                 &log,
                 &cancel,
                 None,
+                None,
             )
             .unwrap();
         assert!(
@@ -2100,6 +2123,7 @@ mod tests {
             &log,
             &cancel,
             None,
+            None,
         );
         let elapsed = start.elapsed();
         canceller.join().unwrap();
@@ -2139,6 +2163,7 @@ mod tests {
                 &dir.join("stream.jsonl"),
                 &CancellationToken::new(),
                 budget_usd,
+                None,
             )
             .unwrap();
         assert!(res.ok, "stub run succeeds");
@@ -2717,6 +2742,7 @@ mod tests {
                 &log,
                 &cancel,
                 None,
+                None,
             )
             .unwrap();
         assert!(!res.ok, "non-zero exit is a failure");
@@ -3093,6 +3119,7 @@ mod tests {
                     &log,
                     &cancel,
                     None,
+                    None,
                 )
                 .unwrap()
         });
@@ -3219,6 +3246,7 @@ mod tests {
                 dir.path(),
                 &log,
                 &cancel,
+                None,
                 None,
             )
             .unwrap();

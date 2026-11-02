@@ -1263,6 +1263,7 @@ async fn run_instruction(
                 pool,
                 run_id,
                 key,
+                &ctx.paths,
             )
         })
     } else {
@@ -1382,6 +1383,7 @@ fn serve_run(
     pool: &crate::db::DbPool,
     run_id: Option<i64>,
     key: &str,
+    paths: &Paths,
 ) -> RunOutcome {
     let cancel = CancellationToken::new();
 
@@ -1399,12 +1401,26 @@ fn serve_run(
         return RunOutcome::failed(format!("creating the workdir failed: {e}"));
     }
 
+    // SPEC-3.10 items 2-3: the repo's shared Cargo target directory comes from
+    // the clone URL path and must be writable before the session starts; the
+    // runner never falls back to a per-workdir `target/`.
     let clone = backend
         .clone_url(&cmd.host, &cmd.repo)
         .map_err(|e| format!("resolve clone url: {e}"))
-        .and_then(|url| clone_branch(&url, &branch, workdir).map_err(|e| format!("git clone: {e}")))
-        .and_then(|()| {
+        .and_then(|url| {
+            clone_branch(&url, &branch, workdir).map_err(|e| format!("git clone: {e}"))?;
+            let dir = crate::native::youtrack::cargo_target_dir(paths, &url);
+            crate::native::youtrack::ensure_cargo_target_dir(&dir).map_err(|e| {
+                format!(
+                    "could not create or write the Cargo target directory {}: {e}",
+                    dir.display()
+                )
+            })?;
+            Ok(dir)
+        })
+        .and_then(|dir| {
             prepare_checkout(workdir, &src.bot_author, &src.bot_email)
+                .map(|head| (head, dir))
                 .map_err(|e| format!("preparing the checkout failed: {e}"))
         });
 
@@ -1412,10 +1428,10 @@ fn serve_run(
     let mut cloned_head = None;
     let claude_result = match clone {
         Err(reason) => {
-            warn!(repo = %cmd.repo, pr = cmd.number, %reason, "clone failed (the PR reply still runs)");
-            ClaudeResult::synthesized("clone failed", reason)
+            warn!(repo = %cmd.repo, pr = cmd.number, %reason, "clone or setup failed (the PR reply still runs)");
+            ClaudeResult::synthesized("clone or setup failed", reason)
         }
-        Ok(head) => {
+        Ok((head, cargo_target_dir)) => {
             cloned_head = Some(head);
             // The instruction reaches the agent through a FILE, verbatim, placed
             // in the clone's OWN git directory rather than its work tree: git
@@ -1463,7 +1479,7 @@ fn serve_run(
                             &instruction_path,
                             ci_failure_path.as_deref(),
                         );
-                        info!(repo = %cmd.repo, pr = cmd.number, stream_log = %stream_log.display(), "invoking claude for a comment command");
+                        info!(repo = %cmd.repo, pr = cmd.number, stream_log = %stream_log.display(), cargo_target_dir = %cargo_target_dir.display(), "invoking claude for a comment command");
                         let result = match claude.invoke(
                             &prompt,
                             &crate::action::ClaudeBlock::default(),
@@ -1473,6 +1489,9 @@ fn serve_run(
                             &cancel,
                             // Cap the child at this run's remaining ceiling.
                             Some(spend.remaining_usd()),
+                            // SPEC-3.10 item 3: this repo workdir shares the
+                            // repo's compiled-dependency cache.
+                            Some(cargo_target_dir.as_path()),
                         ) {
                             Ok(r) => {
                                 claude_ran = true;
@@ -2664,20 +2683,19 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        let mut ended: Option<String> = None;
-        for _ in 0..200 {
-            ended = sqlx::query_scalar(sqlx::AssertSqlSafe(
-                crate::db::q(&pool, "SELECT ended_at FROM runs WHERE id = ?").into_owned(),
-            ))
-            .bind(run_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            if ended.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        // CLAUDE-504: a fixed, short poll window flaked on Postgres under
+        // heavy I/O contention, so this backs off over a much wider budget.
+        let ended: Option<String> =
+            crate::testutil::poll_until(std::time::Duration::from_secs(20), || async {
+                sqlx::query_scalar(sqlx::AssertSqlSafe(
+                    crate::db::q(&pool, "SELECT ended_at FROM runs WHERE id = ?").into_owned(),
+                ))
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            })
+            .await;
         assert!(
             ended.is_some(),
             "a panicking webhook-comment handler must not leave its run row open"

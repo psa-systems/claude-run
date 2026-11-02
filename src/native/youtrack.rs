@@ -1199,6 +1199,10 @@ async fn process_job(
 
     let wb_base = workdir::resolve_workdir_base(action.workdir_base.as_deref(), paths);
     let workdir_path = workdir::job_workdir(&wb_base, &action.name, key);
+    // SPEC-3.10 item 2: computed from the job's own clone URL, independent of
+    // `run_pre`'s clone outcome, so it is available to both the main
+    // invocation and the post-success review session below.
+    let cargo_target_dir = cargo_target_dir(paths, &job.clone_url);
 
     // ---- filter: live AI Agent re-read ----
     // The gather-time eligibility pass ([`filter_eligible`]) already
@@ -1330,6 +1334,9 @@ async fn process_job(
     // watcher's own outcome; every other arm never checkpoints, so this
     // stays `None` for them, which `finalize` treats as "nothing rejected".
     let mut checkpoint_rejected: Option<String> = None;
+    // Computed once regardless of `pre_result`, so the match below never
+    // calls the fallible I/O twice for one attempt.
+    let cargo_target_dir_result = ensure_cargo_target_dir(&cargo_target_dir);
     let (claude_result, claude_ran) = match pre_result {
         Err(reason) => {
             warn!(action = %action.name, key = %key, %reason, "pre step failed (finalize still runs)");
@@ -1369,6 +1376,24 @@ async fn process_job(
                 false,
             )
         }
+        // SPEC-3.10 item 3: the directory is created (or confirmed writable)
+        // before the child starts; an unwritable directory fails this
+        // attempt (finalize still runs) rather than falling back to a
+        // per-workdir `target/`.
+        Ok(()) if cargo_target_dir_result.is_err() => {
+            let error = cargo_target_dir_result
+                .as_ref()
+                .expect_err("the guard above already confirmed this is Err");
+            let reason = format!(
+                "could not create or write the Cargo target directory {}: {error}",
+                cargo_target_dir.display()
+            );
+            warn!(action = %action.name, key = %key, %reason, "cargo target directory unwritable (SPEC-3.10 item 3); claude not started, finalize still runs");
+            (
+                ClaudeResult::synthesized("Cargo target directory unwritable", reason),
+                false,
+            )
+        }
         Ok(()) => {
             let prompt = build_prompt(
                 src,
@@ -1380,7 +1405,13 @@ async fn process_job(
             );
             let stream_log =
                 ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1);
-            info!(action = %action.name, key = %key, stream_log = %stream_log.display(), "invoking claude");
+            // SPEC-3.10 item 9: the run's start log line names the
+            // `CARGO_TARGET_DIR` the run was given.
+            info!(
+                action = %action.name, key = %key, stream_log = %stream_log.display(),
+                cargo_target_dir = %cargo_target_dir.display(),
+                "invoking claude"
+            );
             // ---- checkpoint-push watcher (CLAUDE-448) ----
             // Ticks `forge.checkpoint_push` on its own OS thread for as long
             // as `claude.invoke` (below) runs; `stop_tx` is dropped the
@@ -1414,6 +1445,9 @@ async fn process_job(
                     cancel,
                     // Cap the child at the run's remaining ceiling.
                     Some(spend.remaining_usd()),
+                    // SPEC-3.10 item 3: every child spawned for this repo
+                    // workdir shares the repo's cache.
+                    Some(cargo_target_dir.as_path()),
                 );
                 drop(stop_tx);
                 let outcome = watcher.join().unwrap_or(CheckpointOutcome {
@@ -1557,6 +1591,7 @@ async fn process_job(
                 &review_stream_log,
                 cancel,
                 Some(spend.remaining_usd()),
+                Some(cargo_target_dir.as_path()),
             )
         });
         spend.record(&review_result);
@@ -2495,6 +2530,63 @@ fn clone_repo(clone_url: &str, workdir: &Path, branch: Option<&str>) -> Result<(
     provider::shallow_clone(clone_url, branch, workdir, 50)
 }
 
+/// Derive `<repo-slug>` from a clone URL's path (`SPEC-3.10` item 2):
+/// `<owner>__<repo>`, lowercased, with every character outside
+/// `[a-z0-9._-]` replaced by `_`. The owner segment keeps two repos with the
+/// same name under different owners from colliding.
+///
+/// Handles `scheme://host/owner/repo[.git]`, the scp-like
+/// `user@host:owner/repo[.git]`, and a bare local path, since tests and a
+/// host install's own credential helper can hand any of the three to `git
+/// clone`.
+pub(crate) fn repo_slug(clone_url: &str) -> String {
+    let path = match clone_url.split_once("://") {
+        // Drop the scheme and the host that follows it; what is left is the
+        // URL's path.
+        Some((_, rest)) => rest.split_once('/').map_or("", |(_, p)| p),
+        // No scheme: either `user@host:owner/repo` (split on the last `:`)
+        // or already a bare path (no `:` at all, so this is a no-op).
+        None => clone_url.rsplit_once(':').map_or(clone_url, |(_, p)| p),
+    };
+    let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let repo = segments.pop().unwrap_or("").trim_end_matches(".git");
+    let owner = segments.pop().unwrap_or("");
+    format!("{owner}__{repo}")
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// `<data dir>/cache/cargo-target/<repo-slug>` (`SPEC-3.10` item 2): outside
+/// `workdirs/`, so workdir GC (`SPEC-3.8`) never reaches it.
+pub(crate) fn cargo_target_dir(paths: &Paths, clone_url: &str) -> PathBuf {
+    paths
+        .data_dir
+        .join("cache")
+        .join("cargo-target")
+        .join(repo_slug(clone_url))
+}
+
+/// Create the repo's shared Cargo target directory if needed and confirm it
+/// is writable (`SPEC-3.10` item 3): the runner never falls back to a
+/// per-workdir `target/`, so a directory that cannot be created or written
+/// must fail the attempt instead of silently degrading. `create_dir_all`
+/// alone would not catch an existing, unwritable directory, so this also
+/// writes and removes a probe file.
+pub(crate) fn ensure_cargo_target_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(".claude-run-write-probe");
+    std::fs::write(&probe, b"")?;
+    std::fs::remove_file(&probe)
+}
+
 /// SPEC-3.3: "Claude works in the local clone ... The agent may create
 /// issues in `write_projects` (default: the triggering issue's project),
 /// linked `relates to` / `depends on` / `is required for`, never as a
@@ -2810,6 +2902,9 @@ fn run_review_session(
     stream_log: &Path,
     cancel: &CancellationToken,
     budget_usd: Option<f64>,
+    // SPEC-3.10 item 3: the review session is a `claude` child spawned for
+    // this same repo workdir, so it shares the repo's cache too.
+    cargo_target_dir: Option<&Path>,
 ) -> (ReviewOutcome, ClaudeResult) {
     let pass_marker = workdir.join(REVIEW_PASS_MARKER);
     let fail_marker = workdir.join(REVIEW_FAIL_MARKER);
@@ -2829,6 +2924,7 @@ fn run_review_session(
         stream_log,
         cancel,
         budget_usd,
+        cargo_target_dir,
     );
     let result = match invoke_result {
         Ok(r) => r,
@@ -13108,6 +13204,7 @@ mod tests {
             &scratch.path().join("stream.jsonl"),
             &cancel,
             None,
+            None,
         );
         assert!(result.ok);
         assert_eq!(
@@ -13139,6 +13236,7 @@ mod tests {
             &scratch.path().join("stream.jsonl"),
             &cancel,
             None,
+            None,
         );
         assert!(result.ok);
         assert_eq!(
@@ -13166,6 +13264,7 @@ mod tests {
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
             &cancel,
+            None,
             None,
         );
         assert!(
@@ -13196,6 +13295,7 @@ mod tests {
             &scratch.path().join("stream.jsonl"),
             &cancel,
             None,
+            None,
         );
         assert!(
             matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("both the pass and fail markers"))
@@ -13222,6 +13322,7 @@ mod tests {
             Duration::from_secs(1),
             &scratch.path().join("stream.jsonl"),
             &cancel,
+            None,
             None,
         );
         assert!(result.timed_out);
@@ -13256,6 +13357,7 @@ mod tests {
             &scratch.path().join("stream.jsonl"),
             &cancel,
             None,
+            None,
         );
         assert!(
             matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("read-only by contract"))
@@ -13284,6 +13386,7 @@ mod tests {
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
             &cancel,
+            None,
             None,
         );
         assert!(
@@ -13323,6 +13426,7 @@ mod tests {
             &stream_log,
             &cancel,
             Some(2.5),
+            None,
         );
         assert_eq!(outcome, ReviewOutcome::Pass("ok".to_string()));
         let argv = std::fs::read_to_string(&argv_path).unwrap();
@@ -13386,6 +13490,7 @@ mod tests {
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
             &cancel,
+            None,
             None,
         );
         assert!(result.ok);

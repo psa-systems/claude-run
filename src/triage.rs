@@ -23,7 +23,7 @@
 //! tool-using session (`Read,Grep,Bash`) over the COMPLETE log plus the failing
 //! workflow YAML and ending with a fenced JSON verdict
 //! ([`parse_analysis_verdict`]). This replaces the old two-pass split (a
-//! tool-less classifier at ingest bounded by [`bound_log`], a separate scheduled
+//! tool-less classifier at ingest bounded to a fixed byte budget, a separate scheduled
 //! deep analysis later): one session now produces both the routing decision and
 //! the analysis text the minted issue carries.
 //!
@@ -50,9 +50,6 @@ use crate::config::AutoFixConfig;
 use crate::db::DbPool;
 use crate::error::Result;
 use crate::forge_log::ForgeReads;
-
-/// Default cap (bytes) for the log text inlined into the classifier prompt.
-pub const DEFAULT_MAX_LOG_BYTES: usize = 48 * 1024;
 
 /// SPEC-3.5: the triage buckets. Lowercase `snake_case` is the stable wire form
 /// (used in the classifier reply and any persistence).
@@ -377,45 +374,6 @@ pub fn triage(
     }
 }
 
-/// Bound `log` to at most `max_bytes`, keeping a head and a (larger) tail joined
-/// by a truncation marker - the root cause usually sits at the end of a CI log,
-/// but the head carries the workflow/setup context. UTF-8 safe.
-pub fn bound_log(log: &str, max_bytes: usize) -> String {
-    if log.len() <= max_bytes {
-        return log.to_string();
-    }
-    let head_budget = max_bytes / 4;
-    let tail_budget = max_bytes - head_budget;
-    let head = take_prefix(log, head_budget);
-    let tail = take_suffix(log, tail_budget);
-    let dropped = log.len() - head.len() - tail.len();
-    format!("{head}\n...[{dropped} bytes truncated]...\n{tail}")
-}
-
-/// Largest char-boundary prefix of `s` no longer than `max` bytes.
-fn take_prefix(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// Largest char-boundary suffix of `s` no longer than `max` bytes.
-fn take_suffix(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut start = s.len() - max;
-    while start < s.len() && !s.is_char_boundary(start) {
-        start += 1;
-    }
-    &s[start..]
-}
-
 /// Find and parse the LAST balanced `{...}` JSON object in `s`, scanning
 /// backward from the final `}` and matching braces so a Markdown report
 /// (which may itself contain `{`/`}`, e.g. in a code block) before the fenced
@@ -498,7 +456,7 @@ pub fn parse_analysis_verdict(reply: &str) -> Triage {
 
 /// SPEC-3.5.1: production [`FailureClassifier`]: one tool-using `claude`
 /// session per failure, over the COMPLETE log (not the bounded copy the old
-/// [`bound_log`]-based classifier used) plus the failing workflow YAML, ending
+/// classifier used) plus the failing workflow YAML, ending
 /// with a fenced JSON verdict ([`parse_analysis_verdict`]) that routes the
 /// failure. Replaces the old two-pass split (a tool-less classifier at ingest,
 /// a separate scheduled deep-analysis action over the full log later): the
@@ -673,6 +631,9 @@ impl FailureClassifier for AnalysisClassifier {
             &cancel,
             // Cap the child at the caller's remaining per-delivery ceiling.
             Some(spend.remaining_usd()),
+            // The CI-failure analysis session reads a log, not a repo
+            // workdir (SPEC-3.10 scopes the shared cache to those).
+            None,
         )?;
         // Fold this call's tokens and cost into the caller's own
         // ledger; the caller (the webhook mint consumer) owns the ledger and
@@ -1191,34 +1152,6 @@ mod tests {
         );
         assert_eq!(verdict.bucket, TriageBucket::HumanAction);
         assert_eq!(stub.calls(), 1, "classifier consulted when auto-fix is off");
-    }
-
-    // ---- AC 3: log bounding before the LLM call --------------------------
-
-    #[test]
-    fn bound_log_leaves_small_logs_untouched() {
-        let log = "short log line\n";
-        assert_eq!(bound_log(log, 1024), log);
-    }
-
-    #[test]
-    fn bound_log_truncates_large_logs_keeping_head_and_tail() {
-        let log = format!("HEAD-MARKER\n{}\nTAIL-MARKER", "x".repeat(10_000));
-        let bounded = bound_log(&log, 1024);
-        assert!(bounded.len() < log.len());
-        assert!(bounded.contains("HEAD-MARKER"));
-        assert!(bounded.contains("TAIL-MARKER"));
-        assert!(bounded.contains("bytes truncated"));
-    }
-
-    #[test]
-    fn bound_log_is_utf8_boundary_safe() {
-        // Multi-byte chars across the cut points must not panic or split.
-        let log = "héllo wörld ".repeat(1000);
-        let bounded = bound_log(&log, 64);
-        assert!(bounded.len() <= log.len());
-        // Round-trips as valid UTF-8 (a split codepoint would not).
-        assert!(bounded.chars().count() > 0);
     }
 
     // ---- AC 2: analysis verdict mapping, all four values plus an
