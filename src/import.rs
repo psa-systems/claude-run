@@ -35,7 +35,7 @@ use crate::error::Result;
 /// three tables that reference it. Checked against the live catalog by
 /// [`verify_schema`], so a migration that adds a table fails the import (and
 /// `the_table_list_matches_the_schema`) instead of silently leaving its rows
-/// behind.
+/// behind. SPEC-5.3.
 pub const TABLES: &[&str] = &[
     "actions",
     "attempt_counters",
@@ -85,7 +85,7 @@ const IDENTITY_COLUMNS: &[(&str, &str)] = &[
     ("claude_invocations", "id"),
 ];
 
-/// How the import treats a target that already holds rows.
+/// How the import treats a target that already holds rows. SPEC-5.3.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ImportOptions {
     /// Copy into a target that is not empty. Off by default: the expected move
@@ -94,7 +94,7 @@ pub struct ImportOptions {
     pub allow_nonempty: bool,
 }
 
-/// One row of the per-table comparison the operator sees.
+/// One row of the per-table comparison the operator sees. SPEC-5.3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableReport {
     pub table: String,
@@ -104,19 +104,21 @@ pub struct TableReport {
     pub target_rows_after: i64,
 }
 
+/// SPEC-5.3.
 #[derive(Debug, Clone, Default)]
 pub struct ImportReport {
     pub tables: Vec<TableReport>,
 }
 
 impl ImportReport {
+    /// SPEC-5.3.
     pub fn total_copied(&self) -> i64 {
         self.tables.iter().map(|t| t.copied).sum()
     }
 
     /// The comparison table printed on stdout. Both sides are shown per table
     /// rather than a bare success line, because "it worked" is not something an
-    /// operator can check afterwards without this.
+    /// operator can check afterwards without this. SPEC-5.3.
     pub fn render(&self) -> String {
         let width = self
             .tables
@@ -194,7 +196,7 @@ impl ColumnKind {
 
 /// Refuse an import whose source file IS the configured target. Without this
 /// the default invocation (no `[database] url` set) would copy `state.db` into
-/// itself and fail on its own primary keys half way through.
+/// itself and fail on its own primary keys half way through. SPEC-5.3.
 pub fn refuse_same_target(source: &Path, target: &DatabaseTarget) -> Result<()> {
     let DatabaseTarget::Sqlite(target_path) = target else {
         return Ok(());
@@ -249,6 +251,7 @@ async fn open_source(path: &Path) -> Result<DbPool> {
 ///
 /// One transaction on the target: a failure at any table rolls the whole copy
 /// back rather than leaving a half-populated database that looks startable.
+/// SPEC-5.3.
 pub async fn import_sqlite(
     source_path: &Path,
     target: &DbPool,
