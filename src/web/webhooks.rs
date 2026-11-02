@@ -84,6 +84,7 @@ use crate::triage::{self, FailureClassifier, TriageInput};
 /// carries existing history across each rename.
 pub const WEBHOOK_MINT_ACTION: &str = "webhook-triage";
 
+/// SPEC-4.4.1: the pause gate every delivery passes through right after auth/replay: a global or per-action pause, or a failed pause read, accepts and drops the delivery (2xx) rather than starting work, since a retry cannot help once the delivery id is in the replay store.
 /// The pause gate both webhook listeners take, once
 /// signature / replay / rate-limit have passed. True means "accept the delivery
 /// and drop it": return 2xx without parsing, minting, or emitting anything.
@@ -140,6 +141,7 @@ pub(crate) async fn paused_accept_and_drop(
     }
 }
 
+/// SPEC-4.4.1: the same pause gate as [`paused_accept_and_drop`], applied to a timer/queue-driven continuation of the synthetic webhook action rather than the initial HTTP accept.
 /// True when a timer- or queue-driven path of the
 /// synthetic action `action` must not act: the daemon is globally paused,
 /// `action` is paused, or a
@@ -170,6 +172,7 @@ pub(crate) async fn webhook_action_paused(pool: &DbPool, action: &str, what: &st
     }
 }
 
+/// SPEC-4.4.1: a login-required drop, checked right after the pause gate; accepted and dropped (2xx) like a pause, but also recorded as a `run_events` row since it is unusual enough to need on-screen visibility.
 /// Right after the pause check, accept-and-drop a delivery while
 /// the Claude login needs renewing. 2xx for the same reason as a pause: a
 /// retry cannot help (the delivery id is already in the replay store), and
@@ -263,6 +266,7 @@ pub const GITHUB_ISSUE_COMMENT_EVENT_TYPE: &str = "issue_comment";
 /// unhandled events.
 pub const GITHUB_PING_EVENT_TYPE: &str = "ping";
 
+/// SPEC-4.4.1: `WebhookProvider` is the `{provider}` path segment naming the sending forge (`forgejo` or `github`); each provider owns its own signature/delivery/event header names and signature-verification scheme, but shares one pipeline (auth, replay, rate-limit, pause, allow-list).
 /// The forge sending a webhook delivery, named by the `:provider` URL path
 /// segment (`/webhooks/:provider/triage/:source`,
 /// `/webhooks/:provider/comment/:source`). This is deliberately a thin
@@ -342,6 +346,7 @@ impl WebhookProvider {
     }
 }
 
+/// SPEC-4.4.1: GitHub's default webhook content type form-encodes the JSON body; this decodes it back to raw JSON bytes after signature verification (never before, since the signature covers the raw body).
 /// A GitHub webhook created with GitHub's default Content type delivers its
 /// body as `payload=<url-encoded JSON>` instead of raw JSON. Returns the JSON
 /// bytes to parse: the decoded `payload` form field when `provider` is
@@ -383,6 +388,7 @@ impl std::fmt::Display for WebhookProvider {
     }
 }
 
+/// SPEC-4.4.4: the subset of a Forgejo/GitHub `pull_request` delivery this listener consumes; only a terminal `closed` action is acted on.
 /// The subset of Forgejo's `pull_request` webhook payload the
 /// merge-close path consumes. Extra fields are ignored (no
 /// `deny_unknown_fields`), matching [`ActionPayload`]'s tolerance of a Forgejo
@@ -414,6 +420,7 @@ pub struct PullRequestHead {
     pub sha: String,
 }
 
+/// SPEC-4.4.4: the typed event [`handle_pull_request_delivery`] emits downstream for a verified, allow-listed, terminal pull-request delivery.
 /// The typed event emitted downstream for a verified, allow-listed, terminal
 /// (`closed`) pull-request delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +436,7 @@ pub struct VerifiedPullRequestEvent {
     pub source: String,
 }
 
+/// SPEC-4.4.1: the subset of a Forgejo Action-run delivery this listener consumes; only `action == "failure"` is kept, by [`VerifiedFailureEvent::status`]'s stricter rule.
 /// Subset of the Forgejo Action-run webhook payload we consume. Extra fields in
 /// the delivery are ignored (no `deny_unknown_fields`) so a Forgejo upgrade that
 /// adds keys does not break ingestion.
@@ -478,6 +486,7 @@ impl TryFrom<ActionUserRaw> for ActionUser {
     }
 }
 
+/// SPEC-4.4.1: the delivery's repository, keyed by `full_name` against the source's allow-list; `private` travels onto the mint as context only.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Repository {
     /// `owner/repo`, matched against the configured allow-list.
@@ -490,6 +499,7 @@ pub struct Repository {
     pub private: bool,
 }
 
+/// SPEC-4.4.1: the subset of a GitHub `workflow_run` delivery this listener consumes, mapped by [`github_workflow_run_to_action_payload`] onto the same shape a Forgejo delivery produces.
 /// Subset of GitHub's `workflow_run` webhook payload we consume
 /// (`Webhook events and payloads / workflow_run`, docs.github.com). Extra
 /// fields are ignored, matching [`ActionPayload`]'s tolerance of upstream
@@ -536,6 +546,7 @@ pub struct GithubActor {
 /// [`VerifiedFailureEvent::status`]'s doc comment).
 const GITHUB_CONCLUSION_SUCCESS: &str = "success";
 
+/// SPEC-4.4.1: maps a completed GitHub `workflow_run` delivery onto the Forgejo-shaped [`ActionPayload`] so one dispatch path (SPEC-4.4.2 onward) serves both forges.
 /// Map a completed GitHub `workflow_run` delivery onto the same
 /// [`ActionPayload`] shape [`verified_failure_event`] and
 /// [`handle_action_success`] already consume, so neither needs a
@@ -584,6 +595,7 @@ fn github_workflow_run_to_action_payload(
     })
 }
 
+/// SPEC-4.4.1: the typed event emitted downstream for a verified, allow-listed failure; carries exactly what SPEC-4.4.2's triage/mint dispatch needs.
 /// The typed event emitted downstream for a verified, allow-listed failure.
 /// Carries exactly the fields the next stage (log fetch / triage) needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -610,6 +622,7 @@ pub struct VerifiedFailureEvent {
     pub source: String,
 }
 
+/// SPEC-4.4.4: the typed event emitted downstream for a verified, allow-listed `success`/`recover` Action-run delivery, consumed by SPEC-4.4.4's `process_action_success_event`.
 /// The typed event emitted downstream for a verified, allow-listed
 /// `success` or `recover` Action-run delivery - an agent PR's checks may have
 /// just gone green. Deliberately thin: which PR (if any) this run belongs to,
@@ -634,6 +647,7 @@ pub struct VerifiedActionSuccessEvent {
 /// full 60s retry budget); both finish in ~0s with no fetch, triage, or mint.
 pub const RUN_STATUS_FAILURE: &str = "failure";
 
+/// SPEC-4.4.1: per-request state injected into the webhook handler: the live config, the shared replay store, one rate limiter per source, and the optional readiness/PR-event/success-event channels a non-daemon caller leaves unset.
 /// State injected into the webhook handler. Cheap to clone (`DbPool` and
 /// `Sender` are `Arc`-shaped; the config and the rate-limiter map are
 /// `Arc`-wrapped). One [`RateLimiter`] per source (built once at
@@ -668,6 +682,7 @@ pub struct WebhookState {
     success_events: Option<mpsc::Sender<VerifiedActionSuccessEvent>>,
 }
 
+/// SPEC-4.4.1: builds one fixed-window rate limiter per source (point 1 of SPEC-4.4's pipeline), so one source's storm never starves another's bucket.
 /// Build one fixed-window rate limiter per source, so exhausting
 /// one source's budget never 429s another. Shared by [`WebhookState`] startup and
 /// the live-apply rebuild in [`crate::settings::LiveSettings`], keeping the
@@ -681,6 +696,7 @@ pub fn build_rate_map(config: &WebhookConfig) -> HashMap<String, Mutex<RateLimit
     )
 }
 
+/// SPEC-4.4.1: the source-name-to-limiter build itself, shared with the comment listener's own source map.
 /// The source-name-to-limiter build itself, over any `(name, limit)`
 /// pairs. The comment listener ([`super::comment_webhooks`]) has its own source
 /// map with the same per-source bucket semantics, so it shares this builder (and
@@ -775,6 +791,7 @@ impl WebhookState {
     }
 }
 
+/// SPEC-4.4.1: the triage webhook's route, `POST /webhooks/{provider}/triage/{source}` (SPEC-4.4's path table).
 /// Router carrying the per-source webhook route, merged into the daemon's TCP
 /// app. `{provider}` names the sending forge ([`WebhookProvider`]); `{source}`
 /// is an axum path param resolved against the configured sources map.
@@ -787,6 +804,7 @@ pub fn router(state: WebhookState) -> Router {
         .with_state(state)
 }
 
+/// SPEC-4.4.2: everything the triage-and-mint dispatch (SPEC-4.4.2) and PR-comment routing (SPEC-4.4.3) need: the resolved provider backend, mint config, caps, route cache, and optional automerge conflict dispatch handle.
 /// Everything [`consume_events`] needs to triage a verified failure and mint
 /// (or decline to mint) a YouTrack issue from it. Built once at daemon start
 /// from the resolved provider backend (`IssueTracker` + `Forge`), the
@@ -835,6 +853,7 @@ pub struct MintContext {
     pub comment_dispatch: Option<CommentDispatch>,
 }
 
+/// SPEC-4.4.3: the automerge conflict auto-resolve dispatch handle on [`MintContext`], used to send a synthetic `/claude`-equivalent command to the comment listener on an `update_pr_branch` failure.
 /// See [`MintContext::comment_dispatch`].
 #[derive(Clone)]
 pub struct CommentDispatch {
@@ -842,6 +861,7 @@ pub struct CommentDispatch {
     pub cfg: Arc<RwLock<crate::config::CommentWebhookConfig>>,
 }
 
+/// SPEC-4.4.2: drains verified-failure events, bounding concurrent analyses to `webhook.analysis_concurrency` (default 2) so a burst of failures does not run one 600s analysis per event at once.
 /// Drain emitted events. For each verified failure this fetches the run's logs
 /// through `fj actions logs`, redacts secrets, and writes a redacted artifact;
 /// then, when a [`MintContext`] is configured, triages
@@ -909,6 +929,7 @@ pub async fn consume_events(
     }
 }
 
+/// SPEC-4.4.2: one verified failure's whole pipeline: fetch and redact the run's log, then (SPEC-4.4.2 onward) triage and mint, skipping entirely for a non-`failure` status or an all-stopped job set.
 /// One verified failure's whole pipeline: fetch the run's logs, redact, and
 /// (when a [`MintContext`] is configured) triage and mint. Spawned as its own task by
 /// [`consume_events`]'s worker pool so a slow analysis for one event never
@@ -1249,6 +1270,7 @@ pub const STAGE_TRIAGING: &str = "triaging";
 pub const STAGE_CLASSIFYING: &str = "classifying with claude";
 pub const STAGE_MINTING: &str = "minting issue";
 
+/// SPEC-4.4.2: decrypts a webhook source's `log_token_ref` to authorize the `fj actions logs` read of a private repo's run.
 /// Decrypt the named log token from the secrets store (same age-key
 /// mechanism as the HMAC refs).
 async fn resolve_log_token(pool: &DbPool, name: &str) -> crate::error::Result<String> {
@@ -1259,6 +1281,7 @@ async fn resolve_log_token(pool: &DbPool, name: &str) -> crate::error::Result<St
     Ok(token.trim().to_string())
 }
 
+/// SPEC-4.4.2: resolves a source's configured `log_token_ref`, or `None` when unset or unresolvable (a public repo's run reads without one).
 /// The source's `log_token_ref` decrypted, or `None` when the
 /// source has no token configured or it cannot be resolved. Authorizes the
 /// `fj actions logs` read; a public repo's run reads without one.
@@ -1280,7 +1303,7 @@ async fn source_log_token(
     }
 }
 
-/// Open the `runs` row for one webhook event and stamp its
+/// SPEC-4.4.1: shared primitive opening the `runs` row for one webhook event and stamping its
 /// single planned job key. Also registers the job in-flight (so the
 /// run-detail badge reads `running`, not `queued`, for the whole pipeline) and
 /// sets the initial stage. Stores the event's `html_url` as the
@@ -1331,6 +1354,7 @@ pub(crate) async fn begin_webhook_run(
     }
 }
 
+/// SPEC-4.4.2: closes a webhook run's `job_outcomes` row and finalizes its `RunGuard`; `attempt_counted = false` since the caps ledger is advanced separately inside the triage/mint dispatch.
 /// Close a webhook run. Writes one `job_outcomes` row
 /// carrying the human-readable `summary` (triage bucket + mint result, plus the
 /// redacted-log artifact path when present) and finalizes the run through its
@@ -1478,6 +1502,7 @@ fn store_outcome_summary(outcome: &StoreOutcome) -> String {
     }
 }
 
+/// SPEC-4.4.2: the `ci_failure` store lookup that runs BEFORE triage: an `open` match attaches with no `claude` call, a `resolved` match reopens and re-triages, and a miss (`none`/`pr_only`) falls through to classification, after one legacy-adoption lookup.
 /// Fingerprint the log and look it up in the `ci_failure` store
 /// BEFORE triage. A store read failure fails the run rather than falling
 /// through to a mint, which would recreate the duplicate this issue removes.
@@ -1738,6 +1763,7 @@ fn attach_comment_body(ev: &VerifiedFailureEvent, branch: &str, test_ids: &[Stri
     )
 }
 
+/// SPEC-4.4.2: reads an issue's live YouTrack `State` to tell an `open` store row that the resolve-on-merge workflow already closed from one still genuinely open; a read failure is never read as "still open".
 /// Read `key`'s live YouTrack `State` and report whether it
 /// already equals `resolved_state` (case-insensitive). The store's own
 /// `open`/`resolved` column no longer changes on merge (the runner writes no
@@ -1762,6 +1788,7 @@ async fn issue_state_is_resolved(
     }
 }
 
+/// SPEC-4.4.2: attach a new sighting to an already-open `ci_failures` row: no triage, no mint, just a comment naming the overlap.
 /// Attach `ev` to the already-tracked, still-`open` failure `m`
 /// matched. No triage, no mint, no `claude` call: the failure is already
 /// filed and this run is just another sighting of it.
@@ -1834,6 +1861,7 @@ fn regression_comment_body(ev: &VerifiedFailureEvent, branch: &str, test_ids: &[
     )
 }
 
+/// SPEC-4.4.2: reopen a resolved `ci_failures` row on a regression: set state back, comment the regression, then triage again for the analysis comment and `AI Agent` write exactly as a fresh mint would.
 /// Reopen the resolved failure `m` matched: `set_state` back to
 /// `target_state`, comment the regression, mark the store row `open` and
 /// attach this run, then triage (for the analysis comment) and set `AI Agent`
@@ -1950,6 +1978,7 @@ async fn reopen_resolved_failure(
     WebhookRunSummary::store_decided(&StoreOutcome::Reopened { key })
 }
 
+/// SPEC-4.4.2: record a brand-new `ci_failures` row (fresh mint or legacy adoption) plus its tests and run.
 /// Record a brand-new `ci_failures` row for `issue_key` (either
 /// freshly minted, or a legacy issue this delivery adopted), and the tests /
 /// run this delivery already carries.
@@ -1988,6 +2017,7 @@ async fn record_new_store_row(
     Ok(())
 }
 
+/// SPEC-4.4.2: best-effort `run_events` row for a triage/mint-path failure outside the ordinary per-job accounting.
 /// Best-effort record a `run_events` row for something that went
 /// wrong outside the ordinary per-job accounting (an open-PR lookup failure, a
 /// missing `write_token_ref`): attaches to the run when one exists, else a
@@ -2014,6 +2044,7 @@ async fn record_run_event(
     }
 }
 
+/// SPEC-4.4.3: matches an open PR's head commit against the failing commit, tolerant of a short/long SHA prefix relationship.
 /// True when some open PR's head commit matches `commit_sha`, and the PR
 /// itself (tolerant of a short / long SHA mismatch, accepting a prefix
 /// relationship in either direction).
@@ -2029,6 +2060,7 @@ fn pr_matching_commit<'a>(
     })
 }
 
+/// SPEC-4.4.3: finds the open PR (if any) whose head matches the failing commit, for the agent-PR/human-PR routing decision; unlike the triage-context lookup, a forge error here is never folded into "no PR".
 /// Find the open PR (if any) whose head matches the failing
 /// commit. Replaces the old `resolve_has_open_pr` for the routing
 /// decision: that helper degraded a forge error or an underivable host to
@@ -2052,6 +2084,7 @@ fn resolve_open_pr(
     Ok(pr_matching_commit(&prs, &ev.commit_sha).cloned())
 }
 
+/// SPEC-4.4.3: the `Forge` a failing run's own open-PR lookup goes through: GitHub for a `github.com` URL, the configured mint backend otherwise.
 /// The [`Forge`] a failing run's own open-PR lookups go through:
 /// [`GithubForge`] for a `github.com` `html_url` (the same `github.com`-only
 /// default [`resolve_forge`]'s other callers use - no action is known yet at
@@ -3148,6 +3181,7 @@ async fn route_new_pr_only_failure(
     }
 }
 
+/// SPEC-4.4.2: the classify + mint path for a failure the store does not yet track, or that is `pr_only` (owned here as `none`); records a `Created` or legacy-adopted outcome into the store so the next sighting matches.
 /// The classify + mint path for a failure the `ci_failure` store
 /// does not yet track (`none`) or that is on an open PR (`pr_only`, treated as
 /// `none` here; the PR-routing issue owns that case). One legacy adoption
@@ -3328,6 +3362,7 @@ async fn classify_and_mint(
     }
 }
 
+/// SPEC-4.4.2: one legacy-adoption lookup (an issue minted before the `ci_failure` store existed), then the ordinary triage + mint pipeline on a miss.
 /// One legacy adoption lookup, then the ordinary triage + mint
 /// pipeline. Factored out from [`classify_and_mint`] so the blocking work (the
 /// legacy search, triage, and mint all shell out) stays inside one
@@ -3390,6 +3425,7 @@ fn decide_with_legacy_adoption(
     Ok(DecideOutcome::Mint(bucket, outcome))
 }
 
+/// SPEC-4.4.2: pure triage + mint composition over the classifier/tracker traits, with `has_open_pr` already resolved; issues no dedupe search itself, since the caller already decided against the store.
 /// Pure triage + mint composition over the two traits, with `has_open_pr`
 /// already resolved. Factored out so the bucket routing is unit tested against
 /// a stub classifier / tracker with no forge, DB, or process spawn. Builds the
@@ -3504,6 +3540,7 @@ impl FailureClassifier for ReportingClassifier<'_> {
     }
 }
 
+/// SPEC-4.4.2: advisory-only open-PR check for the triage classifier's context; unlike [`resolve_open_pr`], a lookup failure or underivable host degrades to `false` rather than erroring, since it is read as context, not a routing decision.
 /// Best-effort `has_open_pr` signal for the triage classifier: list the repo's
 /// open PRs and check whether the failing commit is the head of one. A forge
 /// error or an underivable host degrades to `false` (treated as "no PR"), never
@@ -3522,6 +3559,7 @@ fn resolve_has_open_pr(forge: &dyn Forge, ev: &VerifiedFailureEvent) -> bool {
     }
 }
 
+/// SPEC-4.4.2/4.4.3: shared commit-match predicate for an open PR's head, tolerant of a short/long SHA prefix relationship.
 /// True when some open PR's head commit matches `commit_sha`. Tolerates short /
 /// long SHA mismatches by accepting a prefix relationship in either direction.
 fn pr_matches_commit(prs: &[ForgePullRequest], commit_sha: &str) -> bool {
@@ -3533,6 +3571,7 @@ fn pr_matches_commit(prs: &[ForgePullRequest], commit_sha: &str) -> bool {
     })
 }
 
+/// SPEC-4.4.2: derives the forge host from a delivery's `html_url`, used wherever the pipeline needs a host with no action yet resolved.
 /// Authority (`host[:port]`) of a forge `html_url`, the bare host the `fj`
 /// forge backend addresses repos by (e.g. `dev.a8n.run`). `None` when the URL
 /// has no host segment.
@@ -3542,6 +3581,7 @@ fn forge_host_from_url(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
+/// SPEC-4.4.2: structured log line for a mint decision, emitted on every classify-and-mint outcome.
 /// Structured log line for one mint decision, one branch per [`MintOutcome`].
 fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
     match outcome {
@@ -3565,6 +3605,7 @@ fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
     }
 }
 
+/// SPEC-4.4.1: the `forgejo_webhook` axum handler implementing SPEC-4.4's full numbered pipeline (points 0-6): provider/source resolution and 404s, rate limit, HMAC secret resolution, signature verification, delivery-id replay protection, event-type dispatch to the failure (SPEC-4.4.2/4.4.3), pull-request (SPEC-4.4.4) or action-success (SPEC-4.4.4) paths, and the accept/drop response codes.
 async fn forgejo_webhook(
     State(st): State<WebhookState>,
     Path((provider, source)): Path<(String, String)>,
@@ -3840,6 +3881,7 @@ async fn forgejo_webhook(
     }
 }
 
+/// SPEC-4.4.4: dispatches a verified `success`/`recover` Action-run delivery onto the success-events channel, acking and dropping with a log when none is configured.
 /// Parse and route an authenticated, de-duplicated `success` or
 /// `recover` Action-run delivery: an agent PR's checks may have just gone
 /// green. Repo-allow-listed only; which PR (if any) this belongs to, and
@@ -3885,6 +3927,7 @@ async fn handle_action_success(
     StatusCode::ACCEPTED.into_response()
 }
 
+/// SPEC-4.4.4: dispatches a verified terminal pull-request delivery onto the PR-events channel, acking and dropping with a log when none is configured.
 /// Parse and route an authenticated, de-duplicated `pull_request`
 /// delivery. Only a terminal `closed` action does anything; every other
 /// action (`opened`, `edited`, `synchronized`, ...) and a repo outside the
@@ -3959,6 +4002,7 @@ async fn handle_pull_request_delivery(
     StatusCode::ACCEPTED.into_response()
 }
 
+/// SPEC-4.4.4: drains verified pull-request events, closing an `agent_pull_requests` row on merge or on an unmerged close.
 /// Drain verified `pull_request` deliveries for the lifetime of
 /// the daemon, mirroring [`consume_events`]'s shape. `mint` carries the
 /// backend + store access every close/left-open/mark-merged decision needs;
@@ -3988,6 +4032,7 @@ pub async fn consume_pr_events(
     }
 }
 
+/// SPEC-4.4.4: routes one verified pull-request event to the merged or closed-unmerged path by `merged`.
 /// One merged-or-closed PR's whole handling: mark its
 /// `agent_pull_requests` row (merged / closed), and on a merge, close or leave
 /// open every open store failure the PR references.
@@ -4040,6 +4085,7 @@ async fn process_pr_event(
     finish_webhook_run(&pool, run, &job_key, &summary, ok, None, None).await;
 }
 
+/// SPEC-4.4.4: an agent PR closed without merging: records the outcome so it stops counting toward open-PR routing.
 /// A PR closed WITHOUT merging. The only action is marking the
 /// agent's own PR record `closed` when one exists; a human's PR (no record)
 /// changes nothing.
@@ -4067,6 +4113,7 @@ async fn handle_closed_unmerged_pr(
     ))
 }
 
+/// SPEC-4.4.4: an agent PR merged: records the outcome and lets the YouTrack resolve-on-merge workflow own the issue state (the runner writes no `State` itself).
 /// A merged PR. Marks the agent's own PR record
 /// `merged` when one exists; makes no tracker call and no forge run-list
 /// call. A YouTrack workflow (`docs/yt-workflow-resolve-on-pr-merge.js`)
@@ -4097,6 +4144,7 @@ async fn handle_merged_pr(
     ))
 }
 
+/// SPEC-4.4.4: drains verified action-success events, resolving each to its agent PR (if any) and re-checking automerge eligibility.
 /// Drain verified `success`/`recover` Action-run deliveries for the
 /// lifetime of the daemon, mirroring [`consume_pr_events`]'s shape. `mint`
 /// carries the backend every routing decision needs; `None` (no usable
@@ -4126,6 +4174,7 @@ pub async fn consume_action_success_events(
     }
 }
 
+/// SPEC-4.4.4: one verified success/recover event's whole pipeline: resolve the PR it belongs to (if any) and re-evaluate automerge now that a check just went green.
 /// One success event's whole handling. Finds the open PR matching
 /// the run's commit, looks it up in `agent_pull_requests`, and (only when it
 /// is a recorded, still-open agent PR whose action has automerge enabled)
@@ -4230,6 +4279,7 @@ async fn process_action_success_event(
     finish_webhook_run(&pool, run, &job_key, &summary, ok, None, None).await;
 }
 
+/// SPEC-4.4.4: on a repository-level fault (e.g. an unreachable forge), notifies every open agent PR tracked for that repo rather than failing silently per-event.
 /// A fault that happened before the failing commit could be
 /// matched to a specific PR (host derivation, `list_open_prs`) still concerns
 /// this repo, and any currently-open, automerge-enabled agent PR recorded for
@@ -4308,6 +4358,7 @@ async fn notify_agent_prs_of_repo_fault(
     }
 }
 
+/// SPEC-4.4.4: builds the web URL for an agent PR, honoring configured GitHub Enterprise hosts alongside github.com.
 /// Build a PR's web URL from its recorded host/repo/number, without an extra
 /// forge call: every caller already has these three fields from the
 /// `agent_pull_requests` row. `extra_github_hosts` is the configured GitHub
@@ -4318,6 +4369,7 @@ fn agent_pr_url(host: &str, repo: &str, pr_number: i64, extra_github_hosts: &[St
     provider::pr_web_url(host, repo, pr_number, extra_github_hosts)
 }
 
+/// SPEC-4.4.4: re-evaluates automerge for one agent PR after a success event, dispatching to SPEC-4.4.3's automerge decision.
 /// The per-PR decision once a success event's PR is known. Looks
 /// up the `agent_pull_requests` row and, once found and open, delegates the
 /// rest of the decision to [`apply_automerge_decision`] - the same function
@@ -4360,6 +4412,7 @@ async fn handle_action_success_for_pr(
         .map(AutomergeOutcome::into_summary)
 }
 
+/// SPEC-4.4.3: resolves the `Forge` backend for a given host, GitHub for github.com/configured GHE hosts, the mint backend otherwise.
 /// Route a forge operation through [`GithubForge`] when `host` is
 /// a GitHub host, mirroring the per-job dispatch at
 /// `src/native/youtrack.rs:421-435`; every other host reuses `mint.backend`
@@ -4406,6 +4459,7 @@ struct AutomergePr<'a> {
     issue_key: &'a str,
 }
 
+/// SPEC-4.4.3: records an automerge outcome and posts its comment exactly once, guarding against the same decision being posted twice for one PR.
 async fn record_automerge_outcome_and_comment_once(
     mint: &MintContext,
     pool: &DbPool,
@@ -4437,6 +4491,7 @@ async fn record_automerge_outcome_and_comment_once(
     }
 }
 
+/// SPEC-4.4.3: deterministic synthetic comment id for a conflict auto-resolve dispatch, used to dedupe the dispatch itself.
 /// `hash(repo, pr_number, head_sha)`, forced negative so it never collides
 /// with a real (positive) Forgejo comment id in the dedupe / attempt key
 /// [`crate::web::comment_webhooks::command_key`] both routes share. Clearing
@@ -4458,6 +4513,7 @@ fn synthetic_conflict_comment_id(repo: &str, pr_number: u64, head_sha: &str) -> 
     -(1 + magnitude)
 }
 
+/// SPEC-4.4.3: on an automerge conflict (`update_pr_branch` failure), dispatches a synthetic `/claude`-equivalent command to the comment listener instead of leaving a "needs a human" comment, when a [`MintContext::comment_dispatch`] handle is configured.
 /// On a conflict `update_pr_branch` failure, dispatch the same
 /// conflict-resolution run a human's `/claude merge from main and resolve any
 /// merge conflicts` PR comment would start (CLAUDE-380), at most once per
@@ -4600,6 +4656,7 @@ impl AutomergeOutcome {
     }
 }
 
+/// SPEC-4.4.3: the automerge decision for one agent PR: conflict auto-resolve, a behind-base update/merge, or a clean merge, each with its own comment.
 /// The shared decision body both [`handle_action_success_for_pr`]
 /// (the webhook's low-latency trigger) and [`reconcile_automerge`] (the
 /// tick-driven backstop for a missed webhook) call once a recorded, open
@@ -4972,6 +5029,7 @@ async fn apply_automerge_decision(
     }
 }
 
+/// SPEC-4.4.3: marks an agent PR merged in the `agent_pull_requests` store once automerge lands it.
 /// Record a recorded agent PR as merged so neither the webhook nor
 /// the reconciler walks it again. A store failure is logged at `error`, written
 /// as a `run_events` row, and returned: an unrecorded merge would be re-walked
@@ -4993,7 +5051,8 @@ async fn mark_agent_pr_merged(
     }
 }
 
-/// The reconciler backstop for a missed, dropped, or too-early
+/// SPEC-3.3.1: the 300-second reconciler that "drive[s] the decision for recorded agent PRs"
+/// alongside action-success webhooks, backstopping a missed, dropped, or too-early
 /// Action Run success webhook. Runs on its own tick (`daemon::automerge_reconciler_loop`),
 /// independent of any webhook delivery: lists every `agent_pull_requests` row
 /// still `open` and, for each, calls the exact same [`apply_automerge_decision`]
@@ -5116,6 +5175,7 @@ pub(crate) async fn reconcile_automerge(
     }
 }
 
+/// SPEC-4.4.3: lists the open PR numbers tracked for automerge re-evaluation on a repo.
 /// The numbers of the PRs the forge lists as open for `repo`, or
 /// `None` when the listing failed (logged at `error` and written to
 /// `run_events`), so the caller leaves that repo's rows alone rather than
@@ -5152,6 +5212,7 @@ async fn list_open_pr_numbers(
     None
 }
 
+/// SPEC-4.4.3: posts an issue comment through the resolved forge backend, as part of an automerge or routing decision.
 /// Post a best-effort issue comment on an automerge decision path. A
 /// failed comment (write error, or the blocking task itself panicking) logs at
 /// `error` naming the issue and the cause; it never replaces the caller's own
@@ -5184,6 +5245,7 @@ async fn post_issue_comment(
     }
 }
 
+/// SPEC-4.4.3: posts the push-comment this run's branch write requires (CLAUDE-447), naming the event, issue, state and SHA range.
 /// Post the CLAUDE-447 `branch updated from base` PR comment after
 /// [`Forge::update_pr_branch`] succeeds. This is a server-side forge
 /// operation with no local clone to run `git log` against, so the new SHA
@@ -5231,6 +5293,7 @@ async fn post_branch_updated_push_comment(
     .unwrap_or_else(|e| Some(format!("push comment task panicked: {e}")))
 }
 
+/// SPEC-4.4.1: resolves a webhook source's HMAC secret from the secrets store (SPEC-4.4 point 2); missing or unresolvable fails closed.
 /// Resolve a source's configured webhook secret to plaintext, loading the age key
 /// from `CLAUDE_RUN_SECRETS_KEY_FILE`. Errors when the source has no `secret_ref`
 /// or the secret cannot be decrypted.
@@ -5242,6 +5305,7 @@ async fn resolve_secret(st: &WebhookState, src: &WebhookSource) -> crate::error:
     secrets::resolve_secret(&st.pool, &key, name).await
 }
 
+/// SPEC-4.4.1: Forgejo's bare hex HMAC-SHA256 signature check (SPEC-4.4 point 3), constant-time.
 /// Constant-time HMAC-SHA256 verification of `body` against the hex-encoded
 /// `signature` under `secret`. Returns false on any decode/key/length error so
 /// malformed input is indistinguishable from a bad signature.
@@ -5266,6 +5330,7 @@ pub(crate) fn repo_allowed(allowed: &[String], repo: &str) -> bool {
     crate::config::repo_matches(allowed, repo)
 }
 
+/// SPEC-4.4.1: builds a [`VerifiedFailureEvent`] from a parsed, allow-listed [`ActionPayload`] (SPEC-4.4 point 5).
 /// Build a [`VerifiedFailureEvent`] when the payload is an `action_run_failure`
 /// for an allow-listed repo; `None` otherwise (caller acks and drops).
 pub fn verified_failure_event(
@@ -5293,6 +5358,7 @@ pub fn verified_failure_event(
     })
 }
 
+/// SPEC-4.4.1: the shared replay store (SPEC-4.4 point 4), one instance across both webhook listeners so a delivery id fanned out to both is still caught.
 /// Time-bounded set of delivery ids for replay protection. Entries older than
 /// the window are evicted lazily on each check, so the map stays bounded by the
 /// delivery rate within one window.
@@ -5322,6 +5388,7 @@ impl SeenDeliveries {
     }
 }
 
+/// SPEC-4.4.1: the fixed-window per-source rate limiter (SPEC-4.4 point 1).
 /// Fixed-window rate limiter: at most `max` allowances per `window`.
 pub struct RateLimiter {
     max: u32,
@@ -6499,6 +6566,10 @@ mod tests {
     /// concurrency rather than inferring it from timing.
     struct SlowClassifier {
         delay: Duration,
+        /// Hold each call until this many overlap, so a test of overlap does not
+        /// depend on the second call starting within `delay` (CLAUDE-507). A
+        /// deadline keeps a real failure a failed assertion, not a hang.
+        hold_for_peak: usize,
         live: std::sync::atomic::AtomicUsize,
         peak: std::sync::atomic::AtomicUsize,
         calls: std::sync::atomic::AtomicUsize,
@@ -6508,6 +6579,7 @@ mod tests {
         fn new(delay: Duration) -> Self {
             Self {
                 delay,
+                hold_for_peak: 0,
                 live: std::sync::atomic::AtomicUsize::new(0),
                 peak: std::sync::atomic::AtomicUsize::new(0),
                 calls: std::sync::atomic::AtomicUsize::new(0),
@@ -6531,6 +6603,12 @@ mod tests {
             self.calls.fetch_add(1, SeqCst);
             let now = self.live.fetch_add(1, SeqCst) + 1;
             self.peak.fetch_max(now, SeqCst);
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            while self.peak.load(SeqCst) < self.hold_for_peak
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             std::thread::sleep(self.delay);
             self.live.fetch_sub(1, SeqCst);
             Ok(Triage {
@@ -6549,7 +6627,10 @@ mod tests {
     async fn run_two_distinct_jobs_at_concurrency(analysis_concurrency: usize) -> usize {
         let pool = crate::db::test_pool().await;
         let backend = Arc::new(StoreBackend::new());
-        let slow = Arc::new(SlowClassifier::new(Duration::from_millis(150)));
+        let slow = Arc::new(SlowClassifier {
+            hold_for_peak: analysis_concurrency,
+            ..SlowClassifier::new(Duration::from_millis(150))
+        });
         let classifier: Arc<dyn FailureClassifier> = slow.clone();
 
         let mut logs = HashMap::new();
@@ -8244,8 +8325,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        // Wait on the outcome, not a short budget (CLAUDE-507).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut ended: Option<String> = None;
-        for _ in 0..200 {
+        while std::time::Instant::now() < deadline {
             ended = sqlx::query_scalar(sqlx::AssertSqlSafe(
                 crate::db::q(&pool, "SELECT ended_at FROM runs WHERE id = ?").into_owned(),
             ))
@@ -8348,8 +8431,11 @@ mod tests {
             .unwrap();
         drop(parked);
 
+        // Wait on the outcome, not a short budget: on a busy runner the retry can
+        // take far longer than it does locally (CLAUDE-507).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut ended: Option<String> = None;
-        for _ in 0..200 {
+        while std::time::Instant::now() < deadline {
             ended = sqlx::query_scalar(sqlx::AssertSqlSafe(
                 crate::db::q(&pool, "SELECT ended_at FROM runs WHERE id = ?").into_owned(),
             ))

@@ -1,4 +1,5 @@
-//! Shared reporting aggregations over historical state.
+//! Implements SPEC-4.3.13. Shared reporting aggregations over historical
+//! state.
 //!
 //! Both the JSON API (`/api/report/*`, [`crate::api`]) and the `/reports` HTML
 //! page ([`crate::web`]) render these series, so the SQL lives here once rather
@@ -26,7 +27,7 @@ use serde::Serialize;
 
 use crate::error::Result;
 
-/// Selectable reporting window. Bounds every query by date / `ts`.
+/// SPEC-4.3.13: selectable reporting window. Bounds every query by date / `ts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Range {
     Last30Days,
@@ -35,8 +36,9 @@ pub enum Range {
 }
 
 impl Range {
-    /// Parse the `range` query param. Anything but `30d` / `90d` (including an
-    /// absent value) defaults to all-time, per the issue decision.
+    /// SPEC-4.3.13: "query `range` (`30d`, `90d`, other values mean all
+    /// time)." Anything but `30d` / `90d` (including an absent value)
+    /// defaults to all-time.
     pub fn from_param(s: &str) -> Range {
         match s {
             "30d" => Range::Last30Days,
@@ -80,11 +82,11 @@ fn ts_cutoff(range: Range) -> Option<String> {
         .map(|d| (Utc::now() - Duration::days(d)).to_rfc3339())
 }
 
-/// Convert a stored UTC RFC3339 timestamp into a `(weekday, hour)` pair in the
-/// supplied timezone, where `weekday` is `0 = Sunday .. 6 = Saturday` and `hour`
-/// is `0..=23`. Returns `None` if the timestamp fails to parse. Generic over the
-/// timezone so tests can force a known offset; production passes
-/// [`chrono::Local`].
+/// SPEC-4.3.13: "All weekday / hour bucketing converts the stored UTC
+/// timestamp to the daemon's local timezone before extracting the weekday /
+/// hour." `weekday` is `0 = Sunday .. 6 = Saturday`, `hour` is `0..=23`.
+/// Returns `None` if the timestamp fails to parse. Generic over the timezone
+/// so tests can force a known offset; production passes [`chrono::Local`].
 pub fn weekday_hour_in<Tz: TimeZone>(ts: &str, tz: &Tz) -> Option<(u32, u32)> {
     let dt = DateTime::parse_from_rfc3339(ts).ok()?;
     let local = dt.with_timezone(tz);
@@ -110,7 +112,7 @@ fn weekday_label(idx: u32) -> &'static str {
 
 // ---- output series --------------------------------------------------------
 
-/// Top-line totals over the window.
+/// SPEC-4.3.13: top-line totals over the window.
 #[derive(Debug, Default, Serialize)]
 pub struct Summary {
     pub range: String,
@@ -160,7 +162,7 @@ pub struct HourBucket {
     pub run_starts: i64,
 }
 
-/// One `claude_invocations` row, oldest-to-newest, for the plan
+/// SPEC-4.3.13: one `claude_invocations` row, oldest-to-newest, for the plan
 /// usage chart. `five_hour_utilization` / `seven_day_utilization` are `None`
 /// when the invocation's stream log had no `rate_limit_event` at all (an old
 /// CLI, or a session that made no API call reporting one): those points are
@@ -200,9 +202,9 @@ pub struct RecentInvocation {
     pub api_retries: u64,
 }
 
-/// The whole "Claude plan usage" report section: the chart series plus the
-/// most-recent-invocations table, both honoring the same `range`/`action`
-/// filters as the rest of `/reports`.
+/// SPEC-4.3.13: the whole "Claude plan usage" report section: the chart
+/// series plus the most-recent-invocations table, both honoring the same
+/// `range`/`action` filters as the rest of `/reports`.
 #[derive(Debug, Default, Serialize)]
 pub struct ClaudeUsageReport {
     pub points: Vec<ClaudeUsagePoint>,
@@ -215,7 +217,8 @@ pub struct ClaudeUsageReport {
 
 // ---- aggregations ---------------------------------------------------------
 
-/// Daily spend + run-count series from `daily_ledger`, oldest to newest.
+/// SPEC-4.3.13: "`GET /report/daily`" series: daily spend + run-count from
+/// `daily_ledger` (already local-dated), oldest to newest.
 pub async fn daily(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Vec<DailyPoint>> {
     let cutoff = date_cutoff(range);
     let mut sql = String::from(
@@ -249,8 +252,9 @@ pub async fn daily(pool: &DbPool, range: Range, action: Option<&str>) -> Result<
         .collect())
 }
 
-/// Weekly (ISO-week) rollup of the daily series. Aggregated in Rust off
-/// [`daily`] rather than via SQLite date functions, which lack ISO-week support.
+/// SPEC-4.3.13: "`GET /report/weekly`" series. ISO-week rollup of [`daily`],
+/// aggregated in Rust rather than via SQLite date functions, which lack
+/// ISO-week support.
 pub async fn weekly(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Vec<WeeklyPoint>> {
     let daily = daily(pool, range, action).await?;
     let mut weeks: BTreeMap<String, (f64, i64)> = BTreeMap::new();
@@ -325,9 +329,10 @@ async fn run_span_rows(
     Ok(q.fetch_all(pool).await?)
 }
 
-/// Day-of-week aggregation (the sum of all Sundays, all Mondays, ...): spend
-/// from `job_outcomes`, run count + run minutes from `runs`, all bucketed by
-/// local weekday. Always returns 7 buckets, Sunday first, even when empty.
+/// SPEC-4.3.13: "`GET /report/by-weekday`" series: spend from `job_outcomes`,
+/// run count + run minutes from `runs`, bucketed by local weekday. Always
+/// returns 7 buckets, Sunday first, even when empty, rather than omitting an
+/// empty bucket.
 pub async fn by_weekday(
     pool: &DbPool,
     range: Range,
@@ -364,9 +369,9 @@ pub async fn by_weekday(
         .collect())
 }
 
-/// Time-of-day aggregation: spend + job activity from `job_outcomes` and run
-/// starts from `runs`, bucketed by local hour. Always returns 24 buckets,
-/// `0..=23`, even when empty.
+/// SPEC-4.3.13: "`GET /report/by-hour`" series: spend + job activity from
+/// `job_outcomes` and run starts from `runs`, bucketed by local hour. Always
+/// returns 24 buckets, `0..=23`, even when empty.
 pub async fn by_hour(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Vec<HourBucket>> {
     let mut cost = [0.0_f64; 24];
     let mut jobs = [0_i64; 24];
@@ -394,8 +399,9 @@ pub async fn by_hour(pool: &DbPool, range: Range, action: Option<&str>) -> Resul
         .collect())
 }
 
-/// Top-line totals: spend + run count from `daily_ledger`, run minutes from
-/// `runs` (the only source with both endpoints; NULL `ended_at` excluded).
+/// SPEC-4.3.13: "`GET /report/summary`" totals: spend + run count from
+/// `daily_ledger`, run minutes from `runs` (the only source with both
+/// endpoints; NULL `ended_at` excluded).
 pub async fn summary(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Summary> {
     let cutoff_date = date_cutoff(range);
     let mut sql = String::from(
@@ -433,13 +439,11 @@ pub async fn summary(pool: &DbPool, range: Range, action: Option<&str>) -> Resul
     })
 }
 
-/// The `claude_invocations` chart series plus the 20-most-recent
-/// table, both filtered by the same `range`/`action` the rest of the page
-/// uses. The chart reads every row in the window (oldest first, so the SVG
-/// draws left-to-right); the table re-queries the same window newest-first
-/// and caps at 20, rather than reversing and slicing the chart's own rows, so
-/// a huge window's chart cost is not doubled by also holding the sorted
-/// reverse.
+/// SPEC-4.3.13: the "Claude plan usage" section backing [`ClaudeUsageReport`].
+/// The chart reads every row in the window oldest first, so the SVG draws
+/// left-to-right; the table re-queries the same window newest-first and caps
+/// at 20, rather than reversing and slicing the chart's own rows, so a huge
+/// window's chart cost is not doubled by also holding the sorted reverse.
 pub async fn claude_usage(
     pool: &DbPool,
     range: Range,

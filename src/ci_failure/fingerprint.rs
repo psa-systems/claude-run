@@ -1,5 +1,7 @@
 //! Turn a redacted job log into the ids the CI-failure store matches on.
 //!
+//! Implements SPEC-3.5.2's fingerprint.
+//!
 //! Assumes cargo test output is the only format that needs per-test parsing.
 //! A repository whose CI runs something else falls back to
 //! [`crate::mint::failure_signature`], the same normalized first-diagnostic
@@ -28,7 +30,8 @@ const TARGETS_FAILED_MARKER: &str = "target failed:";
 const TARGETS_FAILED_MARKER_PLURAL: &str = "targets failed:";
 const TARGET_LINE_MARKER: &str = "--test ";
 
-/// Parse cargo test output into sorted, deduplicated `<target>::<test>` ids.
+/// SPEC-3.5.2: parse cargo test output into sorted, deduplicated
+/// `<target>::<test>` ids.
 ///
 /// The target comes from the nearest preceding `Running <path>.rs (...)` line;
 /// `Running unittests src/lib.rs (...)` gives `lib`. The test comes from
@@ -82,7 +85,7 @@ pub fn failing_tests(log: &str) -> Vec<String> {
     ids.into_iter().collect()
 }
 
-/// The full fingerprint of a job log: `["infra:<kind>"]` when
+/// SPEC-3.5.2: the full fingerprint of a job log: `["infra:<kind>"]` when
 /// [`infra_failure::detect`] recognises a host condition, else
 /// [`failing_tests`], falling back to the normalized
 /// [`mint::failure_signature`] as a single id when neither parses anything.

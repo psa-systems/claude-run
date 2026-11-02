@@ -1,5 +1,7 @@
 //! The CI-failure store.
 //!
+//! Implements SPEC-3.5.2.
+//!
 //! The CI-failure redesign dedupes failures by failing-test
 //! overlap and recognises the agent's own PRs from the runner's own records,
 //! rather than a YouTrack full-text search for a `crdedupe` marker (an
@@ -10,9 +12,10 @@
 //! failures, their runs, and the agent's own pull requests, and answer "which
 //! issue does this failure belong to".
 //!
-//! Nothing in the webhook or the `youtrack` action calls this yet: later
-//! routing work wires it in. This module is public so that
-//! not-yet-called API is not dead code.
+//! The CI-failure webhook (`src/web/webhooks.rs`) and the `youtrack` native
+//! action both call into this module on every failure delivery; it is public
+//! because [`store`] and [`fingerprint`] are also used from `src/mint.rs` and
+//! `src/triage.rs`, which live outside this module's privacy boundary.
 
 pub mod fingerprint;
 pub mod store;

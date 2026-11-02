@@ -460,13 +460,13 @@ pub fn validate_concurrency(cfg: &ConcurrencyConfig) -> std::result::Result<(), 
     Ok(())
 }
 
-/// Longest reporting range the web UI exposes, in days
+/// SPEC-3.8.4: longest reporting range the web UI exposes, in days
 /// ([`crate::report::Range::Last90Days`]). A retention window shorter than this
 /// would silently truncate the bounded reports, so a save is rejected below it.
 /// SPEC-6.3.
 pub const MIN_DB_RETENTION_DAYS: u64 = 90;
 
-/// Validate a [`DbRetentionConfig`] before it is persisted. The
+/// SPEC-3.8.4: validate a [`DbRetentionConfig`] before it is persisted. The
 /// window must stay `>=` the longest reporting range so a prune never silently
 /// truncates the 30d / 90d reports. Returns a human message on failure.
 /// SPEC-6.3.
@@ -479,10 +479,10 @@ pub fn validate_db_retention(cfg: &DbRetentionConfig) -> std::result::Result<(),
     Ok(())
 }
 
-/// Validate a [`DockerGcConfig`] before it is persisted: `volume_retention_days`
-/// must be at least 1, since Docker records no last-used time and a 0-day
-/// window would remove a volume a session created moments ago while its
-/// container was between restarts. SPEC-6.3.
+/// SPEC-3.8.5, SPEC-6.3: validate a [`DockerGcConfig`] before it is persisted:
+/// `volume_retention_days` must be at least 1, since Docker records no
+/// last-used time and a 0-day window would remove a volume a session created
+/// moments ago while its container was between restarts.
 pub fn validate_docker_gc(cfg: &DockerGcConfig) -> std::result::Result<(), String> {
     if cfg.volume_retention_days < 1 {
         return Err("volume_retention_days must be >= 1".to_string());

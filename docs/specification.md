@@ -45,8 +45,9 @@ directory and runs these concurrent tasks:
   is in flight, and the action's `concurrency.max_parallel` cap has a free slot. The scheduler does nothing while the
   daemon is globally paused or while the Claude credential is not ready. An action's own schedule (3.1) decides
   whether it is due at all: `interval` fires once that duration has elapsed since its last run's `started_at` (or
-  immediately if it has never run), `cron` fires at the next matching instant after that same timestamp, and
-  `manual` never auto-fires. The re-gather cadence itself is tracked by the scheduler's own last-fire time in
+  immediately if it has never run), `cron` fires at the next matching instant (UTC) after that same timestamp (or,
+  if it has never run, after the scheduler first saw it), and `manual` never auto-fires. A re-gather that finds no
+  work creates no run, so a due action keeps re-gathering at the cadence until one starts. The re-gather cadence itself is tracked by the scheduler's own last-fire time in
   memory, per action, not by run rows, since a re-gather that finds only already-in-flight work creates no run row.
   The "no gather in flight" check is advisory and scheduler-only: a manual trigger always gathers regardless, and a
   scheduled pickup that narrowly loses the race still gathers rather than erroring.
@@ -154,11 +155,132 @@ GitHub MCP endpoint (GitHub), `git`, `claude`, `nu` (default interpreter for scr
 Each job runs `timeout <seconds>s claude --print --verbose --output-format=stream-json --permission-mode=... --allowed-tools=... [--model] [--effort] --autocompact=... [--max-budget-usd] --disallowedTools=Monitor,ScheduleWakeup
 <prompt>` with stdin closed, in its own process group (cancellation signals the group). Environment for the child sets
 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and sets `BASH_DEFAULT_TIMEOUT_MS` / `BASH_MAX_TIMEOUT_MS` to the invocation's
-timeout. `CLAUDE_RUN_DATABASE_URL`, `CLAUDE_RUN_DATABASE_URL_FILE`, `CLAUDE_RUN_SMTP_PASSWORD` and
+timeout. For a repo workdir it also sets `CARGO_TARGET_DIR` to that repo's shared target directory (`SPEC-3.10`).
+`CLAUDE_RUN_DATABASE_URL`, `CLAUDE_RUN_DATABASE_URL_FILE`, `CLAUDE_RUN_SMTP_PASSWORD` and
 `CLAUDE_RUN_SMTP_PASSWORD_FILE` are removed from the child environment. Stdout events are timestamped into a per-attempt
 stream log under `<state dir>/logs/<action>/streams/`. Exit code 124 from `timeout` is recorded as a timed-out outcome.
 Each run appends one JSON record (tokens, estimated cost, duration, tool counts) to `<state dir>/logs/usage.jsonl`, and
 each invocation is recorded in `claude_invocations`.
+
+#### 3.2.1 Model, effort and autocompact resolution (`SPEC-3.2.1`)
+
+`--model` and `--effort` resolve action value, then the live `claude` settings section, then omission (the `claude`
+CLI's own default applies); `--autocompact` resolves the same way but falls back to a fixed window (200000 tokens)
+rather than omission, because the CLI's own `auto` scales to the model's whole context window, and on a large-context
+model a long tool-heavy session would then never compact, resending every completed tool payload on every turn so
+spend grows with the square of the tool-call count rather than linearly in it. A resolved effort level outside the
+CLI's documented set (`low`, `medium`, `high`, `xhigh`, `max`) is passed through unchanged after one warning naming the
+value and its source: the CLI itself only ignores an unknown level and falls back to its own default, so without the
+warning a typo would silently downgrade effort for every run.
+
+#### 3.2.2 Per-invocation spend ceiling (`SPEC-3.2.2`)
+
+The run's remaining budget (`limits.run_budget_usd`, see 3.1, minus what the run has already spent) is passed as
+`--max-budget-usd` on every invocation, so a single runaway session cannot overshoot the run's ceiling between the
+runner's own between-job checks; an unset remaining budget passes no flag. Each invocation's reported cost is folded
+into the run's shared ledger before any other branch can discard the result, including a cancelled invocation, so a
+cancelled run still bills what it actually spent. The ledger's ceiling is resolved once, before the run starts, and
+is immutable for the run's lifetime: no job can raise it mid-run.
+
+#### 3.2.3 Cancellation and the process group (`SPEC-3.2.3`)
+
+`claude` and the `timeout` wrapper around it run in a process group whose id equals the wrapped child's pid
+(`setpgid(0)`), so a cancellation or a timeout signals the whole tree (the wrapper, `claude`, and anything it spawned)
+at once rather than leaving a descendant orphaned. Termination is SIGTERM, then (if the group has not exited within a
+short grace window) SIGKILL. The wait for the child is a poll loop rather than a blocking `wait`, so an operator
+cancel is observed promptly without a dedicated thread per invocation.
+
+#### 3.2.4 Result-exit grace and the background-task backstop (`SPEC-3.2.4`)
+
+Once `claude`'s terminal `result` event appears in the stream log the turn is functionally done; the child gets a
+grace window (30 seconds) to exit on its own, after which the runner force-terminates the group and finalizes from
+the already-captured result rather than waiting out the job's full timeout. This is the backstop behind the
+disallowed-tools restriction below: a session is not expected to still be working once it has reported its result, so
+a result followed by a hang is treated as a leftover background task, not as more legitimate work in progress.
+
+A `claude` child always runs with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and `--disallowedTools=Monitor,ScheduleWakeup`,
+because a session run under `--print` is over the instant its turn ends: a turn that ends waiting on a background
+`Bash` task, a `Monitor`, or a `ScheduleWakeup` never resumes. As a further backstop, the stream log is scanned for a
+`system`/`task_updated` event with `patch.status: killed` that appears AFTER the terminal `result` event; a match
+means a background task outlived the session's own report of success, and the runner overrides that into a
+non-transient failure naming the task id rather than reporting it as a clean success.
+
+#### 3.2.5 Failure classification (`SPEC-3.2.5`)
+
+An invocation's outcome is one of: a normal result (`ok` from the terminal event's `is_error`), a non-transient
+failure (a nonzero exit with no authentication signal, or a terminal event present but marked an error), a transient
+failure (the terminal event's `api_error_status` or `error` names a rate limit; never a timeout), a timed-out run
+(`timeout`'s exit code 124), a killed run (exit code 137, SIGKILL, with no terminal result captured; typically an
+out-of-memory kill), or a login-required run.
+
+A run is login-required when the CLI reports a structured `authentication_failed`: either on a single event anywhere
+in the stream (checked against the nonzero-exit path), or via three or more `system`/`api_retry` events carrying that
+same structured error observed during the wait loop, which force-terminates the child well below the job's timeout
+rather than waiting it out. Detection keys only on the structured `error` field, never on human-readable text the CLI
+may reword between releases. A login-required outcome is always transient (no attempt spent) and trips the daemon's
+readiness gate (3.7) so no further Claude work starts until a fresh sign-in.
+
+#### 3.2.6 Stream-log relay and read failures (`SPEC-3.2.6`)
+
+The stream log is the only record of an invocation's events, written by a relay thread that copies the child's piped
+stdout line by line, stamping each parseable JSON event with an arrival-time `ts`; a line that fails to parse passes
+through unstamped rather than being dropped. A relay I/O failure (for example a full log partition) is carried out as
+an explicit error rather than discarded: if the terminal result was already captured before the relay died, the run
+still finalizes from it, with the truncation logged; if not, the run is reported as a transient failure naming the
+write error and the log path, so it spends no attempt rather than being blamed for an agent silence the runner itself
+produced. Reading the stream log back (to find the terminal result or the last assistant text) carries its own
+read failure out the same way: an unreadable log finalizes as a transient failure, while a log that reads fine but
+simply has no terminal `result` event is a real, non-transient claude-side outcome.
+
+#### 3.2.7 Usage, cost and rate-limit accounting (`SPEC-3.2.7`)
+
+Each invocation's stream log is replayed once to attribute tokens, tool-call counts and context growth per tool (a
+turn is attributed to the tool whose result most recently entered its context), and to capture the last-seen Claude
+plan rate-limit reading (`five_hour` / `seven_day` utilization) plus a count of `api_retry` events per reason; every
+rate-limit field stays absent rather than defaulting to zero when the CLI reported none. One `claude usage` log line
+is emitted per invocation, at `warn` instead of `info` when the plan status is not `allowed` or either window's
+utilization is at least 90%, so an operator sees a tightening limit before the next invocation is throttled outright.
+Each invocation is also persisted to `claude_invocations` (3.2's closing sentence) immediately after it returns,
+independent of the outcome, since the invocation already succeeded or failed on its own terms; a persistence failure
+is logged and never fails the job. Context growth that stays flat as the number of tool calls grows is linear
+accounting (3.2.1's fixed autocompact window doing its job); growth that rises with the tool-call count is quadratic.
+
+#### 3.2.8 Job pipeline orchestration (`SPEC-3.2.8`)
+
+A scripted job's per-job pipeline is: `filter` -> workdir creation -> `pre` steps -> `prompt` -> `claude` -> `post`
+steps -> outcome record -> guarded workdir cleanup (3.2.9). `post` runs on every path that reached the workdir,
+including a `filter`/`pre`/`prompt` failure or an operator cancel, with a synthesized `$claude_result` describing
+why `claude` did not run, so a `post` script always sees a uniform shape. A job's attempt is not counted, and its
+daily run/cost ledger does not advance, on three paths: a transient `claude` result (3.2.5), an operator cancel taken
+before or during the invocation, and a global pause (or a login-required stop) taken after the job started but
+before `claude` ran; a `post` script can additionally suppress attempt counting itself by writing
+`$workdir/.claude-run-skip-attempt` (a parked or blocked job). A job's key is its `dedup_key` field value, or a
+positional fallback when unset or absent; two jobs sharing a concurrency key (3.1) never overlap, computed by joining
+the configured key fields with a unit separator, falling back to the job's own key when none of those fields are
+present on it.
+
+#### 3.2.9 Workdir resolution and the local-only-work guard (`SPEC-3.2.9`)
+
+A job's workdir base resolves in order: the action's own `workdir_base` field, then `CLAUDE_RUN_WORKDIR_BASE`, then
+`<data dir>/workdirs`; the job's workdir is `<base>/<action name>/<job key>`. Every runner deletes a job's workdir
+through one guarded path that first checks whether it holds local-only work: a local branch tip the remote does not
+have under that same branch name (excluding a tip that merely equals the remote default branch's tip, which has no
+commits of its own), a tracked or staged modification, an untracked and non-ignored file, or a stash. Any local-only
+work, or a git or network failure while checking, preserves the workdir (after pruning gitignored build artifacts)
+rather than risking a wrong delete; only a clean check with nothing local-only found deletes it. A caller with a forge
+token in scope authenticates the one network call this check makes (`ls-remote origin`) per invocation via the
+token's own userinfo, since the clone's `origin` remote carries no embedded credential.
+
+#### 3.2.10 Snippet execution (`SPEC-3.2.10`)
+
+Each `filter` / `pre` / `prompt` / `post` step, and a native kind's own snippets, run as a separate interpreter
+process rather than in-process. For the `nu` interpreter (the default), bindings (`$job`, `$workdir`,
+`$claude_result`, ...) are each written to a sibling JSON tempfile and loaded by a generated `let`-binding prelude,
+avoiding any quoting issue from embedding a value directly in the script source; for any other declared interpreter,
+each binding is instead exposed as an environment variable holding its compact-JSON value. An action's `env` and
+`secrets` blocks (3.1) are set on the snippet's own process only, never on the `claude` child, and every secret value
+is replaced with a fixed placeholder in both the snippet's stdout and stderr before either is logged, returned, or
+folded into a later prompt, so a script that prints a secret cannot leak it.
 
 ### 3.3 YouTrack action (`kind: youtrack`)
 
@@ -258,8 +380,8 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
 - Accepts Action-run deliveries (Forgejo `action_run_*`, GitHub `workflow_run`). Only a failure for an allow-listed
   repository is processed. A `success` or `recover` action goes to the automerge pipeline. A `pull_request` delivery
   with action `closed` reconciles recorded agent PRs; other PR actions are acknowledged and dropped.
-- Processing: fetch the job logs (`fj actions logs`), redact secrets, fingerprint the failure, store it in
-  `ci_failures`, then triage into a bucket and act:
+- Processing: fetch the job logs (`fj actions logs`), redact secrets, fingerprint the failure (3.5.2), match or store it
+  in `ci_failures`, then triage into a bucket (3.5.1) and act:
   - `code_fix`: create a tracker issue; set the queued value only when `webhook.auto_fix` is true.
   - `auto_fix`: set only by deterministic detectors (`cargo-fmt` signature; failing workflows named in
     `mint.auto_fix.checks_workflows`, default `check.yml`) when the failing branch has no open PR; skipped when
@@ -267,9 +389,12 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
   - `human_action`: create an issue assigned to `mint.human_assignee` when set, no queue.
   - `transient`: no issue. An infrastructure failure kind is stored on the failure row.
 - Branches matching `mint.bot_branch_prefixes` (default `renovate/`) never route to `code_fix` or `auto_fix`.
-- Failures from logins listed in `mint.bot_logins` do not mint (loop safety). Open-PR routing: a failure on the agent's own
-  open PR requeues its issue until `webhook.agent_pr_fix_attempts` (default 3) is reached, then the issue is set to
-  needs-review; a failure on a human's PR is commented on that PR.
+- `mint.bot_logins` is not a mint-time loop guard: loop safety is the open-PR routing below, decided from the
+  `agent_pull_requests` store (3.5.2) before a failure on the agent's own PR ever reaches the mint. `bot_logins` is
+  read only by the comment-command webhook (3.6). Open-PR routing: a failure on the agent's own open PR requeues its
+  issue until `webhook.agent_pr_fix_attempts` (default 3) is reached, then the issue is set to needs-review; a
+  failure on a human's PR is commented on that PR; a resolved match reopens as a regression, comments the run and
+  its failing tests, and is re-triaged so `AI Agent` is set exactly as a freshly minted issue of that bucket would.
 - Issues are created in the project whose VCS integration claims the repository, with `mint.repo_project_map` consulted
   first and `mint.fallback_project` (default `CLAUDE`) last. State on creation is `mint.target_state` (default `To do`).
   The redacted log is attached.
@@ -277,6 +402,59 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
   counter.
 - The whole mint pipeline degrades to log-only (no tracker issue created) when no YouTrack/Forgejo/GitHub backend is
   usable, or its on-disk analysis directory cannot be created.
+
+#### 3.5.1 Triage classification (`SPEC-3.5.1`)
+
+Hybrid: a cheap deterministic pass runs first and only the residue it cannot label reaches the LLM.
+
+- Deterministic rules, in order: a log that could not be fetched at all routes to `human_action` (never silently
+  dropped as transient), naming the reason; a job the runner skipped (`Skipping job '...' due to '...'`, its
+  workflow `if` guard evaluated false) routes to `transient`, since nothing ran; a `runner-unavailable` infrastructure
+  condition (below) routes to `human_action`; a curated set of transient/infra log substrings (no runner available,
+  registry 401/429/manifest-unknown, connection reset/refused, DNS/TLS timeouts, 502/503/504) routes to `transient`
+  with no LLM call.
+- A branch matching `mint.bot_branch_prefixes` always routes to `human_action` before auto-fix or the classifier run:
+  the owning bot force-pushes/rebases that branch on its own schedule, so a fix pushed there would be wiped.
+- Deterministic auto-fix detectors (cargo-fmt signature; a failing workflow named in `mint.auto_fix.checks_workflows`)
+  run next, only when the failing branch has no open PR, and only when `mint.auto_fix.enabled`; a match routes to
+  `auto_fix` with no LLM call.
+- The residue goes to one tool-using `claude` session (`Read,Grep,Bash`) over the complete redacted log plus the
+  failing workflow YAML, ending with a fenced JSON verdict: `code_defect` maps to `code_fix`, `needs_human` to
+  `human_action`, and `flaky` / `infra` both to `transient`. An unparseable or missing verdict, or a session that does
+  not complete, degrades to `human_action` and is logged; it must never become `code_fix` on its own. The session's
+  Markdown report becomes the minted issue's analysis text, capped at 24 KiB.
+- Infrastructure-failure detection (a full disk, an out-of-memory kill, or an unreachable package/container registry)
+  is deterministic phrase matching over the complete log, most-specific-first, case-insensitive, with cargo's own
+  test-result and `failures:` lines stripped first so a test NAMED after a detector phrase can never match. The
+  matched `kind` id (not the matched line or its wording) is what downstream dedupe hashes, so two differently-worded
+  reports of the same host condition collapse identically; an undetected condition is the deliberately preferred
+  failure mode over a false positive that would merge two unrelated code failures across branches.
+
+#### 3.5.2 CI-failure store and dedupe (`SPEC-3.5.2`)
+
+- `ci_failures` (one row per distinct failure, keyed on `(repo, workflow_id, job_name)`), `ci_failure_tests` (its
+  failing-test fingerprint), `ci_failure_runs` (one row per sighting: commit, branch, PR number, timestamp), and
+  `agent_pull_requests` (every PR the runner's own `youtrack` action opens, carrying `fix_attempts` and a `salvaged`
+  flag) replace a YouTrack full-text search for dedupe: an unindexed issue is invisible to that search, and a
+  failure every PR inherits from `main` would otherwise mint one issue per PR.
+- The fingerprint is the sorted, deduplicated `<target>::<test>` ids parsed from cargo test output (a target that
+  failed to build or run at all, with no parsed test, contributes a bare `<target>` id), or `infra:<kind>` when the
+  infrastructure detector (3.5.1) matches, or a single normalized first-diagnostic-line signature when neither
+  parses anything.
+- A failure matches an existing `ci_failures` row by failing-test id overlap within the same `(repo, workflow_id,
+  job_name)`, preferring `open` over `resolved` over `pr_only` and the newest on a tie.
+- A hidden `Dedupe-Key:` marker in the issue body (searched only by the legacy-adoption lookup, for an issue minted
+  before this store existed; nothing else searches YouTrack for it) carries three hashed markers: a primary key
+  `(repo, run index)` for webhook-redelivery idempotency, a secondary key `(repo, commit, workflow)` kept for
+  back-compat with issues minted before the root-cause key existed, and the cross-run collapse key, which is either
+  the root-cause key `(repo, branch, workflow, job, failure signature)` (falling back to `(repo, branch, workflow,
+  job)` when no signature is derivable) or, when an infrastructure condition was detected, the branch-agnostic
+  `(repo, workflow, job, infra kind)` key in its place: a host condition is identical on every branch and is not
+  fixable on any of them, so it must collapse onto one issue across every PR branch it hits, while two unrelated code
+  failures on two branches must never merge.
+- `agent_pull_requests` tracks every PR the runner's own `youtrack` action opens so a re-queued issue continues that
+  same branch (3.3.1) instead of opening a second PR, and so the open-PR loop-safety routing (3.5) can bump and read
+  back a fix-attempt counter keyed on the PR rather than on a login.
 
 ### 3.6 Comment-command webhook
 
@@ -309,7 +487,8 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
   process-wide registry (no cross-process cancellation; only a run inside the same daemon process can be cancelled).
   Tripping it, in order: the in-flight `claude` child is sent SIGTERM then, after a grace period, SIGKILL to its whole
   process group (3.2); the job still in flight runs its `post` phase with a synthesized cancelled result; the run loop
-  stops dispatching further jobs and finalizes with exit code 130.
+  stops dispatching further jobs, and a job still waiting for a concurrency permit stops without waiting for one, and
+  finalizes with exit code 130.
 - Readiness has two not-ready kinds: `no_credential` and `login_required`. A credential counts, in this order: an
   agent-config-dir `.credentials.json` file (the host login, or one a container `/setup` sign-in wrote), a stored
   Anthropic API key (Settings -> Auth), or `ANTHROPIC_API_KEY` in the daemon's own environment; none of the three
@@ -320,15 +499,78 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
 
 ### 3.8 Garbage collection and retention
 
-All sweeps are DB-backed settings, enabled by default flags in each section, and run at serve start and hourly:
+All sweeps are DB-backed settings, enabled by default flags in each section, and run at serve start and hourly.
 
-- Workdir GC: preserved or aside workdirs older than `retention_days` (14) are deleted. A workdir holding unpushed
-  commits violates 3.3.1; it is kept until `unpushed_hard_cap_days` (60) and logged as a defect, never treated as normal.
-- Stream-log GC: stream logs older than `retention_days` (30); `daemon.log`, per-action `output.file` and `usage.jsonl`
-  are bounded by size; snippets and `webhook-logs` have their own retention days.
-- DB retention: rows older than `retention_days` (180) are deleted from `job_outcomes`, `run_events`, `ci_failure_runs`
-  and `claude_invocations`.
-- Docker GC: named Docker volumes unreferenced by any container and older than `volume_retention_days` (3) are removed.
+#### 3.8.1 Workdir GC (`SPEC-3.8.1`)
+
+- Preserved or aside workdirs under `workdirs/<source>/<key>` older than `retention_days` (14), measured from the
+  directory's last-modified time, are deleted. A workdir whose mtime is unreadable or newer than "now" is treated as
+  age zero (kept).
+- A workdir holding unpushed commits, a dirty tracked/untracked tree, or a stash violates 3.3.1; it is kept past
+  `retention_days` until the longer `unpushed_hard_cap_days` (60), and logged as a defect, never treated as normal.
+  Past the hard cap it is deleted even with local-only work still inside it.
+- A filesystem error deleting one directory is logged and that directory is skipped; the pass continues sweeping the
+  rest rather than aborting.
+- A `target/` directory inside any workdir older than one day is removed even when the workdir itself is kept
+  (`SPEC-3.10` item 5).
+- A per-repo shared Cargo target directory over `cargo_cache.max_bytes_per_repo` is deleted once no run for that repo
+  is in flight (`SPEC-3.10` item 6).
+
+#### 3.8.2 Stream-log, snippet and webhook-log age sweeps (`SPEC-3.8.2`)
+
+- Per-attempt stream logs under `logs/<action>/streams/*.jsonl` older than `retention_days` (30) are deleted. A log
+  whose `(action, job_key)` pair is still in flight (joined from `run_inflight_jobs` to runs that have not ended) is
+  kept regardless of age, because age alone is not evidence a run has finished. A file not shaped
+  `<key>-attempt-<n>.jsonl` is not a stream log and is swept on age alone without the in-flight check.
+- `snippets/<action>/<job_key>/` directories older than `snippet_retention_days` are deleted the same way, reusing the
+  exact in-flight set the stream-log sweep reads; a failed read of that set skips both sweeps, since sweeping with an
+  empty set would delete a live run's own stream log or snippet directory.
+- Files directly under `webhook-logs/` older than `webhook_log_retention_days` are deleted by age alone, with no
+  in-flight guard: a webhook run is not a scheduled job and never appears in `run_inflight_jobs`. Only files directly
+  under the directory are considered; a subdirectory (the mint classifier's own per-event working directory) is never
+  descended into or deleted by this sweep.
+
+#### 3.8.3 Size-bounded logs (`SPEC-3.8.3`)
+
+- `logs/daemon.log`, each `logs/<action>/<output.file>`, and `logs/usage.jsonl` are append-forever files with no
+  per-unit-of-work age to expire, so each is bounded by SIZE instead: past its configured ceiling (`daemon_log_max_bytes`,
+  `output_file_max_bytes`, `usage_log_max_bytes`; `0` disables a ceiling) the file is rolled to one `<name>.1`
+  predecessor holding the full prior content, then truncated in place back to its newest half, cut at the first line
+  boundary inside that half so every retained line is whole.
+- The truncation is in place, never a rename: `daemon.log` is held open for append, and a rename would leave new
+  writes landing in the predecessor while the live file stayed empty.
+- A predecessor (`<name>.1`) is itself never rolled over into a second generation.
+- A missing file is silent and uncounted (the daemon may not have run yet, or an action may have logged no output);
+  any other error bounding a file is logged and that file is left as-is, and the pass continues to the rest.
+
+#### 3.8.4 DB retention (`SPEC-3.8.4`)
+
+- Rows older than `retention_days` (180), by their stored `ts`, are deleted from `job_outcomes`, `run_events`,
+  `ci_failure_runs` and `claude_invocations`. Each pruned table has a single-column index on `ts` so the cutoff
+  predicate seeks rather than scans.
+- `ci_failures`, `ci_failure_tests` and `agent_pull_requests` are never pruned by this sweep: a resolved failure or a
+  merged PR must still be matchable against a regression months later, so only the per-sighting/per-invocation
+  history tables above are bounded by age.
+- The default `retention_days` stays `>=` the longest reporting range the web UI exposes (90 days), so a bounded
+  report is never silently truncated by the prune running ahead of it. A save that enables the sweep with
+  `retention_days` below that same 90-day floor is rejected outright, not just defaulted away from, so the floor
+  holds for every saved value, not only the shipped default.
+
+#### 3.8.5 Docker volume GC (`SPEC-3.8.5`)
+
+- A named volume in the sidecar's Docker daemon that no container currently references and that is older than
+  `volume_retention_days` (3), measured from Docker's own `CreatedAt` (Docker records no last-used time), is removed.
+  A `buildx_buildkit_*` state volume is kept at any age; recreating buildkit's own cache costs far more than the disk
+  it uses.
+- When the Docker daemon cannot be reached (including `DOCKER_HOST` unset), the pass is skipped and logged, and
+  nothing is removed; this is never reported as a clean sweep.
+- A remove Docker refuses because the volume is now in use (a race between listing and removing it) is logged and the
+  volume is left in place; any other remove failure is logged and the pass continues to the rest. Neither `--force`
+  nor `--all` is ever passed: Docker's own in-use refusal is the safety net this sweep relies on, and `--all` has no
+  age filter.
+- A save setting `volume_retention_days` below 1 is rejected: Docker records no last-used time, so a 0-day window
+  would remove a volume a session created moments ago while its container sat between restarts.
+- The sidecar's total Docker storage is also bounded by `docker_gc.max_bytes` (`SPEC-3.11`).
 
 ### 3.9 Run comment footer (`SPEC-3.9`)
 
@@ -345,11 +587,80 @@ callers to build one themselves:
 - `Started:`, `Finished:` (RFC 3339, second precision) and `Duration:` (`<minutes>m <seconds>s`, or `<seconds>s` under
   a minute) lines, computed from the attempt's or run's own start time and "now" as the finish time.
 
+### 3.10 Shared Cargo target directory (`SPEC-3.10`)
+
+A run clones its repo into a fresh workdir, so a Rust repo starts with an empty `target/` and rebuilds every
+dependency. Runs of the same repo share one compiled-dependency cache instead.
+
+1. **Purpose.** Cargo keys each dependency artifact by package, version, features, profile and compiler version, so two
+   clones using the same dependency versions reuse the same compiled output in one target directory.
+2. **Location.** For each repo the runner owns `<data dir>/cache/cargo-target/<repo-slug>`. `<repo-slug>` is
+   `<owner>__<repo>` taken from the clone URL path, lowercased, with every character outside `[a-z0-9._-]` replaced by
+   `_`. Two repos never share a directory. The directory is outside `workdirs/`, so workdir GC (3.8) never reaches it.
+3. **Injection.** Every `claude` child spawned for a repo workdir, and every runner-spawned build subprocess in that
+   workdir, gets `CARGO_TARGET_DIR` set to that repo's directory. A repo that is not Rust is unaffected. If the
+   directory cannot be created or written, the attempt fails with the path and the OS error; the runner never falls
+   back to a per-workdir `target/`.
+4. **Incremental builds.** Incremental compilation stays enabled; the runner does not set `CARGO_INCREMENTAL`.
+5. **Workdir `target/`.** A workdir's `target/` is removed when the workdir is preserved or set aside, and by the
+   workdir sweep (3.8) from any workdir older than one day, including one kept for local-only work. This covers a
+   `target/` left by a build that ignored the variable (for example a project that sets its own `build.target-dir`).
+   Each removal is logged at `info` with the key, path and bytes reclaimed.
+6. **Bound.** Each repo directory has a size ceiling, `cargo_cache.max_bytes_per_repo` (default 60 GB; assume this
+   value and revise if measurement shows otherwise). A directory over its ceiling is deleted once no run for that repo
+   is in flight, on the existing GC tick, with a `warn` naming the repo, size and ceiling. The next run for that repo
+   rebuilds cold.
+7. **Concurrency.** Cargo serializes builds on one target directory, so simultaneous runs of one repo take turns
+   compiling; waiting is not a failure. Runs of different repos do not wait on each other.
+8. **Scope.** Docker builds the agent starts through `just check-docker` run in the Docker-in-Docker sidecar with their
+   own build cache (9). This requirement does not change them.
+9. **Visibility.** A run's start log line names the `CARGO_TARGET_DIR` it was given. The Status page (4.3) lists each
+   repo directory with its size and last-used time.
+10. **Management.** The Status page has a Management part listing each directory with its size, last-used time and
+    whether a run for that repo is in flight. Each row has a Delete button, and a Delete all button covers every row;
+    both ask for confirmation naming the directory and its size. A delete is a `POST` (`/status/cargo-cache/{repo-slug}/delete`
+    and `/status/cargo-cache/delete`, mirrored under `/api` as the UI's own buttons use it, 4.2). While a run for the repo
+    is in flight the delete is refused with `409` and the page shows the refusal where the person clicked. Each delete
+    is logged at `info` with the repo, path and bytes reclaimed; an I/O failure is logged at `error` and shown on the
+    page. The controls need the same authentication as the other Status page controls and add no route to the unix
+    socket.
+
+### 3.11 Sidecar Docker storage (`SPEC-3.11`)
+
+The Docker-in-Docker sidecar keeps its images, containers, build cache and named volumes in the `/var/lib/docker`
+volume (9). Only unreferenced named volumes were bounded before this requirement.
+
+1. **Measure.** The runner reads the sidecar's usage by category (images, containers, local volumes, build cache)
+   through the Docker CLI against the sidecar daemon (`tcp://127.0.0.1:2375`). A failed read is logged at `error` and
+   shown as "unknown", never as zero.
+2. **Ceiling.** The setting `docker_gc.max_bytes` (default 250 GB; assume this value and revise if measurement shows
+   otherwise) bounds the total. When it is exceeded on the Docker GC tick and no run is in flight, the runner reclaims
+   in this order and stops once under the ceiling: stopped containers older than 1 day, dangling images, build cache
+   older than 7 days, unused images older than 7 days, then unreferenced named volumes older than
+   `volume_retention_days` (3.8). A pass with a run in flight is skipped and logged.
+3. **Logging.** Each step logs the category, bytes reclaimed, and the size before and after. A failed step logs at
+   `error` and the pass continues with the next step; a failed pass is never reported as clean.
+4. **Management.** The Status page's Management part (3.10 item 10) has one row per category with its size and a Prune
+   button. A prune is a `POST` (`/status/docker/{category}/prune`, mirrored under `/api` as the UI's own buttons use it,
+   4.2), refused with `409` while any run is in flight because any run may be using the sidecar, and shown where the
+   person clicked. It logs bytes reclaimed at `info`; a failure is logged at `error` and shown. It needs the same
+   authentication as the other Status controls and adds no route to the unix socket.
+5. **Scope.** The runner never removes an image, container or volume that a running container references, never uses a
+   prune command that needs a force flag to skip its confirmation (removal is by explicit id from a listing), and never
+   touches the app's own `/data`, `/config` or `/state` volumes.
+
 ## 4. Interfaces
 
 ### 4.1 CLI
 
 Global flags: `--actions-dir <dir>` (env `CLAUDE_RUN_ACTIONS_DIR`), `--color auto|always|never`.
+
+#### 4.1.1 JSON syntax highlighting (`SPEC-4.1.1`)
+
+JSON printed to a terminal (`--color auto`, a TTY) or forced on is syntax-highlighted token by token (keys, strings,
+numbers, `true`/`false`/`null`) with the surrounding structure and whitespace copied through unchanged; stripping the
+color codes back out always yields byte-identical output to the plain `serde_json::to_string_pretty` form, so a
+scripted consumer piping the output (`claude-run status | from json`) is unaffected by color being on or off.
 
 | Command | Behavior |
 |---|---|
@@ -422,7 +733,7 @@ JSON or the `reason=...` urlencoded body htmx's Pause form posts; an unparseable
 pause proceeds with no reason rather than being refused. A settings `PUT` validates the body against the section's
 config struct before persisting anything: a validation failure 400s with the message and nothing is saved; a secret
 field in the response names only its `*_ref`, never its value. `/status`'s `activity` field is the same `Activity`
-snapshot (9) the `status` command and the About page's quiet indicator read, so the three cannot disagree about
+snapshot (9) the `status` command and the Status page's quiet indicator read, so the three cannot disagree about
 whether a restart is safe; its `stale_gates` and `attempt_cap_hits` are the dependency-gate (3.3) and per-key
 attempt-cap (3.1) backlogs an operator without the web UI would otherwise have no machine-readable view of.
 `/access/check` is the typed report defined in 4.6.
@@ -432,10 +743,144 @@ attempt-cap (3.1) backlogs an operator without the web UI would otherwise have n
 Pages: `/` dashboard; `/actions/new`, `/actions/new/raw`, `/actions/new/youtrack`, `/actions/new/closed-issue-summary`;
 `/actions/{name}` with `/durations`, `/events` (redirect), `/edit`, `/form`, `/export`, `/delete`; `/logs`; `/secrets` with
 rotate, delete and check; `/access`; `/settings` with per-section saves and the Claude, YouTrack, Forgejo, GitHub and git
-auth cards; `/reports`; `/about` and `/about/activity`; `/runs/{id}`; `/runs/{id}/jobs/{key}/attempt/{attempt}`;
+auth cards; `/reports`; `/status` and `/status/activity`, with `/about` and `/about/activity` redirecting permanently to
+them; `/status/cargo-cache/{repo-slug}/delete` and `/status/cargo-cache/delete`; `/status/docker/{category}/prune`; `/runs/{id}`; `/runs/{id}/jobs/{key}/attempt/{attempt}`;
 `/sse/runs/{id}/jobs/{key}/attempt/{attempt}` (live stream); `/static/htmx.min.js`, `/static/idiomorph-ext.min.js`.
 Auth routes: `/login`, `/login/2fa`, `/logout`, `/setup`, `/account/2fa/setup`, `/invite/{token}`, `/settings/accounts` with
-invite, remove and revoke.
+invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src/auth.rs` are specified separately
+(`SPEC-7`), this section's subsections cover only the pages owned by `src/web/mod.rs`, `src/web/native_forms.rs`,
+`src/report.rs` and `src/paint.rs`.
+
+#### 4.3.1 Dashboard and run search (`SPEC-4.3.1`)
+
+- The dashboard lists every configured action plus the two always-present synthetic rows (`audit-run`,
+  `closed-issue-summary` reporting), each annotated with its live pause/readiness/dependency-gate state and its most
+  recent run; a synthetic row that resolves disabled hides itself rather than rendering a dead trigger button.
+- Job search matches a free-text needle against job keys and, when given, the matching portion of the job's stream log
+  (a short snippet around the first match), filterable by action, trigger source and a recent-run window.
+- The duration and plan-usage charts on the dashboard are built from the same `report::` series the Reports page uses,
+  scaled to the widget's own bar/line geometry rather than the page's full chart.
+
+#### 4.3.2 Action detail, durations and events (`SPEC-4.3.2`)
+
+- `/actions/{name}/events` is a redirect to the dashboard's events view scoped to that action, not a page of its own.
+- The events view's level/action/context filters are populated from the distinct values actually present in
+  `run_events`, not a fixed list, so a filter never offers a value with zero matching rows.
+- `/actions/{name}/durations` charts one action's own run-duration history; an action with no runs yet renders the page
+  with an empty chart rather than 404ing.
+
+#### 4.3.3 Action create, edit, export and delete (`SPEC-4.3.3`)
+
+- `/actions/new/raw` and `/actions/{name}/edit` both validate the submitted YAML with the same `validate_str` path the
+  loader uses and re-index the action on a successful save; a rejected save re-renders the editor with the validation
+  message instead of discarding the submission.
+- `/actions/{name}/delete` and `/actions/{name}/export` operate on the file indexed for that action name, resolved
+  through the action index rather than a path built from the name directly, so a deleted or renamed file on disk cannot
+  be reached through a stale name.
+- A synthetic action (`audit-run`, `closed-issue-summary` reporting) rejects edit, export and delete: there is no file
+  backing it to touch.
+
+#### 4.3.4 Native action editor forms (`SPEC-4.3.4`)
+
+- A kind with a structured editor (`youtrack`, `closed-issue-summary`) is edited through `GET`/`POST
+  /actions/{name}/form` and created through `GET`/`POST /actions/new/{kind}`, instead of the raw YAML editor; a kind
+  with no structured editor (`scripted`) has no `/form` route and uses the raw editor only.
+- Every submitted form is serialized to YAML and run through the same `validate_str` + write + re-index path the raw
+  editor uses, so a structured save can never write a file the raw editor would reject; a rejected save re-renders the
+  form inline with the validation message rather than discarding the submission.
+- An edit overlays only the fields the form owns onto the existing YAML mapping: every key the structured editor does
+  not expose (for example `dedup_key`, `concurrency`, or a hand-written `claude:` block on a kind that runs no agent
+  session) is left untouched.
+- A checkbox absent from the submitted body is a false value, never a fallback to the loaded action's or the kind's
+  default; a cleared text field whose config key has a documented default is written back as that default rather than
+  as an empty string, and a cleared field with no default removes the key instead.
+- The new-action filename is derived from the posted name through `safe_action_stem` (letters, digits, `-`, `_`, `.`
+  only); a save is rejected if that file already exists rather than silently overwritten.
+- If the on-disk YAML for an action being edited fails to parse, the save is rejected with a message pointing at the
+  raw editor rather than silently treated as an empty mapping.
+
+#### 4.3.5 Logs page (`SPEC-4.3.5`)
+
+- `/logs` renders `run_events` filtered by level, action and context, windowed to a configurable recent period, newest
+  first.
+
+#### 4.3.6 Secrets page (`SPEC-4.3.6`)
+
+- A secret name is restricted to a safe identifier charset; `/secrets` create, rotate and delete all reject a name
+  outside that charset before touching the store.
+- Rotating or deleting a secret still in use by an action's `token_ref` or the `auth` settings is allowed; the page
+  does not track or block on referential use.
+- The secrets page never renders a stored secret's value, only its name and `last_used_at`; `check` (`SPEC-7.1`)
+  reports whether a name resolves, not what it resolves to.
+
+#### 4.3.7 Access page (`SPEC-4.3.7`)
+
+- `/access` runs the same typed report as `access check` / `POST /api/access/check` (`SPEC-4.2`) and renders it as a
+  page instead of JSON.
+
+#### 4.3.8 Settings page and service auth cards (`SPEC-4.3.8`)
+
+- Each settings section (`SPEC-6.3`) saves independently; saving one section never touches another section's stored
+  value, and a save takes effect without a daemon restart.
+- The Claude, YouTrack, Forgejo, GitHub and git auth cards each validate and materialize their own credential
+  (`SPEC-7.3`) on save; a card left blank clears that credential's configured secret reference rather than leaving a
+  stale reference pointed at a deleted secret.
+- The email test action (`auth_test_email`) sends a real test message through the configured SMTP settings and
+  reports delivery failure inline, without persisting anything.
+- The Claude login card starts, submits a code to, and can cancel, the interactive broker session (`SPEC-7.5`); the
+  rendered banner reflects the broker's own session state, not a separate poll of `claude auth status`.
+
+#### 4.3.9 About and activity pages (`SPEC-4.3.9`)
+
+- `/about` and `/about/activity` render the version, build metadata and the same `quiet` restart-safety flag `GET
+  /api/status` exposes (`SPEC-9`), plus a recent-activity feed across all actions.
+
+#### 4.3.10 Run detail, job stream and live SSE (`SPEC-4.3.10`)
+
+- `/runs/{id}` 404s an unknown run id, otherwise lists its jobs sortable by key, outcome, duration and cost, each
+  linked through the action's configured `link_template` (falling back to a bare issue-key heuristic when none is
+  set) so a job key that looks like a tracker issue becomes a clickable link.
+- `/runs/{id}/jobs/{key}/attempt/{attempt}` resolves the attempt's on-disk stream-log path and renders it with the
+  run's blocker signature, if any, rendered through the same link-template resolution.
+- `/sse/runs/{id}/jobs/{key}/attempt/{attempt}` is a server-sent-events feed over that same on-disk `.jsonl` log: it
+  404s an unknown run, waits briefly for the file to appear on a still-running job, reports a permanently absent file
+  as `stream-log-gone` on an ended run versus `no-stream-yet` on a live one, resumes from `Last-Event-ID` (or a
+  `lastEventId` query parameter on a manual reconnect) by line index, and closes with a `done` event on a `type:
+  result` line or a matching `job_outcomes` row.
+- Each SSE line carries a server-formatted `ts_fmt` alongside its raw `ts` (the browser cannot run the daemon's
+  strftime), honoring the operator's configured locale/timezone/datetime format (`SPEC-6.3`); a line that is not a JSON
+  object, or carries no string `ts`, passes through unchanged.
+
+#### 4.3.11 Static assets (`SPEC-4.3.11`)
+
+- `/static/htmx.min.js` and `/static/idiomorph-ext.min.js` are served from the binary's own embedded copy, not fetched
+  from a CDN, with a one-year immutable cache-control header so the browser never re-requests them.
+
+#### 4.3.12 Web error responses (`SPEC-4.3.12`)
+
+- Every fallible page handler returns one `WebError` type: a status code plus a plain message, with `From`
+  conversions from the error types handlers actually hit (the crate's own error, a database error, a filesystem
+  error, a template error), so a stray `?` can never bypass the page's error rendering. A `WebError` renders as a
+  plain-text response at its status code.
+
+#### 4.3.13 Reports page and aggregation (`SPEC-4.3.13`)
+
+- `/reports` and its JSON siblings `GET /report/{summary,daily,weekly,by-weekday,by-hour}` (`SPEC-4.2`) share one
+  aggregation layer (`src/report.rs`); the `range` (`30d`, `90d`, other values mean all time) and `action` query
+  parameters filter every series identically.
+- `daily_ledger` is already local-dated and is the source for the daily and weekly spend/run-count series;
+  `job_outcomes.ts` and `runs.started_at`/`ended_at` are UTC and are converted to the daemon's local timezone before
+  weekday/hour bucketing.
+- `by-weekday` and `by-hour` always return a fixed 7- or 24-bucket series (Sunday first, respectively `0..=23`), even
+  when a bucket has no data, rather than omitting an empty bucket.
+- The top-line `summary` totals spend and run count from `daily_ledger` and run minutes from `runs` (the only table
+  with both a start and an end timestamp; a run with a NULL `ended_at` is excluded from the minutes total).
+- The Claude plan-usage chart reads its series oldest first (so the chart draws left to right); the most-recent-
+  invocations table is a separate newest-first query capped at 20 rows, not a reverse-and-slice of the chart's rows.
+
+The Status page (`/status`, the former About page) carries build and version information, the quiet indicator, the
+global Pause and Resume control, the activity list, and the Management part (3.10 item 10). The nav entry "About" is
+"Status".
 
 ### 4.4 Webhooks
 
@@ -455,6 +900,92 @@ configured for a different provider, or a disabled listener returns 404. Pipelin
    `replay_window_secs` (default 300, shared across both listeners): 409.
 5. Event type header (`X-Forgejo-Event` / `X-GitHub-Event`) selects the handler. Unparseable payload: 400.
 6. Accepted failure events: 202. Authenticated events that are not actionable: 200 and dropped.
+7. Two gates run between replay (point 4) and event dispatch (point 5), both accept-and-drop (2xx) rather than reject:
+   a hit on global pause, the action's own pause, or a failed pause read; and a configured Claude login that needs
+   renewing. Both still record the delivery id as seen, since a retry could not help either way.
+
+#### 4.4.1 Ingress pipeline, types and shared primitives (`SPEC-4.4.1`)
+
+- `WebhookProvider` (`forgejo` or `github`, the `{provider}` path segment) owns its own signature header, delivery-id
+  header, event-type header and signature-verification scheme; both providers share the pipeline in SPEC-4.4 (auth,
+  replay, rate limit, pause) and converge on the same internal event types downstream.
+- A GitHub delivery sent with GitHub's default content type arrives form-encoded (`payload=<url-encoded JSON>`); it is
+  decoded back to raw JSON only after signature verification, since the signature covers the original raw body.
+- A GitHub `workflow_run` delivery is mapped onto the same internal action-run payload shape a Forgejo Action-run
+  delivery produces, so one dispatch path serves both forges.
+- One fixed-window rate limiter is built per configured source, so one source exhausting its budget never 429s
+  another.
+
+#### 4.4.2 CI-failure triage and mint dispatch (`SPEC-4.4.2`)
+
+- Before triage runs, a failing run's fingerprinted tests are checked against the `ci_failures` store: a match on an
+  `open` row attaches a new sighting with no `claude` call and no mint; a match on a `resolved` row reopens it and
+  re-triages it as a regression; no match falls through to classification, after one legacy-adoption lookup (an issue
+  minted before the store existed).
+- Whether the failing commit sits on an open PR is resolved before the store-match dispatch; a lookup failure here is
+  a routing failure, never silently folded into "no open PR" the way the advisory open-PR check fed to the classifier
+  degrades to `false` on a lookup failure or an underivable forge host.
+- An issue's live YouTrack `State` is re-checked before treating an `open` store row's reappearance as a regression,
+  so the store never reopens an issue the resolve-on-merge workflow (`SPEC-3.3.1`) already closed; a `State` read
+  failure is never read as "still open".
+- A fresh mint or a legacy adoption records a new `ci_failures` row together with its failing tests and the
+  triggering run; the caps/attempt ledger advances only on a genuine new mint, never on an attach or a reopen.
+
+#### 4.4.3 PR-comment routing and automerge (`SPEC-4.4.3`)
+
+- A PR comment is posted through credentials materialized and scoped to the call (`SPEC-7.2`), using the GitHub or
+  Forgejo backend the source is configured for.
+- A failure on the agent's own open PR either re-queues the issue or, past a fix-attempt ceiling, flags it `Needs
+  Review`; a re-queue is suppressed in favor of `Needs Review` when the new failure's fingerprint set repeats the
+  immediately preceding attempt (the loop-breaker).
+- A failure on a human-authored open PR routes by whether its tests overlap an existing `ci_failures` row: an open
+  match attaches (after re-checking the issue is not already resolved); a resolved match reopens and comments; a
+  `pr_only` match on a second distinct branch promotes to a real minted issue, pointing the existing row at the new
+  issue rather than duplicating it, and comments the issue link onto every open PR the failure was sighted on; a
+  first sighting records a `pr_only` row and always comments the PR, minting no issue yet.
+- On an automerge conflict (an `update_pr_branch` failure), a configured conflict-auto-resolve dispatch sends a
+  synthetic command to the comment listener (`SPEC-4.4.5`) instead of leaving a "needs a human" comment.
+- An automerge outcome (conflict dispatch, behind-base update/merge, or clean merge) is recorded and its comment
+  posted exactly once per decision, guarded against double-posting.
+
+#### 4.4.4 Action-run success and pull-request delivery consumption (`SPEC-4.4.4`)
+
+- A verified terminal (`closed`) pull-request delivery and a verified `success`/`recover` Action-run delivery are
+  each dispatched onto their own channel; with no channel configured the handler acks and drops with a log rather than
+  failing the delivery.
+- A merged agent PR records the outcome and leaves the issue `State` to the YouTrack resolve-on-merge workflow
+  (`SPEC-3.3.1`); a closed-but-unmerged agent PR records the outcome so it stops counting toward open-PR routing.
+- A success/recover event resolves to its agent PR, if any, and re-triggers the SPEC-4.4.3 automerge decision now
+  that a check just went green.
+- A repository-level fault (for example an unreachable forge) notifies every open agent PR tracked for that
+  repository rather than failing silently per event.
+
+#### 4.4.5 Comment-command webhooks (`SPEC-4.4.5`)
+
+`POST /webhooks/{provider}/comment/{source}` is a second, independent listener sharing the pipeline mechanics in
+SPEC-4.4 (provider/source resolution, rate limit, HMAC verify, delivery/replay, pause gate) and the same replay store,
+rate-limiter type and allow-list matcher as the triage listener, but its own write token and pause switch. A GitHub
+delivery that is not `issue_comment` (except `ping`) is acked and dropped before parsing.
+
+- A comment is a command only when its first line opens with the configured `trigger` followed by whitespace or
+  end-of-line; an empty or `help` instruction is a help request, and one over `max_instruction_chars` is refused by
+  name. A delivery is dropped (2xx, logged, never a command) when its action is not `created`, its repository is not
+  allow-listed, or its author is a configured bot login.
+- Authorization is a live read of the commenter's repository permission against the forge, never cached; the read
+  failing, or ranking below `allowed_permissions`, denies (fail closed). A synthetic (runner-dispatched) command skips
+  only this check. At most one denial reply is sent per (repository, commenter) per window.
+- A comment command is one-shot: its effective per-key attempt cap is one, and that same counter is the redelivery
+  guard, keyed by a hash of (repository, PR/issue number, comment id). Admission also checks the shared daily run
+  ledger. A refusal before admission (login required, over cap) advances no counter and runs no `claude`, and replies
+  naming the reason. At most one comment job per thread runs at a time; a second command is told so and dropped.
+- A pull-request command clones the PR's head branch, writes the instruction verbatim to a file outside the work
+  tree, runs Claude, then a decision gate classifies the result as no changes, unresolved conflicts, a measurement
+  failure, too big (over `max_files` / `max_lines`), or a push; only a push pushes and posts a push comment
+  (`SPEC-4.4.4`-adjacent, `CLAUDE-447`).
+- A plain-issue command clones nothing and runs no agent: it mints a YouTrack issue carrying the instruction verbatim,
+  sets `State` then the `AI Agent` field to the queued value last, and replies naming the minted key.
+- Every outcome replies on the originating thread; a served command records one `job_outcomes` row and finalizes
+  through the run guard.
 
 ### 4.5 MCP tools
 
@@ -655,7 +1186,7 @@ requires `secret_ref` and `write_token_ref` on every source.
 Edited on the Settings page or through `PUT /api/settings/{section}`; changes apply without restart. Fields not listed in
 3.x: `webhook.analysis_timeout_secs` (600), `webhook.analysis_concurrency` (2); `concurrency.max_parallel_global` (0 =
 largest enabled action cap); `preferences` (`locale`, `timezone`, `datetime_format`); `claude` (`model`, `effort`,
-`autocompact`); `auth` (service base URLs, secret names, git author name and email). `webhook_comment.sources.<name>`
+`autocompact`); `cargo_cache` (`enabled`, `max_bytes_per_repo`, 3.10); `docker_gc.max_bytes` (250 GB, 3.11); `auth` (service base URLs, secret names, git author name and email). `webhook_comment.sources.<name>`
 adds `allowed_permissions`, `max_files`, `max_lines`, `bot_author`, `bot_email`, `skip_marker`.
 
 Each section is one JSON document keyed `config.<section>` in the `settings` table (5.2); the serde struct in
@@ -1098,7 +1629,8 @@ action's `token_ref`, which is injected per job.
   command.
 - Shipped action files: `youtrack.yml` (interval 5m), `audit-run.yml` (interval 5m), `closed-issue-summary.yml` (interval
   24h). `examples/release-notes.yml` (weekly, gated in its input) is an example and is not seeded into a new install.
-- Restart safety: `GET /api/status` and the About page expose a `quiet` flag that is true only when no run is open and
+- The shared Cargo target directories (`SPEC-3.10`) live under the `/data` volume, which is disk-backed.
+- Restart safety: `GET /api/status` and the Status page expose a `quiet` flag that is true only when no run is open and
   no run is dispatched.
 
 ### 9.1 Entrypoint and UID/GID remap (`SPEC-9.1`)
