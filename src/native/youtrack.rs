@@ -4134,6 +4134,34 @@ fn gate_failure_comment(r: &ClaudeResult, pr_url: &str, command: &str, output: &
     .join("\n")
 }
 
+/// CLAUDE-521: write `body` to a scratch file under `std::env::temp_dir()`
+/// for a `Forge` call that reads its comment/PR body from disk, named
+/// uniquely per call (not just per `prefix`) via `tempfile`'s atomic
+/// create-with-random-suffix. Two concurrent callers racing on the same
+/// logical key (an issue key, a PR number) therefore never write, read, or
+/// remove the same path, unlike a fixed `<prefix>-<key>.md` name.
+fn scratch_file(prefix: &str, body: &str) -> Result<tempfile::TempPath> {
+    use std::io::Write as _;
+    let mut f = tempfile::Builder::new()
+        .prefix(&format!("{prefix}-"))
+        .suffix(".md")
+        .tempfile_in(std::env::temp_dir())?;
+    f.write_all(body.as_bytes())?;
+    Ok(f.into_temp_path())
+}
+
+/// Remove a [`scratch_file`] path, logging anything but a benign
+/// already-gone file, exactly like the pre-CLAUDE-521 `remove_file` calls
+/// this replaces.
+fn remove_scratch_file(scratch: tempfile::TempPath, what: &str) {
+    let path = scratch.to_path_buf();
+    if let Err(e) = scratch.close() {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            error!(path = %path.display(), error = %e, "removing the {what} scratch file failed");
+        }
+    }
+}
+
 /// Post a [`gate_failure_comment`]-shaped notice naming `output` as a
 /// comment on PR `pr_number`, through a scratch file since
 /// [`Forge::pr_comment`] reads its body from disk (mirrors
@@ -4150,14 +4178,9 @@ fn post_gate_failure_on_pr(
     let body = format!(
         "SPEC-3.3.2 verification gate: the runner's own `just {command}` failed:\n\n{output}"
     );
-    let scratch = std::env::temp_dir().join(format!("claude-run-gate-pr-comment-{key}.md"));
-    std::fs::write(&scratch, &body)?;
+    let scratch = scratch_file(&format!("claude-run-gate-pr-comment-{key}"), &body)?;
     let result = forge.pr_comment(host, repo, pr_number, &scratch);
-    if let Err(e) = std::fs::remove_file(&scratch) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            error!(path = %scratch.display(), error = %e, "removing the gate-failure PR comment scratch file failed");
-        }
-    }
+    remove_scratch_file(scratch, "gate-failure PR comment");
     result
 }
 
@@ -4204,14 +4227,9 @@ fn post_review_findings_on_pr(
     findings: &str,
 ) -> Result<()> {
     let body = format!("Post-success review findings:\n\n{findings}");
-    let scratch = std::env::temp_dir().join(format!("claude-run-review-pr-comment-{key}.md"));
-    std::fs::write(&scratch, &body)?;
+    let scratch = scratch_file(&format!("claude-run-review-pr-comment-{key}"), &body)?;
     let result = forge.pr_comment(host, repo, pr_number, &scratch);
-    if let Err(e) = std::fs::remove_file(&scratch) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            error!(path = %scratch.display(), error = %e, "removing the review PR comment scratch file failed");
-        }
-    }
+    remove_scratch_file(scratch, "review PR comment");
     result
 }
 
@@ -4387,20 +4405,14 @@ fn salvage_timeout_work(
                     timeout,
                     report.commit_error.as_deref(),
                 );
-                let scratch = std::env::temp_dir()
-                    .join(format!("claude-run-timeout-pr-comment-{}.md", job.key));
-                match std::fs::write(&scratch, &body) {
-                    Ok(()) => {
+                match scratch_file(&format!("claude-run-timeout-pr-comment-{}", job.key), &body) {
+                    Ok(scratch) => {
                         if let Err(e) = forge.pr_comment(&host, &job.repo_path, pr_number, &scratch)
                         {
                             error!(key = %job.key, pr_number, error = %e, "timeout salvage: posting the PR comment failed");
                             report.comment_error = Some(e.to_string());
                         }
-                        if let Err(e) = std::fs::remove_file(&scratch) {
-                            if e.kind() != std::io::ErrorKind::NotFound {
-                                error!(path = %scratch.display(), error = %e, "timeout salvage: removing the PR comment scratch file failed");
-                            }
-                        }
+                        remove_scratch_file(scratch, "timeout-salvage PR comment");
                     }
                     Err(e) => {
                         error!(key = %job.key, pr_number, error = %e, "timeout salvage: writing the PR comment scratch file failed");
@@ -4858,6 +4870,32 @@ mod tests {
         drop(guard);
         let out = buf.lock().unwrap().clone();
         String::from_utf8(out).unwrap()
+    }
+
+    /// CLAUDE-521: two concurrent scratch-file writers racing on the exact
+    /// same logical key (here, a fixed prefix standing in for an issue key
+    /// or PR number) must never land on the same path. Before the fix,
+    /// `scratch_file` built a fixed `<prefix>.md` name, so both threads
+    /// wrote, and one clobbered the other's body; `tempfile`'s atomic
+    /// random-suffix creation makes every call land on a distinct path.
+    #[test]
+    fn scratch_file_is_unique_for_concurrent_calls_with_the_same_prefix() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            scratch_file("claude-run-race-test-MK-1", "one").unwrap()
+        });
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            scratch_file("claude-run-race-test-MK-1", "two").unwrap()
+        });
+        let p1 = t1.join().unwrap();
+        let p2 = t2.join().unwrap();
+        assert_ne!(p1.to_path_buf(), p2.to_path_buf());
+        assert_eq!(std::fs::read_to_string(&p1).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(&p2).unwrap(), "two");
     }
 
     /// The pre step clones the URL the FORGE resolves from its key
@@ -8224,10 +8262,14 @@ mod tests {
             .join(".claude-run-pr-body.md")
             .to_string_lossy()
             .to_string();
-        let gate_comment_path = std::env::temp_dir()
-            .join("claude-run-gate-pr-comment-MK-16.md")
-            .to_string_lossy()
-            .to_string();
+        // CLAUDE-521: the scratch file carries a random suffix now, so the
+        // stub can only match a prefix up to the fixed part of the name.
+        let gate_comment_prefix = format!(
+            "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {}",
+            std::env::temp_dir()
+                .join("claude-run-gate-pr-comment-MK-16-")
+                .display()
+        );
         let runner = Arc::new(
             StubRunner::new()
                 .ok(
@@ -8295,19 +8337,7 @@ mod tests {
                     ],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
-                .ok(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "comment",
-                        "contoso/claude-run#7",
-                        "--body-file",
-                        gate_comment_path.as_str(),
-                    ],
-                    "",
-                )
+                .ok_prefix(&gate_comment_prefix, "")
                 .ok_prefix("yt issue comment MK-16", "")
                 .ok(
                     "yt",
@@ -10438,8 +10468,14 @@ mod tests {
             .join(".claude-run-pr-body.md")
             .to_string_lossy()
             .to_string();
-        let scratch = std::env::temp_dir().join("claude-run-timeout-pr-comment-MK-16.md");
-        let _ = std::fs::remove_file(&scratch);
+        // CLAUDE-521: the scratch file carries a random suffix now, so the
+        // stub and the later assertion can only match a prefix.
+        let comment_prefix = format!(
+            "fj --host dev.a8n.run pr comment contoso/claude-run#9 --body-file {}",
+            std::env::temp_dir()
+                .join("claude-run-timeout-pr-comment-MK-16-")
+                .display()
+        );
 
         let runner = Arc::new(
             StubRunner::new()
@@ -10517,19 +10553,7 @@ mod tests {
                     ],
                     r#"{"number":9,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/9"}"#,
                 )
-                .ok(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "comment",
-                        "contoso/claude-run#9",
-                        "--body-file",
-                        scratch.to_string_lossy().as_ref(),
-                    ],
-                    "",
-                )
+                .ok_prefix(&comment_prefix, "")
                 .ok(
                     "yt",
                     &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
@@ -10574,11 +10598,10 @@ mod tests {
             calls.iter().any(|c| c.contains("WIP: feat: agent work")),
             "the draft PR title must carry the WIP: prefix: {calls:?}"
         );
-        let expect_comment_call = format!(
-            "fj --host dev.a8n.run pr comment contoso/claude-run#9 --body-file {}",
-            scratch.display()
+        assert!(
+            calls.iter().any(|c| c.starts_with(&comment_prefix)),
+            "{calls:?}"
         );
-        assert!(calls.iter().any(|c| c == &expect_comment_call), "{calls:?}");
         assert!(
             calls
                 .iter()
@@ -10591,7 +10614,6 @@ mod tests {
                 .any(|c| c == "git log -1 --format=%b feat/x"),
             "the runner-written draft body must not be derived from the tip commit's own body: {calls:?}"
         );
-        let _ = std::fs::remove_file(&scratch);
     }
 
     #[test]
@@ -10608,8 +10630,14 @@ mod tests {
             .join(".claude-run-pr-body.md")
             .to_string_lossy()
             .to_string();
-        let scratch = std::env::temp_dir().join("claude-run-timeout-pr-comment-MK-16.md");
-        let _ = std::fs::remove_file(&scratch);
+        // CLAUDE-521: the scratch file carries a random suffix now, so the
+        // stub can only match a prefix up to the fixed part of the name.
+        let comment_prefix = format!(
+            "fj --host dev.a8n.run pr comment contoso/claude-run#9 --body-file {}",
+            std::env::temp_dir()
+                .join("claude-run-timeout-pr-comment-MK-16-")
+                .display()
+        );
 
         let runner = Arc::new(
             StubRunner::new()
@@ -10682,19 +10710,7 @@ mod tests {
                     ],
                     r#"{"number":9,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/9"}"#,
                 )
-                .ok(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "comment",
-                        "contoso/claude-run#9",
-                        "--body-file",
-                        scratch.to_string_lossy().as_ref(),
-                    ],
-                    "",
-                )
+                .ok_prefix(&comment_prefix, "")
                 .ok(
                     "yt",
                     &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
@@ -10736,7 +10752,6 @@ mod tests {
                     && !c.contains("WIP: WIP:")),
             "a tip already carrying the WIP: prefix must not be double-prefixed: {calls:?}"
         );
-        let _ = std::fs::remove_file(&scratch);
     }
 
     #[test]
@@ -10852,8 +10867,14 @@ mod tests {
             .join(".claude-run-pr-body.md")
             .to_string_lossy()
             .to_string();
-        let scratch = std::env::temp_dir().join("claude-run-timeout-pr-comment-MK-16.md");
-        let _ = std::fs::remove_file(&scratch);
+        // CLAUDE-521: the scratch file carries a random suffix now, so the
+        // stub can only match a prefix up to the fixed part of the name.
+        let comment_prefix = format!(
+            "fj --host dev.a8n.run pr comment contoso/claude-run#9 --body-file {}",
+            std::env::temp_dir()
+                .join("claude-run-timeout-pr-comment-MK-16-")
+                .display()
+        );
 
         let runner = Arc::new(
             StubRunner::new()
@@ -10931,20 +10952,7 @@ mod tests {
                     ],
                     r#"{"number":9,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/9"}"#,
                 )
-                .fail(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "comment",
-                        "contoso/claude-run#9",
-                        "--body-file",
-                        scratch.to_string_lossy().as_ref(),
-                    ],
-                    1,
-                    "comment rejected",
-                )
+                .fail_prefix(&comment_prefix, 1, "comment rejected")
                 .ok(
                     "yt",
                     &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
@@ -10979,7 +10987,6 @@ mod tests {
                 head_branch: Some("feat/x".into()),
             }
         );
-        let _ = std::fs::remove_file(&scratch);
     }
 
     #[test]
@@ -13847,20 +13854,13 @@ mod tests {
                     ],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
-                .ok(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "comment",
-                        "contoso/claude-run#7",
-                        "--body-file",
+                .ok_prefix(
+                    &format!(
+                        "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {}",
                         std::env::temp_dir()
-                            .join("claude-run-review-pr-comment-MK-16.md")
-                            .to_string_lossy()
-                            .as_ref(),
-                    ],
+                            .join("claude-run-review-pr-comment-MK-16-")
+                            .display()
+                    ),
                     "",
                 )
                 .ok(
@@ -14005,20 +14005,13 @@ mod tests {
                     ],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
-                .ok(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "comment",
-                        "contoso/claude-run#7",
-                        "--body-file",
+                .ok_prefix(
+                    &format!(
+                        "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {}",
                         std::env::temp_dir()
-                            .join("claude-run-review-pr-comment-MK-16.md")
-                            .to_string_lossy()
-                            .as_ref(),
-                    ],
+                            .join("claude-run-review-pr-comment-MK-16-")
+                            .display()
+                    ),
                     "",
                 )
                 .ok(
@@ -14146,20 +14139,13 @@ mod tests {
                     ],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
-                .ok(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "comment",
-                        "contoso/claude-run#7",
-                        "--body-file",
+                .ok_prefix(
+                    &format!(
+                        "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {}",
                         std::env::temp_dir()
-                            .join("claude-run-review-pr-comment-MK-16.md")
-                            .to_string_lossy()
-                            .as_ref(),
-                    ],
+                            .join("claude-run-review-pr-comment-MK-16-")
+                            .display()
+                    ),
                     "",
                 )
                 .ok(

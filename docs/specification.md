@@ -1718,3 +1718,14 @@ never write the same registry destination.
   on.
 - Timeouts: per-job `claude` wall clock (default 600 seconds), review session (1800), CI-failure analysis (600).
 - Time rendering: stored UTC timestamps are rendered through the `preferences` timezone, locale and format.
+- Storage latency (`SPEC-10.1`):
+  - **SPEC-10.1.1**: Storage with the latency and throughput of spinning disks is a supported environment, including a
+    volume that mixes SSD, HDD and NVMe devices (for example a RAID logical volume). Slower disk I/O MUST make an
+    operation take longer and MUST NOT make it fail or give a wrong result.
+  - **SPEC-10.1.2**: A deadline, pool acquire timeout or retry budget on an operation backed by disk I/O (database
+    access, git, builds, log and state writes) MUST be sized to catch a stalled operation, not an expected-slow one, and
+    MUST NOT be the only thing standing between a slow disk and a failure.
+  - **SPEC-10.1.3**: The unit-test suite, on SQLite and on PostgreSQL, MUST pass on such storage without a test-specific
+    timeout increase, retry or skip. A test that fails only when disk I/O is slow is a defect in the code or the fixture.
+  - **SPEC-10.1.4**: A timeout, pool exhaustion or similar failure caused by slow disk I/O MUST be reported as that
+    failure with the operation and its elapsed time, and MUST NOT be retried silently or recorded as success.
