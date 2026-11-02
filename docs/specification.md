@@ -1143,6 +1143,28 @@ domain-specific variants (action validation, snippet and provider-CLI failures, 
 secret resolution) carry structured fields (name, field, path, exit code, stderr) so the closed failure message a
 caller renders names the specific thing that went wrong instead of a generic wrapper message.
 
+### 5.6 Postgres test fixture (`SPEC-5.6`)
+
+With `CLAUDE_RUN_TEST_DATABASE_URL` set, every test fixture pool runs on that PostgreSQL server (`db::test_pool`). The
+shared contract for such fixtures is section 12 of the `common` specification; the requirements below are claude-run's
+implementation of it.
+
+- **SPEC-5.6.1**: Each fixture pool MUST get a schema of its own, named from the process id and a per-process counter,
+  and every connection of the pool MUST select it through `search_path`.
+- **SPEC-5.6.2**: The fixture MUST build one script per test process by joining the SQL of `POSTGRES_MIGRATOR` in
+  version order, and MUST NOT rebuild it per test.
+- **SPEC-5.6.3**: The fixture MUST create the schema and run that script in one transaction on one connection, and
+  MUST NOT write `_sqlx_migrations` rows into a fixture schema.
+- **SPEC-5.6.4**: The fixture MUST drop the schema with `DROP SCHEMA ... CASCADE` when the last handle of the pool is
+  dropped or the pool is closed. One worker thread per test process does all the dropping over a single connection, so
+  cleanup adds one server connection however many tests run in parallel, and drops every schema already waiting in one
+  statement so a backlog clears in one commit. It is a thread of its own because the test's runtime is gone by then.
+- **SPEC-5.6.5**: A failed drop MUST print one line to standard error naming the schemas it was dropping and the database error.
+- **SPEC-5.6.6**: Once per test process, before the first schema is created, the fixture MUST fail naming the database
+  when `public._sqlx_migrations` exists, since that marks a database a runner has migrated (CLAUDE-403).
+- **SPEC-5.6.7**: A test MUST apply `POSTGRES_MIGRATOR` itself into a schema of its own and assert that it recorded
+  every migration, so the production path stays exercised while fixtures bypass it.
+
 ## 6. Configuration
 
 ### 6.1 Environment variables (`SPEC-6.1`)
