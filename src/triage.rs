@@ -631,6 +631,9 @@ impl FailureClassifier for AnalysisClassifier {
             &cancel,
             // Cap the child at the caller's remaining per-delivery ceiling.
             Some(spend.remaining_usd()),
+            // The CI-failure analysis session reads a log, not a repo
+            // workdir (SPEC-3.10 scopes the shared cache to those).
+            None,
         )?;
         // Fold this call's tokens and cost into the caller's own
         // ledger; the caller (the webhook mint consumer) owns the ledger and
