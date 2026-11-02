@@ -1642,6 +1642,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cargo_cache_max_bytes_per_repo_defaults_round_trips_and_rejects_zero() {
+        let pool = pool().await;
+        let live = LiveSettings::new(pool.clone(), eff_default(), None);
+
+        let default: CargoCacheConfig =
+            serde_json::from_str(&live.section_json(Section::CargoCache).await).unwrap();
+        assert!(default.enabled);
+        assert_eq!(default.max_bytes_per_repo, 60 * 1024 * 1024 * 1024);
+
+        live.save_section(
+            Section::CargoCache,
+            r#"{"enabled":true,"max_bytes_per_repo":1000}"#,
+        )
+        .await
+        .expect("a >= 1-byte ceiling is valid");
+        assert_eq!(
+            live.cargo_cache_handle().read().await.max_bytes_per_repo,
+            1000
+        );
+
+        let err = live
+            .save_section(
+                Section::CargoCache,
+                r#"{"enabled":true,"max_bytes_per_repo":0}"#,
+            )
+            .await
+            .expect_err("a 0-byte ceiling must be rejected");
+        assert!(matches!(err, SaveError::Invalid(_)), "{err}");
+        assert_eq!(
+            live.cargo_cache_handle().read().await.max_bytes_per_repo,
+            1000,
+            "a rejected save leaves the live handle unchanged"
+        );
+    }
+
     // ---- stream-log GC section ---------------------------------
 
     #[tokio::test]
