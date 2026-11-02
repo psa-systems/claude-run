@@ -118,6 +118,18 @@ pub fn build_body(ctx: &PushCommentContext<'_>) -> String {
     crate::run_footer::append_run(&body, ctx.public_url, ctx.run_id, ctx.started)
 }
 
+/// One lock per scratch path, so posts for different PRs still run in parallel.
+fn scratch_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<std::path::PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(path.to_path_buf()).or_default().clone()
+}
+
 /// SPEC-8.8: post the push comment through `forge.pr_comment`, body written to
 /// a scratch file under `scratch_dir` (the caller's choice of
 /// [`crate::provider::cli::CliBackend::git_dir_scratch`]-style git-directory
@@ -138,6 +150,12 @@ pub fn post(
         "claude-run-push-comment-{pr_number}-{}.md",
         ctx.event.label().replace([' ', '(', ')'], "_")
     ));
+    // The name is fixed per PR and event, so two concurrent posts would write,
+    // read and delete each other's file; hold the path's lock across all three.
+    let _scratch_guard = scratch_lock(&scratch);
+    let _held = _scratch_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Err(e) = std::fs::write(&scratch, &body) {
         tracing::error!(pr_number, event = ctx.event.label(), error = %e, "writing the push comment scratch file failed");
         return Some(format!(
@@ -321,8 +339,10 @@ mod tests {
             _host: &str,
             _repo: &str,
             _pr_number: u64,
-            _body_file: &Path,
+            body_file: &Path,
         ) -> crate::error::Result<()> {
+            // Read the body like a real forge, so a vanished scratch file shows as a different error.
+            std::fs::read_to_string(body_file)?;
             Err(crate::error::Error::Other(anyhow::anyhow!(
                 "pr comment boom"
             )))
@@ -344,5 +364,29 @@ mod tests {
         let failure = failure.expect("a failing pr_comment call must be reported");
         assert!(failure.starts_with("PR comment for resumed-run push failed:"));
         assert!(failure.contains("pr comment boom"));
+    }
+
+    #[test]
+    fn concurrent_posts_for_one_pr_and_event_never_lose_their_scratch_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let forge = FailingForge;
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    for _ in 0..50 {
+                        let failure = post(
+                            &forge,
+                            "dev.a8n.run",
+                            "psa-systems/claude-run",
+                            7,
+                            dir.path(),
+                            &ctx(PushEvent::ResumedRunPush, CommitSubjects::Listed(vec![])),
+                        )
+                        .expect("a failing pr_comment call must be reported");
+                        assert!(failure.contains("pr comment boom"), "{failure}");
+                    }
+                });
+            }
+        });
     }
 }

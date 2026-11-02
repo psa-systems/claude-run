@@ -44,7 +44,7 @@ use std::time::{Duration, SystemTime};
 
 use tracing::{debug, error, info, warn};
 
-use crate::config::{DockerGcConfig, StreamLogGcConfig, WorkdirGcConfig};
+use crate::config::{CargoCacheConfig, DockerGcConfig, StreamLogGcConfig, WorkdirGcConfig};
 
 const SECS_PER_DAY: u64 = 86_400;
 
@@ -712,6 +712,110 @@ pub(crate) fn dir_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Recursively sum the byte size of every regular file under `path`, like
+/// [`dir_size`], but propagating the first I/O error instead of treating an
+/// unreadable entry as zero. [`sweep_cargo_cache`] needs this variant because
+/// a failed size read must skip the directory and log at `error` rather than
+/// silently reading as "zero bytes, well under ceiling".
+fn dir_size_checked(path: &Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            total += dir_size_checked(&entry.path())?;
+        } else {
+            total += entry.metadata()?.len();
+        }
+    }
+    Ok(total)
+}
+
+// ---- Shared Cargo target directory per-repo ceiling (CLAUDE-512) ----------
+
+/// `SPEC-3.10` item 6: walk the immediate subdirectories of `base` (each one
+/// a `repo_slug()`-named shared `cargo-target/<repo-slug>` directory) and
+/// delete any directory over `cfg.max_bytes_per_repo` once no run for that
+/// repo is in flight, logged at `warn` with the repo, size, and ceiling. The
+/// next run for that repo rebuilds cold.
+///
+/// `in_flight_repos` is injected: `Some(set)` names every repo-slug with a run
+/// currently in flight (production resolves this from
+/// [`crate::daemon::inflight_stream_log_jobs`] plus each job's git remote);
+/// `None` means that evidence could not be obtained this pass (e.g. the DB
+/// query failed), in which case every over-ceiling directory is kept and
+/// logged at `error` rather than risked deleted blind. A directory whose size
+/// cannot be read is likewise kept and logged at `error`, and does not count
+/// against `deleted`.
+pub fn sweep_cargo_cache(
+    base: &Path,
+    cfg: &CargoCacheConfig,
+    in_flight_repos: Option<&HashSet<String>>,
+) -> SweepStats {
+    let mut stats = SweepStats::default();
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                error!(dir = %base.display(), error = %e, "cargo cache GC: cannot list cache base directory");
+            }
+            return stats;
+        }
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let repo = entry.file_name().to_string_lossy().into_owned();
+        let size = match dir_size_checked(&path) {
+            Ok(size) => size,
+            Err(e) => {
+                error!(repo = %repo, path = %path.display(), error = %e, "cargo cache GC: size read failed, keeping");
+                stats.kept += 1;
+                continue;
+            }
+        };
+        if size <= cfg.max_bytes_per_repo {
+            stats.kept += 1;
+            continue;
+        }
+        match in_flight_repos {
+            None => {
+                error!(
+                    repo = %repo,
+                    size,
+                    ceiling = cfg.max_bytes_per_repo,
+                    "cargo cache GC: over ceiling but in-flight evidence unavailable, keeping"
+                );
+                stats.kept += 1;
+            }
+            Some(set) if set.contains(&repo) => {
+                debug!(repo = %repo, size, ceiling = cfg.max_bytes_per_repo, "cargo cache GC: over ceiling but a run is in flight, keeping");
+                stats.kept += 1;
+            }
+            Some(_) => match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    warn!(
+                        repo = %repo,
+                        size,
+                        ceiling = cfg.max_bytes_per_repo,
+                        "cargo cache GC: repo over ceiling with no run in flight, deleted"
+                    );
+                    stats.deleted += 1;
+                    stats.bytes_reclaimed += size;
+                }
+                Err(e) => {
+                    warn!(repo = %repo, path = %path.display(), error = %e, "cargo cache GC: delete failed, keeping");
+                    stats.kept += 1;
+                }
+            },
+        }
+    }
+    stats
 }
 
 // ---- Docker sidecar named-volume sweep (CLAUDE-433) -----------------------
@@ -2723,5 +2827,75 @@ mod tests {
         assert_eq!(parse_docker_size("512MB"), 512_000_000);
         assert_eq!(parse_docker_size("1.2GB"), 1_200_000_000);
         assert_eq!(parse_docker_size("bogus"), 0);
+    }
+
+    // ---- cargo cache sweep (CLAUDE-512) -----------------------------------
+
+    fn cargo_cache_cfg(max_bytes_per_repo: u64) -> CargoCacheConfig {
+        CargoCacheConfig {
+            enabled: true,
+            max_bytes_per_repo,
+        }
+    }
+
+    /// Create `<base>/<repo>` with one file of `bytes` bytes inside.
+    fn make_repo_cache(base: &Path, repo: &str, bytes: usize) -> std::path::PathBuf {
+        let dir = base.join(repo);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file.bin"), vec![b'x'; bytes]).unwrap();
+        dir
+    }
+
+    #[test]
+    fn cargo_cache_under_ceiling_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_repo_cache(tmp.path(), "owner__repo", 100);
+        let stats = sweep_cargo_cache(tmp.path(), &cargo_cache_cfg(1_000), None);
+        assert!(dir.exists());
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.kept, 1);
+    }
+
+    #[test]
+    fn cargo_cache_over_ceiling_with_no_run_in_flight_is_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_repo_cache(tmp.path(), "owner__repo", 1_000);
+        let in_flight: HashSet<String> = HashSet::new();
+        let stats = sweep_cargo_cache(tmp.path(), &cargo_cache_cfg(100), Some(&in_flight));
+        assert!(
+            !dir.exists(),
+            "an over-ceiling repo with no run in flight must be deleted"
+        );
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.kept, 0);
+        assert!(stats.bytes_reclaimed >= 1_000);
+    }
+
+    #[test]
+    fn cargo_cache_over_ceiling_with_run_in_flight_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_repo_cache(tmp.path(), "owner__repo", 1_000);
+        let mut in_flight = HashSet::new();
+        in_flight.insert("owner__repo".to_string());
+        let stats = sweep_cargo_cache(tmp.path(), &cargo_cache_cfg(100), Some(&in_flight));
+        assert!(
+            dir.exists(),
+            "a repo with a run in flight must be kept even over ceiling"
+        );
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.kept, 1);
+    }
+
+    #[test]
+    fn cargo_cache_unavailable_in_flight_evidence_keeps_and_is_not_blind_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_repo_cache(tmp.path(), "owner__repo", 1_000);
+        let stats = sweep_cargo_cache(tmp.path(), &cargo_cache_cfg(100), None);
+        assert!(
+            dir.exists(),
+            "with no in-flight evidence an over-ceiling repo must be kept, not blind-deleted"
+        );
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.kept, 1);
     }
 }

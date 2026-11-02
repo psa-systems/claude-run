@@ -125,6 +125,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - `daemon.log`, `output.file` and `usage.jsonl` are bounded by SIZE on the same tick ([CLAUDE-257, CLAUDE-268](docs/conventions/retention.md#size-bounded-log-files-claude-257-claude-268))
 - `snippets/` and `webhook-logs/` are bounded by AGE on the same tick ([CLAUDE-262](docs/conventions/retention.md#snippet-and-webhook-log-sweeps-claude-262))
 - Over `docker_gc.max_bytes`, storage is reclaimed in a fixed order until under it; a run in flight skips the pass ([CLAUDE-516](docs/conventions/retention.md#docker-storage-ceiling-reclaim-spec-311-claude-516))
+- A repo's shared Cargo target cache over `cargo_cache.max_bytes_per_repo` is deleted once no run for that repo is in flight ([CLAUDE-512](docs/conventions/retention.md#per-repo-cargo-target-cache-ceiling-spec-310-item-6-claude-512))
 
 ## Phases
 

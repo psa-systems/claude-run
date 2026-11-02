@@ -4779,6 +4779,18 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "total ceiling across every Docker storage category (images, containers, local volumes, build cache); over it with no run in flight, storage is reclaimed in the SPEC-3.11 order until under it again; must be >= 1.",
             },
         ],
+        CargoCache => vec![
+            FieldDoc {
+                name: "enabled",
+                badge: "next sweep",
+                note: "master toggle; false parks the per-repo Cargo target cache sweep without losing the ceiling.",
+            },
+            FieldDoc {
+                name: "max_bytes_per_repo",
+                badge: "next sweep",
+                note: "size ceiling for each repo's shared cargo-target directory; over it with no run for that repo in flight, the directory is deleted and rebuilt cold on the next run; must be >= 1.",
+            },
+        ],
     }
 }
 
