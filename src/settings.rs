@@ -33,9 +33,10 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
-    AuthConfig, ClaudeConfig, ClaudeConfigHandle, CommentWebhookConfig, CommentWebhookSource,
-    ConcurrencyConfig, DbRetentionConfig, DockerGcConfig, MintConfig, OnDiskConfig, Paths,
-    PreferencesConfig, StreamLogGcConfig, WebhookConfig, WebhookSource, WorkdirGcConfig,
+    AuthConfig, CargoCacheConfig, ClaudeConfig, ClaudeConfigHandle, CommentWebhookConfig,
+    CommentWebhookSource, ConcurrencyConfig, DbRetentionConfig, DockerGcConfig, MintConfig,
+    OnDiskConfig, Paths, PreferencesConfig, StreamLogGcConfig, WebhookConfig, WebhookSource,
+    WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
@@ -70,11 +71,14 @@ pub enum Section {
     Auth,
     /// Docker sidecar named-volume GC retention window (CLAUDE-433).
     DockerGc,
+    /// Per-repo shared Cargo target directory size ceiling (CLAUDE-512,
+    /// `SPEC-3.10` item 6).
+    CargoCache,
 }
 
 impl Section {
     /// Every section, in display order (used by the Settings page). SPEC-6.3.
-    pub const ALL: [Section; 12] = [
+    pub const ALL: [Section; 13] = [
         Section::Mint,
         Section::Webhook,
         Section::WebhookComment,
@@ -85,6 +89,7 @@ impl Section {
         Section::Concurrency,
         Section::DbRetention,
         Section::DockerGc,
+        Section::CargoCache,
         Section::Claude,
         Section::Auth,
     ];
@@ -105,6 +110,7 @@ impl Section {
             Section::Claude => "config.claude",
             Section::Auth => "config.auth",
             Section::DockerGc => "config.docker_gc",
+            Section::CargoCache => "config.cargo_cache",
         }
     }
 
@@ -123,6 +129,7 @@ impl Section {
             Section::Claude => "claude",
             Section::Auth => "auth",
             Section::DockerGc => "docker_gc",
+            Section::CargoCache => "cargo_cache",
         }
     }
 
@@ -147,6 +154,7 @@ impl Section {
             Section::Claude => "Claude invocation",
             Section::Auth => "Service auth",
             Section::DockerGc => "Docker volume GC",
+            Section::CargoCache => "Cargo target cache",
         }
     }
 
@@ -165,6 +173,7 @@ impl Section {
             Section::Claude => "next invocation",
             Section::Auth => "live",
             Section::DockerGc => "next sweep",
+            Section::CargoCache => "next sweep",
         }
     }
 }
@@ -390,6 +399,10 @@ pub struct EffectiveRuntime {
     /// (never in `config.toml`), so the DB value or the built-in default (3
     /// days).
     pub docker_gc: DockerGcConfig,
+    /// Per-repo shared Cargo target directory size ceiling (`SPEC-3.10` item
+    /// 6). Brand-new section (never in `config.toml`), so the DB value or the
+    /// built-in default (60 GB).
+    pub cargo_cache: CargoCacheConfig,
 }
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
@@ -432,6 +445,9 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
     let docker_gc = get_json::<DockerGcConfig>(pool, Section::DockerGc.key())
         .await?
         .unwrap_or_default();
+    let cargo_cache = get_json::<CargoCacheConfig>(pool, Section::CargoCache.key())
+        .await?
+        .unwrap_or_default();
     Ok(EffectiveRuntime {
         mint,
         webhook,
@@ -445,6 +461,7 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
         claude,
         auth,
         docker_gc,
+        cargo_cache,
     })
 }
 
@@ -491,6 +508,17 @@ pub fn validate_docker_gc(cfg: &DockerGcConfig) -> std::result::Result<(), Strin
     }
     if cfg.max_bytes < 1 {
         return Err("max_bytes must be >= 1".to_string());
+    }
+    Ok(())
+}
+
+/// `SPEC-3.10` item 6, SPEC-6.3: validate a [`CargoCacheConfig`] before it is
+/// persisted: `max_bytes_per_repo` must be at least 1, since `0` would read
+/// as "always over the ceiling" on the very first measurement rather than as
+/// a disabled bound.
+pub fn validate_cargo_cache(cfg: &CargoCacheConfig) -> std::result::Result<(), String> {
+    if cfg.max_bytes_per_repo < 1 {
+        return Err("max_bytes_per_repo must be >= 1".to_string());
     }
     Ok(())
 }
@@ -682,6 +710,10 @@ pub struct LiveSettings {
     /// Docker sidecar named-volume GC config, read by the sweeper on each tick
     /// so a Settings save applies on the next sweep.
     docker_gc: Arc<RwLock<DockerGcConfig>>,
+    /// Per-repo shared Cargo target directory size ceiling, read by the
+    /// sweeper on each tick so a Settings save applies on the next sweep.
+    /// CLAUDE-512, `SPEC-3.10` item 6.
+    cargo_cache: Arc<RwLock<CargoCacheConfig>>,
 }
 
 impl LiveSettings {
@@ -712,6 +744,7 @@ impl LiveSettings {
             claude: Arc::new(std::sync::RwLock::new(eff.claude)),
             auth: Arc::new(RwLock::new(eff.auth)),
             docker_gc: Arc::new(RwLock::new(eff.docker_gc)),
+            cargo_cache: Arc::new(RwLock::new(eff.cargo_cache)),
         };
         if let (Some(apply), Some(filter)) = (s.log_apply.as_ref(), eff.log_filter.as_ref()) {
             match apply(filter) {
@@ -801,6 +834,13 @@ impl LiveSettings {
         self.docker_gc.clone()
     }
 
+    /// Shared handle to the live Cargo cache ceiling config, read by the
+    /// sweeper on each tick so a Settings save applies on the next sweep.
+    /// CLAUDE-512, `SPEC-3.10` item 6.
+    pub fn cargo_cache_handle(&self) -> Arc<RwLock<CargoCacheConfig>> {
+        self.cargo_cache.clone()
+    }
+
     /// Shared handle to the live `claude` invocation defaults, read
     /// by [`crate::claude::ClaudeInvoker`] on each invocation so a Settings save
     /// applies to the next one without a daemon restart. SPEC-6.4.
@@ -827,6 +867,7 @@ impl LiveSettings {
             Section::Claude => to_pretty(&*read_claude(&self.claude)),
             Section::Auth => to_pretty(&*self.auth.read().await),
             Section::DockerGc => to_pretty(&*self.docker_gc.read().await),
+            Section::CargoCache => to_pretty(&*self.cargo_cache.read().await),
         }
     }
 
@@ -936,6 +977,12 @@ impl LiveSettings {
                 validate_docker_gc(&v).map_err(SaveError::Invalid)?;
                 set_json(&self.pool, section.key(), &v).await?;
                 *self.docker_gc.write().await = v;
+            }
+            Section::CargoCache => {
+                let v: CargoCacheConfig = parse(json)?;
+                validate_cargo_cache(&v).map_err(SaveError::Invalid)?;
+                set_json(&self.pool, section.key(), &v).await?;
+                *self.cargo_cache.write().await = v;
             }
         }
         Ok(())
@@ -1189,6 +1236,7 @@ mod tests {
             claude: ClaudeConfig::default(),
             auth: AuthConfig::default(),
             docker_gc: DockerGcConfig::default(),
+            cargo_cache: CargoCacheConfig::default(),
         }
     }
 

@@ -85,6 +85,13 @@ impl Paths {
         self.state_dir.join("webhook-logs")
     }
 
+    /// `SPEC-3.10` item 2: parent of every repo's shared Cargo target
+    /// directory (`<cargo_cache_dir>/<repo-slug>`), outside `workdirs/` so
+    /// the workdir GC sweep never reaches it.
+    pub fn cargo_cache_dir(&self) -> PathBuf {
+        self.data_dir.join("cache").join("cargo-target")
+    }
+
     /// The newline-delimited per-run usage record, one line per run,
     /// so runs are comparable over time without a provider console.
     pub fn usage_log(&self) -> PathBuf {
@@ -908,6 +915,38 @@ impl Default for DockerGcConfig {
             volume_retention_days: 3,
             // 250 GB, SPEC-3.11's assumed default.
             max_bytes: 250 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Size ceiling for each repo's shared Cargo target directory
+/// (`<data dir>/cache/cargo-target/<repo-slug>`, `SPEC-3.10`). A DB-backed
+/// runtime setting (settings key `config.cargo_cache`, editable on the web
+/// Settings page), reading this section off the shared handle so a Settings
+/// save applies on the next sweep. CLAUDE-512: nothing bounded these
+/// directories before; they grow as each repo's dependencies change and
+/// nothing ever reclaims them. SPEC-6.3.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CargoCacheConfig {
+    /// Master enable toggle. When `false`, no repo directory is ever deleted
+    /// by this sweep, so an operator can park the feature without losing the
+    /// configured ceiling.
+    pub enabled: bool,
+    /// Size ceiling, in bytes, per repo directory. Past it, once no run for
+    /// that repo is in flight, [`crate::gc::sweep_cargo_cache`] deletes the
+    /// whole directory; the next run for that repo rebuilds cold (`SPEC-3.10`
+    /// item 6). Default 60 GB (assumed; revise if measurement shows
+    /// otherwise). Validated on save as an integer `>= 1`.
+    pub max_bytes_per_repo: u64,
+}
+
+impl Default for CargoCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // 60 GB, SPEC-3.10 item 6's assumed default.
+            max_bytes_per_repo: 60 * 1024 * 1024 * 1024,
         }
     }
 }
