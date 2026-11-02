@@ -1530,7 +1530,7 @@ pub async fn action_has_active_run(pool: &DbPool, action: &str) -> Result<bool> 
     Ok(row.is_some())
 }
 
-/// One still-open run, for the About page's quiet indicator and the
+/// One still-open run, for the Status page.s quiet indicator and the
 /// `/api/status` activity block. SPEC-4.2.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ActiveRun {
@@ -1612,6 +1612,33 @@ pub async fn action_inflight_concurrency_keys(pool: &DbPool, action: &str) -> Re
         .into_owned(),
     ))
     .bind(action)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(k,)| k).collect())
+}
+
+/// The set of CONCURRENCY keys currently in flight across every still-open
+/// run of every action, not just one. The Status page's cargo-cache
+/// Management part (`SPEC-3.10` item 10) uses this to tell whether a run for
+/// a given repo is in flight: the default concurrency key is
+/// `project\u{1f}repo`, so a repo slug matches when it equals
+/// [`crate::native::youtrack::repo_slug`] of one `\u{1f}`-separated segment of
+/// one of these keys. NULL `concurrency_key` values (rows written before
+/// migration 0016) are ignored.
+pub async fn all_inflight_concurrency_keys(pool: &DbPool) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
+        SELECT DISTINCT rij.concurrency_key
+        FROM run_inflight_jobs rij
+        JOIN runs r ON r.id = rij.run_id
+        WHERE r.ended_at IS NULL
+          AND rij.concurrency_key IS NOT NULL
+        "#,
+        )
+        .into_owned(),
+    ))
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(k,)| k).collect())
@@ -2712,6 +2739,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys, vec!["BETA".to_string()]);
+    }
+
+    // `all_inflight_concurrency_keys` unions across every action, unlike
+    // `action_inflight_concurrency_keys` which is scoped to one, so the
+    // Status page's cargo-cache Management part can tell a repo is in flight
+    // no matter which action is running it.
+    #[tokio::test]
+    async fn all_inflight_concurrency_keys_unions_every_action() {
+        let pool = mem_pool().await;
+        let r1 = run_begin(&pool, "act-a", "scheduler").await.unwrap();
+        let r2 = run_begin(&pool, "act-b", "scheduler").await.unwrap();
+        run_inflight_add(&pool, r1, "ALPHA-1", "ALPHA\u{1f}owner/repo-a")
+            .await
+            .unwrap();
+        run_inflight_add(&pool, r2, "BETA-3", "BETA\u{1f}owner/repo-b")
+            .await
+            .unwrap();
+
+        let mut keys = all_inflight_concurrency_keys(&pool).await.unwrap();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "ALPHA\u{1f}owner/repo-a".to_string(),
+                "BETA\u{1f}owner/repo-b".to_string()
+            ]
+        );
+
+        // Finishing both runs drops their markers; nothing remains in flight.
+        run_finish(&pool, r1, crate::exit::OK, 1).await.unwrap();
+        run_finish(&pool, r2, crate::exit::OK, 1).await.unwrap();
+        assert!(all_inflight_concurrency_keys(&pool)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// The dashboard banner shows a poll-time access failure and
