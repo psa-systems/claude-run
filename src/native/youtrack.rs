@@ -2870,6 +2870,11 @@ enum ReviewOutcome {
 /// review session moved HEAD; a lookup failure is treated the same as "we
 /// cannot tell", which the caller folds into a conservative `NoVerdict`.
 fn git_head_sha(workdir: &Path) -> Option<String> {
+    // Bare `git` resolves through the process-wide `PATH`; serialize against
+    // the CLAUDE-410 PATH-stub test's mutation/deletion window the same way
+    // `comment_webhooks::git_output` does.
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
     let out = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(workdir)
@@ -4435,6 +4440,11 @@ fn salvage_timeout_work(
 /// (CLAUDE-432), because `git commit` runs the repo's `pre-commit` hook and a
 /// failing hook's report goes to stdout, not stderr.
 fn commit_timeout_wip(workdir: &Path, key: &str) -> std::result::Result<(), String> {
+    // Bare `git` resolves through the process-wide `PATH`; serialize against
+    // the CLAUDE-410 PATH-stub test's mutation/deletion window the same way
+    // `comment_webhooks::git_output` does.
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
     let add = Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -4916,6 +4926,7 @@ mod tests {
     /// Clone a tiny one-commit repo at `tmp/origin`, for a `run_pre` test
     /// that clones for real with no network.
     fn make_origin_repo(tmp: &Path) -> PathBuf {
+        let _path_guard = crate::testutil::path_env_lock();
         let origin = tmp.join("origin");
         std::fs::create_dir_all(&origin).unwrap();
         for args in [
@@ -7339,12 +7350,15 @@ mod tests {
 
         run_pre(&backend, &backend, &src(), &j, &wd, Some("fix/existing")).unwrap();
 
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&wd)
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .unwrap();
+        let out = {
+            let _path_guard = crate::testutil::path_env_lock();
+            Command::new("git")
+                .arg("-C")
+                .arg(&wd)
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .output()
+                .unwrap()
+        };
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "fix/existing");
         assert_eq!(std::fs::read_to_string(wd.join("f.txt")).unwrap(), "fix");
     }
@@ -8598,6 +8612,7 @@ mod tests {
     // ---- workdir preservation -------------------------------
 
     fn git_in(dir: &Path, args: &[&str]) {
+        let _path_guard = crate::testutil::path_env_lock();
         let out = Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -8872,18 +8887,21 @@ mod tests {
         git_in(&clone, &["add", "."]);
         git_in(&clone, &["commit", "-m", "fix: redact"]);
         git_in(&clone, &["push", "origin", "fix/redact-env-vars-on-export"]);
-        let sha = String::from_utf8(
-            Command::new("git")
-                .arg("-C")
-                .arg(&clone)
-                .args(["rev-parse", "fix/redact-env-vars-on-export"])
-                .output()
-                .expect("git runs")
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
+        let sha = {
+            let _path_guard = crate::testutil::path_env_lock();
+            String::from_utf8(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&clone)
+                    .args(["rev-parse", "fix/redact-env-vars-on-export"])
+                    .output()
+                    .expect("git runs")
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        };
 
         let body = pr_failure_comment(
             &ok_result(),
@@ -11031,12 +11049,15 @@ mod tests {
         repo_with_commit(dir.path());
         std::fs::write(dir.path().join("dirty.txt"), "uncommitted\n").unwrap();
         commit_timeout_wip(dir.path(), "MK-16").unwrap();
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir.path())
-            .args(["log", "-1", "--format=%B"])
-            .output()
-            .unwrap();
+        let out = {
+            let _path_guard = crate::testutil::path_env_lock();
+            Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["log", "-1", "--format=%B"])
+                .output()
+                .unwrap()
+        };
         let message = String::from_utf8_lossy(&out.stdout);
         assert!(
             message.trim_end().ends_with("#MK-16"),
