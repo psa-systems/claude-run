@@ -5280,14 +5280,31 @@ async fn post_branch_updated_push_comment(
             run_id: None,
             started: None,
         };
-        crate::push_comment::post(
-            forge.as_ref(),
-            &host,
-            &repo,
-            pr_number,
-            &std::env::temp_dir(),
-            &ctx,
-        )
+        // A directory scoped to this one call, not the bare shared
+        // `std::env::temp_dir()` (CLAUDE-519): `push_comment::post` names its
+        // scratch file deterministically from `pr_number` and the event, so
+        // two concurrent calls sharing a directory for the same PR (routing
+        // decisions on the same PR racing, or just parallel tests driving
+        // the same fixture PR number) could truncate or delete the scratch
+        // file the other was about to read, recording an empty or
+        // wrong comment body on the forge. There is no local git clone here
+        // (a server-side "update branch from base" forge operation), so,
+        // unlike `CliBackend`'s `git_dir_scratch`, there is no workdir to key
+        // a per-job scratch path off instead.
+        let scratch_dir =
+            std::env::temp_dir().join(format!("claude-run-push-comment-{}", secrets::unique_suffix()));
+        if let Err(e) = std::fs::create_dir_all(&scratch_dir) {
+            tracing::error!(pr_number, error = %e, "creating the push comment scratch directory failed");
+            return Some(format!(
+                "PR comment for {} failed: creating the scratch directory failed: {e}",
+                ctx.event.label()
+            ));
+        }
+        let result = crate::push_comment::post(forge.as_ref(), &host, &repo, pr_number, &scratch_dir, &ctx);
+        if let Err(e) = std::fs::remove_dir(&scratch_dir) {
+            tracing::error!(path = %scratch_dir.display(), error = %e, "removing the push comment scratch directory failed");
+        }
+        result
     })
     .await
     .unwrap_or_else(|e| Some(format!("push comment task panicked: {e}")))
@@ -11525,6 +11542,50 @@ mod tests {
                 pr_comments[0]
             );
             assert!(pr_comments[0].contains("MK-16"), "{:?}", pr_comments[0]);
+        }
+
+        /// CLAUDE-519: two concurrent branch-updated-from-base push comments
+        /// for the same PR number (two routing decisions racing, or just
+        /// parallel test threads sharing the fixture PR number 7) must not
+        /// corrupt each other's recorded body: before the fix, both shared
+        /// `std::env::temp_dir()` under a filename built only from
+        /// `pr_number` and the event, so one call's write could truncate the
+        /// scratch file the other was about to read.
+        #[tokio::test]
+        async fn concurrent_branch_updated_push_comments_for_the_same_pr_do_not_corrupt_each_other()
+        {
+            let backend = Arc::new(StoreBackend::new());
+            let forge: Arc<dyn crate::provider::Forge> = backend.clone();
+            let (left, right) = tokio::join!(
+                post_branch_updated_push_comment(
+                    forge.clone(),
+                    "dev.a8n.run",
+                    "contoso/claude-run",
+                    7,
+                    "MK-16",
+                    Some("aaaaaaaaaaaaaaaa"),
+                ),
+                post_branch_updated_push_comment(
+                    forge.clone(),
+                    "dev.a8n.run",
+                    "contoso/claude-run",
+                    7,
+                    "MK-17",
+                    Some("bbbbbbbbbbbbbbbb"),
+                ),
+            );
+            assert_eq!(left, None, "{left:?}");
+            assert_eq!(right, None, "{right:?}");
+            let pr_comments = backend.pr_comments();
+            assert_eq!(pr_comments.len(), 2, "{pr_comments:?}");
+            assert!(
+                pr_comments.iter().any(|c| c.contains("MK-16")),
+                "lost or corrupted MK-16 body: {pr_comments:?}"
+            );
+            assert!(
+                pr_comments.iter().any(|c| c.contains("MK-17")),
+                "lost or corrupted MK-17 body: {pr_comments:?}"
+            );
         }
 
         /// A failed push-comment post never fails the branch update it
