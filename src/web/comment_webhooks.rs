@@ -1,4 +1,4 @@
-//! Comment-command webhook listener.
+//! Comment-command webhook listener. Implements SPEC-4.4.5.
 //!
 //! `POST /webhooks/{provider}/comment/{source}` receives `issue_comment`
 //! deliveries from the forge named by `{provider}` ([`super::webhooks::WebhookProvider`]:
@@ -194,7 +194,7 @@ pub enum CommandKind {
     Run { instruction: String },
 }
 
-/// The typed command emitted downstream for a verified, allow-listed, triggered
+/// SPEC-4.4.5: the typed command emitted downstream for a verified, allow-listed, triggered
 /// comment. Everything the consumer needs; no request state travels with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedCommentCommand {
@@ -272,6 +272,11 @@ fn thread_label(is_pull_request: bool) -> &'static str {
 
 // ---- trigger parsing -------------------------------------------------------
 
+/// SPEC-4.4.5: "A comment is a command only when its first line opens with
+/// the configured `trigger` followed by whitespace or end-of-line; everything
+/// after it on that line plus every remaining line is the instruction. An
+/// empty or `help` instruction is a help request; one over
+/// `max_instruction_chars` is refused by name rather than run."
 /// Classify a comment body against the configured `trigger`. `None` means the
 /// first line does not open with the trigger, i.e. an ordinary comment (acked and
 /// dropped at debug level, not an error).
@@ -311,6 +316,10 @@ fn forge_host_from_url(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
+/// SPEC-4.4.5: "A delivery is dropped (acked 2xx, logged with a reason,
+/// never a command) when its action is not `created`, its repo is not in
+/// `allowed_repos`, its author is a configured bot login, or its body does
+/// not start with the trigger."
 /// Build a [`VerifiedCommentCommand`] from an authenticated delivery, or the
 /// human-readable reason it was dropped. Every drop is acked with 2xx by the
 /// caller and logged with this reason, so no drop is silent.
@@ -368,6 +377,11 @@ pub fn verified_comment_command(
 
 // ---- listener state + router ----------------------------------------------
 
+/// SPEC-4.4.5: "the comment listener shares the triage listener's replay
+/// store instance, rate-limiter type and builder, and allow-list matcher by
+/// reference rather than by copy, so one delivery id fanned out to both
+/// endpoints is still caught once; its own write token and pause switch stay
+/// independent of the CI-failure listener's."
 /// State injected into the comment handler. Cheap to clone; every field is
 /// `Arc`-shaped and the config / limiter handles are the same ones
 /// [`crate::settings::LiveSettings`] swaps on save.
@@ -429,6 +443,7 @@ impl CommentWebhookState {
     }
 }
 
+/// SPEC-4.4.5: "`POST /webhooks/{provider}/comment/{source}`: Comment commands."
 /// Router carrying the per-source comment route, merged into the daemon's TCP
 /// app alongside the CI-failure webhook router. `{provider}` names the
 /// sending forge ([`WebhookProvider`]).
@@ -441,6 +456,12 @@ pub fn router(state: CommentWebhookState) -> Router {
         .with_state(state)
 }
 
+/// SPEC-4.4.5: the comment listener's pipeline, numbered 0-7 in the module
+/// doc comment above: provider/source resolution (404), rate limit (429),
+/// secret resolve (401), signature verify (401), delivery/replay (400/409),
+/// GitHub non-`issue_comment` drop (200), pause accept-and-drop (200),
+/// GitHub form decode and JSON parse (400), then dispatch (202) or an
+/// authenticated-but-dropped delivery (200).
 async fn forgejo_comment_webhook(
     State(st): State<CommentWebhookState>,
     Path((provider, source)): Path<(String, String)>,
@@ -656,6 +677,9 @@ async fn forgejo_comment_webhook(
     }
 }
 
+/// SPEC-4.4.5: "Resolve the source's HMAC secret from the secrets store;
+/// missing or unresolvable: 401" (the shared pipeline mechanics of SPEC-4.4
+/// apply unchanged to the comment listener).
 /// Resolve a source's HMAC secret to plaintext. Errors when the source has no
 /// `secret_ref` or the secret cannot be decrypted (both fail closed as 401).
 async fn resolve_secret(pool: &DbPool, src: &CommentWebhookSource) -> crate::error::Result<String> {
@@ -670,6 +694,11 @@ async fn resolve_secret(pool: &DbPool, src: &CommentWebhookSource) -> crate::err
 
 // ---- authorization gate ----------------------------------------------------
 
+/// SPEC-4.4.5: "A command is authorized by a LIVE read of the commenter's
+/// repository permission against the forge, never a cache or static list.
+/// The read failing, or the permission ranking below `allowed_permissions`,
+/// denies (fail closed) with a reply naming the reason; a synthetic
+/// (runner-dispatched) command skips only this check."
 /// Outcome of the live permission read. A lookup ERROR is a distinct variant so
 /// the reply can say "could not verify" rather than "you lack permission", but
 /// both deny (fail closed).
@@ -740,6 +769,9 @@ pub fn check_permission(
     }
 }
 
+/// SPEC-4.4.5: "At most one denial reply per (repo, commenter) every
+/// `DENIAL_REPLY_WINDOW_SECS`, so a scripted denied commenter cannot flood a
+/// PR with bot replies; the command is still dropped either way."
 /// Per-(repo, login) throttle for DENIAL replies, so a scripted denied commenter
 /// cannot flood a PR with bot replies. Built on the SHARED
 /// [`RateLimiter`]: one allowance per key per window.
@@ -794,6 +826,12 @@ pub struct CommentContext {
     pub readiness: Option<crate::readiness::ReadinessGate>,
 }
 
+/// SPEC-4.4.5: "Accepted commands leave the request path on an mpsc
+/// channel; the consumer does the authorization read and then the route's
+/// work, plus every reply, off the request path, each on its own task so two
+/// pull requests progress concurrently. At most one comment job per thread is
+/// served at a time (the per-(repo, PR-or-issue) key gate); a second command
+/// while one runs is told so and dropped rather than queued."
 /// Drain accepted commands for the daemon's lifetime. Each command is served on
 /// its own task so two PRs progress concurrently; the per-(repo, PR) key gate is
 /// what serializes work on ONE pull request.
@@ -825,6 +863,10 @@ struct ServeEnv {
     _creds: secrets::JobCredentials,
 }
 
+/// SPEC-4.4.5: drives one accepted command end to end: the comment-webhook
+/// pause check, write-token resolution, the per-thread key gate, the
+/// commenter authorization gate (SPEC-4.4.5), then dispatch by
+/// [`CommandKind`] (help, too-long refusal, or a real instruction).
 /// Serve one accepted command end to end: authorize, then help / refuse / run.
 async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
     // A command accepted before a pause was set must not act after it.
@@ -926,13 +968,18 @@ async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
     }
 }
 
-/// True when serving this command consumes an attempt / daily-ledger slot. Help
+/// SPEC-4.4.5: true when serving this command consumes an attempt / daily-ledger slot. Help
 /// and the oversize refusal reply and stop: no clone, no Claude run, and no
 /// attempt counted. Only a real instruction runs work.
 pub fn counts_attempt(kind: &CommandKind) -> bool {
     matches!(kind, CommandKind::Run { .. })
 }
 
+/// SPEC-4.4.5: "A comment command is a ONE-SHOT request: its effective
+/// per-key attempt cap is one however high the runner default is, and that
+/// counter (keyed by `hash(repo, number, comment_id)`) is the redelivery
+/// guard. Admission also checks the comment-webhook synthetic action's
+/// shared daily run ledger."
 /// Whether a command may run, given the reused counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
@@ -963,6 +1010,10 @@ pub fn admit(
     Admission::Run
 }
 
+/// SPEC-4.4.5: "A command is served by the source's own `write_token_ref`
+/// (GitHub-provider sources route through the GitHub forge backend, others
+/// through `fj`); a source with no write token cannot post comments or push
+/// and the command is dropped."
 /// Resolve the source's `write_token_ref` and build a forge backend that carries
 /// it, so the token never appears in YAML, env, a process argument, or a
 /// settings response. A GitHub-provider source (`src.provider`, the config's
@@ -1083,6 +1134,13 @@ async fn reply(
     }
 }
 
+/// SPEC-4.4.5: "A command refused before admission (Claude login required,
+/// over the daily run cap) advances no attempt counter and runs no `claude`;
+/// a replying refusal names the reason to the commenter rather than the
+/// CI-triage webhook's silent accept-and-drop. An admitted instruction's
+/// per-key attempt counter advances before the work runs." Also drives the
+/// PR-vs-plain-issue route split (SPEC-4.4.5) and the per-delivery spend
+/// ceiling.
 /// Work a real instruction: caps + dedupe, run row, then the route's work (the
 /// PR clone / Claude / decision gate / push, or the plain-issue
 /// mint), with a reply on EVERY outcome path.
@@ -1289,6 +1347,12 @@ impl RunOutcome {
     }
 }
 
+/// SPEC-4.4.5: "A pull-request comment command clones the PR's head branch,
+/// writes the human's instruction verbatim to a file outside the work tree
+/// (never interpolated into a command line), runs Claude against it, applies
+/// the decision gate (SPEC-4.4.5), pushes on a `Push` decision, and replies
+/// on the PR on every outcome path (pushed, no changes, unresolved conflicts,
+/// too big, or an error)."
 /// The whole blocking half of one instruction: resolve the PR's head branch,
 /// clone it, write the instruction file, run Claude, apply the decision gate,
 /// push, and reply on EVERY outcome path (pushed, no changes, too big, error).
@@ -1541,6 +1605,14 @@ fn serve_run(
     }
 }
 
+/// SPEC-4.4.5: "A comment command on a plain issue (not a pull request)
+/// clones nothing and runs no agent session: it resolves the repo's YouTrack
+/// project through the shared VCS route cache, creates an issue carrying the
+/// instruction verbatim and a link back to the forge issue, sets the target
+/// state, then `AI Agent` to the queued value LAST (so the `youtrack` native
+/// action only picks it up once it is fully formed), and replies on the
+/// forge issue naming the minted key on every outcome path (minted, create
+/// failed, queue failed)."
 /// The whole blocking half of one PLAIN-ISSUE instruction. There is
 /// no head branch to clone or push, so nothing is run here: resolve the repo's
 /// YouTrack project through the shared VCS route cache, create an issue carrying
@@ -1745,6 +1817,12 @@ fn build_prompt(
     lines.join("\n")
 }
 
+/// SPEC-4.4.5: "The decision gate classifies a completed PR-route run into
+/// no changes, unresolved conflicts (nothing staged/committed/pushed),
+/// a measurement failure (never read as no changes), a change over
+/// `max_files` / `max_lines` (too big, not pushed), or a push. Unmerged paths
+/// are checked before anything is staged, so a conflict left behind is never
+/// `git add`ed into a commit."
 /// The decision gate outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -1792,6 +1870,8 @@ impl Decision {
     }
 }
 
+/// SPEC-4.4.5: "A clean base merge with no other change (`commits >= 1,
+/// files == 0`) is still a push, never 'no changes'."
 /// Classify a completed run into a [`Decision`]. Pure, so the gate is unit
 /// tested without a workdir. `commits` is the number of commits made since the
 /// cloned head: a clean base merge with no other change is
@@ -1862,6 +1942,11 @@ fn git_output(workdir: &FsPath, args: &[&str]) -> crate::error::Result<String> {
     }
 }
 
+/// SPEC-4.4.5: "A merge commit (more than one parent) is measured by
+/// `--remerge-diff --numstat`, counting only the conflict resolution, never
+/// the lines the base branch brought in; an ordinary commit is measured by
+/// its own `--numstat`. `files` is the count of distinct paths across every
+/// commit in the range."
 /// The decision gate, run after a successful Claude session. Order matters:
 /// unmerged paths are checked BEFORE anything is staged, so a conflict left
 /// behind (markers and all) is never `git add`ed into a commit. Then the
@@ -1976,6 +2061,10 @@ fn numstat_files_and_lines(stdout: &str, files: &mut std::collections::HashSet<S
     lines
 }
 
+/// SPEC-4.4.5: "A `Push` decision pushes the PR's own head branch, then
+/// posts a CLAUDE-447 push comment naming the issue key (parsed from the
+/// pushed tip's commit body) and the commit range; a failure to post that
+/// comment is a note, not a fault, since the push itself already succeeded."
 /// Push the PR branch. Push-only: committing the leftovers now
 /// happens in [`run_decision_gate`], before the change is measured.
 fn push_fix(
@@ -2195,6 +2284,10 @@ fn post_reply(backend: &dyn Backend, cmd: &VerifiedCommentCommand, dir: &FsPath,
 
 // ---- reply bodies ----------------------------------------------------------
 
+/// SPEC-4.4.5: "Every outcome of a comment command (help, refused as too
+/// long, denied, dropped for being busy or over cap, a run fault, or a
+/// decision-gate outcome) is reported back as a reply on the originating
+/// thread; no outcome is silent."
 /// Usage reply for `/claude help`. The first two bullets differ by route: a pull
 /// request is worked in place, a plain issue mints a queued YouTrack issue.
 pub fn help_comment(trigger: &str, is_pull_request: bool) -> String {
@@ -2453,6 +2546,10 @@ fn first_line(s: &str) -> String {
         .to_string()
 }
 
+/// SPEC-4.4.5: "A served comment command, like every other job, records one
+/// `job_outcomes` row and finalizes through `RunGuard` so a failed finalize
+/// still closes the row as unexpected on drop (CLAUDE-402), rather than
+/// leaving a run open forever."
 /// Close a comment run: one `job_outcomes` row carrying the decision summary and
 /// the stream-log link, then finalize the run through its [`state::RunGuard`],
 /// so a failed finalize still leaves the row closed by the guard's `Drop`
@@ -2505,7 +2602,7 @@ async fn finish_comment_run(
     spend.finish(Some(run_id), exit_code);
 }
 
-/// Root the per-command credential dirs live under. One directory per command,
+/// SPEC-4.4.5: root the per-command credential dirs live under. One directory per command,
 /// removed when its [`secrets::JobCredentials`] guard drops.
 pub fn creds_root(paths: &Paths) -> PathBuf {
     paths.runtime_dir.join("comment-creds")
