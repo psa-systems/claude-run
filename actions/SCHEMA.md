@@ -1022,8 +1022,9 @@ Semantics:
 #### Overlapping runs and continuous pickup (CLAUDE-162)
 
 The daemon no longer serializes runs per action. An issue queued while a run is in flight is picked up by a new,
-**overlapping** run within `regather_interval` (a runtime setting, default 60s) rather than waiting for the in-flight run
-to drain, subject only to the concurrency caps above. The whole-run per-action file lock that used to force a full drain
+**overlapping** run once the action's `schedule` makes it due (SPEC-2.2: for `interval`, once `spec` has passed since the
+last run started) and `regather_interval` (a runtime setting, default 60s) has elapsed, rather than waiting for the
+in-flight run to drain, subject only to the concurrency caps above. For quick pickup, keep `spec` short. The whole-run per-action file lock that used to force a full drain
 is gone on the daemon path; a manual `trigger` during an in-flight run now starts an overlapping pickup run instead of
 being dropped. Two overlapping runs never both work the same job: each run drops gathered jobs whose **concurrency key**
 is already in flight in another open run (CLAUDE-163 widened this admission check from issue id to concurrency key, so a
@@ -1055,7 +1056,8 @@ action once immediately.
 `spec` is a [humantime](https://docs.rs/humantime) duration string
 (`90s`, `30m`, `2h`, `1h30m`). The action fires every N measured from the
 **last run's `started_at`**, not from a fixed wall-clock grid. An action
-that has never run fires on the next scheduler tick.
+that has never run fires on the next scheduler tick. A check that finds no work
+starts no run, so a due action keeps checking every `regather_interval` until one starts.
 
 ```yaml
 schedule:
@@ -1067,8 +1069,9 @@ schedule:
 
 `spec` is a cron expression: either the common **5-field** form (`minute hour day-of-month month day-of-week`) or a
 **6-field** seconds-precision form (`second minute hour dom month dow`). A 5-field expression is internally prefixed
-with `0 `, so it fires on the 0th second of the matching minute. The action fires at the next instant matching the
-expression after the last run.
+with `0 `, so it fires on the 0th second of the matching minute. Times are UTC. The action fires at the next instant
+matching the expression after the last run; one that has never run counts from when the daemon first sees it. A check
+that finds no work starts no run, so the action stays due and keeps checking every `regather_interval` until one starts.
 
 ```yaml
 schedule:

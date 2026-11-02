@@ -1,5 +1,6 @@
 //! The reusable pieces of a deep, log-grounded CI-failure
-//! analysis, used by the at-ingest [`crate::triage::AnalysisClassifier`]:
+//! analysis. Implements SPEC-3.5.1's LLM classifier session. Used by the
+//! at-ingest [`crate::triage::AnalysisClassifier`]:
 //! fetching the run log + workflow YAML, building the agentic prompt, and
 //! capping/formatting the analysis text for a comment. Originally shared with
 //! a scheduled analysis native handler that has since been retired.
@@ -8,12 +9,12 @@ use std::path::PathBuf;
 
 use crate::forge_log;
 
-/// Cap (bytes) on an analysis comment/description, so a runaway agent reply
-/// cannot blow the comment. Used by [`crate::mint::build_description`]
+/// SPEC-3.5.1: cap (bytes) on an analysis comment/description, so a runaway
+/// agent reply cannot blow the comment. Used by [`crate::mint::build_description`]
 /// to cap the [`crate::triage::AnalysisClassifier`]'s report.
 pub(crate) const DEFAULT_MAX_ANALYSIS_BYTES: usize = 24 * 1024;
 
-/// The redacted-log + workflow-YAML inputs claude reads.
+/// SPEC-3.5.1: the redacted-log + workflow-YAML inputs claude reads.
 pub(crate) struct AnalysisInputs {
     /// Path to the complete redacted run log written under the workdir.
     pub(crate) log_path: PathBuf,
@@ -59,7 +60,7 @@ pub(crate) fn cap_comment(text: &str, max_bytes: usize) -> String {
     )
 }
 
-/// The agentic-analysis prompt. Directs claude to identify the failing step by
+/// SPEC-3.5.1: the agentic-analysis prompt. Directs claude to identify the failing step by
 /// mapping log position to workflow step order, state the root-cause diagnostic
 /// or, when the log carries none, classify on the run's timing whether the job
 /// stopped emitting output and was killed or the run ended with no diagnostic,

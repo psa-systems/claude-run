@@ -39,7 +39,7 @@ pub mod comment_webhooks;
 pub mod native_forms;
 pub mod webhooks;
 
-/// Custom Askama filters. `{{ ts | datetime }}` renders a stored
+/// SPEC-6.3: custom Askama filters. `{{ ts | datetime }}` renders a stored
 /// RFC3339 UTC timestamp string through the live display preferences (timezone +
 /// strftime format). Askama filters are free functions, so the preferences come
 /// from the process-global snapshot kept current by `LiveSettings`. Malformed
@@ -58,12 +58,19 @@ const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
 // morph the DOM in place instead of replacing it (preserves selection/scroll).
 const IDIOMORPH_JS: &[u8] = include_bytes!("../../assets/idiomorph-ext.min.js");
 
+/// SPEC-4.3: shared handler state (the daemon's `AppState` plus config
+/// paths) threaded through every web UI route.
 #[derive(Clone)]
 pub struct WebState {
     pub api: Arc<AppState>,
     pub paths: Paths,
 }
 
+/// SPEC-4.3: mounts the full web UI page set listed in SPEC-4.3 onto one
+/// `Router`; see SPEC-4.3.1 through SPEC-4.3.13 for each page group's own
+/// requirement. Auth routes (`/login`, `/setup`, `/account/2fa/setup`,
+/// `/invite/{token}`, `/settings/accounts`) are mounted elsewhere (`src/auth.rs`
+/// / `src/web_admin.rs`), not in this router.
 pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
     let st = WebState { api, paths };
     Router::new()
@@ -190,6 +197,8 @@ struct ActionView {
     providers: String,
 }
 
+/// SPEC-4.3.1: one dashboard run-list row, including the in-flight
+/// `stage` and `failed_jobs` count the dashboard renders per run.
 #[derive(Serialize, sqlx::FromRow)]
 struct RunRow {
     id: i64,
@@ -242,6 +251,9 @@ impl RunRow {
     }
 }
 
+/// SPEC-4.3.10: one run-detail outcomes-table row for a single job
+/// attempt, including the "timed out" and free-text summary fields the
+/// run-detail page renders.
 #[derive(Serialize)]
 struct JobOutcomeRow {
     job_key: String,
@@ -306,10 +318,11 @@ impl JobOutcomeRow {
     }
 }
 
-/// Convert a job-outcome summary from Markdown to HTML. Raw HTML
-/// events in the source are demoted to text (which `push_html` escapes), never
-/// passed through: summaries are model output and must not inject markup into
-/// the page.
+/// SPEC-7: "Run summaries rendered in the UI are Markdown with raw HTML
+/// demoted to text." Convert a job-outcome summary from Markdown to HTML. Raw
+/// HTML events in the source are demoted to text (which `push_html` escapes),
+/// never passed through: summaries are model output and must not inject markup
+/// into the page.
 fn render_summary_markdown(md: &str) -> String {
     use pulldown_cmark::{html, Event, Parser};
     let parser = Parser::new(md).map(|ev| match ev {
@@ -393,9 +406,10 @@ struct DurationChart {
     count: usize,
 }
 
-/// Compute the duration-chart geometry from a `(started_at, duration_ms)`
-/// series ordered oldest to newest. Pure function of its input so it is
-/// unit-testable without a database. Caller guarantees `series` is non-empty.
+/// SPEC-4.3.2: the `/actions/{name}/durations` chart geometry. Compute the
+/// duration-chart geometry from a `(started_at, duration_ms)` series ordered
+/// oldest to newest. Pure function of its input so it is unit-testable without
+/// a database. Caller guarantees `series` is non-empty.
 fn build_duration_chart(series: &[(String, i64)]) -> DurationChart {
     let count = series.len();
     let plot_l = CHART_PAD_L;
@@ -562,8 +576,9 @@ fn usage_series(
     (polylines, markers)
 }
 
-/// Compute the usage-chart geometry from the report's chart series (oldest to
-/// newest). Caller guarantees `points` is non-empty.
+/// SPEC-4.3.13: the Reports page plan-usage chart geometry. Compute the
+/// usage-chart geometry from the report's chart series (oldest to newest).
+/// Caller guarantees `points` is non-empty.
 fn build_usage_chart(points: &[crate::report::ClaudeUsagePoint]) -> UsageChart {
     let count = points.len();
     let plot_l = CHART_PAD_L;
@@ -615,6 +630,9 @@ fn build_usage_chart(points: &[crate::report::ClaudeUsagePoint]) -> UsageChart {
 /// shared settings handles rather than a startup snapshot, so saving the
 /// first source (or removing the last one) for either section is reflected on
 /// the next page load with no restart.
+/// SPEC-4.3.1: "A configured event-driven listener surfaces as a
+/// synthetic, read-only action on the dashboard, with its own provider
+/// display names."
 async fn listener_providers(s: &WebState) -> (Option<String>, Option<String>) {
     let webhook_handle = s.api.settings.webhook_handle();
     let webhook = webhook_handle.read().await;
@@ -628,6 +646,8 @@ async fn listener_providers(s: &WebState) -> (Option<String>, Option<String>) {
     (webhook_providers, comment_providers)
 }
 
+/// SPEC-4.3.1: assembles the dashboard's action list, appending a
+/// synthetic entry per configured event-driven listener.
 async fn enriched_actions(
     pool: &DbPool,
     webhook_providers: Option<String>,
@@ -676,7 +696,11 @@ async fn enriched_actions(
     Ok(out)
 }
 
-/// Build the synthetic webhook action view (e.g. `webhook-triage`). Read-only and
+/// SPEC-4.3.1: "It has no backing YAML and is never indexed in the
+/// `actions` table; it participates in Pause like any other action, is always
+/// shown as enabled (it fires on deliveries, not a timer), and rejects edit,
+/// export and delete." Build the synthetic webhook action view (e.g.
+/// `webhook-triage`). Read-only and
 /// event-driven: no schedule, no file, always "enabled" (it fires on webhook
 /// deliveries, not a timer). Its `last_run_started` comes from the recorded
 /// webhook runs so the dashboard shows recency like any other action.
@@ -719,6 +743,8 @@ async fn synthetic_action_view(
 /// `providers`, joined with ", ". Used to describe a synthetic listener's
 /// configured sources without hardcoding a provider name that may not be
 /// configured.
+/// SPEC-4.3.1: sorted, de-duplicated provider display names for a
+/// synthetic listener's configured sources.
 fn provider_display_names(providers: impl Iterator<Item = webhooks::WebhookProvider>) -> String {
     let mut names: Vec<&'static str> = providers
         .map(|p| match p {
@@ -731,13 +757,14 @@ fn provider_display_names(providers: impl Iterator<Item = webhooks::WebhookProvi
     names.join(", ")
 }
 
-/// True for the reserved synthetic action name. Mutating endpoints
-/// (edit / export / delete) reject it: it has no backing YAML to operate on.
+/// SPEC-4.3.1: true for the reserved synthetic action name. Mutating
+/// endpoints (edit / export / delete) reject it: it has no backing YAML to
+/// operate on.
 pub fn is_synthetic_action(name: &str) -> bool {
     SYNTHETIC_ACTIONS.contains(&name)
 }
 
-/// Every reserved synthetic action name, in ONE place.
+/// SPEC-4.3.1: every reserved synthetic action name, in ONE place.
 /// The daemon's scan guard, the API's trigger / delete rejections, and the web
 /// layer's edit / export / delete rejections all read this set, so a new
 /// event-driven listener is reserved everywhere by adding one entry here.
@@ -746,10 +773,11 @@ pub const SYNTHETIC_ACTIONS: &[&str] = &[
     comment_webhooks::WEBHOOK_COMMENT_ACTION,
 ];
 
-/// True when `name` is a synthetic action whose listener is actually
-/// configured this run, so the action-detail / durations pages render it instead
-/// of 404ing. An unconfigured listener keeps its historical runs queryable but
-/// has no live entry.
+/// SPEC-4.3.1: "A synthetic action whose listener is unconfigured
+/// this run keeps its historical runs queryable (SPEC-4.3.2) but has no live
+/// dashboard entry." True when `name` is a synthetic action whose listener is
+/// actually configured this run, so the action-detail / durations pages render
+/// it instead of 404ing.
 async fn synthetic_enabled(s: &WebState, name: &str) -> bool {
     let (webhook_providers, comment_webhook_providers) = listener_providers(s).await;
     match name {
@@ -759,7 +787,8 @@ async fn synthetic_enabled(s: &WebState, name: &str) -> bool {
     }
 }
 
-/// A 403 response rejecting a mutating operation on the synthetic
+/// SPEC-4.3.1: "Edit, export and delete reject the synthetic action
+/// with 403." A 403 response rejecting a mutating operation on the synthetic
 /// action, or `None` when `name` is a normal action.
 fn reject_synthetic(name: &str) -> Option<Response> {
     is_synthetic_action(name).then(|| {
@@ -773,8 +802,11 @@ fn reject_synthetic(name: &str) -> Option<Response> {
     })
 }
 
-/// The one definition of "the latest attempt of each job in this
-/// run", parameterised by an outcome predicate on the `o` alias. Every
+/// SPEC-4.3.1: "A run's `failed_jobs` count and its Jobs-column
+/// outcome filter both key off the latest attempt of each job, excluding
+/// timeouts from the failed count." The one definition of "the latest attempt
+/// of each job in this run", parameterised by an outcome predicate on the `o`
+/// alias. Every
 /// `failed_jobs` count and the Jobs-column outcome filter are built from it, so
 /// the rows the filter selects and the `(N failed)` marker a row renders can
 /// never drift apart. `pred` is always one of the fixed constants below, never
@@ -806,8 +838,12 @@ fn has_job_matching(pred: &str) -> String {
     format!("EXISTS (SELECT 1 {})", latest_job_attempts(pred))
 }
 
-/// When `show_empty` is false, finished runs that processed zero jobs
-/// are hidden. In-progress runs (`exit_code IS NULL`) are always kept so a
+/// SPEC-4.3.1: "The dashboard hides finished zero-job runs unless
+/// `show_empty` is set, always keeps in-progress runs, paginates with
+/// `limit`/`offset`, and sorts/filters through a fixed column allow-list with
+/// bound filter values." When `show_empty` is false, finished runs that
+/// processed zero jobs are hidden. In-progress runs (`exit_code IS NULL`) are
+/// always kept so a
 /// just-started run never momentarily vanishes (it can legitimately sit at
 /// `jobs_processed = 0` before its first job lands). The filter applies before
 /// the `LIMIT`/`OFFSET`, so up to `limit` matching runs are returned per page,
@@ -860,7 +896,8 @@ async fn count_recent_runs(
     Ok(total)
 }
 
-/// Distinct `action_name` values that appear in the `runs` table,
+/// SPEC-4.3.1: dashboard Action filter options, restricted to actions
+/// with actual runs. Distinct `action_name` values that appear in the `runs` table,
 /// alphabetically. Drives the dashboard Action filter dropdown so it only offers
 /// actions that actually have runs (not every indexed action), and serves as the
 /// allow-list that whitelists the incoming `?action=` value.
@@ -877,7 +914,7 @@ async fn distinct_run_actions(pool: &DbPool) -> Result<Vec<String>, WebError> {
     Ok(rows)
 }
 
-/// Distinct `triggered_by` values present in the `runs` table,
+/// SPEC-4.3.1: dashboard Triggered filter options. Distinct `triggered_by` values present in the `runs` table,
 /// alphabetically. Drives the dashboard Triggered filter dropdown and whitelists
 /// the incoming `?triggered=` value.
 async fn distinct_triggered_by(pool: &DbPool) -> Result<Vec<String>, WebError> {
@@ -894,6 +931,14 @@ async fn distinct_triggered_by(pool: &DbPool) -> Result<Vec<String>, WebError> {
 }
 
 // ---- run search --------------------------------------------------------------
+//
+// SPEC-4.3.1: "The dashboard's Runs search finds jobs by content: the
+// `summary` column is always searched; an opt-in `in_stream` toggle also greps
+// the per-attempt stream `.jsonl` logs server-side, newest first, up to a fixed
+// file count and a per-file byte cap. Matching is a case-insensitive ASCII
+// substring for both. An unreadable stream log is reported distinctly from a
+// clean no-match, and a capped search says so rather than silently
+// truncating."
 //
 // The Runs screen search finds jobs by content. The `summary` is always
 // searched (cheap, indexed-free LIKE/instr over `job_outcomes`). When the
@@ -1091,7 +1136,8 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
-/// Find jobs whose `summary` (always) - and, when `in_stream`, whose
+/// SPEC-4.3.1: the dashboard Runs-search handler. Find jobs whose
+/// `summary` (always) - and, when `in_stream`, whose
 /// per-attempt stream `.jsonl` log - contains `q` (case-insensitive ASCII
 /// substring). Stream search is bounded to the most recent failed-job attempts
 /// (`SEARCH_STREAM_MAX_FILES`, reading at most `SEARCH_STREAM_MAX_BYTES` each);
@@ -1247,6 +1293,12 @@ async fn search_jobs(
 
 // ---- templates ---------------------------------------------------------------
 
+/// SPEC-4.3.1: "The dashboard renders global pause, today's run/action/cost
+/// counters, the action list (including synthetic listeners), a paginated and
+/// filterable recent-runs table with an optional content search, a 24h
+/// warn/error event banner that separately names access-failure events, a
+/// stale dependency-gate banner, and an attempt-cap banner." Render state for
+/// the dashboard page.
 #[derive(Template)]
 #[template(path = "dashboard.html")]
 struct DashboardTpl {
@@ -1411,8 +1463,12 @@ struct PageNav {
     has_next: bool,
 }
 
-/// Whitelisted sort + filter selection for the dashboard recent-runs
-/// table. Every field is validated in [`dashboard`] before it lands here:
+/// SPEC-4.3.1: "Sort/filter input never reaches SQL unvalidated: the
+/// sort column, direction, exit and job-outcome filters are checked against
+/// fixed allow-lists, and the action/triggered filters against the actual
+/// distinct DB values." Whitelisted sort + filter selection for the dashboard
+/// recent-runs table. Every field is validated in [`dashboard`] before it
+/// lands here:
 /// `sort`/`dir`/`exit`/`outcome` against fixed allow-lists, `action`/`triggered` against
 /// the actual distinct DB values. So nothing user-controlled reaches the SQL
 /// `ORDER BY`, the filter values are bound as parameters, and the strings echoed
@@ -1613,6 +1669,7 @@ struct DashboardQuery {
 /// previous hardcoded `LIMIT 20` so page 1 shows exactly the rows it did before.
 const DASHBOARD_PAGE_SIZE: i64 = 20;
 
+/// SPEC-4.3.1: the `/` dashboard handler.
 async fn dashboard(
     State(s): State<WebState>,
     Query(q): Query<DashboardQuery>,
@@ -1713,6 +1770,13 @@ async fn dashboard(
 
     let (today_runs, today_cost) = totals.unwrap_or((0, 0.0));
 
+    // SPEC-4.3.1: "The dashboard shows today's run/action/cost totals
+    // from `daily_ledger`, a 24h warn/error event count that separately names
+    // the access-failure subset, stale dependency gates past
+    // `STALE_GATE_AFTER_MS`, and keys parked at their per-action attempt cap,
+    // each with the action's own effective link template resolved once and
+    // shared across the gate and parked-key banners."
+    //
     // The poll-time repo-access preflight leaves its issues Queued
     // with no field change, so without this banner the only symptom is issues
     // that never move. 24h window; a later passing preflight for the same repo
@@ -1810,6 +1874,7 @@ async fn dashboard(
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
 
+/// SPEC-4.3.2: render state for the `/actions/{name}` detail page.
 #[derive(Template)]
 #[template(path = "action_detail.html")]
 struct ActionDetailTpl {
@@ -1837,6 +1902,8 @@ struct ActionDetailQuery {
     show_empty: bool,
 }
 
+/// SPEC-4.3.2: the `/actions/{name}` detail-page handler. Unknown
+/// action name: 404.
 async fn action_detail(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
@@ -1903,6 +1970,10 @@ struct ActionChartTpl {
     chart: Option<DurationChart>,
 }
 
+/// SPEC-4.3.2: "The durations chart accepts the configured synthetic
+/// webhook action (unindexed but charts its recorded runs) in addition to any
+/// indexed action name; any other unknown name is 404. Only completed runs are
+/// plotted, oldest to newest." The `/actions/{name}/durations` handler.
 async fn action_durations(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
@@ -1946,6 +2017,12 @@ async fn action_durations(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
+// SPEC-4.3.5: "The `/logs` page lists every `run_events` row with no
+// dedup, filtered by whitelisted Level / Action / Context selections, a
+// parameterized message substring search, and a since-this-serve / last-24h /
+// all-time window, sorted by time and paginated. Every user-supplied value is
+// validated server-side before it reaches SQL."
+//
 // ---- logs page (global across all actions) ---------------------------------
 //
 // The one diagnostics screen. It lists every `run_events` row with no dedup,
@@ -1972,8 +2049,9 @@ fn events_window_start() -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// Distinct `level` values present in `run_events`, alphabetically.
-/// Drives the Level dropdown and whitelists the incoming `?level=`.
+/// SPEC-4.3.5: distinct `level` values present in `run_events`,
+/// alphabetically. Drives the Level dropdown and whitelists the incoming
+/// `?level=`.
 async fn distinct_event_levels(pool: &DbPool) -> Result<Vec<String>, WebError> {
     let rows = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
         crate::db::q(pool, "SELECT DISTINCT level FROM run_events ORDER BY level").into_owned(),
@@ -2013,7 +2091,10 @@ async fn distinct_event_contexts(pool: &DbPool) -> Result<Vec<String>, WebError>
     Ok(rows)
 }
 
-/// Whitelisted filter + sort selection for the error-log table. The
+/// SPEC-4.3.5: "Logs page filter input (level, action, context, dir,
+/// since) never reaches SQL unvalidated; the free-text message search binds
+/// through a parameter, never interpolated." Whitelisted filter + sort
+/// selection for the error-log table. The
 /// `RunsView` sibling: every field is validated in [`logs`] before it
 /// lands here (`dir`/`since` against fixed allow-lists, `level`/`action`/
 /// `context` against the actual distinct DB values), so nothing user-controlled
@@ -2162,8 +2243,8 @@ impl EventsView {
     }
 }
 
-/// Total `run_events` rows matching the active filter, for the page
-/// bounds and the "X-Y of N" indicator. Counts over the same `WHERE` as
+/// SPEC-4.3.5: total `run_events` rows matching the active filter, for
+/// the page bounds and the "X-Y of N" indicator. Counts over the same `WHERE` as
 /// [`fetch_run_events`], so the two never disagree.
 async fn count_run_events(
     pool: &DbPool,
@@ -2202,8 +2283,11 @@ async fn fetch_run_events(
     Ok(q.bind(limit).bind(offset).fetch_all(pool).await?)
 }
 
-/// One `/logs` row, with its Context link and linked-message HTML
-/// pre-rendered: the row's own `context` key is linked wherever it appears in
+/// SPEC-4.3.5: "Each `/logs` row links its own context key wherever it
+/// appears in the Context column and inside the free-text Message column (not
+/// any key-shaped token), everything else HTML-escaped." One `/logs` row, with
+/// its Context link and linked-message HTML pre-rendered: the row's own
+/// `context` key is linked wherever it appears in
 /// the Context column and inside the free-text Message column (not any
 /// key-shaped token), everything else HTML-escaped.
 struct EventRow {
@@ -2220,6 +2304,7 @@ struct EventRow {
     message_html: String,
 }
 
+/// SPEC-4.3.5: render state for the `/logs` page.
 #[derive(Template)]
 #[template(path = "logs.html")]
 struct LogsTpl {
@@ -2263,7 +2348,8 @@ struct LogsQuery {
     page: Option<i64>,
 }
 
-/// The log page moved from `/actions/:name/events` to the global
+/// SPEC-4.3.2: "`/actions/{name}/events` is a permanent redirect to
+/// `/logs?action={name}`." The log page moved from `/actions/:name/events` to the global
 /// `/logs`. The old route stays as a permanent redirect that carries the action
 /// into the Action filter, so links, bookmarks and old READMEs still land on the
 /// same rows.
@@ -2271,6 +2357,7 @@ async fn action_events_redirect(AxumPath(name): AxumPath<String>) -> Redirect {
     Redirect::permanent(&format!("/logs?action={name}"))
 }
 
+/// SPEC-4.3.5: the `/logs` handler.
 async fn logs(State(s): State<WebState>, Query(q): Query<LogsQuery>) -> Result<Response, WebError> {
     let pool = &s.api.pool;
 
@@ -2481,6 +2568,7 @@ struct ReportsQuery {
 
 /// Bar width as a percentage of the series max, guarded against an all-zero
 /// series so an empty window renders flat rather than dividing by zero.
+/// SPEC-4.3.13: bar-width percentage helper for the Reports page bars.
 fn bar_pct(value: f64, max: f64) -> u32 {
     if max <= 0.0 {
         0
@@ -2489,6 +2577,7 @@ fn bar_pct(value: f64, max: f64) -> u32 {
     }
 }
 
+/// SPEC-4.3.13: the `/reports` handler.
 async fn reports_page(
     State(s): State<WebState>,
     Query(q): Query<ReportsQuery>,
@@ -2676,9 +2765,12 @@ prompt: |\n\
 \x20\x20print \"Describe the task for this job.\"\n\
 enabled: false\n";
 
-/// Resolve an indexed action's on-disk path by exact name. Only names the
-/// daemon has scanned (always under `actions_dir`) resolve, so a hostile
-/// `:name` such as `../../etc/passwd` can never reach the filesystem here.
+/// SPEC-4.3.3: "Edit, export and delete resolve an action's on-disk path only
+/// through the daemon's scanned index, by exact name, so a hostile `:name`
+/// path segment can never reach the filesystem." Resolve an indexed action's
+/// on-disk path by exact name. Only names the daemon has scanned (always
+/// under `actions_dir`) resolve, so a hostile `:name` such as
+/// `../../etc/passwd` can never reach the filesystem here.
 async fn indexed_action_path(pool: &DbPool, name: &str) -> Result<Option<String>, WebError> {
     let rows = state::action_index_list(pool).await?;
     Ok(rows
@@ -2687,9 +2779,12 @@ async fn indexed_action_path(pool: &DbPool, name: &str) -> Result<Option<String>
         .map(|r| r.file_path))
 }
 
-/// Constrain an action name to a single safe path component for use as a
-/// `<stem>.yml` filename. Rejects empty, `.`/`..`, path separators, and any
-/// character outside `[A-Za-z0-9._-]`.
+/// SPEC-4.3.3: "A new action's name must be a single safe path component:
+/// non-empty, not `.`/`..`, with no path separator, restricted to
+/// `[A-Za-z0-9._-]`, used as the `<stem>.yml` filename." Constrain an action
+/// name to a single safe path component for use as a `<stem>.yml` filename.
+/// Rejects empty, `.`/`..`, path separators, and any character outside
+/// `[A-Za-z0-9._-]`.
 fn safe_action_stem(name: &str) -> Option<String> {
     let n = name.trim();
     if n.is_empty() || n == "." || n == ".." {
@@ -2704,7 +2799,10 @@ fn safe_action_stem(name: &str) -> Option<String> {
     Some(n.to_string())
 }
 
-/// Re-render the editor with an inline error (HTTP 422), preserving the draft.
+/// SPEC-4.3.3: "A rejected create or edit re-renders the raw-YAML editor with
+/// the draft preserved and an inline error, HTTP 422, never a redirect or a
+/// blank form." Re-render the editor with an inline error (HTTP 422),
+/// preserving the draft.
 fn editor_error(
     version: &'static str,
     is_new: bool,
@@ -2733,6 +2831,10 @@ fn editor_error(
         .into_response())
 }
 
+/// SPEC-4.3.3: "The raw-YAML edit page offers a structured-form link whenever
+/// the stored YAML parses as a native kind; a `scripted` action, or one that
+/// fails to parse, stays raw-YAML only." The `/actions/{name}/edit` page
+/// handler.
 async fn action_edit_page(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
@@ -2764,6 +2866,12 @@ async fn action_edit_page(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
+/// SPEC-4.3.3: "Saving an edit validates the new YAML through the same
+/// checks the loader/scanner uses before writing it; a failure leaves the
+/// on-disk file untouched and re-renders the editor with the draft. A
+/// successful save re-scans actions synchronously so the redirect target
+/// reflects the edit immediately, instead of waiting for the daemon's next
+/// periodic scan." The `/actions/{name}/edit` save handler.
 async fn action_edit_save(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
@@ -2789,9 +2897,12 @@ async fn action_edit_save(
     Ok(Redirect::to(&format!("/actions/{name}")).into_response())
 }
 
-/// The new-action page lists every [`ActionKind`] with a one-line
-/// description and a link to its editor. Raw-YAML paste is an explicit
-/// alternative (`/actions/new/raw`), not the default.
+/// SPEC-4.3.3: "The new-action page lists every action kind with a one-line
+/// description and a link to its editor; raw-YAML paste is an explicit
+/// alternative, not the default." The new-action page lists every
+/// [`ActionKind`] with a one-line description and a link to its editor.
+/// Raw-YAML paste is an explicit alternative (`/actions/new/raw`), not the
+/// default.
 async fn action_new_page(State(s): State<WebState>) -> Result<Html<String>, WebError> {
     let tpl = ActionNewTpl {
         version: s.api.version,
@@ -2800,7 +2911,7 @@ async fn action_new_page(State(s): State<WebState>) -> Result<Html<String>, WebE
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
 
-/// One row of the new-action kind picker.
+/// SPEC-4.3.3: one row of the new-action kind picker.
 struct KindCard {
     kind: &'static str,
     description: &'static str,
@@ -2809,7 +2920,9 @@ struct KindCard {
     action_label: &'static str,
 }
 
-/// Describe a kind for the picker. The match is exhaustive, so a new
+/// SPEC-4.3.3: "Every action kind must decide, exhaustively, which editor
+/// creates it: a native kind gets a structured form, `scripted` is raw YAML
+/// only." Describe a kind for the picker. The match is exhaustive, so a new
 /// [`ActionKind`] cannot ship without deciding which editor creates it.
 fn kind_card(kind: ActionKind) -> KindCard {
     let (description, url, action_label) = match kind {
@@ -2840,7 +2953,8 @@ fn kind_card(kind: ActionKind) -> KindCard {
     }
 }
 
-/// The raw-YAML editor for a new action, reached from the kind picker.
+/// SPEC-4.3.3: the `/actions/new/raw` raw-YAML editor for a new action,
+/// reached from the kind picker.
 async fn action_new_raw_page(State(s): State<WebState>) -> Result<Html<String>, WebError> {
     let tpl = ActionEditorTpl {
         version: s.api.version,
@@ -2855,6 +2969,11 @@ async fn action_new_raw_page(State(s): State<WebState>) -> Result<Html<String>, 
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
 
+/// SPEC-4.3.3: "Creating an action from raw YAML rejects a name that is not
+/// a safe filename or whose destination `.yml` already exists, inline with
+/// the draft preserved; a successful create writes the file and re-scans
+/// actions synchronously so the redirect target resolves immediately." The
+/// `/actions` create handler.
 async fn action_create(
     State(s): State<WebState>,
     Form(form): Form<ActionForm>,
@@ -2886,6 +3005,10 @@ async fn action_create(
     Ok(Redirect::to(&format!("/actions/{}", loaded.action.name)).into_response())
 }
 
+/// SPEC-4.3.3: "Export streams the action's own on-disk YAML back as an
+/// `application/x-yaml` attachment named `<action>.yml`; the synthetic
+/// action and an unknown name both reject it." The `/actions/{name}/export`
+/// handler.
 async fn action_export(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
@@ -2908,10 +3031,15 @@ async fn action_export(
     Ok(resp)
 }
 
-/// Delete an action from the web UI. Mirrors `secret_delete`: 404s
-/// an unknown action, renders a 409 when a run for it is in flight, otherwise
-/// removes the YAML file + purges the derived index/control state (keeping run
-/// history) and redirects to the dashboard, which no longer lists it.
+/// SPEC-4.3.3: "Delete 404s an unknown action, rejects the synthetic action,
+/// and 409s while a run for it is dispatched or active in the DB; otherwise
+/// it removes the YAML file and purges the derived index/control state while
+/// keeping run history, then redirects to the dashboard, which no longer
+/// lists it." Delete an action from the web UI. Mirrors `secret_delete`:
+/// 404s an unknown action, renders a 409 when a run for it is in flight,
+/// otherwise removes the YAML file + purges the derived index/control state
+/// (keeping run history) and redirects to the dashboard, which no longer
+/// lists it.
 async fn action_delete(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
@@ -2942,6 +3070,14 @@ async fn action_delete(
 
 // ---- structured YouTrack action editor -------------------------------------
 //
+// SPEC-4.3.4: "The structured YouTrack action editor is a field-based form,
+// an alternative to the raw-YAML textarea, that owns the native config
+// (youtrack source + forgejo target) plus the generic Action blocks it
+// surfaces; every other key the file carries is left untouched on save.
+// `token_ref` fields offer only stored secret names, never a value.
+// Submissions round-trip through the same validator the raw editor uses, so
+// a bad config is rejected inline with the entered values preserved."
+//
 // A field-based form for the native `kind: youtrack` action, an alternative to
 // the raw-YAML textarea above. The form owns the native config (youtrack source
 // + forgejo target) plus the generic Action blocks it surfaces (workdir_base,
@@ -2952,6 +3088,7 @@ async fn action_delete(
 // `crate::action::validate_str` the raw editor uses, so a bad config is rejected
 // inline with the entered values preserved.
 
+/// SPEC-4.3.4: render state for the structured YouTrack action editor page.
 #[derive(Template)]
 #[template(path = "youtrack_editor.html")]
 struct YoutrackEditorTpl {
@@ -2977,7 +3114,7 @@ struct YoutrackEditorTpl {
     prompt_preset: &'static str,
 }
 
-/// Flat form backing the structured editor. Every input posts a string; the
+/// SPEC-4.3.4: flat form backing the structured editor. Every input posts a string; the
 /// mapping into the typed config (and number / enum parsing) happens in
 /// [`youtrack_form_to_yaml`]. `#[serde(default)]` lets an unchecked checkbox or
 /// an omitted field deserialize cleanly.
@@ -3106,9 +3243,12 @@ impl YoutrackEditForm {
     }
 }
 
-/// Field defaults for a brand-new YouTrack action: blank identity, but the
-/// query / custom field / state labels seeded from [`YoutrackConfig::default`]
-/// so the form opens with the same values a bare `native: {}` resolves to.
+/// SPEC-4.3.4: "A brand-new YouTrack action's form opens with a blank
+/// identity but the query, custom field, and state labels seeded from the
+/// same defaults a bare `native: {}` resolves to." Field defaults for a
+/// brand-new YouTrack action: blank identity, but the query / custom field /
+/// state labels seeded from [`YoutrackConfig::default`] so the form opens
+/// with the same values a bare `native: {}` resolves to.
 fn youtrack_form_defaults() -> YoutrackEditForm {
     let c = YoutrackConfig::default();
     let conc = Concurrency::default();
@@ -3137,9 +3277,11 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
     }
 }
 
-/// Prefill the form from a loaded action. Returns `None` when the action is not
-/// a native `kind: youtrack` action (the structured editor only handles that
-/// kind; callers redirect to the raw editor instead).
+/// SPEC-4.3.4: "The structured editor only handles the native `kind:
+/// youtrack` action; any other kind redirects to the raw editor instead."
+/// Prefill the form from a loaded action. Returns `None` when the action is
+/// not a native `kind: youtrack` action (the structured editor only handles
+/// that kind; callers redirect to the raw editor instead).
 fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
     let NativeConfig::Youtrack(yt) = a.native.as_ref()? else {
         return None;
@@ -3226,10 +3368,13 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
     })
 }
 
-/// Recursively drop `null` values and empty maps / sequences so the emitted
-/// YAML carries only the fields the user actually set (a `None` `token_ref`
-/// disappears rather than serializing as `token_ref: null`). Returns `None`
-/// when the whole value prunes away to nothing.
+/// SPEC-4.3.4: "The structured editor emits YAML with only the fields the
+/// user actually set: a `None` field disappears rather than serializing as
+/// an explicit null." Recursively drop `null` values and empty maps /
+/// sequences so the emitted YAML carries only the fields the user actually
+/// set (a `None` `token_ref` disappears rather than serializing as
+/// `token_ref: null`). Returns `None` when the whole value prunes away to
+/// nothing.
 fn prune_yaml(v: serde_yaml::Value) -> Option<serde_yaml::Value> {
     use serde_yaml::Value;
     match v {
@@ -3251,7 +3396,13 @@ fn prune_yaml(v: serde_yaml::Value) -> Option<serde_yaml::Value> {
     }
 }
 
-/// Map the structured form into a full action YAML string, overlaid onto `base`
+/// SPEC-4.3.4: "Saving the structured form overlays the form's owned keys
+/// (name, kind, native, claude, limits, schedule, workdir_base,
+/// link_template, enabled) onto the existing file for an edit, or an empty
+/// mapping for a create, preserving every other on-disk key untouched. A
+/// numeric limit, duration, or schedule kind that fails to parse rejects the
+/// whole save with a human-readable inline error, writing nothing." Map the
+/// structured form into a full action YAML string, overlaid onto `base`
 /// (the parsed existing file for an edit, or an empty mapping for a create).
 /// The form owns the `name`, `kind`, `native`, `claude`, `limits`, `schedule`,
 /// `workdir_base`, `link_template`, and `enabled` keys; every other key in
@@ -3562,7 +3713,7 @@ fn youtrack_form_to_yaml(
     serde_yaml::to_string(&base).map_err(|e| e.to_string())
 }
 
-/// Insert `val` under `key`, or remove the key when `val` is `None`.
+/// SPEC-4.3.4: insert `val` under `key`, or remove the key when `val` is `None`.
 fn set_or_remove(map: &mut serde_yaml::Mapping, key: &str, val: Option<serde_yaml::Value>) {
     match val {
         Some(v) => {
@@ -3574,13 +3725,17 @@ fn set_or_remove(map: &mut serde_yaml::Mapping, key: &str, val: Option<serde_yam
     }
 }
 
-/// Insert a scalar string under `key`, or remove the key when `val` is `None`.
+/// SPEC-4.3.4: insert a scalar string under `key`, or remove the key when `val` is `None`.
 fn set_scalar_or_remove(map: &mut serde_yaml::Mapping, key: &str, val: Option<String>) {
     set_or_remove(map, key, val.map(serde_yaml::Value::from));
 }
 
-/// Stored secret names, with any `token_ref` the action already references that
-/// no longer exists folded in so an orphaned reference still shows as selected.
+/// SPEC-4.3.4: "The `token_ref` dropdowns list every stored secret name, plus
+/// any `token_ref` the action already references that no longer exists, so
+/// an orphaned reference still shows as selected rather than silently
+/// resetting." Stored secret names, with any `token_ref` the action already
+/// references that no longer exists folded in so an orphaned reference
+/// still shows as selected.
 async fn token_ref_options(s: &WebState, form: &YoutrackEditForm) -> Result<Vec<String>, WebError> {
     let mut names: Vec<String> = state::secret_list(&s.api.pool)
         .await?
@@ -3602,7 +3757,10 @@ async fn token_ref_options(s: &WebState, form: &YoutrackEditForm) -> Result<Vec<
     Ok(names)
 }
 
-/// Prompt provenance shown on the structured editor.
+/// SPEC-4.3.4: "The structured editor shows the resolved prompt's
+/// provenance (override vs. builtin preset); a file that fails to load
+/// renders as `unknown` with the reason, never a guessed preset." Prompt
+/// provenance shown on the structured editor.
 struct PromptProvenance {
     source: String,
     preset: &'static str,
@@ -3646,7 +3804,7 @@ impl PromptProvenance {
     }
 }
 
-/// Render the structured editor at `status`, preserving the supplied `form`.
+/// SPEC-4.3.4: render the structured editor at `status`, preserving the supplied `form`.
 async fn render_youtrack_editor(
     s: &WebState,
     status: StatusCode,
@@ -3683,7 +3841,10 @@ async fn render_youtrack_editor(
     Ok((status, Html(tpl.render().map_err(WebError::from)?)).into_response())
 }
 
-/// `/actions/:name/form` for any kind. Renders the structured
+/// SPEC-4.3.4: "`/actions/{name}/form` renders the structured editor
+/// matching the action's own native config; an action with no structured
+/// editor (`scripted`, or a file that no longer parses) falls back to the
+/// raw editor." `/actions/:name/form` for any kind. Renders the structured
 /// editor matching the action's own native config; an action with no structured
 /// editor (`scripted`, or a file that no longer parses) falls back to the raw
 /// editor.
@@ -3712,9 +3873,13 @@ async fn action_form_page(
     }
 }
 
-/// POST counterpart of [`action_form_page`]: decodes the body with the form type
-/// of the action's own kind. The body is taken raw because the per-repo
-/// `log_token_ref` rows post repeated keys, which `Form<T>` collapses.
+/// SPEC-4.3.4: "The form-save route decodes the POST body raw, not through
+/// `Form<T>`, because the per-repo `log_token_ref` rows post repeated keys
+/// that `Form<T>` would collapse, then dispatches by the action's own
+/// kind." POST counterpart of [`action_form_page`]: decodes the body with
+/// the form type of the action's own kind. The body is taken raw because
+/// the per-repo `log_token_ref` rows post repeated keys, which `Form<T>`
+/// collapses.
 async fn action_form_save(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
@@ -3753,6 +3918,7 @@ async fn action_form_save(
     }
 }
 
+/// SPEC-4.3.4: the `/actions/new/youtrack` structured-editor page for a new action.
 async fn youtrack_new_page(State(s): State<WebState>) -> Result<Response, WebError> {
     render_youtrack_editor(
         &s,
@@ -3765,6 +3931,11 @@ async fn youtrack_new_page(State(s): State<WebState>) -> Result<Response, WebErr
     .await
 }
 
+/// SPEC-4.3.4: "The structured edit page names why a file no longer parses
+/// and links to the raw editor (422) instead of redirecting there with no
+/// explanation; a file that validates but is not a youtrack action still
+/// redirects, since it simply has no structured form." The
+/// `/actions/{name}/form` youtrack edit page.
 async fn youtrack_edit_page(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
@@ -3789,6 +3960,9 @@ async fn youtrack_edit_page(
     render_youtrack_editor(&s, StatusCode::OK, Some(name), form, None, prompt).await
 }
 
+/// SPEC-4.3.4: "A structured-editor route that cannot load the action file
+/// at all (read failure or a validation rejection) renders a shared 422
+/// naming the reason, instead of silently falling back to the raw editor."
 /// Shared 422 response for a structured-editor route that could not
 /// load the action file at all (read failure or a `validate_str` rejection),
 /// naming the reason instead of silently falling back to the raw editor.
@@ -3809,6 +3983,7 @@ async fn action_load_error_response(
         .into_response())
 }
 
+/// SPEC-4.3.4: render state for the shared action-load-error page.
 #[derive(Template)]
 #[template(path = "action_load_error.html")]
 struct ActionLoadErrorTpl {
@@ -3817,6 +3992,10 @@ struct ActionLoadErrorTpl {
     message: String,
 }
 
+/// SPEC-4.3.4: "An unparsable on-disk base never becomes an empty mapping
+/// for the save: that would drop every key the form does not show, so it
+/// is rejected inline instead, naming the raw editor as the fix." The
+/// `/actions/{name}/form` youtrack save handler.
 async fn youtrack_edit_save(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
@@ -3886,6 +4065,7 @@ async fn youtrack_edit_save(
     Ok(Redirect::to(&format!("/actions/{}", loaded.action.name)).into_response())
 }
 
+/// SPEC-4.3.4: the `/actions/new/youtrack` structured-editor create handler.
 async fn youtrack_create(
     State(s): State<WebState>,
     Form(form): Form<YoutrackEditForm>,
@@ -3960,6 +4140,14 @@ async fn youtrack_create(
 
 // ---- secrets management -----------------------------------------------
 //
+// SPEC-4.3.6: "Secret values are write-only: the create / rotate forms
+// accept a value, but the listing only ever shows a secret's name and
+// timestamps; a stored value is never re-rendered or sent back to the
+// browser, leaving the DB only as ciphertext, decrypted in-process at run
+// time. Encryption needs the `age` key file named by
+// `CLAUDE_RUN_SECRETS_KEY_FILE`; when it is missing, create / rotate fail
+// closed with an inline error and the listing shows a banner."
+//
 // Values are write-only: the create / rotate forms accept a value, but the
 // listing only ever shows a secret's name + timestamps. A stored value is never
 // re-rendered or sent back to the browser; it leaves the DB only as ciphertext,
@@ -3967,6 +4155,7 @@ async fn youtrack_create(
 // `CLAUDE_RUN_SECRETS_KEY_FILE`; when it is missing, create / rotate fail closed
 // with an inline error and the listing shows a banner.
 
+/// SPEC-4.3.6: render state for the `/secrets` page.
 #[derive(Template)]
 #[template(path = "secrets.html")]
 struct SecretsTpl {
@@ -3991,7 +4180,9 @@ struct SecretValueForm {
     value: String,
 }
 
-/// Constrain a secret name to a safe handle: non-empty, `[A-Za-z0-9._-]` only.
+/// SPEC-4.3.6: "A secret name is constrained to a safe handle: non-empty,
+/// `[A-Za-z0-9._-]` only." Constrain a secret name to a safe handle:
+/// non-empty, `[A-Za-z0-9._-]` only.
 fn valid_secret_name(name: &str) -> bool {
     let n = name.trim();
     !n.is_empty()
@@ -3999,7 +4190,7 @@ fn valid_secret_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// Render the secrets page (HTTP `status`), loading the listing and the key
+/// SPEC-4.3.6: render the secrets page (HTTP `status`), loading the listing and the key
 /// status. Never renders any secret value.
 async fn render_secrets(
     s: &WebState,
@@ -4021,10 +4212,15 @@ async fn render_secrets(
     Ok((status, Html(tpl.render().map_err(WebError::from)?)).into_response())
 }
 
+/// SPEC-4.3.6: the `/secrets` page handler.
 async fn secrets_page(State(s): State<WebState>) -> Result<Response, WebError> {
     render_secrets(&s, StatusCode::OK, None).await
 }
 
+/// SPEC-4.3.6: "Create rejects an invalid name, an empty value, a missing
+/// key file, or a name that already exists (which must go through rotate
+/// instead), each inline with 422 and the listing preserved." The
+/// `/secrets` create handler.
 async fn secret_create(
     State(s): State<WebState>,
     Form(form): Form<SecretCreateForm>,
@@ -4074,6 +4270,10 @@ async fn secret_create(
     Ok(Redirect::to("/secrets").into_response())
 }
 
+/// SPEC-4.3.6: "Rotate rejects an empty value or a missing key file inline
+/// with 422, and 404s an unknown secret name; a successful rotate keeps the
+/// same name and redirects to the listing." The `/secrets/{name}/rotate`
+/// handler.
 async fn secret_rotate(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
@@ -4110,6 +4310,8 @@ async fn secret_rotate(
     Ok(Redirect::to("/secrets").into_response())
 }
 
+/// SPEC-4.3.6: "Delete 404s an unknown secret name; a successful delete
+/// redirects to the listing." The `/secrets/{name}/delete` handler.
 async fn secret_delete(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
@@ -4127,10 +4329,16 @@ async fn secret_delete(
 
 // ---- Access check -----------------------------------------------------
 //
+// SPEC-4.3.7: "One service backs the `/access` page, `POST
+// /api/access/check`, and `claude-run access check`; a row names the
+// secret, the probe, and the failure text, and a secret VALUE is never read
+// back here, exactly as on `/secrets`."
+//
 // One service (`crate::access`) backs this page, `POST /api/access/check`, and
 // `claude-run access check`. A row names the secret, the probe, and the failure
 // text; a secret VALUE is never read back here, exactly as on `/secrets`.
 
+/// SPEC-4.3.7: render state for the `/access` page.
 #[derive(Template)]
 #[template(path = "access.html")]
 struct AccessTpl {
@@ -4141,13 +4349,15 @@ struct AccessTpl {
     report: Option<crate::access::AccessReport>,
 }
 
-/// The result table alone, for the HTMX swap.
+/// SPEC-4.3.7: the result table alone, for the HTMX swap.
 #[derive(Template)]
 #[template(path = "access_rows.html")]
 struct AccessRowsTpl {
     report: Option<crate::access::AccessReport>,
 }
 
+/// SPEC-4.3.7: "A setup failure (the daemon cannot invoke `yt` / `fj`)
+/// renders as a report row, not a 500: the failure itself is the answer."
 /// Run the check, rendering a setup failure as a report row rather than a 500:
 /// "the daemon cannot invoke `yt` / `fj`" is itself the answer.
 async fn run_access_check(
@@ -4161,6 +4371,7 @@ async fn run_access_check(
     }
 }
 
+/// SPEC-4.3.7: the `/access` page handler (bare GET, no check run yet).
 async fn access_page(
     State(s): State<WebState>,
     Query(q): Query<crate::access::AccessRequest>,
@@ -4173,6 +4384,7 @@ async fn access_page(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
+/// SPEC-4.3.7: the `/access` check handler, returning the result-table HTMX swap.
 async fn access_check(
     State(s): State<WebState>,
     Form(form): Form<crate::access::AccessRequest>,
@@ -4184,8 +4396,11 @@ async fn access_check(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-/// The per-secret Check button on `/secrets`: run the identity probe of every
-/// action that references this secret, and land on `/access` with the result.
+/// SPEC-4.3.7: "The per-secret Check button on `/secrets` runs the identity
+/// probe of every action that references that secret, and lands on
+/// `/access` with the result." The per-secret Check button on `/secrets`:
+/// run the identity probe of every action that references this secret, and
+/// land on `/access` with the result.
 async fn secret_check(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
@@ -4204,7 +4419,14 @@ async fn secret_check(
 }
 
 // ---- Settings page ----------------------------------------------------
+//
+// SPEC-4.3.8: "The Settings page renders the runtime config sections plus
+// the service-auth cards (Claude, YouTrack, Forgejo, GitHub, Git identity)
+// and a read-only Email card. Rendering never decrypts a secret: a card's
+// `configured` state means a credential is named and its non-secret half is
+// present, not that its value was read."
 
+/// SPEC-4.3.8: render state for the `/settings` page.
 #[derive(Template)]
 #[template(path = "settings.html")]
 struct SettingsTpl {
@@ -4215,6 +4437,8 @@ struct SettingsTpl {
     email: EmailCardView,
 }
 
+/// SPEC-4.3.8: "The Email card is read-only, resolved from the environment
+/// at render time; a password is never shown, only whether one is set."
 /// What the Email card shows (CLAUDE-428: read-only, resolved from the
 /// environment at render time; the password is never shown, only whether one
 /// is set).
@@ -4231,9 +4455,12 @@ struct EmailCardView {
     error: Option<String>,
 }
 
-/// What the Auth card shows. Derived from the `config.auth` document alone, so
-/// rendering the page never decrypts a secret; "configured" means a credential
-/// is named and its non-secret half is present.
+/// SPEC-4.3.8: "The Auth card is derived from the `config.auth` document
+/// alone, so rendering the page never decrypts a secret; `configured` means
+/// a credential is named and its non-secret half is present." What the
+/// Auth card shows. Derived from the `config.auth` document alone, so
+/// rendering the page never decrypts a secret; "configured" means a
+/// credential is named and its non-secret half is present.
 struct AuthCardView {
     anthropic_key: bool,
     youtrack_base_url: Option<String>,
@@ -4261,6 +4488,7 @@ struct AuthCardView {
     login_error: Option<String>,
 }
 
+/// SPEC-4.3.8: one runtime-config section card's render state.
 struct SettingsSectionView {
     path: &'static str,
     title: &'static str,
@@ -4270,6 +4498,7 @@ struct SettingsSectionView {
     fields: Vec<FieldDoc>,
 }
 
+/// SPEC-4.3.8: one field's apply-semantics doc shown on a section card.
 struct FieldDoc {
     name: &'static str,
     badge: &'static str,
@@ -4281,7 +4510,11 @@ struct SettingsForm {
     json: String,
 }
 
-/// Static per-field apply-semantics reference shown on each section card.
+/// SPEC-4.3.8: "Each runtime-config section card documents, per field,
+/// when an edit takes effect: `live` (immediately), `next event` / `next
+/// sweep` (the next matching run), or `restart` (only after the daemon
+/// restarts)." Static per-field apply-semantics reference shown on each
+/// section card.
 fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
     use crate::settings::Section::*;
     match section {
@@ -4532,7 +4765,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
     }
 }
 
-/// Build the full settings view. `flash` carries a just-saved section name or a
+/// SPEC-4.3.8: build the full settings view. `flash` carries a just-saved section name or a
 /// just-rejected section's submitted-but-invalid JSON + serde error.
 async fn render_settings(
     s: &WebState,
@@ -4543,6 +4776,7 @@ async fn render_settings(
     render_settings_with(s, status, saved, rejected, None).await
 }
 
+/// SPEC-4.3.8: like [`render_settings`], with an optional Auth-card error.
 async fn render_settings_with(
     s: &WebState,
     status: StatusCode,
@@ -4553,7 +4787,7 @@ async fn render_settings_with(
     render_settings_full(s, status, saved, rejected, auth_error, None, None).await
 }
 
-/// Like [`render_settings_with`], but the error belongs to the Email card
+/// SPEC-4.3.8: like [`render_settings_with`], but the error belongs to the Email card
 /// instead of the Auth card.
 async fn render_settings_with_email_error(
     s: &WebState,
@@ -4563,6 +4797,10 @@ async fn render_settings_with_email_error(
     render_settings_full(s, status, None, None, None, None, email_error).await
 }
 
+/// SPEC-4.3.8: "The Auth section is excluded from the generic JSON-textarea
+/// section list and rendered instead as a dedicated card with real password
+/// inputs: a JSON textarea would invite pasting a token into a stored
+/// document." Assembles the full settings view for every variant above.
 async fn render_settings_full(
     s: &WebState,
     status: StatusCode,
@@ -4665,13 +4903,15 @@ async fn render_settings_full(
     Ok((status, Html(tpl.render()?)).into_response())
 }
 
-/// `?saved=<what>` renders the confirmation banner after an Auth-card save
-/// redirects back here.
+/// SPEC-4.3.8: "`?saved=<what>` renders the confirmation banner after an
+/// Auth-card save redirects back here." `?saved=<what>` renders the
+/// confirmation banner after an Auth-card save redirects back here.
 #[derive(Deserialize)]
 struct SettingsQuery {
     saved: Option<String>,
 }
 
+/// SPEC-4.3.8: the `/settings` page handler.
 async fn settings_page(
     State(s): State<WebState>,
     Query(q): Query<SettingsQuery>,
@@ -4679,6 +4919,10 @@ async fn settings_page(
     render_settings(&s, StatusCode::OK, q.saved, None).await
 }
 
+/// SPEC-4.3.8: "Saving a section 404s an unknown section path; an invalid
+/// JSON submission re-renders the settings page at 422 with the rejected
+/// section's submitted text and the serde error inline, never a silent
+/// fallback to the stored value." The `/settings/{section}` save handler.
 async fn settings_save(
     State(s): State<WebState>,
     AxumPath(section): AxumPath<String>,
@@ -4705,6 +4949,11 @@ async fn settings_save(
 }
 
 // ---- Settings: service auth ------------------------------------------------
+//
+// SPEC-4.3.8: "Each service-auth card stores its secret encrypted under a
+// fixed name, records the non-secret half in the `config.auth` document,
+// and re-materializes the credential files the CLIs read with no restart.
+// A stored value is never rendered back, only the fact that it is set."
 //
 // The daemon's own logins to Claude, YouTrack and Forgejo, typed into the
 // Settings page instead of a CLI. Each handler stores the secret encrypted under
@@ -4742,7 +4991,7 @@ struct AuthGitForm {
     email: String,
 }
 
-/// Store `value` under `name`, creating or rotating as needed. The caller has
+/// SPEC-4.3.8: store `value` under `name`, creating or rotating as needed. The caller has
 /// already checked the value is non-empty.
 async fn put_secret(s: &WebState, name: &str, value: &str) -> std::result::Result<(), String> {
     let key = crate::secrets::SecretsKey::load().map_err(|e| e.to_string())?;
@@ -4762,7 +5011,7 @@ async fn put_secret(s: &WebState, name: &str, value: &str) -> std::result::Resul
     Ok(())
 }
 
-/// Persist `cfg` as the `config.auth` document and re-materialize the credential
+/// SPEC-4.3.8: persist `cfg` as the `config.auth` document and re-materialize the credential
 /// files from it, so the next `yt` / `fj` / `claude` child sees the new login
 /// with no restart.
 async fn save_auth_config(
@@ -4798,6 +5047,10 @@ async fn save_auth_config(
     Ok(())
 }
 
+/// SPEC-4.3.8: "Saving the Claude auth card requires a non-empty API key;
+/// a successful save also clears any login-required gate with no restart,
+/// alongside a brokered sign-in and the status probe." The
+/// `/settings/auth/claude` handler.
 async fn auth_save_claude(
     State(s): State<WebState>,
     Form(form): Form<AuthClaudeForm>,
@@ -4832,6 +5085,9 @@ async fn auth_save_claude(
     Ok(Redirect::to("/settings?saved=Claude+auth").into_response())
 }
 
+/// SPEC-4.3.8: "Saving the YouTrack auth card requires a non-empty base
+/// URL and token, and rejects a base URL with no `http(s)://` scheme." The
+/// `/settings/auth/youtrack` handler.
 async fn auth_save_youtrack(
     State(s): State<WebState>,
     Form(form): Form<AuthYoutrackForm>,
@@ -4875,6 +5131,9 @@ async fn auth_save_youtrack(
     Ok(Redirect::to("/settings?saved=YouTrack+auth").into_response())
 }
 
+/// SPEC-4.3.8: "Saving the Forgejo auth card requires a non-empty host and
+/// token; a pasted scheme is stripped since `fj` keys by bare host." The
+/// `/settings/auth/forgejo` handler.
 async fn auth_save_forgejo(
     State(s): State<WebState>,
     Form(form): Form<AuthForgejoForm>,
@@ -4914,7 +5173,11 @@ async fn auth_save_forgejo(
     Ok(Redirect::to("/settings?saved=Forgejo+auth").into_response())
 }
 
-/// POST `/settings/auth/github`: `gh auth login` runs BEFORE anything is
+/// SPEC-4.3.8: "Saving the GitHub auth card runs `gh auth login` BEFORE
+/// anything is stored, so a bad token shows on the page instead of failing
+/// at the first job. A blank host defaults to `github.com`; a pasted scheme
+/// is stripped the same way the Forgejo host is." POST
+/// `/settings/auth/github`: `gh auth login` runs BEFORE anything is
 /// stored, so a bad token shows on the page instead of failing at the first
 /// job. A blank host defaults to `github.com`; a pasted scheme is stripped the
 /// same way the Forgejo host is.
@@ -4973,11 +5236,15 @@ async fn auth_save_github(
     Ok(Redirect::to("/settings?saved=GitHub+auth").into_response())
 }
 
-/// POST `/settings/auth/git`: sets the git commit identity the agent's
-/// commits are authored as. Not a credential (no secret store
-/// entry), so an empty field clears it back to the `"claude-run"` /
-/// `"claude-run@a8n.run"` default that `service_auth::materialize` falls back
-/// to, rather than being rejected as required input.
+/// SPEC-4.3.8: "Saving the Git-identity card is not a credential save (no
+/// secret store entry): an empty field clears it back to the default
+/// `\"claude-run\"` / `\"claude-run@a8n.run\"` identity rather than being
+/// rejected as required input." POST `/settings/auth/git`: sets the git
+/// commit identity the agent's commits are authored as. Not a credential
+/// (no secret store entry), so an empty field clears it back to the
+/// `"claude-run"` / `"claude-run@a8n.run"` default that
+/// `service_auth::materialize` falls back to, rather than being rejected as
+/// required input.
 async fn auth_save_git(
     State(s): State<WebState>,
     Form(form): Form<AuthGitForm>,
@@ -4999,7 +5266,10 @@ struct TestEmailForm {
     test_address: String,
 }
 
-/// POST `/settings/auth/email/test`: sends a short test message through the
+/// SPEC-4.3.8: "The Email card's test send goes through the
+/// environment-resolved SMTP transport, the same config a real invite send
+/// would use; it requires a non-blank destination address." POST
+/// `/settings/auth/email/test`: sends a short test message through the
 /// environment-resolved SMTP transport (CLAUDE-428: no stored document),
 /// proving the same config a real invite send would use.
 async fn auth_test_email(
@@ -5064,7 +5334,10 @@ struct AuthCodeForm {
     code: String,
 }
 
-/// POST `/settings/auth/claude/login`: start `claude auth login` and show the
+/// SPEC-4.3.8: "The brokered sign-in start route 503s when the broker is
+/// unavailable in this process, and starts `claude auth login`, keeping the
+/// child alive holding its PKCE verifier until a code arrives." POST
+/// `/settings/auth/claude/login`: start `claude auth login` and show the
 /// authorize URL. The child stays alive holding its PKCE verifier until the code
 /// arrives (see `crate::claude_login`).
 async fn auth_login_start(State(s): State<WebState>) -> Result<Response, WebError> {
@@ -5097,7 +5370,12 @@ async fn auth_login_start(State(s): State<WebState>) -> Result<Response, WebErro
     }
 }
 
-/// POST `/settings/auth/claude/code`: hand the pasted code to the waiting child.
+/// SPEC-4.3.8: "An empty pasted code is rejected inline at 422. A refused
+/// code leaves the session open for another paste, showing the CLI's own
+/// wording; a successful code clears login-required immediately, rather
+/// than waiting for the next status-probe tick, so the next scheduler tick
+/// dispatches normally." POST `/settings/auth/claude/code`: hand the pasted
+/// code to the waiting child.
 async fn auth_login_code(
     State(s): State<WebState>,
     Form(form): Form<AuthCodeForm>,
@@ -5167,7 +5445,9 @@ async fn auth_login_code(
     }
 }
 
-/// POST `/settings/auth/claude/cancel`: abandon an in-flight sign-in, killing
+/// SPEC-4.3.8: "Cancel abandons an in-flight sign-in by killing the child,
+/// rather than leaving it holding a pipe and a verifier." POST
+/// `/settings/auth/claude/cancel`: abandon an in-flight sign-in, killing
 /// the child rather than leaving it holding a pipe and a verifier.
 async fn auth_login_cancel(State(s): State<WebState>) -> Result<Response, WebError> {
     if let Some(broker) = &s.api.claude_login {
@@ -5176,11 +5456,15 @@ async fn auth_login_cancel(State(s): State<WebState>) -> Result<Response, WebErr
     Ok(Redirect::to("/settings#section-auth").into_response())
 }
 
-/// The shared not-ready banner fragment, polled from every page via
-/// `templates/base.html`. Behind the same auth gate as the rest of
-/// `/settings` (mounted on the same router); `templates/login.html` and
-/// `templates/setup.html` do not extend `base.html`, so the poll never runs
-/// unauthenticated.
+/// SPEC-4.3.8: "The shared not-ready banner fragment is polled from every
+/// page via the base template, and is behind the same auth gate as the
+/// rest of `/settings` since it is mounted on the same router; the
+/// unauthenticated login and setup pages do not extend that base template,
+/// so the poll never runs unauthenticated." The shared not-ready banner
+/// fragment, polled from every page via `templates/base.html`. Behind the
+/// same auth gate as the rest of `/settings` (mounted on the same router);
+/// `templates/login.html` and `templates/setup.html` do not extend
+/// `base.html`, so the poll never runs unauthenticated.
 #[derive(Template)]
 #[template(path = "claude_readiness_banner.html")]
 struct ClaudeReadinessBannerTpl {
@@ -5188,6 +5472,7 @@ struct ClaudeReadinessBannerTpl {
     login_required: bool,
 }
 
+/// SPEC-4.3.8: the polled not-ready banner fragment handler.
 async fn auth_claude_banner(State(s): State<WebState>) -> Result<Html<String>, WebError> {
     let check = s.api.readiness.as_ref().map(|g| g.check());
     let tpl = ClaudeReadinessBannerTpl {
@@ -5203,12 +5488,20 @@ async fn auth_claude_banner(State(s): State<WebState>) -> Result<Html<String>, W
 
 // ---- About page -------------------------------------------------------
 //
+// SPEC-4.3.9: "The About page shows version/build info plus the Activity
+// card (live quiet indicator and global pause); updating is by pulling a
+// newer image, so the page has no update action."
+//
 // Version / build info plus the Activity card (live quiet indicator and global
 // pause). Updating is by pulling a newer image; the page has no update action.
 
-/// The Activity card's live indicator, in exactly one of three states.
-/// `Unknown` exists because the alternative (rendering an empty list as idle)
-/// would tell an operator it is safe to reboot BECAUSE the query failed.
+/// SPEC-4.3.9: "The Activity card's live indicator renders in exactly one
+/// of three states; `Unknown` exists because the alternative (rendering an
+/// empty list as idle) would tell an operator it is safe to reboot BECAUSE
+/// the query failed." The Activity card's live indicator, in exactly one of
+/// three states. `Unknown` exists because the alternative (rendering an
+/// empty list as idle) would tell an operator it is safe to reboot BECAUSE
+/// the query failed.
 #[derive(Serialize)]
 enum ActivityView {
     /// Nothing is live: no dispatched run, no open `runs` row. Safe to restart.
@@ -5264,7 +5557,7 @@ struct ActiveRunView {
     started_at: String,
 }
 
-/// Resolve the current activity for the Activity card. A failed query is
+/// SPEC-4.3.9: resolve the current activity for the Activity card. A failed query is
 /// logged at `error` here and converted to [`ActivityView::Unknown`],
 /// so the failure reaches both the log and the operator's screen instead of
 /// being collapsed into an empty (idle-looking) list.
@@ -5305,15 +5598,18 @@ async fn activity_view(s: &WebState) -> ActivityView {
     }
 }
 
-/// The polled Activity fragment (`GET /about/activity`). Rendered standalone
-/// every 2s and included in the full About page, so both surfaces agree by
-/// construction.
+/// SPEC-4.3.9: "The polled Activity fragment is rendered standalone every
+/// 2s and included in the full About page, so both surfaces agree by
+/// construction." The polled Activity fragment (`GET /about/activity`).
+/// Rendered standalone every 2s and included in the full About page, so
+/// both surfaces agree by construction.
 #[derive(Template)]
 #[template(path = "activity.html")]
 struct ActivityTpl {
     activity: ActivityView,
 }
 
+/// SPEC-4.3.9: the `/about/activity` polled fragment handler.
 async fn about_activity(State(s): State<WebState>) -> Result<Response, WebError> {
     let tpl = ActivityTpl {
         activity: activity_view(&s).await,
@@ -5321,6 +5617,7 @@ async fn about_activity(State(s): State<WebState>) -> Result<Response, WebError>
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
+/// SPEC-4.3.9: render state for the About page.
 #[derive(Template)]
 #[template(path = "about.html")]
 struct AboutTpl {
@@ -5333,6 +5630,7 @@ struct AboutTpl {
     activity: ActivityView,
 }
 
+/// SPEC-4.3.9: the `/about` page handler.
 async fn about_page(State(s): State<WebState>) -> Result<Response, WebError> {
     let global_pause = state::global_pause_status(&s.api.pool)
         .await?
@@ -5348,6 +5646,7 @@ async fn about_page(State(s): State<WebState>) -> Result<Response, WebError> {
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
+/// SPEC-4.3.10: one planned job row on the run-detail page.
 #[derive(Serialize)]
 pub struct PlannedJob {
     pub key: String,
@@ -5366,11 +5665,15 @@ pub struct PlannedJob {
     pub watch_attempt: Option<u32>,
 }
 
-/// Resolve the highest attempt number with a stream log on disk for `key`.
-/// Stream logs are written live by `ClaudeInvoker::invoke` to
-/// `<logs>/<action>/streams/<key>-attempt-<n>.jsonl`, so the presence of one
-/// without a matching `job_outcomes` record means that job is in flight. This
-/// is the on-disk fallback for the per-run in-flight registry.
+/// SPEC-4.3.10: "A job's \"running\" badge on the run-detail page resolves
+/// its attempt number from the highest `<key>-attempt-<n>.jsonl` stream log
+/// on disk, the on-disk fallback for the per-run in-flight registry: the
+/// presence of one without a matching `job_outcomes` record means that job
+/// is in flight." Resolve the highest attempt number with a stream log on
+/// disk for `key`. Stream logs are written live by `ClaudeInvoker::invoke`
+/// to `<logs>/<action>/streams/<key>-attempt-<n>.jsonl`, so the presence of
+/// one without a matching `job_outcomes` record means that job is in
+/// flight. This is the on-disk fallback for the per-run in-flight registry.
 fn latest_attempt_on_disk(logs_dir: &std::path::Path, action: &str, key: &str) -> Option<u32> {
     let dir = logs_dir.join(action).join("streams");
     let prefix = format!("{key}-attempt-");
@@ -5394,6 +5697,7 @@ fn latest_attempt_on_disk(logs_dir: &std::path::Path, action: &str, key: &str) -
     best
 }
 
+/// SPEC-4.3.10: render state for the run-detail page.
 #[derive(Template)]
 #[template(path = "run_detail.html")]
 struct RunDetailTpl {
@@ -5424,10 +5728,14 @@ struct RunDetailTpl {
     has_outcomes: bool,
 }
 
-/// Whitelisted sort/filter state for the two run-detail tables. Every value
-/// is validated against a fixed allow-list in [`run_detail`]
-/// before it lands here, so nothing user-controlled reaches a SQL `ORDER BY`
-/// (the sort/filter run in-memory) or gets echoed unescaped into the page.
+/// SPEC-4.3.10: "Run-detail sort/filter state for its two tables (Jobs in
+/// batch, Job outcomes) is validated against a fixed allow-list before it
+/// lands in the template, so nothing user-controlled reaches the in-memory
+/// sort/filter or gets echoed unescaped into the page." Whitelisted
+/// sort/filter state for the two run-detail tables. Every value is
+/// validated against a fixed allow-list in [`run_detail`] before it lands
+/// here, so nothing user-controlled reaches a SQL `ORDER BY` (the
+/// sort/filter run in-memory) or gets echoed unescaped into the page.
 #[derive(Default)]
 struct RunDetailSort {
     jobs_sort: String,
@@ -5525,7 +5833,7 @@ impl RunDetailSort {
     }
 }
 
-/// Up/down triangle for the column `col` given the active `sort`/`dir`, or the
+/// SPEC-4.3.10: up/down triangle for the column `col` given the active `sort`/`dir`, or the
 /// empty string when `col` is not the sorted column.
 fn arrow(sort: &str, dir: &str, col: &str) -> &'static str {
     if sort != col {
@@ -5537,7 +5845,7 @@ fn arrow(sort: &str, dir: &str, col: &str) -> &'static str {
     }
 }
 
-/// Keep `v` only when it is in `allowed`, else return the empty string (the
+/// SPEC-4.3.10: keep `v` only when it is in `allowed`, else return the empty string (the
 /// "no selection" sentinel). This is the whitelist that stops raw query
 /// input from reaching the in-memory `ORDER BY`/`WHERE` equivalents.
 fn whitelisted(v: &str, allowed: &[&str]) -> String {
@@ -5548,7 +5856,7 @@ fn whitelisted(v: &str, allowed: &[&str]) -> String {
     }
 }
 
-/// Keep `v` only when it appears in `allowed` (an owned allow-list
+/// SPEC-4.3.10: keep `v` only when it appears in `allowed` (an owned allow-list
 /// built from actual DB values, e.g. the distinct action / triggered_by sets),
 /// else the empty "no selection" sentinel. The `&[String]` sibling of
 /// [`whitelisted`] for filters whose legal values come from the data.
@@ -5560,8 +5868,10 @@ fn whitelist_member(v: &str, allowed: &[String]) -> String {
     }
 }
 
-/// Claude-column rank used to sort the Job-outcomes "Claude" column:
-/// did-not-run < ran-and-failed < ran-and-ok.
+/// SPEC-4.3.10: "The Job-outcomes \"Claude\" column sorts
+/// did-not-run < ran-and-failed < ran-and-ok." Claude-column rank used to
+/// sort the Job-outcomes "Claude" column: did-not-run < ran-and-failed <
+/// ran-and-ok.
 fn claude_rank(o: &JobOutcomeRow) -> u8 {
     if !o.claude_ran {
         0
@@ -5572,7 +5882,7 @@ fn claude_rank(o: &JobOutcomeRow) -> u8 {
     }
 }
 
-/// Compare two outcomes by a whitelisted column. Unknown columns compare
+/// SPEC-4.3.10: compare two outcomes by a whitelisted column. Unknown columns compare
 /// equal (the caller only sorts when the column passed the whitelist).
 fn out_cmp(a: &JobOutcomeRow, b: &JobOutcomeRow, col: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -5618,9 +5928,13 @@ struct RunDetailQuery {
     out_counted: String,
 }
 
-/// The template that links a run's job keys: the action's own override, else
-/// (for actions whose keys are YouTrack issue keys) `{base}/issue/{key}` from
-/// the Auth card's YouTrack URL, else none (keys render as plain text).
+/// SPEC-4.3.10: "The template that links a run's job keys is the action's
+/// own override, else (for actions whose keys are YouTrack issue keys)
+/// `{base}/issue/{key}` from the Auth card's YouTrack URL, else none (keys
+/// render as plain text)." The template that links a run's job keys: the
+/// action's own override, else (for actions whose keys are YouTrack issue
+/// keys) `{base}/issue/{key}` from the Auth card's YouTrack URL, else none
+/// (keys render as plain text).
 fn effective_link_template(
     declared: Option<String>,
     keys_are_youtrack: bool,
@@ -5632,12 +5946,18 @@ fn effective_link_template(
     })
 }
 
-/// Resolve one action's effective link template: its own declared
-/// `link_template`, else (for a native-kind action, whose keys are YouTrack
-/// issue keys) `{base}/issue/{key}` from the Auth card's YouTrack URL, else
-/// `None`. The single resolution rule behind every tracker-keyed site in the
-/// web UI (Dashboard gates/parked tables, `/logs`, the usage report, the job
-/// stream page, and the run-detail page).
+/// SPEC-4.3.10: "One resolution rule backs every tracker-keyed site in the
+/// web UI (Dashboard gates/parked tables, `/logs`, the usage report, the
+/// job stream page, and the run-detail page): an action's own declared
+/// `link_template`, else (for a native-kind action, whose keys are
+/// YouTrack issue keys) `{base}/issue/{key}` from the Auth card's YouTrack
+/// URL, else `None`." Resolve one action's effective link template: its
+/// own declared `link_template`, else (for a native-kind action, whose
+/// keys are YouTrack issue keys) `{base}/issue/{key}` from the Auth card's
+/// YouTrack URL, else `None`. The single resolution rule behind every
+/// tracker-keyed site in the web UI (Dashboard gates/parked tables,
+/// `/logs`, the usage report, the job stream page, and the run-detail
+/// page).
 async fn action_link_template(
     pool: &crate::db::DbPool,
     actions_dir: &std::path::Path,
@@ -5659,7 +5979,7 @@ async fn action_link_template(
     effective_link_template(declared, keys_are_youtrack, base_url)
 }
 
-/// HTML-escape plain text for a context where it is not auto-escaped by
+/// SPEC-4.3.10: HTML-escape plain text for a context where it is not auto-escaped by
 /// askama (building a `|safe`-marked string in Rust, e.g. the Logs Message
 /// column). Mirrors askama's own default escaping.
 fn html_escape(s: &str) -> String {
@@ -5677,7 +5997,7 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-/// An `<a target="_blank" rel="noopener">` anchor around `text`, both
+/// SPEC-4.3.10: an `<a target="_blank" rel="noopener">` anchor around `text`, both
 /// HTML-escaped, matching the run-detail anchors.
 fn link_anchor(href: &str, text: &str) -> String {
     format!(
@@ -5687,7 +6007,7 @@ fn link_anchor(href: &str, text: &str) -> String {
     )
 }
 
-/// Whether `token` looks like a tracker issue key (`^[A-Z][A-Z0-9_]*-[0-9]+$`),
+/// SPEC-4.3.10: whether `token` looks like a tracker issue key (`^[A-Z][A-Z0-9_]*-[0-9]+$`),
 /// used to decide whether the leading token of a blocker-signature part is a
 /// key to link, versus free text to leave alone.
 fn looks_like_issue_key(token: &str) -> bool {
@@ -5705,7 +6025,11 @@ fn looks_like_issue_key(token: &str) -> bool {
     chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// Render a dependency-gate `signature` (`KEY (verb); KEY (verb)`, see
+/// SPEC-4.3.10: "A dependency-gate signature links each leading key token
+/// that looks issue-key-shaped via the action's link template, and
+/// HTML-escapes every other part of the text; a part whose leading token
+/// is not key-shaped is left unchanged (escaped, not linked)." Render a
+/// dependency-gate `signature` (`KEY (verb); KEY (verb)`, see
 /// `state::StaleGate::signature`), linking each leading key token via
 /// `template` and HTML-escaping every other part of the text. A part whose
 /// leading token is not key-shaped is left unchanged (escaped, not linked).
@@ -5734,7 +6058,7 @@ fn render_blocker_signature(signature: &str, template: Option<&str>) -> String {
         .join("; ")
 }
 
-/// Render a log-event `message`, linking occurrences of the row's own
+/// SPEC-4.3.10: render a log-event `message`, linking occurrences of the row's own
 /// `context` key (not any key-shaped token) and HTML-escaping everything
 /// else. `context` is linked only when `template` resolves, else the whole
 /// message is just escaped.
@@ -5752,6 +6076,13 @@ fn link_message(message: &str, context: &str, template: Option<&str>) -> String 
     }
 }
 
+/// SPEC-4.3.10: "The run-detail page 404s an unknown run id. A planned
+/// job's status is ok/fail/timed_out from its latest outcome, else
+/// running/queued (for an active run) or skipped (for an ended run with no
+/// outcome), where running resolves its live-stream attempt from disk.
+/// Sort/filter selections for the two tables are whitelisted then applied
+/// in-memory, never as interpolated SQL." The `/runs/{id}` run-detail
+/// handler.
 async fn run_detail(
     State(s): State<WebState>,
     AxumPath(id): AxumPath<i64>,
@@ -5939,6 +6270,7 @@ async fn run_detail(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
+/// SPEC-4.3.10: render state for the job-stream page.
 #[derive(Template)]
 #[template(path = "job_stream.html")]
 struct JobStreamTpl {
@@ -5955,6 +6287,9 @@ struct JobStreamTpl {
     href: Option<String>,
 }
 
+/// SPEC-4.3.10: "The job-stream page 404s an unknown run, otherwise resolves
+/// the attempt's on-disk stream-log path and the job key's link href through
+/// the same effective-link-template resolution used elsewhere."
 async fn job_stream_page(
     State(s): State<WebState>,
     AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
@@ -5989,8 +6324,13 @@ async fn job_stream_page(
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
 
+// SPEC-4.3.10: "The live job stream is a server-sent events feed over the
+// same on-disk `.jsonl` log the job-stream page links to."
 // ---- SSE ------------------------------------------------------------------
 
+/// SPEC-4.3.10: "Each SSE line gets a server-formatted `ts_fmt` alongside its
+/// raw `ts`, since the browser can't run chrono's strftime; a line that is
+/// not a JSON object, or carries no string `ts`, passes through unchanged."
 /// Add a preference-formatted `ts_fmt` alongside a stream event's
 /// raw `ts` so the live log renders the same timezone + format as every other
 /// date, while the client keeps the raw `ts` for its hover tooltip. Lines that
@@ -6009,6 +6349,13 @@ fn augment_stream_line_ts(line: &str, prefs: &crate::config::PreferencesConfig) 
     Value::Object(map).to_string()
 }
 
+/// SPEC-4.3.10: "The SSE feed 404s an unknown run, otherwise tails the
+/// attempt's stream-log file: waiting briefly for it to appear on a live run,
+/// reporting a permanently absent file as `stream-log-gone` on an ended run
+/// versus `no-stream-yet` on a live one, resuming from `Last-Event-ID` (or a
+/// `lastEventId` query param on a manual reconnect) by line index, and
+/// closing with a `done` event on a `type: result` line or a matching
+/// `job_outcomes` row."
 async fn job_stream_sse(
     State(s): State<WebState>,
     AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
@@ -6143,8 +6490,13 @@ async fn job_stream_sse(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+// SPEC-4.3.11: "The htmx and idiomorph client scripts are served from the
+// binary itself, not fetched from a CDN, with a one-year immutable
+// cache-control so the browser never re-requests them."
 // ---- static htmx ----------------------------------------------------------
 
+/// SPEC-4.3.11: serves the vendored htmx script as `application/javascript`
+/// with an immutable one-year cache header.
 async fn htmx_handler() -> Response {
     let mut resp = Response::new(Body::from(HTMX_JS));
     resp.headers_mut().insert(
@@ -6158,6 +6510,8 @@ async fn htmx_handler() -> Response {
     resp
 }
 
+/// SPEC-4.3.11: serves the vendored idiomorph script as `application/javascript`
+/// with an immutable one-year cache header.
 async fn idiomorph_handler() -> Response {
     let mut resp = Response::new(Body::from(IDIOMORPH_JS));
     resp.headers_mut().insert(
@@ -6171,8 +6525,12 @@ async fn idiomorph_handler() -> Response {
     resp
 }
 
+// SPEC-4.3.12: "Every fallible handler returns one `WebError` type: a status
+// code plus a plain message, with `From` conversions for the error types
+// handlers hit, so a stray `?` can never bypass the page's error rendering."
 // ---- error ----------------------------------------------------------------
 
+/// SPEC-4.3.12: carries the HTTP status and message a handler's error renders as.
 #[derive(Debug)]
 pub struct WebError {
     status: StatusCode,
@@ -6180,6 +6538,7 @@ pub struct WebError {
 }
 
 impl WebError {
+    /// SPEC-4.3.12: constructs a 404 for a missing row or path.
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -6188,6 +6547,7 @@ impl WebError {
     }
 }
 
+/// SPEC-4.3.12: an internal `crate::error::Error` always renders as 500.
 impl From<crate::error::Error> for WebError {
     fn from(e: crate::error::Error) -> Self {
         Self {
@@ -6197,6 +6557,7 @@ impl From<crate::error::Error> for WebError {
     }
 }
 
+/// SPEC-4.3.12: a database error always renders as 500.
 impl From<sqlx::Error> for WebError {
     fn from(e: sqlx::Error) -> Self {
         Self {
@@ -6206,6 +6567,7 @@ impl From<sqlx::Error> for WebError {
     }
 }
 
+/// SPEC-4.3.12: a filesystem error always renders as 500.
 impl From<std::io::Error> for WebError {
     fn from(e: std::io::Error) -> Self {
         Self {
@@ -6215,6 +6577,7 @@ impl From<std::io::Error> for WebError {
     }
 }
 
+/// SPEC-4.3.12: a template-rendering error always renders as 500.
 impl From<askama::Error> for WebError {
     fn from(e: askama::Error) -> Self {
         Self {
@@ -6224,6 +6587,7 @@ impl From<askama::Error> for WebError {
     }
 }
 
+/// SPEC-4.3.12: a `WebError` becomes a plain-text response at its status code.
 impl IntoResponse for WebError {
     fn into_response(self) -> Response {
         (self.status, self.message).into_response()
