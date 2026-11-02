@@ -15,6 +15,13 @@
 //! event's `api_error_status` / `error` fields. We do NOT substring-match
 //! the whole stream log - that previously false-positived on MCP "needs-auth"
 //! strings in the `system/init` event.
+//!
+//! Implements SPEC-3.2 (the invocation command line and environment) and its
+//! subsections: SPEC-3.2.1 (model/effort/autocompact resolution),
+//! SPEC-3.2.2 (per-invocation spend ceiling), SPEC-3.2.3 (cancellation and
+//! the process group), SPEC-3.2.4 (result-exit grace and the
+//! background-task backstop), SPEC-3.2.5 (failure classification) and
+//! SPEC-3.2.6 (stream-log relay and read failures).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
@@ -57,6 +64,9 @@ fn strip_smtp_password_env(command: &mut Command) {
 
 /// Grace window the claude process group gets after SIGTERM, before the
 /// canceller escalates to SIGKILL.
+///
+/// SPEC-3.2.3: "Termination is SIGTERM, then (if the group has not exited
+/// within a short grace window) SIGKILL."
 const CANCEL_GRACE: Duration = Duration::from_millis(2000);
 /// How often the cancellable wait loop polls the child and the token.
 const CANCEL_POLL: Duration = Duration::from_millis(100);
@@ -66,11 +76,19 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 /// runner terminates the group and finalizes from the captured result rather
 /// than waiting out the full `timeout`. A plain constant for now; expose via
 /// config only if real runs show a legitimate longer tail.
+///
+/// SPEC-3.2.4: "the child gets a grace window (30 seconds) to exit on its
+/// own, after which the runner force-terminates the group and finalizes
+/// from the already-captured result."
 const RESULT_EXIT_GRACE: Duration = Duration::from_secs(30);
 /// The `--effort` levels the `claude` CLI documents. ADVISORY only:
 /// a resolved value outside this set is warned about and then passed through, so
 /// a level Anthropic adds later needs no runner release. Nothing here rejects or
 /// substitutes a value.
+///
+/// SPEC-3.2.1: "A resolved effort level outside the CLI's documented set
+/// ... is passed through unchanged after one warning naming the value and
+/// its source."
 pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// The compaction window every invocation runs with when neither the
 /// action's `claude.autocompact` nor the global default sets one. The `claude`
@@ -79,8 +97,14 @@ pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// compacts and resends every completed operation's tool payloads on every
 /// turn. A fixed window bounds what one turn resends, so cumulative spend grows
 /// linearly in the number of tool calls rather than quadratically.
+///
+/// SPEC-3.2.1: "`--autocompact` resolves the same way but falls back to a
+/// fixed window (200000 tokens) rather than omission."
 pub const DEFAULT_AUTOCOMPACT: &str = "200000";
 
+/// SPEC-3.2.5: "An invocation's outcome is one of: a normal result ..., a
+/// non-transient failure ..., a transient failure ..., a timed-out run ...,
+/// a killed run ..., or a login-required run."
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaudeResult {
     pub ok: bool,
@@ -215,6 +239,9 @@ impl ClaudeInvoker {
     /// `claude.model`, else the live global default, else `None` (no `--model`
     /// flag, so the `claude` CLI's own default applies). The value is passed
     /// through untouched; the CLI validates it.
+    ///
+    /// SPEC-3.2.1: "`--model` and `--effort` resolve action value, then the
+    /// live `claude` settings section, then omission."
     fn resolve_model(&self, claude_cfg: &ClaudeBlock) -> Option<String> {
         claude_cfg.model.clone().or_else(|| {
             let handle = self.default_claude.as_ref()?;
@@ -231,6 +258,9 @@ impl ClaudeInvoker {
     /// rejection and never a substitution: the CLI silently ignores an unknown
     /// level and uses its default, so without this warn a typo would downgrade
     /// effort for every run with nothing in the log to say so.
+    ///
+    /// SPEC-3.2.1: "an unknown effort level is passed through unchanged after
+    /// a warning naming it, where it came from, and the known set."
     fn resolve_effort(&self, claude_cfg: &ClaudeBlock) -> Option<String> {
         let (effort, source) = match claude_cfg.effort.clone() {
             Some(v) => (v, "the action's claude.effort"),
@@ -257,6 +287,8 @@ impl ClaudeInvoker {
     /// falling back to [`DEFAULT_AUTOCOMPACT`] rather than to the CLI's own
     /// `auto`, so the bound holds for every action with no per-action config.
     /// Values are passed through unchanged; the CLI owns their validation.
+    // SPEC-3.2.1: "`--autocompact` resolves the same way but falls back to a
+    // fixed window (200000 tokens) rather than omission."
     fn resolve_autocompact(&self, claude_cfg: &ClaudeBlock) -> String {
         claude_cfg
             .autocompact
@@ -305,6 +337,10 @@ impl ClaudeInvoker {
     /// the child as `--max-budget-usd`, so ONE runaway session cannot overshoot
     /// the run's ceiling between the runner's own between-invocation checks.
     /// `None` leaves the child uncapped (no flag passed at all).
+    ///
+    /// SPEC-3.2.2: "The run's remaining budget ... is passed as
+    /// `--max-budget-usd` on every invocation, so a single runaway session
+    /// cannot overshoot the run's ceiling."
     #[allow(clippy::too_many_arguments)]
     pub fn invoke(
         &self,
@@ -524,6 +560,9 @@ impl ClaudeInvoker {
         // unhappy: a non-"allowed" status, or either window at or past 90%
         // utilization, since that is the point an operator needs to notice
         // before the next invocation gets rate-limited outright.
+        //
+        // SPEC-3.2.7: "a `warn` (rather than `info`) logging threshold at a
+        // non-`allowed` status or either utilization window at or past 90%."
         match &usage.rate_limit {
             Some(rl) => {
                 let hot = rl.status.as_deref().is_some_and(|s| s != "allowed")
@@ -749,6 +788,12 @@ impl ClaudeInvoker {
 }
 
 /// Outcome of the cancellable wait loop.
+///
+/// SPEC-3.2.4: "the child gets a grace window ... to exit on its own, after
+/// which the runner force-terminates the group and finalizes from the
+/// already-captured result." SPEC-3.2.5: "A run is login-required when the
+/// CLI reports a structured `authentication_failed` ... via three or more
+/// `system`/`api_retry` events ... observed during the wait loop."
 struct WaitOutcome {
     status: ExitStatus,
     /// True when claude emitted its terminal `result` event but did
@@ -778,6 +823,9 @@ struct WaitOutcome {
 /// synchronous call already blocking its worker thread on the child, so a
 /// 100ms poll adds responsiveness to cancellation without changing the
 /// threading model.
+///
+/// SPEC-3.2.3: "The wait for the child is a poll loop rather than a
+/// blocking `wait`, so an operator cancel is observed promptly."
 fn wait_or_cancel(
     child: &mut Child,
     pgid: i32,
@@ -883,6 +931,10 @@ fn wait_or_cancel(
 /// force-terminated rather than left to exhaust `claude_timeout_seconds`. A
 /// single retry during a token-refresh race is not evidence of a dead login;
 /// three in a row is.
+///
+/// SPEC-3.2.5: "via three or more `system`/`api_retry` events carrying that
+/// same structured error observed during the wait loop, which
+/// force-terminates the child well below the job's timeout."
 const AUTH_RETRY_LIMIT: usize = 3;
 
 /// Count `system`/`api_retry` events in the stream log whose top-level `error`
@@ -962,6 +1014,9 @@ fn stream_has_terminal_result(stream_log: &Path) -> std::io::Result<bool> {
 /// Terminate the child's process group: SIGTERM, a short grace window, then
 /// SIGKILL. Signalling `-pgid` hits every process in the group (`timeout`,
 /// `claude`, and anything they spawned), so nothing is left orphaned.
+///
+/// SPEC-3.2.3: "a cancellation or a timeout signals the whole tree ... at
+/// once rather than leaving a descendant orphaned."
 fn terminate_group(child: &mut Child, pgid: i32) -> std::io::Result<ExitStatus> {
     unsafe {
         libc::kill(-pgid, libc::SIGTERM);
@@ -981,6 +1036,9 @@ fn terminate_group(child: &mut Child, pgid: i32) -> std::io::Result<ExitStatus> 
 
 /// Transient = "the API itself told us to back off; a retry might succeed".
 /// Only rate-limit signals count. Timeout (exit 124) is never transient.
+///
+/// SPEC-3.2.5: "a transient failure (the terminal event's
+/// `api_error_status` or `error` names a rate limit; never a timeout)."
 fn classify_transient(exit_code: i32, final_event: &Value) -> bool {
     if exit_code == 124 {
         return false;
@@ -1019,6 +1077,11 @@ fn classify_transient(exit_code: i32, final_event: &Value) -> bool {
 ///
 /// Generic over both ends so the failure paths are unit-testable without a real
 /// child process or a real full disk.
+///
+/// SPEC-3.2.6: "written by a relay thread that copies the child's piped
+/// stdout line by line, stamping each parseable JSON event with an
+/// arrival-time `ts` ... A relay I/O failure ... is carried out as an
+/// explicit error rather than discarded."
 fn relay_stamped_stdout<R: std::io::Read, W: Write>(stdout: R, mut sink: W) -> std::io::Result<()> {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
@@ -1077,6 +1140,11 @@ fn stamp_line(raw: &[u8]) -> Vec<u8> {
 /// the runner could not open. `read_to_string` fails with `InvalidData` on a
 /// file ending inside a multi-byte UTF-8 sequence, which is exactly what a
 /// disk-full truncation produces.
+///
+/// SPEC-3.2.6: "Reading the stream log back ... carries its own read
+/// failure out the same way: an unreadable log finalizes as a transient
+/// failure, while a log that reads fine but simply has no terminal
+/// `result` event is a real, non-transient claude-side outcome."
 fn parse_final_result(stream_log: &Path) -> std::io::Result<Option<Value>> {
     let raw = std::fs::read_to_string(stream_log)?;
     Ok(raw
@@ -1094,6 +1162,10 @@ fn parse_final_result(stream_log: &Path) -> std::io::Result<Option<Value>> {
 /// Shape observed in a real run's log (a `task_updated` event with
 /// `patch.status: killed` following a successful `result`) and confirmed
 /// against the CLI directly; revise if a CLI release renames these fields.
+///
+/// SPEC-3.2.4: "a match means a background task outlived the session's own
+/// report of success, and the runner overrides that into a non-transient
+/// failure naming the task id."
 fn killed_tasks_after_result(stream_log: &Path) -> std::io::Result<Vec<String>> {
     let raw = std::fs::read_to_string(stream_log)?;
     let lines: Vec<&str> = raw.lines().collect();
@@ -1155,6 +1227,10 @@ pub(crate) fn count_compact_boundaries(stream_log: &Path) -> std::io::Result<usi
 /// matching the CLAUDE-233 convention for every other writer of this file;
 /// the caller logs a failure and continues, since the run's outcome is
 /// already decided by the time this runs.
+///
+/// SPEC-3.2.6: a relay or read failure is "carried out as an explicit error
+/// rather than discarded"; this is how that error is appended to the log
+/// a caller could not otherwise annotate.
 pub(crate) fn append_runner_error(
     stream_log: &Path,
     step: &str,
@@ -1243,6 +1319,9 @@ fn no_final_message_summary(turns: usize, last_tool: Option<&str>, stream_log: &
 /// 3. A plain sentence stating that the run produced no final message, with
 ///    the facts the stream log does support: the number of assistant turns,
 ///    the last tool name used, and the stream log path.
+///
+/// SPEC-3.2.5: the human-readable rendering of the non-transient / transient
+/// outcome a `result` event (or its absence) classifies into.
 pub(crate) fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -> String {
     if final_event.get("type").and_then(|v| v.as_str()) == Some("result") {
         let result = final_event
@@ -1280,6 +1359,10 @@ pub(crate) fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -
 /// `claude.error` / `claude.summary` text. `timed_out` takes precedence over
 /// `killed` (the two are expected to be mutually exclusive in practice, since
 /// they come from different exit codes). Neither set returns `None`.
+///
+/// SPEC-3.2.5: "a timed-out run (`timeout`'s exit code 124)" and "a killed
+/// run (exit code 137, SIGKILL ... typically an out-of-memory kill)" are
+/// distinct classified outcomes; this spells each out for a human reader.
 pub fn failure_hint(timed_out: bool, killed: bool) -> Option<&'static str> {
     if timed_out {
         Some(
@@ -1329,6 +1412,9 @@ fn unreadable_log_summary(stream_log: &Path, err: &std::io::Error) -> String {
 /// `relay_failure_result` / `read_failure_result` runner-fault outcomes above.
 /// `login_required` additionally lets a caller that wants to react
 /// specifically (rather than just retry later) branch on it.
+///
+/// SPEC-3.2.5: "a login-required outcome is always transient, so the attempt
+/// is not counted, and it trips the daemon's readiness gate."
 fn login_required_result(message: &str) -> ClaudeResult {
     ClaudeResult {
         ok: false,
@@ -1350,6 +1436,10 @@ fn login_required_result(message: &str) -> ClaudeResult {
     }
 }
 
+/// SPEC-3.2.6: "a relay I/O failure is carried out as an explicit error
+/// rather than discarded: if the terminal result was already captured before
+/// the relay died, the run still finalizes from it; if not, the run is
+/// reported as a transient failure naming the write error and the log path."
 fn relay_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> ClaudeResult {
     ClaudeResult {
         ok: false,
@@ -1387,6 +1477,10 @@ fn relay_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> Clau
 /// one of the job's `max_attempts_per_key`. Without it the run finalized as
 /// "claude stream did not end with a result event", a non-transient failure
 /// pinned on the agent.
+///
+/// SPEC-3.2.6: "an unreadable log finalizes as a transient failure, while a
+/// log that reads fine but simply has no terminal `result` event is a real,
+/// non-transient claude-side outcome."
 fn read_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> ClaudeResult {
     ClaudeResult {
         ok: false,
@@ -1455,6 +1549,10 @@ fn last_assistant_text(stream_log: &Path) -> std::io::Result<Option<String>> {
 /// block for failure comments (YouTrack and Forgejo both render Markdown + the
 /// `<details>` HTML element). Returns an empty string for synthesized results
 /// (`Value::Null` or an empty object) so callers can append it unconditionally.
+///
+/// SPEC-3.2.5: renders the `raw` terminal event a classified outcome carries,
+/// empty for the synthesized results `login_required_result` and friends
+/// construct with no real `claude` child behind them.
 pub fn raw_event_details(raw: &Value) -> String {
     match raw {
         Value::Null => return String::new(),

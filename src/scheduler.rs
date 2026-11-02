@@ -5,11 +5,12 @@
 //! | kind | spec | example | semantics |
 //! |------|------|---------|-----------|
 //! | `interval` | human duration | `30m`, `2h`, `90s` | fire every N from the last run's `started_at` |
-//! | `cron` | 5-field cron | `*/30 * * * *` | fire at the next instant matching the expression after the last run |
+//! | `cron` | 5-field cron, UTC | `*/30 * * * *` | fire at the next instant matching the expression after the last run |
 //! | `manual` | (omitted) | - | never auto-fires; only `claude-run trigger` |
 //!
-//! `parse_schedule` validates the action's stored fields; `next_fire` decides
-//! whether an action is due now.
+//! `parse_schedule` validates the action's stored fields; `next_fire_due` decides
+//! whether an action's schedule makes it due now, and `regather_due` paces how
+//! often a due action is gathered.
 //!
 //! SPEC-3.1: "`schedule.kind` is `interval`, `cron`, or `manual`"; SPEC-2.2:
 //! the scheduler computes a due time per schedule kind and tracks regather

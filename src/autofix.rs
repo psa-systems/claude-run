@@ -1,5 +1,7 @@
 //! Deterministic auto-fix detector layer.
 //!
+//! Implements SPEC-3.5.1's auto-fix detector step.
+//!
 //! A verification-only CI failure (the canonical case is `cargo fmt --check`;
 //! the general case is any failure of a configured checks workflow, default
 //! `check.yml`) is mechanically fixable: the fix is a known command with no
@@ -21,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::AutoFixConfig;
 use crate::triage::TriageInput;
 
-/// A mechanically-fixable CI failure produced by a detector. Flows through the
+/// SPEC-3.5.1: a mechanically-fixable CI failure produced by a detector. Flows through the
 /// [`crate::triage::Triage`] verdict into the mint so the issue summary /
 /// description name the concrete problem and fix instead of the generic
 /// "CI failure" template.
@@ -42,9 +44,9 @@ pub struct AutoFix {
     pub scope: Option<String>,
 }
 
-/// Run the detectors against a failure, most-specific first. Returns `None` when
-/// the framework is disabled or no detector matches (the caller then falls
-/// through to the LLM classifier).
+/// SPEC-3.5.1: run the detectors against a failure, most-specific first, only
+/// when the framework is enabled. Returns `None` when disabled or no detector
+/// matches (the caller then falls through to the LLM classifier).
 pub fn detect(input: &TriageInput, cfg: &AutoFixConfig) -> Option<AutoFix> {
     if !cfg.enabled {
         return None;
