@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+/// The one error type every fallible path in the binary returns. SPEC-5.5.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("io: {0}")]
@@ -112,4 +113,5 @@ pub enum Error {
     Other(#[from] anyhow::Error),
 }
 
+/// The `Result` alias every fallible path returns. SPEC-5.5.
 pub type Result<T> = std::result::Result<T, Error>;

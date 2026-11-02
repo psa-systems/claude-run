@@ -17,6 +17,8 @@
 //!
 //! `~`, `$VAR`, and `${VAR}` are expanded in all values (the env override and
 //! the `workdir_base` field on actions both go through `expand_path`).
+//!
+//! SPEC-6.1 (environment variables) and SPEC-6.2 (`config.toml`).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -28,9 +30,10 @@ use crate::web::webhooks::WebhookProvider;
 
 /// The per-run usage record, directly under `logs/`. Shared with
 /// `crate::gc` so the writer's path and the sweep's target cannot drift apart.
+/// SPEC-6.1.
 pub const USAGE_LOG: &str = "usage.jsonl";
 
-/// Resolved on-disk locations. Computed once at startup.
+/// Resolved on-disk locations. Computed once at startup. SPEC-6.1.
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub config_dir: PathBuf,
@@ -89,6 +92,7 @@ impl Paths {
     }
 }
 
+/// Env-override-then-XDG-default resolution for one [`Paths`] field. SPEC-6.1.
 fn resolve_dir(env_var: &str, xdg_default: Option<PathBuf>, subdir: &str) -> Result<PathBuf> {
     if let Ok(raw) = std::env::var(env_var) {
         return Ok(PathBuf::from(expand_path(&raw)));
@@ -100,6 +104,7 @@ fn resolve_dir(env_var: &str, xdg_default: Option<PathBuf>, subdir: &str) -> Res
 
 /// Expand `~`, `$VAR`, and `${VAR}` in a path string. No nu evaluation.
 /// Used for the `workdir_base` action field and the env-override values.
+/// SPEC-6.1.
 pub fn expand_path(raw: &str) -> String {
     shellexpand::full(raw)
         .map(|cow| cow.into_owned())
@@ -108,7 +113,7 @@ pub fn expand_path(raw: &str) -> String {
 
 /// `config.toml` schema. All fields optional; absence means "use built-in default".
 /// Runtime-tunable settings live in the DB (`settings` table); this file is
-/// for things that have to be known before the DB is opened.
+/// for things that have to be known before the DB is opened. SPEC-6.2.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OnDiskConfig {
@@ -129,7 +134,7 @@ pub struct OnDiskConfig {
     pub mcp: McpConfig,
 }
 
-/// Backend selection for the runtime state store.
+/// Backend selection for the runtime state store. SPEC-6.1, SPEC-6.2.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DatabaseConfig {
@@ -155,7 +160,7 @@ pub struct DatabaseConfig {
 /// Serves the same seven read-only troubleshooting tools as `claude-run mcp
 /// stdio` (`src/mcp.rs`, CLAUDE-437), but over Streamable HTTP behind the
 /// `mcp-web` crate's local-account + OAuth 2.1 bearer layer, so a remote
-/// client can reach them without `docker compose exec`.
+/// client can reach them without `docker compose exec`. SPEC-4.5, SPEC-6.2.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpConfig {
@@ -195,6 +200,7 @@ impl Default for McpConfig {
     }
 }
 
+/// Web UI / `/api/*` bind and auth-gate settings. SPEC-6.2.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebConfig {
@@ -242,6 +248,8 @@ impl Default for WebConfig {
 /// `rate_limit_per_min` keys are gone; `deny_unknown_fields` makes a config still
 /// carrying them fail to parse at serve start, naming the offending key, which is
 /// the intended migration signal.
+///
+/// SPEC-6.2, SPEC-4.4.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebhookConfig {
@@ -322,7 +330,7 @@ impl Default for WebhookConfig {
 /// silently widen what a consumer acts on. Matching is case-sensitive; an empty
 /// list matches nothing (fail closed). Shared by the webhook allow-list, the
 /// reconciler's `repos`, and the per-repo log-token mapping so all
-/// three read a pattern the same way.
+/// three read a pattern the same way. SPEC-7.6, SPEC-7.12.
 pub fn repo_matches(patterns: &[String], repo: &str) -> bool {
     patterns.iter().any(|pat| match pat.as_str() {
         "*" => true,
@@ -336,7 +344,7 @@ pub fn repo_matches(patterns: &[String], repo: &str) -> bool {
 /// True when `name` is a clean source name (lowercase `[a-z0-9_-]`, non-empty)
 /// usable verbatim as a URL path segment with no escaping. Source names outside
 /// this set still work as map keys but produce an ambiguous / escaped URL, so
-/// [`WebhookConfig::warn_unusual_source_names`] flags them at load.
+/// [`WebhookConfig::warn_unusual_source_names`] flags them at load. SPEC-6.2.
 fn source_name_is_clean(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -349,7 +357,7 @@ impl WebhookConfig {
     /// `[a-z0-9_-]`. The name is the `/webhooks/forgejo/<name>` path segment, so
     /// an unusual name needs URL escaping in the Forgejo webhook URL and is a
     /// likely typo; the source still loads (the map key is honored) but the
-    /// operator is told to expect an escaped URL.
+    /// operator is told to expect an escaped URL. SPEC-6.2.
     pub fn warn_unusual_source_names(&self) {
         for name in self.sources.keys() {
             if !source_name_is_clean(name) {
@@ -368,6 +376,9 @@ impl WebhookConfig {
 /// its own bucket. The HMAC secret itself is never inlined here; `secret_ref`
 /// names a credential in the `secrets` table, resolved (and decrypted)
 /// at request time.
+///
+/// SPEC-6.2 (declared shape); SPEC-7.12 (`secret_ref` / `write_token_ref`
+/// required-when-enabled validation).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebhookSource {
@@ -435,6 +446,8 @@ impl Default for WebhookSource {
 /// Settings page / via `PUT /api/settings/webhook_comment`). It is deliberately
 /// absent from [`OnDiskConfig`], so a `config.toml` declaring `[webhook_comment]`
 /// fails to parse as an unknown key, and there is no file-to-DB import path.
+///
+/// SPEC-6.3, SPEC-6.5 (no import path: a DB-only-from-birth section).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommentWebhookConfig {
@@ -483,15 +496,15 @@ impl Default for CommentWebhookConfig {
 /// Default git commit identity used wherever the runner authors a commit and
 /// nothing more specific is configured: the comment-webhook's own corrective
 /// commits ([`CommentWebhookSource::bot_author`] / `bot_email`) and
-/// [`AuthConfig::git_author_name`] / `git_author_email` when unset.
+/// [`AuthConfig::git_author_name`] / `git_author_email` when unset. SPEC-7.3.
 pub const DEFAULT_GIT_AUTHOR_NAME: &str = "claude-run";
-/// See [`DEFAULT_GIT_AUTHOR_NAME`].
+/// See [`DEFAULT_GIT_AUTHOR_NAME`]. SPEC-7.3.
 pub const DEFAULT_GIT_AUTHOR_EMAIL: &str = "claude-run@a8n.run";
 
 impl CommentWebhookConfig {
     /// Warn at load for any source name needing URL escaping, exactly as
     /// [`WebhookConfig::warn_unusual_source_names`] does for the CI-failure
-    /// sources (same predicate, same reasoning).
+    /// sources (same predicate, same reasoning). SPEC-6.3.
     pub fn warn_unusual_source_names(&self) {
         for name in self.sources.keys() {
             if !source_name_is_clean(name) {
@@ -508,6 +521,9 @@ impl CommentWebhookConfig {
 /// [`WebhookSource`] (own HMAC secret, own allow-list, own rate bucket) plus the
 /// write-scoped PAT and the authorization / decision-gate knobs the comment
 /// pipeline needs.
+///
+/// SPEC-6.3 (declared shape); SPEC-7.12 (`secret_ref` / `write_token_ref`
+/// required-when-enabled validation).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommentWebhookSource {
@@ -571,10 +587,13 @@ impl Default for CommentWebhookSource {
 }
 
 /// Settings for minting (or updating) a YouTrack issue from a triaged
-/// failure. Lives in `config.toml` because the daemon's webhook consumer needs it
-/// at startup. Routing sends an issue to the project whose enabled VCS
+/// failure. DB-backed (settings key `config.mint`, SPEC-6.3); `config.toml`'s
+/// `[mint]` is only a bootstrap copy, one-time imported into the DB per
+/// SPEC-6.5. Routing sends an issue to the project whose enabled VCS
 /// integration claims the failing repo; `repo_project_map` is an optional override
 /// consulted first, and `fallback_project` catches any unclaimed repo.
+///
+/// SPEC-6.2, SPEC-6.3.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MintConfig {
@@ -650,7 +669,7 @@ impl Default for MintConfig {
 /// deterministic auto-fix verdict (no LLM call). The `cargo-fmt` detector is
 /// signature-driven and always on while the framework is `enabled`; the
 /// `checks-workflow` detector matches the run's `workflow_id` against
-/// [`AutoFixConfig::checks_workflows`].
+/// [`AutoFixConfig::checks_workflows`]. SPEC-6.2.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutoFixConfig {
@@ -681,7 +700,7 @@ impl Default for AutoFixConfig {
 /// workdirs/<source>/<key>` (including `.kept-<n>` aside dirs) older than
 /// `retention_days`. A workdir that still holds unpushed commits is respected
 /// until the longer `unpushed_hard_cap_days`, so genuine un-saved work is not
-/// discarded the moment the window passes.
+/// discarded the moment the window passes. SPEC-6.3.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkdirGcConfig {
@@ -729,6 +748,8 @@ impl Default for WorkdirGcConfig {
 /// the `Stream log GC` card title) rather than being renamed to match the wider
 /// scope: the key is the primary key of the stored document, so renaming it
 /// would silently reset an operator's configured window back to the default.
+///
+/// SPEC-6.3.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct StreamLogGcConfig {
@@ -822,7 +843,7 @@ impl Default for StreamLogGcConfig {
 /// [`crate::retention::RETENTION_TABLES`] whose `ts` is older than
 /// `retention_days`. `job_outcomes` is the driver; `run_events`
 /// shares the same config, helper, and loop rather than a divergent
-/// implementation.
+/// implementation. SPEC-6.3.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DbRetentionConfig {
@@ -846,25 +867,38 @@ impl Default for DbRetentionConfig {
     }
 }
 
-/// Retention window for the sidecar's Docker named volumes (settings key
-/// `config.docker_gc`, editable on the web Settings page). NOT a `config.toml`
-/// key. The sweep ([`crate::gc::sweep_docker_volumes`]) runs on the same GC tick
-/// as the sweeps above, removing a named volume that no container references
-/// once it is older than `volume_retention_days`. CLAUDE-433: nothing removed
-/// these before; one deployment held 139 named volumes totalling about 206 GB,
-/// 138 of them referenced by no container, and the sidecar's data directory
-/// filled to 100%.
+/// Retention window and overall ceiling for the sidecar's Docker storage
+/// (settings key `config.docker_gc`, editable on the web Settings page). NOT a
+/// `config.toml` key. The named-volume sweep
+/// ([`crate::gc::sweep_docker_volumes`]) and the SPEC-3.11 ceiling reclaim
+/// ([`crate::gc::reclaim_docker_storage`]) both run on the same GC tick,
+/// reading this section off the shared handle so a Settings save applies on
+/// the next pass. CLAUDE-433: nothing removed unreferenced named volumes
+/// before; one deployment held 139 named volumes totalling about 206 GB, 138
+/// of them referenced by no container, and the sidecar's data directory filled
+/// to 100%. CLAUDE-516 (SPEC-3.11) extends the bound to the sidecar's images,
+/// stopped containers and build cache, which were still unmeasured and
+/// unbounded. SPEC-6.3.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DockerGcConfig {
-    /// Master enable toggle. When `false`, the sweep removes nothing, so an
-    /// operator can park the feature without losing the configured window.
+    /// Master enable toggle. When `false`, neither the volume sweep nor the
+    /// ceiling reclaim removes anything, so an operator can park the feature
+    /// without losing the configured window.
     pub enabled: bool,
     /// Age, in days, past which an unused named volume is removed, measured
     /// from Docker's own `CreatedAt` (Docker records no last-used time, so age
     /// means time since creation). Default 3 days. Validated on save as an
     /// integer `>= 1`.
     pub volume_retention_days: u64,
+    /// SPEC-3.11: total ceiling, in bytes, across every category of the
+    /// sidecar's Docker storage (images, containers, local volumes, build
+    /// cache). When the sidecar's measured total exceeds this and no run is
+    /// in flight, [`crate::gc::reclaim_docker_storage`] reclaims storage in
+    /// the SPEC-3.11 order until the total is back under the ceiling. Default
+    /// 250 GB (assumed; revise if measurement shows otherwise). Validated on
+    /// save as an integer `>= 1`.
+    pub max_bytes: u64,
 }
 
 impl Default for DockerGcConfig {
@@ -872,6 +906,8 @@ impl Default for DockerGcConfig {
         Self {
             enabled: true,
             volume_retention_days: 3,
+            // 250 GB, SPEC-3.11's assumed default.
+            max_bytes: 250 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -882,7 +918,7 @@ impl Default for DockerGcConfig {
 /// per-user rows. It drives how every stored RFC3339 UTC timestamp is rendered
 /// in the web UI: convert to `timezone`, then format with `datetime_format`
 /// (a chrono strftime string). Defaults reproduce today's UTC ISO-with-seconds
-/// surface, so behavior is unchanged until an operator configures it.
+/// surface, so behavior is unchanged until an operator configures it. SPEC-6.3.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PreferencesConfig {
@@ -917,6 +953,8 @@ impl Default for PreferencesConfig {
 /// page and via `GET`/`PUT /api/settings/claude`) per the
 /// bootstrap-vs-runtime split, so it is NOT a `config.toml` key (a brand-new
 /// section, so there is no file fallback: the DB value or the default).
+///
+/// SPEC-6.3 ("Fields not listed in 3.x" model/effort/autocompact precedence).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClaudeConfig {
@@ -947,7 +985,7 @@ pub struct ClaudeConfig {
 /// [`crate::settings::LiveSettings`] (which swaps it on save) and
 /// [`crate::claude::ClaudeInvoker`] (which reads it per invocation). A
 /// `std::sync::RwLock` rather than a tokio one because the read happens inside
-/// the synchronous `invoke`, which has no `await`.
+/// the synchronous `invoke`, which has no `await`. SPEC-6.4.
 pub type ClaudeConfigHandle = std::sync::Arc<std::sync::RwLock<ClaudeConfig>>;
 
 /// Daemon-wide concurrency + continuous-pickup settings. A DB-backed
@@ -962,7 +1000,7 @@ pub type ClaudeConfigHandle = std::sync::Arc<std::sync::RwLock<ClaudeConfig>>;
 /// `regather_interval_secs` is the cadence at which the scheduler starts
 /// overlapping pickup runs, decoupled from (and typically faster than) an
 /// action's `schedule.spec`, so an issue queued mid-run is picked up within one
-/// interval rather than waiting for the in-flight run to drain.
+/// interval rather than waiting for the in-flight run to drain. SPEC-6.3.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConcurrencyConfig {
@@ -990,12 +1028,13 @@ impl Default for ConcurrencyConfig {
 /// Names the service-auth secrets are stored under. Fixed rather than
 /// operator-chosen: the Settings page owns these three credentials end to end,
 /// and a stable name keeps a rotation an overwrite instead of an orphan.
+/// SPEC-7.1.
 pub const ANTHROPIC_KEY_SECRET: &str = "auth-anthropic-api-key";
-/// See [`ANTHROPIC_KEY_SECRET`].
+/// See [`ANTHROPIC_KEY_SECRET`]. SPEC-7.1.
 pub const YOUTRACK_TOKEN_SECRET: &str = "auth-youtrack-token";
-/// See [`ANTHROPIC_KEY_SECRET`].
+/// See [`ANTHROPIC_KEY_SECRET`]. SPEC-7.1.
 pub const FORGEJO_TOKEN_SECRET: &str = "auth-forgejo-token";
-/// See [`ANTHROPIC_KEY_SECRET`].
+/// See [`ANTHROPIC_KEY_SECRET`]. SPEC-7.1.
 pub const GITHUB_TOKEN_SECRET: &str = "auth-github-token";
 
 /// The `config.auth` settings section: the daemon's own logins to Claude,
@@ -1007,6 +1046,8 @@ pub const GITHUB_TOKEN_SECRET: &str = "auth-github-token";
 /// `fj` and `gh` CLIs read. An action's own `token_ref` still wins for its runs;
 /// this is the default the daemon's own provider calls use, which before had
 /// nothing but whatever the host operator had logged in.
+///
+/// SPEC-6.3 (declared shape); SPEC-7.3 (`git_author_name` / `git_author_email`).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
@@ -1038,12 +1079,13 @@ pub struct AuthConfig {
 /// Name the SMTP password secret used to be stored under, before CLAUDE-428
 /// moved the SMTP transport to environment variables. Kept only so the
 /// startup retirement in `src/settings.rs` can delete a leftover secret by
-/// this name; no code writes it anymore.
+/// this name; no code writes it anymore. SPEC-7.1.
 pub const SMTP_PASSWORD_SECRET: &str = "email-smtp-password";
 
 /// How the SMTP connection is secured. `Starttls` is the default: plaintext
 /// connect, then upgrade. `Tls` connects already encrypted (the old "implicit
 /// TLS" port 465 style). `None` sends in the clear, for a local relay only.
+/// SPEC-6.1.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SmtpEncryption {
@@ -1059,7 +1101,7 @@ pub enum SmtpEncryption {
 /// [`EmailConfig::password`].
 ///
 /// Email is "configured" only once `smtp_host`, `from`, and `public_url` are
-/// all set; see [`EmailConfig::configured`].
+/// all set; see [`EmailConfig::configured`]. SPEC-6.1.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct EmailConfig {
     /// SMTP server host, e.g. `smtp.example.com`. `CLAUDE_RUN_SMTP_HOST`;
@@ -1109,7 +1151,7 @@ impl std::fmt::Debug for EmailConfig {
 
 impl EmailConfig {
     /// Whether enough is set to send mail: host, From, and the public URL the
-    /// invite link is built from.
+    /// invite link is built from. SPEC-6.1.
     pub fn configured(&self) -> bool {
         self.smtp_host.is_some() && self.from.is_some() && self.public_url.is_some()
     }
@@ -1149,7 +1191,7 @@ impl EmailConfig {
 /// runner-posted comment needs this value even on an instance with no SMTP
 /// configured, or whose SMTP configuration is otherwise broken, so it is not
 /// read through [`EmailConfig`]. Same validation as before: an absolute
-/// `http`/`https` URL, or unset.
+/// `http`/`https` URL, or unset. SPEC-6.1.
 pub fn public_url_from_env(
     get: impl Fn(&str) -> Option<String>,
 ) -> std::result::Result<Option<String>, String> {
@@ -1168,7 +1210,7 @@ pub fn public_url_from_env(
 
 /// Resolve `CLAUDE_RUN_PUBLIC_URL` from the real process environment. Thin
 /// wrapper over [`public_url_from_env`] so call sites do not each repeat the
-/// `std::env::var` lookup closure.
+/// `std::env::var` lookup closure. SPEC-6.1.
 pub fn public_url() -> std::result::Result<Option<String>, String> {
     public_url_from_env(|k| std::env::var(k).ok())
 }
@@ -1201,7 +1243,7 @@ pub fn public_url_env_lock_blocking() -> tokio::sync::MutexGuard<'static, ()> {
 /// On any failure, returns a message naming the offending variable and (for
 /// everything except the password itself) its value - never the password.
 /// `CLAUDE_RUN_SMTP_PASSWORD_FILE` wins over `CLAUDE_RUN_SMTP_PASSWORD` when
-/// both are set.
+/// both are set. SPEC-6.1.
 pub fn email_config_from_env(
     get: impl Fn(&str) -> Option<String>,
 ) -> std::result::Result<EmailConfig, String> {
@@ -1272,6 +1314,9 @@ pub fn email_config_from_env(
     })
 }
 
+/// Daemon-process bootstrap settings: binary overrides, the agent's
+/// `CLAUDE_CONFIG_DIR`, and the persistent log filter. SPEC-6.2, SPEC-6.1
+/// (`log_filter` vs. `CLAUDE_RUN_LOG` precedence).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
@@ -1303,6 +1348,7 @@ pub struct DaemonConfig {
 /// Precedence decision for the post-config-load log-filter swap,
 /// extracted as a pure function so the `CLAUDE_RUN_LOG` > `[daemon].log_filter`
 /// > default ordering is unit-testable without a live tracing subscriber.
+/// > SPEC-6.1, SPEC-6.2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogFilterChoice {
     /// `CLAUDE_RUN_LOG` is set; it already seeded the initial filter and wins.
@@ -1316,6 +1362,7 @@ pub enum LogFilterChoice {
 
 /// Pure precedence logic. `env_set` is whether `CLAUDE_RUN_LOG` is
 /// present in the environment; `file_filter` is `[daemon].log_filter`.
+/// SPEC-6.1, SPEC-6.2.
 pub fn log_filter_choice(env_set: bool, file_filter: Option<&str>) -> LogFilterChoice {
     if env_set {
         LogFilterChoice::EnvWins
@@ -1331,7 +1378,7 @@ pub fn log_filter_choice(env_set: bool, file_filter: Option<&str>) -> LogFilterC
 /// log one startup line answering "was my config actually read?". The silent
 /// default-fallback under systemd (a different resolved config dir than the
 /// shell, so the file "does not exist" there and defaults win) is exactly the
-/// case this disambiguates.
+/// case this disambiguates. SPEC-6.2.
 #[derive(Debug, Clone)]
 pub enum ConfigSource {
     /// `config.toml` existed at this path and was parsed.
@@ -1344,6 +1391,7 @@ impl ConfigSource {
     /// Emit the single config-source startup line. `info` when a file backed the
     /// config, `warn` when defaults silently won: a missing file under systemd
     /// while the shell shows one is exactly the silent failure this guards against.
+    /// SPEC-6.2.
     pub fn log(&self) {
         match self {
             ConfigSource::Loaded(path) => {
@@ -1363,7 +1411,7 @@ impl OnDiskConfig {
     /// Load `config.toml`, returning the parsed config alongside a
     /// [`ConfigSource`] recording whether the file existed. A missing file is
     /// not an error (built-in defaults apply); a present-but-invalid file aborts
-    /// loudly so it is never the silent case.
+    /// loudly so it is never the silent case. SPEC-6.2.
     pub fn load(paths: &Paths) -> Result<(Self, ConfigSource)> {
         let f = paths.config_file();
         if !f.exists() {
@@ -1377,7 +1425,7 @@ impl OnDiskConfig {
 }
 
 /// The resolved state-store backend, produced once at startup and
-/// handed to `db::open`.
+/// handed to `db::open`. SPEC-6.1, SPEC-6.2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatabaseTarget {
     /// The SQLite file at [`Paths::state_db`], or at the path a `sqlite://`
@@ -1391,6 +1439,7 @@ pub enum DatabaseTarget {
 /// The URL configured for the state store, or `None` for the default SQLite
 /// file. Highest precedence first: `CLAUDE_RUN_DATABASE_URL_FILE`, then
 /// `CLAUDE_RUN_DATABASE_URL`, then `[database] url` in `config.toml`.
+/// SPEC-6.1, SPEC-6.2.
 pub fn database_url(cfg: &DatabaseConfig) -> Result<Option<String>> {
     if let Ok(path) = std::env::var("CLAUDE_RUN_DATABASE_URL_FILE") {
         let path = expand_path(&path);
@@ -1406,7 +1455,7 @@ pub fn database_url(cfg: &DatabaseConfig) -> Result<Option<String>> {
 
 /// Resolve [`database_url`] into the backend `db::open` should open. An
 /// unrecognised scheme is an error naming it, so a typo stops the daemon
-/// instead of quietly opening a second, empty SQLite store.
+/// instead of quietly opening a second, empty SQLite store. SPEC-6.1, SPEC-6.2.
 pub fn resolve_database(paths: &Paths, cfg: &DatabaseConfig) -> Result<DatabaseTarget> {
     let Some(url) = database_url(cfg)? else {
         return Ok(DatabaseTarget::Sqlite(paths.state_db()));

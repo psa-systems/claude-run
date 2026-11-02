@@ -24,13 +24,15 @@ use tracing::warn;
 
 use crate::error::{Error, Result};
 
+/// SPEC-6.6.
 pub const DEFAULT_IMAGE: &str = "docker.io/postgres:18.4-alpine3.23";
+/// SPEC-6.6.
 pub const LABEL_KEY: &str = "claude-run.test-postgres";
 
 const PG_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// `--image` / `--init-sql` options for a `test-postgres` invocation.
+/// `--image` / `--init-sql` options for a `test-postgres` invocation. SPEC-6.6.
 #[derive(Debug, Clone, Default)]
 pub struct Opts {
     pub image: Option<String>,
@@ -132,6 +134,7 @@ fn fail(stage: impl Into<String>, message: impl Into<String>) -> Error {
 /// Exact `docker run` arguments for the container. Pure and unit-testable
 /// without a docker binary; `password` is accepted as an owned string so a
 /// test can pick a non-secret value and assert the exact argument list.
+/// SPEC-6.6.
 pub fn docker_run_args(name: &str, pid: u32, image: &str, password: &str) -> Vec<String> {
     vec![
         "run".into(),
@@ -159,7 +162,7 @@ pub fn docker_run_args(name: &str, pid: u32, image: &str, password: &str) -> Vec
 
 /// `claude-run-test-postgres-<pid>-<nonce>`: unique per invocation, and the
 /// pid in the name (also carried separately in the label) is what the orphan
-/// sweep keys its liveness check on.
+/// sweep keys its liveness check on. SPEC-6.6.
 pub fn container_name(pid: u32, nonce: &str) -> String {
     format!("claude-run-test-postgres-{pid}-{nonce}")
 }
@@ -175,13 +178,14 @@ fn random_hex(bytes: usize) -> Result<String> {
 /// {{.Names}}\t{{.Label "claude-run.test-postgres"}}` line into (name, pid).
 /// A line whose label value is not a plain integer is skipped rather than
 /// failing the whole sweep: a hand-run container sharing the label prefix by
-/// coincidence should not abort cleanup of the ones we understand.
+/// coincidence should not abort cleanup of the ones we understand. SPEC-6.6.
 pub fn parse_ps_line(line: &str) -> Option<(String, u32)> {
     let (name, pid) = line.split_once('\t')?;
     let pid: u32 = pid.trim().parse().ok()?;
     Some((name.trim().to_string(), pid))
 }
 
+/// SPEC-6.6.
 pub fn parse_ps_output(output: &str) -> Vec<(String, u32)> {
     output.lines().filter_map(parse_ps_line).collect()
 }
@@ -199,7 +203,7 @@ fn pid_is_alive(pid: u32) -> bool {
 
 /// Stop every labelled container whose owning pid is no longer alive, and
 /// return the names stopped (for the "one line per container stopped"
-/// requirement; the caller prints them).
+/// requirement; the caller prints them). SPEC-6.6.
 pub fn sweep_orphans() -> Result<Vec<String>> {
     let out = docker(
         &[
@@ -477,6 +481,7 @@ fn wait_for_child(mut child: Child) -> Result<i32> {
 /// has started, even when an earlier step, the command, or a signal is what
 /// ends the run; a teardown failure is folded into the returned error rather
 /// than swallowed, and wins over a successful command's own exit code.
+/// SPEC-6.6.
 pub fn run(opts: &Opts, command: &[String]) -> Result<i32> {
     install_signal_handlers();
 
