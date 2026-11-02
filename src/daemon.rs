@@ -21,7 +21,7 @@ use crate::db::DbPool;
 use chrono::{DateTime, Utc};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::action::{self, LoadedAction};
 use crate::api::{self, AppState};
@@ -658,6 +658,16 @@ impl Daemon {
         // the invocation-side detection). Skipped entirely on the `always()`
         // gate (no daemon holds it) and while unready for the no-credential
         // reason (nothing to probe yet).
+        // Sweep the shared Cargo target cache: a repo directory over
+        // `cargo_cache.max_bytes_per_repo` is deleted once no run for that
+        // repo is in flight (`SPEC-3.10` item 6, CLAUDE-512). Same cadence
+        // and live-config shape as the sweeps above.
+        let cargo_cache_gc_task = tokio::spawn(cargo_cache_gc_loop(
+            self.paths.clone(),
+            pool.clone(),
+            settings.cargo_cache_handle(),
+        ));
+
         let login_probe_task = tokio::spawn(login_probe_loop(
             readiness.clone(),
             self.on_disk
@@ -709,6 +719,7 @@ impl Daemon {
         retention_task.abort();
         stream_log_gc_task.abort();
         docker_gc_task.abort();
+        cargo_cache_gc_task.abort();
         login_probe_task.abort();
 
         // Cancel in-flight runs through the token-cancellation path (child
@@ -1934,6 +1945,118 @@ async fn docker_gc_loop(
         .await;
         if let Err(e) = result {
             warn!(error = %e, "docker storage GC reclaim task failed");
+        }
+    }
+}
+
+/// `SPEC-3.10` item 6, CLAUDE-512: resolve each in-flight `(action_name,
+/// job_key)` pair to the repo-slug of the git remote its workdir points at,
+/// which is the same slug the shared `cargo-target/<repo-slug>` directory is
+/// named for. This is blocking I/O (a `git remote get-url` subprocess per
+/// pair), so it runs on a blocking thread.
+///
+/// A pair whose workdir has no readable git remote (not yet cloned, already
+/// cleaned up, or a transient git failure) simply does not contribute to the
+/// returned set; it is not treated as a whole-pass failure, since the other
+/// pairs' evidence is still good. This is an accepted limitation: a job
+/// between dispatch and its first successful clone is briefly invisible to
+/// this evidence, but [`crate::gc::sweep_cargo_cache`] still cannot delete
+/// out from under a build Cargo already started locking that directory, so
+/// the race this leaves is on the next tick's measurement, not on Cargo's own
+/// lock.
+fn inflight_cargo_repos(
+    workdirs_base: &Path,
+    pairs: &std::collections::HashSet<(String, String)>,
+) -> std::collections::HashSet<String> {
+    let mut repos = std::collections::HashSet::new();
+    for (action_name, job_key) in pairs {
+        let workdir = crate::workdir::job_workdir(workdirs_base, action_name, job_key);
+        if !workdir.join(".git").exists() {
+            continue;
+        }
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workdir)
+            .arg("remote")
+            .arg("get-url")
+            .arg("origin")
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !url.is_empty() {
+                    repos.insert(crate::native::youtrack::repo_slug(&url));
+                }
+            }
+            Ok(out) => {
+                debug!(
+                    workdir = %workdir.display(),
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "cargo cache GC: cannot read git remote for in-flight workdir"
+                );
+            }
+            Err(e) => {
+                debug!(workdir = %workdir.display(), error = %e, "cargo cache GC: cannot spawn git to read in-flight workdir's remote");
+            }
+        }
+    }
+    repos
+}
+
+/// `SPEC-3.10` item 6, CLAUDE-512: periodic sweep of the shared Cargo target
+/// cache, on the same [`GC_TICK_SECS`] cadence as the other sweeps. A failed
+/// read of `run_inflight_jobs` is treated as "evidence unavailable" rather
+/// than skipping the sweep outright, since an unavailable-evidence pass still
+/// needs to run so an under-ceiling repo's size is re-measured; it simply
+/// keeps every over-ceiling directory instead of risking a blind delete
+/// (`crate::gc::sweep_cargo_cache`'s own `None` handling).
+async fn cargo_cache_gc_loop(
+    paths: Paths,
+    pool: DbPool,
+    cfg: Arc<tokio::sync::RwLock<crate::config::CargoCacheConfig>>,
+) {
+    let base = paths.cargo_cache_dir();
+    let workdirs_base = paths.workdirs_dir();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(GC_TICK_SECS));
+    loop {
+        ticker.tick().await;
+        let snapshot = cfg.read().await.clone();
+        if !snapshot.enabled {
+            continue;
+        }
+        let in_flight = match inflight_stream_log_jobs(&pool).await {
+            Ok(pairs) => {
+                let workdirs_base = workdirs_base.clone();
+                match tokio::task::spawn_blocking(move || {
+                    inflight_cargo_repos(&workdirs_base, &pairs)
+                })
+                .await
+                {
+                    Ok(repos) => Some(repos),
+                    Err(e) => {
+                        warn!(error = %e, "cargo cache GC: in-flight resolution task failed; treating as unavailable this pass");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "cargo cache GC: cannot read in-flight jobs; treating as unavailable this pass");
+                None
+            }
+        };
+        let base = base.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::gc::sweep_cargo_cache(&base, &snapshot, in_flight.as_ref())
+        })
+        .await;
+        match result {
+            Ok(stats) => info!(
+                deleted = stats.deleted,
+                kept = stats.kept,
+                bytes_reclaimed = stats.bytes_reclaimed,
+                "cargo cache GC sweep complete"
+            ),
+            Err(e) => warn!(error = %e, "cargo cache GC sweep task failed"),
         }
     }
 }
@@ -3517,5 +3640,48 @@ mod tests {
         // Both remain: the guard skips the rename when the new dir exists.
         assert!(old.exists(), "old dir left intact when new already exists");
         assert!(new.join("keep.jsonl").exists(), "new dir untouched");
+    }
+
+    /// A workdir with a real git remote resolves to its repo-slug; a
+    /// job whose workdir was never cloned (no `.git`) is silently skipped
+    /// rather than failing the whole pass (CLAUDE-512).
+    #[test]
+    fn inflight_cargo_repos_resolves_cloned_workdirs_and_skips_uncloned_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdirs_base = tmp.path();
+
+        let cloned = crate::workdir::job_workdir(workdirs_base, "youtrack", "CLAUDE-1");
+        std::fs::create_dir_all(&cloned).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&cloned)
+            .arg("init")
+            .arg("-q")
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&cloned)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.test/owner/repo.git"
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        let uncloned = crate::workdir::job_workdir(workdirs_base, "youtrack", "CLAUDE-2");
+        std::fs::create_dir_all(&uncloned).unwrap();
+
+        let mut pairs = std::collections::HashSet::new();
+        pairs.insert(("youtrack".to_string(), "CLAUDE-1".to_string()));
+        pairs.insert(("youtrack".to_string(), "CLAUDE-2".to_string()));
+
+        let repos = inflight_cargo_repos(workdirs_base, &pairs);
+        assert_eq!(repos.len(), 1);
+        assert!(repos.contains("owner__repo"));
     }
 }
