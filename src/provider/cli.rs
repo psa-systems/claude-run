@@ -4128,13 +4128,20 @@ mod tests {
                 ],
                 r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
             )
-            .fail_prefix(
-                &format!(
-                    "fj --host dev.a8n.run pr comment contoso/claude-run#77 --body-file {}",
+            .fail(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "comment",
+                    "contoso/claude-run#77",
+                    "--body-file",
                     scratch
-                        .join("claude-run-push-comment-77-initial_push__PR_opened_")
+                        .join("claude-run-push-comment-77-initial_push__PR_opened_.md")
                         .to_string_lossy()
-                ),
+                        .as_ref(),
+                ],
                 1,
                 "Error: unexpected status code 500",
             );

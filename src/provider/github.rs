@@ -2851,8 +2851,8 @@ mod tests {
         // consults gh, though the push below falls back to the daemon's own
         // `gh` login since no action token_ref is set.
         let push_remote = "https://x-access-token:ghp_from_login@github.com/octo/widget.git";
-        let body_prefix = std::env::temp_dir()
-            .join("claude-run-push-comment-11-initial_push__PR_opened_-")
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-11-initial_push__PR_opened_.md")
             .to_string_lossy()
             .to_string();
         let runner = Arc::new(
@@ -2863,8 +2863,17 @@ mod tests {
                     "ghp_from_login\n",
                 )
                 .ok("gh", &list_open_prs_args("octo/widget"), "[]")
-                .ok_prefix(
-                    &format!("gh pr comment 11 --repo octo/widget --body-file {body_prefix}"),
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "11",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
                     "",
                 ),
         );
@@ -2980,8 +2989,8 @@ mod tests {
         // CLAUDE-447: a non-empty `ls-remote` before the push means this
         // branch was pushed before, so the event is `resumed-run push`, not
         // `initial push (PR opened)`.
-        let body_prefix = std::env::temp_dir()
-            .join("claude-run-push-comment-5-resumed-run_push-")
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-5-resumed-run_push.md")
             .to_string_lossy()
             .to_string();
         let runner = Arc::new(
@@ -3014,8 +3023,17 @@ mod tests {
                     ],
                     "https://github.com/octo/widget/pull/5\n",
                 )
-                .ok_prefix(
-                    &format!("gh pr comment 5 --repo octo/widget --body-file {body_prefix}"),
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "5",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
                     "",
                 ),
         );
@@ -3047,8 +3065,8 @@ mod tests {
         // CLAUDE-447: `draft` always overrides the event to `timeout
         // salvage push`, regardless of whether the remote already had the
         // branch.
-        let body_prefix = std::env::temp_dir()
-            .join("claude-run-push-comment-9-timeout_salvage_push-")
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-9-timeout_salvage_push.md")
             .to_string_lossy()
             .to_string();
         let runner = Arc::new(
@@ -3073,8 +3091,17 @@ mod tests {
                     ],
                     "https://github.com/octo/widget/pull/9\n",
                 )
-                .ok_prefix(
-                    &format!("gh pr comment 9 --repo octo/widget --body-file {body_prefix}"),
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "9",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
                     "",
                 ),
         );
@@ -3293,15 +3320,24 @@ mod tests {
         // create` call, even though the `gh` backend is the only one
         // configured (proves adoption runs before the backend walk).
         let open_pr = r#"[{"number":42,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#;
-        let body_prefix = std::env::temp_dir()
-            .join("claude-run-push-comment-42-initial_push__PR_opened_-")
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-42-initial_push__PR_opened_.md")
             .to_string_lossy()
             .to_string();
         let runner = Arc::new(
             with_git(StubRunner::new(), "feat/x", "origin")
                 .ok("gh", &list_open_prs_args("octo/widget"), open_pr)
-                .ok_prefix(
-                    &format!("gh pr comment 42 --repo octo/widget --body-file {body_prefix}"),
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "42",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
                     "",
                 ),
         );
@@ -3340,15 +3376,24 @@ mod tests {
         // before the backend walk regardless of which backend would have
         // been used, so no `create_pull_request` call is issued either.
         let open_pr = r#"[{"number":42,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#;
-        let body_prefix = std::env::temp_dir()
-            .join("claude-run-push-comment-42-initial_push__PR_opened_-")
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-42-initial_push__PR_opened_.md")
             .to_string_lossy()
             .to_string();
         let runner = Arc::new(
             with_git(StubRunner::new(), "feat/x", "origin")
                 .ok("gh", &list_open_prs_args("octo/widget"), open_pr)
-                .ok_prefix(
-                    &format!("gh pr comment 42 --repo octo/widget --body-file {body_prefix}"),
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "42",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
                     "",
                 ),
         );
@@ -3420,15 +3465,24 @@ mod tests {
         // exercised here with a `GithubForge` double, mirrors the same
         // assertion run against `CliBackend` in `cli.rs`'s own test module.
         let open_pr = r#"[{"number":777,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/777"}]"#;
-        let body_prefix = std::env::temp_dir()
-            .join("claude-run-push-comment-777-initial_push__PR_opened_-")
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-777-initial_push__PR_opened_.md")
             .to_string_lossy()
             .to_string();
         let runner = Arc::new(
             with_git(StubRunner::new(), "feat/x", "origin")
                 .ok("gh", &list_open_prs_args("octo/widget"), open_pr)
-                .ok_prefix(
-                    &format!("gh pr comment 777 --repo octo/widget --body-file {body_prefix}"),
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "777",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
                     "",
                 ),
         );
@@ -3537,8 +3591,8 @@ mod tests {
         // succeeds, so the existing PR is adopted instead of the run
         // failing.
         let open_pr = r#"[{"number":42,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#;
-        let body_prefix = std::env::temp_dir()
-            .join("claude-run-push-comment-42-initial_push__PR_opened_-")
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-42-initial_push__PR_opened_.md")
             .to_string_lossy()
             .to_string();
         let runner = Arc::new(
@@ -3558,8 +3612,17 @@ mod tests {
                     "GraphQL: a pull request for branch \"feat/x\" into branch \"main\" already \
                      exists: octo/widget#42",
                 )
-                .ok_prefix(
-                    &format!("gh pr comment 42 --repo octo/widget --body-file {body_prefix}"),
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "42",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
                     "",
                 ),
         );
@@ -3639,8 +3702,8 @@ mod tests {
         // GitHub's REST 422 "already exists" text; the same retry-and-adopt
         // path applies as the `gh` variant above.
         let open_pr = r#"[{"number":42,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#;
-        let body_prefix = std::env::temp_dir()
-            .join("claude-run-push-comment-42-initial_push__PR_opened_-")
+        let body_arg = std::env::temp_dir()
+            .join("claude-run-push-comment-42-initial_push__PR_opened_.md")
             .to_string_lossy()
             .to_string();
         let runner = Arc::new(
@@ -3652,8 +3715,17 @@ mod tests {
                     "HTTP 403: Resource not accessible by integration",
                 )
                 .ok("gh", &list_open_prs_args("octo/widget"), open_pr)
-                .ok_prefix(
-                    &format!("gh pr comment 42 --repo octo/widget --body-file {body_prefix}"),
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "42",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        &body_arg,
+                    ],
                     "",
                 ),
         );

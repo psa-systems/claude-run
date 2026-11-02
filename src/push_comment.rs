@@ -118,20 +118,16 @@ pub fn build_body(ctx: &PushCommentContext<'_>) -> String {
     crate::run_footer::append_run(&body, ctx.public_url, ctx.run_id, ctx.started)
 }
 
-/// CLAUDE-521: write `body` to a scratch file under `dir`, named uniquely
-/// per call (not just per `prefix`) via `tempfile`'s atomic
-/// create-with-random-suffix, so two concurrent [`post`] calls sharing the
-/// same `(pr_number, event)` never write, read, or remove the same path,
-/// unlike the fixed `claude-run-push-comment-<pr_number>-<event>.md` name
-/// this replaces.
-fn scratch_file(dir: &Path, prefix: &str, body: &str) -> std::io::Result<tempfile::TempPath> {
-    use std::io::Write as _;
-    let mut f = tempfile::Builder::new()
-        .prefix(&format!("{prefix}-"))
-        .suffix(".md")
-        .tempfile_in(dir)?;
-    f.write_all(body.as_bytes())?;
-    Ok(f.into_temp_path())
+/// One lock per scratch path, so posts for different PRs still run in parallel.
+fn scratch_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<std::path::PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(path.to_path_buf()).or_default().clone()
 }
 
 /// SPEC-8.8: post the push comment through `forge.pr_comment`, body written to
@@ -150,24 +146,27 @@ pub fn post(
     ctx: &PushCommentContext<'_>,
 ) -> Option<String> {
     let body = build_body(ctx);
-    let prefix = format!(
-        "claude-run-push-comment-{pr_number}-{}",
+    let scratch = scratch_dir.join(format!(
+        "claude-run-push-comment-{pr_number}-{}.md",
         ctx.event.label().replace([' ', '(', ')'], "_")
-    );
-    let scratch = match scratch_file(scratch_dir, &prefix, &body) {
-        Ok(scratch) => scratch,
-        Err(e) => {
-            tracing::error!(pr_number, event = ctx.event.label(), error = %e, "writing the push comment scratch file failed");
-            return Some(format!(
-                "PR comment for {} failed: writing the comment body failed: {e}",
-                ctx.event.label()
-            ));
-        }
-    };
+    ));
+    // The name is fixed per PR and event, so two concurrent posts would write,
+    // read and delete each other's file; hold the path's lock across all three.
+    let _scratch_guard = scratch_lock(&scratch);
+    let _held = _scratch_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Err(e) = std::fs::write(&scratch, &body) {
+        tracing::error!(pr_number, event = ctx.event.label(), error = %e, "writing the push comment scratch file failed");
+        return Some(format!(
+            "PR comment for {} failed: writing the comment body failed: {e}",
+            ctx.event.label()
+        ));
+    }
     let result = forge.pr_comment(host, repo, pr_number, &scratch);
-    if let Err(e) = scratch.close() {
+    if let Err(e) = std::fs::remove_file(&scratch) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::error!(error = %e, "removing the push comment scratch file failed");
+            tracing::error!(path = %scratch.display(), error = %e, "removing the push comment scratch file failed");
         }
     }
     match result {
@@ -340,8 +339,10 @@ mod tests {
             _host: &str,
             _repo: &str,
             _pr_number: u64,
-            _body_file: &Path,
+            body_file: &Path,
         ) -> crate::error::Result<()> {
+            // Read the body like a real forge, so a vanished scratch file shows as a different error.
+            std::fs::read_to_string(body_file)?;
             Err(crate::error::Error::Other(anyhow::anyhow!(
                 "pr comment boom"
             )))
@@ -365,20 +366,27 @@ mod tests {
         assert!(failure.contains("pr comment boom"));
     }
 
-    /// CLAUDE-521: two concurrent `post` calls sharing the same
-    /// `(pr_number, event)` must not write, read, or remove the same
-    /// scratch path. Before the fix, `scratch_file` built a fixed
-    /// `claude-run-push-comment-<pr_number>-<event>.md` name, so both calls
-    /// raced on the identical path.
     #[test]
-    fn scratch_file_is_unique_for_concurrent_calls_with_the_same_prefix() {
+    fn concurrent_posts_for_one_pr_and_event_never_lose_their_scratch_file() {
         let dir = tempfile::tempdir().unwrap();
-        let one =
-            scratch_file(dir.path(), "claude-run-push-comment-7-initial_push", "one").unwrap();
-        let two =
-            scratch_file(dir.path(), "claude-run-push-comment-7-initial_push", "two").unwrap();
-        assert_ne!(one.to_path_buf(), two.to_path_buf());
-        assert_eq!(std::fs::read_to_string(&one).unwrap(), "one");
-        assert_eq!(std::fs::read_to_string(&two).unwrap(), "two");
+        let forge = FailingForge;
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    for _ in 0..50 {
+                        let failure = post(
+                            &forge,
+                            "dev.a8n.run",
+                            "psa-systems/claude-run",
+                            7,
+                            dir.path(),
+                            &ctx(PushEvent::ResumedRunPush, CommitSubjects::Listed(vec![])),
+                        )
+                        .expect("a failing pr_comment call must be reported");
+                        assert!(failure.contains("pr comment boom"), "{failure}");
+                    }
+                });
+            }
+        });
     }
 }

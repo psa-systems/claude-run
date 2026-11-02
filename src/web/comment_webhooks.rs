@@ -5333,14 +5333,21 @@ mod tests {
         git_in(dir, &["commit", "-q", "-m", "fix the thing\n\n#CLAUDE-447"]).unwrap();
 
         let scratch = git_dir_scratch(dir).unwrap();
-        let body_prefix = scratch
-            .join("claude-run-push-comment-7-comment-webhook_fix_push-")
+        let body_arg = scratch
+            .join("claude-run-push-comment-7-comment-webhook_fix_push.md")
             .to_string_lossy()
             .to_string();
-        let runner = Arc::new(StubRunner::new().ok_prefix(
-            &format!(
-                "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {body_prefix}"
-            ),
+        let runner = Arc::new(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "comment",
+                "contoso/claude-run#7",
+                "--body-file",
+                &body_arg,
+            ],
             "",
         ));
         let backend = CliBackend::new(runner.clone());
@@ -5372,14 +5379,21 @@ mod tests {
         git_in(dir, &["commit", "-q", "-m", "fix the thing"]).unwrap();
 
         let scratch = git_dir_scratch(dir).unwrap();
-        let body_prefix = scratch
-            .join("claude-run-push-comment-7-comment-webhook_fix_push-")
+        let body_arg = scratch
+            .join("claude-run-push-comment-7-comment-webhook_fix_push.md")
             .to_string_lossy()
             .to_string();
-        let runner = Arc::new(StubRunner::new().fail_prefix(
-            &format!(
-                "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {body_prefix}"
-            ),
+        let runner = Arc::new(StubRunner::new().fail(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "comment",
+                "contoso/claude-run#7",
+                "--body-file",
+                &body_arg,
+            ],
             1,
             "network error",
         ));
