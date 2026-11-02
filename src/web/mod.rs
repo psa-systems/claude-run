@@ -21,7 +21,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Json, Router};
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -144,13 +144,30 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         // day-of-week). Global by default; `action` + `range` query params narrow
         // it. The shared aggregations live in `crate::report`.
         .route("/reports", get(reports_page))
-        // About page (version + build info) and the live Activity card.
-        .route("/about", get(about_page))
+        // Status page (version + build info), the live Activity card, and
+        // the cargo-cache Management part (SPEC-3.10 item 10). `/about` and
+        // `/about/activity` are the pre-rename paths, kept as permanent
+        // redirects so an existing link or bookmark keeps working.
+        .route("/status", get(status_page))
+        .route("/about", get(about_redirect))
         // The Activity card's live quiet indicator polls this
         // fragment every 2s. Its own route (rather than an `hx-select` off
-        // `/about`) so the busy / idle / unknown states are rendered by one
+        // `/status`) so the busy / idle / unknown states are rendered by one
         // handler and an activity-query failure cannot be mistaken for idle.
-        .route("/about/activity", get(about_activity))
+        .route("/status/activity", get(status_activity))
+        .route("/about/activity", get(about_activity_redirect))
+        // Cargo-cache delete routes (SPEC-3.10 item 10). Posted under `/api`
+        // the way the Pause form posts to `/api/pause`, but defined here
+        // (not in `api::router`) rather than there so they add no route to
+        // the unix socket.
+        .route(
+            "/api/status/cargo-cache/{slug}/delete",
+            post(cargo_cache_delete_one),
+        )
+        .route(
+            "/api/status/cargo-cache/delete",
+            post(cargo_cache_delete_all),
+        )
         .route("/runs/{id}", get(run_detail))
         .route(
             "/runs/{id}/jobs/{key}/attempt/{attempt}",
@@ -5486,11 +5503,12 @@ async fn auth_claude_banner(State(s): State<WebState>) -> Result<Html<String>, W
     Ok(Html(tpl.render()?))
 }
 
-// ---- About page -------------------------------------------------------
+// ---- Status page --------------------------------------------------------
 //
-// SPEC-4.3.9: "The About page shows version/build info plus the Activity
+// SPEC-4.3.9: "The Status page shows version/build info plus the Activity
 // card (live quiet indicator and global pause); updating is by pulling a
-// newer image, so the page has no update action."
+// newer image, so the page has no update action." SPEC-3.10 item 10 adds the
+// cargo-cache Management part below the Activity card.
 //
 // Version / build info plus the Activity card (live quiet indicator and global
 // pause). Updating is by pulling a newer image; the page has no update action.
@@ -5590,7 +5608,7 @@ async fn activity_view(s: &WebState) -> ActivityView {
             }
         }
         Err(e) => {
-            tracing::error!(error = %e, "activity query failed; the About page reports UNKNOWN, not idle");
+            tracing::error!(error = %e, "activity query failed; the Status page reports UNKNOWN, not idle");
             ActivityView::Unknown {
                 error: e.to_string(),
             }
@@ -5599,9 +5617,9 @@ async fn activity_view(s: &WebState) -> ActivityView {
 }
 
 /// SPEC-4.3.9: "The polled Activity fragment is rendered standalone every
-/// 2s and included in the full About page, so both surfaces agree by
-/// construction." The polled Activity fragment (`GET /about/activity`).
-/// Rendered standalone every 2s and included in the full About page, so
+/// 2s and included in the full Status page, so both surfaces agree by
+/// construction." The polled Activity fragment (`GET /status/activity`).
+/// Rendered standalone every 2s and included in the full Status page, so
 /// both surfaces agree by construction.
 #[derive(Template)]
 #[template(path = "activity.html")]
@@ -5609,41 +5627,255 @@ struct ActivityTpl {
     activity: ActivityView,
 }
 
-/// SPEC-4.3.9: the `/about/activity` polled fragment handler.
-async fn about_activity(State(s): State<WebState>) -> Result<Response, WebError> {
+/// SPEC-4.3.9: the `/status/activity` polled fragment handler.
+async fn status_activity(State(s): State<WebState>) -> Result<Response, WebError> {
     let tpl = ActivityTpl {
         activity: activity_view(&s).await,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-/// SPEC-4.3.9: render state for the About page.
+/// SPEC-4.3.9 / SPEC-3.10 item 10: one Management-part row, the shared Cargo
+/// target directory for one repo. `slug` is the directory's own name, already
+/// in `<owner>__<repo>` form (`crate::native::youtrack::repo_slug`).
+#[derive(Serialize)]
+struct CargoCacheRow {
+    slug: String,
+    size_bytes: u64,
+    size_human: String,
+    /// RFC3339, or empty when the directory's mtime could not be read; the
+    /// `datetime` filter passes an unparsable value through unchanged.
+    last_used: String,
+    /// Whether a run for this repo is currently in flight (any still-open
+    /// run whose concurrency key resolves to this slug), so the page can
+    /// show it and the delete routes can refuse with `409`.
+    in_flight: bool,
+}
+
+/// `<data dir>/cache/cargo-target/`, the root `crate::native::youtrack::
+/// cargo_target_dir` creates one subdirectory under, per repo. SPEC-3.10
+/// item 2.
+fn cargo_cache_root(paths: &Paths) -> std::path::PathBuf {
+    paths.data_dir.join("cache").join("cargo-target")
+}
+
+/// Render `bytes` as a human-readable size (binary units), for the
+/// Management part's Size column and its delete confirmations.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Whether `slug` names a repo with a run currently in flight, per
+/// `inflight_keys` (`state::all_inflight_concurrency_keys`). The default
+/// concurrency key is `project\u{1f}repo\u{1f}` (`SPEC-3.1`), so a match is
+/// any `\u{1f}`-separated segment whose own repo-slug equals `slug`.
+fn cargo_cache_slug_in_flight(inflight_keys: &[String], slug: &str) -> bool {
+    inflight_keys.iter().any(|key| {
+        key.split('\u{1f}')
+            .any(|part| crate::native::youtrack::repo_slug(part) == slug)
+    })
+}
+
+/// SPEC-3.10 items 9 and 10: list every shared Cargo target directory under
+/// [`cargo_cache_root`], each with its size, last-used time and in-flight
+/// status. A root that does not exist yet (no repo has built there) is an
+/// empty list, not an error.
+async fn cargo_cache_rows(paths: &Paths, pool: &DbPool) -> Result<Vec<CargoCacheRow>, WebError> {
+    let root = cargo_cache_root(paths);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let inflight_keys = state::all_inflight_concurrency_keys(pool).await?;
+    let mut rows = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        let size_bytes = crate::gc::dir_size(&path);
+        let last_used = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map(|m| chrono::DateTime::<chrono::Utc>::from(m).to_rfc3339())
+            .unwrap_or_default();
+        let in_flight = cargo_cache_slug_in_flight(&inflight_keys, &slug);
+        rows.push(CargoCacheRow {
+            slug,
+            size_bytes,
+            size_human: human_bytes(size_bytes),
+            last_used,
+            in_flight,
+        });
+    }
+    rows.sort_by(|a, b| a.slug.cmp(&b.slug));
+    Ok(rows)
+}
+
+/// SPEC-4.3.9: render state for the Status page.
 #[derive(Template)]
-#[template(path = "about.html")]
-struct AboutTpl {
+#[template(path = "status.html")]
+struct StatusTpl {
     version: &'static str,
     /// The global pause, so the Activity card offers Pause when running and
     /// Resume (with since / reason) when paused.
     global_pause: Option<PauseInfo>,
     /// The first render of the live indicator; the 2s poll then replaces it
-    /// from `/about/activity`.
+    /// from `/status/activity`.
     activity: ActivityView,
+    /// SPEC-3.10 item 10: the Management part's rows.
+    cargo_cache: Vec<CargoCacheRow>,
+    /// Pre-formatted total, for the Delete all confirmation.
+    cargo_cache_total_human: String,
 }
 
-/// SPEC-4.3.9: the `/about` page handler.
-async fn about_page(State(s): State<WebState>) -> Result<Response, WebError> {
+/// SPEC-4.3.9: the `/status` page handler.
+async fn status_page(State(s): State<WebState>) -> Result<Response, WebError> {
     let global_pause = state::global_pause_status(&s.api.pool)
         .await?
         .map(|(a, r)| PauseInfo {
             paused_at: a,
             reason: r,
         });
-    let tpl = AboutTpl {
+    let cargo_cache = cargo_cache_rows(&s.paths, &s.api.pool).await?;
+    let cargo_cache_total_human =
+        human_bytes(cargo_cache.iter().map(|r| r.size_bytes).sum::<u64>());
+    let tpl = StatusTpl {
         version: s.api.version,
         global_pause,
         activity: activity_view(&s).await,
+        cargo_cache,
+        cargo_cache_total_human,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
+}
+
+/// Permanent redirect from the pre-rename `/about` to `/status`.
+async fn about_redirect() -> Redirect {
+    Redirect::permanent("/status")
+}
+
+/// Permanent redirect from the pre-rename `/about/activity` to
+/// `/status/activity`.
+async fn about_activity_redirect() -> Redirect {
+    Redirect::permanent("/status/activity")
+}
+
+/// SPEC-3.10 item 10: `POST /api/status/cargo-cache/{slug}/delete`. Refused
+/// with `409` while a run for the repo is in flight; a removal failure is
+/// logged at `error` and shown (the message is also what a non-htmx caller
+/// of the same URL sees).
+async fn cargo_cache_delete_one(
+    State(s): State<WebState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Response, WebError> {
+    let inflight_keys = state::all_inflight_concurrency_keys(&s.api.pool).await?;
+    if cargo_cache_slug_in_flight(&inflight_keys, &slug) {
+        return Ok((
+            StatusCode::CONFLICT,
+            format!("a run for `{slug}` is in flight; wait before deleting its Cargo cache"),
+        )
+            .into_response());
+    }
+    let dir = cargo_cache_root(&s.paths).join(&slug);
+    if !dir.is_dir() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            format!("no Cargo cache directory for `{slug}`"),
+        )
+            .into_response());
+    }
+    let bytes = crate::gc::dir_size(&dir);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {
+            tracing::info!(
+                repo = %slug,
+                path = %dir.display(),
+                bytes_reclaimed = bytes,
+                "Status page: Cargo cache directory deleted (SPEC-3.10 item 10)"
+            );
+            Ok(
+                Json(serde_json::json!({"ok": true, "message": format!("deleted `{slug}`")}))
+                    .into_response(),
+            )
+        }
+        Err(e) => {
+            tracing::error!(
+                repo = %slug,
+                path = %dir.display(),
+                error = %e,
+                "Status page: Cargo cache directory delete failed"
+            );
+            Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not delete {}: {e}", dir.display()),
+            )
+                .into_response())
+        }
+    }
+}
+
+/// SPEC-3.10 item 10: `POST /api/status/cargo-cache/delete` (Delete all).
+/// Refused with `409` naming the first repo found with a run in flight, so
+/// a bulk delete never removes some rows and skips others silently.
+async fn cargo_cache_delete_all(State(s): State<WebState>) -> Result<Response, WebError> {
+    let rows = cargo_cache_rows(&s.paths, &s.api.pool).await?;
+    if let Some(busy) = rows.iter().find(|r| r.in_flight) {
+        return Ok((
+            StatusCode::CONFLICT,
+            format!(
+                "a run for `{}` is in flight; wait before deleting the Cargo cache",
+                busy.slug
+            ),
+        )
+            .into_response());
+    }
+    let root = cargo_cache_root(&s.paths);
+    let mut reclaimed = 0u64;
+    for row in &rows {
+        let dir = root.join(&row.slug);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                reclaimed += row.size_bytes;
+                tracing::info!(
+                    repo = %row.slug,
+                    path = %dir.display(),
+                    bytes_reclaimed = row.size_bytes,
+                    "Status page: Cargo cache directory deleted (SPEC-3.10 item 10)"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    repo = %row.slug,
+                    path = %dir.display(),
+                    error = %e,
+                    "Status page: Cargo cache directory delete failed"
+                );
+                return Ok((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not delete {}: {e}", dir.display()),
+                )
+                    .into_response());
+            }
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": format!("deleted {} Cargo cache director{} ({})", rows.len(), if rows.len() == 1 { "y" } else { "ies" }, human_bytes(reclaimed)),
+    }))
+    .into_response())
 }
 
 /// SPEC-4.3.10: one planned job row on the run-detail page.
@@ -11677,20 +11909,24 @@ mod tests {
         assert_eq!(latest_attempt_on_disk(logs, "act", "CLAUDE-9"), None);
     }
 
-    // ---- About page handlers -----------------------------------------------
+    // ---- Status page handlers -----------------------------------------------
     //
-    // The GET renders the version and the Activity card.
-    mod about {
-        use super::super::{about_page, WebState};
+    // The GET renders the version, the Activity card, and the cargo-cache
+    // Management part (SPEC-3.10 item 10).
+    mod status {
+        use super::super::{
+            about_activity_redirect, about_redirect, cargo_cache_delete_all,
+            cargo_cache_delete_one, status_activity, status_page, WebState,
+        };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
         use crate::config::Paths;
-        use axum::extract::State;
+        use axum::extract::{Path as AxumPath, State};
         use axum::http::StatusCode;
-        use axum::response::Response;
+        use axum::response::{IntoResponse, Response};
         use std::sync::Arc;
 
-        async fn web_state() -> WebState {
+        async fn web_state_with_data_dir(data_dir: std::path::PathBuf) -> WebState {
             let pool = crate::db::test_pool().await;
             let (trigger_tx, _rx) = tokio::sync::mpsc::channel(8);
             let api = Arc::new(AppState {
@@ -11713,11 +11949,15 @@ mod tests {
                 api,
                 paths: Paths {
                     config_dir: "/tmp/x/config".into(),
-                    data_dir: "/tmp/x/data".into(),
+                    data_dir,
                     state_dir: "/tmp/x/state".into(),
                     runtime_dir: "/tmp/x/runtime".into(),
                 },
             }
+        }
+
+        async fn web_state() -> WebState {
+            web_state_with_data_dir("/tmp/x/data".into()).await
         }
 
         async fn body_string(resp: Response) -> String {
@@ -11731,7 +11971,7 @@ mod tests {
         #[tokio::test]
         async fn get_renders_version_without_update_controls() {
             let s = web_state().await;
-            let resp = about_page(State(s)).await.unwrap();
+            let resp = status_page(State(s)).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = body_string(resp).await;
             assert!(body.contains("9.9.9 (testsha, 2026-06-25)"), "{body}");
@@ -11744,16 +11984,16 @@ mod tests {
         #[tokio::test]
         async fn activity_card_offers_pause_then_resume() {
             let s = web_state().await;
-            let body = body_string(about_page(State(s.clone())).await.unwrap()).await;
+            let body = body_string(status_page(State(s.clone())).await.unwrap()).await;
             assert!(body.contains("Pause all activity"), "{body}");
             assert!(body.contains(r#"hx-post="/api/pause""#), "{body}");
-            assert!(body.contains(r#"hx-get="/about/activity""#), "{body}");
+            assert!(body.contains(r#"hx-get="/status/activity""#), "{body}");
             assert!(!body.contains("Resume all activity"), "{body}");
 
             crate::state::global_pause_set(&s.api.pool, Some("rebooting"))
                 .await
                 .unwrap();
-            let body = body_string(about_page(State(s)).await.unwrap()).await;
+            let body = body_string(status_page(State(s)).await.unwrap()).await;
             assert!(body.contains("Resume all activity"), "{body}");
             assert!(body.contains(r#"hx-post="/api/resume""#), "{body}");
             assert!(body.contains("rebooting"), "{body}");
@@ -11766,24 +12006,14 @@ mod tests {
         #[tokio::test]
         async fn activity_indicator_renders_idle_busy_and_unknown() {
             let s = web_state().await;
-            let body = body_string(
-                super::super::about_activity(State(s.clone()))
-                    .await
-                    .unwrap(),
-            )
-            .await;
+            let body = body_string(status_activity(State(s.clone())).await.unwrap()).await;
             assert!(body.contains("idle"), "{body}");
             assert!(body.contains("Safe to restart"), "{body}");
 
             let run = crate::state::run_begin(&s.api.pool, "act", "cli")
                 .await
                 .unwrap();
-            let body = body_string(
-                super::super::about_activity(State(s.clone()))
-                    .await
-                    .unwrap(),
-            )
-            .await;
+            let body = body_string(status_activity(State(s.clone())).await.unwrap()).await;
             assert!(body.contains("busy"), "{body}");
             assert!(body.contains(&format!("/runs/{run}")), "{body}");
             assert!(body.contains("act"), "{body}");
@@ -11793,10 +12023,172 @@ mod tests {
             // idle: "safe to restart" because the query broke is the bug this
             // state exists to prevent.
             s.api.pool.close().await;
-            let body = body_string(super::super::about_activity(State(s)).await.unwrap()).await;
+            let body = body_string(status_activity(State(s)).await.unwrap()).await;
             assert!(body.contains("unknown"), "{body}");
             assert!(body.contains("Do not treat this as idle"), "{body}");
             assert!(!body.contains("Safe to restart"), "{body}");
+        }
+
+        /// `/about` and `/about/activity` redirect permanently to their
+        /// `/status` replacements.
+        #[tokio::test]
+        async fn about_redirects_permanently_to_status() {
+            let resp = about_redirect().await.into_response();
+            assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(resp.headers().get("location").unwrap(), "/status");
+
+            let resp = about_activity_redirect().await.into_response();
+            assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(resp.headers().get("location").unwrap(), "/status/activity");
+        }
+
+        /// A helper that creates `<data_dir>/cache/cargo-target/<slug>` with
+        /// one file of the given size, so size/last-used can be asserted.
+        fn make_cargo_cache_dir(data_dir: &std::path::Path, slug: &str, bytes: usize) {
+            let dir = data_dir.join("cache").join("cargo-target").join(slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("blob"), vec![0u8; bytes]).unwrap();
+        }
+
+        /// No `cache/cargo-target/` directory yet (nothing has built there)
+        /// renders an empty Management part rather than erroring.
+        #[tokio::test]
+        async fn management_part_is_empty_with_no_cargo_cache_dir_yet() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
+            let body = body_string(status_page(State(s)).await.unwrap()).await;
+            assert!(
+                body.contains("No shared Cargo target directories yet"),
+                "{body}"
+            );
+        }
+
+        /// The Management part lists one row per repo directory, with its
+        /// size and a Delete button, and the Delete all button.
+        #[tokio::test]
+        async fn management_part_lists_cargo_cache_directories() {
+            let tmp = tempfile::tempdir().unwrap();
+            make_cargo_cache_dir(tmp.path(), "owner__repo-a", 2048);
+            let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
+            let body = body_string(status_page(State(s)).await.unwrap()).await;
+            assert!(body.contains("owner__repo-a"), "{body}");
+            assert!(body.contains("2.0 KiB"), "{body}");
+            assert!(
+                body.contains("/api/status/cargo-cache/owner__repo-a/delete"),
+                "{body}"
+            );
+            assert!(body.contains("/api/status/cargo-cache/delete"), "{body}");
+            assert!(body.contains("Delete all"), "{body}");
+        }
+
+        /// Deleting one row removes exactly that directory from disk.
+        #[tokio::test]
+        async fn delete_one_removes_the_directory() {
+            let tmp = tempfile::tempdir().unwrap();
+            make_cargo_cache_dir(tmp.path(), "owner__repo-a", 16);
+            make_cargo_cache_dir(tmp.path(), "owner__repo-b", 16);
+            let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
+            let root = tmp.path().join("cache").join("cargo-target");
+
+            let resp = cargo_cache_delete_one(State(s), AxumPath("owner__repo-a".to_string()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(!root.join("owner__repo-a").exists());
+            assert!(root.join("owner__repo-b").exists());
+        }
+
+        /// Deleting all rows removes every directory from disk.
+        #[tokio::test]
+        async fn delete_all_removes_every_directory() {
+            let tmp = tempfile::tempdir().unwrap();
+            make_cargo_cache_dir(tmp.path(), "owner__repo-a", 16);
+            make_cargo_cache_dir(tmp.path(), "owner__repo-b", 16);
+            let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
+            let root = tmp.path().join("cache").join("cargo-target");
+
+            let resp = cargo_cache_delete_all(State(s)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(!root.join("owner__repo-a").exists());
+            assert!(!root.join("owner__repo-b").exists());
+        }
+
+        /// A delete is refused with `409` and a visible message while a run
+        /// for that repo is in flight, and the directory is left alone.
+        #[tokio::test]
+        async fn delete_one_refused_while_repo_run_in_flight() {
+            let tmp = tempfile::tempdir().unwrap();
+            make_cargo_cache_dir(tmp.path(), "owner__repo-a", 16);
+            let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
+            let root = tmp.path().join("cache").join("cargo-target");
+
+            let run_id = crate::state::run_begin(&s.api.pool, "youtrack", "scheduler")
+                .await
+                .unwrap();
+            crate::state::run_inflight_add(
+                &s.api.pool,
+                run_id,
+                "CLAUDE-1",
+                "CLAUDE\u{1f}owner/repo-a",
+            )
+            .await
+            .unwrap();
+
+            let resp =
+                cargo_cache_delete_one(State(s.clone()), AxumPath("owner__repo-a".to_string()))
+                    .await
+                    .unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let body = body_string(resp).await;
+            assert!(body.contains("owner__repo-a"), "{body}");
+            assert!(body.contains("in flight"), "{body}");
+            assert!(root.join("owner__repo-a").exists());
+
+            // Delete all is refused too, and touches nothing.
+            let resp = cargo_cache_delete_all(State(s)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            assert!(root.join("owner__repo-a").exists());
+        }
+
+        /// A deletion I/O failure is logged at `error` (asserted via the
+        /// `500` response naming the path) and shown rather than silently
+        /// swallowed: removing a write-protected entry inside the directory
+        /// makes `remove_dir_all` fail with a permission error, which must
+        /// not be mistaken for success.
+        #[tokio::test]
+        async fn delete_one_shows_a_failed_removal() {
+            use std::os::unix::fs::PermissionsExt;
+            if unsafe { libc::geteuid() } == 0 {
+                // Root ignores directory write permission, so this
+                // failure mode cannot be produced; skip rather than assert
+                // a false pass.
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            make_cargo_cache_dir(tmp.path(), "owner__repo-a", 16);
+            let root = tmp.path().join("cache").join("cargo-target");
+            let dir = root.join("owner__repo-a");
+            // Removing a directory entry requires write permission on its
+            // parent; stripping that from `dir` itself makes `remove_dir_all`
+            // fail partway through instead of succeeding.
+            let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+            perms.set_mode(0o555);
+            std::fs::set_permissions(&dir, perms).unwrap();
+            let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
+
+            let resp = cargo_cache_delete_one(State(s), AxumPath("owner__repo-a".to_string()))
+                .await
+                .unwrap();
+
+            // Restore permissions so the tempdir can be cleaned up.
+            let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&dir, perms).unwrap();
+
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = body_string(resp).await;
+            assert!(body.contains("owner__repo-a"), "{body}");
+            assert!(dir.exists());
         }
     }
 
