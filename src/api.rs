@@ -151,7 +151,7 @@ struct StatusResponse {
     version: String,
     global_paused: Option<PauseInfo>,
     /// Live-work snapshot, so an operator scripting a reboot polls
-    /// `/status` instead of scraping the About page.
+    /// `/status` instead of scraping the Status page.
     activity: Activity,
     /// Whether the daemon can run anything at all. `false` means setup is
     /// unfinished (no Claude credential) and the scheduler is idle by design,
@@ -181,7 +181,7 @@ struct StatusResponse {
 /// SPEC-9: the `quiet` flag the restart-safety bullet names.
 ///
 /// The daemon's live-work snapshot. One type behind `/api/status`,
-/// `claude-run status`, and the About page's quiet indicator, so the three
+/// `claude-run status`, and the Status page.s quiet indicator, so the three
 /// surfaces cannot disagree about whether a restart is safe.
 #[derive(Debug, Serialize)]
 pub struct Activity {
@@ -546,7 +546,7 @@ async fn cancel_run(
 /// SPEC-4.2: the dual-encoding pause reason.
 ///
 /// The optional pause reason, from either encoding. The CLI and
-/// API clients send `{"reason": "..."}`; the About page's Pause form posts
+/// API clients send `{"reason": "..."}`; the Status page.s Pause form posts
 /// `reason=...` urlencoded, which is what htmx serializes a form to without an
 /// extension. An unparseable body is logged at `warn` and pauses with no reason
 /// rather than refusing: losing the annotation is recoverable, refusing the
@@ -1106,7 +1106,7 @@ mod tests {
     }
 
     /// `/status` carries the activity block, so `claude-run status`
-    /// and a reboot script read the same snapshot the About page renders.
+    /// and a reboot script read the same snapshot the Status page renders.
     #[tokio::test]
     async fn status_reports_the_activity_block() {
         let s = app_state().await;

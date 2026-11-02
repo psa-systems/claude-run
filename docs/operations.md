@@ -130,7 +130,7 @@ and `regather_interval_secs` (default `60`, must be `>= 1`). Both apply on the n
 ## Global pause and the restart-safety workflow (CLAUDE-223)
 
 Applying an update does not restart the service, and restarting while jobs are running kills them mid-flight. The
-**Activity** card at the top of `/about` is the control for doing it safely, and it is the same state
+**Activity** card at the top of `/status` is the control for doing it safely, and it is the same state
 `claude-run pause` / `claude-run resume` / `claude-run status` read and write.
 
 The workflow:
@@ -157,7 +157,7 @@ Two properties worth knowing:
   operator cancel (`130`) and from a clean finish (`0`). Its unprocessed jobs consume no attempt and are re-gathered on
   the first run after Resume.
 - **The pause is stored in the database, so it survives a restart.** A daemon that comes up paused logs one `info` line
-  saying so and stays idle until you resume; the Dashboard banner and the About card are the visual reminder.
+  saying so and stays idle until you resume; the Dashboard banner and the Status card are the visual reminder.
 
 Scripting a reboot instead of clicking: `/api/status` (and `claude-run status`) carries an `activity` block with
 `quiet`, `active_runs`, and `dispatched_actions`. `quiet` is true only when BOTH signals are clear: the daemon's

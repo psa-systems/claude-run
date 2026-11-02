@@ -178,8 +178,9 @@ will want to know about:
   seven-day window, a red marker for a timed-out or failed invocation, and a gap in the line (with a stated count)
   wherever an invocation's log carried no rate-limit reading at all rather than a fabricated zero. A table below the
   chart lists the 20 most recent invocations with their status and API-retry counts.
-- **About** (`/about`, CLAUDE-129) shows version + build info. Its **Activity** card (CLAUDE-223) carries the global Pause / Resume control and the live quiet
-  indicator (see [Global pause and the restart-safety workflow](operations.md#global-pause-and-the-restart-safety-workflow-claude-223)).
+- **Status** (`/status`, CLAUDE-129, renamed from About in CLAUDE-513; `/about` and `/about/activity` redirect permanently) shows version + build info. Its **Activity** card (CLAUDE-223) carries the global Pause / Resume control and the live quiet
+  indicator (see [Global pause and the restart-safety workflow](operations.md#global-pause-and-the-restart-safety-workflow-claude-223)). Its **Management** part (SPEC-3.10 item 10, CLAUDE-513) lists each shared Cargo target cache directory under `cache/cargo-target/`
+  with its size, last-used time, and whether a run for that repo is in flight, with a Delete button per row and a Delete all button; a delete is refused with `409` while a run for that repo is in flight.
 
 ## Access check (CLAUDE-216)
 

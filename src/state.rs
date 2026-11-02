@@ -1530,7 +1530,7 @@ pub async fn action_has_active_run(pool: &DbPool, action: &str) -> Result<bool> 
     Ok(row.is_some())
 }
 
-/// One still-open run, for the About page's quiet indicator and the
+/// One still-open run, for the Status page.s quiet indicator and the
 /// `/api/status` activity block. SPEC-4.2.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ActiveRun {
