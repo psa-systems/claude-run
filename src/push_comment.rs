@@ -134,8 +134,17 @@ pub fn post(
     ctx: &PushCommentContext<'_>,
 ) -> Option<String> {
     let body = build_body(ctx);
+    // A per-call unique suffix (not just `pr_number`+event) keeps two
+    // concurrent `post` calls for the same PR and event from colliding on
+    // this filename: callers with no local git workdir (no per-job scratch
+    // directory to key off) pass a shared directory such as
+    // `std::env::temp_dir()`, and without this, one call's `write` could
+    // truncate the file a concurrent call had just written but not yet
+    // read, so the comment recorded on the forge would be empty or belong
+    // to the other call.
     let scratch = scratch_dir.join(format!(
-        "claude-run-push-comment-{pr_number}-{}.md",
+        "claude-run-push-comment-{pr_number}-{}-{}.md",
+        crate::secrets::unique_suffix(),
         ctx.event.label().replace([' ', '(', ')'], "_")
     ));
     if let Err(e) = std::fs::write(&scratch, &body) {
@@ -344,5 +353,113 @@ mod tests {
         let failure = failure.expect("a failing pr_comment call must be reported");
         assert!(failure.starts_with("PR comment for resumed-run push failed:"));
         assert!(failure.contains("pr comment boom"));
+    }
+
+    struct RecordingForge {
+        bodies: std::sync::Mutex<Vec<String>>,
+    }
+    impl Forge for RecordingForge {
+        fn create_pr(
+            &self,
+            _workdir: &Path,
+            _host: &str,
+            _strategy: crate::action::PrStrategy,
+        ) -> crate::error::Result<crate::provider::PullRequest> {
+            unreachable!()
+        }
+        fn clone_url(&self, _host: &str, _repo: &str) -> crate::error::Result<String> {
+            unreachable!()
+        }
+        fn repo_access(&self, _host: &str, _repo: &str) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        fn list_open_prs(
+            &self,
+            _host: &str,
+            _repo: &str,
+        ) -> crate::error::Result<Vec<crate::provider::ForgePullRequest>> {
+            unreachable!()
+        }
+        fn pr_ci_state(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _pr_number: u64,
+        ) -> crate::error::Result<String> {
+            unreachable!()
+        }
+        fn issue_comment(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _issue_number: u64,
+            _body_file: &Path,
+        ) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        fn pr_comment(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _pr_number: u64,
+            body_file: &Path,
+        ) -> crate::error::Result<()> {
+            // Read, then pause before recording: widens the window in which
+            // a concurrent `post` call sharing this same scratch file (the
+            // CLAUDE-519 bug: a deterministic filename with no per-call
+            // uniqueness) would truncate it out from under this read.
+            let body = std::fs::read_to_string(body_file)?;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            self.bodies.lock().unwrap().push(body);
+            Ok(())
+        }
+    }
+
+    /// CLAUDE-519: two routing decisions posting a push comment for the same
+    /// PR and event, through a scratch directory they have no choice but to
+    /// share (no local git workdir to key a scratch path off, e.g. the
+    /// server-side "update branch from base" operation), must not corrupt
+    /// each other's comment body.
+    #[test]
+    fn concurrent_calls_for_the_same_pr_and_event_do_not_corrupt_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let forge = std::sync::Arc::new(RecordingForge {
+            bodies: std::sync::Mutex::new(Vec::new()),
+        });
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let markers: Vec<String> = (0..4).map(|i| format!("thread-{i}-marker")).collect();
+        let handles: Vec<_> = markers
+            .iter()
+            .map(|marker| {
+                let forge = forge.clone();
+                let dir_path = dir.path().to_path_buf();
+                let barrier = barrier.clone();
+                let marker = marker.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let subjects = CommitSubjects::Listed(vec![marker]);
+                    let c = ctx(PushEvent::BranchUpdatedFromBase, subjects);
+                    post(
+                        forge.as_ref(),
+                        "dev.a8n.run",
+                        "psa-systems/claude-run",
+                        7,
+                        &dir_path,
+                        &c,
+                    );
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let bodies = forge.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 4, "{bodies:?}");
+        for marker in &markers {
+            assert!(
+                bodies.iter().any(|b| b.contains(marker)),
+                "lost or corrupted body for {marker}: {bodies:?}"
+            );
+        }
     }
 }
