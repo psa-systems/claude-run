@@ -1949,6 +1949,15 @@ fn git_dir_scratch(workdir: &FsPath) -> crate::error::Result<PathBuf> {
 /// Run `git` in `workdir` and return trimmed stdout, or git's own failure
 /// reason via [`crate::provider::git_error`].
 fn git_output(workdir: &FsPath, args: &[&str]) -> crate::error::Result<String> {
+    // Bare `git` resolves through the process-wide `PATH`. A concurrent test
+    // that prepends a stub `git` to `PATH` (CLAUDE-410, `provider::mod::tests`)
+    // can otherwise race this call: it forks while the stub dir is still on
+    // `PATH` and still exists, but that test's `tempfile::TempDir` can drop
+    // (deleting the stub) before the delayed exec actually runs under CI load,
+    // producing a transient "No such file or directory". Holding the same
+    // lock every `PATH` mutator holds serializes this call against them.
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -2199,6 +2208,10 @@ fn needs_commit(workdir: &FsPath) -> crate::error::Result<bool> {
     if workdir.join(".git").join("MERGE_HEAD").exists() {
         return Ok(true);
     }
+    // See the matching guard in `git_output` above: serializes against any
+    // concurrent test that stubs `git` on the process-wide `PATH`.
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -2219,6 +2232,10 @@ fn needs_commit(workdir: &FsPath) -> crate::error::Result<bool> {
 }
 
 fn git_in(workdir: &FsPath, args: &[&str]) -> crate::error::Result<()> {
+    // See the matching guard in `git_output` above: serializes against any
+    // concurrent test that stubs `git` on the process-wide `PATH`.
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -3228,23 +3245,29 @@ mod tests {
     /// the working tree and then call [`prepare_checkout`] / [`run_decision_gate`]
     /// / [`needs_commit`] against it exactly as `serve_run` does.
     fn repo_with_one_commit(dir: &FsPath) {
-        for args in [
-            vec!["init", "-q", "-b", "main"],
-            vec!["config", "user.name", "tester"],
-            vec!["config", "user.email", "tester@example.com"],
-            // git 2.54's detached auto-maintenance repacks mid-test past ~100 loose objects.
-            vec!["config", "maintenance.auto", "false"],
-        ] {
-            assert!(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(dir)
-                    .args(&args)
-                    .status()
-                    .unwrap()
-                    .success(),
-                "git {args:?}"
-            );
+        {
+            // Same `PATH`-race guard as `git_in`/`git_output`/`needs_commit`,
+            // scoped to just this loop: `git_in` below takes the same
+            // (non-reentrant) lock itself.
+            let _path_guard = crate::testutil::path_env_lock();
+            for args in [
+                vec!["init", "-q", "-b", "main"],
+                vec!["config", "user.name", "tester"],
+                vec!["config", "user.email", "tester@example.com"],
+                // git 2.54's detached auto-maintenance repacks mid-test past ~100 loose objects.
+                vec!["config", "maintenance.auto", "false"],
+            ] {
+                assert!(
+                    std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(dir)
+                        .args(&args)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "git {args:?}"
+                );
+            }
         }
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         git_in(dir, &["add", "a.txt"]).unwrap();

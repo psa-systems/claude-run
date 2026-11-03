@@ -6164,6 +6164,7 @@ mod tests {
         let origin = tmp.path().join("origin");
         std::fs::create_dir_all(&origin).unwrap();
         let git_in = |dir: &Path, args: &[&str]| {
+            let _path_guard = crate::testutil::path_env_lock();
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(dir)
@@ -6226,17 +6227,20 @@ mod tests {
         std::fs::write(origin_feat.join("h.txt"), "z").unwrap();
         git_in(&origin_feat, &["add", "."]);
         git_in(&origin_feat, &["commit", "-q", "-m", "checkpoint push"]);
-        let remote_sha = String::from_utf8_lossy(
-            &std::process::Command::new("git")
-                .arg("-C")
-                .arg(&origin_feat)
-                .args(["rev-parse", "feat/x"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string();
+        let remote_sha = {
+            let _path_guard = crate::testutil::path_env_lock();
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&origin_feat)
+                    .args(["rev-parse", "feat/x"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .trim()
+            .to_string()
+        };
         // Drop the worktree so `feat/x` is no longer "checked out" anywhere
         // in `origin`, which would otherwise reject the fast-forward push
         // this test makes to it at the end.
@@ -6251,17 +6255,20 @@ mod tests {
             &workdir,
             &["commit", "--amend", "-q", "-m", "feat commit v2"],
         );
-        let local_sha = String::from_utf8_lossy(
-            &std::process::Command::new("git")
-                .arg("-C")
-                .arg(&workdir)
-                .args(["rev-parse", "feat/x"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string();
+        let local_sha = {
+            let _path_guard = crate::testutil::path_env_lock();
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&workdir)
+                    .args(["rev-parse", "feat/x"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .trim()
+            .to_string()
+        };
         assert_ne!(
             local_sha, remote_sha,
             "setup must diverge: neither side is an ancestor of the other"
@@ -6280,28 +6287,34 @@ mod tests {
         // The merge leaves the remote tip as an ancestor, so the push the
         // caller makes next is a plain fast-forward.
         git_in(&workdir, &["push", "origin", "feat/x:feat/x"]);
-        let pushed_sha = String::from_utf8_lossy(
-            &std::process::Command::new("git")
-                .arg("-C")
-                .arg(&origin)
-                .args(["rev-parse", "feat/x"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string();
-        let merged_local_sha = String::from_utf8_lossy(
-            &std::process::Command::new("git")
-                .arg("-C")
-                .arg(&workdir)
-                .args(["rev-parse", "feat/x"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string();
+        let pushed_sha = {
+            let _path_guard = crate::testutil::path_env_lock();
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&origin)
+                    .args(["rev-parse", "feat/x"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .trim()
+            .to_string()
+        };
+        let merged_local_sha = {
+            let _path_guard = crate::testutil::path_env_lock();
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&workdir)
+                    .args(["rev-parse", "feat/x"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .trim()
+            .to_string()
+        };
         assert_eq!(pushed_sha, merged_local_sha);
     }
 
@@ -7583,6 +7596,7 @@ mod tests {
         let origin = tmp.path().join("origin");
         std::fs::create_dir_all(&origin).unwrap();
         let git_in = |dir: &Path, args: &[&str]| {
+            let _path_guard = crate::testutil::path_env_lock();
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(dir)

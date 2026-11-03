@@ -98,6 +98,19 @@ pub fn ensure_coreutils_timeout_on_path() {
         // exit path (`kill "$watcher"`, below) reach the grandchild `sleep`
         // and terminate it immediately instead of leaving it to run out
         // its clock.
+        //
+        // The trap must name that grandchild through `jobs -p`, never
+        // through a `spid=$!` variable (SPEC-10.1): capturing `$!` is a
+        // separate statement from the `sleep "$secs" &` that forks it, and
+        // under the scheduling delay `SPEC-10.1.1`/`SPEC-10.1.3` require
+        // tolerating, `TERM` can land in the gap between the two, between the
+        // fork completing and the assignment running. The trap then reads a
+        // stale (empty) `$spid` and kills nothing, leaking `sleep` as the
+        // orphan described above. `jobs -p` instead reads the subshell's own
+        // job table, which the fork updates atomically as part of the same
+        // command that creates the job, so it is never stale: empty before
+        // the fork (nothing to kill yet, and the fork never runs because
+        // `exit 0` in the handler already ended the subshell), accurate after.
         let body = r#"#!/bin/sh
 secs=$1; shift
 secs=${secs%s}
@@ -106,10 +119,9 @@ rm -f "$fired"
 "$@" &
 child=$!
 (
-    trap 'kill -TERM "$spid" 2>/dev/null; exit 0' TERM
+    trap 'kill -TERM $(jobs -p) 2>/dev/null; exit 0' TERM
     sleep "$secs" &
-    spid=$!
-    wait "$spid"
+    wait
     : > "$fired"
     kill -TERM "$child" 2>/dev/null
     sleep 1
