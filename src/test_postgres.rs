@@ -669,7 +669,7 @@ exit 0
 
     /// `PATH` is process-global, so every test that stubs a binary on it holds
     /// the crate-wide `testutil::path_env_lock` for its whole body.
-    fn lock_path() -> std::sync::MutexGuard<'static, ()> {
+    fn lock_path() -> crate::testutil::PathEnvGuard {
         crate::testutil::path_env_lock()
     }
 

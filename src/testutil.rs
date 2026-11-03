@@ -17,9 +17,42 @@ use std::process::{Command, Stdio};
 /// The one lock every test that mutates the process-wide `PATH` must hold for
 /// its whole body. Separate per-module locks let one test restore a stale
 /// `PATH` snapshot over another's stub dir, so the stub vanishes mid-test.
-pub fn path_env_lock() -> std::sync::MutexGuard<'static, ()> {
+///
+/// Re-entrant on one thread: a test holds it for its whole body and then calls
+/// production code that takes it again under `cfg(test)`, which a plain
+/// `std::sync::Mutex` turns into a permanent self-deadlock (CLAUDE-536). Take
+/// it BEFORE any other test lock (`git_allow_protocol_test_lock`,
+/// `git_trace_test_lock`) so two locks are never acquired in opposite orders.
+pub fn path_env_lock() -> PathEnvGuard {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    thread_local! {
+        static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let outer = DEPTH.with(|d| {
+        let depth = d.get();
+        d.set(depth + 1);
+        depth == 0
+    });
+    let guard = outer.then(|| LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    PathEnvGuard {
+        _guard: guard,
+        depth: &DEPTH,
+    }
+}
+
+/// Guard returned by [`path_env_lock`]. Only the outermost guard on a thread
+/// owns the mutex; inner guards just count. Not `Send`, like the
+/// `MutexGuard` it wraps.
+pub struct PathEnvGuard {
+    // `Some` only on the outermost guard of a thread; released after `drop` resets the depth.
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+    depth: &'static std::thread::LocalKey<std::cell::Cell<usize>>,
+}
+
+impl Drop for PathEnvGuard {
+    fn drop(&mut self) {
+        self.depth.with(|d| d.set(d.get() - 1));
+    }
 }
 
 /// Strip every ambient git-config and credential input from `cmd` before a
@@ -217,6 +250,34 @@ pub fn write_stub(path: &Path, body: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// CLAUDE-536: the guard is re-entrant on one thread (nested production
+    /// takes no longer self-deadlock) and still excludes other threads.
+    #[test]
+    fn path_env_lock_is_reentrant_and_still_excludes_other_threads() {
+        let outer = path_env_lock();
+        let inner = path_env_lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let _g = path_env_lock();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "another thread must not acquire the lock while this one holds it"
+        );
+        drop(inner);
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "dropping the inner guard must not release the lock"
+        );
+        drop(outer);
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the lock must be released once the outer guard drops");
+        other.join().unwrap();
+    }
+
     use super::*;
 
     /// CLAUDE-224 guard: hammer write-then-exec while sibling threads fork, the
