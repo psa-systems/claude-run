@@ -979,6 +979,11 @@ fn scrub_workdir_credentials(url: &str, workdir: &std::path::Path) -> Result<()>
 /// Strip userinfo from `origin`'s URL in `workdir`, if it has one and if the
 /// URL carries any.
 fn scrub_remote_origin_url(url: &str, workdir: &std::path::Path) -> Result<()> {
+    // Bare `git` resolves through the process-wide `PATH`; serialize against
+    // the CLAUDE-410 PATH-stub test's mutation/deletion window the same way
+    // `comment_webhooks::git_output` does.
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -1015,6 +1020,10 @@ fn scrub_remote_origin_url(url: &str, workdir: &std::path::Path) -> Result<()> {
 /// when `.gitmodules` carries a relative URL, resolved against the
 /// token-bearing `origin`).
 fn scrub_submodule_config_urls(url: &str, workdir: &std::path::Path) -> Result<()> {
+    // See `scrub_remote_origin_url`: serialize against the CLAUDE-410
+    // PATH-stub test's mutation/deletion window.
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -1056,15 +1065,22 @@ fn recurse_into_submodules(url: &str, workdir: &std::path::Path) -> Result<()> {
     if !workdir.join(".gitmodules").is_file() {
         return Ok(());
     }
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workdir)
-        .arg("config")
-        .arg("--file")
-        .arg(".gitmodules")
-        .arg("--get-regexp")
-        .arg(r"^submodule\..*\.path$")
-        .output()?;
+    // Scoped tightly (unlike the sibling scrub functions) because this
+    // function recurses into submodules-of-submodules below: a guard held
+    // for the whole function body would deadlock on the recursive call.
+    let out = {
+        #[cfg(test)]
+        let _path_guard = crate::testutil::path_env_lock();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .arg("config")
+            .arg("--file")
+            .arg(".gitmodules")
+            .arg("--get-regexp")
+            .arg(r"^submodule\..*\.path$")
+            .output()?
+    };
     if !out.status.success() {
         return Ok(());
     }
@@ -1401,6 +1417,8 @@ fn restore_default_branch_refs_retrying(
         }
     }
 
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -2491,11 +2509,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = origin_with_submodule(tmp.path());
         let workdir = tmp.path().join("plain_clone");
-        let out = std::process::Command::new("git")
-            .args(["clone", "-q", &url])
-            .arg(&workdir)
-            .output()
-            .unwrap();
+        let out = {
+            let _path_guard = crate::testutil::path_env_lock();
+            std::process::Command::new("git")
+                .args(["clone", "-q", &url])
+                .arg(&workdir)
+                .output()
+                .unwrap()
+        };
         assert!(
             out.status.success(),
             "{}",
@@ -2564,39 +2585,46 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin");
         std::fs::create_dir_all(&origin).unwrap();
-        std::process::Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .arg("-b")
-            .arg("main")
-            .arg(&origin)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&origin)
-            .args(["config", "user.email", "a@b.c"])
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&origin)
-            .args(["config", "user.name", "a"])
-            .output()
-            .unwrap();
-        std::fs::write(origin.join("f"), "x").unwrap();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&origin)
-            .args(["add", "f"])
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&origin)
-            .args(["commit", "-q", "-m", "x"])
-            .output()
-            .unwrap();
+        {
+            // Serialize this fixture's bare `git` spawns against the
+            // CLAUDE-410 PATH-stub test's mutation/deletion window; dropped
+            // before `restore_default_branch_refs_retrying` runs below, which
+            // takes the same lock itself.
+            let _path_guard = crate::testutil::path_env_lock();
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg("-b")
+                .arg("main")
+                .arg(&origin)
+                .output()
+                .unwrap();
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["config", "user.email", "a@b.c"])
+                .output()
+                .unwrap();
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["config", "user.name", "a"])
+                .output()
+                .unwrap();
+            std::fs::write(origin.join("f"), "x").unwrap();
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["add", "f"])
+                .output()
+                .unwrap();
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["commit", "-q", "-m", "x"])
+                .output()
+                .unwrap();
+        }
 
         let log = tmp.path().join("helper-calls.log");
         let script = tmp.path().join("helper.sh");
@@ -2651,11 +2679,14 @@ mod tests {
         let origin_path = url.strip_prefix("file://").unwrap().to_string();
 
         let workdir = tmp.path().join("clone");
-        let out = std::process::Command::new("git")
-            .args(["clone", "-q", "--branch", "feat", "--depth", "1", &url])
-            .arg(&workdir)
-            .output()
-            .unwrap();
+        let out = {
+            let _path_guard = crate::testutil::path_env_lock();
+            std::process::Command::new("git")
+                .args(["clone", "-q", "--branch", "feat", "--depth", "1", &url])
+                .arg(&workdir)
+                .output()
+                .unwrap()
+        };
         assert!(
             out.status.success(),
             "{}",
@@ -2678,17 +2709,20 @@ mod tests {
             .arg(&script)
             .output()
             .unwrap();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&workdir)
-            .args([
-                "remote",
-                "set-url",
-                "origin",
-                &format!("ext::sh {}", script.display()),
-            ])
-            .output()
-            .unwrap();
+        {
+            let _path_guard = crate::testutil::path_env_lock();
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&workdir)
+                .args([
+                    "remote",
+                    "set-url",
+                    "origin",
+                    &format!("ext::sh {}", script.display()),
+                ])
+                .output()
+                .unwrap();
+        }
 
         // `GIT_ALLOW_PROTOCOL` replaces git's default allowlist rather than
         // widening it, so `file` (needed by `url`'s own `ls-remote`) stays
@@ -2733,14 +2767,19 @@ mod tests {
     /// recursively for every submodule), for asserting none carries userinfo.
     fn all_configured_urls(workdir: &std::path::Path) -> Vec<String> {
         let mut urls = Vec::new();
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(workdir)
-            .arg("config")
-            .arg("--get-regexp")
-            .arg(r"\.url$")
-            .output()
-            .unwrap();
+        // Each call is scoped tightly, not held for the whole function, since
+        // this function recurses into submodules below.
+        let out = {
+            let _path_guard = crate::testutil::path_env_lock();
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(workdir)
+                .arg("config")
+                .arg("--get-regexp")
+                .arg(r"\.url$")
+                .output()
+                .unwrap()
+        };
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         for line in stdout.lines() {
             if let Some((_, value)) = line.split_once(' ') {
@@ -2748,16 +2787,19 @@ mod tests {
             }
         }
         if workdir.join(".gitmodules").is_file() {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(workdir)
-                .arg("config")
-                .arg("--file")
-                .arg(".gitmodules")
-                .arg("--get-regexp")
-                .arg(r"^submodule\..*\.path$")
-                .output()
-                .unwrap();
+            let out = {
+                let _path_guard = crate::testutil::path_env_lock();
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(workdir)
+                    .arg("config")
+                    .arg("--file")
+                    .arg(".gitmodules")
+                    .arg("--get-regexp")
+                    .arg(r"^submodule\..*\.path$")
+                    .output()
+                    .unwrap()
+            };
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
             for line in stdout.lines() {
                 if let Some((_, path)) = line.split_once(' ') {
@@ -2811,6 +2853,7 @@ mod tests {
     /// both carry the credential until the scrub runs.
     fn origin_with_relative_submodule(base: &std::path::Path) -> String {
         let git_in = |dir: &std::path::Path, args: &[&str]| {
+            let _path_guard = crate::testutil::path_env_lock();
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(dir)
@@ -2891,13 +2934,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = with_fake_userinfo(&origin_with_default_branch(tmp.path(), "main"));
         let clone = tmp.path().join("clone");
-        std::process::Command::new("git")
-            .arg("clone")
-            .arg("-q")
-            .arg(&url)
-            .arg(&clone)
-            .output()
-            .unwrap();
+        {
+            let _path_guard = crate::testutil::path_env_lock();
+            std::process::Command::new("git")
+                .arg("clone")
+                .arg("-q")
+                .arg(&url)
+                .arg(&clone)
+                .output()
+                .unwrap();
+        }
         // A pre-existing `config.lock` makes `git remote set-url` fail with
         // "Unable to create ... File exists", with no permission bit involved
         // (CLAUDE-255 bars `set_mode` from a test; this needs none).
@@ -2934,13 +2980,16 @@ mod tests {
         // succeeds with no `ref:` line, and that must never be read as "main".
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin");
-        std::process::Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .arg("--bare")
-            .arg(&origin)
-            .output()
-            .unwrap();
+        {
+            let _path_guard = crate::testutil::path_env_lock();
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg("--bare")
+                .arg(&origin)
+                .output()
+                .unwrap();
+        }
         let url = format!("file://{}", origin.display());
         let err = restore_default_branch_refs_retrying(
             &url,
@@ -3132,61 +3181,64 @@ mod tests {
     fn clone_retry_removes_a_directory_a_failed_first_attempt_left_behind() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin");
-        std::process::Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .arg("--bare")
-            .arg(&origin)
-            .output()
-            .unwrap();
-        // Pin HEAD to `main` regardless of the host git's configured
-        // default branch name, so the seeded push below lands on the
-        // branch the bare repo's HEAD actually resolves to.
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&origin)
-            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
-            .output()
-            .unwrap();
-        // Seed a commit so the clone itself can succeed on retry.
         let seed = tmp.path().join("seed");
-        std::process::Command::new("git")
-            .args([
-                "clone",
-                "-q",
-                origin.to_str().unwrap(),
-                seed.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
-        std::fs::write(seed.join("f"), b"x").unwrap();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&seed)
-            .args(["add", "f"])
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&seed)
-            .args([
-                "-c",
-                "user.email=a@b.c",
-                "-c",
-                "user.name=a",
-                "commit",
-                "-q",
-                "-m",
-                "x",
-            ])
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&seed)
-            .args(["push", "-q", "origin", "HEAD:main"])
-            .output()
-            .unwrap();
+        {
+            let _path_guard = crate::testutil::path_env_lock();
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg("--bare")
+                .arg(&origin)
+                .output()
+                .unwrap();
+            // Pin HEAD to `main` regardless of the host git's configured
+            // default branch name, so the seeded push below lands on the
+            // branch the bare repo's HEAD actually resolves to.
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+                .output()
+                .unwrap();
+            // Seed a commit so the clone itself can succeed on retry.
+            std::process::Command::new("git")
+                .args([
+                    "clone",
+                    "-q",
+                    origin.to_str().unwrap(),
+                    seed.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            std::fs::write(seed.join("f"), b"x").unwrap();
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&seed)
+                .args(["add", "f"])
+                .output()
+                .unwrap();
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&seed)
+                .args([
+                    "-c",
+                    "user.email=a@b.c",
+                    "-c",
+                    "user.name=a",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "x",
+                ])
+                .output()
+                .unwrap();
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&seed)
+                .args(["push", "-q", "origin", "HEAD:main"])
+                .output()
+                .unwrap();
+        }
 
         let url = format!("file://{}", origin.display());
         let workdir = tmp.path().join("clone");
@@ -3204,6 +3256,7 @@ mod tests {
             } else if workdir.exists() {
                 std::fs::remove_dir_all(&workdir).unwrap();
             }
+            let _path_guard = crate::testutil::path_env_lock();
             Ok(std::process::Command::new("git")
                 .arg("clone")
                 .arg("--depth")

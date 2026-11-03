@@ -102,6 +102,11 @@ impl std::fmt::Display for WorkCheckError {
 }
 
 fn git_out(workdir: &Path, args: &[&str]) -> Option<String> {
+    // Bare `git` resolves through the process-wide `PATH`; serialize against
+    // the CLAUDE-410 PATH-stub test's mutation/deletion window the same way
+    // `comment_webhooks::git_output` does.
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
     let out = Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -301,6 +306,10 @@ pub fn local_only_work_with_token(
 /// preserved. `git clean -fdX` deletes only ignored files and directories; a
 /// failure is logged and tolerated (the directory is still preserved).
 fn prune_ignored_artifacts(workdir: &Path) {
+    // See `git_out`: serialize against the CLAUDE-410 PATH-stub test's
+    // mutation/deletion window.
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
     let out = Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -431,6 +440,7 @@ mod tests {
     // ---- local_only_work / cleanup_or_preserve fixtures --------
 
     fn git_in(dir: &Path, args: &[&str]) {
+        let _path_guard = crate::testutil::path_env_lock();
         let out = Command::new("git")
             .arg("-C")
             .arg(dir)
