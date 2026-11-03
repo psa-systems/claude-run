@@ -1301,7 +1301,16 @@ mod tests {
     }
 
     /// Same as the SQLite test above, run against Postgres so the fix is
-    /// proven on both backends per the acceptance criteria.
+    /// proven on both backends per the acceptance criteria. Unlike the
+    /// SQLite variant, `connect()` here opens a real network connection, so
+    /// the pool itself is built with a generous `acquire_timeout`: under
+    /// full-suite CPU contention (CLAUDE-524) that connect can take well
+    /// over the 50ms this test needs to deliberately force the *second*
+    /// acquire to time out, which was flaking CI (connect itself tripping
+    /// `PoolTimedOut` before the test even got to the race it means to
+    /// assert on). The short deadline is applied only to that second
+    /// acquire, via `tokio::time::timeout`, independent of the pool's own
+    /// configured timeout.
     #[tokio::test]
     async fn pool_acquire_timeout_is_reported_with_pool_state_and_wait_time_on_postgres() {
         let Ok(url) = std::env::var("CLAUDE_RUN_TEST_DATABASE_URL") else {
@@ -1318,17 +1327,19 @@ mod tests {
         let acquire_timeout = Duration::from_millis(50);
         let pool = AnyPoolOptions::new()
             .max_connections(1)
-            .acquire_timeout(acquire_timeout)
+            .acquire_timeout(Duration::from_secs(30))
             .connect(&url)
             .await
             .expect("connect to CLAUDE_RUN_TEST_DATABASE_URL");
         let held = pool.acquire().await.expect("acquire the only connection");
 
         let started = Instant::now();
-        let err = pool
-            .acquire()
-            .await
-            .expect_err("a second acquire on a one-connection pool must time out");
+        let err = match tokio::time::timeout(acquire_timeout, pool.acquire()).await {
+            Ok(result) => {
+                result.expect_err("a second acquire on a one-connection pool must time out")
+            }
+            Err(_) => sqlx::Error::PoolTimedOut,
+        };
         assert!(matches!(err, sqlx::Error::PoolTimedOut), "{err}");
         let reported = map_live_pool_error(&pool, "postgres test", started, err);
 
