@@ -168,6 +168,13 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             "/api/status/cargo-cache/delete",
             post(cargo_cache_delete_all),
         )
+        // Docker storage prune route (SPEC-3.11 item 4, CLAUDE-517). Same
+        // `/api`-mirrored, no-unix-socket pattern as the cargo-cache routes
+        // above.
+        .route(
+            "/api/status/docker/{category}/prune",
+            post(docker_storage_prune),
+        )
         .route("/runs/{id}", get(run_detail))
         .route(
             "/runs/{id}/jobs/{key}/attempt/{attempt}",
@@ -5736,6 +5743,203 @@ async fn cargo_cache_rows(paths: &Paths, pool: &DbPool) -> Result<Vec<CargoCache
     Ok(rows)
 }
 
+// ---- SPEC-3.11 item 4: Docker storage prune (CLAUDE-517) -------------------
+//
+// The Management part's second table: one row per sidecar Docker storage
+// category (stopped containers, images, build cache, unreferenced volumes),
+// each with its size, or "unknown" with the error when the usage read
+// fails, and a Prune button refused with `409` while any run is in flight.
+
+/// SPEC-3.11 item 4: one Docker storage category the Management part lists
+/// and prunes individually. `slug` is the route segment
+/// (`/api/status/docker/{slug}/prune`); `label` is the display name used in
+/// the row, the confirmation dialog, and the log/error messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockerCategory {
+    StoppedContainers,
+    Images,
+    BuildCache,
+    Volumes,
+}
+
+impl DockerCategory {
+    const ALL: [DockerCategory; 4] = [
+        Self::StoppedContainers,
+        Self::Images,
+        Self::BuildCache,
+        Self::Volumes,
+    ];
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::StoppedContainers => "stopped-containers",
+            Self::Images => "images",
+            Self::BuildCache => "build-cache",
+            Self::Volumes => "volumes",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::StoppedContainers => "Stopped containers",
+            Self::Images => "Images",
+            Self::BuildCache => "Build cache",
+            Self::Volumes => "Unreferenced volumes",
+        }
+    }
+
+    fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.slug() == slug)
+    }
+
+    /// This category's share of a [`crate::gc::DockerUsage`] read.
+    fn usage_bytes(self, usage: &crate::gc::DockerUsage) -> u64 {
+        match self {
+            Self::StoppedContainers => usage.containers_bytes,
+            Self::Images => usage.images_bytes,
+            Self::BuildCache => usage.build_cache_bytes,
+            Self::Volumes => usage.volumes_bytes,
+        }
+    }
+
+    /// Prune this category through the injected client. `Err` only when the
+    /// category's own listing (or, for build cache, the one prune call)
+    /// fails; see `crate::gc::prune_*` for what each category does.
+    fn prune(self, client: &dyn crate::gc::DockerVolumeClient) -> Result<u64, String> {
+        match self {
+            Self::StoppedContainers => crate::gc::prune_stopped_containers(client),
+            Self::Images => crate::gc::prune_images(client),
+            Self::BuildCache => crate::gc::prune_build_cache_now(client),
+            Self::Volumes => crate::gc::prune_unreferenced_volumes(client),
+        }
+    }
+}
+
+/// SPEC-3.11 item 4: one Docker storage Management row. `size_bytes` is
+/// `None`, and `size_human` reads "unknown", when the usage read failed;
+/// `error` then carries the message so the operator sees why, never a
+/// silent zero.
+#[derive(Serialize)]
+struct DockerStorageRow {
+    slug: &'static str,
+    label: &'static str,
+    size_bytes: Option<u64>,
+    size_human: String,
+    error: Option<String>,
+}
+
+/// SPEC-3.11 item 4: build the Management part's Docker storage rows from
+/// one `usage()` read, shared by every category so a single unreachable
+/// daemon shows the same "unknown" + error on all four rows rather than
+/// querying per category.
+fn docker_storage_rows(client: &dyn crate::gc::DockerVolumeClient) -> Vec<DockerStorageRow> {
+    let usage = client.usage();
+    DockerCategory::ALL
+        .into_iter()
+        .map(|cat| match &usage {
+            Ok(u) => {
+                let bytes = cat.usage_bytes(u);
+                DockerStorageRow {
+                    slug: cat.slug(),
+                    label: cat.label(),
+                    size_bytes: Some(bytes),
+                    size_human: human_bytes(bytes),
+                    error: None,
+                }
+            }
+            Err(e) => DockerStorageRow {
+                slug: cat.slug(),
+                label: cat.label(),
+                size_bytes: None,
+                size_human: "unknown".to_string(),
+                error: Some(e.clone()),
+            },
+        })
+        .collect()
+}
+
+/// SPEC-3.11 item 4: `POST /api/status/docker/{category}/prune`'s logic is
+/// split across this function and [`docker_storage_prune_run`] below, since
+/// a `&dyn DockerVolumeClient` (not `Sync`) cannot live across an `.await`
+/// without making the handler's future non-`Send`; [`docker_storage_prune`]
+/// is the thin production entry point joining the two.
+///
+/// The async half: parse the category and check in-flight activity. Returns
+/// `Ok(cat)` to proceed, or `Err(response)` with the early `404`/`409`.
+/// Kept separate from the actual prune so no `&dyn DockerVolumeClient` (not
+/// `Sync`) needs to live across the `.await` here, which would make the
+/// handler's future non-`Send`.
+async fn docker_storage_prune_check(
+    pool: &DbPool,
+    in_flight: &crate::api::InFlight,
+    category: &str,
+) -> Result<DockerCategory, WebError> {
+    let Some(cat) = DockerCategory::from_slug(category) else {
+        return Err(WebError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("unknown Docker storage category `{category}`"),
+        });
+    };
+    let activity = crate::api::activity(pool, in_flight).await?;
+    if !activity.quiet {
+        return Err(WebError {
+            status: StatusCode::CONFLICT,
+            message: "a run is in flight; wait before pruning Docker storage".to_string(),
+        });
+    }
+    Ok(cat)
+}
+
+/// The synchronous half: run the category's prune through the injected
+/// client and build the response, logging `info` on success and `error` on
+/// failure (never swallowed to a silent zero).
+fn docker_storage_prune_run(
+    cat: DockerCategory,
+    client: &dyn crate::gc::DockerVolumeClient,
+) -> Response {
+    match crate::blocking::in_place(|| cat.prune(client)) {
+        Ok(bytes) => {
+            tracing::info!(
+                category = cat.label(),
+                bytes_reclaimed = bytes,
+                "Status page: Docker storage pruned (SPEC-3.11 item 4)"
+            );
+            Json(serde_json::json!({
+                "ok": true,
+                "message": format!("pruned {} ({})", cat.label(), human_bytes(bytes)),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(
+                category = cat.label(),
+                error = %e,
+                "Status page: Docker storage prune failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not prune {}: {e}", cat.label()),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// SPEC-3.11 item 4: `POST /api/status/docker/{category}/prune`'s production
+/// entry point. Posted under `/api` the way the Pause form posts to
+/// `/api/pause`, but defined here (not in `api::router`) rather than there
+/// so it adds no route to the unix socket.
+async fn docker_storage_prune(
+    State(s): State<WebState>,
+    AxumPath(category): AxumPath<String>,
+) -> Result<Response, WebError> {
+    let cat = docker_storage_prune_check(&s.api.pool, &s.api.in_flight, &category).await?;
+    Ok(docker_storage_prune_run(
+        cat,
+        &crate::gc::CliDockerVolumeClient,
+    ))
+}
+
 /// SPEC-4.3.9: render state for the Status page.
 #[derive(Template)]
 #[template(path = "status.html")]
@@ -5747,10 +5951,16 @@ struct StatusTpl {
     /// The first render of the live indicator; the 2s poll then replaces it
     /// from `/status/activity`.
     activity: ActivityView,
-    /// SPEC-3.10 item 10: the Management part's rows.
+    /// SPEC-3.10 item 10: the Management part's cargo-cache rows.
     cargo_cache: Vec<CargoCacheRow>,
     /// Pre-formatted total, for the Delete all confirmation.
     cargo_cache_total_human: String,
+    /// SPEC-3.11 item 4: the Management part's Docker storage rows.
+    docker_storage: Vec<DockerStorageRow>,
+    /// Whether any run is in flight, so the Docker storage Prune buttons'
+    /// confirmation can warn before the `409` the server would refuse with
+    /// anyway.
+    docker_run_in_flight: bool,
 }
 
 /// SPEC-4.3.9: the `/status` page handler.
@@ -5764,12 +5974,19 @@ async fn status_page(State(s): State<WebState>) -> Result<Response, WebError> {
     let cargo_cache = cargo_cache_rows(&s.paths, &s.api.pool).await?;
     let cargo_cache_total_human =
         human_bytes(cargo_cache.iter().map(|r| r.size_bytes).sum::<u64>());
+    let docker_storage =
+        crate::blocking::in_place(|| docker_storage_rows(&crate::gc::CliDockerVolumeClient));
+    let docker_run_in_flight = !crate::api::activity(&s.api.pool, &s.api.in_flight)
+        .await?
+        .quiet;
     let tpl = StatusTpl {
         version: s.api.version,
         global_pause,
         activity: activity_view(&s).await,
         cargo_cache,
         cargo_cache_total_human,
+        docker_storage,
+        docker_run_in_flight,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
@@ -12199,6 +12416,176 @@ mod tests {
             let body = body_string(resp).await;
             assert!(body.contains("owner__repo-a"), "{body}");
             assert!(dir.exists());
+        }
+
+        // ---- SPEC-3.11 item 4: Docker storage prune (CLAUDE-517) --------
+
+        /// A fake [`crate::gc::DockerVolumeClient`] so these tests never shell
+        /// out to the real, reachable sidecar Docker daemon. `usage` and
+        /// `prune_build_cache` are the only calls the Status page / prune
+        /// route reach; the by-id listing methods return empty so
+        /// `prune_stopped_containers` etc. have nothing to remove and can be
+        /// used in the "succeeds with nothing to do" sense when needed.
+        struct FakeDockerStorageClient {
+            usage: std::result::Result<crate::gc::DockerUsage, String>,
+            build_cache_result: std::result::Result<u64, String>,
+        }
+
+        impl crate::gc::DockerVolumeClient for FakeDockerStorageClient {
+            fn list_volumes(&self) -> Result<Vec<crate::gc::DockerVolume>, String> {
+                Ok(Vec::new())
+            }
+            fn remove_volume(&self, _name: &str) -> Result<(), crate::gc::VolumeRemoveError> {
+                Ok(())
+            }
+            fn usage(&self) -> Result<crate::gc::DockerUsage, String> {
+                self.usage.clone()
+            }
+            fn list_stopped_containers(&self) -> Result<Vec<crate::gc::StoppedContainer>, String> {
+                Ok(Vec::new())
+            }
+            fn remove_container(&self, _id: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn list_dangling_images(&self) -> Result<Vec<crate::gc::DockerImage>, String> {
+                Ok(Vec::new())
+            }
+            fn list_unused_images(&self) -> Result<Vec<crate::gc::DockerImage>, String> {
+                Ok(Vec::new())
+            }
+            fn remove_image(&self, _id: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn prune_build_cache(&self, _older_than: std::time::Duration) -> Result<u64, String> {
+                self.build_cache_result.clone()
+            }
+        }
+
+        /// The Management part's Docker storage table lists all four
+        /// categories with their size, and "unknown" plus the error when the
+        /// usage read fails.
+        #[tokio::test]
+        async fn docker_storage_rows_reports_size_or_unknown_with_error() {
+            let ok_rows = super::super::docker_storage_rows(&FakeDockerStorageClient {
+                usage: Ok(crate::gc::DockerUsage {
+                    containers_bytes: 1,
+                    images_bytes: 2,
+                    volumes_bytes: 3,
+                    build_cache_bytes: 4,
+                }),
+                build_cache_result: Ok(0),
+            });
+            assert_eq!(ok_rows.len(), 4);
+            assert!(ok_rows.iter().all(|r| r.error.is_none()));
+            assert!(ok_rows
+                .iter()
+                .any(|r| r.label == "Stopped containers" && r.size_bytes == Some(1)));
+            assert!(ok_rows
+                .iter()
+                .any(|r| r.label == "Images" && r.size_bytes == Some(2)));
+            assert!(ok_rows
+                .iter()
+                .any(|r| r.label == "Unreferenced volumes" && r.size_bytes == Some(3)));
+            assert!(ok_rows
+                .iter()
+                .any(|r| r.label == "Build cache" && r.size_bytes == Some(4)));
+
+            let err_rows = super::super::docker_storage_rows(&FakeDockerStorageClient {
+                usage: Err("daemon unreachable".to_string()),
+                build_cache_result: Ok(0),
+            });
+            assert_eq!(err_rows.len(), 4);
+            for row in &err_rows {
+                assert_eq!(row.size_bytes, None);
+                assert_eq!(row.size_human, "unknown");
+                assert_eq!(row.error.as_deref(), Some("daemon unreachable"));
+            }
+        }
+
+        /// The Status page renders the Docker storage table with its Prune
+        /// buttons, each naming the category.
+        #[tokio::test]
+        async fn status_page_renders_docker_storage_table() {
+            let s = web_state().await;
+            let body = body_string(status_page(State(s)).await.unwrap()).await;
+            assert!(body.contains("Stopped containers"), "{body}");
+            assert!(body.contains("Build cache"), "{body}");
+            assert!(
+                body.contains("/api/status/docker/build-cache/prune"),
+                "{body}"
+            );
+            assert!(body.contains("Prune"), "{body}");
+        }
+
+        /// A prune removes only its own category: pruning `build-cache`
+        /// calls the client's build-cache prune and nothing else, and the
+        /// bytes reclaimed are reported back.
+        #[tokio::test]
+        async fn prune_run_removes_only_its_own_category() {
+            let client = FakeDockerStorageClient {
+                usage: Ok(crate::gc::DockerUsage::default()),
+                build_cache_result: Ok(4096),
+            };
+            let resp = super::super::docker_storage_prune_run(
+                super::super::DockerCategory::BuildCache,
+                &client,
+            );
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            assert!(body.contains("Build cache"), "{body}");
+            assert!(body.contains("4.0 KiB") || body.contains("4096"), "{body}");
+        }
+
+        /// A failed prune is shown (`500`, naming the category and the
+        /// error) rather than swallowed to a silent zero.
+        #[tokio::test]
+        async fn prune_run_shows_a_failed_prune() {
+            let client = FakeDockerStorageClient {
+                usage: Ok(crate::gc::DockerUsage::default()),
+                build_cache_result: Err("builder prune failed".to_string()),
+            };
+            let resp = super::super::docker_storage_prune_run(
+                super::super::DockerCategory::BuildCache,
+                &client,
+            );
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = body_string(resp).await;
+            assert!(body.contains("Build cache"), "{body}");
+            assert!(body.contains("builder prune failed"), "{body}");
+        }
+
+        /// An unknown category is refused with `404`.
+        #[tokio::test]
+        async fn prune_check_refuses_unknown_category() {
+            let s = web_state().await;
+            let err = super::super::docker_storage_prune_check(
+                &s.api.pool,
+                &s.api.in_flight,
+                "not-a-category",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::NOT_FOUND);
+        }
+
+        /// A prune is refused with `409` and a visible message while any run
+        /// is in flight, regardless of category.
+        #[tokio::test]
+        async fn prune_check_refused_while_run_in_flight() {
+            let s = web_state().await;
+            crate::state::run_begin(&s.api.pool, "act", "cli")
+                .await
+                .unwrap();
+
+            let err = super::super::docker_storage_prune_check(
+                &s.api.pool,
+                &s.api.in_flight,
+                "build-cache",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::CONFLICT);
+            assert!(err.message.contains("in flight"), "{}", err.message);
         }
     }
 
