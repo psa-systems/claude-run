@@ -180,7 +180,11 @@ will want to know about:
   chart lists the 20 most recent invocations with their status and API-retry counts.
 - **Status** (`/status`, CLAUDE-129, renamed from About in CLAUDE-513; `/about` and `/about/activity` redirect permanently) shows version + build info. Its **Activity** card (CLAUDE-223) carries the global Pause / Resume control and the live quiet
   indicator (see [Global pause and the restart-safety workflow](operations.md#global-pause-and-the-restart-safety-workflow-claude-223)). Its **Management** part (SPEC-3.10 item 10, CLAUDE-513) lists each shared Cargo target cache directory under `cache/cargo-target/`
-  with its size, last-used time, and whether a run for that repo is in flight, with a Delete button per row and a Delete all button; a delete is refused with `409` while a run for that repo is in flight.
+  with its size, last-used time, and whether a run for that repo is in flight, with a Delete button per row and a Delete all button; a delete is refused with `409` while a run for that repo is in flight. The same part also lists the sidecar's Docker storage by
+  category (SPEC-3.11 item 4, CLAUDE-517: stopped containers, images, build cache, unreferenced volumes), each with its
+  size, or "unknown" with the read's error when the usage read fails, and a Prune button that removes everything in
+  that category now; a prune is refused with `409` while any run is in flight, and a failed prune is shown rather than
+  swallowed. See [Docker storage prune from the Status page](operations.md#docker-storage-prune-from-the-status-page-spec-311-item-4-claude-517).
 
 ## Access check (CLAUDE-216)
 

@@ -3052,6 +3052,25 @@ pub mod testutil {
             self
         }
 
+        /// Register a failing response (non-zero exit) for any call whose
+        /// `binary args...` starts with `prefix`. The `ok_prefix` counterpart
+        /// for a call that must fail but whose trailing args carry dynamic
+        /// text (CLAUDE-521's randomized scratch-file names) a test cannot
+        /// predict exactly. Checked only after an exact `ok`/`fail` match
+        /// misses.
+        pub fn fail_prefix(mut self, prefix: &str, exit_code: i32, stderr: &str) -> Self {
+            self.prefix_responses.push((
+                prefix.to_string(),
+                CmdOutput {
+                    ok: false,
+                    stdout: String::new(),
+                    stderr: stderr.to_string(),
+                    exit_code,
+                },
+            ));
+            self
+        }
+
         fn lookup(&self, binary: &str, args: &[&str]) -> Result<CmdOutput> {
             let key = Self::key(binary, args);
             self.calls.lock().unwrap().push(key.clone());

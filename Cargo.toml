@@ -49,6 +49,7 @@ getrandom = "0.2"
 argon2 = "0.6.0"
 qrcodegen = "1.8.0"
 schemars = "1"
+tempfile = "3"
 
 [dependencies.totp-rs]
 version = "6.0.0"
@@ -163,7 +164,6 @@ features = [
 ]
 
 [dev-dependencies]
-tempfile = "3"
 
 [dev-dependencies.rmcp]
 version = "1.7.0"
