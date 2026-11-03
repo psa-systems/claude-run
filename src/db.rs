@@ -566,6 +566,13 @@ fn next_fixture_schema() -> String {
 /// A pool whose every connection selects `schema`; the schema itself is not
 /// created here. Refuses a live runner database on the first call of the
 /// process. SPEC-5.6.1, SPEC-5.6.6.
+///
+/// Carries the same raised `acquire_timeout` as [`test_sqlite_pool`]: a
+/// capacity-constrained pool here (most acutely `max_connections(1)` via
+/// [`test_pg_pool_single_connection`]) is exposed to the identical race, a
+/// dropped transaction's background rollback losing to full-suite CPU
+/// contention, just on the Postgres leg of CI instead of the SQLite one
+/// (CLAUDE-524).
 #[cfg(test)]
 async fn pg_pool_in_schema(url: &str, schema: &str, max_connections: u32) -> DbPool {
     static LIVE_CHECK: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
@@ -573,6 +580,7 @@ async fn pg_pool_in_schema(url: &str, schema: &str, max_connections: u32) -> DbP
     let set_path = format!("SET search_path TO {schema}");
     let pool = AnyPoolOptions::new()
         .max_connections(max_connections)
+        .acquire_timeout(Duration::from_secs(120))
         .after_connect(move |conn, _meta| {
             let set_path = set_path.clone();
             Box::pin(async move {
