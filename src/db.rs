@@ -407,6 +407,7 @@ async fn open_postgres(url: &str) -> Result<DbPool> {
     let mut attempt = 0u32;
     let pool = loop {
         attempt += 1;
+        let attempt_started = Instant::now();
         match pool_options(Dialect::Postgres)
             .connect_with(opts.clone())
             .await
@@ -420,6 +421,19 @@ async fn open_postgres(url: &str) -> Result<DbPool> {
                     "postgres not reachable yet, retrying"
                 );
                 tokio::time::sleep(CONNECT_RETRY_INTERVAL).await;
+            }
+            // A pool-acquire timeout on the final attempt gets the dedicated
+            // variant (and its own `error!` log) instead of the generic
+            // unreachable-host message below, so it is reported like every
+            // other pool acquire timeout rather than losing its pool state.
+            Err(e) if matches!(e, sqlx::Error::PoolTimedOut) => {
+                return Err(map_connect_error(
+                    "postgres",
+                    POOL_MAX_CONNECTIONS,
+                    POOL_ACQUIRE_TIMEOUT,
+                    attempt_started,
+                    e,
+                ));
             }
             Err(e) => {
                 // Loud and terminal. Falling back to SQLite here would start a
@@ -443,7 +457,14 @@ async fn open_postgres(url: &str) -> Result<DbPool> {
             }
         }
     };
-    POSTGRES_MIGRATOR.run(&pool).await?;
+    let started = Instant::now();
+    POSTGRES_MIGRATOR.run(&pool).await.map_err(|e| {
+        if migrate_pool_timeout(&e) {
+            map_live_pool_error(&pool, "postgres", started, sqlx::Error::PoolTimedOut)
+        } else {
+            e.into()
+        }
+    })?;
     Ok(pool)
 }
 
