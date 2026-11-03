@@ -903,7 +903,8 @@ CLAUDE-379: a run that hits `claude_timeout_seconds` (exit 124) no longer just p
 
 CLAUDE-448: a run no longer has to hit the timeout for its work to be salvaged. While `claude` is running, the runner
 ticks a checkpoint-push watcher every 60 seconds that pushes the feature branch's current commits with hooks skipped
-(`--no-verify` on this push only, never on the final push a successful run makes). The first successful checkpoint
+(`--no-verify`, same as every other runner push of the agent branch including the final push a successful run
+makes, CLAUDE-533). The first successful checkpoint
 push opens the same kind of draft PR the CLAUDE-379 timeout salvage opens (recorded `salvaged: true` in
 `agent_pull_requests`, so automerge leaves it alone exactly as above), and every push after that, including that
 first one, posts a `checkpoint push` PR comment (CLAUDE-447). A run that then finishes normally promotes that draft

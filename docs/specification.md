@@ -325,9 +325,9 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   imply a PR; PR creation follows the path rules above.
 - A failed final push is a failure: non-zero exit, field set to failed, a `run_events` row naming the branch and the
   redacted git error. It is never reported as success.
-- When the repository's `pre-push` hook rejects the final push, the runner pushes the same commits with `--no-verify`,
-  opens the PR as a draft, and posts the hook output on the PR and the issue. The hook's verdict is reported, not used
-  to withhold the work. The checkpoint push already uses `--no-verify`.
+- Every runner push of an agent's feature branch (checkpoint, branch-strategy create-PR push, and the final push above)
+  always uses `--no-verify`: the repository's own `pre-push` hook never runs on a runner push. The SPEC-3.3.2
+  verification gate is the sole post-agent full-suite check (CLAUDE-533).
 - A fresh clone carries the remote's tags (CLAUDE-484), so a repository check that reads tags gives the same verdict in a
   run as on a developer machine.
 - The runner never sets `State` to done. A tracker-side workflow resolves the issue when its PR merges
@@ -364,9 +364,9 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   neither recipe exists and no command ran); a report naming no command is not evidence the checks passed.
 - A file change a failing check requires is allowed in the diff and is justified in the PR body; the gate checks the
   state of the clone after the agent's own commits, not whether the agent's diff was minimal.
-- The clone's own hooks (`SPEC-3.3`'s `just install-hooks` step) already run locally on every commit and on the final
-  push itself; this gate is independent of them and runs even when the clone has no hooks installed, or the host has
-  no `just install-hooks` recipe to run.
+- The clone's own commit hooks (`SPEC-3.3`'s `just install-hooks` step) already run locally on every commit; the
+  `pre-push` hook never runs on a runner push (`SPEC-3.3.1`). This gate is independent of both and runs even when the
+  clone has no hooks installed, or the host has no `just install-hooks` recipe to run.
 
 ### 3.4 Closed-issue summary action (`kind: closed-issue-summary`)
 
@@ -1560,7 +1560,8 @@ action's `token_ref`, which is injected per job.
 - A failed git subprocess reports the exit code plus a bounded, redacted tail of its stderr (the last few non-empty
   lines, skipping the `Cloning into ...` progress banner) instead of a bare exit code, so a missing credential, an
   unknown host, a deleted branch, a rejected non-fast-forward and a protected branch are told apart. A redacted,
-  bounded tail of stdout is appended too (a `pre-push` hook's test report lands there, not in stderr).
+  bounded tail of stdout is appended too, since some git subcommands write their diagnostic text there instead of
+  stderr.
 - Redaction (`forge_log::redact`) masks a clone URL's userinfo verbatim (passed as a known secret) on top of a
   shape-based scan for well-known token prefixes (`ghp_`, `glpat-`, `xoxb-`, ...) and for a value following an auth
   keyword (`Bearer`/`token`/`Basic`) above a minimum length, so ordinary prose is never masked. The redacted string
