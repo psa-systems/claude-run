@@ -683,6 +683,8 @@ mod tests {
         // widening it, so `file` (used by other tests' local-path remotes
         // running concurrently) must stay listed alongside `ext`; the lock
         // keeps this test's set/remove pair from racing another thread's.
+        // PATH lock first: production code reached below takes it too (CLAUDE-536).
+        let _path_guard = crate::provider::git_stub_path_test_lock();
         let _guard = crate::provider::git_allow_protocol_test_lock();
         std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
         let work = local_only_work(&clone).unwrap();
