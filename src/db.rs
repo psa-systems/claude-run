@@ -26,14 +26,14 @@
 use std::borrow::Cow;
 use std::path::Path;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sqlx::any::{AnyConnectOptions, AnyPoolOptions};
 use sqlx::Executor;
 use tracing::{error, warn};
 
 use crate::config::DatabaseTarget;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// The pool every module threads. One type, whichever backend is configured.
 /// SPEC-5.1.
@@ -364,11 +364,39 @@ pub async fn open_sqlite(db_path: &Path) -> Result<DbPool> {
         std::fs::create_dir_all(parent)?;
     }
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let started = Instant::now();
     let pool = pool_options(Dialect::Sqlite)
         .connect_with(AnyConnectOptions::from_str(&url)?)
-        .await?;
-    SQLITE_MIGRATOR.run(&pool).await?;
+        .await
+        .map_err(|e| {
+            map_connect_error(
+                "sqlite",
+                POOL_MAX_CONNECTIONS,
+                POOL_ACQUIRE_TIMEOUT,
+                started,
+                e,
+            )
+        })?;
+    let started = Instant::now();
+    SQLITE_MIGRATOR.run(&pool).await.map_err(|e| {
+        if migrate_pool_timeout(&e) {
+            map_live_pool_error(&pool, "sqlite", started, sqlx::Error::PoolTimedOut)
+        } else {
+            e.into()
+        }
+    })?;
     Ok(pool)
+}
+
+/// True when a migration failed because the acquire that fetches its
+/// connection timed out, rather than for any other reason (a bad statement, a
+/// constraint violation, ...).
+fn migrate_pool_timeout(e: &sqlx::migrate::MigrateError) -> bool {
+    matches!(
+        e,
+        sqlx::migrate::MigrateError::Execute(sqlx::Error::PoolTimedOut)
+            | sqlx::migrate::MigrateError::ExecuteMigration(sqlx::Error::PoolTimedOut, _)
+    )
 }
 
 async fn open_postgres(url: &str) -> Result<DbPool> {
@@ -419,15 +447,21 @@ async fn open_postgres(url: &str) -> Result<DbPool> {
     Ok(pool)
 }
 
+/// The production pool's capacity and acquire timeout, named so the pool
+/// acquire timeout error (below) can report them without a live pool to read
+/// them off.
+const POOL_MAX_CONNECTIONS: u32 = 16;
+const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Pool settings, applied to both backends.
 fn pool_options(dialect: Dialect) -> AnyPoolOptions {
     let opts = AnyPoolOptions::new()
         // 8 left no headroom once the daemon runs several overlapping
         // runs plus the web UI's polling.
-        .max_connections(16)
+        .max_connections(POOL_MAX_CONNECTIONS)
         // sqlx's default, stated so it is a decision and not an
         // inherited value. An acquire that waits this long is a real fault.
-        .acquire_timeout(Duration::from_secs(30))
+        .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
         // Raised from the 2s default. With blocking work off the
         // async runtime an acquire is sub-millisecond, so 5s flags a genuine
         // regression instead of logging routine contention.
@@ -450,6 +484,76 @@ fn pool_options(dialect: Dialect) -> AnyPoolOptions {
     }
 }
 
+/// Builds [`Error::PoolAcquireTimeout`] for `pool_name` and logs it once at
+/// `error` with the same fields, so a pool acquire that exceeds
+/// `acquire_timeout` is reported with the operation's wait time and the
+/// pool's state instead of a bare `Sqlx(PoolTimedOut)`. SPEC-10.1.4.
+fn pool_acquire_timeout_error(
+    pool_name: &str,
+    timeout: Duration,
+    size: u32,
+    idle: u32,
+    waited: Duration,
+) -> Error {
+    error!(
+        pool = pool_name,
+        waited_ms = waited.as_millis() as u64,
+        timeout_secs = timeout.as_secs(),
+        size,
+        idle,
+        "pool acquire timed out"
+    );
+    Error::PoolAcquireTimeout {
+        pool: pool_name.to_string(),
+        waited,
+        timeout,
+        size,
+        idle,
+    }
+}
+
+/// Maps `err` into [`pool_acquire_timeout_error`] when it is a
+/// `sqlx::Error::PoolTimedOut` surfaced while a `pool` already exists (a
+/// query or migration acquiring a connection), reading the pool's live state;
+/// any other error passes through unchanged.
+fn map_live_pool_error(
+    pool: &DbPool,
+    pool_name: &str,
+    started: Instant,
+    err: sqlx::Error,
+) -> Error {
+    match err {
+        sqlx::Error::PoolTimedOut => pool_acquire_timeout_error(
+            pool_name,
+            pool.options().get_acquire_timeout(),
+            pool.size(),
+            pool.num_idle() as u32,
+            started.elapsed(),
+        ),
+        other => other.into(),
+    }
+}
+
+/// Maps `err` into [`pool_acquire_timeout_error`] when it is a
+/// `sqlx::Error::PoolTimedOut` surfaced while establishing `pool_name`
+/// itself: no pool exists yet on this path, so the idle count is always 0 and
+/// the size is the configured `max_connections`; any other error passes
+/// through unchanged.
+fn map_connect_error(
+    pool_name: &str,
+    max_connections: u32,
+    timeout: Duration,
+    started: Instant,
+    err: sqlx::Error,
+) -> Error {
+    match err {
+        sqlx::Error::PoolTimedOut => {
+            pool_acquire_timeout_error(pool_name, timeout, max_connections, 0, started.elapsed())
+        }
+        other => other.into(),
+    }
+}
+
 /// The pool every test builds its fixture in: an in-memory SQLite database by
 /// default, or a private schema on the server named by
 /// `CLAUDE_RUN_TEST_DATABASE_URL`. Setting that variable therefore re-runs the
@@ -468,12 +572,41 @@ pub async fn test_pool() -> DbPool {
 #[cfg(test)]
 pub async fn test_sqlite_pool() -> DbPool {
     sqlx::any::install_default_drivers();
+    let max_connections = 1;
+    let acquire_timeout = Duration::from_secs(30);
+    let started = Instant::now();
     let pool = AnyPoolOptions::new()
-        .max_connections(1)
+        .max_connections(max_connections)
+        .acquire_timeout(acquire_timeout)
         .connect("sqlite::memory:")
         .await
-        .expect("open in-memory sqlite");
-    SQLITE_MIGRATOR.run(&pool).await.expect("run migrations");
+        .map_err(|e| {
+            map_connect_error(
+                "sqlite test fixture",
+                max_connections,
+                acquire_timeout,
+                started,
+                e,
+            )
+        })
+        .unwrap_or_else(|e: Error| panic!("{e}"));
+    let started = Instant::now();
+    SQLITE_MIGRATOR
+        .run(&pool)
+        .await
+        .map_err(|e| {
+            if migrate_pool_timeout(&e) {
+                map_live_pool_error(
+                    &pool,
+                    "sqlite test fixture",
+                    started,
+                    sqlx::Error::PoolTimedOut,
+                )
+            } else {
+                e.into()
+            }
+        })
+        .unwrap_or_else(|e: Error| panic!("{e}"));
     pool
 }
 
@@ -564,8 +697,11 @@ async fn pg_pool_in_schema(url: &str, schema: &str, max_connections: u32) -> DbP
     static LIVE_CHECK: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     sqlx::any::install_default_drivers();
     let set_path = format!("SET search_path TO {schema}");
+    let acquire_timeout = Duration::from_secs(30);
+    let started = Instant::now();
     let pool = AnyPoolOptions::new()
         .max_connections(max_connections)
+        .acquire_timeout(acquire_timeout)
         .after_connect(move |conn, _meta| {
             let set_path = set_path.clone();
             Box::pin(async move {
@@ -575,7 +711,16 @@ async fn pg_pool_in_schema(url: &str, schema: &str, max_connections: u32) -> DbP
         })
         .connect(url)
         .await
-        .expect("connect to CLAUDE_RUN_TEST_DATABASE_URL");
+        .map_err(|e| {
+            map_connect_error(
+                "postgres test fixture",
+                max_connections,
+                acquire_timeout,
+                started,
+                e,
+            )
+        })
+        .unwrap_or_else(|e: Error| panic!("{e}"));
     LIVE_CHECK
         .get_or_try_init(|| refuse_live_database(&pool, "public"))
         .await
@@ -670,13 +815,15 @@ async fn test_pg_pool_at(url: &str, max_connections: u32) -> DbPool {
     let pool = pg_pool_in_schema(url, &schema, max_connections).await;
     // Register the drop first so a failed setup still cleans up.
     drop_schema_when_closed(&pool, url, &schema);
+    let started = Instant::now();
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE SCHEMA {schema};\n{}",
         fixture_script()
     )))
     .execute(&pool)
     .await
-    .expect("create the test schema and apply the migrations");
+    .map_err(|e| map_live_pool_error(&pool, "postgres test fixture", started, e))
+    .unwrap_or_else(|e: Error| panic!("{e}"));
     pool
 }
 
@@ -1080,5 +1227,117 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 2);
+    }
+
+    /// CLAUDE-529: forces a real `sqlx::Error::PoolTimedOut` out of a
+    /// one-connection pool (hold its only connection, then acquire again
+    /// under a short timeout) and asserts the mapped message names the pool,
+    /// the configured timeout, and the pool's live size and idle count,
+    /// instead of the bare `Sqlx(PoolTimedOut)` this fails on before the fix.
+    #[tokio::test]
+    async fn pool_acquire_timeout_is_reported_with_pool_state_and_wait_time_on_sqlite() {
+        sqlx::any::install_default_drivers();
+        let acquire_timeout = Duration::from_millis(50);
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(acquire_timeout)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        let held = pool.acquire().await.expect("acquire the only connection");
+
+        let started = Instant::now();
+        let err = pool
+            .acquire()
+            .await
+            .expect_err("a second acquire on a one-connection pool must time out");
+        assert!(matches!(err, sqlx::Error::PoolTimedOut), "{err}");
+        let reported = map_live_pool_error(&pool, "sqlite test", started, err);
+
+        let message = reported.to_string();
+        assert!(message.contains("pool `sqlite test`"), "{message}");
+        assert!(message.contains("size 1"), "{message}");
+        assert!(message.contains("idle 0"), "{message}");
+        assert!(
+            matches!(reported, Error::PoolAcquireTimeout { .. }),
+            "{message}"
+        );
+
+        drop(held);
+    }
+
+    /// Same as the SQLite test above, run against Postgres so the fix is
+    /// proven on both backends per the acceptance criteria.
+    #[tokio::test]
+    async fn pool_acquire_timeout_is_reported_with_pool_state_and_wait_time_on_postgres() {
+        let Ok(url) = std::env::var("CLAUDE_RUN_TEST_DATABASE_URL") else {
+            eprintln!(
+                "SKIP {}: CLAUDE_RUN_TEST_DATABASE_URL is unset, no postgres to test against",
+                concat!(
+                    module_path!(),
+                    "::pool_acquire_timeout_is_reported_with_pool_state_and_wait_time_on_postgres"
+                )
+            );
+            return;
+        };
+        sqlx::any::install_default_drivers();
+        let acquire_timeout = Duration::from_millis(50);
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(acquire_timeout)
+            .connect(&url)
+            .await
+            .expect("connect to CLAUDE_RUN_TEST_DATABASE_URL");
+        let held = pool.acquire().await.expect("acquire the only connection");
+
+        let started = Instant::now();
+        let err = pool
+            .acquire()
+            .await
+            .expect_err("a second acquire on a one-connection pool must time out");
+        assert!(matches!(err, sqlx::Error::PoolTimedOut), "{err}");
+        let reported = map_live_pool_error(&pool, "postgres test", started, err);
+
+        let message = reported.to_string();
+        assert!(message.contains("pool `postgres test`"), "{message}");
+        assert!(message.contains("size 1"), "{message}");
+        assert!(message.contains("idle 0"), "{message}");
+        assert!(
+            matches!(reported, Error::PoolAcquireTimeout { .. }),
+            "{message}"
+        );
+
+        drop(held);
+    }
+
+    /// `map_connect_error` has no live pool to read on a connect failure, so
+    /// it reports the configured capacity and an idle count of 0 instead.
+    #[test]
+    fn connect_timeout_is_reported_with_configured_capacity() {
+        let reported = map_connect_error(
+            "sqlite",
+            16,
+            Duration::from_secs(30),
+            Instant::now(),
+            sqlx::Error::PoolTimedOut,
+        );
+        let message = reported.to_string();
+        assert!(message.contains("pool `sqlite`"), "{message}");
+        assert!(message.contains("size 16"), "{message}");
+        assert!(message.contains("idle 0"), "{message}");
+    }
+
+    /// A non-timeout error must pass through unchanged rather than being
+    /// misreported as a pool acquire timeout.
+    #[test]
+    fn a_non_timeout_sqlx_error_is_not_reported_as_a_pool_timeout() {
+        let reported = map_connect_error(
+            "sqlite",
+            16,
+            Duration::from_secs(30),
+            Instant::now(),
+            sqlx::Error::RowNotFound,
+        );
+        assert!(!matches!(reported, Error::PoolAcquireTimeout { .. }));
     }
 }

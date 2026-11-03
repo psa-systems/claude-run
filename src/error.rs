@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// The one error type every fallible path in the binary returns. SPEC-5.5.
@@ -14,6 +16,23 @@ pub enum Error {
 
     #[error("sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
+
+    /// A dedicated name for `sqlx::Error::PoolTimedOut`, SPEC-10.1.4: a pool
+    /// acquire that exceeds `acquire_timeout` must name the pool, how long it
+    /// waited, and the pool's size and idle count, so a slow-disk stall is
+    /// distinguishable from a leaked connection instead of surfacing as a
+    /// bare `Sqlx(PoolTimedOut)`.
+    #[error(
+        "pool `{pool}` acquire timed out after {waited:?} (configured timeout {timeout:?}); \
+         size {size}, idle {idle}"
+    )]
+    PoolAcquireTimeout {
+        pool: String,
+        waited: Duration,
+        timeout: Duration,
+        size: u32,
+        idle: u32,
+    },
 
     #[error("sqlx migrate: {0}")]
     SqlxMigrate(#[from] sqlx::migrate::MigrateError),
