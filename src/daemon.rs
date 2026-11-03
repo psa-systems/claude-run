@@ -3647,6 +3647,11 @@ mod tests {
     /// rather than failing the whole pass (CLAUDE-512).
     #[test]
     fn inflight_cargo_repos_resolves_cloned_workdirs_and_skips_uncloned_ones() {
+        // Bare `git` resolves through the process-wide `PATH`; serialize
+        // against the CLAUDE-410 PATH-stub test's mutation/deletion window
+        // the same way `comment_webhooks::git_output` does.
+        let _path_guard = crate::testutil::path_env_lock();
+
         let tmp = tempfile::tempdir().unwrap();
         let workdirs_base = tmp.path();
 
