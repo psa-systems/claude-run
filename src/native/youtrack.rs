@@ -2646,7 +2646,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
         "3. If {{existing_branch}} is empty, create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, ALSO read that PR's own comments (a prior timed-out run may have left one explaining what it salvaged and why, e.g. a draft PR opened from uncommitted work at kill time, or a separate fresh-context review session may have left one listing findings that kept the PR a draft), then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
         "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit whose body ends with the bare '#{{key}}' reference, so a kill leaves committed progress instead of none; the final commit still carries the full PR-description format from step 7 and stays the branch tip. The runner pushes your commits as WIP checkpoints automatically every 60 seconds while you work, from whatever feature branch is checked out, and opens a draft PR from the first one - this is not something you do, and a checkpoint landing is not a stopping point or a reason to wrap up early; keep working exactly as step 1 describes until you are done, blocked, or killed. Because of those checkpoint pushes, a commit on this branch may already be on the remote before you notice a mistake in it: never run 'git reset', 'git commit --amend', 'git rebase', 'git filter-branch', or any force push on this branch to fix it - any of those rewrites history the runner has already published and orphans the checkpoint. Fix a mistake, including a wrong commit message, with a new commit on top instead.",
-        "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (e.g. the repo's 'just check', tests, or build) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off. The runner itself re-runs the repository's own pre-push entrypoint (`just pre-push`, else `just check`) in the clone after this attempt finishes and before recording it as successful (SPEC-3.3.2): it does not trust this report, so a report that checks passed must name the exact command you ran, and a failing check still needs fixing here rather than left for the gate to catch.",
+        "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (the repo's 'just pre-push' recipe when it exists, else 'just check', else the repo's documented checks) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off. The runner itself re-runs the repository's own pre-push entrypoint (`just pre-push`, else `just check`) in the clone after this attempt finishes and before recording it as successful (SPEC-3.3.2): it does not trust this report, so a report that checks passed must name the exact command you ran, and a failing check still needs fixing here rather than left for the gate to catch.",
         "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
         "7. The runner uses this commit's SUBJECT as the PR title and its body as the PR description (if you make more than one commit, the LAST commit carries both, since the runner reads only the branch tip). The subject is a SEPARATE line from the body, not the body's first heading: write one short imperative line (about 72 characters or fewer, no leading '#', not a Markdown heading like '## Summary') that names the change itself, e.g. 'Fix the off-by-one in the retry budget'; confirm it with 'git log -1 --format=%s' before you stop - if that prints a Markdown heading, a bare issue reference, or anything else that is not a one-line summary of the change, the commit is wrong and the runner will refuse to open the PR from it. The body (what 'git log -1 --format=%b' prints) is the PR description; it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the literal line 'Closes', then the bare issue reference on the next line alone, with nothing after it on that line and no line after it; a 'Co-Authored-By:' trailer goes above the 'Closes' line, never after the reference. If the commit owns more than one issue, put each '#<KEY>-N' on its own line below the single 'Closes' line. NO 'State ...' command after the reference. Example of the tail:",
         "     ## Verification",
@@ -3125,33 +3125,20 @@ fn record_finalize_outcome(
 /// (needs-review, no-code-change, and the generic hard-failure path below):
 /// those paths never call [`Forge::create_pr_with_draft`], which is the only
 /// other place a push happens, so without this call any commits the agent
-/// made would end the run local-only. `Ok(None)` means nothing to push (no
-/// commits, or the branch is already up to date); `Ok(Some(note))` means the
-/// push succeeded but only after a `pre-push` hook rejection fell back to
-/// `--no-verify`, which the caller folds into its outcome comment rather than
-/// leaving silent. A failed push is itself an error: per SPEC-3.3.1 ("a
-/// failed final push is a failure ... never reported as success"), the
-/// caller must turn whichever outcome it was about to report into a failure
-/// instead.
-fn final_push_note(forge: &dyn Forge, job: &YoutrackJob, workdir: &Path) -> Result<Option<String>> {
+/// made would end the run local-only. Like every other runner push of the
+/// agent branch, this never runs the repo's `pre-push` hook (CLAUDE-533). A
+/// failed push is itself an error: per SPEC-3.3.1 ("a failed final push is a
+/// failure ... never reported as success"), the caller must turn whichever
+/// outcome it was about to report into a failure instead.
+fn final_push(forge: &dyn Forge, job: &YoutrackJob, workdir: &Path) -> Result<()> {
     let host = host_only(&job.repo_host);
-    match forge.final_push(workdir, &host) {
-        Ok(None) => Ok(None),
-        Ok(Some(report)) => Ok(report.hook_rejected.map(|hook_output| {
-            format!(
-                "The final push to `{}` was rejected by the repository's pre-push hook; \
-                 the runner retried with `--no-verify` (SPEC-3.3.1) and the commits are pushed. \
-                 Hook output:\n\n{hook_output}",
-                report.branch
-            )
-        })),
-        Err(e) => Err(Error::Other(anyhow::anyhow!(
-            "final push failed (SPEC-3.3.1): {e}"
-        ))),
-    }
+    forge
+        .final_push(workdir, &host)
+        .map(|_| ())
+        .map_err(|e| Error::Other(anyhow::anyhow!("final push failed (SPEC-3.3.1): {e}")))
 }
 
-/// The outcome of a failed [`final_push_note`] call (SPEC-3.3.1): always
+/// The outcome of a failed [`final_push`] call (SPEC-3.3.1): always
 /// Failed, whatever marker or result would otherwise have driven this
 /// finalize path, since the commits never reached the forge.
 fn final_push_failed(
@@ -3252,30 +3239,23 @@ fn finalize(
         // A failed push overrides this outcome with Failed, never Needs
         // Review: SPEC-3.3.1 forbids reporting a failed push as anything
         // else.
-        let push_note = match final_push_note(forge, job, workdir) {
-            Ok(note) => note,
-            Err(e) => {
-                return final_push_failed(
-                    backend,
-                    src,
-                    job,
-                    claude_result,
-                    &e,
-                    public_url.as_deref(),
-                    run,
-                );
-            }
-        };
+        if let Err(e) = final_push(forge, job, workdir) {
+            return final_push_failed(
+                backend,
+                src,
+                job,
+                claude_result,
+                &e,
+                public_url.as_deref(),
+                run,
+            );
+        }
         // Blocker: ensure the skip marker is present so this attempt is not
         // counted, surface the reason verbatim, AI Agent=Needs Review, no PR.
         if !skip_marker.exists() {
             std::fs::write(&skip_marker, b"")?;
         }
         let reason = std::fs::read_to_string(&needs_review)?.trim().to_string();
-        let reason = match push_note {
-            Some(note) => format!("{reason}\n\n{note}"),
-            None => reason,
-        };
         let reason = append_compaction_note(&reason, stream_log, &job.key);
         let reason = note_checkpoint_rejection(reason);
         let reason = crate::run_footer::append_job(&reason, public_url.as_deref(), run, &job.key);
@@ -3299,25 +3279,18 @@ fn finalize(
         // text verbatim, and finish on the no-code label. State is left
         // alone, so the issue stays In Progress until a human closes it. A
         // failed push overrides this outcome with Failed, per SPEC-3.3.1.
-        let push_note = match final_push_note(forge, job, workdir) {
-            Ok(note) => note,
-            Err(e) => {
-                return final_push_failed(
-                    backend,
-                    src,
-                    job,
-                    claude_result,
-                    &e,
-                    public_url.as_deref(),
-                    run,
-                );
-            }
-        };
+        if let Err(e) = final_push(forge, job, workdir) {
+            return final_push_failed(
+                backend,
+                src,
+                job,
+                claude_result,
+                &e,
+                public_url.as_deref(),
+                run,
+            );
+        }
         let summary = std::fs::read_to_string(&no_code)?.trim().to_string();
-        let summary = match push_note {
-            Some(note) => format!("{summary}\n\n{note}"),
-            None => summary,
-        };
         let summary = note_checkpoint_rejection(summary);
         let summary = crate::run_footer::append_job(&summary, public_url.as_deref(), run, &job.key);
         let label = src.states.no_code_label().to_string();
@@ -3664,11 +3637,10 @@ fn finalize(
         // since this path opens no PR of its own; a failed push is folded
         // into both the comment and `cause` rather than silently leaving the
         // commits unpushed.
-        let push_result = final_push_note(forge, job, workdir);
+        let push_result = final_push(forge, job, workdir);
         let body = failure_comment(claude_result);
         let body = match &push_result {
-            Ok(Some(note)) => format!("{body}\n\n{note}"),
-            Ok(None) => body,
+            Ok(()) => body,
             Err(e) => format!(
                 "{body}\n\n**The final push failed (SPEC-3.3.1): {e}.** The commits are still \
                  only in the preserved workdir on the runner host."
@@ -3679,7 +3651,7 @@ fn finalize(
         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
         let (cause, pr_step) = match &push_result {
             Err(e) => (format!("final push failed: {e}"), Some("push")),
-            _ => (claude_result.error.clone(), None),
+            Ok(()) => (claude_result.error.clone(), None),
         };
         Ok(Finalized::Failed {
             cause,
@@ -7472,7 +7444,13 @@ mod tests {
             .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
             .ok(
                 "git",
-                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
                 "",
             )
     }
@@ -7515,7 +7493,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+                .any(|c| c == "git push --no-verify --set-upstream origin feat/x:feat/x"),
             "needs-review must still push the feature branch (SPEC-3.3.1): {calls:?}"
         );
         // Still no PR: needs-review opens none.
@@ -7560,7 +7538,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+                .any(|c| c == "git push --no-verify --set-upstream origin feat/x:feat/x"),
             "no-code-change must still push any commits the agent made (SPEC-3.3.1): {calls:?}"
         );
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
@@ -7579,7 +7557,13 @@ mod tests {
             stub_runner_for_a_clean_final_push()
                 .fail(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     1,
                     "remote: permission denied",
                 )
@@ -8037,7 +8021,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
@@ -8105,7 +8095,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+                .any(|c| c == "git push --no-verify --set-upstream origin feat/x:feat/x"),
             "{calls:?}"
         );
         assert!(
@@ -8173,7 +8163,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
@@ -8321,7 +8317,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
@@ -8391,7 +8393,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+                .any(|c| c == "git push --no-verify --set-upstream origin feat/x:feat/x"),
             "{calls:?}"
         );
         assert!(
@@ -8473,7 +8475,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
@@ -9270,7 +9278,13 @@ mod tests {
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .fail(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     128,
                     "no upstream",
                 )
@@ -9362,7 +9376,13 @@ mod tests {
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .fail(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     128,
                     "no upstream",
                 )
@@ -9459,7 +9479,13 @@ mod tests {
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .fail(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     128,
                     "no upstream",
                 )
@@ -9542,7 +9568,13 @@ mod tests {
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .fail(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     128,
                     "no upstream",
                 )
@@ -9631,7 +9663,13 @@ mod tests {
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .fail(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     128,
                     "no upstream",
                 )
@@ -9716,7 +9754,13 @@ mod tests {
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .fail(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     128,
                     "no upstream",
                 )
@@ -9900,7 +9944,11 @@ mod tests {
                 )
                 .ok("git", &["log", "-1", "--pretty=format:%s"], "feat: x")
                 .ok("git", &["log", "-1", "--pretty=format:%b"], "")
-                .ok("git", &["push", "origin", "HEAD:feat/gh"], ""),
+                .ok(
+                    "git",
+                    &["push", "--no-verify", "origin", "HEAD:feat/gh"],
+                    "",
+                ),
         );
         let forge = GithubForge::with_transport(
             forge_runner,
@@ -10158,7 +10206,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+                .any(|c| c == "git push --no-verify --set-upstream origin feat/x:feat/x"),
             "a generic failure must still push the feature branch (SPEC-3.3.1): {calls:?}"
         );
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
@@ -10174,7 +10222,13 @@ mod tests {
             stub_runner_for_a_clean_final_push()
                 .fail(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     1,
                     "remote: permission denied",
                 )
@@ -10537,7 +10591,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok(
@@ -10609,7 +10669,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+                .any(|c| c == "git push --no-verify --set-upstream origin feat/x:feat/x"),
             "{calls:?}"
         );
         assert!(
@@ -10699,7 +10759,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok(
@@ -10822,7 +10888,13 @@ mod tests {
                 )
                 .fail(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     1,
                     "remote rejected the push",
                 )
@@ -10936,7 +11008,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok(
@@ -11127,7 +11205,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
@@ -11297,7 +11381,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
@@ -11446,7 +11536,7 @@ mod tests {
                 .ok("git", &["merge", "--no-edit", "origin/feat/x"], "")
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &["push", "--no-verify", "--set-upstream", "origin", "feat/x:feat/x"],
                     "",
                 )
                 // `pr search` is called twice with identical args: once by
@@ -11561,7 +11651,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+                .any(|c| c == "git push --no-verify --set-upstream origin feat/x:feat/x"),
             "the merge result must still be pushed: {calls:?}"
         );
         assert!(
@@ -13579,7 +13669,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
@@ -13721,7 +13817,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
@@ -13845,7 +13947,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
@@ -13996,7 +14104,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
@@ -14130,7 +14244,13 @@ mod tests {
                 )
                 .ok(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     "",
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
