@@ -1729,3 +1729,12 @@ never write the same registry destination.
     timeout increase, retry or skip. A test that fails only when disk I/O is slow is a defect in the code or the fixture.
   - **SPEC-10.1.4**: A timeout, pool exhaustion or similar failure caused by slow disk I/O MUST be reported as that
     failure with the operation and its elapsed time, and MUST NOT be retried silently or recorded as success.
+
+## 11. CI
+
+- **SPEC-11.1**: The `postgres` service container in `.forgejo/workflows/check.yml` MUST take its `--health-interval`,
+  `--health-timeout`, `--health-retries` and `--health-start-period` from the `CI_POSTGRES_HEALTH_INTERVAL`,
+  `CI_POSTGRES_HEALTH_TIMEOUT`, `CI_POSTGRES_HEALTH_RETRIES` and `CI_POSTGRES_HEALTH_START_PERIOD` variables using the
+  Actions expression form (`common` `SPEC-13.2`), and MUST fall back to `5s`, `5s`, `24` and `30s` respectively when a
+  variable is unset or empty, matching today's floor before this requirement existed. The variables themselves, their
+  runner-side values and the ban on shell parameter expansion are `common` `SPEC-13.1` and `SPEC-13.2`.
