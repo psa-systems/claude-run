@@ -1592,6 +1592,119 @@ pub fn reclaim_docker_storage(
     stats
 }
 
+// ---- Docker sidecar storage: manual per-category prune (SPEC-3.11 item 4,
+// CLAUDE-517) ----------------------------------------------------------------
+
+/// SPEC-3.11 item 4: remove every stopped container with NO age filter, for
+/// an operator-confirmed Status page prune of one category. Unlike
+/// [`reclaim_stopped_containers`], which only removes containers stopped more
+/// than a day ago for the automatic ceiling sweep, a manual prune the
+/// operator just confirmed removes the whole category. `Err` only when the
+/// listing itself fails; a single container's remove failure is logged at
+/// `error` and the pass continues with the rest, the same as the automatic
+/// sweep.
+pub fn prune_stopped_containers(client: &dyn DockerVolumeClient) -> Result<u64, String> {
+    let containers = client.list_stopped_containers()?;
+    let mut reclaimed = 0u64;
+    for c in containers {
+        match client.remove_container(&c.id) {
+            Ok(()) => {
+                info!(
+                    id = %c.id,
+                    bytes_reclaimed = ?c.size_bytes,
+                    "docker storage prune: removed stopped container"
+                );
+                reclaimed += c.size_bytes.unwrap_or(0);
+            }
+            Err(e) => {
+                error!(id = %c.id, error = %e, "docker storage prune: container remove failed")
+            }
+        }
+    }
+    Ok(reclaimed)
+}
+
+/// SPEC-3.11 item 4: remove every dangling and unused image with NO age
+/// filter, mirroring [`prune_stopped_containers`]'s "whole category, operator
+/// just confirmed it" semantics. An image a running or stopped container
+/// still references is kept regardless, the same guard
+/// [`reclaim_images`] applies. `Err` only when either listing fails.
+pub fn prune_images(client: &dyn DockerVolumeClient) -> Result<u64, String> {
+    let mut images = client.list_dangling_images()?;
+    images.extend(client.list_unused_images()?);
+    let mut reclaimed = 0u64;
+    for img in images {
+        if img.in_use {
+            continue;
+        }
+        match client.remove_image(&img.id) {
+            Ok(()) => {
+                info!(
+                    id = %img.id,
+                    bytes_reclaimed = ?img.size_bytes,
+                    "docker storage prune: removed image"
+                );
+                reclaimed += img.size_bytes.unwrap_or(0);
+            }
+            Err(e) => error!(id = %img.id, error = %e, "docker storage prune: image remove failed"),
+        }
+    }
+    Ok(reclaimed)
+}
+
+/// SPEC-3.11 item 4: prune ALL build cache (no age filter), through the one
+/// prune-call exception [`DockerVolumeClient::prune_build_cache`] documents.
+/// Unlike [`reclaim_build_cache`], a failure here is returned rather than
+/// swallowed to zero, so the Status page can show it.
+pub fn prune_build_cache_now(client: &dyn DockerVolumeClient) -> Result<u64, String> {
+    match client.prune_build_cache(Duration::ZERO) {
+        Ok(bytes) => {
+            info!(
+                bytes_reclaimed = bytes,
+                "docker storage prune: pruned build cache"
+            );
+            Ok(bytes)
+        }
+        Err(e) => {
+            error!(error = %e, "docker storage prune: build cache prune failed");
+            Err(e)
+        }
+    }
+}
+
+/// SPEC-3.11 item 4: remove every named volume no container references, with
+/// NO age filter (a `buildx_buildkit_*` state volume is still kept
+/// regardless, the same as [`sweep_docker_volumes`]). `Err` only when the
+/// listing itself fails; a single volume's remove failure (including Docker's
+/// own "in use" refusal, a race with the listing) is logged and the pass
+/// continues with the rest.
+pub fn prune_unreferenced_volumes(client: &dyn DockerVolumeClient) -> Result<u64, String> {
+    let volumes = client.list_volumes()?;
+    let mut reclaimed = 0u64;
+    for vol in volumes {
+        if vol.in_use || vol.name.starts_with(BUILDX_VOLUME_PREFIX) {
+            continue;
+        }
+        match client.remove_volume(&vol.name) {
+            Ok(()) => {
+                info!(
+                    name = %vol.name,
+                    bytes_reclaimed = ?vol.size_bytes,
+                    "docker storage prune: removed unreferenced volume"
+                );
+                reclaimed += vol.size_bytes.unwrap_or(0);
+            }
+            Err(VolumeRemoveError::InUse(msg)) => {
+                info!(name = %vol.name, reason = %msg, "docker storage prune: volume is now in use; kept");
+            }
+            Err(VolumeRemoveError::Other(msg)) => {
+                error!(name = %vol.name, error = %msg, "docker storage prune: volume remove failed");
+            }
+        }
+    }
+    Ok(reclaimed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2897,5 +3010,108 @@ mod tests {
         );
         assert_eq!(stats.deleted, 0);
         assert_eq!(stats.kept, 1);
+    }
+
+    // ---- SPEC-3.11 item 4: manual per-category Docker storage prune
+    // (CLAUDE-517) ----------------------------------------------------------
+
+    /// AC: pruning the stopped-containers category removes every stopped
+    /// container regardless of age, and touches no other category.
+    #[test]
+    fn prune_stopped_containers_removes_all_regardless_of_age() {
+        let client = FakeDockerClient::new(Vec::new()).with_stopped_containers(vec![
+            stopped_container("c-fresh", 0, 10),
+            stopped_container("c-old", 30, 20),
+        ]);
+        let reclaimed = prune_stopped_containers(&client).unwrap();
+        assert_eq!(reclaimed, 30);
+        assert_eq!(
+            *client.removed_containers.lock().unwrap(),
+            vec!["c-fresh".to_string(), "c-old".to_string()]
+        );
+        assert!(client.removed_images.lock().unwrap().is_empty());
+        assert!(client.removed.lock().unwrap().is_empty());
+    }
+
+    /// AC: a failed listing is returned as `Err`, not silently zero.
+    #[test]
+    fn prune_stopped_containers_propagates_listing_failure() {
+        let client = FakeDockerClient::new(Vec::new());
+        let client = FakeDockerClient {
+            stopped_containers: Err("daemon unreachable".to_string()),
+            ..client
+        };
+        let err = prune_stopped_containers(&client).unwrap_err();
+        assert_eq!(err, "daemon unreachable");
+    }
+
+    /// AC: pruning the images category removes dangling AND unused images
+    /// (no age filter), keeps an in-use image, and touches no other
+    /// category.
+    #[test]
+    fn prune_images_removes_dangling_and_unused_but_not_in_use() {
+        let client = FakeDockerClient::new(Vec::new())
+            .with_dangling_images(vec![docker_image("img-dangling", false, 0, 5)])
+            .with_unused_images(vec![
+                docker_image("img-unused-fresh", false, 0, 7),
+                docker_image("img-in-use", true, 30, 999),
+            ]);
+        let reclaimed = prune_images(&client).unwrap();
+        assert_eq!(reclaimed, 12);
+        let removed = client.removed_images.lock().unwrap().clone();
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&"img-dangling".to_string()));
+        assert!(removed.contains(&"img-unused-fresh".to_string()));
+        assert!(!removed.contains(&"img-in-use".to_string()));
+        assert!(client.removed_containers.lock().unwrap().is_empty());
+        assert!(client.removed.lock().unwrap().is_empty());
+    }
+
+    /// AC: pruning build cache removes everything (no 7-day age filter) and
+    /// a failure is returned, not swallowed to zero.
+    #[test]
+    fn prune_build_cache_now_prunes_everything_and_propagates_failure() {
+        let ok_client = FakeDockerClient {
+            build_cache_bytes: Ok(4096),
+            ..FakeDockerClient::new(Vec::new())
+        };
+        assert_eq!(prune_build_cache_now(&ok_client).unwrap(), 4096);
+
+        let err_client = FakeDockerClient {
+            build_cache_bytes: Err("builder prune failed".to_string()),
+            ..FakeDockerClient::new(Vec::new())
+        };
+        assert_eq!(
+            prune_build_cache_now(&err_client).unwrap_err(),
+            "builder prune failed"
+        );
+    }
+
+    /// AC: pruning unreferenced volumes removes every unreferenced volume
+    /// regardless of age, keeps an in-use volume and a buildx state volume,
+    /// and touches no other category.
+    #[test]
+    fn prune_unreferenced_volumes_removes_all_regardless_of_age() {
+        let client = FakeDockerClient::new(vec![
+            volume("fresh-unused", false, 0),
+            volume("in-use", true, 30),
+            volume("buildx_buildkit_state", false, 30),
+        ]);
+        let reclaimed = prune_unreferenced_volumes(&client).unwrap();
+        assert_eq!(reclaimed, 1024);
+        assert_eq!(
+            *client.removed.lock().unwrap(),
+            vec!["fresh-unused".to_string()]
+        );
+        assert!(client.removed_containers.lock().unwrap().is_empty());
+        assert!(client.removed_images.lock().unwrap().is_empty());
+    }
+
+    /// AC: an unreachable daemon's listing failure is returned as `Err`.
+    #[test]
+    fn prune_unreferenced_volumes_propagates_listing_failure() {
+        let client = FakeDockerClient::unreachable("DOCKER_HOST is not set");
+        let err = prune_unreferenced_volumes(&client).unwrap_err();
+        assert_eq!(err, "DOCKER_HOST is not set");
     }
 }
