@@ -464,12 +464,19 @@ pub async fn test_pool() -> DbPool {
 }
 
 /// An in-memory SQLite pool with the schema applied. One connection, because a
-/// second connection to `sqlite::memory:` is a second, empty database.
+/// second connection to `sqlite::memory:` is a second, empty database. A test
+/// that drops a transaction on this pool releases the connection only once
+/// sqlx's background rollback finishes, and under the CPU contention of a
+/// full-suite run that rollback can be scheduled well behind the 30s default
+/// (CLAUDE-524); the queries themselves are in-memory and instant, so a
+/// longer acquire timeout only tolerates scheduler starvation, not a real
+/// stuck pool.
 #[cfg(test)]
 pub async fn test_sqlite_pool() -> DbPool {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()
         .max_connections(1)
+        .acquire_timeout(Duration::from_secs(120))
         .connect("sqlite::memory:")
         .await
         .expect("open in-memory sqlite");
