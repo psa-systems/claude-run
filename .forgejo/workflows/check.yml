@@ -135,11 +135,14 @@ jobs:
           POSTGRES_DB: claude_run
           POSTGRES_USER: claude_run
           POSTGRES_PASSWORD: claude_run
+        # SPEC-11.1: health allowance comes from the runner's CI_POSTGRES_HEALTH_* variables, falling back to
+        # today's floor when unset.
         options: >-
           --health-cmd "pg_isready --username=claude_run --dbname=claude_run"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
+          --health-interval ${{ env.CI_POSTGRES_HEALTH_INTERVAL || '5s' }}
+          --health-timeout ${{ env.CI_POSTGRES_HEALTH_TIMEOUT || '5s' }}
+          --health-retries ${{ env.CI_POSTGRES_HEALTH_RETRIES || '24' }}
+          --health-start-period ${{ env.CI_POSTGRES_HEALTH_START_PERIOD || '30s' }}
 
     steps:
       - name: Clone the repository
