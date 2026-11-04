@@ -1346,34 +1346,11 @@ impl CliBackend {
     /// `HEAD`, so the server branch carries the feature name regardless of the
     /// current checkout. Never forced: a rejected non-fast-forward push is a
     /// real-divergence signal the caller has already ruled out before calling.
+    /// Always `--no-verify`: the runner never runs the repo's `pre-push` hook
+    /// on any push of an agent's feature branch, since the SPEC-3.3.2
+    /// verification gate is the only post-agent full-suite run (CLAUDE-533).
     /// SPEC-8.5: a retried, per-invocation-authenticated git network call.
     fn push_branch(&self, workdir: &Path, branch: &str, token_url: Option<&str>) -> Result<()> {
-        let refspec = format!("{branch}:{branch}");
-        let push_args = ["push", "--set-upstream", "origin", refspec.as_str()];
-        let secrets = token_url_secrets(token_url);
-        let out =
-            crate::provider::retry_git_network("push", &secrets, &self.git_retry_waits, || {
-                crate::provider::run_authed_git(
-                    self.runner.as_ref(),
-                    Some(workdir),
-                    &push_args,
-                    token_url,
-                )
-            })?;
-        Self::checked_redacting("git", out, &push_args, &secrets)?;
-        Ok(())
-    }
-
-    /// Like [`Self::push_branch`], but with `--no-verify` (CLAUDE-448 step
-    /// 2): a checkpoint push runs while the agent is still editing, so the
-    /// repo's `pre-push` hook would check a half-edited working tree rather
-    /// than the pushed commit, and would compete with the agent for CPU.
-    fn push_branch_no_verify(
-        &self,
-        workdir: &Path,
-        branch: &str,
-        token_url: Option<&str>,
-    ) -> Result<()> {
         let refspec = format!("{branch}:{branch}");
         let push_args = [
             "push",
@@ -2149,7 +2126,7 @@ impl Forge for CliBackend {
         if remote_sha.as_deref() == Some(local_sha.as_str()) {
             return Ok(None);
         }
-        self.push_branch_no_verify(workdir, &branch, token_url)?;
+        self.push_branch(workdir, &branch, token_url)?;
         let mut pr = self.find_or_create_pr(workdir, host, &repo, &branch, true, body)?;
         if let Some(pr_number) = pr.number {
             let issue_key = self.tip_issue_key(workdir, &branch);
@@ -2184,8 +2161,10 @@ impl Forge for CliBackend {
 
     /// SPEC-3.3.1's final push: see [`Forge::final_push`]. Shares
     /// [`Self::resolve_feature_branch`] / [`Self::remote_branch_sha`] with
-    /// [`Self::checkpoint_push`] for the "nothing to push" degrade, but runs
-    /// hooks on the first attempt and opens no PR.
+    /// [`Self::checkpoint_push`] for the "nothing to push" degrade. Opens no
+    /// PR. Like every other runner push of the agent branch, this never runs
+    /// the repo's `pre-push` hook (CLAUDE-533): the SPEC-3.3.2 verification
+    /// gate is the only post-agent full-suite run.
     fn final_push(
         &self,
         workdir: &Path,
@@ -2203,19 +2182,8 @@ impl Forge for CliBackend {
         if remote_sha.as_deref() == Some(local_sha.as_str()) {
             return Ok(None);
         }
-        match self.push_branch(workdir, &branch, token_url) {
-            Ok(()) => Ok(Some(crate::provider::FinalPushReport {
-                branch,
-                hook_rejected: None,
-            })),
-            Err(e) => {
-                self.push_branch_no_verify(workdir, &branch, token_url)?;
-                Ok(Some(crate::provider::FinalPushReport {
-                    branch,
-                    hook_rejected: Some(e.to_string()),
-                }))
-            }
-        }
+        self.push_branch(workdir, &branch, token_url)?;
+        Ok(Some(crate::provider::FinalPushReport { branch }))
     }
 
     /// Strip the `WIP: ` title prefix a timeout-salvaged draft PR (CLAUDE-379)
@@ -3670,7 +3638,13 @@ mod tests {
         let runner = with_open_pr_search(runner, "[]")
             .ok(
                 "git",
-                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
                 "",
             )
             .ok(
@@ -3715,7 +3689,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+                .any(|c| c == "git push --no-verify --set-upstream origin feat/x:feat/x"),
             "{calls:?}"
         );
         // Never push the ambient HEAD; always the resolved branch by name.
@@ -3747,7 +3721,13 @@ mod tests {
         let runner = with_open_pr_search(runner, "[]")
             .ok(
                 "git",
-                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
                 "",
             )
             .ok(
@@ -3841,7 +3821,13 @@ mod tests {
             )
             .ok(
                 "git",
-                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
                 "",
             )
             .ok(
@@ -3948,6 +3934,7 @@ mod tests {
             "git",
             &[
                 "push",
+                "--no-verify",
                 "--set-upstream",
                 "origin",
                 "feat/yotun-96:feat/yotun-96",
@@ -4001,7 +3988,13 @@ mod tests {
         let runner = with_open_pr_search(runner, "[]")
             .ok(
                 "git",
-                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
                 "",
             )
             .ok(
@@ -4083,7 +4076,13 @@ mod tests {
         let runner = with_open_pr_search(runner, "[]")
             .ok(
                 "git",
-                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
                 "",
             )
             .ok(
@@ -4175,7 +4174,13 @@ mod tests {
         let runner = with_remote_state(runner, "feat/x", "abc123", "");
         let runner = with_open_pr_search(runner, "[]").ok(
             "git",
-            &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+            &[
+                "push",
+                "--no-verify",
+                "--set-upstream",
+                "origin",
+                "feat/x:feat/x",
+            ],
             "",
         );
         let runner = runner.ok(
@@ -4725,6 +4730,7 @@ mod tests {
                     "-c",
                     crate::provider::CREDENTIAL_HELPER,
                     "push",
+                    "--no-verify",
                     "--set-upstream",
                     "origin",
                     "feat/x:feat/x",
@@ -4830,6 +4836,7 @@ mod tests {
                 "git",
                 &[
                     "push",
+                    "--no-verify",
                     "--set-upstream",
                     "origin",
                     "fix/CLAUDE-166-work:fix/CLAUDE-166-work",
@@ -4878,7 +4885,7 @@ mod tests {
             calls
                 .iter()
                 .any(|c| c
-                    == "git push --set-upstream origin fix/CLAUDE-166-work:fix/CLAUDE-166-work"),
+                    == "git push --no-verify --set-upstream origin fix/CLAUDE-166-work:fix/CLAUDE-166-work"),
             "must push the feature branch by name: {calls:?}"
         );
         assert!(
@@ -5072,7 +5079,13 @@ mod tests {
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .fail(
                     "git",
-                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
                     128,
                     "could not read Username",
                 ),
@@ -5215,7 +5228,13 @@ mod tests {
             )
             .ok(
                 "git",
-                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
                 "",
             )
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
@@ -5283,7 +5302,13 @@ mod tests {
             )
             .ok(
                 "git",
-                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
                 "",
             )
             .ok(
@@ -5327,7 +5352,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+                .any(|c| c == "git push --no-verify --set-upstream origin feat/x:feat/x"),
             "fast-forward must push the branch: {calls:?}"
         );
         assert!(
@@ -5392,6 +5417,7 @@ mod tests {
             "git",
             &[
                 "push",
+                "--no-verify",
                 "--set-upstream",
                 "origin",
                 "feat/yotun-96:feat/yotun-96",
@@ -5420,7 +5446,8 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git push --set-upstream origin feat/yotun-96:feat/yotun-96"),
+                .any(|c| c
+                    == "git push --no-verify --set-upstream origin feat/yotun-96:feat/yotun-96"),
             "diverged must push the merge result: {calls:?}"
         );
         assert!(
@@ -5718,6 +5745,7 @@ mod tests {
                 "git",
                 &[
                     "push",
+                    "--no-verify",
                     "--set-upstream",
                     "origin",
                     "fix/CLAUDE-206:fix/CLAUDE-206",
@@ -5804,6 +5832,7 @@ mod tests {
             "git",
             &[
                 "push",
+                "--no-verify",
                 "--set-upstream",
                 "origin",
                 "fix/CLAUDE-206:fix/CLAUDE-206",
@@ -5872,6 +5901,7 @@ mod tests {
                 "git",
                 &[
                     "push",
+                    "--no-verify",
                     "--set-upstream",
                     "origin",
                     "fix/CLAUDE-206:fix/CLAUDE-206",
@@ -5969,6 +5999,7 @@ mod tests {
                 "git",
                 &[
                     "push",
+                    "--no-verify",
                     "--set-upstream",
                     "origin",
                     "fix/CLAUDE-206:fix/CLAUDE-206",
@@ -6320,7 +6351,13 @@ mod tests {
 
     #[test]
     fn push_branch_retries_once_and_succeeds_on_second_attempt() {
-        let args = ["push", "--set-upstream", "origin", "feature:feature"];
+        let args = [
+            "push",
+            "--no-verify",
+            "--set-upstream",
+            "origin",
+            "feature:feature",
+        ];
         let runner = Arc::new(
             StubRunner::new()
                 .fail_once("git", &args, 1, "connect timeout")
@@ -6334,7 +6371,13 @@ mod tests {
 
     #[test]
     fn push_branch_failing_all_four_attempts_returns_the_last_failure() {
-        let args = ["push", "--set-upstream", "origin", "feature:feature"];
+        let args = [
+            "push",
+            "--no-verify",
+            "--set-upstream",
+            "origin",
+            "feature:feature",
+        ];
         let runner = Arc::new(StubRunner::new().fail("git", &args, 1, "connection reset"));
         let b = CliBackend::new(runner.clone()).with_git_retry_waits(NO_WAIT);
         let err = b
@@ -6349,7 +6392,13 @@ mod tests {
     /// and git's own rejection text must still reach the caller unchanged.
     #[test]
     fn push_branch_rejected_as_non_fast_forward_fails_after_exhausting_attempts() {
-        let args = ["push", "--set-upstream", "origin", "feature:feature"];
+        let args = [
+            "push",
+            "--no-verify",
+            "--set-upstream",
+            "origin",
+            "feature:feature",
+        ];
         let rejection = "! [rejected]        feature -> feature (non-fast-forward)\n\
              error: failed to push some refs to 'origin'";
         let runner = Arc::new(StubRunner::new().fail("git", &args, 1, rejection));
@@ -6361,11 +6410,17 @@ mod tests {
         assert_eq!(runner.calls.lock().unwrap().len(), 4);
     }
 
-    /// CLAUDE-422: a failing `pre-push` hook writes its test report to stdout and
-    /// git's banner to stderr; the failure text must carry both.
+    /// CLAUDE-422: a failed push can write a test report to stdout and git's
+    /// own banner to stderr; the failure text must carry both.
     #[test]
     fn push_branch_failure_carries_the_hook_stdout_and_the_git_stderr() {
-        let args = ["push", "--set-upstream", "origin", "feature:feature"];
+        let args = [
+            "push",
+            "--no-verify",
+            "--set-upstream",
+            "origin",
+            "feature:feature",
+        ];
         let runner = Arc::new(StubRunner::new().fail_with_stdout(
             "git",
             &args,
@@ -6406,7 +6461,13 @@ mod tests {
     #[test]
     fn push_branch_redacts_the_token_url_secret_from_the_stdout_tail() {
         let token_url = "https://bot:s3cretTokenValue99@example.invalid/o/r.git";
-        let args = ["push", "--set-upstream", "origin", "feature:feature"];
+        let args = [
+            "push",
+            "--no-verify",
+            "--set-upstream",
+            "origin",
+            "feature:feature",
+        ];
         let mut full: Vec<&str> = crate::provider::credential_helper_args().to_vec();
         full.extend(args);
         let runner = Arc::new(StubRunner::new().fail_with_stdout(
@@ -7091,7 +7152,13 @@ mod tests {
         let runner = with_open_pr_search(runner, "[]")
             .ok(
                 "git",
-                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
                 "",
             )
             .ok(
@@ -7754,7 +7821,13 @@ mod tests {
         let runner = with_open_pr_search(runner, "[]")
             .ok(
                 "git",
-                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
                 "",
             )
             .ok(

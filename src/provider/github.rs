@@ -401,22 +401,13 @@ impl GithubForge {
     /// (CLAUDE-395: `origin`'s own URL carries no credential after the
     /// post-clone scrub, and the token must never appear in argv); otherwise
     /// fall back to an unauthenticated push against `origin` (host git auth),
-    /// warning with both misses named rather than failing silently.
+    /// warning with both misses named rather than failing silently. Always
+    /// `--no-verify`: the runner never runs the repo's `pre-push` hook on any
+    /// push of an agent's feature branch (CLAUDE-533).
     /// SPEC-8.5: pushes authenticated per invocation via the credential-helper mechanism.
-    fn push(
-        &self,
-        workdir: &Path,
-        host: &str,
-        repo: &str,
-        branch: &str,
-        no_verify: bool,
-    ) -> Result<()> {
+    fn push(&self, workdir: &Path, host: &str, repo: &str, branch: &str) -> Result<()> {
         let refspec = format!("HEAD:{branch}");
-        let push_args: Vec<&str> = if no_verify {
-            vec!["push", "--no-verify", "origin", refspec.as_str()]
-        } else {
-            vec!["push", "origin", refspec.as_str()]
-        };
+        let push_args: Vec<&str> = vec!["push", "--no-verify", "origin", refspec.as_str()];
         let token_url = match self.effective_token(host) {
             Ok(token) => Some(format!("https://x-access-token:{token}@{host}/{repo}.git")),
             Err(e) => {
@@ -602,7 +593,7 @@ impl GithubForge {
             .and_then(|out| out.split_whitespace().next().map(str::to_string))
             .filter(|s| !s.is_empty());
 
-        self.push(workdir, host, &repo, &branch, false)?;
+        self.push(workdir, host, &repo, &branch)?;
 
         let event = if draft {
             crate::push_comment::PushEvent::TimeoutSalvagePush
@@ -1014,7 +1005,9 @@ impl Forge for GithubForge {
 
     /// SPEC-3.3.1's final push: see [`Forge::final_push`]. GitHub has no
     /// AGit equivalent, so `HEAD` is always the feature branch; "nothing to
-    /// push" degrades to `Ok(None)` when it carries no commit the base lacks.
+    /// push" degrades to `Ok(None)` when it carries no commit the base
+    /// lacks. Like every other push here, the repo's `pre-push` hook is
+    /// never run (CLAUDE-533).
     fn final_push(
         &self,
         workdir: &Path,
@@ -1038,19 +1031,8 @@ impl Forge for GithubForge {
                     workdir.display()
                 ))
             })?;
-        match self.push(workdir, host, &repo, &branch, false) {
-            Ok(()) => Ok(Some(crate::provider::FinalPushReport {
-                branch,
-                hook_rejected: None,
-            })),
-            Err(e) => {
-                self.push(workdir, host, &repo, &branch, true)?;
-                Ok(Some(crate::provider::FinalPushReport {
-                    branch,
-                    hook_rejected: Some(e.to_string()),
-                }))
-            }
-        }
+        self.push(workdir, host, &repo, &branch)?;
+        Ok(Some(crate::provider::FinalPushReport { branch }))
     }
 
     fn clone_url(&self, host: &str, repo: &str) -> Result<String> {
@@ -2374,7 +2356,7 @@ mod tests {
     fn with_git(runner: StubRunner, branch: &str, push_remote: &str) -> StubRunner {
         let refspec = format!("HEAD:{branch}");
         let push_args: Vec<&str> = if push_remote == "origin" {
-            vec!["push", "origin", &refspec]
+            vec!["push", "--no-verify", "origin", &refspec]
         } else {
             vec![
                 "-c",
@@ -2382,6 +2364,7 @@ mod tests {
                 "-c",
                 crate::provider::CREDENTIAL_HELPER,
                 "push",
+                "--no-verify",
                 "origin",
                 &refspec,
             ]
@@ -2405,13 +2388,13 @@ mod tests {
 
     const NO_WAIT: [std::time::Duration; 3] = [std::time::Duration::ZERO; 3];
 
-    /// CLAUDE-423: `GithubForge::push`'s failure must carry a `pre-push` hook's
+    /// CLAUDE-423: `GithubForge::push`'s failure must carry a hook's
     /// stdout tail, exactly as `CliBackend::push_branch` does for Forgejo
     /// (CLAUDE-422).
     #[test]
     fn push_failure_carries_the_hook_stdout_and_the_git_stderr() {
         let mut full = crate::provider::credential_helper_args().to_vec();
-        full.extend(["push", "origin", "HEAD:feat/x"]);
+        full.extend(["push", "--no-verify", "origin", "HEAD:feat/x"]);
         let runner = Arc::new(StubRunner::new().fail_with_stdout(
             "git",
             &full,
@@ -2427,13 +2410,7 @@ mod tests {
         )
         .with_git_retry_waits(NO_WAIT);
         let err = forge
-            .push(
-                Path::new("/tmp/wd"),
-                "github.com",
-                "octo/widget",
-                "feat/x",
-                false,
-            )
+            .push(Path::new("/tmp/wd"), "github.com", "octo/widget", "feat/x")
             .unwrap_err()
             .to_string();
         assert!(err.contains("failed to push some refs"), "{err}");
@@ -2449,7 +2426,7 @@ mod tests {
     #[test]
     fn push_failure_with_empty_stdout_keeps_its_stderr_text_unchanged() {
         let mut full = crate::provider::credential_helper_args().to_vec();
-        full.extend(["push", "origin", "HEAD:feat/x"]);
+        full.extend(["push", "--no-verify", "origin", "HEAD:feat/x"]);
         let runner = Arc::new(StubRunner::new().fail("git", &full, 1, " boom \n"));
         let forge = GithubForge::with_transport(
             runner.clone(),
@@ -2459,13 +2436,7 @@ mod tests {
         )
         .with_git_retry_waits(NO_WAIT);
         match forge
-            .push(
-                Path::new("/tmp/wd"),
-                "github.com",
-                "octo/widget",
-                "feat/x",
-                false,
-            )
+            .push(Path::new("/tmp/wd"), "github.com", "octo/widget", "feat/x")
             .unwrap_err()
         {
             Error::CliFailed { stderr, .. } => assert_eq!(stderr, "boom"),
@@ -2477,7 +2448,7 @@ mod tests {
     fn push_retries_once_and_succeeds_on_second_attempt() {
         let runner = Arc::new(with_git(StubRunner::new(), "feat/x", "origin").fail_once(
             "git",
-            &["push", "origin", "HEAD:feat/x"],
+            &["push", "--no-verify", "origin", "HEAD:feat/x"],
             1,
             "connection reset",
         ));
@@ -2502,16 +2473,15 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         let push_calls = calls
             .iter()
-            .filter(|c| c.as_str() == "git push origin HEAD:feat/x")
+            .filter(|c| c.as_str() == "git push --no-verify origin HEAD:feat/x")
             .count();
         assert_eq!(push_calls, 2, "{calls:?}");
     }
 
     /// CLAUDE-486 (SPEC-3.3.1): `GithubForge::final_push` pushes HEAD when it
-    /// is ahead of the detected base, reporting no hook rejection on a clean
-    /// push.
+    /// is ahead of the detected base.
     #[test]
-    fn final_push_pushes_ahead_commits_with_no_hook_rejection() {
+    fn final_push_pushes_ahead_commits() {
         let runner = Arc::new(with_git(StubRunner::new(), "feat/x", "origin").ok(
             "git",
             &["rev-list", "--count", "origin/main..HEAD"],
@@ -2529,10 +2499,11 @@ mod tests {
             .unwrap()
             .expect("a branch ahead of base should push");
         assert_eq!(report.branch, "feat/x");
-        assert!(report.hook_rejected.is_none(), "{report:?}");
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls.iter().any(|c| c == "git push origin HEAD:feat/x"),
+            calls
+                .iter()
+                .any(|c| c == "git push --no-verify origin HEAD:feat/x"),
             "{calls:?}"
         );
     }
@@ -2561,50 +2532,6 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.contains("push")),
             "no push should be attempted: {calls:?}"
-        );
-    }
-
-    /// A `pre-push` hook rejection on the first push retries with
-    /// `--no-verify`, exactly as `CliBackend::final_push` does, and the
-    /// report names the hook's own failure text.
-    #[test]
-    fn final_push_retries_no_verify_on_hook_rejection() {
-        let runner = Arc::new(
-            with_git(StubRunner::new(), "feat/x", "origin")
-                .ok("git", &["rev-list", "--count", "origin/main..HEAD"], "2\n")
-                .fail(
-                    "git",
-                    &["push", "origin", "HEAD:feat/x"],
-                    1,
-                    "pre-push hook declined",
-                )
-                .ok("git", &["push", "--no-verify", "origin", "HEAD:feat/x"], ""),
-        );
-        let forge = GithubForge::with_transport(
-            runner.clone(),
-            Arc::new(StubTransport::new(false, json!({}))),
-            "https://api.githubcopilot.com/mcp/".into(),
-            None,
-        )
-        .with_git_retry_waits(NO_WAIT);
-        let report = forge
-            .final_push(Path::new("/tmp/wd"), "github.com")
-            .unwrap()
-            .expect("a hook-rejected push still reports a push attempt");
-        assert_eq!(report.branch, "feat/x");
-        let hook_rejected = report
-            .hook_rejected
-            .expect("hook rejection should be recorded");
-        assert!(
-            hook_rejected.contains("pre-push hook declined"),
-            "{hook_rejected}"
-        );
-        let calls = runner.calls.lock().unwrap();
-        assert!(
-            calls
-                .iter()
-                .any(|c| c == "git push --no-verify origin HEAD:feat/x"),
-            "{calls:?}"
         );
     }
 
@@ -2908,7 +2835,7 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls.iter().any(|c| c.contains("credential.helper=")
-                && c.ends_with("push origin HEAD:feat/x")),
+                && c.ends_with("push --no-verify origin HEAD:feat/x")),
             "{calls:?}"
         );
         for call in calls.iter() {
@@ -3280,7 +3207,7 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls.iter().any(|c| c.contains("credential.helper=")
-                && c.ends_with("push origin HEAD:feat/x")),
+                && c.ends_with("push --no-verify origin HEAD:feat/x")),
             "{calls:?}"
         );
         for call in calls.iter() {
