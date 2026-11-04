@@ -892,16 +892,51 @@ async fn run_database_statement_with_retry(
     }
 }
 
+/// The fixture databases the cleanup worker has actually dropped, so a test
+/// can deterministically wait for its own database's drop to land rather than
+/// race a fixed poll window. The worker runs on a background runtime after the
+/// pool's `close_event` fires and drops serially over one connection, so under
+/// a loaded CI host with a durable server (where `DROP DATABASE` checkpoints)
+/// a given drop can lag tens of seconds behind the pool close (CLAUDE-542).
+#[cfg(test)]
+fn dropped_fixture_databases() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static DROPPED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    DROPPED.get_or_init(Default::default)
+}
+
+/// Waits until the cleanup worker has dropped `database`, up to `timeout`.
+/// Returns false if it does not land in time (a genuine leak, e.g. the worker
+/// gave up after retrying a drop), which the caller asserts on.
+#[cfg(test)]
+async fn wait_for_fixture_database_drop(database: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if dropped_fixture_databases()
+            .lock()
+            .expect("dropped-fixture-databases lock")
+            .contains(database)
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Drops `database` once `pool` is dropped or closed. One worker thread per
 /// process does all the dropping over a single connection to the maintenance
 /// database, so cleanup adds one server connection however many tests run in
 /// parallel, and runs on a runtime of its own because the test's runtime is
 /// gone by then. `DROP DATABASE` names one database and cannot run in a
 /// transaction, so a backlog is drained and dropped one statement at a time
-/// (unlike the one combined `DROP SCHEMA` this replaced). A failure goes to
-/// stderr naming the database, which is then leaked: harmless, since the whole
-/// server is a throwaway container discarded on teardown. SPEC-5.6.4,
-/// SPEC-5.6.5.
+/// (unlike the one combined `DROP SCHEMA` this replaced). Each successful drop
+/// is recorded in [`dropped_fixture_databases`] so a test can await its own.
+/// A failure goes to stderr naming the database, which is then leaked:
+/// harmless, since the whole server is a throwaway container discarded on
+/// teardown. SPEC-5.6.4, SPEC-5.6.5.
 #[cfg(test)]
 fn drop_database_when_closed(pool: &DbPool, url: &str, database: &str) {
     use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -969,6 +1004,10 @@ fn drop_database_when_closed(pool: &DbPool, url: &str, database: &str) {
                                             broke = true;
                                             break;
                                         }
+                                        dropped_fixture_databases()
+                                            .lock()
+                                            .expect("dropped-fixture-databases lock")
+                                            .insert(database.clone());
                                     }
                                 }
                                 if broke {
@@ -1274,20 +1313,27 @@ mod tests {
         assert_eq!(bookkeeping, 0, "no bookkeeping rows in a fixture database");
 
         drop(pool);
+        // The cleanup worker drops the database on a background runtime after
+        // the pool's close_event fires, serially over one connection. Under a
+        // loaded CI host with a durable server that can lag well past a fixed
+        // poll window, so wait for this database's own drop to be recorded
+        // (CLAUDE-542) rather than race a timer. The bound is generous: it is
+        // only hit on a genuine leak (the worker gave up), not on a slow drop.
+        let dropped = wait_for_fixture_database_drop(&database, Duration::from_secs(180)).await;
+        assert!(
+            dropped,
+            "database {database} was never dropped by the cleanup worker"
+        );
+
+        // Ground truth (SPEC-5.6.4): it is actually gone from the catalog.
         let url = std::env::var("CLAUDE_RUN_TEST_DATABASE_URL").unwrap();
         let mut conn = sqlx::AnyConnection::connect(&url).await.unwrap();
-        let mut remaining = 1_i64;
-        for _ in 0..300 {
-            remaining = sqlx::query_scalar("SELECT COUNT(*) FROM pg_database WHERE datname = $1")
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pg_database WHERE datname = $1")
                 .bind(&database)
                 .fetch_one(&mut conn)
                 .await
                 .unwrap();
-            if remaining == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
         assert_eq!(remaining, 0, "database {database} survived its pool");
     }
 
