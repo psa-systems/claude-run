@@ -267,6 +267,12 @@ pub struct YoutrackSource {
     /// `.claude-run-needs-review` (CLAUDE-373).
     #[serde(skip_serializing_if = "Tags::is_default")]
     pub tags: Tags,
+    /// Install the repo's own git hooks (`just install-hooks`) on the fresh
+    /// clone during `run_pre`. Enabled by default; `false` skips the install
+    /// so the agent's commits are only checked by the `SPEC-3.3.2`
+    /// verification gate and CI, which still run unconditionally.
+    #[serde(skip_serializing_if = "is_true")]
+    pub install_hooks: bool,
 }
 
 impl Default for YoutrackSource {
@@ -285,8 +291,16 @@ impl Default for YoutrackSource {
             assignee: None,
             dependencies: Dependencies::default(),
             tags: Tags::default(),
+            install_hooks: true,
         }
     }
+}
+
+/// True when `b` is `true`; used as `skip_serializing_if` for a bool field
+/// whose default is `true`, so an untouched `install_hooks` is omitted on
+/// serialize the same way `automerge` / `dependencies` are when default.
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 impl YoutrackSource {
@@ -1401,6 +1415,49 @@ native:
             validate_str(&bogus, "<candidate>").unwrap_err(),
             Error::Yaml(_)
         ));
+    }
+
+    #[test]
+    fn youtrack_install_hooks_defaults_to_true_when_absent() {
+        // A youtrack config with no `install_hooks` key deserializes to the
+        // enabled default, so existing actions keep installing hooks.
+        let raw = "name: yt\nkind: youtrack\nnative:\n  youtrack: {}\n";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert!(cfg.youtrack.install_hooks);
+    }
+
+    #[test]
+    fn youtrack_install_hooks_default_is_omitted_on_serialize() {
+        let src = YoutrackSource::default();
+        let yaml = serde_yaml::to_string(&src).unwrap();
+        assert!(
+            !yaml.contains("install_hooks"),
+            "default install_hooks must be omitted from serialized YAML, got:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn youtrack_install_hooks_false_round_trips_through_yaml() {
+        let raw = "\
+name: yt
+kind: youtrack
+native:
+  youtrack:
+    install_hooks: false
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert!(!cfg.youtrack.install_hooks);
+
+        let yaml = serde_yaml::to_string(&cfg.youtrack).unwrap();
+        assert!(yaml.contains("install_hooks: false"));
+        let back: YoutrackSource = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(cfg.youtrack, back);
     }
 
     #[test]
