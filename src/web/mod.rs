@@ -58,6 +58,14 @@ const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
 // morph the DOM in place instead of replacing it (preserves selection/scroll).
 const IDIOMORPH_JS: &[u8] = include_bytes!("../../assets/idiomorph-ext.min.js");
 
+/// SPEC-4.3.11/SPEC-7.16: the signed-out landing page's mascot. A placeholder;
+/// replacing `assets/mascot.svg` swaps the art with no other change.
+const MASCOT_SVG: &[u8] = include_bytes!("../../assets/mascot.svg");
+
+/// SPEC-7.16: where the landing page's mascot is served. The auth gate lets a
+/// signed-out browser fetch this one asset, and nothing else under `/static/`.
+pub const MASCOT_PATH: &str = "/static/mascot.svg";
+
 /// SPEC-4.3: shared handler state (the daemon's `AppState` plus config
 /// paths) threaded through every web UI route.
 #[derive(Clone)]
@@ -186,6 +194,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         )
         .route("/static/htmx.min.js", get(htmx_handler))
         .route("/static/idiomorph-ext.min.js", get(idiomorph_handler))
+        .route(MASCOT_PATH, get(mascot_handler))
         .with_state(st)
 }
 
@@ -7015,6 +7024,22 @@ async fn idiomorph_handler() -> Response {
     resp
 }
 
+/// SPEC-4.3.11/SPEC-7.16: serves the landing page's mascot as `image/svg+xml`.
+/// A one-day cache rather than immutable, so swapping the file reaches browsers
+/// after an upgrade.
+async fn mascot_handler() -> Response {
+    let mut resp = Response::new(Body::from(MASCOT_SVG));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("image/svg+xml"),
+    );
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    resp
+}
+
 // SPEC-4.3.12: "Every fallible handler returns one `WebError` type: a status
 // code plus a plain message, with `From` conversions for the error types
 // handlers hit, so a stray `?` can never bypass the page's error rendering."
@@ -7090,6 +7115,23 @@ mod tests {
         build_duration_chart, build_usage_chart, format_duration_ms, latest_attempt_on_disk,
         render_summary_markdown,
     };
+
+    /// SPEC-7.16: the landing page's mascot is served as SVG from the
+    /// binary's embedded copy.
+    #[tokio::test]
+    async fn mascot_is_served_as_svg() {
+        let resp = super::mascot_handler().await;
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "image/svg+xml"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.starts_with(b"<svg"));
+    }
 
     // ---- summary markdown rendering ----------------------------------------
 

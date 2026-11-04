@@ -556,6 +556,19 @@ async fn require_token(State(gate): State<TokenGate>, request: Request, next: Ne
             }
         }
     }
+    // SPEC-7.16: a signed-out browser at `/` gets the landing page instead of
+    // the `/login` redirect, and may fetch that page's one image. Only where a
+    // browser login exists: a bearer-only gate has no Sign in to offer, so it
+    // keeps answering 401 for everything. An unconfigured instance never gets
+    // here (it returned above), so it still serves only `/setup`.
+    if gate.has_browser_login().await && request.method() == Method::GET {
+        if path == "/" && wants_html(&request) {
+            return render_landing();
+        }
+        if path == crate::web::MASCOT_PATH {
+            return next.run(request).await;
+        }
+    }
     // Send browsers to the login form (when there is one) instead of a bare 401,
     // so a password manager can complete the sign-in. API clients still get 401.
     if gate.has_browser_login().await && request.method() == Method::GET && wants_html(&request) {
@@ -574,6 +587,14 @@ async fn require_token(State(gate): State<TokenGate>, request: Request, next: Ne
 /// enrollment page itself and the static assets it renders with.
 fn totp_setup_exempt(path: &str) -> bool {
     path == "/account/2fa/setup" || path.starts_with("/static/")
+}
+
+/// SPEC-7.16: the signed-out landing page. It carries no instance data, only
+/// the documentation link.
+#[derive(Template)]
+#[template(path = "landing.html")]
+struct LandingTpl {
+    docs_url: &'static str,
 }
 
 #[derive(Template)]
@@ -1426,6 +1447,20 @@ fn render_invite_accept(token: String, error: Option<String>, status: StatusCode
     }
 }
 
+// SPEC-7.16: the documentation link is the repository the package metadata
+// names (`Cargo.toml` `repository`), so a fork links its own home with no
+// hostname written into the page.
+/// Render the signed-out landing page.
+fn render_landing() -> Response {
+    let tpl = LandingTpl {
+        docs_url: env!("CARGO_PKG_REPOSITORY"),
+    };
+    match tpl.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "landing template error").into_response(),
+    }
+}
+
 fn render_login(error: Option<String>, status: StatusCode) -> Response {
     match (LoginTpl { error }).render() {
         Ok(html) => (status, Html(html)).into_response(),
@@ -1893,24 +1928,211 @@ mod tests {
 
     /// A router protected with form login enabled.
     fn login_router(token: &str, user: &str) -> Router {
-        let app = Router::new().route("/", get(|| async { "home" }));
+        let app = Router::new()
+            .route("/", get(|| async { "home" }))
+            .route("/logs", get(|| async { "logs" }))
+            .route("/api/status", get(|| async { "ok" }));
         protect(
             app,
             TokenGate::with_login(token.to_string(), user.to_string()),
         )
     }
 
+    /// Every page but the root still sends a signed-out browser to the login
+    /// form; only `/` became the landing page (SPEC-7.16).
     #[tokio::test]
     async fn browser_request_without_auth_redirects_to_login() {
+        let resp = login_router("s3cret", "admin")
+            .oneshot(html_get("/logs"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/login");
+    }
+
+    async fn body_text(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// SPEC-7.16: a signed-out browser at `/` sees the landing page, with Sign
+    /// in and the documentation link, instead of a redirect.
+    #[tokio::test]
+    async fn signed_out_root_shows_the_landing_page() {
+        let resp = login_router("s3cret", "admin")
+            .oneshot(html_get("/"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = body_text(resp).await;
+        assert!(html.contains("href=\"/login\""), "offers Sign in");
+        assert!(html.contains("What's inside"));
+        assert!(html.contains(crate::web::MASCOT_PATH), "shows the mascot");
+        assert!(
+            html.contains(&format!("href=\"{}\"", env!("CARGO_PKG_REPOSITORY"))),
+            "links the documentation"
+        );
+        assert!(!html.contains("<script"), "needs no JavaScript");
+    }
+
+    /// SPEC-7.16: the landing page is public and ships with every install, so
+    /// it names no deployment: every link is the instance's own (`/`,
+    /// `/login`) or the repository from the package metadata, and no other URL
+    /// appears anywhere in the page.
+    #[tokio::test]
+    async fn landing_page_names_no_deployment() {
+        let resp = login_router("s3cret", "admin")
+            .oneshot(html_get("/"))
+            .await
+            .unwrap();
+        let html = body_text(resp).await;
+        let repo = env!("CARGO_PKG_REPOSITORY");
+        for href in html.split("href=\"").skip(1) {
+            let href = href.split('"').next().unwrap();
+            assert!(
+                href == "/" || href == "/login" || href == repo,
+                "unexpected link {href}"
+            );
+        }
+        let rest = html.replace(repo, "");
+        assert!(!rest.contains("://"), "the page names another URL");
+        assert!(!rest.contains("www."), "the page names another host");
+    }
+
+    /// SPEC-7.16: the landing page carries no instance data. It is rendered
+    /// before any handler runs, so the protected route behind `/` is never
+    /// reached for a signed-out visitor.
+    #[tokio::test]
+    async fn landing_page_does_not_reach_the_dashboard() {
+        let resp = login_router("s3cret", "admin")
+            .oneshot(html_get("/"))
+            .await
+            .unwrap();
+        assert_ne!(body_text(resp).await, "home");
+    }
+
+    /// SPEC-7.16: signed in, `/` is the dashboard exactly as before.
+    #[tokio::test]
+    async fn signed_in_root_is_unchanged() {
+        let session = sign_session("s3cret", LEGACY_ACCOUNT_ID, now_unix() + 60);
         let req = Request::builder()
+            .uri("/")
+            .header(header::ACCEPT, "text/html")
+            .header(header::COOKIE, format!("{SESSION_COOKIE}={session}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = login_router("s3cret", "admin").oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_text(resp).await, "home");
+    }
+
+    /// SPEC-7.16: only a browser navigation gets the page; an API-shaped
+    /// request to `/` and every API route still need a credential.
+    #[tokio::test]
+    async fn api_routes_still_need_auth_beside_the_landing_page() {
+        for uri in ["/", "/api/status"] {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            assert_eq!(
+                status_of(login_router("s3cret", "admin"), req).await,
+                StatusCode::UNAUTHORIZED,
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            status_of(login_router("s3cret", "admin"), html_get("/api/status")).await,
+            StatusCode::SEE_OTHER,
+            "a browser at an API route is sent to log in, not shown the landing page"
+        );
+        let req = Request::builder()
+            .method(Method::POST)
             .uri("/")
             .header(header::ACCEPT, "text/html")
             .body(Body::empty())
             .unwrap();
         assert_eq!(
             status_of(login_router("s3cret", "admin"), req).await,
-            StatusCode::SEE_OTHER
+            StatusCode::UNAUTHORIZED
         );
+    }
+
+    /// SPEC-7.16: the mascot is the one asset a signed-out browser may fetch;
+    /// the rest of `/static/` stays behind the gate.
+    #[tokio::test]
+    async fn signed_out_browser_may_fetch_only_the_mascot() {
+        let app = Router::new()
+            .route(crate::web::MASCOT_PATH, get(|| async { "svg" }))
+            .route("/static/htmx.min.js", get(|| async { "js" }));
+        let router = protect(
+            app,
+            TokenGate::with_login("s3cret".to_string(), "admin".to_string()),
+        );
+        let req = Request::builder()
+            .uri(crate::web::MASCOT_PATH)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status_of(router.clone(), req).await, StatusCode::OK);
+        let req = Request::builder()
+            .uri("/static/htmx.min.js")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status_of(router, req).await, StatusCode::UNAUTHORIZED);
+    }
+
+    /// SPEC-7.16: a bearer-only gate (no browser login at all) offers no Sign
+    /// in, so it shows no landing page and keeps answering 401.
+    #[tokio::test]
+    async fn bearer_only_gate_shows_no_landing_page() {
+        let app = Router::new()
+            .route("/", get(|| async { "home" }))
+            .route(crate::web::MASCOT_PATH, get(|| async { "svg" }));
+        let router = protect(app, TokenGate::new("s3cret".to_string()));
+        assert_eq!(
+            status_of(router.clone(), html_get("/")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_of(router, html_get(crate::web::MASCOT_PATH)).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// SPEC-7.7/SPEC-7.16: an unconfigured instance still serves only
+    /// `/setup`: no landing page and no mascot before the first account.
+    #[tokio::test]
+    async fn unconfigured_instance_shows_no_landing_page() {
+        let pool = setup_pool().await;
+        let app = Router::new()
+            .route("/", get(|| async { "home" }))
+            .route(crate::web::MASCOT_PATH, get(|| async { "svg" }));
+        let router = protect(app, TokenGate::unconfigured(pool));
+        let resp = router.clone().oneshot(html_get("/")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/setup");
+        let req = Request::builder()
+            .uri(crate::web::MASCOT_PATH)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            status_of(router, req).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// SPEC-7.16: the production shape (DB accounts, no bearer token) shows
+    /// the landing page once the first account exists.
+    #[tokio::test]
+    async fn account_instance_shows_the_landing_page() {
+        let pool = setup_pool().await;
+        crate::web_admin::create_first(&pool, "admin", "correct horse battery")
+            .await
+            .unwrap();
+        let app = Router::new().route("/", get(|| async { "home" }));
+        let router = protect(app, TokenGate::unconfigured(pool));
+        let resp = router.oneshot(html_get("/")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_text(resp).await.contains("What's inside"));
     }
 
     #[tokio::test]

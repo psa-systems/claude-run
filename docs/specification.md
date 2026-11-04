@@ -755,7 +755,8 @@ Pages: `/` dashboard; `/actions/new`, `/actions/new/raw`, `/actions/new/youtrack
 rotate, delete and check; `/access`; `/settings` with per-section saves and the Claude, YouTrack, Forgejo, GitHub and git
 auth cards; `/reports`; `/status` and `/status/activity`, with `/about` and `/about/activity` redirecting permanently to
 them; `/status/cargo-cache/{repo-slug}/delete` and `/status/cargo-cache/delete`; `/status/docker/{category}/prune`; `/runs/{id}`; `/runs/{id}/jobs/{key}/attempt/{attempt}`;
-`/sse/runs/{id}/jobs/{key}/attempt/{attempt}` (live stream); `/static/htmx.min.js`, `/static/idiomorph-ext.min.js`.
+`/sse/runs/{id}/jobs/{key}/attempt/{attempt}` (live stream); `/static/htmx.min.js`, `/static/idiomorph-ext.min.js`,
+`/static/mascot.svg`. A signed-out browser at `/` gets the landing page instead of the dashboard (`SPEC-7.16`).
 Auth routes: `/login`, `/login/2fa`, `/logout`, `/setup`, `/account/2fa/setup`, `/invite/{token}`, `/settings/accounts` with
 invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src/auth.rs` are specified separately
 (`SPEC-7`), this section's subsections cover only the pages owned by `src/web/mod.rs`, `src/web/native_forms.rs`,
@@ -865,6 +866,8 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
 
 - `/static/htmx.min.js` and `/static/idiomorph-ext.min.js` are served from the binary's own embedded copy, not fetched
   from a CDN, with a one-year immutable cache-control header so the browser never re-requests them.
+- `/static/mascot.svg`, the landing page's art (`SPEC-7.16`), is served the same way from `assets/mascot.svg` with a
+  one-day cache instead, so replacing the file reaches browsers after an upgrade.
 
 #### 4.3.12 Web error responses (`SPEC-4.3.12`)
 
@@ -1381,6 +1384,8 @@ retry. The generated password never appears in a log line or an error message.
   authenticate by HMAC (4.4) and cannot carry a bearer header, and the auth routes themselves must stay reachable
   unauthenticated or there is no way to obtain a credential. `/account/2fa/setup` still requires a valid credential; it
   is exempt only from the enrollment check in 7.10, not from this gate.
+- A signed-out browser GET of `/` and of `/static/mascot.svg` is the one other exception, and only where a browser
+  login exists (7.16).
 
 ### 7.7 Unconfigured instance (`SPEC-7.7`)
 
@@ -1462,6 +1467,20 @@ retry. The generated password never appears in a log line or an error message.
 
 - The agent may mutate only through the bounded tracker writes the prompt permits; the runner owns the `AI Agent` field
   and every write to the triggering issue except comments.
+
+### 7.16 Signed-out landing page (`SPEC-7.16`)
+
+- Where the gate would redirect a signed-out browser to `/login`, a GET of `/` that accepts `text/html` is answered
+  `200` with the landing page instead, and a GET of `/static/mascot.svg` is served. Every other path, `/api/`
+  included, keeps its 7.6 behaviour (a browser is redirected to `/login`, anything else is refused with 401), and so
+  does a request to `/` that is not a GET or does not accept `text/html`.
+- The page is static: it describes claude-run, links Sign in (`/login`) and the documentation (the `repository` URL
+  from the package metadata), and carries no instance data (no action names, runs, status or version). It needs no
+  JavaScript.
+- A signed-in request to `/` is the dashboard, unchanged. An unconfigured instance (7.7) never shows the page: it still
+  serves only `/setup`. A gate built with a bearer token and no browser login at all (no `auth_username` and no account
+  store; the daemon always attaches the account store, so this is a library-level gate) offers no Sign in, so it shows
+  no landing page and keeps answering 401. A loopback bind with no gate (7.6) has no signed-out state, so `/` is the dashboard.
 
 ## 8. Integrations and dependencies
 
