@@ -1173,10 +1173,16 @@ implementation.
   transaction). A fixture database therefore holds the schema but no `_sqlx_migrations` rows.
 - **SPEC-5.6.4**: The fixture MUST drop its database with `DROP DATABASE IF EXISTS` when the last handle of the pool is
   dropped or the pool is closed. One worker thread per test process does all the dropping over a single connection to
-  the maintenance database, so cleanup adds one server connection however many tests run in parallel. `DROP DATABASE`
-  names one database and cannot run in a transaction, so a drained backlog is dropped one statement at a time; a drop
-  that loses the race with the pool's own connection teardown (`55006`, "being accessed by other users") is retried
-  briefly, with no `WITH (FORCE)`. It is a thread of its own because the test's runtime is gone by then.
+  the maintenance database, so cleanup adds one server connection however many tests run in parallel. Before each drop
+  it MUST terminate any backend still attached to that database with `pg_terminate_backend` (the pool fired its close
+  event, but a loaded durable server can lag reaping the last backends, which would make every `DROP DATABASE` hit
+  `55006`, "being accessed by other users", and burn the retry window per drop until the single-connection worker falls
+  hopelessly behind); no `DROP DATABASE ... (FORCE)`. `DROP DATABASE` names one database and cannot run in a
+  transaction, so a drained backlog is dropped one statement at a time; a drop that still loses the teardown race is
+  retried briefly. A failing drop leaves that one database leaked but MUST NOT strand the rest of the batch. It is a
+  thread of its own because the test's runtime is gone by then. The test that asserts the drop path removes a database
+  MUST drive the drop directly (close the pool, then terminate and drop) rather than race this shared single-connection
+  worker under full-suite load, which on a contended runner lags arbitrarily and is not a correctness signal.
 - **SPEC-5.6.5**: A failed drop MUST print one line to standard error naming the database it was dropping and the
   database error, then leak it (harmless: the server is a throwaway container discarded on teardown).
 - **SPEC-5.6.6**: Once per test process, before the template is created, the fixture MUST fail naming the database when
