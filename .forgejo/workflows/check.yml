@@ -126,21 +126,18 @@ jobs:
 
     # CLAUDE-250: the runner supports SQLite and PostgreSQL through one sqlx
     # `Any` pool, so the suite runs twice: once on the default SQLite and once
-    # against this server. Without it the Postgres half of the dialect
+    # against a real PostgreSQL. Without it the Postgres half of the dialect
     # chokepoint would only ever be exercised in principle.
-    services:
-      postgres:
-        image: docker.io/postgres:18.4-alpine3.23
-        env:
-          POSTGRES_DB: claude_run
-          POSTGRES_USER: claude_run
-          POSTGRES_PASSWORD: claude_run
-        options: >-
-          --health-cmd "pg_isready --username=claude_run --dbname=claude_run"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
-
+    #
+    # CLAUDE-528: no `services: postgres:` container here. A GitHub/Forgejo
+    # Actions service's `options` is appended to `docker create` ahead of the
+    # image name, so it cannot carry a postgres server flag like `-c
+    # fsync=off`, and a durable service container pays commit-flush latency
+    # SPEC-10.1.3 forbids. `claude-run test-postgres` (SPEC-6.6) starts its own
+    # throwaway, non-durable Postgres in this runner's Docker-in-Docker and
+    # disables `fsync`, `synchronous_commit` and `full_page_writes`, so the
+    # PostgreSQL pass below runs through it instead, same as `just
+    # test-postgres` locally.
     steps:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
@@ -160,8 +157,8 @@ jobs:
         # NEXTEST_TEST_THREADS (set above), so without this `cargo test` fans
         # its harness out over every CPU of the HEAVY runner instead of this
         # job's share of it. Unbounded, the Postgres step below runs far more
-        # concurrent tests than the one shared Postgres service container can
-        # hold connections for, which is what produced the Sqlx(PoolTimedOut)
+        # concurrent tests than the one shared Postgres can hold connections
+        # for, which is what produced the Sqlx(PoolTimedOut)
         # failures in run #641. Mirrors the same mapping in
         # common/.forgejo/actions/check-rust/action.yml.
         shell: nu {0}
@@ -183,11 +180,10 @@ jobs:
         run: cargo test
 
       - name: Unit tests (PostgreSQL)
-        # CLAUDE_RUN_TEST_DATABASE_URL switches every test fixture onto the
-        # service container, each test in a schema of its own.
-        env:
-          CLAUDE_RUN_TEST_DATABASE_URL: postgres://claude_run:claude_run@postgres:5432/claude_run
-        run: cargo test
+        # SPEC-6.6: `claude-run test-postgres` starts its own non-durable
+        # Postgres and sets CLAUDE_RUN_TEST_DATABASE_URL, which switches every
+        # test fixture onto it, each test in a schema of its own.
+        run: cargo run -- test-postgres -- cargo test
 
       - name: Report job metrics
         # Last and always(), so a failing job still reports (composite actions have no post hook).
@@ -216,7 +212,7 @@ jobs:
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/check-secrets@main
         with:
           # Placeholder credentials only, also present in git history: the CI
-          # Postgres service password above, the docs/configuration.md and compose.yml example
+          # former CI Postgres service password, the docs/configuration.md and compose.yml example
           # URIs, the token-shaped remote URLs in src/ tests, the nu
           # interpolation in the removed scripts/claude-run.nu, and the
           # retry_git_network redaction test's placeholder URL (CLAUDE-396,
