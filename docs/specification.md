@@ -1732,9 +1732,8 @@ never write the same registry destination.
 
 ## 11. CI
 
-- **SPEC-11.1**: The `postgres` service container in `.forgejo/workflows/check.yml` MUST take its `--health-interval`,
-  `--health-timeout`, `--health-retries` and `--health-start-period` from the `CI_POSTGRES_HEALTH_INTERVAL`,
-  `CI_POSTGRES_HEALTH_TIMEOUT`, `CI_POSTGRES_HEALTH_RETRIES` and `CI_POSTGRES_HEALTH_START_PERIOD` variables using the
-  Actions expression form (`common` `SPEC-13.2`), and MUST fall back to `5s`, `5s`, `24` and `30s` respectively when a
-  variable is unset or empty, matching today's floor before this requirement existed. The variables themselves, their
-  runner-side values and the ban on shell parameter expansion are `common` `SPEC-13.1` and `SPEC-13.2`.
+- **SPEC-11.1**: The PostgreSQL pass of the unit-test job in `.forgejo/workflows/check.yml` MUST run through
+  `claude-run test-postgres` (`SPEC-6.6`) and MUST NOT use a `postgres` service container: a service's `options`
+  cannot carry the server flags that disable durability, and a durable container makes the pass depend on disk flush
+  latency (`SPEC-10.1.3`). With no service there is no health check, so the `CI_POSTGRES_HEALTH_*` variables
+  (`common` `SPEC-13.1`) do not apply to this job.
