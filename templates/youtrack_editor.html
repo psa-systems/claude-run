@@ -117,6 +117,15 @@
   </div>
 
   <div class="card">
+    <h3>Git hooks</h3>
+    <label class="fld-inline">
+      <input type="checkbox" name="yt_install_hooks"{% if form.is_install_hooks() %} checked{% endif %}>
+      <span>Install the repo's git hooks on the clone (<code>just install-hooks</code>)</span>
+    </label>
+    <p class="hint dim">Disabling this skips <code>just install-hooks</code> on the clone. The agent's commits are then not checked locally by the repo's pre-commit and pre-push hooks, so a failing check is only caught by the post-run verification gate or CI, after the attempt has already spent its time and cost.</p>
+  </div>
+
+  <div class="card">
     <h3>Dependency gate</h3>
     <label class="fld-inline">
       <input type="checkbox" name="deps_enabled"{% if form.is_deps_enabled() %} checked{% endif %}>
