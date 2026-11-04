@@ -151,11 +151,17 @@ jobs:
           POSTGRES_USER: claude_run
           POSTGRES_PASSWORD: claude_run
           POSTGRES_DB: claude_run
+        # The retries are generous because a loaded runner starts the job
+        # container minutes after the service: run #747 failed with "container
+        # health check ... is not healthy" before a single check ran, the same
+        # shape as mirzam's MIRZAM-242. The start period keeps the first probes
+        # of a database still recovering from initdb out of the count.
         options: >-
-          --health-cmd "pg_isready --username claude_run"
-          --health-interval 10s
+          --health-cmd "pg_isready --username=claude_run --dbname=claude_run"
+          --health-interval 5s
           --health-timeout 5s
-          --health-retries 10
+          --health-start-period 30s
+          --health-retries 24
     steps:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
@@ -210,13 +216,15 @@ jobs:
         # (scripts/postgres-test-filters.txt, enforced by the db.rs guard
         # test); the pure-logic tests already ran on the SQLite leg above and
         # would do identical, SQL-free work on Postgres. This leg is DB/IO-
-        # bound once the per-test setup is a block-copy clone, so it takes the
-        # job's full CPU share (CI_JOBS) rather than the build-derived
-        # NEXTEST_TEST_THREADS (nproc/4) the SQLite leg inherits.
+        # bound once per-test setup is a block-copy clone, so it oversubscribes
+        # the job's CPU share (CI_JOBS, which the build-parallelism action can
+        # floor at nproc/4 = 2): the test threads mostly wait on Postgres, so
+        # running several per core overlaps that wait. The thread count stays
+        # bounded so it times the per-test pool's max_connections plus the
+        # clone and cleanup connections to well under the service's default 100.
         shell: nu {0}
         env:
           CLAUDE_RUN_TEST_DATABASE_URL: postgres://claude_run:claude_run@postgres:5432/claude_run
-          RUST_TEST_THREADS: ${{ env.CI_JOBS }}
         run: |
           let filters = (
               open scripts/postgres-test-filters.txt
@@ -224,8 +232,10 @@ jobs:
               | each {|line| $line | str trim}
               | where {|line| ($line | is-not-empty) and (not ($line | str starts-with "#"))}
           )
-          print $"postgres test filters: ($filters)"
-          cargo test -- ...$filters
+          let ci_jobs = ($env.CI_JOBS? | default "2" | into int)
+          let threads = ([($ci_jobs * 4) 8] | math max)
+          print $"postgres test threads: ($threads); filters: ($filters)"
+          cargo test -- --test-threads $threads ...$filters
 
       - name: Report job metrics
         # Last and always(), so a failing job still reports (composite actions have no post hook).
