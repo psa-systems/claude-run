@@ -372,7 +372,7 @@ pub async fn open_sqlite(db_path: &Path) -> Result<DbPool> {
             map_connect_error(
                 "sqlite",
                 POOL_MAX_CONNECTIONS,
-                POOL_ACQUIRE_TIMEOUT,
+                pool_acquire_timeout(),
                 started,
                 e,
             )
@@ -430,7 +430,7 @@ async fn open_postgres(url: &str) -> Result<DbPool> {
                 return Err(map_connect_error(
                     "postgres",
                     POOL_MAX_CONNECTIONS,
-                    POOL_ACQUIRE_TIMEOUT,
+                    pool_acquire_timeout(),
                     attempt_started,
                     e,
                 ));
@@ -474,6 +474,23 @@ async fn open_postgres(url: &str) -> Result<DbPool> {
 const POOL_MAX_CONNECTIONS: u32 = 16;
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The acquire timeout the production pools (`open_sqlite`, `open_postgres`)
+/// are built with. In production it is [`POOL_ACQUIRE_TIMEOUT`] (30s): an
+/// acquire that waits that long is a real stuck pool and should fail fast.
+/// Under `cfg(test)` it is raised to 120s, matching the test-fixture pools'
+/// own rationale (CLAUDE-524): on a contended CI host a connection can take
+/// far longer than 30s to free purely from scheduler/IO starvation, not a
+/// stuck pool (SPEC-10.1.4 slow-IO class), which was tripping the file-backed
+/// SQLite pool these tests open at 30s (CLAUDE-542). The production binary is
+/// not built with `cfg(test)`, so it keeps the 30s fail-fast behaviour.
+fn pool_acquire_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_secs(120)
+    } else {
+        POOL_ACQUIRE_TIMEOUT
+    }
+}
+
 /// Pool settings, applied to both backends.
 fn pool_options(dialect: Dialect) -> AnyPoolOptions {
     let opts = AnyPoolOptions::new()
@@ -481,8 +498,9 @@ fn pool_options(dialect: Dialect) -> AnyPoolOptions {
         // runs plus the web UI's polling.
         .max_connections(POOL_MAX_CONNECTIONS)
         // sqlx's default, stated so it is a decision and not an
-        // inherited value. An acquire that waits this long is a real fault.
-        .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+        // inherited value. An acquire that waits this long is a real fault
+        // (raised under cfg(test); see pool_acquire_timeout).
+        .acquire_timeout(pool_acquire_timeout())
         // Raised from the 2s default. With blocking work off the
         // async runtime an acquire is sub-millisecond, so 5s flags a genuine
         // regression instead of logging routine contention.

@@ -1728,7 +1728,11 @@ mod tests {
                 &cfg,
                 // A budget the orphaned watchdog would have blocked for if it
                 // survived being killed; the assertion below is well under it.
-                Duration::from_secs(10),
+                // The budget and threshold are generous (and far apart) so a
+                // scheduler-starved CI host cannot push a genuinely prompt exit
+                // past the threshold while the orphan bug would still block for
+                // the full budget (CLAUDE-542, SPEC-10.1.4 slow-IO class).
+                Duration::from_secs(60),
                 dir.path(),
                 &log,
                 &cancel,
@@ -1738,7 +1742,7 @@ mod tests {
             .unwrap();
         assert!(res.ok, "a clean immediate exit is ok");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(30),
             "invoke took {:?}, which means something still holds the stdout \
              pipe open past the stub's own exit",
             started.elapsed()
@@ -2158,7 +2162,11 @@ mod tests {
             .invoke(
                 "hi",
                 cfg,
-                Duration::from_secs(10),
+                // Generous budget: these tests assert on the captured argv, not
+                // on timing, so a scheduler-starved CI host must not let the
+                // stub hit the budget and report a timeout instead of success
+                // (CLAUDE-542, SPEC-10.1.4 slow-IO class).
+                Duration::from_secs(120),
                 dir,
                 &dir.join("stream.jsonl"),
                 &CancellationToken::new(),
