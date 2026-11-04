@@ -858,7 +858,7 @@ pub(crate) fn git_allow_protocol_test_lock() -> std::sync::MutexGuard<'static, (
 /// never interleave; `std::env::set_var`/`var` on `PATH` are documented as
 /// unsound under concurrent access from other threads.
 #[cfg(test)]
-pub(crate) fn git_stub_path_test_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn git_stub_path_test_lock() -> crate::testutil::PathEnvGuard {
     crate::testutil::path_env_lock()
 }
 
@@ -2382,6 +2382,8 @@ mod tests {
         let clone = tmp.path().join("clone");
         let trace_file = tmp.path().join("git-trace.log");
 
+        // PATH lock first: production code reached below takes it too (CLAUDE-536).
+        let _path_guard = git_stub_path_test_lock();
         let _guard = git_trace_test_lock();
         std::env::set_var("GIT_TRACE", &trace_file);
         let result = shallow_clone(&url, Some("feat"), &clone, 50);
@@ -2560,6 +2562,8 @@ mod tests {
         // widening it, so `file` (used by other tests' local-path remotes
         // running concurrently) must stay listed alongside `ext`; the lock
         // keeps this test's set/remove pair from racing another thread's.
+        // PATH lock first: production code reached below takes it too (CLAUDE-536).
+        let _path_guard = git_stub_path_test_lock();
         let _guard = git_allow_protocol_test_lock();
         std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
         let result = init_submodules_retrying(&url, &workdir, &NO_WAIT);
@@ -2649,6 +2653,8 @@ mod tests {
         // `GIT_ALLOW_PROTOCOL` replaces git's default allowlist rather than
         // widening it, so `file` stays listed alongside `ext`; the lock keeps
         // this test's set/remove pair from racing another thread's.
+        // PATH lock first: production code reached below takes it too (CLAUDE-536).
+        let _path_guard = git_stub_path_test_lock();
         let _guard = git_allow_protocol_test_lock();
         std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
         let result = restore_default_branch_refs_retrying(&url, "other", &workdir, 50, &NO_WAIT);

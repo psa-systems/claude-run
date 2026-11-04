@@ -589,12 +589,18 @@ pub async fn test_pool() -> DbPool {
 }
 
 /// An in-memory SQLite pool with the schema applied. One connection, because a
-/// second connection to `sqlite::memory:` is a second, empty database.
+/// second connection to `sqlite::memory:` is a second, empty database. A test
+/// that drops a transaction on this pool releases the connection only once
+/// sqlx's background rollback finishes, and under the CPU contention of a
+/// full-suite run that rollback can be scheduled well behind the 30s default
+/// (CLAUDE-524); the queries themselves are in-memory and instant, so a
+/// longer acquire timeout only tolerates scheduler starvation, not a real
+/// stuck pool.
 #[cfg(test)]
 pub async fn test_sqlite_pool() -> DbPool {
     sqlx::any::install_default_drivers();
     let max_connections = 1;
-    let acquire_timeout = Duration::from_secs(30);
+    let acquire_timeout = Duration::from_secs(120);
     let started = Instant::now();
     let pool = AnyPoolOptions::new()
         .max_connections(max_connections)
@@ -713,12 +719,19 @@ fn next_fixture_schema() -> String {
 /// A pool whose every connection selects `schema`; the schema itself is not
 /// created here. Refuses a live runner database on the first call of the
 /// process. SPEC-5.6.1, SPEC-5.6.6.
+///
+/// Carries the same raised `acquire_timeout` as [`test_sqlite_pool`]: a
+/// capacity-constrained pool here (most acutely `max_connections(1)` via
+/// [`test_pg_pool_single_connection`]) is exposed to the identical race, a
+/// dropped transaction's background rollback losing to full-suite CPU
+/// contention, just on the Postgres leg of CI instead of the SQLite one
+/// (CLAUDE-524).
 #[cfg(test)]
 async fn pg_pool_in_schema(url: &str, schema: &str, max_connections: u32) -> DbPool {
     static LIVE_CHECK: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     sqlx::any::install_default_drivers();
     let set_path = format!("SET search_path TO {schema}");
-    let acquire_timeout = Duration::from_secs(30);
+    let acquire_timeout = Duration::from_secs(120);
     let started = Instant::now();
     let pool = AnyPoolOptions::new()
         .max_connections(max_connections)
@@ -1288,7 +1301,16 @@ mod tests {
     }
 
     /// Same as the SQLite test above, run against Postgres so the fix is
-    /// proven on both backends per the acceptance criteria.
+    /// proven on both backends per the acceptance criteria. Unlike the
+    /// SQLite variant, `connect()` here opens a real network connection, so
+    /// the pool itself is built with a generous `acquire_timeout`: under
+    /// full-suite CPU contention (CLAUDE-524) that connect can take well
+    /// over the 50ms this test needs to deliberately force the *second*
+    /// acquire to time out, which was flaking CI (connect itself tripping
+    /// `PoolTimedOut` before the test even got to the race it means to
+    /// assert on). The short deadline is applied only to that second
+    /// acquire, via `tokio::time::timeout`, independent of the pool's own
+    /// configured timeout.
     #[tokio::test]
     async fn pool_acquire_timeout_is_reported_with_pool_state_and_wait_time_on_postgres() {
         let Ok(url) = std::env::var("CLAUDE_RUN_TEST_DATABASE_URL") else {
@@ -1305,17 +1327,19 @@ mod tests {
         let acquire_timeout = Duration::from_millis(50);
         let pool = AnyPoolOptions::new()
             .max_connections(1)
-            .acquire_timeout(acquire_timeout)
+            .acquire_timeout(Duration::from_secs(30))
             .connect(&url)
             .await
             .expect("connect to CLAUDE_RUN_TEST_DATABASE_URL");
         let held = pool.acquire().await.expect("acquire the only connection");
 
         let started = Instant::now();
-        let err = pool
-            .acquire()
-            .await
-            .expect_err("a second acquire on a one-connection pool must time out");
+        let err = match tokio::time::timeout(acquire_timeout, pool.acquire()).await {
+            Ok(result) => {
+                result.expect_err("a second acquire on a one-connection pool must time out")
+            }
+            Err(_) => sqlx::Error::PoolTimedOut,
+        };
         assert!(matches!(err, sqlx::Error::PoolTimedOut), "{err}");
         let reported = map_live_pool_error(&pool, "postgres test", started, err);
 

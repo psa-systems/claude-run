@@ -1729,3 +1729,11 @@ never write the same registry destination.
     timeout increase, retry or skip. A test that fails only when disk I/O is slow is a defect in the code or the fixture.
   - **SPEC-10.1.4**: A timeout, pool exhaustion or similar failure caused by slow disk I/O MUST be reported as that
     failure with the operation and its elapsed time, and MUST NOT be retried silently or recorded as success.
+
+## 11. CI
+
+- **SPEC-11.1**: The PostgreSQL pass of the unit-test job in `.forgejo/workflows/check.yml` MUST run through
+  `claude-run test-postgres` (`SPEC-6.6`) and MUST NOT use a `postgres` service container: a service's `options`
+  cannot carry the server flags that disable durability, and a durable container makes the pass depend on disk flush
+  latency (`SPEC-10.1.3`). With no service there is no health check, so the `CI_POSTGRES_HEALTH_*` variables
+  (`common` `SPEC-13.1`) do not apply to this job.
