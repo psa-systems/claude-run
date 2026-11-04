@@ -3241,6 +3241,10 @@ struct YoutrackEditForm {
     /// parks an issue via `.claude-run-needs-review` (`tags.needs_info`,
     /// CLAUDE-373). Blank disables the tag write.
     tags_needs_info: String,
+    /// Install the repo's own git hooks on the clone
+    /// (`native.youtrack.install_hooks`). Present ("on") when checked;
+    /// absent means the box was unchecked (`false`).
+    yt_install_hooks: Option<String>,
 }
 
 impl YoutrackEditForm {
@@ -3266,6 +3270,12 @@ impl YoutrackEditForm {
     /// [`Self::is_enabled`], absence means the box was unchecked.
     fn is_deps_block_cross_project(&self) -> bool {
         self.deps_block_cross_project.is_some()
+    }
+
+    /// Whether the install-hooks checkbox was ticked. Like
+    /// [`Self::is_enabled`], absence means the box was unchecked (`false`).
+    fn is_install_hooks(&self) -> bool {
+        self.yt_install_hooks.is_some()
     }
 }
 
@@ -3300,6 +3310,7 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
         deps_block_on: deps.block_on.join(", "),
         deps_block_cross_project: deps.block_cross_project.then(|| "on".to_string()),
         tags_needs_info: c.youtrack.tags.needs_info,
+        yt_install_hooks: c.youtrack.install_hooks.then(|| "on".to_string()),
         ..Default::default()
     }
 }
@@ -3393,6 +3404,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
             .then(|| "on".to_string()),
         state_no_code: s(&yt.youtrack.states.no_code),
         tags_needs_info: yt.youtrack.tags.needs_info.clone(),
+        yt_install_hooks: yt.youtrack.install_hooks.then(|| "on".to_string()),
     })
 }
 
@@ -3578,6 +3590,9 @@ fn youtrack_form_to_yaml(
     // setting (disables the tag write), not "fall back to the default", so it
     // is stored verbatim rather than through `opt`/`or_default`.
     youtrack.tags.needs_info = form.tags_needs_info.trim().to_string();
+    // Install the repo's git hooks on the clone. The form always sets this
+    // explicitly from the checkbox state, matching automerge/dependencies.
+    youtrack.install_hooks = form.is_install_hooks();
     // Preserve a hand-written `github` block. The form exposes only
     // `token_ref`, so read the existing `native.github` sub-block off the parsed
     // on-disk action (before we overwrite the `native` key below) to carry its
@@ -9468,6 +9483,51 @@ mod tests {
                 err.contains("Dependency recheck timeout") && err.contains("not-a-duration"),
                 "unexpected error: {err}"
             );
+        }
+
+        #[test]
+        fn install_hooks_defaults_to_checked() {
+            // A brand-new form opens with the checkbox ticked, matching
+            // `install_hooks`'s `true` default.
+            let f = super::super::youtrack_form_defaults();
+            assert!(f.is_install_hooks());
+        }
+
+        #[test]
+        fn install_hooks_false_round_trips_and_keeps_other_native_keys() {
+            // Unchecking the box saves `install_hooks: false`, and an
+            // unrelated existing `native.youtrack` key (`custom_field`) that
+            // the form itself owns survives the save untouched.
+            let yaml =
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    custom_field: Agent State\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let mut f = action_to_youtrack_form(&loaded.action).unwrap();
+            assert!(
+                f.is_install_hooks(),
+                "existing action with no key defaults checked"
+            );
+            f.name = "yt".to_string();
+            f.yt_install_hooks = None;
+            let saved_yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let saved = crate::action::validate_str(&saved_yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = saved.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert!(!yt.youtrack.install_hooks, "unchecked box must save false");
+            assert_eq!(yt.youtrack.custom_field, "Agent State");
+        }
+
+        #[test]
+        fn install_hooks_true_round_trips() {
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            assert!(f.yt_install_hooks.is_some());
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert!(yt.youtrack.install_hooks);
         }
 
         #[test]

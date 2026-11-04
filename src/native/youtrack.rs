@@ -1353,7 +1353,15 @@ async fn process_job(
     // all synchronous; keep them off the async worker thread.
     let resume_branch = resume.as_ref().map(|r| r.branch.as_str());
     let pre_result = crate::blocking::in_place(|| {
-        run_pre(backend, forge, src, job, &workdir_path, resume_branch)
+        run_pre(
+            backend,
+            forge,
+            src,
+            job,
+            &workdir_path,
+            resume_branch,
+            &action.name,
+        )
     });
 
     // ---- prompt + claude (skipped on pre failure / cancel / global pause) ----
@@ -2409,6 +2417,7 @@ fn run_pre(
     // The recorded PR's head branch to resume, or `None` for the
     // default-branch clone this always used to be.
     resume_branch: Option<&str>,
+    action_name: &str,
 ) -> std::result::Result<(), String> {
     backend
         .set_field(&job.key, &src.custom_field, &src.states.working)
@@ -2426,7 +2435,15 @@ fn run_pre(
     }
     clone_repo(&clone_url_for(forge, job), workdir, resume_branch)
         .map_err(|e| format!("git clone: {e}"))?;
-    install_hooks(workdir);
+    if src.install_hooks {
+        install_hooks(workdir);
+    } else {
+        info!(
+            action = action_name,
+            key = %job.key,
+            "native.youtrack.install_hooks is false; skipping repo git hook install"
+        );
+    }
     Ok(())
 }
 
@@ -7485,7 +7502,7 @@ mod tests {
         let mut j = job();
         // Bogus local path: `git clone` fails immediately with no network.
         j.clone_url = "/nonexistent/claude-run-131.git".into();
-        let _ = run_pre(&backend, &backend, &s, &j, &wd, None);
+        let _ = run_pre(&backend, &backend, &s, &j, &wd, None, "test-action");
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls
@@ -7519,7 +7536,7 @@ mod tests {
         assert!(s.assignee.is_none());
         let mut j = job();
         j.clone_url = "/nonexistent/claude-run-131.git".into();
-        let _ = run_pre(&backend, &backend, &s, &j, &wd, None);
+        let _ = run_pre(&backend, &backend, &s, &j, &wd, None, "test-action");
         let calls = runner.calls.lock().unwrap();
         assert!(!calls.iter().any(|c| c.contains("--assignee")), "{calls:?}");
     }
@@ -7554,7 +7571,7 @@ mod tests {
         s.assignee = Some("octocat".into());
         let mut j = job();
         j.clone_url = "/nonexistent/claude-run-131.git".into();
-        let err = run_pre(&backend, &backend, &s, &j, &wd, None).unwrap_err();
+        let err = run_pre(&backend, &backend, &s, &j, &wd, None, "test-action").unwrap_err();
         assert!(err.starts_with("set Assignee=octocat:"), "{err}");
         // The clone is never attempted: the workdir stays absent.
         assert!(!wd.exists(), "clone must not run after an assignee failure");
@@ -7593,7 +7610,16 @@ mod tests {
         let mut j = job();
         j.clone_url = origin.to_str().unwrap().to_string();
 
-        run_pre(&backend, &backend, &src(), &j, &wd, Some("fix/existing")).unwrap();
+        run_pre(
+            &backend,
+            &backend,
+            &src(),
+            &j,
+            &wd,
+            Some("fix/existing"),
+            "test-action",
+        )
+        .unwrap();
 
         let out = {
             let _path_guard = crate::testutil::path_env_lock();
@@ -7606,6 +7632,54 @@ mod tests {
         };
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "fix/existing");
         assert_eq!(std::fs::read_to_string(wd.join("f.txt")).unwrap(), "fix");
+    }
+
+    /// `native.youtrack.install_hooks: false` makes `run_pre` skip the hook
+    /// install entirely: a clone whose repo has an `install-hooks` recipe
+    /// gets no `.git/hooks/pre-commit` written. The default (`true`) is
+    /// unchanged: the existing `install_hooks_*` unit tests above cover that
+    /// behavior directly, and `run_pre_clones_the_resume_branch_when_set`
+    /// above already exercises `run_pre` with the default enabled.
+    #[test]
+    fn run_pre_skips_hook_install_when_disabled() {
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_in(&origin, &["init"]);
+        set_identity(&origin);
+        std::fs::write(
+            origin.join("justfile"),
+            "install-hooks:\n    #!/usr/bin/env sh\n    printf '#!/usr/bin/env sh\\nexec just pre-commit\\n' > .git/hooks/pre-commit\n    chmod +x .git/hooks/pre-commit\n",
+        )
+        .unwrap();
+        std::fs::write(origin.join("f.txt"), "main").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-m", "feat: base"]);
+
+        let wd = base.path().join("clone");
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+                    "",
+                )
+                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], ""),
+        );
+        let keys = base.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
+        let backend = CliBackend::new(runner.clone()).with_keys_path(&keys);
+        let mut j = job();
+        j.clone_url = origin.to_str().unwrap().to_string();
+        let mut s = src();
+        s.install_hooks = false;
+
+        run_pre(&backend, &backend, &s, &j, &wd, None, "test-action").unwrap();
+
+        assert!(
+            !wd.join(".git/hooks/pre-commit").exists(),
+            "install_hooks: false must skip the hook install"
+        );
     }
 
     #[test]
