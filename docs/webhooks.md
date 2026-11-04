@@ -215,7 +215,10 @@ daemon's own tick (CLAUDE-328, see below). Both entry points make the same decis
      merge the base into the branch, instead of racing into Forgejo's 405 refusal to merge a behind-base PR. A
      successful update comments that the branch was updated and leaves the issue at Code Review; updating a branch
      retriggers CI, and the next `success` event tries again. A failed update (e.g. a real conflict) comments the
-     failure and fails the run.
+     failure and fails the run. Before updating, the runner checks the action's `concurrency.max_ci_in_flight_per_repo`
+     (CLAUDE-535): it waits, with no comment and no update, while another PR's branch update on the repo is still in CI
+     or the repo's other runner PRs with CI pending are at the cap, so one merge to the base does not retrigger full CI
+     on every open agent PR at once.
    - **`behind_base: false` and not mergeable** (a real conflict, still-checking, or a WIP PR): comments that the PR
      is not mergeable and leaves the issue at Code Review.
    - **`behind_base: false` and mergeable:** merges it as a merge-commit and posts a "runner merged" comment; it makes

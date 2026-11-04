@@ -134,7 +134,8 @@ GitHub MCP endpoint (GitHub), `git`, `claude`, `nu` (default interpreter for scr
 - Per-action `limits`: `max_attempts_per_key` (default 3), `max_runs_per_day` (20), `claude_timeout_seconds` (600),
   `daily_budget_usd` (5.00), `run_budget_usd`, `budget_warn_fraction`, `max_issues_per_run`, `review_timeout_seconds`
   (1800). `concurrency` has `max_parallel` and a `key` list; two jobs sharing a concurrency key never overlap, across
-  scheduled runs and manual triggers. The key is the literal joined value of those fields, not prefixed by the
+  scheduled runs and manual triggers. `concurrency.max_ci_in_flight_per_repo` (default 3, `0` disables) caps the runner
+  PRs on one repo with CI pending (`SPEC-3.3`). The key is the literal joined value of those fields, not prefixed by the
   action name, and is held in one process-wide gate: two jobs from *different* actions that resolve to the same key
   value also never overlap, not only two jobs of the same action.
 - `claude` block: `cwd`, `allowed_tools`, `permission_mode`, `model`, `effort`, `autocompact`. Precedence for model,
@@ -292,6 +293,10 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   must still equal the queued value, and the dependency gate must pass. The dependency gate blocks on open issues linked
   by the configured verbs (defaults: `depends on`, `parent for`), leaves the issue queued, comments the blockers once,
   and re-evaluates after `recheck_timeout`.
+- CI in-flight cap (CLAUDE-535): after the dependency gate, a pickup is deferred while
+  `concurrency.max_ci_in_flight_per_repo` of the repo's other open agent PRs have CI `pending`: the issue stays queued,
+  no attempt is consumed and nothing is cloned. A PR whose status lookup fails is logged at `warn` and not counted,
+  and a store or forge read failure lets the pickup proceed. `0` disables the cap.
 - Pre: set the field to working and `State` to the in-progress value, optionally set `Assignee`, then
   `git clone --depth 50` and install the repo's own git hooks (`just install-hooks`, when the clone has that
   recipe) so a commit or push that fails the repo's local checks is blocked locally, not only caught later by CI
@@ -347,7 +352,9 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   back to leaving it at Code Review. When the forge reports no `behind_base` at all, automerge takes no merge action:
   on Forgejo this means the runtime's `fj` predates FJ-99 and a human must act; on GitHub, `mergeStateStatus` is
   still `UNKNOWN` (computed lazily after a push) and the reconciler re-checks on its next pass. Each of these
-  outcomes posts one comment naming the reason.
+  outcomes posts one comment naming the reason. The behind-base update runs only when the repo is below the
+  `concurrency.max_ci_in_flight_per_repo` cap and no other PR's branch update on the repo is still in CI; otherwise it
+  is deferred with no comment, and the next success event or reconciler pass asks again.
 - Targets: `forgejo` (`base_url`, `token_ref`, `pr_strategy`) and `github` (`hosts`, `mcp_endpoint`, `token_ref`). A job
   whose repository host is `github.com` or listed in `github.hosts` uses the GitHub backend; any other host uses `fj`.
 - Prompt: `prompt` overrides; otherwise `prompt_preset` is `default` or `audit`.

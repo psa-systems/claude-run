@@ -160,8 +160,9 @@
     <div class="grid2">
       {% call m::numfield("Max parallel", "concurrency_max_parallel", form.concurrency_max_parallel, "1 = strictly sequential", "1") %}
       {% call m::textfield("Concurrency key", "concurrency_key", form.concurrency_key, "project, repo, workflow") %}
+      {% call m::numfield("Max CI in flight per repo", "concurrency_max_ci_in_flight_per_repo", form.concurrency_max_ci_in_flight_per_repo, "3 default; 0 = no cap", "0") %}
     </div>
-    <span class="dim" style="font-size: 12px; margin-top: 4px; display: block;">Max parallel is the per-run cap on distinct-key jobs in flight. The comma-separated key names the job fields whose values compose the per-key serialization scope (per-key concurrency is fixed at 1). The defaults (max parallel 1, key <code>project, repo, workflow</code>) are omitted from the saved file.</span>
+    <span class="dim" style="font-size: 12px; margin-top: 4px; display: block;">Max parallel is the per-run cap on distinct-key jobs in flight. The comma-separated key names the job fields whose values compose the per-key serialization scope (per-key concurrency is fixed at 1). Max CI in flight per repo (CLAUDE-535) defers a pickup, and holds a behind-base branch update, while that many runner PRs on the repo have CI pending; 0 disables both. The defaults (max parallel 1, key <code>project, repo, workflow</code>, cap 3) are omitted from the saved file.</span>
   </div>
 
   <div class="row-actions" style="margin-top: 12px;">

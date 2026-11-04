@@ -610,6 +610,10 @@ pub enum ProcessedJob {
     /// attempt (like `Filtered` / `CapHit`, no `attempts_increment` runs on this
     /// path). `blockers` lists the unmet dependencies (`ID (verb)`), for logging.
     Blocked { key: String, blockers: Vec<String> },
+    /// CLAUDE-535: the repo already has `max_ci_in_flight_per_repo` runner PRs
+    /// with CI pending, so the issue was left Queued and never cloned or handed
+    /// to claude. Consumes no attempt. `pending` is the count that was found.
+    Deferred { key: String, pending: u32 },
     /// Job reached at least pre steps; outcome record is meaningful.
     Done {
         key: String,

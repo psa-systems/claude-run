@@ -86,7 +86,7 @@ The daemon does not serialize runs per action. An issue queued while a run is in
 **overlapping** run once the action's `schedule` makes it due (SPEC-2.2: for `interval`, once `spec` has passed since the
 last run started) and `regather_interval` (default 60s) has elapsed, rather than waiting for the in-flight run to drain, and it is
 never blocked behind an unrelated in-flight run of another action. A manual `trigger` during an in-flight run likewise
-starts an overlapping pickup run instead of being silently dropped. Concurrency is bounded by four limits:
+starts an overlapping pickup run instead of being silently dropped. Concurrency is bounded by five limits:
 
 - **Per-action `max_parallel`** (the action's `concurrency.max_parallel`, default 1), now enforced **daemon-wide**: the
   total number of concurrent jobs for an action stays `<= max_parallel` across all its overlapping runs, not just within
@@ -96,6 +96,9 @@ starts an overlapping pickup run instead of being silently dropped. Concurrency 
   `max_parallel`, so a single action still reaches its full per-action cap out of the box.
 - **Per-key serialization** (unchanged): same-repo / same-project jobs still serialize by the daemon-wide key gate, so
   distinct repos parallelize but two jobs against the same repo never run at once, even across overlapping runs.
+- **Per-repo CI in flight** (CLAUDE-535, `youtrack` only): the action's `concurrency.max_ci_in_flight_per_repo`
+  (default 3, `0` disables) defers a pickup, and holds back automerge's behind-base branch update, while that many
+  runner PRs on the repo have CI pending. A deferred issue stays Queued and consumes no attempt.
 - **One gather at a time per action** (CLAUDE-228): a scheduled pickup is skipped while that action's previous gather is
   still running. A gather is the `yt list` / `fj` scan that runs before `run_begin`, and when the source slows down it can
   outlast the 60s cadence; each stacked fire then re-ran the same query against the same source for no new work. The skip
