@@ -3212,6 +3212,8 @@ struct YoutrackEditForm {
     limit_review_timeout_seconds: String,
     /// Per-run parallelism cap (number-as-text, like the `limit_*` fields).
     concurrency_max_parallel: String,
+    /// Per-repo cap on runner PRs with CI pending (CLAUDE-535); `0` disables.
+    concurrency_max_ci_in_flight_per_repo: String,
     /// Comma-separated job-field names composing the concurrency key.
     concurrency_key: String,
     /// Present ("on") when the enabled checkbox is checked, absent otherwise.
@@ -3290,6 +3292,7 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
         state_in_progress: c.youtrack.states.in_progress,
         state_done: c.youtrack.states.done,
         concurrency_max_parallel: conc.max_parallel.to_string(),
+        concurrency_max_ci_in_flight_per_repo: conc.max_ci_in_flight_per_repo.to_string(),
         concurrency_key: conc.key.join(", "),
         fj_pr_strategy: c.forgejo.pr_strategy.as_str().to_string(),
         deps_enabled: deps.enabled.then(|| "on".to_string()),
@@ -3376,6 +3379,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         limit_max_issues_per_run: n(a.limits.max_issues_per_run),
         limit_review_timeout_seconds: n(a.limits.review_timeout_seconds),
         concurrency_max_parallel: a.concurrency.max_parallel.to_string(),
+        concurrency_max_ci_in_flight_per_repo: a.concurrency.max_ci_in_flight_per_repo.to_string(),
         concurrency_key: a.concurrency.key.join(", "),
         enabled: a.enabled.then(|| "on".to_string()),
         yt_write_projects: yt.youtrack.write_projects.join(", "),
@@ -3694,6 +3698,12 @@ fn youtrack_form_to_yaml(
             .parse::<u32>()
             .map_err(|_| format!("Max parallel must be a whole number (got `{t}`)"))?,
     };
+    let max_ci_in_flight_per_repo = match form.concurrency_max_ci_in_flight_per_repo.trim() {
+        "" => Concurrency::default().max_ci_in_flight_per_repo,
+        t => t
+            .parse::<u32>()
+            .map_err(|_| format!("Max CI in flight per repo must be a whole number (got `{t}`)"))?,
+    };
     let key: Vec<String> = {
         let parsed: Vec<String> = form
             .concurrency_key
@@ -3708,7 +3718,11 @@ fn youtrack_form_to_yaml(
             parsed
         }
     };
-    let concurrency = Concurrency { max_parallel, key };
+    let concurrency = Concurrency {
+        max_parallel,
+        key,
+        max_ci_in_flight_per_repo,
+    };
     if concurrency == Concurrency::default() {
         map.remove("concurrency");
     } else {
@@ -9277,6 +9291,35 @@ mod tests {
             let out = youtrack_form_to_yaml(empty_base(), &form).unwrap();
             let reloaded = crate::action::validate_str(&out, "<test>").unwrap();
             assert_eq!(reloaded.action.concurrency, loaded.action.concurrency);
+        }
+
+        #[test]
+        fn youtrack_form_round_trips_the_ci_in_flight_cap() {
+            // CLAUDE-535: default 3 is omitted from the file; 0 and other values
+            // survive the form and back; a non-number is an inline error.
+            let loaded =
+                crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                    .unwrap();
+            let form = action_to_youtrack_form(&loaded.action).unwrap();
+            assert_eq!(form.concurrency_max_ci_in_flight_per_repo, "3");
+
+            for cap in ["0", "5"] {
+                let mut f = form.clone();
+                f.concurrency_max_ci_in_flight_per_repo = cap.to_string();
+                let out = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+                let reloaded = crate::action::validate_str(&out, "<test>").unwrap();
+                assert_eq!(
+                    reloaded.action.concurrency.max_ci_in_flight_per_repo,
+                    cap.parse::<u32>().unwrap()
+                );
+                let back = action_to_youtrack_form(&reloaded.action).unwrap();
+                assert_eq!(back.concurrency_max_ci_in_flight_per_repo, cap);
+            }
+
+            let mut bad = form.clone();
+            bad.concurrency_max_ci_in_flight_per_repo = "many".to_string();
+            let err = youtrack_form_to_yaml(empty_base(), &bad).unwrap_err();
+            assert!(err.contains("Max CI in flight per repo"), "{err}");
         }
 
         #[test]

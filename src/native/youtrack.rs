@@ -1269,6 +1269,36 @@ async fn process_job(
         }
     }
 
+    // ---- CI in-flight cap (CLAUDE-535) ----
+    // One slow CI runner serves every runner PR on a repo, so a pickup waits while
+    // `max_ci_in_flight_per_repo` of the repo's other runner PRs still have CI
+    // pending. Like the dependency gate it leaves the issue Queued, consumes no
+    // attempt and never clones; CI-fix re-queues pass through here too. A store or
+    // forge read failure is logged and the pickup proceeds.
+    let ci_cap = action.concurrency.max_ci_in_flight_per_repo;
+    if ci_cap > 0 {
+        match ci_cap_reached(pool, forge, job, ci_cap).await {
+            Ok(Some(pending)) => {
+                info!(
+                    action = %action.name,
+                    key = %key,
+                    repo = %job.repo_path,
+                    pending,
+                    cap = ci_cap,
+                    "repo at its CI in-flight cap; job deferred, left Queued, no attempt consumed"
+                );
+                return Ok(ProcessedJob::Deferred {
+                    key: key.clone(),
+                    pending,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(action = %action.name, key = %key, error = %e, "CI in-flight cap check failed; proceeding with pickup");
+            }
+        }
+    }
+
     // ---- resume an existing open PR's branch on a re-queue ----
     // A DB lookup (async) plus, when a record is found, a live confirmation
     // against the forge (sync, so wrapped). Any failure here just means a fresh
@@ -1826,6 +1856,32 @@ struct PrResume {
     branch: String,
     /// Human-facing PR URL, rendered into the `{{existing_pr_url}}` placeholder.
     pr_url: String,
+}
+
+/// CLAUDE-535: `Some(pending)` when the job's repo already has `cap` other
+/// runner PRs with CI pending (the job's own PR does not count), else `None`.
+/// A store read failure is an `Err`; a failed per-PR status lookup is logged by
+/// [`crate::ci_gate::pending_ci`] and not counted.
+async fn ci_cap_reached(
+    pool: &DbPool,
+    forge: &dyn Forge,
+    job: &YoutrackJob,
+    cap: u32,
+) -> Result<Option<u32>> {
+    let host = host_only(&job.repo_host);
+    let rows = crate::ci_failure::store::open_agent_prs(pool).await?;
+    let pending = crate::blocking::in_place(|| {
+        crate::ci_gate::pending_ci(
+            forge,
+            &rows,
+            &host,
+            &job.repo_path,
+            Some(&job.key),
+            None,
+            cap,
+        )
+    });
+    Ok((pending >= cap).then_some(pending))
 }
 
 /// Look up whether `job`'s issue already has an open PR recorded
@@ -5226,6 +5282,185 @@ mod tests {
         );
         assert!(tracker.comments.lock().unwrap().is_empty());
         assert_eq!(state::attempts_get(&pool, "yt", "MK-16").await.unwrap(), 0);
+    }
+
+    /// CLAUDE-535 fixture: a forge whose PRs report the CI state listed in
+    /// `states`; a PR not listed has no canned response, so its lookup fails.
+    fn ci_forge(states: &[(u64, &str)]) -> CliBackend {
+        let mut runner = StubRunner::new();
+        for (pr, state) in states {
+            let id = format!("contoso/claude-run#{pr}");
+            let json = format!(r#"{{"pr":{pr},"state":"{state}","mergeable":true}}"#);
+            runner = runner.ok(
+                "fj",
+                &["--host", "dev.a8n.run", "pr", "status", &id, "--json"],
+                &json,
+            );
+        }
+        CliBackend::new(Arc::new(runner)).with_fj_read_retry_waits([Duration::ZERO; 3])
+    }
+
+    async fn record_ci_pr(pool: &DbPool, issue: &str, pr: i64) {
+        crate::ci_failure::store::record_agent_pr(
+            pool,
+            "yt",
+            issue,
+            "dev.a8n.run",
+            "contoso/claude-run",
+            pr,
+            &format!("fix/{issue}"),
+            "open",
+            false,
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ci_cap_reached_counts_other_pending_prs_only() {
+        let pool = mem_pool().await;
+        // The job's own PR (MK-16, #1) and three others.
+        for (issue, pr) in [("MK-16", 1), ("MK-20", 2), ("MK-21", 3), ("MK-22", 4)] {
+            record_ci_pr(&pool, issue, pr).await;
+        }
+        let j = job();
+
+        let at_cap = ci_forge(&[
+            (1, "pending"),
+            (2, "pending"),
+            (3, "pending"),
+            (4, "pending"),
+        ]);
+        assert_eq!(
+            ci_cap_reached(&pool, &at_cap, &j, 3).await.unwrap(),
+            Some(3),
+            "three OTHER pending PRs reach a cap of 3 (the job's own #1 is skipped)"
+        );
+
+        let below = ci_forge(&[
+            (1, "pending"),
+            (2, "pending"),
+            (3, "pending"),
+            (4, "success"),
+        ]);
+        assert_eq!(
+            ci_cap_reached(&pool, &below, &j, 3).await.unwrap(),
+            None,
+            "only two others pending, below the cap"
+        );
+
+        // PR 3 has no canned response, so its status lookup fails and is not counted.
+        let failed_lookup = ci_forge(&[(1, "pending"), (2, "pending"), (4, "pending")]);
+        assert_eq!(
+            ci_cap_reached(&pool, &failed_lookup, &j, 3).await.unwrap(),
+            None,
+            "a failed status lookup is not counted toward the cap"
+        );
+    }
+
+    async fn run_gated_process_job(
+        pool: &DbPool,
+        forge: &CliBackend,
+        cap: u32,
+        cancelled: bool,
+    ) -> (ProcessedJob, FakeTracker) {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = ClaudeInvoker::new(Some("/nonexistent/claude-stub-should-never-run.sh"));
+        let tracker = FakeTracker::new("Queued");
+        let mut s = src();
+        s.dependencies.enabled = false;
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let yaml = format!(
+            "name: yt\nkind: youtrack\nnative: {{}}\nconcurrency:\n  max_ci_in_flight_per_repo: {cap}\n"
+        );
+        let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout: Duration::from_secs(30),
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+            review_timeout: Duration::from_secs(1800),
+        };
+        let cancel = CancellationToken::new();
+        if cancelled {
+            cancel.cancel();
+        }
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+        let pause = crate::pause::PauseGate::new(pool.clone()).for_action_run("yt");
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            pool,
+            &claude,
+            &tracker,
+            forge,
+            &s,
+            &limits,
+            &cancel,
+            &pause,
+            &spend,
+            &job(),
+            PrStrategy::Branch,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+        (outcome, tracker)
+    }
+
+    /// CLAUDE-535: a pickup for a repo at its CI cap leaves the issue Queued,
+    /// writes nothing and spends no attempt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_job_defers_when_the_repo_is_at_its_ci_cap() {
+        let pool = mem_pool().await;
+        for (issue, pr) in [("MK-20", 2), ("MK-21", 3), ("MK-22", 4)] {
+            record_ci_pr(&pool, issue, pr).await;
+        }
+        let forge = ci_forge(&[(2, "pending"), (3, "pending"), (4, "pending")]);
+
+        let (outcome, tracker) = run_gated_process_job(&pool, &forge, 3, true).await;
+        assert!(
+            matches!(&outcome, ProcessedJob::Deferred { key, pending: 3 } if key == "MK-16"),
+            "got {outcome:?}"
+        );
+        assert_eq!(tracker.field(), "Queued");
+        assert!(tracker.set_calls.lock().unwrap().is_empty());
+        assert!(tracker.comments.lock().unwrap().is_empty());
+        assert_eq!(state::attempts_get(&pool, "yt", "MK-16").await.unwrap(), 0);
+    }
+
+    /// CLAUDE-535: below the cap, and with the cap at 0, the pickup is not
+    /// deferred. The cancelled token then stops the job at the next checkpoint
+    /// (`Filtered`), before any clone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_job_is_not_deferred_below_the_cap_or_with_cap_zero() {
+        let pool = mem_pool().await;
+        for (issue, pr) in [("MK-20", 2), ("MK-21", 3), ("MK-22", 4)] {
+            record_ci_pr(&pool, issue, pr).await;
+        }
+        let forge = ci_forge(&[(2, "pending"), (3, "pending"), (4, "pending")]);
+
+        let (below, _) = run_gated_process_job(&pool, &forge, 4, true).await;
+        assert!(
+            matches!(below, ProcessedJob::Filtered { .. }),
+            "got {below:?}"
+        );
+
+        let (disabled, _) = run_gated_process_job(&pool, &forge, 0, true).await;
+        assert!(
+            matches!(disabled, ProcessedJob::Filtered { .. }),
+            "got {disabled:?}"
+        );
     }
 
     /// The Claude login needing renewal mid-run trips the readiness gate

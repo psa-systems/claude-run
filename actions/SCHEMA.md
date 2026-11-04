@@ -55,6 +55,7 @@ limits: # optional per-action overrides of the built-in defaults
 concurrency: # optional; default is strictly sequential
   max_parallel: 1           # distinct-key jobs in flight at once, daemon-wide (default 1)
   key: [ project, repo, workflow ]   # job fields composing the concurrency key
+  max_ci_in_flight_per_repo: 3       # runner PRs per repo with CI pending at once; 0 = no cap
 schedule: # optional; omit for trigger-only (manual)
   kind: interval            # interval | cron | manual
   spec: 30m                 # interval/cron spec; omit for manual
@@ -980,12 +981,14 @@ never run at once.
 concurrency:
   max_parallel: 4                  # up to 4 distinct-key jobs at a time
   key: [ project, repo, workflow ]   # default; the per-job concurrency key
+  max_ci_in_flight_per_repo: 3       # default; 0 disables the CI in-flight cap
 ```
 
 | Key            | Default                     | Meaning                                                   |
 |----------------|-----------------------------|-----------------------------------------------------------|
 | `max_parallel` | `1`                         | Maximum distinct-key jobs in flight at once for this action, enforced daemon-wide. |
 | `key`          | `[project, repo, workflow]` | Job fields whose values compose the concurrency key.      |
+| `max_ci_in_flight_per_repo` | `3`            | `youtrack` only (CLAUDE-535): the most runner PRs on one repo that may have CI pending at once; `0` disables the cap. |
 
 Semantics:
 
@@ -1017,6 +1020,14 @@ Semantics:
 - **Caps stay best-effort.** The daily cap and budget are checked before each job launches; because up to
   `max_parallel_global` jobs can pass the check before any of them advances the ledger, the cap may overshoot by at most
   `max_parallel_global - 1` jobs.
+- **`max_ci_in_flight_per_repo` bounds the runner's own CI load on one repo (CLAUDE-535).** A job ends once its PR is
+  open while that PR's CI keeps running, so the key gate alone does not stop the next job from opening another PR on a
+  slow CI runner. The `youtrack` action counts the repo's other open runner PRs (rows in `agent_pull_requests`, the
+  job's own PR excluded) whose `Forge::pr_status` state is `pending`; at the cap the pickup returns
+  `ProcessedJob::Deferred`: the issue stays Queued, no attempt is consumed, nothing is cloned. The same cap holds
+  automerge's behind-base branch update back, and only one branch update per repo may have CI pending at a time (the
+  holder is kept in memory, so a restart costs at most one extra update). A PR status lookup that fails is logged at
+  `warn` and not counted. The human-initiated `/claude` comment push is exempt. `0` disables both gates.
 - **`max_parallel` is bounded by available worker threads.** Each running job occupies a thread for the duration of its
   `claude` invocation, so set `max_parallel` no higher than the host has cores to spare.
 

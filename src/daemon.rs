@@ -864,6 +864,7 @@ fn build_mint_context(
         paths: paths.clone(),
         pr_comment_runner: Arc::new(crate::provider::ProcessRunner::new()),
         comment_dispatch,
+        ci_update_holders: Arc::new(crate::ci_gate::UpdateHolders::new()),
     })
 }
 

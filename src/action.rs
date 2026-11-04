@@ -2100,6 +2100,10 @@ pub struct Concurrency {
     /// without a code change. `workflow` is forward-looking (reserved for a
     /// future Forgejo-failed-workflow action) and unset on YouTrack jobs today.
     pub key: Vec<String>,
+    /// CLAUDE-535: the most runner PRs on one repo that may have CI pending at
+    /// once. A youtrack pickup for a repo at the cap is deferred, and a
+    /// behind-base branch update waits at the cap. `0` disables both gates.
+    pub max_ci_in_flight_per_repo: u32,
 }
 
 impl Default for Concurrency {
@@ -2107,9 +2111,13 @@ impl Default for Concurrency {
         Self {
             max_parallel: 1,
             key: default_concurrency_key(),
+            max_ci_in_flight_per_repo: DEFAULT_MAX_CI_IN_FLIGHT_PER_REPO,
         }
     }
 }
+
+/// CLAUDE-535: [`Concurrency::max_ci_in_flight_per_repo`]'s default.
+pub const DEFAULT_MAX_CI_IN_FLIGHT_PER_REPO: u32 = 3;
 
 fn default_concurrency_key() -> Vec<String> {
     vec![

@@ -27,6 +27,7 @@ pub mod autofix;
 pub mod blocking;
 pub mod cancel;
 pub mod ci_failure;
+pub mod ci_gate;
 pub mod claude;
 pub mod claude_login;
 pub mod client;

@@ -851,6 +851,10 @@ pub struct MintContext {
     /// comment listener unconfigured) keeps today's "needs a human" comment
     /// behavior exactly.
     pub comment_dispatch: Option<CommentDispatch>,
+    /// CLAUDE-535: per `(host, repo)`, the PR whose behind-base branch update is
+    /// still in CI. In memory only: a restart losing it costs at most one
+    /// extra update. Shared by the webhook trigger and the reconciler.
+    pub ci_update_holders: Arc<crate::ci_gate::UpdateHolders>,
 }
 
 /// SPEC-4.4.3: the automerge conflict auto-resolve dispatch handle on [`MintContext`], used to send a synthetic `/claude`-equivalent command to the comment listener on an `update_pr_branch` failure.
@@ -4710,6 +4714,7 @@ async fn apply_automerge_decision(
             return Err(msg);
         }
     };
+    let ci_cap = loaded.action.concurrency.max_ci_in_flight_per_repo;
     let (youtrack_cfg, github_cfg) = match loaded.action.native {
         Some(crate::action::NativeConfig::Youtrack(cfg)) => (cfg.youtrack, cfg.github),
         _ => {
@@ -4846,6 +4851,42 @@ async fn apply_automerge_decision(
                 Err(msg)
             }
             Some(true) => {
+                // CLAUDE-535: bring the branch current only when CI capacity
+                // allows, so one merge to base does not retrigger full CI on
+                // every open agent PR at once. A wait takes no action and posts
+                // no comment; the next webhook or reconciler pass asks again.
+                if ci_cap > 0 {
+                    let open_rows = match ci_failure_store::open_agent_prs(pool).await {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            warn!(repo = %repo, pr = pr_number, error = %e, "action-run success: open agent PR read failed; branch-update CI gate counts no other PRs");
+                            Vec::new()
+                        }
+                    };
+                    let forge_for_wait = forge.clone();
+                    let holders = mint.ci_update_holders.clone();
+                    let host_owned = host.to_string();
+                    let repo_owned = repo.to_string();
+                    let wait = tokio::task::spawn_blocking(move || {
+                        crate::ci_gate::branch_update_wait(
+                            forge_for_wait.as_ref(),
+                            &holders,
+                            &open_rows,
+                            &host_owned,
+                            &repo_owned,
+                            pr_number as i64,
+                            ci_cap,
+                        )
+                    })
+                    .await
+                    .map_err(|e| format!("branch_update_wait task panicked: {e}"))?;
+                    if let Some(reason) = wait {
+                        info!(repo = %repo, pr = pr_number, %reason, "action-run success: behind base; branch update deferred");
+                        return Ok(AutomergeOutcome::NoAction(format!(
+                            "PR #{pr_number} is behind base; branch update deferred: {reason}"
+                        )));
+                    }
+                }
                 let forge_for_update = forge.clone();
                 let host_owned = host.to_string();
                 let repo_owned = repo.to_string();
@@ -4856,6 +4897,7 @@ async fn apply_automerge_decision(
                 .map_err(|e| format!("update_pr_branch task panicked: {e}"))?;
                 match update_result {
                     Ok(()) => {
+                        mint.ci_update_holders.set(host, repo, pr_number as i64);
                         let body =
                             crate::native::youtrack::automerge_branch_updated_comment(pr_url);
                         post_issue_comment(
@@ -5847,6 +5889,8 @@ mod tests {
         /// tests. `None` (the default) errors, matching every pre-existing test
         /// that never reaches the automerge path.
         pr_status: StdMutex<Option<crate::provider::PrStatus>>,
+        /// Per-PR `pr_status` overrides (CLAUDE-535), consulted before `pr_status`.
+        pr_status_by_pr: StdMutex<std::collections::HashMap<u64, crate::provider::PrStatus>>,
         /// When set, `update_pr_branch` fails with this message.
         update_pr_branch_error: StdMutex<Option<String>>,
         /// When set, `merge_pr` fails with this message.
@@ -5876,6 +5920,7 @@ mod tests {
                 open_prs: StdMutex::new(Vec::new()),
                 open_prs_error: StdMutex::new(None),
                 pr_status: StdMutex::new(None),
+                pr_status_by_pr: StdMutex::new(std::collections::HashMap::new()),
                 update_pr_branch_error: StdMutex::new(None),
                 merge_pr_error: StdMutex::new(None),
                 state_field: StdMutex::new(None),
@@ -5926,6 +5971,18 @@ mod tests {
                 head_sha: head_sha.map(str::to_string),
             });
             self
+        }
+        /// Make `pr_status` for `pr_number` alone report `state`, behind base or not.
+        fn set_pr_status_for(&self, pr_number: u64, state: &str, behind_base: Option<bool>) {
+            self.pr_status_by_pr.lock().unwrap().insert(
+                pr_number,
+                crate::provider::PrStatus {
+                    state: state.to_string(),
+                    mergeable: Some(true),
+                    behind_base,
+                    head_sha: None,
+                },
+            );
         }
         fn with_update_pr_branch_error(self, message: &str) -> Self {
             *self.update_pr_branch_error.lock().unwrap() = Some(message.to_string());
@@ -6120,6 +6177,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("pr_status {pr_number}"));
+            if let Some(status) = self.pr_status_by_pr.lock().unwrap().get(&pr_number) {
+                return Ok(status.clone());
+            }
             self.pr_status
                 .lock()
                 .unwrap()
@@ -6271,6 +6331,7 @@ mod tests {
             paths: test_paths(paths_dir),
             pr_comment_runner,
             comment_dispatch: None,
+            ci_update_holders: Arc::new(crate::ci_gate::UpdateHolders::new()),
         }
     }
 
@@ -11477,6 +11538,140 @@ mod tests {
             );
             assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
             assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
+        }
+
+        /// CLAUDE-535: an agent PR row on the shared test repo.
+        async fn record_open_pr(pool: &DbPool, issue: &str, pr: i64) {
+            ci_failure_store::record_agent_pr(
+                pool,
+                "yt",
+                issue,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                pr,
+                &format!("fix/{issue}"),
+                "open",
+                false,
+                "2026-09-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn run_success_for(ctx: &MintContext, pool: &DbPool, pr: u64) -> String {
+            handle_action_success_for_pr(
+                ctx,
+                pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                pr,
+                &format!("https://dev.a8n.run/contoso/claude-run/pulls/{pr}"),
+            )
+            .await
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn behind_base_update_is_deferred_while_the_repo_is_at_the_ci_cap() {
+            // CLAUDE-535: with two other runner PRs pending and a cap of 2, a green
+            // behind-base PR is neither updated nor commented on.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            std::fs::write(
+                dir.path().join("actions/yt.yml"),
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\nconcurrency:\n  max_ci_in_flight_per_repo: 2\n",
+            )
+            .unwrap();
+            for (issue, pr) in [("MK-16", 7), ("MK-17", 8), ("MK-18", 9)] {
+                record_open_pr(&pool, issue, pr).await;
+            }
+            let backend =
+                Arc::new(StoreBackend::new().with_pr_status_behind("success", true, Some(true)));
+            backend.set_pr_status_for(8, "pending", Some(false));
+            backend.set_pr_status_for(9, "pending", Some(false));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = run_success_for(&ctx, &pool, 7).await;
+            assert!(result.contains("deferred"), "{result}");
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("update_pr_branch")),
+                "{calls:?}"
+            );
+            assert!(!calls.iter().any(|c| c.starts_with("comment")), "{calls:?}");
+            assert_eq!(
+                ctx.ci_update_holders
+                    .get("dev.a8n.run", "contoso/claude-run"),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn second_branch_update_waits_for_the_holders_ci_then_goes() {
+            // CLAUDE-535: after PR 7's branch is updated it holds the repo's update
+            // slot; PR 8 waits while PR 7's CI is pending and updates once it is not.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            record_open_pr(&pool, "MK-16", 7).await;
+            record_open_pr(&pool, "MK-17", 8).await;
+            let backend =
+                Arc::new(StoreBackend::new().with_pr_status_behind("success", true, Some(true)));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let first = run_success_for(&ctx, &pool, 7).await;
+            assert!(first.contains("branch updated"), "{first}");
+            assert_eq!(
+                ctx.ci_update_holders
+                    .get("dev.a8n.run", "contoso/claude-run"),
+                Some(7)
+            );
+
+            backend.set_pr_status_for(7, "pending", Some(false));
+            let second = run_success_for(&ctx, &pool, 8).await;
+            assert!(
+                second.contains("deferred") && second.contains("PR #7"),
+                "{second}"
+            );
+            assert!(
+                !backend.calls().iter().any(|c| c == "update_pr_branch 8"),
+                "{:?}",
+                backend.calls()
+            );
+
+            backend.set_pr_status_for(7, "success", Some(false));
+            let third = run_success_for(&ctx, &pool, 8).await;
+            assert!(third.contains("branch updated"), "{third}");
+            assert!(backend.calls().iter().any(|c| c == "update_pr_branch 8"));
+            assert_eq!(
+                ctx.ci_update_holders
+                    .get("dev.a8n.run", "contoso/claude-run"),
+                Some(8)
+            );
+        }
+
+        #[tokio::test]
+        async fn ci_cap_zero_never_defers_a_branch_update() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            std::fs::write(
+                dir.path().join("actions/yt.yml"),
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\nconcurrency:\n  max_ci_in_flight_per_repo: 0\n",
+            )
+            .unwrap();
+            record_open_pr(&pool, "MK-16", 7).await;
+            record_open_pr(&pool, "MK-17", 8).await;
+            let backend =
+                Arc::new(StoreBackend::new().with_pr_status_behind("success", true, Some(true)));
+            backend.set_pr_status_for(8, "pending", Some(false));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            ctx.ci_update_holders
+                .set("dev.a8n.run", "contoso/claude-run", 8);
+
+            let result = run_success_for(&ctx, &pool, 7).await;
+            assert!(result.contains("branch updated"), "{result}");
         }
 
         #[tokio::test]
