@@ -298,10 +298,13 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   no attempt is consumed and nothing is cloned. A PR whose status lookup fails is logged at `warn` and not counted,
   and a store or forge read failure lets the pickup proceed. `0` disables the cap.
 - Pre: set the field to working and `State` to the in-progress value, optionally set `Assignee`, then
-  `git clone --depth 50` and install the repo's own git hooks (`just install-hooks`, when the clone has that
-  recipe) so a commit or push that fails the repo's local checks is blocked locally, not only caught later by CI
-  (A8N-69). Hook install is best-effort: a repo with no `install-hooks` recipe, or a host without `just`, is left
-  unchanged and pickup continues.
+  `git clone --depth 50` and, unless `native.youtrack.install_hooks` is `false` (default `true`), install the
+  repo's own git hooks (`just install-hooks`, when the clone has that recipe) so a commit or push that fails
+  the repo's local checks is blocked locally, not only caught later by CI (A8N-69). Hook install is
+  best-effort: a repo with no `install-hooks` recipe, or a host without `just`, is left unchanged and pickup
+  continues. `install_hooks: false` (CLAUDE-537) skips the install entirely and logs the skip at `info`, naming
+  the action and the issue key; this does not affect the `SPEC-3.3.2` verification gate, which still runs the
+  repo's checks independently of any installed hook.
 - Claude works in the local clone; the runner pushes the result (see 3.3.1). The agent may create issues in
   `write_projects` (default: the triggering issue's project), linked `relates to` / `depends on` / `is required for`,
   never as a subtask.
