@@ -1259,15 +1259,18 @@ a `config.toml` key, for example `webhook_comment` or `docker_gc`) has no import
 
 ### 6.6 Throwaway test Postgres (`SPEC-6.6`)
 
-`claude-run test-postgres [--image <ref>] [--init-sql <file>]... -- <command> [args...]` starts a private,
+`claude-run test-postgres [--image <ref>] [--init-sql <file>]... [--network <name>] -- <command> [args...]` starts a private,
 non-durable PostgreSQL container in the Docker-in-Docker sidecar, runs `<command>` against it with `DATABASE_URL`,
 `CLAUDE_RUN_TEST_DATABASE_URL` and `CLAUDE_RUN_TEST_POSTGRES_CONTAINER` set, and tears the container down however
 the command ends (normal exit, command failure, `SIGINT`/`SIGTERM`, or a setup error), propagating the command's
 exit code (128 + signal if it was killed by one) and failing the run if teardown itself fails even when the command
 succeeded. It sweeps orphaned containers from earlier runs whose owning pid is no longer alive first, starts the
-container with a loopback-only ephemeral published port, `--rm` and no volume (the writable layer and data
-directory are both discarded on teardown), waits for an actual `psql` connection (not `pg_isready`, which can report
-ready during the official image's post-`initdb` restart) up to 60s, then disables `fsync`, `synchronous_commit` and
+container with a loopback-only ephemeral published port (or, with `--network`, on that Docker network with nothing
+published, reached by container name on port 5432), `--rm` and no volume (the writable layer and data directory are
+both discarded on teardown), waits for an actual `psql` connection (not `pg_isready`, which can report ready during
+the official image's post-`initdb` restart) up to 60s, then opens a TCP connection to the URL's host and port from
+its own process for up to 20s and fails naming `--network` when it cannot (a caller in a container of its own cannot
+reach the Docker host's loopback), then disables `fsync`, `synchronous_commit` and
 `full_page_writes` and verifies the change by reading `SHOW fsync` back, retrying for up to 20s against a
 restart-shaped connection failure. Each `--init-sql` file then runs in order with `ON_ERROR_STOP`, through the same
 retry. The generated password never appears in a log line or an error message.
@@ -1746,5 +1749,6 @@ never write the same registry destination.
 - **SPEC-11.1**: The PostgreSQL pass of the unit-test job in `.forgejo/workflows/check.yml` MUST run through
   `claude-run test-postgres` (`SPEC-6.6`) and MUST NOT use a `postgres` service container: a service's `options`
   cannot carry the server flags that disable durability, and a durable container makes the pass depend on disk flush
-  latency (`SPEC-10.1.3`). With no service there is no health check, so the `CI_POSTGRES_HEALTH_*` variables
+  latency (`SPEC-10.1.3`). The job runs in a container of its own, so the pass MUST pass `--network` with the job
+  container's network, and the step MUST carry a `timeout-minutes` far below the runner's 3 hour job limit. With no service there is no health check, so the `CI_POSTGRES_HEALTH_*` variables
   (`common` `SPEC-13.1`) do not apply to this job.

@@ -183,7 +183,31 @@ jobs:
         # SPEC-6.6: `claude-run test-postgres` starts its own non-durable
         # Postgres and sets CLAUDE_RUN_TEST_DATABASE_URL, which switches every
         # test fixture onto it, each test in a schema of its own.
-        run: cargo run -- test-postgres -- cargo test
+        #
+        # CLAUDE-541: this job is a container on its own per-job network, so a
+        # port published on the Docker host's loopback is out of its reach;
+        # Postgres joins the job's network instead and is reached by name.
+        # `job.container.network` names it; when the runner leaves it empty,
+        # read it off this container (its hostname is its id). The step
+        # timeout keeps a stall from running into the 3 hour job limit.
+        timeout-minutes: 45
+        shell: nu {0}
+        env:
+          JOB_NETWORK: ${{ job.container.network }}
+        run: |
+          mut network = ($env.JOB_NETWORK? | default "")
+          if ($network | is-empty) {
+              let me = (^hostname | str trim)
+              let found = (^docker inspect --format "{{json .NetworkSettings.Networks}}" $me | complete)
+              if $found.exit_code == 0 {
+                  $network = ($found.stdout | from json | columns | where {|n| $n not-in [bridge host none] } | get 0? | default "")
+              }
+          }
+          if ($network | is-empty) {
+              error make {msg: "cannot tell this job container's Docker network: job.container.network is empty and docker inspect of this container found none"}
+          }
+          print $"test-postgres on network ($network)"
+          ^cargo run -- test-postgres --network $network -- cargo test
 
       - name: Report job metrics
         # Last and always(), so a failing job still reports (composite actions have no post hook).
