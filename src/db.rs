@@ -372,7 +372,7 @@ pub async fn open_sqlite(db_path: &Path) -> Result<DbPool> {
             map_connect_error(
                 "sqlite",
                 POOL_MAX_CONNECTIONS,
-                POOL_ACQUIRE_TIMEOUT,
+                pool_acquire_timeout(),
                 started,
                 e,
             )
@@ -430,7 +430,7 @@ async fn open_postgres(url: &str) -> Result<DbPool> {
                 return Err(map_connect_error(
                     "postgres",
                     POOL_MAX_CONNECTIONS,
-                    POOL_ACQUIRE_TIMEOUT,
+                    pool_acquire_timeout(),
                     attempt_started,
                     e,
                 ));
@@ -474,6 +474,23 @@ async fn open_postgres(url: &str) -> Result<DbPool> {
 const POOL_MAX_CONNECTIONS: u32 = 16;
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The acquire timeout the production pools (`open_sqlite`, `open_postgres`)
+/// are built with. In production it is [`POOL_ACQUIRE_TIMEOUT`] (30s): an
+/// acquire that waits that long is a real stuck pool and should fail fast.
+/// Under `cfg(test)` it is raised to 120s, matching the test-fixture pools'
+/// own rationale (CLAUDE-524): on a contended CI host a connection can take
+/// far longer than 30s to free purely from scheduler/IO starvation, not a
+/// stuck pool (SPEC-10.1.4 slow-IO class), which was tripping the file-backed
+/// SQLite pool these tests open at 30s (CLAUDE-542). The production binary is
+/// not built with `cfg(test)`, so it keeps the 30s fail-fast behaviour.
+fn pool_acquire_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_secs(120)
+    } else {
+        POOL_ACQUIRE_TIMEOUT
+    }
+}
+
 /// Pool settings, applied to both backends.
 fn pool_options(dialect: Dialect) -> AnyPoolOptions {
     let opts = AnyPoolOptions::new()
@@ -481,8 +498,9 @@ fn pool_options(dialect: Dialect) -> AnyPoolOptions {
         // runs plus the web UI's polling.
         .max_connections(POOL_MAX_CONNECTIONS)
         // sqlx's default, stated so it is a decision and not an
-        // inherited value. An acquire that waits this long is a real fault.
-        .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+        // inherited value. An acquire that waits this long is a real fault
+        // (raised under cfg(test); see pool_acquire_timeout).
+        .acquire_timeout(pool_acquire_timeout())
         // Raised from the 2s default. With blocking work off the
         // async runtime an acquire is sub-millisecond, so 5s flags a genuine
         // regression instead of logging routine contention.
@@ -662,15 +680,15 @@ pub async fn test_pg_pool_single_connection() -> Option<DbPool> {
 /// just created. Schema-qualified so the connection's `search_path` does not
 /// matter.
 #[cfg(test)]
-async fn refuse_live_database(pool: &DbPool, schema: &str) -> anyhow::Result<()> {
+async fn refuse_live_database(conn: &mut sqlx::AnyConnection, schema: &str) -> anyhow::Result<()> {
     let regclass = format!("{schema}._sqlx_migrations");
     let already_migrated: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
         .bind(&regclass)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
     if already_migrated.is_some() {
         let database: String = sqlx::query_scalar("SELECT current_database()::text")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
         anyhow::bail!(
             "{database} already has `_sqlx_migrations`: this is a live runner database, not a \
@@ -703,10 +721,10 @@ fn fixture_script() -> &'static str {
     })
 }
 
-/// A schema name no other fixture in this process or on this server uses.
+/// A database name no other fixture in this process or on this server uses.
 /// SPEC-5.6.1.
 #[cfg(test)]
-fn next_fixture_schema() -> String {
+fn next_fixture_database() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     format!(
@@ -716,34 +734,110 @@ fn next_fixture_schema() -> String {
     )
 }
 
-/// A pool whose every connection selects `schema`; the schema itself is not
-/// created here. Refuses a live runner database on the first call of the
-/// process. SPEC-5.6.1, SPEC-5.6.6.
+/// `url` with its database path replaced by `database`, so a fixture pool
+/// connects to a disposable database of its own on the same server, port and
+/// credentials as `CLAUDE_RUN_TEST_DATABASE_URL`. SPEC-5.6.1.
+#[cfg(test)]
+fn url_with_database(url: &str, database: &str) -> anyhow::Result<String> {
+    let mut parsed = url::Url::parse(url)?;
+    parsed.set_path(database);
+    Ok(parsed.into())
+}
+
+/// Opens a short-lived connection to the maintenance database (the one `url`
+/// names) on the current runtime, for one `CREATE DATABASE` / `DROP DATABASE`.
+/// Every such statement gets its own fresh connection rather than a shared
+/// pool: each `#[tokio::test]` runs on a runtime of its own, and an sqlx pool
+/// (or connection) cached in a process-wide static breaks when reused from a
+/// later test, because its connections are bound to the runtime that opened
+/// them. A clone is a cheap catalog operation, so a connect per clone is
+/// negligible. SPEC-5.6.1.
+#[cfg(test)]
+async fn connect_maintenance(url: &str) -> sqlx::AnyConnection {
+    use sqlx::Connection;
+    sqlx::any::install_default_drivers();
+    sqlx::AnyConnection::connect(url)
+        .await
+        .unwrap_or_else(|e| panic!("connect to the test maintenance database: {e}"))
+}
+
+/// Builds the per-process template database once and returns its name: a
+/// database migrated to the full end schema that every fixture then clones
+/// with `CREATE DATABASE ... TEMPLATE`, a block copy far cheaper than
+/// replaying the migration set per test (CLAUDE-540). Refuses a live runner
+/// database here, once per process, before creating anything, by checking the
+/// maintenance database's own `public._sqlx_migrations` (SPEC-5.6.6). The
+/// `OnceCell` holds only the template's name (not a live connection), so the
+/// name is safe to reuse from every test's own runtime. SPEC-5.6.2.
+#[cfg(test)]
+async fn ensure_template(url: &str) -> &'static str {
+    use sqlx::Connection;
+    static TEMPLATE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    TEMPLATE
+        .get_or_init(|| async {
+            let mut maint = connect_maintenance(url).await;
+            refuse_live_database(&mut maint, "public")
+                .await
+                .expect("refuse a live runner database");
+            let template = format!("cr_test_template_{}", std::process::id());
+            // A leftover template from an earlier process on a reused server
+            // would otherwise fail the CREATE, so drop it first. CREATE
+            // DATABASE cannot run in a transaction, so these go one statement
+            // at a time.
+            for sql in [
+                format!("DROP DATABASE IF EXISTS {template}"),
+                format!("CREATE DATABASE {template}"),
+            ] {
+                maint
+                    .execute(sqlx::AssertSqlSafe(sql))
+                    .await
+                    .unwrap_or_else(|e| panic!("prepare the test template database: {e}"));
+            }
+            maint
+                .close()
+                .await
+                .unwrap_or_else(|e| panic!("close the maintenance connection: {e}"));
+            // Migrate the template over a connection of its own, then close
+            // it: CREATE DATABASE ... TEMPLATE refuses a template that still
+            // has a session connected to it.
+            let template_url = url_with_database(url, template.as_str())
+                .unwrap_or_else(|e| panic!("derive the template database url: {e}"));
+            let mut conn = sqlx::AnyConnection::connect(&template_url)
+                .await
+                .unwrap_or_else(|e| panic!("connect to the test template database: {e}"));
+            conn.execute(sqlx::AssertSqlSafe(fixture_script().to_owned()))
+                .await
+                .unwrap_or_else(|e| panic!("migrate the test template database: {e}"));
+            conn.close()
+                .await
+                .unwrap_or_else(|e| panic!("close the test template connection: {e}"));
+            template
+        })
+        .await
+        .as_str()
+}
+
+/// A pool connected to `database`, a disposable database of its own on the
+/// test server (its default `public` schema holds the cloned tables, so no
+/// `search_path` is needed). The database itself is not created here.
 ///
 /// Carries the same raised `acquire_timeout` as [`test_sqlite_pool`]: a
 /// capacity-constrained pool here (most acutely `max_connections(1)` via
 /// [`test_pg_pool_single_connection`]) is exposed to the identical race, a
 /// dropped transaction's background rollback losing to full-suite CPU
 /// contention, just on the Postgres leg of CI instead of the SQLite one
-/// (CLAUDE-524).
+/// (CLAUDE-524). SPEC-5.6.1.
 #[cfg(test)]
-async fn pg_pool_in_schema(url: &str, schema: &str, max_connections: u32) -> DbPool {
-    static LIVE_CHECK: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+async fn pool_on_database(url: &str, database: &str, max_connections: u32) -> DbPool {
     sqlx::any::install_default_drivers();
-    let set_path = format!("SET search_path TO {schema}");
+    let database_url = url_with_database(url, database)
+        .unwrap_or_else(|e| panic!("derive the fixture database url: {e}"));
     let acquire_timeout = Duration::from_secs(120);
     let started = Instant::now();
-    let pool = AnyPoolOptions::new()
+    AnyPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(acquire_timeout)
-        .after_connect(move |conn, _meta| {
-            let set_path = set_path.clone();
-            Box::pin(async move {
-                conn.execute(sqlx::AssertSqlSafe(set_path)).await?;
-                Ok(())
-            })
-        })
-        .connect(url)
+        .connect(&database_url)
         .await
         .map_err(|e| {
             map_connect_error(
@@ -754,21 +848,65 @@ async fn pg_pool_in_schema(url: &str, schema: &str, max_connections: u32) -> DbP
                 e,
             )
         })
-        .unwrap_or_else(|e: Error| panic!("{e}"));
-    LIVE_CHECK
-        .get_or_try_init(|| refuse_live_database(&pool, "public"))
-        .await
-        .expect("refuse a live runner database");
-    pool
+        .unwrap_or_else(|e: Error| panic!("{e}"))
 }
 
-/// Drops `schema` once `pool` is dropped or closed. One worker thread per
-/// process does all the dropping over a single connection, so cleanup adds one
-/// server connection however many tests run in parallel, and runs on a runtime
-/// of its own because the test's runtime is gone by then. A failure goes to
-/// stderr naming the schema. SPEC-5.6.4, SPEC-5.6.5.
+/// Whether `e` is Postgres reporting SQLSTATE `55006` (`object_in_use`): a
+/// `CREATE DATABASE ... TEMPLATE` whose template is momentarily "being accessed
+/// by other users" (concurrent clones from one template race this check), or a
+/// `DROP DATABASE` losing the race with the pool's own connection teardown (the
+/// pool fires its `CloseEvent` as it closes, and the server can still be
+/// tearing the last backend down for a moment after). The message is matched
+/// too, for when the `Any` driver does not surface the code.
 #[cfg(test)]
-fn drop_schema_when_closed(pool: &DbPool, url: &str, schema: &str) {
+fn is_database_in_use(e: &sqlx::Error) -> bool {
+    if let sqlx::Error::Database(db) = e {
+        if db.code().as_deref() == Some("55006") {
+            return true;
+        }
+    }
+    e.to_string().contains("being accessed by other users")
+}
+
+/// Runs `sql` (a `CREATE` or `DROP DATABASE`, neither of which can be
+/// transactional) over `conn`, retrying every 25ms while the error is
+/// [`is_database_in_use`] until `deadline` elapses. That `55006` is transient:
+/// the conflicting clone or teardown finishes and the retry succeeds. No
+/// `WITH (FORCE)`: an error that outlasts the deadline is a real problem worth
+/// surfacing, not something to force past.
+#[cfg(test)]
+async fn run_database_statement_with_retry(
+    conn: &mut sqlx::AnyConnection,
+    sql: String,
+    deadline: Duration,
+) -> std::result::Result<(), sqlx::Error> {
+    let started = Instant::now();
+    loop {
+        match conn.execute(sqlx::AssertSqlSafe(sql.clone())).await {
+            Ok(_) => return Ok(()),
+            Err(e) if is_database_in_use(&e) && started.elapsed() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Drops `database` once `pool` is dropped or closed. One worker thread per
+/// process does all the dropping over a single connection to the maintenance
+/// database, so cleanup adds one server connection however many tests run in
+/// parallel, and runs on a runtime of its own because the test's runtime is
+/// gone by then. `DROP DATABASE` names one database and cannot run in a
+/// transaction, so a backlog is drained and dropped one statement at a time
+/// (unlike the one combined `DROP SCHEMA` this replaced). Before each drop it
+/// terminates any backend still attached to the database (a loaded durable
+/// server can lag reaping the pool's own closed connections, which would make
+/// the drop hit `55006`). A failure goes to stderr naming the database, which
+/// is then leaked (harmless: the whole server is a throwaway container
+/// discarded on teardown) without stranding the rest of the batch.
+/// SPEC-5.6.4, SPEC-5.6.5.
+#[cfg(test)]
+fn drop_database_when_closed(pool: &DbPool, url: &str, database: &str) {
     use futures_util::stream::{FuturesUnordered, StreamExt};
     use futures_util::FutureExt;
     use sqlx::pool::CloseEvent;
@@ -782,82 +920,123 @@ fn drop_schema_when_closed(pool: &DbPool, url: &str, schema: &str) {
     let sender = WORKER.get_or_init(|| {
         let (sender, mut jobs) = unbounded_channel::<Job>();
         std::thread::Builder::new()
-            .name("test-schema-cleanup".to_owned())
+            .name("test-db-cleanup".to_owned())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("build the test schema cleanup runtime");
+                    .expect("build the test database cleanup runtime");
                 runtime.block_on(async move {
                     let mut waiting = FuturesUnordered::new();
                     let mut conn: Option<sqlx::AnyConnection> = None;
                     loop {
                         tokio::select! {
-                            Some((closed, url, schema)) = jobs.recv() => {
+                            Some((closed, url, database)) = jobs.recv() => {
                                 waiting.push(async move {
                                     closed.await;
-                                    (url, schema)
+                                    (url, database)
                                 });
                             }
-                            Some((url, schema)) = waiting.next(), if !waiting.is_empty() => {
-                                // Every closed pool already waiting joins this drop: one commit
-                                // clears a backlog that single drops could not keep up with.
-                                let mut schemas = vec![schema];
-                                while schemas.len() < 16 {
+                            Some((url, database)) = waiting.next(), if !waiting.is_empty() => {
+                                // Drain every pool already closed and waiting, so a backlog
+                                // is cleared in one wake rather than one select turn each.
+                                let mut databases = vec![database];
+                                while databases.len() < 16 {
                                     match waiting.next().now_or_never() {
-                                        Some(Some((_, more))) => schemas.push(more),
+                                        Some(Some((_, more))) => databases.push(more),
                                         _ => break,
                                     }
                                 }
-                                let schemas = schemas.join(", ");
-                                let dropped = async {
-                                    if conn.is_none() {
-                                        conn = Some(sqlx::AnyConnection::connect(&url).await?);
+                                if conn.is_none() {
+                                    match sqlx::AnyConnection::connect(&url).await {
+                                        Ok(c) => conn = Some(c),
+                                        Err(e) => {
+                                            eprintln!("test databases {databases:?} not dropped: {e}");
+                                            continue;
+                                        }
                                     }
-                                    let conn = conn.as_mut().expect("connected above");
-                                    conn.execute(sqlx::AssertSqlSafe(format!(
-                                        "DROP SCHEMA IF EXISTS {schemas} CASCADE"
-                                    )))
-                                    .await
                                 }
-                                .await;
-                                if let Err(e) = dropped {
-                                    // Reconnect on the next drop rather than reuse a broken connection.
+                                let mut reconnect_after = false;
+                                {
+                                    let conn = conn.as_mut().expect("connected above");
+                                    for database in &databases {
+                                        // Terminate any backend still attached to this
+                                        // disposable database before dropping it. The pool
+                                        // fired close_event, but on a loaded durable server
+                                        // the server can lag reaping the last backends, which
+                                        // makes DROP DATABASE hit 55006 ("being accessed by
+                                        // other users") and burn the retry window per drop,
+                                        // starving the single-connection worker (CLAUDE-540,
+                                        // run #751/#752). pg_terminate_backend is the
+                                        // sanctioned way to drop a test database promptly; no
+                                        // DROP DATABASE ... (FORCE). Best effort: ignore its
+                                        // result, the retry below still covers a residual race.
+                                        let terminate = format!(
+                                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                                             WHERE datname = '{database}' AND pid <> pg_backend_pid()"
+                                        );
+                                        let _ = conn.execute(sqlx::AssertSqlSafe(terminate)).await;
+                                        let sql = format!("DROP DATABASE IF EXISTS {database}");
+                                        match run_database_statement_with_retry(
+                                            conn,
+                                            sql,
+                                            Duration::from_secs(10),
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {}
+                                            // Leave this one leaked (harmless on a throwaway
+                                            // server) but keep draining the rest of the batch,
+                                            // so one bad drop never strands its siblings. A
+                                            // broken connection is replaced after the batch.
+                                            Err(e) => {
+                                                eprintln!("test database {database} not dropped: {e}");
+                                                reconnect_after = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                if reconnect_after {
                                     conn = None;
-                                    eprintln!("test schemas {schemas} not dropped: {e}");
                                 }
                             }
                         }
                     }
                 });
             })
-            .expect("spawn the test schema cleanup thread");
+            .expect("spawn the test database cleanup thread");
         sender
     });
     sender
-        .send((pool.close_event(), url.to_owned(), schema.to_owned()))
-        .expect("the test schema cleanup worker is running");
+        .send((pool.close_event(), url.to_owned(), database.to_owned()))
+        .expect("the test database cleanup worker is running");
 }
 
-/// A Postgres pool whose every connection sees only a schema of its own, so
-/// `cargo test`'s parallel tests do not share tables. The schema and the whole
-/// migration script go in one transaction (one commit per fixture), and the
-/// schema is dropped when the pool is. SPEC-5.6.1, SPEC-5.6.3.
+/// A Postgres pool backed by a disposable database of its own, cloned from the
+/// per-process template (SPEC-5.6.2) so `cargo test`'s parallel tests neither
+/// share tables nor each replay the migration set. The database is created
+/// with `CREATE DATABASE ... TEMPLATE` (a block copy on one maintenance
+/// connection, which cannot run in a transaction) and dropped when the pool
+/// is. SPEC-5.6.1, SPEC-5.6.3.
 #[cfg(test)]
 async fn test_pg_pool_at(url: &str, max_connections: u32) -> DbPool {
-    let schema = next_fixture_schema();
-    let pool = pg_pool_in_schema(url, &schema, max_connections).await;
-    // Register the drop first so a failed setup still cleans up.
-    drop_schema_when_closed(&pool, url, &schema);
-    let started = Instant::now();
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "CREATE SCHEMA {schema};\n{}",
-        fixture_script()
-    )))
-    .execute(&pool)
+    use sqlx::Connection;
+    let template = ensure_template(url).await;
+    let database = next_fixture_database();
+    let mut maint = connect_maintenance(url).await;
+    run_database_statement_with_retry(
+        &mut maint,
+        format!("CREATE DATABASE {database} TEMPLATE {template}"),
+        Duration::from_secs(60),
+    )
     .await
-    .map_err(|e| map_live_pool_error(&pool, "postgres test fixture", started, e))
-    .unwrap_or_else(|e: Error| panic!("{e}"));
+    .unwrap_or_else(|e| panic!("clone the test fixture database {database}: {e}"));
+    maint
+        .close()
+        .await
+        .unwrap_or_else(|e| panic!("close the maintenance connection: {e}"));
+    let pool = pool_on_database(url, &database, max_connections).await;
+    drop_database_when_closed(&pool, url, &database);
     pool
 }
 
@@ -1087,16 +1266,43 @@ mod tests {
         assert_eq!(pg_indexes, lite_indexes);
     }
 
-    /// SPEC-5.6.3, SPEC-5.6.4: a fixture schema holds the tables but no
-    /// migration bookkeeping, and is gone once its pool is dropped.
+    /// SPEC-5.6.3, SPEC-5.6.4: a fixture database holds the tables but no
+    /// migration bookkeeping (the template was built by the joined script, not
+    /// the migrator), and the drop path removes it. The automatic
+    /// drop-on-pool-close is the background cleanup worker's job, which every
+    /// other fixture in the suite exercises; here the drop is driven directly
+    /// (the worker's own terminate-then-drop sequence) so the assertion is
+    /// deterministic rather than racing that single-connection worker under
+    /// full-suite load on a contended runner (CLAUDE-540).
     #[tokio::test]
-    async fn a_fixture_schema_has_no_bookkeeping_and_is_dropped_with_its_pool() {
+    async fn a_fixture_database_has_no_bookkeeping_and_its_drop_path_removes_it() {
         use sqlx::Connection;
-        let pool = skip_without_postgres!();
-        let schema: String = sqlx::query_scalar("SELECT current_schema()::text")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let Ok(url) = std::env::var("CLAUDE_RUN_TEST_DATABASE_URL") else {
+            eprintln!(
+                "SKIP {}: CLAUDE_RUN_TEST_DATABASE_URL is unset, no postgres to test against",
+                concat!(
+                    module_path!(),
+                    "::a_fixture_database_has_no_bookkeeping_and_its_drop_path_removes_it"
+                )
+            );
+            return;
+        };
+
+        // Clone a fixture database of our own from the template, but do not
+        // register the background drop worker: this test owns the drop so it
+        // can prove the path deterministically.
+        let template = ensure_template(&url).await;
+        let database = next_fixture_database();
+        let mut maint = connect_maintenance(&url).await;
+        run_database_statement_with_retry(
+            &mut maint,
+            format!("CREATE DATABASE {database} TEMPLATE {template}"),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        let pool = pool_on_database(&url, &database, 2).await;
         let tables: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.tables \
              WHERE table_schema = current_schema() AND table_name = 'settings'",
@@ -1104,7 +1310,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(tables, 1, "the migration script ran in {schema}");
+        assert_eq!(
+            tables, 1,
+            "the template clone carried the schema into {database}"
+        );
         let bookkeeping: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.tables \
              WHERE table_schema = current_schema() AND table_name = '_sqlx_migrations'",
@@ -1112,40 +1321,52 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(bookkeeping, 0, "no bookkeeping rows in a fixture schema");
+        assert_eq!(bookkeeping, 0, "no bookkeeping rows in a fixture database");
 
-        drop(pool);
-        let url = std::env::var("CLAUDE_RUN_TEST_DATABASE_URL").unwrap();
-        let mut conn = sqlx::AnyConnection::connect(&url).await.unwrap();
-        let mut remaining = 1_i64;
-        for _ in 0..300 {
-            remaining = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = $1",
-            )
-            .bind(&schema)
-            .fetch_one(&mut conn)
-            .await
-            .unwrap();
-            if remaining == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(remaining, 0, "schema {schema} survived its pool");
+        // Fully close the pool (await all its connections closed), then drive
+        // the drop exactly as the worker does: terminate any residual backend
+        // on the database, then DROP DATABASE over the maintenance connection.
+        pool.close().await;
+        let terminate = format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{database}' AND pid <> pg_backend_pid()"
+        );
+        let _ = maint.execute(sqlx::AssertSqlSafe(terminate)).await;
+        run_database_statement_with_retry(
+            &mut maint,
+            format!("DROP DATABASE IF EXISTS {database}"),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pg_database WHERE datname = $1")
+                .bind(&database)
+                .fetch_one(&mut maint)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0, "the drop path did not remove {database}");
+        maint.close().await.unwrap();
     }
 
-    /// SPEC-5.6.7: fixtures bypass the migrator, so this keeps the production
-    /// path (and the checksums it records) exercised.
+    /// SPEC-5.6.7: fixtures clone a template built from the joined script, so
+    /// this keeps the production migrator path (and the checksums it records)
+    /// exercised, in a fresh database of its own.
     #[tokio::test]
     async fn the_production_migrator_applies_every_postgres_migration() {
+        use sqlx::Connection;
         let _ = skip_without_postgres!();
         let url = std::env::var("CLAUDE_RUN_TEST_DATABASE_URL").unwrap();
-        let schema = next_fixture_schema();
-        let pool = pg_pool_in_schema(&url, &schema, 2).await;
-        drop_schema_when_closed(&pool, &url, &schema);
-        pool.execute(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        let database = next_fixture_database();
+        let mut maint = connect_maintenance(&url).await;
+        maint
+            .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
             .await
             .unwrap();
+        maint.close().await.unwrap();
+        let pool = pool_on_database(&url, &database, 2).await;
+        drop_database_when_closed(&pool, &url, &database);
         POSTGRES_MIGRATOR.run(&pool).await.unwrap();
         let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
             .fetch_one(&pool)
@@ -1169,7 +1390,8 @@ mod tests {
         .await
         .unwrap();
 
-        let err = refuse_live_database(&pool, &migrated_schema)
+        let mut conn = pool.acquire().await.unwrap();
+        let err = refuse_live_database(&mut conn, &migrated_schema)
             .await
             .expect_err("a schema with _sqlx_migrations must be refused");
         let database: String = sqlx::query_scalar("SELECT current_database()::text")
@@ -1187,7 +1409,7 @@ mod tests {
         pool.execute(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {empty_schema}")))
             .await
             .unwrap();
-        refuse_live_database(&pool, &empty_schema)
+        refuse_live_database(&mut conn, &empty_schema)
             .await
             .expect("a schema without _sqlx_migrations is not refused");
         pool.execute(sqlx::AssertSqlSafe(format!(
@@ -1195,6 +1417,91 @@ mod tests {
         )))
         .await
         .unwrap();
+    }
+
+    /// Every `.rs` under `src/` that uses a Postgres fixture entrypoint, as a
+    /// `::`-terminated module path (`web/webhooks.rs` -> `web::webhooks::`).
+    #[cfg(test)]
+    fn db_touching_module_prefixes() -> Vec<String> {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let needles = [
+            "test_pool(",
+            "test_pg_pool(",
+            "test_pg_pool_single_connection(",
+            "skip_without_postgres!",
+        ];
+        let mut stack = vec![src.clone()];
+        let mut prefixes = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                if !needles.iter().any(|n| text.contains(n)) {
+                    continue;
+                }
+                let rel = path.strip_prefix(&src).unwrap();
+                let mut parts: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                let last = parts.pop().unwrap();
+                let stem = last.trim_end_matches(".rs");
+                if !matches!(stem, "mod" | "lib" | "main") {
+                    parts.push(stem.to_string());
+                }
+                if !parts.is_empty() {
+                    prefixes.push(format!("{}::", parts.join("::")));
+                }
+            }
+        }
+        prefixes
+    }
+
+    /// CLAUDE-540: the Postgres CI leg re-runs only the test files that touch a
+    /// DB pool (`scripts/postgres-test-filters.txt`), so pure-logic tests are
+    /// not re-run on Postgres. This fails if a source file gains a DB test (a
+    /// call to one of the fixture entrypoints) that no filter in that file
+    /// covers, which would silently drop it from the both-backends guarantee
+    /// (SPEC-5.6).
+    #[test]
+    fn every_db_touching_file_is_in_the_postgres_test_filter() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/postgres-test-filters.txt");
+        let text = std::fs::read_to_string(&path).expect("read scripts/postgres-test-filters.txt");
+        let filters: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+
+        let uncovered: Vec<String> = db_touching_module_prefixes()
+            .into_iter()
+            .filter(|module| !filters.iter().any(|f| module.starts_with(f)))
+            .collect();
+        assert!(
+            uncovered.is_empty(),
+            "these modules have Postgres-backed tests but no matching line in \
+             scripts/postgres-test-filters.txt, so the Postgres CI leg would skip them: {uncovered:?}"
+        );
+
+        // Every filter must still match a real DB module, so a file that stops
+        // touching the DB does not leave a dead over-broad filter behind.
+        let modules = db_touching_module_prefixes();
+        let unused: Vec<&str> = filters
+            .iter()
+            .copied()
+            .filter(|f| !modules.iter().any(|m| m.starts_with(f)))
+            .collect();
+        assert!(
+            unused.is_empty(),
+            "these lines in scripts/postgres-test-filters.txt match no DB-touching module: {unused:?}"
+        );
     }
 
     /// CLAUDE-436 regression: a NULL utilization bind declares the `Any`

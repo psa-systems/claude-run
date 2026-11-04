@@ -157,6 +157,13 @@ pub fn docker_run_args(name: &str, pid: u32, image: &str, password: &str) -> Vec
         "-e".into(),
         format!("POSTGRES_PASSWORD={password}"),
         image.into(),
+        // CLAUDE-540: the Postgres test leg runs many fixtures in parallel,
+        // each with its own small pool, plus the clone/cleanup connections;
+        // 100 (the default) is too few once that parallelism is raised. A
+        // throwaway server can afford the headroom. Server flags follow the
+        // image name, which the official entrypoint forwards to `postgres`.
+        "-c".into(),
+        "max_connections=200".into(),
     ]
 }
 
@@ -574,6 +581,8 @@ mod tests {
                 "-e",
                 "POSTGRES_PASSWORD=sekret",
                 DEFAULT_IMAGE,
+                "-c",
+                "max_connections=200",
             ]
         );
         assert!(!args
@@ -584,7 +593,12 @@ mod tests {
     #[test]
     fn docker_run_args_honor_image_override() {
         let args = docker_run_args("n", 1, "postgres:18.2-alpine3.23", "x");
-        assert_eq!(args.last().unwrap(), "postgres:18.2-alpine3.23");
+        let image_at = args
+            .iter()
+            .position(|a| a == "postgres:18.2-alpine3.23")
+            .expect("the image override appears in the args");
+        // Server flags follow the image name, so the image is no longer last.
+        assert_eq!(&args[image_at + 1..], &["-c", "max_connections=200"]);
     }
 
     #[test]
