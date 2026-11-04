@@ -1290,7 +1290,7 @@ with nothing published, reached by container name on port 5432, for a caller tha
 network), `--rm`, no volume (the writable layer and data directory are both discarded on teardown) and a raised
 `max_connections` (the parallel fixture leg needs more than the default 100, CLAUDE-540), waits for an actual `psql`
 connection (not `pg_isready`, which can report ready during the official image's post-`initdb` restart) up to 60s,
-then (with `--network`) opens a TCP connection to the URL's host and port from its own process for up to 20s and fails
+then opens a TCP connection to the URL's host and port from its own process for up to 20s and fails
 fast naming `--network` when it cannot (a caller in a container of its own cannot reach the Docker host's loopback),
 then disables `fsync`, `synchronous_commit` and
 `full_page_writes` and verifies the change by reading `SHOW fsync` back, retrying for up to 20s against a
