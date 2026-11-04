@@ -169,3 +169,13 @@ features = [
 version = "1.7.0"
 default-features = false
 features = ["client", "transport-streamable-http-client-reqwest"]
+
+# Password hashing is deliberately slow; unoptimized, as in every dev and test
+# build, one argon2 hash costs about 20 times what it does optimized, and every
+# test that hashes or checks a password pays it (CLAUDE-544). Release builds are
+# already optimized, so this changes nothing in production.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
