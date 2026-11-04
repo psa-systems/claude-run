@@ -1156,24 +1156,38 @@ caller renders names the specific thing that went wrong instead of a generic wra
 ### 5.6 Postgres test fixture (`SPEC-5.6`)
 
 With `CLAUDE_RUN_TEST_DATABASE_URL` set, every test fixture pool runs on that PostgreSQL server (`db::test_pool`). The
-shared contract for such fixtures is section 12 of the `common` specification; the requirements below are claude-run's
-implementation of it.
+shared contract for such fixtures is section 12 of the `common` specification, which isolates each test in a schema of
+its own; claude-run deviates to a database-per-test clone (CLAUDE-540) because replaying the ~130-statement migration
+set per test was 94% of the CI job's wall time and failed under load. The requirements below are claude-run's
+implementation.
 
-- **SPEC-5.6.1**: Each fixture pool MUST get a schema of its own, named from the process id and a per-process counter,
-  and every connection of the pool MUST select it through `search_path`.
-- **SPEC-5.6.2**: The fixture MUST build one script per test process by joining the SQL of `POSTGRES_MIGRATOR` in
-  version order, and MUST NOT rebuild it per test.
-- **SPEC-5.6.3**: The fixture MUST create the schema and run that script in one transaction on one connection, and
-  MUST NOT write `_sqlx_migrations` rows into a fixture schema.
-- **SPEC-5.6.4**: The fixture MUST drop the schema with `DROP SCHEMA ... CASCADE` when the last handle of the pool is
-  dropped or the pool is closed. One worker thread per test process does all the dropping over a single connection, so
-  cleanup adds one server connection however many tests run in parallel, and drops every schema already waiting in one
-  statement so a backlog clears in one commit. It is a thread of its own because the test's runtime is gone by then.
-- **SPEC-5.6.5**: A failed drop MUST print one line to standard error naming the schemas it was dropping and the database error.
-- **SPEC-5.6.6**: Once per test process, before the first schema is created, the fixture MUST fail naming the database
-  when `public._sqlx_migrations` exists, since that marks a database a runner has migrated (CLAUDE-403).
-- **SPEC-5.6.7**: A test MUST apply `POSTGRES_MIGRATOR` itself into a schema of its own and assert that it recorded
-  every migration, so the production path stays exercised while fixtures bypass it.
+- **SPEC-5.6.1**: Each fixture pool MUST get a disposable database of its own on the server, named from the process id
+  and a per-process counter, reached by replacing the database path of `CLAUDE_RUN_TEST_DATABASE_URL`. Its tables live
+  in the default `public` schema, so no `search_path` is set. `CLAUDE_RUN_TEST_DATABASE_URL` itself names the
+  maintenance database, on which the clone and drop statements run.
+- **SPEC-5.6.2**: The fixture MUST build one template database per test process, migrated once by running the SQL of
+  `POSTGRES_MIGRATOR` joined in version order (not the migrator itself, so no `_sqlx_migrations` rows), and MUST NOT
+  rebuild it per test. Each test MUST get its database with `CREATE DATABASE <name> TEMPLATE <template>`, a block copy,
+  rather than replaying the schema.
+- **SPEC-5.6.3**: The clone MUST run on one connection to the maintenance database (`CREATE DATABASE` cannot run in a
+  transaction). A fixture database therefore holds the schema but no `_sqlx_migrations` rows.
+- **SPEC-5.6.4**: The fixture MUST drop its database with `DROP DATABASE IF EXISTS` when the last handle of the pool is
+  dropped or the pool is closed. One worker thread per test process does all the dropping over a single connection to
+  the maintenance database, so cleanup adds one server connection however many tests run in parallel. `DROP DATABASE`
+  names one database and cannot run in a transaction, so a drained backlog is dropped one statement at a time; a drop
+  that loses the race with the pool's own connection teardown (`55006`, "being accessed by other users") is retried
+  briefly, with no `WITH (FORCE)`. It is a thread of its own because the test's runtime is gone by then.
+- **SPEC-5.6.5**: A failed drop MUST print one line to standard error naming the database it was dropping and the
+  database error, then leak it (harmless: the server is a throwaway container discarded on teardown).
+- **SPEC-5.6.6**: Once per test process, before the template is created, the fixture MUST fail naming the database when
+  the maintenance database's `public._sqlx_migrations` exists, since that marks a database a runner has migrated
+  (CLAUDE-403).
+- **SPEC-5.6.7**: A test MUST apply `POSTGRES_MIGRATOR` itself into a fresh database of its own and assert that it
+  recorded every migration, so the production path stays exercised while fixtures clone the template.
+- **SPEC-5.6.8**: The Postgres CI leg MUST re-run only the test files that build a DB pool
+  (`scripts/postgres-test-filters.txt`); the SQLite leg runs the whole suite. SQL runs only through a DB pool, so this
+  keeps every SQL-executing test on both backends while sparing the pure-logic tests a redundant second run. A guard
+  test MUST fail if a source file gains a DB test no filter covers, or if a filter matches no DB-touching module.
 
 ## 6. Configuration
 
@@ -1265,8 +1279,9 @@ non-durable PostgreSQL container in the Docker-in-Docker sidecar, runs `<command
 the command ends (normal exit, command failure, `SIGINT`/`SIGTERM`, or a setup error), propagating the command's
 exit code (128 + signal if it was killed by one) and failing the run if teardown itself fails even when the command
 succeeded. It sweeps orphaned containers from earlier runs whose owning pid is no longer alive first, starts the
-container with a loopback-only ephemeral published port, `--rm` and no volume (the writable layer and data
-directory are both discarded on teardown), waits for an actual `psql` connection (not `pg_isready`, which can report
+container with a loopback-only ephemeral published port, `--rm`, no volume (the writable layer and data
+directory are both discarded on teardown) and a raised `max_connections` (the parallel fixture leg needs more than the
+default 100, CLAUDE-540), waits for an actual `psql` connection (not `pg_isready`, which can report
 ready during the official image's post-`initdb` restart) up to 60s, then disables `fsync`, `synchronous_commit` and
 `full_page_writes` and verifies the change by reading `SHOW fsync` back, retrying for up to 20s against a
 restart-shaped connection failure. Each `--init-sql` file then runs in order with `ON_ERROR_STOP`, through the same
