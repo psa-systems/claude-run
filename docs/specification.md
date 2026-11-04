@@ -1156,24 +1156,44 @@ caller renders names the specific thing that went wrong instead of a generic wra
 ### 5.6 Postgres test fixture (`SPEC-5.6`)
 
 With `CLAUDE_RUN_TEST_DATABASE_URL` set, every test fixture pool runs on that PostgreSQL server (`db::test_pool`). The
-shared contract for such fixtures is section 12 of the `common` specification; the requirements below are claude-run's
-implementation of it.
+shared contract for such fixtures is section 12 of the `common` specification, which isolates each test in a schema of
+its own; claude-run deviates to a database-per-test clone (CLAUDE-540) because replaying the ~130-statement migration
+set per test was 94% of the CI job's wall time and failed under load. The requirements below are claude-run's
+implementation.
 
-- **SPEC-5.6.1**: Each fixture pool MUST get a schema of its own, named from the process id and a per-process counter,
-  and every connection of the pool MUST select it through `search_path`.
-- **SPEC-5.6.2**: The fixture MUST build one script per test process by joining the SQL of `POSTGRES_MIGRATOR` in
-  version order, and MUST NOT rebuild it per test.
-- **SPEC-5.6.3**: The fixture MUST create the schema and run that script in one transaction on one connection, and
-  MUST NOT write `_sqlx_migrations` rows into a fixture schema.
-- **SPEC-5.6.4**: The fixture MUST drop the schema with `DROP SCHEMA ... CASCADE` when the last handle of the pool is
-  dropped or the pool is closed. One worker thread per test process does all the dropping over a single connection, so
-  cleanup adds one server connection however many tests run in parallel, and drops every schema already waiting in one
-  statement so a backlog clears in one commit. It is a thread of its own because the test's runtime is gone by then.
-- **SPEC-5.6.5**: A failed drop MUST print one line to standard error naming the schemas it was dropping and the database error.
-- **SPEC-5.6.6**: Once per test process, before the first schema is created, the fixture MUST fail naming the database
-  when `public._sqlx_migrations` exists, since that marks a database a runner has migrated (CLAUDE-403).
-- **SPEC-5.6.7**: A test MUST apply `POSTGRES_MIGRATOR` itself into a schema of its own and assert that it recorded
-  every migration, so the production path stays exercised while fixtures bypass it.
+- **SPEC-5.6.1**: Each fixture pool MUST get a disposable database of its own on the server, named from the process id
+  and a per-process counter, reached by replacing the database path of `CLAUDE_RUN_TEST_DATABASE_URL`. Its tables live
+  in the default `public` schema, so no `search_path` is set. `CLAUDE_RUN_TEST_DATABASE_URL` itself names the
+  maintenance database, on which the clone and drop statements run.
+- **SPEC-5.6.2**: The fixture MUST build one template database per test process, migrated once by running the SQL of
+  `POSTGRES_MIGRATOR` joined in version order (not the migrator itself, so no `_sqlx_migrations` rows), and MUST NOT
+  rebuild it per test. Each test MUST get its database with `CREATE DATABASE <name> TEMPLATE <template>`, a block copy,
+  rather than replaying the schema.
+- **SPEC-5.6.3**: The clone MUST run on one connection to the maintenance database (`CREATE DATABASE` cannot run in a
+  transaction). A fixture database therefore holds the schema but no `_sqlx_migrations` rows.
+- **SPEC-5.6.4**: The fixture MUST drop its database with `DROP DATABASE IF EXISTS` when the last handle of the pool is
+  dropped or the pool is closed. One worker thread per test process does all the dropping over a single connection to
+  the maintenance database, so cleanup adds one server connection however many tests run in parallel. Before each drop
+  it MUST terminate any backend still attached to that database with `pg_terminate_backend` (the pool fired its close
+  event, but a loaded durable server can lag reaping the last backends, which would make every `DROP DATABASE` hit
+  `55006`, "being accessed by other users", and burn the retry window per drop until the single-connection worker falls
+  hopelessly behind); no `DROP DATABASE ... (FORCE)`. `DROP DATABASE` names one database and cannot run in a
+  transaction, so a drained backlog is dropped one statement at a time; a drop that still loses the teardown race is
+  retried briefly. A failing drop leaves that one database leaked but MUST NOT strand the rest of the batch. It is a
+  thread of its own because the test's runtime is gone by then. The test that asserts the drop path removes a database
+  MUST drive the drop directly (close the pool, then terminate and drop) rather than race this shared single-connection
+  worker under full-suite load, which on a contended runner lags arbitrarily and is not a correctness signal.
+- **SPEC-5.6.5**: A failed drop MUST print one line to standard error naming the database it was dropping and the
+  database error, then leak it (harmless: the server is a throwaway container discarded on teardown).
+- **SPEC-5.6.6**: Once per test process, before the template is created, the fixture MUST fail naming the database when
+  the maintenance database's `public._sqlx_migrations` exists, since that marks a database a runner has migrated
+  (CLAUDE-403).
+- **SPEC-5.6.7**: A test MUST apply `POSTGRES_MIGRATOR` itself into a fresh database of its own and assert that it
+  recorded every migration, so the production path stays exercised while fixtures clone the template.
+- **SPEC-5.6.8**: The Postgres CI leg MUST re-run only the test files that build a DB pool
+  (`scripts/postgres-test-filters.txt`); the SQLite leg runs the whole suite. SQL runs only through a DB pool, so this
+  keeps every SQL-executing test on both backends while sparing the pure-logic tests a redundant second run. A guard
+  test MUST fail if a source file gains a DB test no filter covers, or if a filter matches no DB-touching module.
 
 ## 6. Configuration
 
@@ -1265,15 +1285,18 @@ non-durable PostgreSQL container in the Docker-in-Docker sidecar, runs `<command
 the command ends (normal exit, command failure, `SIGINT`/`SIGTERM`, or a setup error), propagating the command's
 exit code (128 + signal if it was killed by one) and failing the run if teardown itself fails even when the command
 succeeded. It sweeps orphaned containers from earlier runs whose owning pid is no longer alive first, starts the
-container with a loopback-only ephemeral published port (or, with `--network`, on that Docker network with nothing
-published, reached by container name on port 5432), `--rm` and no volume (the writable layer and data directory are
-both discarded on teardown), waits for an actual `psql` connection (not `pg_isready`, which can report ready during
-the official image's post-`initdb` restart) up to 60s, then opens a TCP connection to the URL's host and port from
-its own process for up to 20s and fails naming `--network` when it cannot (a caller in a container of its own cannot
-reach the Docker host's loopback), then disables `fsync`, `synchronous_commit` and
+container with a loopback-only ephemeral published port (or, with the optional `--network`, on that Docker network
+with nothing published, reached by container name on port 5432, for a caller that is itself a container on that
+network), `--rm`, no volume (the writable layer and data directory are both discarded on teardown) and a raised
+`max_connections` (the parallel fixture leg needs more than the default 100, CLAUDE-540), waits for an actual `psql`
+connection (not `pg_isready`, which can report ready during the official image's post-`initdb` restart) up to 60s,
+then (with `--network`) opens a TCP connection to the URL's host and port from its own process for up to 20s and fails
+fast naming `--network` when it cannot (a caller in a container of its own cannot reach the Docker host's loopback),
+then disables `fsync`, `synchronous_commit` and
 `full_page_writes` and verifies the change by reading `SHOW fsync` back, retrying for up to 20s against a
 restart-shaped connection failure. Each `--init-sql` file then runs in order with `ON_ERROR_STOP`, through the same
-retry. The generated password never appears in a log line or an error message.
+retry. The generated password never appears in a log line or an error message. This subcommand is a local-dev
+capability; CI runs its Postgres leg against a managed `services: postgres` container (`SPEC-11.1`), not through it.
 
 ## 7. Security
 
@@ -1746,9 +1769,13 @@ never write the same registry destination.
 
 ## 11. CI
 
-- **SPEC-11.1**: The PostgreSQL pass of the unit-test job in `.forgejo/workflows/check.yml` MUST run through
-  `claude-run test-postgres` (`SPEC-6.6`) and MUST NOT use a `postgres` service container: a service's `options`
-  cannot carry the server flags that disable durability, and a durable container makes the pass depend on disk flush
-  latency (`SPEC-10.1.3`). The job runs in a container of its own, so the pass MUST pass `--network` with the job
-  container's network, and the step MUST carry a `timeout-minutes` far below the runner's 3 hour job limit. With no service there is no health check, so the `CI_POSTGRES_HEALTH_*` variables
-  (`common` `SPEC-13.1`) do not apply to this job.
+- **SPEC-11.1**: The PostgreSQL pass of the unit-test job in `.forgejo/workflows/check.yml` MUST run against a
+  Forgejo-managed `postgres` service container, reached from the job container by the service name `postgres` on 5432,
+  with `CLAUDE_RUN_TEST_DATABASE_URL` set on that step only (so the SQLite step still runs on SQLite). It MUST NOT use
+  `claude-run test-postgres` in CI: this runner's Docker is a remote daemon, so a container that subcommand starts is
+  not on the job's network and the job cannot reach it. The service is durable (its `options` cannot carry a
+  `-c fsync=off` flag), which CLAUDE-528 had avoided for its per-test flush cost; CLAUDE-540's template-clone fixture
+  (`SPEC-5.6.2`) makes per-test setup a block copy that barely touches disk, so fsync-on is affordable and
+  `SPEC-10.1.3` still holds. `claude-run test-postgres` (`SPEC-6.6`) remains the local-dev path, where Docker is local
+  and reachable; its `--network` option (CLAUDE-541) and fail-fast reachability probe serve a local caller that is
+  itself a container on a shared Docker network, and are not the CI method.
