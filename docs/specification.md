@@ -1758,8 +1758,12 @@ never write the same registry destination.
 
 ## 11. CI
 
-- **SPEC-11.1**: The PostgreSQL pass of the unit-test job in `.forgejo/workflows/check.yml` MUST run through
-  `claude-run test-postgres` (`SPEC-6.6`) and MUST NOT use a `postgres` service container: a service's `options`
-  cannot carry the server flags that disable durability, and a durable container makes the pass depend on disk flush
-  latency (`SPEC-10.1.3`). With no service there is no health check, so the `CI_POSTGRES_HEALTH_*` variables
-  (`common` `SPEC-13.1`) do not apply to this job.
+- **SPEC-11.1**: The PostgreSQL pass of the unit-test job in `.forgejo/workflows/check.yml` MUST run against a
+  Forgejo-managed `postgres` service container, reached from the job container by the service name `postgres` on 5432,
+  with `CLAUDE_RUN_TEST_DATABASE_URL` set on that step only (so the SQLite step still runs on SQLite). It MUST NOT use
+  `claude-run test-postgres` in CI: this runner's Docker is a remote daemon, so a container that subcommand starts is
+  not on the job's network and the job cannot reach it. The service is durable (its `options` cannot carry a
+  `-c fsync=off` flag), which CLAUDE-528 had avoided for its per-test flush cost; CLAUDE-540's template-clone fixture
+  (`SPEC-5.6.2`) makes per-test setup a block copy that barely touches disk, so fsync-on is affordable and
+  `SPEC-10.1.3` still holds. `claude-run test-postgres` (`SPEC-6.6`) remains the local-dev path, where Docker is local
+  and reachable.
