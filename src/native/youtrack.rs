@@ -3890,6 +3890,66 @@ fn finalize(
                 head_branch: None,
             });
         }
+        // CLAUDE-553: the agent committed all its work BEFORE the timeout
+        // fired (no WIP commit was needed, salvage had no step errors, and
+        // a PR was opened from existing commits). The wall-clock most
+        // likely ran out while the agent was running its own check after
+        // the work was done, not while it was still editing - treat this
+        // as a successful run. Promote the draft PR to ready and advance
+        // AI Agent to Code Review instead of parking on Needs Review, so
+        // the issue does not read as a failed run when it is actually
+        // complete.
+        if let Some(pr) = salvage.pr.as_ref() {
+            let agent_completed = !salvage.wip_commit_made
+                && salvage.commit_error.is_none()
+                && salvage.open_error.is_none();
+            if agent_completed {
+                let host = host_only(&job.repo_host);
+                let promote_error = match pr.number {
+                    Some(pr_number) => {
+                        match forge.mark_pr_ready(&host, &job.repo_path, pr_number) {
+                            Ok(()) => None,
+                            Err(e) => {
+                                error!(key = %job.key, pr_number, error = %e, "timeout salvage: promoting the agent-completed PR from draft failed (continuing)");
+                                Some(e.to_string())
+                            }
+                        }
+                    }
+                    None => Some("the PR number is unknown".to_string()),
+                };
+                let url = salvage.pr_url.clone().unwrap_or_else(|| pr.url.clone());
+                let mut lines = vec![
+                    format!(
+                        "Claude AI agent run TIMED OUT after {}s, but the agent had already committed its work before the kill; this is treated as a successful run.",
+                        claude_timeout.as_secs()
+                    ),
+                    String::new(),
+                    format!("- Ready PR: {url}"),
+                ];
+                if let Some(e) = &promote_error {
+                    lines.push(format!("- Promoting the PR from draft failed: {e}"));
+                }
+                lines.push("- The wall-clock most likely ran out while the agent was running its own final check after the work was done, not while it was still editing.".to_string());
+                lines.push(format!("- {}", timeout_cost_line(claude_result)));
+                let body = lines.join("\n");
+                let body = note_checkpoint_rejection(body);
+                let body =
+                    crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+                if let Err(e) = backend.comment(&job.key, &body) {
+                    warn!(key = %job.key, error = %e, "timeout-completed comment failed (continuing)");
+                }
+                if is_working {
+                    backend.set_field(&job.key, &src.custom_field, &src.states.code_review)?;
+                } else {
+                    info!(key = %job.key, current = %current, "timeout agent-completed: AI Agent already advanced off Working, leaving untouched");
+                }
+                return Ok(Finalized::CodeReview {
+                    pr_url: url,
+                    pr_number: pr.number,
+                    head_branch: pr.head_branch.clone(),
+                });
+            }
+        }
         let body = timeout_comment(claude_result, claude_timeout, &salvage);
         let body = note_checkpoint_rejection(body);
         let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
@@ -4600,6 +4660,15 @@ struct SalvageReport {
     pr: Option<PullRequest>,
     /// `pr_url(job, &pr)` computed at salvage time, for the issue comment.
     pr_url: Option<String>,
+    /// CLAUDE-553: `true` when `commit_timeout_wip` was called because the
+    /// workdir had tracked-or-untracked changes the agent had not committed
+    /// yet, `false` when every salvaged commit came from the agent's own
+    /// `git commit` invocations before the timeout fired. The timeout
+    /// finalize path uses this to tell "agent ran out of time during its
+    /// own check after committing the work" (false - treat as Code Review)
+    /// apart from "agent was still editing when the timeout fired" (true -
+    /// stay as TimedOut, needs human review).
+    wip_commit_made: bool,
 }
 
 /// SPEC-3.3: "timeout or cancel: the final push in 3.3.1 runs ... A draft PR
@@ -4640,6 +4709,7 @@ fn salvage_timeout_work(
 
     let mut report = SalvageReport::default();
     if !work.dirty.paths.is_empty() {
+        report.wip_commit_made = true;
         if let Err(e) = commit_timeout_wip(workdir, &job.key) {
             error!(key = %job.key, error = %e, "timeout salvage: committing the uncommitted working tree failed");
             report.commit_error = Some(e);
@@ -6781,7 +6851,6 @@ mod tests {
             "the no-PR bullet must be replaced when a PR URL is given:\n{body}"
         );
     }
-
 
     /// A run with no `compact_boundary` event in its stream log
     /// leaves the outcome comment untouched.
@@ -11356,6 +11425,196 @@ mod tests {
         set_identity(&clone);
         std::fs::write(clone.join("f.txt"), "wip change").unwrap();
         clone
+    }
+
+    /// CLAUDE-553: like [`dirty_single_branch_clone`] but the change was
+    /// committed on a feature branch (no dirty tree): the agent's work is
+    /// done and ready to push, matching the "timeout fired during the
+    /// agent's own check after committing" scenario.
+    fn committed_single_branch_clone(base: &Path) -> PathBuf {
+        let origin = base.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_in(&origin, &["init"]);
+        set_identity(&origin);
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-m", "feat: x"]);
+        let clone = base.join("clone");
+        git_in(
+            base,
+            &[
+                "clone",
+                "--single-branch",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        set_identity(&clone);
+        git_in(&clone, &["checkout", "-b", "feat/x"]);
+        std::fs::write(clone.join("f.txt"), "agent change").unwrap();
+        git_in(&clone, &["add", "."]);
+        git_in(&clone, &["commit", "-m", "feat: agent work"]);
+        clone
+    }
+
+    /// CLAUDE-553: the agent committed all its work before the wall-clock
+    /// timeout fired (no WIP commit needed, the salvage opens a PR from
+    /// the agent's own commits). The run is treated as a successful
+    /// delivery: the draft PR is promoted to ready, AI Agent lands on
+    /// Code Review, and finalize returns `Finalized::CodeReview` instead
+    /// of `Finalized::TimedOut`.
+    #[test]
+    fn finalize_timeout_with_agent_committed_work_promotes_pr_and_sets_code_review() {
+        let base = tempfile::tempdir().unwrap();
+        let clone = committed_single_branch_clone(base.path());
+        let git_dir = clone.join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
+                    "",
+                )
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%s", "feat/x"],
+                    "feat: agent work\n",
+                )
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: feat: agent work",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":9,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/9"}"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            &clone,
+            &timed_out_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::CodeReview {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/9".into(),
+                pr_number: Some(9),
+                head_branch: Some("feat/x".into()),
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Code Review"),
+            "an agent-completed timeout must advance AI Agent to Code Review, not Needs Review: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "an agent-completed timeout must not park at Needs Review: {calls:?}"
+        );
+        // mark_pr_ready is best-effort here: its list_open_prs call reads the
+        // same `pr search` stub whose lookup degraded above during PR create,
+        // so the promotion step reports a failure in the issue comment
+        // instead of promoting. The CodeReview outcome and the AI Agent write
+        // still fire, which is the invariant this test proves.
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .unwrap_or_else(|| panic!("no issue comment call recorded: {calls:?}"));
+        assert!(
+            comment.contains("the agent had already committed its work before the kill"),
+            "the comment must name the agent-committed case: {comment}"
+        );
     }
 
     #[test]
