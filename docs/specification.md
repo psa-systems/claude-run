@@ -1220,6 +1220,10 @@ delivery that is not `issue_comment` (except `ping`) is acked and dropped before
   (`SPEC-4.4.4`-adjacent, `CLAUDE-447`).
 - A plain-issue command clones nothing and runs no agent: it mints a YouTrack issue carrying the instruction verbatim,
   sets `State` then the `AI Agent` field to the queued value last, and replies naming the minted key.
+- Every reply opens with `@<commenter>` and a one-word verdict line (CLAUDE-552): `**Done.**` (a commit reached the
+  PR, or the request was filed), `**No.**` (refused, no change, or too large to push unattended), `**Blocked.**`
+  (anything that stopped it), and `**Started.**` for the acknowledgement posted once an instruction is admitted,
+  before any work. The usage reply has no verdict; a synthetic command mentions no one and posts no acknowledgement.
 - Every outcome replies on the originating thread; a served command records one `job_outcomes` row and finalizes
   through the run guard.
 
