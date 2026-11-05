@@ -1173,6 +1173,11 @@ pub fn validate_comment_webhook(cfg: &CommentWebhookConfig) -> std::result::Resu
     if cfg.claude_timeout_seconds < 1 {
         return Err("claude_timeout_seconds must be >= 1".to_string());
     }
+    // CLAUDE-550: `0` would park every conflicting agent PR without one
+    // resolve attempt.
+    if cfg.agent_conflict_resolve_attempts < 1 {
+        return Err("agent_conflict_resolve_attempts must be >= 1".to_string());
+    }
     for (name, src) in &cfg.sources {
         if src.allowed_permissions.is_empty() {
             return Err(format!(

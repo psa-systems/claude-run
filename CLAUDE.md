@@ -106,6 +106,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - `finalize` makes one bounded status read and merges a PR whose CI is already green in the same tick ([CLAUDE-549](docs/conventions/merge.md#finalize-time-merge-of-an-already-green-pr-claude-549))
 - A reconciler backstops webhook automerge so no green PR sits unwatched ([CLAUDE-328](docs/conventions/merge.md#automerge-reconciler-claude-328))
 - `PrStatus.behind_base` separates a behind-base PR from a real conflict ([CLAUDE-309, FJ-99](docs/conventions/merge.md#behind-base-prs-claude-309-fj-99))
+- Conflict auto-resolve runs are capped per PR, one at a time; a spent cap parks the issue delivery-blocked ([CLAUDE-550](docs/conventions/merge.md#bounded-conflict-auto-resolve-claude-550))
 - At most `max_ci_in_flight_per_repo` runner PRs per repo have CI pending: pickups defer, branch updates wait ([CLAUDE-535](docs/conventions/merge.md#ci-in-flight-cap-claude-535))
 - The runner writes no `State` on merge; a YouTrack workflow resolves the issue ([CLAUDE-327](docs/conventions/merge.md#state-on-merge-is-a-youtrack-workflow-claude-327))
 - A checkpoint-opened PR is `salvaged` from the moment it is opened, not only after a timeout ([CLAUDE-448](docs/conventions/merge.md#salvaged-prs-block-automerge-claude-429))

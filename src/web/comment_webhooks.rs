@@ -111,6 +111,11 @@ const COMMIT_MSG_FILE: &str = ".claude-run-commit-msg";
 /// never interpolated into a command line. Removed as soon as the session
 /// returns.
 const INSTRUCTION_FILE: &str = ".claude-run-instruction.md";
+
+/// CLAUDE-550: the instruction a synthetic automerge conflict auto-resolve
+/// command (CLAUDE-380) carries. Narrow on purpose: resolve the conflicts,
+/// check once, conclude the merge, and change nothing else.
+pub const CONFLICT_RESOLVE_INSTRUCTION: &str = "Merge the PR's base branch into this PR's branch and resolve every merge conflict, keeping the intent of both sides. Change nothing that is not needed to resolve a conflict. Run the project's build and test gate once, fix only what the merge broke, then conclude the merge with a commit. If a conflict cannot be resolved safely, leave it unresolved and say which files in your summary.";
 /// File the resolved CI-failure context is written to (CLAUDE-344), in the
 /// checkout's git-directory scratch space, never its work tree, so git can
 /// never track, stage, or commit it. Only created when a failing check run
@@ -1301,6 +1306,25 @@ async fn run_instruction(
         }
     }
     finish_comment_run(&ctx.pool, run, key, &outcome, &stream_log, &spend).await;
+    // CLAUDE-550: a finished conflict auto-resolve run clears the PR's
+    // in-flight stamp and records what it left unresolved, so the next
+    // automerge pass can dispatch the next attempt or, at the cap, name the
+    // stuck files. A write failure only delays the next attempt until the
+    // stamp goes stale.
+    if cmd.synthetic && cmd.is_pull_request {
+        if let Err(e) = crate::ci_failure::store::finish_conflict_resolve(
+            &ctx.pool,
+            &cmd.host,
+            &cmd.repo,
+            cmd.number as i64,
+            &outcome.unresolved_conflicts,
+            &state::now_iso(),
+        )
+        .await
+        {
+            tracing::error!(repo = %cmd.repo, pr = cmd.number, error = %e, "CLAUDE-550: recording the finished conflict auto-resolve run failed");
+        }
+    }
     // `env.backend`'s `clone_url` resolves the same forge token the clone and
     // push already used; `origin` itself carries none after the post-clone
     // scrub (CLAUDE-395), so the preserve-or-delete check's `ls-remote`
@@ -1330,6 +1354,10 @@ struct RunOutcome {
     /// once a YouTrack issue was created, so a flood of plain-issue commands is
     /// bounded by the same daily cap even though no agent ran.
     counts_run: bool,
+    /// CLAUDE-550: the paths the decision gate refused to push as still
+    /// conflicted (`Decision::UnresolvedConflicts`); empty otherwise. Recorded
+    /// on the agent PR row after a synthetic conflict auto-resolve run.
+    unresolved_conflicts: Vec<String>,
 }
 
 impl RunOutcome {
@@ -1344,6 +1372,7 @@ impl RunOutcome {
             cost: 0.0,
             timed_out: false,
             counts_run: false,
+            unresolved_conflicts: Vec::new(),
         }
     }
 }
@@ -1627,6 +1656,10 @@ fn serve_run(
         cost: claude_result.cost,
         timed_out: claude_result.timed_out,
         counts_run: claude_ran,
+        unresolved_conflicts: match &decision {
+            Decision::UnresolvedConflicts { paths } => paths.clone(),
+            _ => Vec::new(),
+        },
     }
 }
 
@@ -1704,6 +1737,7 @@ fn serve_mint(
             cost: 0.0,
             timed_out: false,
             counts_run: true,
+            unresolved_conflicts: Vec::new(),
         };
     }
 
@@ -1717,6 +1751,7 @@ fn serve_mint(
         cost: 0.0,
         timed_out: false,
         counts_run: true,
+        unresolved_conflicts: Vec::new(),
     }
 }
 
@@ -2012,6 +2047,17 @@ fn run_decision_gate(
     if !paths.is_empty() {
         return Ok(Decision::UnresolvedConflicts { paths });
     }
+    // CLAUDE-550: a conflict auto-resolve run that `git add`ed a file with its
+    // markers still in it clears the unmerged state above without resolving
+    // anything. Checked only for the synthetic resolve command, whose whole
+    // job is a merge; a human's instruction may legitimately touch text that
+    // looks like a marker.
+    if cmd.synthetic {
+        let paths = leftover_conflict_marker_paths(workdir, cloned_head)?;
+        if !paths.is_empty() {
+            return Ok(Decision::UnresolvedConflicts { paths });
+        }
+    }
 
     git_in(workdir, &["add", "-A"])?;
     if needs_commit(workdir)? {
@@ -2063,6 +2109,39 @@ fn run_decision_gate(
         src.max_files,
         src.max_lines,
     ))
+}
+
+/// CLAUDE-550: the distinct paths `git diff --check <cloned_head>` reports a
+/// `leftover conflict marker` in (work tree and index against the cloned
+/// head). `--check` exits non-zero for any whitespace problem too, so the
+/// exit code is ignored and only the marker lines are read; a git that could
+/// not run at all is an error.
+fn leftover_conflict_marker_paths(
+    workdir: &FsPath,
+    cloned_head: &str,
+) -> crate::error::Result<Vec<String>> {
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args(["diff", "--check", cloned_head])
+        .output()?;
+    if out.status.code().is_none_or(|c| c > 2) {
+        return Err(crate::provider::git_error("diff --check", &out, None));
+    }
+    let mut paths: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some((path, _)) = line
+            .strip_suffix("leftover conflict marker")
+            .and_then(|rest| rest.split_once(':'))
+        {
+            if !paths.iter().any(|p| p == path) {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    Ok(paths)
 }
 
 /// Fold one `git show --numstat` (or `--remerge-diff --numstat`) output into
@@ -2191,7 +2270,13 @@ fn post_fix_push_comment(
     };
     let public_url = crate::run_footer::resolved_public_url();
     let ctx = crate::push_comment::PushCommentContext {
-        event: crate::push_comment::PushEvent::CommentWebhookFixPush,
+        // CLAUDE-550: a synthetic command is the automerge conflict
+        // auto-resolve, the only runner-dispatched command today.
+        event: if cmd.synthetic {
+            crate::push_comment::PushEvent::ConflictResolvePush
+        } else {
+            crate::push_comment::PushEvent::CommentWebhookFixPush
+        },
         issue_key: &issue_key,
         draft: false,
         old_sha: Some(cloned_head),
@@ -3475,6 +3560,71 @@ mod tests {
         assert!(
             dir.join(".git").join("MERGE_HEAD").exists(),
             "the merge must conflict"
+        );
+    }
+
+    fn synthetic_gate_cmd() -> VerifiedCommentCommand {
+        let mut cmd = gate_cmd();
+        cmd.synthetic = true;
+        cmd
+    }
+
+    /// CLAUDE-550: a conflict auto-resolve run that staged a file with its
+    /// conflict markers still in it is refused as unresolved, naming the
+    /// file, and nothing is committed.
+    #[test]
+    fn a_resolve_run_that_staged_leftover_markers_is_unresolved_and_commits_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_a_conflicting_merge_in_progress(dir);
+        let cloned_head = git_output(dir, &["merge-base", "HEAD", "other"]).unwrap();
+        let before = git_output(dir, &["rev-parse", "HEAD"]).unwrap();
+        // `git add` clears the unmerged state but keeps the markers.
+        git_in(dir, &["add", "a.txt"]).unwrap();
+
+        let decision = run_decision_gate(
+            dir,
+            &cloned_head,
+            &synthetic_gate_cmd(),
+            &gate_src(),
+            "resolved it",
+        )
+        .unwrap();
+        assert_eq!(
+            decision,
+            Decision::UnresolvedConflicts {
+                paths: vec!["a.txt".to_string()]
+            }
+        );
+        assert_eq!(git_output(dir, &["rev-parse", "HEAD"]).unwrap(), before);
+    }
+
+    /// CLAUDE-550: a conflict auto-resolve run that really resolved the
+    /// conflict (disjoint edits kept from both sides) is pushed.
+    #[test]
+    fn a_resolve_run_that_resolved_the_conflict_is_push() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_a_conflicting_merge_in_progress(dir);
+        let cloned_head = git_output(dir, &["merge-base", "HEAD", "other"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\nmain\nbranch\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+
+        let decision = run_decision_gate(
+            dir,
+            &cloned_head,
+            &synthetic_gate_cmd(),
+            &gate_src(),
+            "resolved it",
+        )
+        .unwrap();
+        assert!(
+            matches!(decision, Decision::Push { .. }),
+            "expected Push, got {decision:?}"
+        );
+        assert!(
+            !dir.join(".git").join("MERGE_HEAD").exists(),
+            "the runner concludes the merge"
         );
     }
 
