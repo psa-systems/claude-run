@@ -128,6 +128,11 @@ pub enum Error {
     #[error("secret: {0}")]
     Secret(String),
 
+    /// CLAUDE-549: a bounded forge read (`Forge::pr_status_within`) did not
+    /// answer within its timeout. The caller falls back rather than waiting.
+    #[error("forge `{op}` did not answer within {timeout:?}")]
+    ForgeTimeout { op: String, timeout: Duration },
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

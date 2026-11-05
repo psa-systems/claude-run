@@ -174,6 +174,8 @@ native:
                                            # when true, a later success/recover webhook event merges
                                            # once checks are green (CLAUDE-278; finalize never polls);
                                            # merging writes no State or AI Agent field (CLAUDE-327)
+      finalize_status_timeout_secs: 10    # bound on finalize's one status read; a PR already green
+                                           # merges in the same tick (CLAUDE-549); 0 skips that read
     dependencies:                         # optional; pre-clone dependency gate (CLAUDE-161)
       enabled: true                       # on by default; false makes the gate a no-op
       recheck_timeout: 5m                 # backoff before a blocked issue is re-evaluated
@@ -210,6 +212,7 @@ native:
 | `youtrack.states.state_done` | `Done`                        | **Deprecated and ignored (CLAUDE-327):** the runner no longer writes `State` on merge; a YouTrack workflow resolves the issue instead. Still parsed (an action file setting it still loads) but otherwise ignored, with one deprecation warning at load when it is set away from its default. Saving the action's structured form resets it to the default; absent from the structured web editor. |
 | `youtrack.states.no_code` | the `done` label                 | AI Agent label set when a successful run deliberately produced no commits and left `.claude-run-no-code-change` (CLAUDE-214). Defaults to whatever `states.done` is, because there is no PR for a human to review. `State` is left untouched, so the issue stays In Progress until a human closes it. Exposed in the structured editor as the "No-code label" field, blank meaning inherit the Done label (CLAUDE-298). |
 | `youtrack.automerge.enabled` | `false`                       | Master switch for CI-gated automerge (CLAUDE-126). When `false`, the PR is never merged by the runner (unchanged behavior). When `true`, `finalize` still stops at Code Review immediately; the merge happens later, normally driven by a `success`/`recover` Action-run webhook event (CLAUDE-278) and, if that event is missed, by the reconciler's own periodic pass (CLAUDE-328) - the webhook is a low-latency trigger, not the only one. |
+| `youtrack.automerge.finalize_status_timeout_secs` | `10`     | CLAUDE-549: when automerge is enabled, `finalize` makes ONE PR status read right after promoting a successful run's PR, bounded by this many seconds, and merges the PR in the same tick when its checks are already `success`, its branch is not behind base and it is mergeable. Any other answer, a read error, or a read slower than this leaves the PR at Code Review for the webhook and reconciler. `0` skips the read. Not a structured-form input; a form save keeps the value on disk. |
 | `youtrack.automerge.wait_seconds` | `1800`                   | **Deprecated (CLAUDE-278):** the runner no longer polls, so this is parsed (an action file setting it still loads) but otherwise ignored; setting it away from its default logs one deprecation warning at load. Saving the action's structured form resets it to the default. |
 | `youtrack.automerge.check_interval_seconds` | `30`           | **Deprecated (CLAUDE-278):** same as `wait_seconds`.                                                  |
 | `youtrack.dependencies.enabled` | `true`                    | Master switch for the pre-clone dependency gate (CLAUDE-161). When `true`, a queued issue with any unmet dependency is left Queued (not cloned, no claude spend) and re-evaluated after `recheck_timeout`. When `false`, the gate is a no-op and pickup proceeds exactly as before. See [Pre-clone dependency gate](#pre-clone-dependency-gate-claude-161). Editable in the structured web form (CLAUDE-298). |
@@ -442,7 +445,11 @@ gather-time preflight probes one capability per scope, so a PAT short of either 
 By default a successful run opens the PR, sets AI Agent to `code_review`, and stops; the issue stays In Progress until a
 human merges. Setting `youtrack.automerge.enabled: true` opts each successful run into merging the PR itself once its CI
 checks pass. `finalize` itself never waits for CI: once the PR is opened it stops at Code Review exactly as when automerge
-is disabled. The merge instead happens later, normally driven by a Forgejo webhook `success` or `recover` Action-run
+is disabled, with one exception (CLAUDE-549): right after promoting the PR it makes a single status read bounded by
+`automerge.finalize_status_timeout_secs`, and a PR whose checks are already green, whose branch is not behind base and
+which the forge reports mergeable is merged in that same tick (outcome `Merged`, `agent_pull_requests` row set to
+`merged`). Every other answer leaves the PR to the later paths below; finalize never branch-updates, comments on a
+not-ready PR, or retries. Otherwise the merge happens later, normally driven by a Forgejo webhook `success` or `recover` Action-run
 event on that PR's head commit (`POST /webhooks/forgejo/triage/<source>`, the same endpoint the CI-failure listener uses) - so
 the wait holds no job slot no matter how long the suite takes, and there is nothing to time out. The webhook is not the
 only trigger: a reconciler pass on the daemon's own tick (every 300s, CLAUDE-328) lists every `open` `agent_pull_requests`

@@ -308,6 +308,32 @@ impl GithubForge {
         }
     }
 
+    /// CLAUDE-549: an owned, independent copy for
+    /// [`crate::provider::pr_status_on_thread`]: same runner, transport,
+    /// token, binaries and retry schedules. The cached `gh auth token`
+    /// fallback is carried over; the notice buffer starts empty (a status
+    /// read records none).
+    fn status_probe(&self) -> Self {
+        let resolved = self
+            .resolved_token
+            .lock()
+            .map(|cached| cached.clone())
+            .unwrap_or(None);
+        Self {
+            runner: self.runner.clone(),
+            transport: self.transport.clone(),
+            endpoint: self.endpoint.clone(),
+            token: self.token.clone(),
+            priority: self.priority.clone(),
+            git: self.git.clone(),
+            gh: self.gh.clone(),
+            resolved_token: std::sync::Mutex::new(resolved),
+            git_retry_waits: self.git_retry_waits,
+            gh_read_retry_waits: self.gh_read_retry_waits,
+            notices: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
     /// Override the backend priority (tests).
     pub fn with_priority(mut self, priority: Vec<BackendKind>) -> Self {
         self.priority = priority;
@@ -1302,6 +1328,16 @@ impl Forge for GithubForge {
             behind_base,
             head_sha: Some(sha),
         })
+    }
+
+    fn pr_status_within(
+        &self,
+        host: &str,
+        repo: &str,
+        pr_number: u64,
+        timeout: std::time::Duration,
+    ) -> Result<super::PrStatus> {
+        super::pr_status_on_thread(self.status_probe(), host, repo, pr_number, timeout)
     }
 
     /// `gh pr merge <n> --repo <repo> --merge --delete-branch`, run with the

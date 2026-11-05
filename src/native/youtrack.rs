@@ -1764,6 +1764,18 @@ async fn process_job(
             .await;
         }
     }
+    // CLAUDE-549: a PR `finalize` merged in the same tick is recorded as
+    // merged right here, after the row above exists, so neither the webhook
+    // nor the reconciler walks it again (and the reconciler never retires it
+    // as `closed` once the forge stops listing it open).
+    if let Ok(Finalized::CodeReview {
+        pr_number: Some(pr_number),
+        merged: true,
+        ..
+    }) = &finalize_res
+    {
+        mark_merged_at_finalize(pool, job, *pr_number).await;
+    }
     let post_failed = match &finalize_res {
         Ok(Finalized::CodeReview { pr_url, .. }) => {
             info!(action = %action.name, key = %key, pr_url = %pr_url, "finalized: Code Review");
@@ -2097,6 +2109,31 @@ async fn clear_salvaged_for_resume(
         if let Err(e) = backend.comment(&job.key, &message) {
             warn!(key = %job.key, error = %e, "salvaged-clear-failure comment also failed (continuing)");
         }
+    }
+}
+
+/// CLAUDE-549: set the `agent_pull_requests` row for a PR `finalize` just
+/// merged to `merged`. The row is looked up by `(host, repo, pr_number)`, so
+/// one path covers a fresh PR (recorded moments ago by [`record_new_pr`]) and
+/// a resumed or checkpoint-opened one alike. A lookup or write failure, or a
+/// missing row, is logged at `error`: the merge itself already landed, and the
+/// forge's `pull_request` merged delivery (CLAUDE-277) can still record it.
+async fn mark_merged_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: u64) {
+    use crate::ci_failure::store;
+    let host = host_only(&job.repo_host);
+    let row = match store::agent_pr(pool, &host, &job.repo_path, pr_number as i64).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            tracing::error!(key = %job.key, pr = pr_number, "CLAUDE-549: merged at finalize, but no agent_pull_requests row exists to mark merged");
+            return;
+        }
+        Err(e) => {
+            tracing::error!(key = %job.key, pr = pr_number, error = %e, "CLAUDE-549: merged at finalize, but reading its agent_pull_requests row failed");
+            return;
+        }
+    };
+    if let Err(e) = store::set_agent_pr_state(pool, row.id, "merged", &state::now_iso()).await {
+        tracing::error!(key = %job.key, pr = pr_number, error = %e, "CLAUDE-549: merged at finalize, but marking its agent_pull_requests row merged failed");
     }
 }
 
@@ -3114,6 +3151,13 @@ enum Finalized {
         /// backend did not report it (e.g. AGit has no server branch).
         pr_number: Option<u64>,
         head_branch: Option<String>,
+        /// CLAUDE-549: `true` when the PR's CI was already green (and the
+        /// branch current and mergeable) at finalize time, so `finalize`
+        /// merged it in the same tick instead of leaving it for the webhook
+        /// or the reconciler. AI Agent still reads Code Review either way
+        /// (CLAUDE-327: a YouTrack workflow resolves the issue on merge);
+        /// `process_job` marks the `agent_pull_requests` row merged.
+        merged: bool,
     },
     /// Hard failure (claude error, pre failure, or PR-create failure);
     /// AI Agent=Failed, no PR (or a failed PR).
@@ -3240,7 +3284,8 @@ impl Finalized {
         match self {
             Finalized::NeedsReview => "Needs Review",
             Finalized::NoCodeChange => "No Code Change",
-            Finalized::CodeReview { .. } => "Code Review",
+            Finalized::CodeReview { merged: true, .. } => "Merged",
+            Finalized::CodeReview { merged: false, .. } => "Code Review",
             Finalized::Failed { requeued: true, .. } => "Queued (push)",
             Finalized::Failed {
                 requeued: false, ..
@@ -3654,15 +3699,34 @@ fn finalize(
                             &job.key,
                         );
                         comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
-                        // Finalize no longer waits for CI itself. When
-                        // `automerge.enabled`, the merge happens later, driven by a
-                        // `success`/`recover` Action-run webhook event on this PR (see
-                        // `crate::web::webhooks`), not by a poll here. The issue simply
-                        // stays at Code Review until that event (or a human) advances it.
+                        // Finalize never waits for CI (CLAUDE-278). It makes
+                        // one bounded status read (CLAUDE-549): a PR that is
+                        // already green, current and mergeable merges now;
+                        // anything else stays at Code Review and the
+                        // `success`/`recover` Action-run webhook (see
+                        // `crate::web::webhooks`) or the reconciler merges it
+                        // later.
+                        let merged = match (pr.number, &promote_error) {
+                            (Some(pr_number), None) => automerge_at_finalize(
+                                backend,
+                                forge,
+                                &src.automerge,
+                                &job.key,
+                                &host,
+                                &job.repo_path,
+                                pr_number,
+                                &url,
+                                run.run_id,
+                            ),
+                            // A PR still a draft, or one whose number is
+                            // unknown, is not merged here.
+                            _ => false,
+                        };
                         Ok(Finalized::CodeReview {
                             pr_url: url,
                             pr_number: pr.number,
                             head_branch: pr.head_branch,
+                            merged,
                         })
                     }
                     Some(ReviewOutcome::Fail(findings))
@@ -3972,6 +4036,7 @@ fn finalize(
                     pr_url: url,
                     pr_number: pr.number,
                     head_branch: pr.head_branch.clone(),
+                    merged: false,
                 });
             }
         }
@@ -4045,6 +4110,78 @@ fn append_compaction_note(body: &str, stream_log: Option<&Path>, key: &str) -> S
         Err(e) => {
             error!(key = %key, error = %e, "stream log read failed while checking for compaction");
             body.to_string()
+        }
+    }
+}
+
+/// CLAUDE-549: SPEC-3.3.1's finalize-time merge. After a successful run's PR
+/// is promoted from draft, make ONE status read bounded by
+/// `automerge.finalize_status_timeout_secs` and merge the PR right away when
+/// its checks are already `success`, its branch is not behind base and the
+/// forge reports it mergeable: the same three conditions
+/// `crate::web::webhooks::apply_automerge_decision` merges on. Every other
+/// answer returns `false` and changes nothing, leaving the PR at Code Review
+/// for the webhook and the reconciler, which own the pending, red,
+/// behind-base and not-mergeable cases (and their comments). In particular a
+/// behind-base PR is never branch-updated here, so this path never starts a
+/// new CI run and never takes a `max_ci_in_flight_per_repo` slot
+/// (CLAUDE-535); merging a green PR only ever frees one.
+///
+/// Returns `true` only when the merge landed. A merge failure is logged at
+/// `error` and returns `false`: the next webhook or reconciler pass retries
+/// and comments on a persisting failure.
+#[allow(clippy::too_many_arguments)]
+fn automerge_at_finalize(
+    backend: &dyn IssueTracker,
+    forge: &dyn Forge,
+    automerge: &crate::action::Automerge,
+    issue_key: &str,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    pr_url: &str,
+    run_id: i64,
+) -> bool {
+    if !automerge.enabled || automerge.finalize_status_timeout_secs == 0 {
+        return false;
+    }
+    let timeout = Duration::from_secs(automerge.finalize_status_timeout_secs);
+    let status = match forge.pr_status_within(host, repo, pr_number, timeout) {
+        Ok(status) => status,
+        Err(e) => {
+            warn!(key = %issue_key, pr_number, error = %e, "finalize-time automerge: PR status read failed or timed out; leaving the PR at Code Review for the webhook and reconciler");
+            return false;
+        }
+    };
+    let green = status.state.trim() == "success";
+    if !(green && status.behind_base == Some(false) && status.mergeable == Some(true)) {
+        info!(
+            key = %issue_key,
+            pr_number,
+            state = %status.state.trim(),
+            behind_base = ?status.behind_base,
+            mergeable = ?status.mergeable,
+            "finalize-time automerge: PR not ready to merge yet; leaving it at Code Review"
+        );
+        return false;
+    }
+    match complete_automerge(
+        backend,
+        forge,
+        issue_key,
+        host,
+        repo,
+        pr_number,
+        pr_url,
+        Some(run_id),
+    ) {
+        Ok(()) => {
+            info!(key = %issue_key, pr_number, "finalize-time automerge: CI already green; merged the PR");
+            true
+        }
+        Err(e) => {
+            error!(key = %issue_key, pr_number, error = %e, "finalize-time automerge: merge failed; leaving the PR at Code Review for the webhook and reconciler");
+            false
         }
     }
 }
@@ -8917,6 +9054,7 @@ mod tests {
                 pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
                 pr_number: Some(7),
                 head_branch: Some("feat/x".into()),
+                merged: false,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -9060,6 +9198,7 @@ mod tests {
                 pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
                 pr_number: Some(7),
                 head_branch: Some("feat/x".into()),
+                merged: false,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -9390,6 +9529,7 @@ mod tests {
                 pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
                 pr_number: Some(7),
                 head_branch: Some("feat/x".into()),
+                merged: false,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -9454,6 +9594,7 @@ mod tests {
                 pr_number: Some(7),
                 // AGit is branchless: no server branch to record.
                 head_branch: None,
+                merged: false,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -10824,6 +10965,7 @@ mod tests {
                 pr_url: "https://github.com/octo/widget/pull/11".into(),
                 pr_number: Some(11),
                 head_branch: Some("feat/gh".into()),
+                merged: false,
             }
         );
         let calls = tracker_runner.calls.lock().unwrap();
@@ -11177,6 +11319,7 @@ mod tests {
                 pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/1".to_string(),
                 pr_number: Some(1),
                 head_branch: Some("feat/x".to_string()),
+                merged: false,
             }),
             Ok(Finalized::NeedsReview),
             Ok(Finalized::NoCodeChange),
@@ -11610,6 +11753,7 @@ mod tests {
                 pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/9".into(),
                 pr_number: Some(9),
                 head_branch: Some("feat/x".into()),
+                merged: false,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -12265,6 +12409,344 @@ mod tests {
         );
     }
 
+    /// CLAUDE-549: the `fj pr status` args the finalize-time automerge read
+    /// issues for PR #7.
+    const FINALIZE_PR_STATUS_ARGS: [&str; 6] = [
+        "--host",
+        "dev.a8n.run",
+        "pr",
+        "status",
+        "contoso/claude-run#7",
+        "--json",
+    ];
+
+    /// CLAUDE-549: the `fj pr merge` call the finalize-time automerge makes.
+    const FINALIZE_PR_MERGE_CALL: &str =
+        "fj --host dev.a8n.run pr merge contoso/claude-run#7 --method merge --delete";
+
+    /// CLAUDE-549 fixture: a resumed run's successful finalize up to and
+    /// including `mark_pr_ready` on PR #7 (the same git/fj/yt stubs as
+    /// `finalize_resumed_success_strips_the_draft_prefix_via_mark_pr_ready`),
+    /// plus `fj pr merge` and any `yt` issue comment. The caller adds the
+    /// `fj pr status` answer for the CI state under test.
+    fn automerge_finalize_runner(git_dir: &Path) -> StubRunner {
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        StubRunner::new()
+            .ok(
+                "git",
+                &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                "origin/main",
+            )
+            .ok(
+                "git",
+                &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                "main\nfeat/x",
+            )
+            .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+            .ok(
+                "git",
+                &["remote", "get-url", "origin"],
+                "https://dev.a8n.run/contoso/claude-run.git",
+            )
+            .ok("git", &["rev-parse", "feat/x"], "abc\n")
+            .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "search",
+                    "--repo",
+                    "contoso/claude-run",
+                    "--state",
+                    "open",
+                    "--json",
+                ],
+                r#"{"pull_requests":[{"number":7,"title":"WIP: feat: x","head_sha":"abc"}]}"#,
+            )
+            .ok(
+                "git",
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
+                "",
+            )
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "body\n\n#MK-16\n",
+            )
+            .ok(
+                "git",
+                &["rev-parse", "--absolute-git-dir"],
+                &git_dir.to_string_lossy(),
+            )
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "create",
+                    "WIP: feat: x",
+                    "--body-file",
+                    body_path.as_str(),
+                    "--head",
+                    "feat/x",
+                    "--json",
+                ],
+                r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
+            )
+            .ok(
+                "yt",
+                &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                "",
+            )
+            .ok_prefix("fj --host dev.a8n.run pr edit contoso/claude-run#7 ", "")
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "merge",
+                    "contoso/claude-run#7",
+                    "--method",
+                    "merge",
+                    "--delete",
+                ],
+                "",
+            )
+            .ok_prefix("yt issue comment MK-16 ", "")
+    }
+
+    /// A [`CommandRunner`] that delegates to `inner` but holds every call
+    /// whose joined args contain `slow_on` for `delay` first, so a test can
+    /// make one forge read outlast a timeout.
+    struct SlowRunner {
+        inner: Arc<StubRunner>,
+        slow_on: &'static str,
+        delay: Duration,
+    }
+
+    impl CommandRunner for SlowRunner {
+        fn run_in_env(
+            &self,
+            dir: Option<&Path>,
+            binary: &str,
+            args: &[&str],
+            envs: &[(&str, &str)],
+        ) -> Result<crate::provider::cli::CmdOutput> {
+            if args.join(" ").contains(self.slow_on) {
+                std::thread::sleep(self.delay);
+            }
+            self.inner.run_in_env(dir, binary, args, envs)
+        }
+    }
+
+    /// CLAUDE-549: an automerge-enabled source with the given finalize
+    /// status timeout.
+    fn automerge_src(timeout_secs: u64) -> YoutrackSource {
+        let mut s = src();
+        s.automerge.enabled = true;
+        s.automerge.finalize_status_timeout_secs = timeout_secs;
+        s
+    }
+
+    /// CLAUDE-549: run the resumed-success finalize against `forge` and
+    /// `src`, with no review session (a pass).
+    fn finalize_automerge_case(
+        forge: &CliBackend,
+        src: &YoutrackSource,
+        workdir: &Path,
+    ) -> Finalized {
+        finalize(
+            forge,
+            forge,
+            src,
+            &job(),
+            workdir,
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+        )
+        .unwrap()
+    }
+
+    fn code_review_pr7(merged: bool) -> Finalized {
+        Finalized::CodeReview {
+            pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+            pr_number: Some(7),
+            head_branch: Some("feat/x".into()),
+            merged,
+        }
+    }
+
+    #[test]
+    fn finalize_merges_a_pr_whose_ci_is_already_green() {
+        // CLAUDE-549: green, current and mergeable at finalize time -> the
+        // PR merges in the same tick and the outcome reads Merged.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+            "fj",
+            &FINALIZE_PR_STATUS_ARGS,
+            r#"{"pr":7,"head_sha":"abc","state":"success","mergeable":true,"behind_base":false}"#,
+        ));
+        let forge = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
+        let res = finalize_automerge_case(&forge, &automerge_src(10), dir.path());
+        assert_eq!(res, code_review_pr7(true));
+        assert_eq!(res.as_str(), "Merged");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c == FINALIZE_PR_MERGE_CALL),
+            "a green PR must merge at finalize: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("yt issue comment MK-16 ") && c.contains("merged this PR")),
+            "the merge must be announced on the issue: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_leaves_a_pending_pr_at_code_review() {
+        // CLAUDE-549: CI still running -> Code Review, no merge; the
+        // webhook and reconciler own the merge once it goes green.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+            "fj",
+            &FINALIZE_PR_STATUS_ARGS,
+            r#"{"pr":7,"head_sha":"abc","state":"pending","mergeable":true,"behind_base":false}"#,
+        ));
+        let forge = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
+        let res = finalize_automerge_case(&forge, &automerge_src(10), dir.path());
+        assert_eq!(res, code_review_pr7(false));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("pr status contoso/claude-run#7")),
+            "finalize must read the PR status once: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains(" pr merge ")),
+            "a pending PR must not merge: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_leaves_a_red_pr_at_code_review() {
+        // CLAUDE-549: failing CI -> Code Review, no merge; the CI-fix flow
+        // owns the retry.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+            "fj",
+            &FINALIZE_PR_STATUS_ARGS,
+            r#"{"pr":7,"head_sha":"abc","state":"failure","mergeable":true,"behind_base":false}"#,
+        ));
+        let forge = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
+        let res = finalize_automerge_case(&forge, &automerge_src(10), dir.path());
+        assert_eq!(res, code_review_pr7(false));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains(" pr merge ")),
+            "a red PR must not merge: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_never_branch_updates_a_green_behind_base_pr() {
+        // CLAUDE-549 / CLAUDE-535: a green PR behind its base is left for
+        // the CI-capped webhook/reconciler branch update; finalize neither
+        // merges it nor starts a new CI run with an update.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+            "fj",
+            &FINALIZE_PR_STATUS_ARGS,
+            r#"{"pr":7,"head_sha":"abc","state":"success","mergeable":true,"behind_base":true}"#,
+        ));
+        let forge = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
+        let res = finalize_automerge_case(&forge, &automerge_src(10), dir.path());
+        assert_eq!(res, code_review_pr7(false));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains(" pr merge ") || c.contains(" pr update ")),
+            "a behind-base PR must be neither merged nor updated at finalize: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_falls_back_to_code_review_when_the_status_read_times_out() {
+        // CLAUDE-549: a status read slower than the timeout -> Code Review,
+        // no merge, and finalize returns without waiting the read out.
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+            "fj",
+            &FINALIZE_PR_STATUS_ARGS,
+            r#"{"pr":7,"head_sha":"abc","state":"success","mergeable":true,"behind_base":false}"#,
+        ));
+        let runner = Arc::new(SlowRunner {
+            inner: inner.clone(),
+            slow_on: "pr status",
+            delay: Duration::from_secs(5),
+        });
+        let forge = CliBackend::new(runner).with_git_retry_waits([Duration::ZERO; 3]);
+        let started = Instant::now();
+        let res = finalize_automerge_case(&forge, &automerge_src(1), dir.path());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "finalize must not wait out a slow status read: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(res, code_review_pr7(false));
+        let calls = inner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains(" pr merge ")),
+            "a timed-out status read must not merge: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_makes_no_status_read_when_automerge_is_off() {
+        // CLAUDE-549: automerge disabled (the default) or a zero timeout
+        // keeps today's behavior exactly: no status read, no merge.
+        for src in [src(), automerge_src(0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")));
+            let forge = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
+            let res = finalize_automerge_case(&forge, &src, dir.path());
+            assert_eq!(res, code_review_pr7(false));
+            let calls = runner.calls.lock().unwrap();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.contains(" pr status ") || c.contains(" pr merge ")),
+                "automerge off must not read status or merge: {calls:?}"
+            );
+        }
+    }
+
     #[test]
     fn finalize_resumed_success_strips_the_draft_prefix_via_mark_pr_ready() {
         // CLAUDE-379 criterion 5: a resumed run that finishes successfully
@@ -12427,6 +12909,7 @@ mod tests {
                 pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
                 pr_number: Some(7),
                 head_branch: Some("feat/x".into()),
+                merged: false,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -12581,6 +13064,7 @@ mod tests {
                 pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
                 pr_number: Some(7),
                 head_branch: Some("feat/x".into()),
+                merged: false,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -12748,6 +13232,7 @@ mod tests {
                 pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
                 pr_number: Some(7),
                 head_branch: Some("feat/x".into()),
+                merged: false,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -12891,6 +13376,7 @@ mod tests {
                 pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
                 pr_number: Some(7),
                 head_branch: None,
+                merged: false,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -13918,6 +14404,42 @@ mod tests {
         );
     }
 
+    /// CLAUDE-549: a PR merged at finalize has its freshly recorded row set
+    /// to `merged`, so the reconciler never walks it or retires it `closed`.
+    #[tokio::test]
+    async fn mark_merged_at_finalize_sets_the_recorded_row_merged() {
+        let pool = mem_pool().await;
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let backend = CliBackend::new(Arc::new(StubRunner::new()));
+        record_new_pr(
+            &pool,
+            &forge,
+            &backend,
+            "act",
+            &job(),
+            9,
+            "feat/x",
+            false,
+            test_comment_run(),
+        )
+        .await;
+
+        mark_merged_at_finalize(&pool, &job(), 9).await;
+
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+            .await
+            .unwrap()
+            .expect("record_new_pr inserts a row");
+        assert_eq!(rec.state, "merged");
+        let open = crate::ci_failure::store::open_agent_prs(&pool)
+            .await
+            .unwrap();
+        assert!(
+            open.is_empty(),
+            "a merged row must not be listed open: {open:?}"
+        );
+    }
+
     /// `process_job`'s `salvaged` flag follows the `finalize_res` variant: set
     /// for `Finalized::TimedOut`, clear for `Finalized::CodeReview` (CLAUDE-429).
     #[tokio::test]
@@ -14844,6 +15366,7 @@ mod tests {
                 pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
                 pr_number: Some(7),
                 head_branch: Some("feat/x".into()),
+                merged: false,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -14979,6 +15502,7 @@ mod tests {
                 pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
                 pr_number: Some(7),
                 head_branch: Some("feat/x".into()),
+                merged: false,
             }
         );
         let calls = runner.calls.lock().unwrap();
