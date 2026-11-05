@@ -4099,9 +4099,9 @@ fn merged_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
-/// SPEC-3.3.1: "a PR whose checks are green but the forge still reports it
-/// not mergeable for another reason (an actual conflict, still-checking, or
-/// WIP) is left at Code Review for a human."
+/// SPEC-3.3.1: a green PR the forge reports not mergeable that has no
+/// conflict-resolution run to send (CLAUDE-547) is left at Code Review for a
+/// human.
 ///
 /// The PR's checks went green but Forgejo reports it as not
 /// mergeable (a conflict, still being checked, or a WIP PR) - unrelated to
