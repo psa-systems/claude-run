@@ -480,6 +480,8 @@ Hybrid: a cheap deterministic pass runs first and only the residue it cannot lab
   the fix addresses the actual CI failure; a PR with no resolvable failing run proceeds with no CI context rather than
   failing the request.
 - Plain issue: create a tracker issue carrying the instruction and a back link, set it to queued, and reply with its key.
+- Start notice: the run posts the `SPEC-3.13` start comment on the PR or issue before it clones, mentioning the
+  commenter, and every rejection is posted as a comment naming the reason.
 - Throttling: synthetic action `webhook-comment` with `max_runs_per_day` (20); session timeout
   `claude_timeout_seconds` (600).
 
@@ -596,6 +598,8 @@ callers to build one themselves:
   explicitly rather than being omitted.
 - `Started:`, `Finished:` (RFC 3339, second precision) and `Duration:` (`<minutes>m <seconds>s`, or `<seconds>s` under
   a minute) lines, computed from the attempt's or run's own start time and "now" as the finish time.
+- `Source:` and `Trigger:` lines naming the action and what started the work (`SPEC-3.13`), and the numbered step
+  list of `SPEC-3.15` for any comment about an attempt.
 
 ### 3.10 Shared Cargo target directory (`SPEC-3.10`)
 
@@ -658,6 +662,139 @@ volume (9). Only unreferenced named volumes were bounded before this requirement
 5. **Scope.** The runner never removes an image, container or volume that a running container references, never uses a
    prune command that needs a force flag to skip its confirmation (removal is by explicit id from a listing), and never
    touches the app's own `/data`, `/config` or `/state` volumes.
+
+### 3.12 Work lifecycle: no unknown state (`SPEC-3.12`)
+
+Every unit of work (a tracker issue, a CI-failure remediation, a `/claude` comment run) is in exactly one state that a
+person can read without opening claude-run. The state is the tracker's `AI Agent` field (or, for a `/claude` run, the
+latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `Code Review`, `Needs Review`, `Done`,
+`Failed`. `Working` is the only in-between state, and it is the only state whose truth lives inside claude-run.
+
+1. **`Working` is backed by a live run.** The field reads `Working` if and only if a `run_inflight_jobs` row exists for
+   the issue in a daemon that is running. The runner never leaves `Working` behind on any exit path, including a
+   crash, a restart, a kill, a timeout and a cancel.
+2. **Reconcile sweep.** On daemon start and every 300 seconds (the automerge reconciler interval), the runner lists
+   issues whose field reads `Working` and which have no in-flight row. Each is moved to `Needs Review` (or `Queued`
+   below the attempt cap, as in 3.3) with a comment naming the cause and the last recorded step (`SPEC-3.14`). Each
+   correction is logged at `warn` naming the issue key. A sweep that cannot read the tracker is logged at `error` and
+   retried, never treated as "nothing stuck".
+3. **Every finalize path ends in a closed outcome.** The table is exhaustive; a path not in it is a defect, and the
+   code matches it with no wildcard arm.
+
+   | Path | Resulting field | Required comment content |
+   |---|---|---|
+   | success, verification gate and review pass | `Code Review` | PR link, step list |
+   | success, gate failed | `Failed` | gate command, bounded output |
+   | review fail marker | `Queued` below the attempt cap, else `Needs Review` | findings |
+   | review gave no verdict (the review session modified the workdir, timed out, or printed no marker) | one fresh review session is run; if it also gives no verdict, `Needs Review` | both causes |
+   | push rejected, remote diverged | one conflict-resolution pass (item 4); on failure `Needs Review` | conflicting files, both SHAs |
+   | push or PR create failed, other cause | `Queued` below the attempt cap, else `Failed` | redacted git error |
+   | timeout or cancel with commits | `Needs Review` | limit, last step, PR link |
+   | timeout or cancel without commits | `Queued` below the attempt cap, else `Failed` | limit, last step |
+   | CI remediation ceiling reached | `Needs Review` with `Needs-Info` | run links, failure categories |
+   | marker `.claude-run-needs-review` | `Needs Review` with `Needs-Info` | the decision needed |
+   | marker `.claude-run-no-code-change` | done label | marker text |
+   | hard failure | `Failed` | cause |
+
+4. **Conflict resolution.** When the final push finds a diverged remote branch (`SPEC-3.3.1`) and the merge conflicts,
+   the runner does not stop at an aborted merge. It dispatches one bounded `claude` pass in the same clone that merges
+   the remote branch and the base branch, resolves the conflicts, runs the verification gate (`SPEC-3.3.2`), and pushes
+   without a force flag. The pass records a `conflict_resolution` step (`SPEC-3.14`). A second divergence, or a failed
+   pass, ends in `Needs Review` per the table. The abort-only behavior is a defect.
+5. **A draft PR is never a state.** A draft PR opened at a checkpoint or a timeout salvage (`SPEC-3.3`) always has an
+   issue in a state from the table. A salvaged PR whose later run finishes the work is promoted by the same rules as
+   any other PR; the automerge block on a salvaged PR (CLAUDE-429) lasts only until a run finishes the work.
+6. **`Needs Review` names one action.** Its comment states the single decision or action a person must take, and the
+   issue carries the `Needs-Info` tag only when that action is a decision.
+7. **Estimate against limit.** At pickup, if the issue's `Estimation` exceeds the action's session timeout, the runner
+   does not start the attempt. It sets `Needs Review` with `Needs-Info`, and the comment names both numbers and asks
+   for the issue to be split or the limit raised. An issue with no `Estimation` is picked up as before.
+8. **CI failures are classified before they spend an attempt.** A CI failure whose log shows a job killed by its own
+   `timeout-minutes`, a container that never started, a runner API deadline (`context deadline exceeded`), or no parsed
+   test ids with no compiler diagnostic, is an infrastructure failure (`SPEC-3.5.1`). It does not count toward
+   `webhook.agent_pr_fix_attempts`, starts no remediation run, and is shown on the dashboard (`SPEC-4.3.15`) and in
+   the Reports failure-cause series (`SPEC-4.3.14`) with its category.
+9. **A review session that changes the workdir** has its changes discarded and is re-run once (item 3); the discard is
+   logged at `warn` with the changed paths.
+
+### 3.13 Work-start notice and comment provenance (`SPEC-3.13`)
+
+- Every action that starts work posts a start comment before it clones, as the first runner write for that attempt:
+  the `youtrack` action on the issue, the comment-command webhook (`SPEC-3.6`) on the PR or issue that carried the
+  comment, the CI-failure remediation on the failure's issue and PR. No action kind is exempt.
+- The start comment names: the action, the attempt number and its stage (`SPEC-3.14`), the run link, the session
+  timeout, and an expected duration. The expected duration is the median of the last 20 completed attempts of the same
+  action and stage; with fewer than 3 such attempts it says "no history" instead of a number.
+- A comment-command start comment mentions the commenter by login and names the trigger (`/claude`) and the instruction
+  length, so the person who typed it sees that it was picked up. Rejections (a missing permission, an over-long body, a
+  daily cap) are also posted as comments naming the reason, never only logged.
+- Every runner-posted comment, in addition to the `SPEC-3.9` footer, carries a `Source:` line (the action name) and a
+  `Trigger:` line, one of `queue` (the field was set to Queued), `comment` (with the commenter's login), `ci-webhook`,
+  `schedule`, `manual` (with the account), `reconcile`. The values are a closed set.
+- A start comment that fails to post is logged at `error` with the issue key and the cause; the run proceeds, and the
+  first progress comment (`SPEC-3.15`) states that the start notice is missing. The failure is never silent.
+
+### 3.14 Step timing (`SPEC-3.14`)
+
+Every attempt is a sequence of steps, each timed. Steps are stored in `attempt_steps` (`SPEC-5.2`) with `run_id`,
+`job_key`, `attempt`, `seq`, `stage`, `kind`, `label`, `started_at`, `ended_at`, `ok` and `detail`. An attempt is
+never summarized by one duration.
+
+1. **Stage** is one of: `initial`, `retry-2`, `retry-3`, `ci-remediation`, `conflict-resolution`, `review`, `final`.
+   An attempt belongs to one stage; the stage is stored on the attempt and on each step.
+2. **Kind** is a closed set: `clone`, `hook_install`, `postgres_start`, `postgres_healthy`, `coding`, `check`,
+   `build`, `checkpoint`, `push`, `pr_create`, `review`, `ci_wait`, `conflict_resolution`, `gate`, `other`.
+3. **Runner-owned steps** (`clone`, `hook_install`, `postgres_start`, `postgres_healthy`, `checkpoint`, `push`,
+   `pr_create`, `gate`, `review`, `ci_wait`, `conflict_resolution`) are timed directly by the runner around the call.
+   `postgres_start` runs from the container create call to its return, and `postgres_healthy` from there to the first
+   successful health probe; a probe that never succeeds is recorded with `ok = false` and the probe's last error.
+4. **Agent-run steps** (`coding`, `check`, `build`) are derived from the stream log (`SPEC-3.2`): a Bash tool call
+   whose command is the repo's pre-commit, pre-push, check or verification recipe is a `check`, with `label`
+   `pre-commit`, `pre-push`, `check`, `verify` or `ad-hoc` (any other test or lint command the agent chose to run); a
+   build command is a `build`; the time between steps is `coding`. Classification uses the command text only and is
+   unit tested against recorded logs. A command that matches no rule is `other`, never silently `coding`.
+5. **Check breakdown.** A `check` step carries sub-steps for each recipe stage the repo's recipe prints as a timed
+   boundary (for example `fmt`, `clippy`, `build`, `test`), each a row with `kind = check` and `label` set to the
+   stage. When the recipe prints no boundary, the check is one row and the report says its sub-steps are unknown.
+6. **No gaps.** The sum of an attempt's steps plus the explicit `unaccounted` remainder equals its wall time, and the
+   remainder is stored, not dropped. A step that ends by kill or timeout is closed with `ok = false` at the kill time.
+7. **Failed first tries are countable.** Each attempt records `outcome` (the `SPEC-3.12` table row), so the number of
+   issues that succeeded on the first, second or third attempt, that ended in `Needs Review` or `Failed`, and that never
+   finished (no terminal outcome 300 seconds after their last step) is a query, not an
+   estimate.
+8. A step that cannot be recorded (a database write failure) is logged at `error` with the issue key, the step and
+   the cause. The attempt continues and its report row is marked "step data incomplete".
+
+### 3.15 Progress comment (`SPEC-3.15`)
+
+Every runner-posted lifecycle comment on an issue or PR (the start notice, checkpoint push comments `SPEC-8.8`, check
+results, CI remediation, review verdict, final outcome) carries the same numbered step list, so a reader sees where
+the work is on any comment.
+
+1. Each line is `N. Label: <step time> / <total time>`. `<step time>` is the step's own duration, `<total time>` is the
+   elapsed time since the first step; both are `m:ss`, or `h:mm:ss` from one hour. A step not yet reached has no times.
+2. The step the current comment reports is marked `<-- This comment`. Earlier steps show their times, later steps are
+   listed with no times, so the list shows the whole expected path. The comment never edits an earlier comment; later
+   comments carry the later numbers.
+3. The happy path is:
+
+   ```text
+   1. Initial commit: 0:02 / 0:02
+   2. Checkpoint 1: 1:26 / 1:28
+   3. Checks 1: 15:52 / 17:20
+   4. Checkpoint 2: <-- This comment
+   5. Checks 2:
+   6. Verdict:
+   7. Final commit:
+   8. PR ready:
+   ```
+
+4. An unhappy path inserts its steps where they happen and numbers them in order: `Checks 1 (failed)`, `Retry 2`,
+   `CI remediation 1`, `Conflict resolution`, `Review (no verdict)`, `Failed`. The list for a run that ended in
+   `Needs Review` or `Failed` ends with that line, marked `<-- This comment`.
+5. The list is rendered from `attempt_steps` (`SPEC-3.14`), not from comment text, so it survives a restart and a
+   resumed run (a resumed run continues the numbering of the branch's earlier attempts).
+6. Steps are ASCII only. A step with no recorded time because its data is incomplete shows `?:??`, not `0:00`.
 
 ## 4. Interfaces
 
@@ -727,6 +864,7 @@ Served at the root of the unix socket (unless `--no-socket`) and under `/api` on
 | `POST /pause`, `POST /resume` | Global pause |
 | `GET`/`PUT /settings/{section}` | Settings sections `mint`, `webhook`, `webhook_comment`, `log_filter`, `workdir_gc`, `stream_log_gc`, `preferences`, `concurrency`, `db_retention`, `docker_gc`, `claude`, `auth` |
 | `GET /report/summary`, `/report/daily`, `/report/weekly`, `/report/by-weekday`, `/report/by-hour` | Aggregations; query `range` (`30d`, `90d`, other values mean all time) and `action` |
+| `GET /report/time-by-kind`, `/report/checks`, `/report/stages`, `/report/funnel`, `/report/failure-causes`, `/report/postgres` | Step-time aggregations (`SPEC-4.3.14`); same `range` and `action` |
 | `POST /access/check` | Same typed report as `access check` |
 
 A trigger is refused before it is queued, never accepted and silently dropped: a synthetic action (event-driven, no
@@ -891,6 +1029,48 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
 The Status page (`/status`, the former About page) carries build and version information, the quiet indicator, the
 global Pause and Resume control, the activity list, and the Management part (3.10 item 10). The nav entry "About" is
 "Status".
+
+#### 4.3.14 Reports: where the time goes (`SPEC-4.3.14`)
+
+`/reports` gains the series below, all built from `attempt_steps` and the attempt outcomes (`SPEC-3.14`), filtered by
+the same `range` and `action` parameters as `SPEC-4.3.13`, with JSON siblings `GET /report/{time-by-kind,checks,stages,
+funnel,failure-causes,postgres}`.
+
+- **Time by kind.** Total, mean, median and 95th-percentile duration, and share of attempt wall time, per step kind,
+  as a stacked bar per day. The `unaccounted` remainder is its own segment.
+- **Checks.** Number of checks per attempt (mean and distribution); for each check label (`pre-commit`, `pre-push`,
+  `check`, `verify`, `ad-hoc`) the count, median and 95th-percentile duration, and total time; for each check
+  sub-step (`fmt`, `clippy`, `build`, `test`) the same. A check with unknown sub-steps is listed as such.
+- **Coding versus building versus checking.** Per action, the split of wall time into `coding`, `build`, `check`,
+  Postgres start and health, push and CI wait.
+- **Postgres.** Time from start to healthy (median, 95th percentile, maximum), the count of starts that never became
+  healthy, and the cause of the last such failure.
+- **Stages.** Duration per stage (`initial`, `retry-2`, `retry-3`, `ci-remediation`, `conflict-resolution`, `review`,
+  `final`): count, median, 95th percentile.
+- **Funnel.** Of the issues in range, how many reached a terminal outcome on the first attempt, on the second, on the
+  third, ended in `Needs Review`, ended in `Failed`, and never finished (`SPEC-3.14` item 7). The counts sum to the
+  number of issues in range; a mismatch is rendered as an error banner naming the difference.
+- **Failure causes.** Count per failed attempt by closed category: `test`, `compile`, `fmt-lint`, `timeout`,
+  `push-diverged`, `hook`, `ci-infrastructure`, `review-no-verdict`, `other`. `other` is shown, never merged into
+  another bucket, and a non-zero `other` count is linked to its attempts.
+- An attempt recorded before step data existed, or marked incomplete, is excluded from the duration statistics and
+  counted in a visible "no step data" figure on every affected series. It is never counted as zero seconds.
+
+#### 4.3.15 Dashboard: in flight and CI failures (`SPEC-4.3.15`)
+
+- **In flight.** The dashboard shows the number of jobs in flight (`run_inflight_jobs`) and a row per job with its
+  action, issue key, stage, current step, elapsed time, and the median elapsed time of the last 20 completed
+  attempts of the same action and stage. A job over that median is highlighted, and a job over the session timeout
+  fraction `0.8` is highlighted as at risk. With fewer than 3 completed attempts the median reads "no history".
+- **Recent averages.** A graph of mean attempt duration by action over the last 7 days, and the time-by-kind stacked
+  bar (`SPEC-4.3.14`) for the same window, drawn from the same `report::` series as `/reports`.
+- **CI failures.** A table of every open CI failure: repository, workflow, job, triage bucket, infrastructure kind
+  when one was stored, the PR (linked), the tracker issue (linked through the action's `link_template`), the
+  remediation attempt count and the failure's state. Filterable by bucket and repository. A failure with no PR or no
+  issue shows "none", visibly different from a failed lookup, which shows an error cell naming the cause and is
+  logged at `warn`.
+- **Stuck work.** A count and list of issues the reconcile sweep corrected (`SPEC-3.12` item 2) in the last 7 days.
+- A series that cannot be read renders an error panel naming the cause, not an empty chart.
 
 ### 4.4 Webhooks
 
@@ -1089,6 +1269,7 @@ same schema. Pool: 16 connections, 30-second acquire timeout. Timestamps are RFC
 | `ci_failures`, `ci_failure_tests`, `ci_failure_runs` | Failure store: repo, workflow, job, `infra_kind`, `issue_key`, `state`; unique (`failure_id`, `test_id`); run index, commit, branch, PR number |
 | `agent_pull_requests` | Recorded agent PRs: unique (`host`, `repo`, `pr_number`), `issue_key`, `head_branch`, `fix_attempts`, `state`, `salvaged` |
 | `claude_invocations` | Per-invocation cost, token and rate-limit utilization record |
+| `attempt_steps` | Timed steps of an attempt (`SPEC-3.14`): `run_id`, `job_key`, `attempt`, `seq`, `stage`, `kind`, `label`, `started_at`, `ended_at`, `ok`, `detail`; `job_outcomes` gains `stage` and `outcome` |
 | `web_accounts` | `username`, unique `username_key`, argon2 `password_hash`, `session_key`, TOTP secret (encrypted), `totp_enrolled_at`, `totp_last_step`, `created_by` |
 | `web_account_recovery_codes` | Hashed one-time recovery codes per account |
 | `web_invites` | `token_hash` (unique), `created_by`, `expires_at`, `used_at`, `email` |
@@ -1621,7 +1802,7 @@ action's `token_ref`, which is injected per job.
   remote branch, a timeout-salvage push, a checkpoint push, the comment-webhook fix push, and the automerge
   behind-base branch update) posts one PR comment naming the event, the issue key, the PR's resulting draft/ready
   state, the old/new SHA range, and the pushed commits' subjects (capped at 20, with the remaining count named
-  beyond that), ending with the SPEC-3.9 run footer. A write with no local clone to read commit subjects from (the
+  beyond that), the SPEC-3.15 step list, ending with the SPEC-3.9 run footer. A write with no local clone to read commit subjects from (the
   automerge branch update) says so explicitly rather than omitting the line.
 - Posting is best-effort and never retried (forge writes do not retry, SPEC-8.4): a failed post is logged at `error`
   and returned as a line the caller folds into whichever outcome comment it already owns, never a second, separate
