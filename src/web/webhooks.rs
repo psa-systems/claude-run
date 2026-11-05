@@ -1835,6 +1835,7 @@ async fn attach_to_open_failure(
         crate::run_footer::resolved_public_url().as_deref(),
         run_id,
         None,
+        "ci-failure-webhook",
     );
     let key_for_comment = key.clone();
     let result =
@@ -1931,6 +1932,7 @@ async fn reopen_resolved_failure(
                 public_url.as_deref(),
                 run_id,
                 None,
+                "ci-failure-webhook",
             );
             backend.comment(&key2, &regression_body)?;
             let has_open_pr = resolve_has_open_pr(forge.as_ref(), &event);
@@ -1958,6 +1960,7 @@ async fn reopen_resolved_failure(
                 public_url.as_deref(),
                 run_id,
                 None,
+                "ci-failure-webhook",
             );
             backend.comment(&key2, &analysis)?;
             if mint::queues_for_fix(verdict.bucket) && auto_fix_enabled {
@@ -2438,6 +2441,7 @@ async fn route_agent_pr_failure(
             crate::run_footer::resolved_public_url().as_deref(),
             webhook_run_id,
             None,
+            "ci-failure-webhook",
         );
         let backend = ctx.backend.clone();
         let mint_cfg = ctx.mint_cfg.read().await.clone();
@@ -2512,6 +2516,7 @@ async fn route_agent_pr_failure(
                 crate::run_footer::resolved_public_url().as_deref(),
                 webhook_run_id,
                 None,
+                "ci-failure-webhook",
             );
             backend.comment(&key, &body)?;
             backend.set_field(&key, &mint_cfg.ai_agent_field, &mint_cfg.queued_value)?;
@@ -2570,6 +2575,7 @@ async fn route_agent_pr_failure(
             crate::run_footer::resolved_public_url().as_deref(),
             webhook_run_id,
             None,
+            "ci-failure-webhook",
         );
         let backend = ctx.backend.clone();
         let mint_cfg = ctx.mint_cfg.read().await.clone();
@@ -5285,6 +5291,7 @@ async fn post_issue_comment(
         crate::run_footer::resolved_public_url().as_deref(),
         None,
         None,
+        "automerge-reconciler",
     );
     match tokio::task::spawn_blocking(move || backend.comment(&key, &body)).await {
         Ok(Ok(())) => {}

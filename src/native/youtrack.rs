@@ -745,6 +745,7 @@ pub async fn reconcile_restart_inflight(
                         crate::run_footer::resolved_public_url().as_deref(),
                         None,
                         None,
+                        "youtrack",
                     );
                     if let Err(e) = backend.comment(&key, &comment) {
                         warn!(action = %action_name, key = %key, error = %e, "restart reconcile: re-queue comment failed (field was already set to Queued)");
@@ -1559,6 +1560,7 @@ async fn process_job(
                     run_id,
                     attempt: attempts + 1,
                     started: started_wall,
+                    source: "youtrack",
                 }),
             );
         });
@@ -1585,6 +1587,7 @@ async fn process_job(
                     run_id,
                     attempt: attempts + 1,
                     started: started_wall,
+                    source: "youtrack",
                 }),
             );
         });
@@ -1672,6 +1675,7 @@ async fn process_job(
                 run_id,
                 attempt: attempts + 1,
                 started: started_wall,
+                source: "youtrack",
             },
             checkpoint_rejected.as_deref(),
             review.as_ref(),
@@ -1717,6 +1721,7 @@ async fn process_job(
                     run_id,
                     attempt: attempts + 1,
                     started: started_wall,
+                    source: "youtrack",
                 },
             )
             .await;
@@ -1737,6 +1742,7 @@ async fn process_job(
                     run_id,
                     attempt: attempts + 1,
                     started: started_wall,
+                    source: "youtrack",
                 },
             )
             .await;
@@ -2356,6 +2362,7 @@ async fn dependency_gate(
             crate::run_footer::resolved_public_url().as_deref(),
             run_id,
             None,
+            "youtrack",
         );
         if let Err(e) = backend.comment(key, &body) {
             // Best-effort: a comment failure must not strand the gate.
@@ -3322,6 +3329,7 @@ fn final_push_failed(
 /// sets AI Agent to the configured `delivery_blocked` label (falling back
 /// to `needs_review` when none is configured, so an unset config still
 /// parks the issue for a human rather than stranding it at Working).
+#[allow(clippy::too_many_arguments)]
 fn finish_delivery_blocked(
     backend: &dyn IssueTracker,
     src: &YoutrackSource,
@@ -3996,6 +4004,7 @@ pub(crate) fn complete_automerge(
         crate::run_footer::resolved_public_url().as_deref(),
         run_id,
         None,
+        "youtrack",
     );
     if let Err(e) = backend.comment(issue_key, &body) {
         error!(key = %issue_key, error = %e, "post-automerge comment failed");
@@ -4204,6 +4213,7 @@ fn report_cap_reached(
         crate::run_footer::resolved_public_url().as_deref(),
         Some(run_id),
         Some(started),
+        "youtrack",
     );
     if let Err(e) = backend.comment(key, &body) {
         error!(action = %action, key = %key, error = %e, "attempt-cap comment failed");
@@ -4284,6 +4294,7 @@ fn requeue_off_working(
             crate::run_footer::resolved_public_url().as_deref(),
             None,
             None,
+            "youtrack",
         ),
     };
     if let Err(e) = comment_then_field(backend, src, key, &body, &src.states.queued) {
@@ -6295,6 +6306,7 @@ mod tests {
             started: chrono::DateTime::parse_from_rfc3339("2026-10-12T18:41:03Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
+            source: "youtrack",
         }
     }
 
@@ -6781,7 +6793,6 @@ mod tests {
             "the no-PR bullet must be replaced when a PR URL is given:\n{body}"
         );
     }
-
 
     /// A run with no `compact_boundary` event in its stream log
     /// leaves the outcome comment untouched.

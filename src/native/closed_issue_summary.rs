@@ -338,6 +338,7 @@ fn file_report(
         crate::run_footer::resolved_public_url().as_deref(),
         Some(run_id),
         None,
+        "closed-issue-summary",
     );
     backend.comment(parent, &comment)?;
     Ok(Filing::Filed(report))

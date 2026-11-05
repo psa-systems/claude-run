@@ -147,7 +147,13 @@ pub fn build_body(ctx: &PushCommentContext<'_>) -> String {
         ctx.issue_key,
         format_subjects(&ctx.subjects),
     );
-    crate::run_footer::append_run(&body, ctx.public_url, ctx.run_id, ctx.started)
+    crate::run_footer::append_run(
+        &body,
+        ctx.public_url,
+        ctx.run_id,
+        ctx.started,
+        "push-comment",
+    )
 }
 
 /// One lock per scratch path, so posts for different PRs still run in parallel.

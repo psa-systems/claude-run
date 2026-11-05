@@ -596,6 +596,7 @@ callers to build one themselves:
   explicitly rather than being omitted.
 - `Started:`, `Finished:` (RFC 3339, second precision) and `Duration:` (`<minutes>m <seconds>s`, or `<seconds>s` under
   a minute) lines, computed from the attempt's or run's own start time and "now" as the finish time.
+- A `Source:` line naming the action that produced the comment (`CLAUDE-555`), e.g. `youtrack`, `closed-issue-summary`, `ci-failure-webhook`, `comment-webhook`, `automerge-reconciler`, `push-comment`. Each call site passes a non-defaulting `source: &'static str`, so a new path that forgets to set it fails to compile.
 
 ### 3.10 Shared Cargo target directory (`SPEC-3.10`)
 
