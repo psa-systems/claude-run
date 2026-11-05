@@ -235,17 +235,44 @@ jobs:
               $"RUST_TEST_THREADS=($env.NEXTEST_TEST_THREADS)\n" | save --append $env.GITHUB_ENV
           }
 
+      # CLAUDE-559: per-phase timing + target-cache size snapshots so a PR run
+      # surfaces where the SQLite leg's 40+ minutes go beyond the suite's own
+      # ~34s wall-clock. Forgejo's UI already prints each step's duration but
+      # does not break down compile vs test inside a step, and `job-metrics-report`
+      # is aggregate; these explicit markers give grep-able anchors in the log.
       - name: Check formatting
-        run: cargo fmt --all --check
+        shell: nu {0}
+        run: |
+          print $"TIMING ($env.NU_VERSION): fmt-start ((date now | format date '%+'))"
+          cargo fmt --all --check
+          print $"TIMING: fmt-end ((date now | format date '%+'))"
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        shell: nu {0}
+        run: |
+          print $"TIMING: clippy-start ((date now | format date '%+'))"
+          if ("target" | path exists) {
+            let size = (du target | get apparent | math sum)
+            print $"TIMING: target-cache-size-before-clippy ($size) bytes"
+          }
+          cargo clippy --all-targets -- -D warnings
+          print $"TIMING: clippy-end ((date now | format date '%+'))"
 
       - name: Build
-        run: cargo build --all-targets
+        shell: nu {0}
+        run: |
+          print $"TIMING: build-start ((date now | format date '%+'))"
+          cargo build --all-targets
+          print $"TIMING: build-end ((date now | format date '%+'))"
+          let size = (du target | get apparent | math sum)
+          print $"TIMING: target-cache-size-after-build ($size) bytes"
 
       - name: Unit tests (SQLite, the default backend)
-        run: cargo test
+        shell: nu {0}
+        run: |
+          print $"TIMING: sqlite-tests-start ((date now | format date '%+'))"
+          cargo test
+          print $"TIMING: sqlite-tests-end ((date now | format date '%+'))"
 
       - name: Unit tests (PostgreSQL)
         # Runs the fixtures against the managed `postgres` service.
@@ -270,6 +297,7 @@ jobs:
         env:
           CLAUDE_RUN_TEST_DATABASE_URL: postgres://claude_run:claude_run@postgres:5432/claude_run
         run: |
+          print $"TIMING: postgres-tests-start ((date now | format date '%+'))"
           let filters = (
               open scripts/postgres-test-filters.txt
               | lines
@@ -280,6 +308,7 @@ jobs:
           let threads = ([($ci_jobs * 4) 8] | math max)
           print $"postgres test threads: ($threads); filters: ($filters)"
           cargo test -- --test-threads $threads ...$filters
+          print $"TIMING: postgres-tests-end ((date now | format date '%+'))"
 
       - name: Report job metrics
         # Last and always(), so a failing job still reports (composite actions have no post hook).
