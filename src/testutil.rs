@@ -415,3 +415,89 @@ mod tests {
         }
     }
 }
+
+thread_local! {
+    /// The current thread's log capture, when a test has one running.
+    static LOG_BUF: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Writes a formatted log line into the current thread's capture, or drops
+/// it when the thread has none.
+struct ThreadLogWriter;
+
+impl Write for ThreadLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        LOG_BUF.with(|cell| {
+            if let Some(capture) = cell.borrow().as_ref() {
+                capture
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Install, once per test binary, the global subscriber every log capture
+/// reads through (CLAUDE-569). A subscriber set per test with
+/// `set_default`/`with_default` made `tracing` rebuild its per-callsite
+/// interest cache each time one was created or dropped; with dozens of test
+/// threads doing that at once, a log site could stay cached as disabled
+/// while a test's own subscriber was in place, and its event never reached
+/// the capture (PR #153, run #835). With one subscriber for the whole run,
+/// nothing is created or dropped and that cache never changes.
+fn install_test_subscriber() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let sub = tracing_subscriber::fmt()
+            .with_writer(|| ThreadLogWriter)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(sub)
+            .expect("the test binary's only global subscriber");
+    });
+}
+
+/// Captures what the current thread logs while it is alive, for a test that
+/// asserts a path logged (or did not log) something. Hold it across `.await`
+/// in a current-thread async test; events from other threads are not seen,
+/// as with the scoped subscribers it replaces.
+pub struct LogCapture {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    previous: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+}
+
+impl LogCapture {
+    pub fn start() -> Self {
+        install_test_subscriber();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let previous = LOG_BUF.with(|cell| cell.borrow_mut().replace(buf.clone()));
+        LogCapture { buf, previous }
+    }
+
+    /// Everything captured so far.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.buf.lock().unwrap_or_else(|p| p.into_inner())).into_owned()
+    }
+}
+
+impl Drop for LogCapture {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        LOG_BUF.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
+/// Run `f` and return what it returned and everything the current thread
+/// logged meanwhile.
+pub fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+    let capture = LogCapture::start();
+    let out = f();
+    let logs = capture.text();
+    (out, logs)
+}

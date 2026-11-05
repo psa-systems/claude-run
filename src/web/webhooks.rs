@@ -8489,28 +8489,7 @@ mod tests {
             parked.push(pool.acquire().await.unwrap());
         }
 
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for CaptureWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-            type Writer = CaptureWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                CaptureWriter(self.0.clone())
-            }
-        }
-        let sub = tracing_subscriber::fmt()
-            .with_writer(CaptureWriter(buf.clone()))
-            .with_ansi(false)
-            .finish();
-        let dispatch_guard = tracing::subscriber::set_default(sub);
+        let capture = crate::testutil::LogCapture::start();
 
         finish_webhook_run(
             &pool,
@@ -8523,8 +8502,8 @@ mod tests {
         )
         .await;
 
-        drop(dispatch_guard);
-        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let logs = capture.text();
+        drop(capture);
         assert!(
             logs.contains("ERROR"),
             "expected an error-level log: {logs}"

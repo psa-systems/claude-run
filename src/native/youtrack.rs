@@ -5245,32 +5245,7 @@ mod tests {
     /// everything it logged. Lets a test assert a failure path logged at
     /// `error` without a real log file to read back.
     fn capture_logs(f: impl FnOnce()) -> String {
-        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for CaptureWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-            type Writer = CaptureWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                CaptureWriter(self.0.clone())
-            }
-        }
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let sub = tracing_subscriber::fmt()
-            .with_writer(CaptureWriter(buf.clone()))
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(sub);
-        f();
-        drop(guard);
-        let out = buf.lock().unwrap().clone();
-        String::from_utf8(out).unwrap()
+        crate::testutil::capture_logs(f).1
     }
 
     /// CLAUDE-521: two concurrent scratch-file writers racing on the exact
@@ -14126,28 +14101,7 @@ mod tests {
             .await
             .unwrap();
 
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for CaptureWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-            type Writer = CaptureWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                CaptureWriter(self.0.clone())
-            }
-        }
-        let sub = tracing_subscriber::fmt()
-            .with_writer(CaptureWriter(buf.clone()))
-            .with_ansi(false)
-            .finish();
-        let dispatch_guard = tracing::subscriber::set_default(sub);
+        let capture = crate::testutil::LogCapture::start();
 
         clear_salvaged_for_resume(
             &pool,
@@ -14160,8 +14114,8 @@ mod tests {
         )
         .await;
 
-        drop(dispatch_guard);
-        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let logs = capture.text();
+        drop(capture);
         assert!(logs.contains("ERROR"), "expected an error log: {logs}");
         assert!(
             logs.contains("CLAUDE-429"),
