@@ -2551,9 +2551,19 @@ async fn route_agent_pr_failure(
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // CLAUDE-545: the CI-fix attempt ceiling is a delivery-blocked
+        // terminal state. The AI Agent label stays at Needs Review here
+        // (MintConfig has no per-action YoutrackStates, so there is no
+        // delivery-blocked label to route to from this path), but the
+        // comment follows the delivery-blocked shape so the issue reads
+        // the same way as the finalize-path blockers.
         let body = format!(
-            "Fix-attempt ceiling ({}) reached on this PR; flagging Needs Review.\nAttempts:\n{links}",
-            webhook_cfg.agent_pr_fix_attempts
+            "{}\n\n- Attempt ceiling: {} (configured `agent_pr_fix_attempts`)\n- Attempts:\n{links}",
+            crate::native::youtrack::delivery_blocked_comment(
+                crate::native::youtrack::DeliveryBlockedReason::CiFixCeiling,
+                Some(&ev.html_url),
+            ),
+            webhook_cfg.agent_pr_fix_attempts,
         );
         let body = crate::run_footer::append_run(
             &body,

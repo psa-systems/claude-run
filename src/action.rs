@@ -554,6 +554,17 @@ pub struct YoutrackStates {
     /// through [`YoutrackStates::no_code_label`], never directly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_code: Option<String>,
+    /// AI Agent value set when `finalize` detects a run that cannot deliver
+    /// a mergeable PR (timeout with nothing to salvage, push rejected,
+    /// CI-fix ceiling reached, review session modified the read-only
+    /// workdir, or a success path with no commits ahead of the base).
+    /// `None` (the default) resolves to `needs_review` so a run that would
+    /// otherwise park on it still does, but the dashboard loses the finer
+    /// distinction; set this to a dedicated label when Needs Review is
+    /// overloaded. Read through
+    /// [`YoutrackStates::delivery_blocked_label`], never directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_blocked: Option<String>,
     /// Standard `State` field value set in the pre step.
     pub in_progress: String,
     /// Deprecated and ignored: the runner no longer writes
@@ -575,6 +586,7 @@ impl Default for YoutrackStates {
             failed: "Failed".to_string(),
             done: "Done".to_string(),
             no_code: None,
+            delivery_blocked: None,
             in_progress: "In Progress".to_string(),
             state_done: "Done".to_string(),
         }
@@ -586,6 +598,16 @@ impl YoutrackStates {
     /// `no_code` when set, otherwise the configured `done` label.
     pub fn no_code_label(&self) -> &str {
         self.no_code.as_deref().unwrap_or(&self.done)
+    }
+
+    /// AI Agent label for a delivery-blocked run (CLAUDE-545): the
+    /// configured `delivery_blocked` when set, otherwise the configured
+    /// `needs_review` label so an unset config still parks the issue for a
+    /// human rather than stranding it at Working.
+    pub fn delivery_blocked_label(&self) -> &str {
+        self.delivery_blocked
+            .as_deref()
+            .unwrap_or(&self.needs_review)
     }
 }
 
