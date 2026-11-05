@@ -188,6 +188,14 @@ jobs:
     # dind host), so a container it starts is not on this job's network and the
     # job cannot connect to it (runs #743-#745). `claude-run test-postgres`
     # stays the LOCAL dev path (SPEC-6.6), where Docker is local and reachable.
+    #
+    # PGDATA is mounted on tmpfs: 993 per-test CREATE DATABASE ... TEMPLATE
+    # clones each force a checkpoint + WAL flush, and run #793 spent 26 minutes
+    # in the Postgres step at avg_cores=0.44 (cpu_seconds=897, wall=2031)
+    # serializing on those disk fsyncs. tmpfs makes fsync() effectively a no-op;
+    # the service container never outlives one job so PGDATA is fully
+    # disposable anyway, and 2g comfortably covers one template plus concurrent
+    # per-test clones on a 9g-peak job.
     services:
       postgres:
         image: docker.io/postgres:18.4-alpine3.23
@@ -206,6 +214,7 @@ jobs:
           --health-timeout 5s
           --health-start-period 30s
           --health-retries 24
+          --tmpfs /var/lib/postgresql/data:rw,size=2g
     steps:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
