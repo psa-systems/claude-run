@@ -100,12 +100,11 @@ pub fn resolved_public_url() -> Option<String> {
 
 /// SPEC-3.9: the attempt-page `Run:` line for a job-lifecycle comment.
 ///
-/// [`append`] for a job-lifecycle comment: links the job's own attempt page,
+/// [`render`] appended for a job-lifecycle comment: links the job's own attempt page,
 /// with "now" as the finish time. The `source` for the `Source:` line is
 /// taken from the `CommentRun` itself (CLAUDE-555).
 pub fn append_job(body: &str, public_url: Option<&str>, run: CommentRun<'_>, key: &str) -> String {
-    append(
-        body,
+    let footer = render(
         public_url,
         Some(run.run_id),
         Some(Attempt {
@@ -116,12 +115,13 @@ pub fn append_job(body: &str, public_url: Option<&str>, run: CommentRun<'_>, key
         Utc::now(),
         run.source,
         run.trigger,
-    )
+    );
+    format!("{body}{footer}")
 }
 
 /// SPEC-3.9: the run-page `Run:` line for a comment about a run as a whole.
 ///
-/// [`append`] for a comment about a run as a whole rather than one job's
+/// [`render`] appended for a comment about a run as a whole rather than one job's
 /// attempt (webhook runs, the closed-issue summary, the dependency gate, the
 /// attempt-cap comment): links `/runs/<id>`, with "now" as both the start
 /// and finish time when no better start time is available. `source`
@@ -135,8 +135,7 @@ pub fn append_run(
     trigger: Option<&Trigger>,
 ) -> String {
     let finished = Utc::now();
-    append(
-        body,
+    let footer = render(
         public_url,
         run_id,
         None,
@@ -144,7 +143,8 @@ pub fn append_run(
         finished,
         source,
         trigger,
-    )
+    );
+    format!("{body}{footer}")
 }
 
 /// SPEC-3.9: full footer text, all three link/no-link/no-run-id cases, the
@@ -191,23 +191,6 @@ pub fn render(
         started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         finished.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         humanize(finished - started),
-    )
-}
-
-/// Append [`render`]'s footer to a comment body.
-pub fn append(
-    body: &str,
-    public_url: Option<&str>,
-    run_id: Option<i64>,
-    attempt: Option<Attempt<'_>>,
-    started: DateTime<Utc>,
-    finished: DateTime<Utc>,
-    source: &'static str,
-    trigger: Option<&Trigger>,
-) -> String {
-    format!(
-        "{body}{}",
-        render(public_url, run_id, attempt, started, finished, source, trigger)
     )
 }
 
@@ -343,14 +326,11 @@ mod tests {
     #[test]
     fn append_puts_the_footer_after_the_body() {
         let started = ts("2026-10-12T18:41:03Z");
-        let finished = ts("2026-10-12T18:41:33Z");
-        let body = append(
+        let body = append_run(
             "Opened a PR.",
             Some("https://claude-run.example.com"),
             Some(1),
-            None,
-            started,
-            finished,
+            Some(started),
             "youtrack",
             None,
         );
