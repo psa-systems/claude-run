@@ -477,7 +477,11 @@ and dispatches on `behind_base` first, since Forgejo's `mergeable` never reflect
   branch was updated and leaves the issue at Code Review; updating a branch retriggers CI, and the next `success`
   event tries again. A failed update comments the failure and fails the run.
 - **Green, `behind_base: false`, and not mergeable** (a real conflict, still-checking, or a WIP PR): the handler
-  comments that the PR is not mergeable and leaves the issue at Code Review.
+  dispatches one conflict-resolution run per PR head commit through the `concurrency.max_ci_in_flight_per_repo` gate
+  (CLAUDE-547) and comments that it is resolving the conflict; a WIP PR is skipped. With no run to send it comments
+  that the PR is not mergeable and leaves the issue at Code Review.
+- **Failed checks and not mergeable** (CLAUDE-547): a non-WIP PR gets the same one resolution run per head commit;
+  with none to send, no action.
 - **Green, `behind_base: false`, and mergeable:** the PR is merged as a **merge-commit** (never squash/rebase, so the
   single commit's bare `#<KEY>` reference survives in history), and a "runner merged" comment is posted. CLAUDE-327
   removed the `State`/`AI Agent` write that used to follow the merge here: a YouTrack workflow

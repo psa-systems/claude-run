@@ -84,7 +84,10 @@ flowchart TD
         AM4 -- "success, behind_base=true" --> AM7{"update_pr_branch (fj pr update --style merge)"}
         AM7 -- ok --> AM7a["comment: branch updated; leave at Code Review"]
         AM7 -- error --> AM7b["comment: update failed; fail run"]
-        AM4 -- "success, behind_base=false, not mergeable" --> AM6["comment: not mergeable; leave at Code Review"]
+        AM4 -- "success, behind_base=false, not mergeable" --> AM6{"conflict run for this head commit (non-WIP, under CI cap)"}
+        AM6 -- dispatched --> AM6a["comment: runner is resolving the conflict"]
+        AM6 -- "none to send" --> AM6c["comment: not mergeable; leave at Code Review"]
+        AM4 -- "failure, not mergeable" --> AM6d["conflict run for this head commit (non-WIP, under CI cap)"]
         AM4 -- "success, behind_base=false, mergeable" --> AM5{"merge_pr"}
         AM5 -- ok --> AM5a["comment: runner merged (no State or AI Agent write; the YouTrack workflow resolves the issue)"]
         AM5 -- error --> AM5b["comment: merge failed; fail run"]

@@ -221,8 +221,13 @@ daemon's own tick (CLAUDE-328, see below). Both entry points make the same decis
      (CLAUDE-535): it waits, with no comment and no update, while another PR's branch update on the repo is still in CI
      or the repo's other runner PRs with CI pending are at the cap, so one merge to the base does not retrigger full CI
      on every open agent PR at once.
-   - **`behind_base: false` and not mergeable** (a real conflict, still-checking, or a WIP PR): comments that the PR
-     is not mergeable and leaves the issue at Code Review.
+   - **`behind_base: false` and not mergeable** (a real conflict, still-checking, or a WIP PR): dispatches one
+     conflict-resolution run per PR head commit (CLAUDE-547) through the same CI cap as a branch update, and
+     comments that the runner is resolving it. A WIP PR is skipped. With no run to send (an attempt already made for
+     this head commit, no comment source covering the repo), it comments that the PR is not mergeable and leaves the
+     issue at Code Review.
+   - **Checks failed and not mergeable** (CLAUDE-547): a non-WIP PR gets the same one resolution run per head
+     commit; with none to send, no action.
    - **`behind_base: false` and mergeable:** merges it as a merge-commit and posts a "runner merged" comment; it makes
      no `State` or `AI Agent` write (CLAUDE-327: the YouTrack workflow resolves the issue once it sees the merge, not
      the runner). A merge failure here (Forgejo refusing for a reason `mergeable` did not predict) comments the failure

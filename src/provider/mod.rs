@@ -1274,6 +1274,48 @@ pub fn shallow_clone(
     shallow_clone_retrying(url, branch, workdir, depth, &GIT_NETWORK_RETRY_WAITS)
 }
 
+/// Fetch `head` and `base` with their full history into a shallow clone, so
+/// the merge base of the two branches is present for a conflict-resolution
+/// merge (CLAUDE-547). Both land in an explicit `refs/remotes/origin/<branch>`,
+/// as a single-branch clone's refspec would otherwise write `FETCH_HEAD` only
+/// (CLAUDE-464). `--depth` at git's maximum works on a shallow and on an
+/// already complete clone, where `--unshallow` would fail.
+pub fn deepen_for_merge(
+    url: &str,
+    workdir: &std::path::Path,
+    head: &str,
+    base: &str,
+) -> Result<()> {
+    deepen_for_merge_retrying(url, workdir, head, base, &GIT_NETWORK_RETRY_WAITS)
+}
+
+fn deepen_for_merge_retrying(
+    url: &str,
+    workdir: &std::path::Path,
+    head: &str,
+    base: &str,
+    waits: &[Duration; 3],
+) -> Result<()> {
+    let secrets = url_secrets(url);
+    let head_spec = format!("+refs/heads/{head}:refs/remotes/origin/{head}");
+    let base_spec = format!("+refs/heads/{base}:refs/remotes/origin/{base}");
+    let out = retry_git_network("fetch full history", &secrets, waits, || {
+        Ok(authed_git_command(Some(workdir), Some(url))
+            .arg("fetch")
+            .arg("--depth")
+            .arg("2147483647")
+            .arg("origin")
+            .arg(&head_spec)
+            .arg(&base_spec)
+            .output()?)
+    })?;
+    if !out.status.success() {
+        return Err(git_error("fetch full history", &out, Some(url)));
+    }
+    scrub_workdir_credentials(url, workdir)?;
+    Ok(())
+}
+
 /// Same as [`shallow_clone`], with the retry wait schedule as a parameter
 /// (tests pass an all-zero schedule).
 ///
@@ -2142,6 +2184,58 @@ mod tests {
         assert_eq!(
             rev_parse_abbrev(&clone, "origin/HEAD").as_deref(),
             Some("origin/main")
+        );
+    }
+
+    /// CLAUDE-547: a depth-1 clone of the head branch has no merge base with
+    /// the base branch; after `deepen_for_merge` both tips and their merge
+    /// base are present.
+    #[test]
+    fn deepen_for_merge_brings_the_merge_base_into_a_shallow_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_default_branch(tmp.path(), "main");
+        let origin = tmp.path().join("origin");
+        let git_in = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git_in(&origin, &["config", "user.name", "t"]);
+        git_in(&origin, &["config", "user.email", "t@t.example"]);
+        let fork_point = git_in(&origin, &["rev-parse", "main"]);
+        for n in 0..3 {
+            std::fs::write(origin.join("m.txt"), n.to_string()).unwrap();
+            git_in(&origin, &["add", "."]);
+            git_in(&origin, &["commit", "-q", "-m", &format!("main {n}")]);
+        }
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, Some("feat"), &clone, 1).unwrap();
+        let before = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&clone)
+            .args(["merge-base", "origin/feat", "origin/main"])
+            .output()
+            .unwrap();
+        assert!(
+            !before.status.success()
+                || String::from_utf8_lossy(&before.stdout).trim() != fork_point,
+            "the depth-1 clone must not already hold the merge base"
+        );
+
+        deepen_for_merge(&url, &clone, "feat", "main").unwrap();
+
+        assert_eq!(
+            git_in(&clone, &["merge-base", "origin/feat", "origin/main"]),
+            fork_point
         );
     }
 
