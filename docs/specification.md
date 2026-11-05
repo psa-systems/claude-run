@@ -1483,19 +1483,24 @@ a `config.toml` key, for example `webhook_comment` or `docker_gc`) has no import
 
 ### 6.6 Throwaway test Postgres (`SPEC-6.6`)
 
-`claude-run test-postgres [--image <ref>] [--init-sql <file>]... -- <command> [args...]` starts a private,
+`claude-run test-postgres [--image <ref>] [--init-sql <file>]... [--network <name>] -- <command> [args...]` starts a private,
 non-durable PostgreSQL container in the Docker-in-Docker sidecar, runs `<command>` against it with `DATABASE_URL`,
 `CLAUDE_RUN_TEST_DATABASE_URL` and `CLAUDE_RUN_TEST_POSTGRES_CONTAINER` set, and tears the container down however
 the command ends (normal exit, command failure, `SIGINT`/`SIGTERM`, or a setup error), propagating the command's
 exit code (128 + signal if it was killed by one) and failing the run if teardown itself fails even when the command
 succeeded. It sweeps orphaned containers from earlier runs whose owning pid is no longer alive first, starts the
-container with a loopback-only ephemeral published port, `--rm`, no volume (the writable layer and data
-directory are both discarded on teardown) and a raised `max_connections` (the parallel fixture leg needs more than the
-default 100, CLAUDE-540), waits for an actual `psql` connection (not `pg_isready`, which can report
-ready during the official image's post-`initdb` restart) up to 60s, then disables `fsync`, `synchronous_commit` and
+container with a loopback-only ephemeral published port (or, with the optional `--network`, on that Docker network
+with nothing published, reached by container name on port 5432, for a caller that is itself a container on that
+network), `--rm`, no volume (the writable layer and data directory are both discarded on teardown) and a raised
+`max_connections` (the parallel fixture leg needs more than the default 100, CLAUDE-540), waits for an actual `psql`
+connection (not `pg_isready`, which can report ready during the official image's post-`initdb` restart) up to 60s,
+then opens a TCP connection to the URL's host and port from its own process for up to 20s and fails
+fast naming `--network` when it cannot (a caller in a container of its own cannot reach the Docker host's loopback),
+then disables `fsync`, `synchronous_commit` and
 `full_page_writes` and verifies the change by reading `SHOW fsync` back, retrying for up to 20s against a
 restart-shaped connection failure. Each `--init-sql` file then runs in order with `ON_ERROR_STOP`, through the same
-retry. The generated password never appears in a log line or an error message.
+retry. The generated password never appears in a log line or an error message. CI runs its Postgres leg through it
+(`SPEC-11.1`).
 
 ## 7. Security
 
@@ -1968,12 +1973,10 @@ never write the same registry destination.
 
 ## 11. CI
 
-- **SPEC-11.1**: The PostgreSQL pass of the unit-test job in `.forgejo/workflows/check.yml` MUST run against a
-  Forgejo-managed `postgres` service container, reached from the job container by the service name `postgres` on 5432,
-  with `CLAUDE_RUN_TEST_DATABASE_URL` set on that step only (so the SQLite step still runs on SQLite). It MUST NOT use
-  `claude-run test-postgres` in CI: this runner's Docker is a remote daemon, so a container that subcommand starts is
-  not on the job's network and the job cannot reach it. The service is durable (its `options` cannot carry a
-  `-c fsync=off` flag), which CLAUDE-528 had avoided for its per-test flush cost; CLAUDE-540's template-clone fixture
-  (`SPEC-5.6.2`) makes per-test setup a block copy that barely touches disk, so fsync-on is affordable and
-  `SPEC-10.1.3` still holds. `claude-run test-postgres` (`SPEC-6.6`) remains the local-dev path, where Docker is local
-  and reachable.
+- **SPEC-11.1**: The PostgreSQL pass of the unit-test job in `.forgejo/workflows/check.yml` MUST run through
+  `claude-run test-postgres --network <job network>` (`SPEC-6.6`), with the job container's network read from the
+  container the runner names in `JOB_CONTAINER_NAME`, and MUST NOT use a `services: postgres` container: a service's
+  `options` cannot turn durability off, and a durable server on the runner's shared array made the pass take an hour
+  (run #764) where the non-durable one took minutes (run #746). Each unit-test step MUST carry a `timeout-minutes` far
+  below the runner's 3 hour job limit. The non-durable server is not a timeout increase, retry or skip: `SPEC-10.1.3`
+  still holds for the suite on slow storage.
