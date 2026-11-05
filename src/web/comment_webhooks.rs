@@ -1409,6 +1409,12 @@ fn serve_run(
         .map_err(|e| format!("resolve clone url: {e}"))
         .and_then(|url| {
             clone_branch(&url, &branch, workdir).map_err(|e| format!("git clone: {e}"))?;
+            // A runner-dispatched conflict run merges the base in, which needs
+            // the merge base, and the depth-50 clone may not reach it (CLAUDE-547).
+            if cmd.synthetic {
+                crate::provider::deepen_for_merge(&url, workdir, &branch, &base)
+                    .map_err(|e| format!("fetching full history for the merge: {e}"))?;
+            }
             let dir = crate::native::youtrack::cargo_target_dir(paths, &url);
             crate::native::youtrack::ensure_cargo_target_dir(&dir).map_err(|e| {
                 format!(
