@@ -406,7 +406,11 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
 - `mint.bot_logins` is not a mint-time loop guard: loop safety is the open-PR routing below, decided from the
   `agent_pull_requests` store (3.5.2) before a failure on the agent's own PR ever reaches the mint. `bot_logins` is
   read only by the comment-command webhook (3.6). Open-PR routing: a failure on the agent's own open PR requeues its
-  issue until `webhook.agent_pr_fix_attempts` (default 3) is reached, then the issue is set to needs-review; a
+  issue until `webhook.agent_pr_fix_attempts` (default 3) is reached, then the issue is set to needs-review, except
+  that a failure whose failing tests overlap none of the earlier attempts' on that PR gets one more attempt, up to
+  `webhook.agent_pr_fix_attempts_hard_cap` (default 6, at least the normal cap; CLAUDE-551); with no earlier fingerprint
+  or no parsed test ids it parks as before. Each re-queue writes a `run_events` row saying normal or extended, and the
+  needs-review comment lists every distinct failing-test set seen on the PR; a
   failure on a human's PR is commented on that PR; a resolved match reopens as a regression, comments the run and
   its failing tests, and is re-triaged so `AI Agent` is set exactly as a freshly minted issue of that bucket would.
 - Issues are created in the project whose VCS integration claims the repository, with `mint.repo_project_map` consulted

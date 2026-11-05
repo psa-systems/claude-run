@@ -4757,6 +4757,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "fix attempts on the agent's own open PR before its issue is flagged Needs Review instead of re-queued.",
             },
             FieldDoc {
+                name: "agent_pr_fix_attempts_hard_cap",
+                badge: "next event",
+                note: "at the cap above, a failure overlapping none of the PR's earlier failing tests gets one more attempt, up to this many in all (default 6, at least agent_pr_fix_attempts).",
+            },
+            FieldDoc {
                 name: "max_runs_per_day",
                 badge: "next event",
                 note: "daily run cap of the webhook-triage ledger (default 20, at least 1).",
