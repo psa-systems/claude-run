@@ -103,15 +103,47 @@ pub struct PushCommentContext<'a> {
     pub started: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// SPEC-8.8: render the push comment body (event, issue key, PR state, commit
-/// range, capped commit subjects, then the SPEC-3.9 run footer).
+/// One-line outcome a reviewer can read at a glance: how many commits
+/// landed and what the last one said. Precedes the issue/range/subjects
+/// block so the push comment opens with a direct answer instead of a bare
+/// event label.
+fn outcome_headline(ctx: &PushCommentContext<'_>) -> String {
+    match &ctx.subjects {
+        CommitSubjects::Unavailable => {
+            format!(
+                "{}, commit count unknown (no local clone).",
+                ctx.event.label()
+            )
+        }
+        CommitSubjects::Listed(subjects) if subjects.is_empty() => {
+            format!("{}, no new commits.", ctx.event.label())
+        }
+        CommitSubjects::Listed(subjects) => {
+            let noun = if subjects.len() == 1 {
+                "commit"
+            } else {
+                "commits"
+            };
+            format!(
+                "{}, {} {noun} pushed (last: \"{}\").",
+                ctx.event.label(),
+                subjects.len(),
+                subjects[0],
+            )
+        }
+    }
+}
+
+/// SPEC-8.8: render the push comment body. Opens with a one-line outcome
+/// (commit count and last subject), then the issue key, PR state, commit
+/// range, capped commit subjects, and the SPEC-3.9 run footer.
 pub fn build_body(ctx: &PushCommentContext<'_>) -> String {
     let state = if ctx.draft { "draft" } else { "ready" };
     let old = ctx.old_sha.map(short).unwrap_or("none");
     let new = ctx.new_sha.map(short).unwrap_or("unknown");
     let body = format!(
         "{}\n\nIssue: {}\nPR state: {state}\nRange: {old}..{new}\n\n{}",
-        ctx.event.label(),
+        outcome_headline(ctx),
         ctx.issue_key,
         format_subjects(&ctx.subjects),
     );
@@ -198,6 +230,54 @@ mod tests {
                     .with_timezone(&chrono::Utc),
             ),
         }
+    }
+
+    #[test]
+    fn outcome_headline_names_the_commit_count_and_last_subject() {
+        let body = build_body(&ctx(
+            PushEvent::CheckpointPush,
+            CommitSubjects::Listed(vec!["Add thing".into(), "Fix other thing".into()]),
+        ));
+        assert!(
+            body.starts_with("checkpoint push, 2 commits pushed (last: \"Add thing\")."),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn outcome_headline_handles_a_single_commit_in_singular() {
+        let body = build_body(&ctx(
+            PushEvent::CheckpointPush,
+            CommitSubjects::Listed(vec!["Only commit".into()]),
+        ));
+        assert!(
+            body.starts_with("checkpoint push, 1 commit pushed (last: \"Only commit\")."),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn outcome_headline_handles_empty_subjects() {
+        let body = build_body(&ctx(
+            PushEvent::ResumedRunPush,
+            CommitSubjects::Listed(vec![]),
+        ));
+        assert!(
+            body.starts_with("resumed-run push, no new commits."),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn outcome_headline_handles_unavailable_subjects() {
+        let body = build_body(&ctx(
+            PushEvent::BranchUpdatedFromBase,
+            CommitSubjects::Unavailable,
+        ));
+        assert!(
+            body.starts_with("branch updated from base, commit count unknown (no local clone)."),
+            "{body}"
+        );
     }
 
     #[test]
