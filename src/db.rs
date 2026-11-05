@@ -1610,8 +1610,9 @@ mod tests {
     /// Same as the SQLite test above, run against Postgres so the fix is
     /// proven on both backends per the acceptance criteria. Unlike the
     /// SQLite variant, `connect()` here opens a real network connection, so
-    /// the pool itself is built with a generous `acquire_timeout`: under
-    /// full-suite CPU contention (CLAUDE-524) that connect can take well
+    /// the pool itself is built with the same 120s `acquire_timeout` as
+    /// `test_sqlite_pool` and `pool_on_database` (CLAUDE-524): under
+    /// full-suite CPU/connection contention that connect can take well
     /// over the 50ms this test needs to deliberately force the *second*
     /// acquire to time out, which was flaking CI (connect itself tripping
     /// `PoolTimedOut` before the test even got to the race it means to
@@ -1634,7 +1635,7 @@ mod tests {
         let acquire_timeout = Duration::from_millis(50);
         let pool = AnyPoolOptions::new()
             .max_connections(1)
-            .acquire_timeout(Duration::from_secs(30))
+            .acquire_timeout(Duration::from_secs(120))
             .connect(&url)
             .await
             .expect("connect to CLAUDE_RUN_TEST_DATABASE_URL");
