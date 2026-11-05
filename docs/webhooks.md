@@ -194,7 +194,9 @@ happened for billing-service's ~25-minute integration suite (GAMMA-1174) - timed
 nothing watching it afterward.
 
 `finalize` no longer waits for CI at all: a successful run opens the PR and stops at Code Review immediately, whether or
-not automerge is enabled. The merge instead happens later, normally driven by a `success` or `recover` Action-run
+not automerge is enabled. The one exception (CLAUDE-549) is a single status read, bounded by
+`automerge.finalize_status_timeout_secs`, right after the PR is promoted: a PR whose CI is already green, whose branch
+is current and which is mergeable merges in that same tick. Otherwise the merge happens later, normally driven by a `success` or `recover` Action-run
 webhook event on `POST /webhooks/forgejo/triage/<source>` - the same endpoint the CI-failure listener uses, dispatched on the
 payload's `action` field rather than dropped as "non-failure" the way it used to be - and, as a backstop for a webhook
 that is missed, dropped, or delivered before the PR's `agent_pull_requests` row exists, by a reconciler pass on the

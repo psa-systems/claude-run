@@ -25,7 +25,9 @@ flowchart TD
     QCreatePR -- yes --> QGate{SPEC-3.3.2<br/>verification gate pass?}
     QGate -- no --> Failed_Verify([Failed pr_step=verify])
     QGate -- yes --> QReview{post-success<br/>review verdict?}
-    QReview -- Pass or None --> CodeReview([CodeReview])
+    QReview -- Pass or None --> QGreen{automerge on and PR<br/>green + current + mergeable<br/>within timeout?}
+    QGreen -- yes --> CodeReviewMerged([CodeReview merged=true])
+    QGreen -- no --> CodeReview([CodeReview])
     QReview -- NoVerdict names<br/>read-only contract --> DB_ReviewWD([DeliveryBlocked<br/>ReviewModifiedWorkdir])
     QReview -- Fail or other<br/>NoVerdict --> ReviewFailed([ReviewFailed])
 
@@ -43,7 +45,7 @@ flowchart TD
 
     classDef terminal fill:#1c3d5a,color:#fff,stroke:#1c3d5a
     classDef blocker fill:#4a1c1c,color:#fff,stroke:#d94f4f,stroke-width:3px,stroke-dasharray:5 5
-    class NeedsReview,NoCodeChange,CodeReview,ReviewFailed,TimedOut,Failed_Push,Failed_Verify,Failed_PrCreate,Failed_Crash terminal
+    class NeedsReview,NoCodeChange,CodeReview,CodeReviewMerged,ReviewFailed,TimedOut,Failed_Push,Failed_Verify,Failed_PrCreate,Failed_Crash terminal
     class DB_PushRejected,DB_ReviewWD,DB_NoCommits,DB_Timeout blocker
 ```
 
@@ -53,7 +55,7 @@ Each terminal variant in [`Finalized`](../src/native/youtrack.rs):
 
 - `NeedsReview`: the agent parked the job (left `.claude-run-needs-review`). No PR. AI Agent = `states.needs_review`.
 - `NoCodeChange`: a successful run deliberately produced no commits and left `.claude-run-no-code-change`. No PR. AI Agent = `states.no_code_label()`.
-- `CodeReview { pr_url, pr_number, head_branch }`: success. PR opened and promoted to ready. AI Agent = `states.code_review`.
+- `CodeReview { pr_url, pr_number, head_branch, merged }`: success. PR opened and promoted to ready. AI Agent = `states.code_review`. `merged` is `true` (outcome `Merged`) when automerge is enabled and the one bounded status read after promotion found the PR green, current and mergeable, so finalize merged it in the same tick (CLAUDE-549); `process_job` then marks its `agent_pull_requests` row `merged`.
 - `Failed { cause, pr_step, requeued }`: a hard failure in the agent's own run or in finalize's post-agent push/PR-create/verify path. AI Agent = `states.failed` (or `states.queued` when `requeued`).
 - `TimedOut { pr_number, head_branch }`: the agent hit its wall-clock limit and some work was salvaged as a draft PR (CLAUDE-379). AI Agent = `states.needs_review` when still Working, left untouched otherwise.
 - `ReviewFailed { pr_url, pr_number, head_branch, requeued }`: the post-success review session (CLAUDE-449) gave a `Fail` verdict or a `NoVerdict` that is NOT the read-only-contract case. PR stays a draft. AI Agent = `states.queued` below the attempt cap, `states.needs_review` at it.
