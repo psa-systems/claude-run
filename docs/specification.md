@@ -1295,8 +1295,8 @@ fast naming `--network` when it cannot (a caller in a container of its own canno
 then disables `fsync`, `synchronous_commit` and
 `full_page_writes` and verifies the change by reading `SHOW fsync` back, retrying for up to 20s against a
 restart-shaped connection failure. Each `--init-sql` file then runs in order with `ON_ERROR_STOP`, through the same
-retry. The generated password never appears in a log line or an error message. This subcommand is a local-dev
-capability; CI runs its Postgres leg against a managed `services: postgres` container (`SPEC-11.1`), not through it.
+retry. The generated password never appears in a log line or an error message. CI runs its Postgres leg through it
+(`SPEC-11.1`).
 
 ## 7. Security
 
@@ -1769,13 +1769,11 @@ never write the same registry destination.
 
 ## 11. CI
 
-- **SPEC-11.1**: The PostgreSQL pass of the unit-test job in `.forgejo/workflows/check.yml` MUST run against a
-  Forgejo-managed `postgres` service container, reached from the job container by the service name `postgres` on 5432,
-  with `CLAUDE_RUN_TEST_DATABASE_URL` set on that step only (so the SQLite step still runs on SQLite). It MUST NOT use
-  `claude-run test-postgres` in CI: this runner's Docker is a remote daemon, so a container that subcommand starts is
-  not on the job's network and the job cannot reach it. The service is durable (its `options` cannot carry a
-  `-c fsync=off` flag), which CLAUDE-528 had avoided for its per-test flush cost; CLAUDE-540's template-clone fixture
-  (`SPEC-5.6.2`) makes per-test setup a block copy that barely touches disk, so fsync-on is affordable and
-  `SPEC-10.1.3` still holds. `claude-run test-postgres` (`SPEC-6.6`) remains the local-dev path, where Docker is local
-  and reachable; its `--network` option (CLAUDE-541) and fail-fast reachability probe serve a local caller that is
-  itself a container on a shared Docker network, and are not the CI method.
+- **SPEC-11.1**: The PostgreSQL pass of the unit-test job in `.forgejo/workflows/check.yml` MUST run through
+  `claude-run test-postgres --network <job network>` (`SPEC-6.6`), with the job container's network read from the
+  container the runner names in `JOB_CONTAINER_NAME`, and MUST NOT use a `services: postgres` container: a service's
+  `options` cannot turn durability off, and a durable server on the runner's shared array made the pass take an hour
+  (run #764) where the non-durable one took minutes (run #746). The unit-test steps MUST set `TMPDIR` to the job
+  container's RAM-backed `/dev/shm`, and each MUST carry a `timeout-minutes` far below the runner's 3 hour job limit.
+  Neither the non-durable server nor `TMPDIR` is a timeout increase, retry or skip: `SPEC-10.1.3` still holds for the
+  suite on slow storage.
