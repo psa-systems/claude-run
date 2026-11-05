@@ -2470,38 +2470,7 @@ mod tests {
 
     // ---- effort selection ------------------------------------------------
 
-    /// Collects the log lines emitted while a closure runs, so the warn path can
-    /// be asserted on rather than assumed.
-    #[derive(Clone)]
-    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-        type Writer = CaptureWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sub = tracing_subscriber::fmt()
-            .with_writer(CaptureWriter(buf.clone()))
-            .with_ansi(false)
-            .finish();
-        let out = tracing::subscriber::with_default(sub, f);
-        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        (out, logs)
-    }
+    use crate::testutil::capture_logs;
 
     /// Neither the action nor the global default names an effort: no `--effort`
     /// flag at all.
