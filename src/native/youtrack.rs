@@ -746,6 +746,7 @@ pub async fn reconcile_restart_inflight(
                         None,
                         None,
                         "youtrack",
+                        None,
                     );
                     if let Err(e) = backend.comment(&key, &comment) {
                         warn!(action = %action_name, key = %key, error = %e, "restart reconcile: re-queue comment failed (field was already set to Queued)");
@@ -1167,6 +1168,15 @@ async fn process_job(
     let action = &loaded.action;
     let key = &job.key;
     let attempts = state::attempts_get(pool, &action.name, key).await?;
+    // CLAUDE-556: a scheduler pickup is the AI Agent = Queued pickup; any
+    // other origin (`bypass_backoff`) is an operator-initiated run.
+    let trigger = if bypass_backoff {
+        crate::run_footer::Trigger::Manual {
+            by: "operator command".to_string(),
+        }
+    } else {
+        crate::run_footer::Trigger::AiAgentPickup
+    };
 
     // YouTrack jobs always carry a stable key (idReadable), so the attempt cap
     // always applies.
@@ -1192,6 +1202,7 @@ async fn process_job(
             limits.max_attempts_per_key,
             run_id,
             started_wall,
+            &trigger,
         );
         return Ok(ProcessedJob::CapHit { key: key.clone() });
     }
@@ -1561,6 +1572,7 @@ async fn process_job(
                     attempt: attempts + 1,
                     started: started_wall,
                     source: "youtrack",
+                    trigger: Some(&trigger),
                 }),
             );
         });
@@ -1588,6 +1600,7 @@ async fn process_job(
                     attempt: attempts + 1,
                     started: started_wall,
                     source: "youtrack",
+                    trigger: Some(&trigger),
                 }),
             );
         });
@@ -1676,6 +1689,7 @@ async fn process_job(
                 attempt: attempts + 1,
                 started: started_wall,
                 source: "youtrack",
+                trigger: Some(&trigger),
             },
             checkpoint_rejected.as_deref(),
             review.as_ref(),
@@ -1722,6 +1736,7 @@ async fn process_job(
                     attempt: attempts + 1,
                     started: started_wall,
                     source: "youtrack",
+                    trigger: Some(&trigger),
                 },
             )
             .await;
@@ -1743,6 +1758,7 @@ async fn process_job(
                     attempt: attempts + 1,
                     started: started_wall,
                     source: "youtrack",
+                    trigger: Some(&trigger),
                 },
             )
             .await;
@@ -2363,6 +2379,7 @@ async fn dependency_gate(
             run_id,
             None,
             "youtrack",
+            None,
         );
         if let Err(e) = backend.comment(key, &body) {
             // Best-effort: a comment failure must not strand the gate.
@@ -4065,6 +4082,7 @@ pub(crate) fn complete_automerge(
         run_id,
         None,
         "youtrack",
+        None,
     );
     if let Err(e) = backend.comment(issue_key, &body) {
         error!(key = %issue_key, error = %e, "post-automerge comment failed");
@@ -4266,6 +4284,7 @@ fn report_cap_reached(
     cap: u32,
     run_id: i64,
     started: chrono::DateTime<chrono::Utc>,
+    trigger: &crate::run_footer::Trigger,
 ) {
     let body = cap_reached_comment(attempts, cap);
     let body = crate::run_footer::append_run(
@@ -4274,6 +4293,7 @@ fn report_cap_reached(
         Some(run_id),
         Some(started),
         "youtrack",
+        Some(trigger),
     );
     if let Err(e) = backend.comment(key, &body) {
         error!(action = %action, key = %key, error = %e, "attempt-cap comment failed");
@@ -4355,6 +4375,7 @@ fn requeue_off_working(
             None,
             None,
             "youtrack",
+            None,
         ),
     };
     if let Err(e) = comment_then_field(backend, src, key, &body, &src.states.queued) {
@@ -6369,7 +6390,7 @@ mod tests {
         );
     }
 
-    fn test_comment_run() -> crate::run_footer::CommentRun {
+    fn test_comment_run() -> crate::run_footer::CommentRun<'static> {
         crate::run_footer::CommentRun {
             run_id: 1,
             attempt: 1,
@@ -6377,6 +6398,7 @@ mod tests {
                 .unwrap()
                 .with_timezone(&chrono::Utc),
             source: "youtrack",
+            trigger: None,
         }
     }
 

@@ -729,9 +729,12 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
 - A comment-command start comment mentions the commenter by login and names the trigger (`/claude`) and the instruction
   length, so the person who typed it sees that it was picked up. Rejections (a missing permission, an over-long body, a
   daily cap) are also posted as comments naming the reason, never only logged.
-- Every runner-posted comment, in addition to the `SPEC-3.9` footer, carries a `Source:` line (the action name) and a
-  `Trigger:` line, one of `queue` (the field was set to Queued), `comment` (with the commenter's login), `ci-webhook`,
-  `schedule`, `manual` (with the account), `reconcile`. The values are a closed set.
+- Every runner-posted comment, in addition to the `SPEC-3.9` footer, carries a `Source:` line (the action name) and,
+  when its run has a known trigger, a `Trigger:` line right after it (`CLAUDE-556`). The trigger is one of `Scheduled`
+  (the scheduler's periodic tick), `WebhookEvent` (with a readable origin such as `CI failure run #42`), `UserCommand`
+  (a `/claude` command, with the asker's login), `Manual` (an operator-initiated `trigger` or `run`) and
+  `AiAgentPickup` (the `youtrack` action picking up an issue whose `AI Agent` field is `Queued`). The set is closed. A
+  comment with no known trigger omits the line.
 - A start comment that fails to post is logged at `error` with the issue key and the cause; the run proceeds, and the
   first progress comment (`SPEC-3.15`) states that the start notice is missing. The failure is never silent.
 

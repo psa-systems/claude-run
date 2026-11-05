@@ -22,6 +22,51 @@ pub struct Attempt<'a> {
     pub attempt: u32,
 }
 
+/// What caused the run that produced a comment (CLAUDE-556), printed as the
+/// footer's `Trigger:` line right after `Source:`.
+///
+/// Variants carry the human-readable origin so a reader sees why the work
+/// started without opening the run page. A comment whose run has no known
+/// trigger passes `None` and the line is omitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    /// The scheduler's periodic tick.
+    Scheduled,
+    /// A webhook delivery; `source` is the readable origin, e.g. "CI failure on PR 42".
+    WebhookEvent { source: String },
+    /// A `/claude` command; `login` is the asker.
+    UserCommand { login: String },
+    /// An operator-initiated run (`claude-run trigger` or `run`); `by` is the channel.
+    Manual { by: String },
+    /// The `youtrack` action picking up an issue whose `AI Agent` field is `Queued`.
+    AiAgentPickup,
+}
+
+impl Trigger {
+    /// The one-line description printed after `Trigger: `.
+    pub fn render(&self) -> String {
+        match self {
+            Trigger::Scheduled => "scheduled poll".to_string(),
+            Trigger::WebhookEvent { source } => format!("webhook event ({source})"),
+            Trigger::UserCommand { login } => format!("/claude command from {login}"),
+            Trigger::Manual { by } => format!("manual run ({by})"),
+            Trigger::AiAgentPickup => "AI Agent pickup".to_string(),
+        }
+    }
+
+    /// Map a run's `triggered_by` origin to a trigger: the scheduler's periodic
+    /// pickup becomes `scheduled`, any other origin is an operator-initiated run.
+    pub fn from_run_origin(triggered_by: &str, scheduled: Trigger) -> Trigger {
+        if triggered_by == "scheduler" {
+            scheduled
+        } else {
+            Trigger::Manual {
+                by: triggered_by.to_string(),
+            }
+        }
+    }
+}
+
 /// Which run and attempt a job-lifecycle comment belongs to, and when that
 /// attempt started: the context a finalize-path comment needs to build its
 /// footer, threaded in by the caller that already holds `run_id` and
@@ -32,12 +77,16 @@ pub struct Attempt<'a> {
 /// `closed-issue-summary`, a webhook listener) wrote it without opening the
 /// run page. The field is non-defaulting on purpose: a new call site that
 /// forgets to set it fails to compile.
+///
+/// `trigger` (CLAUDE-556) is optional: `None` omits the `Trigger:` line.
+/// It borrows so the struct stays `Copy`.
 #[derive(Clone, Copy)]
-pub struct CommentRun {
+pub struct CommentRun<'a> {
     pub run_id: i64,
     pub attempt: u32,
     pub started: DateTime<Utc>,
     pub source: &'static str,
+    pub trigger: Option<&'a Trigger>,
 }
 
 /// SPEC-3.9: "`public_url` is resolved independently of SMTP configuration."
@@ -54,7 +103,7 @@ pub fn resolved_public_url() -> Option<String> {
 /// [`append`] for a job-lifecycle comment: links the job's own attempt page,
 /// with "now" as the finish time. The `source` for the `Source:` line is
 /// taken from the `CommentRun` itself (CLAUDE-555).
-pub fn append_job(body: &str, public_url: Option<&str>, run: CommentRun, key: &str) -> String {
+pub fn append_job(body: &str, public_url: Option<&str>, run: CommentRun<'_>, key: &str) -> String {
     append(
         body,
         public_url,
@@ -66,6 +115,7 @@ pub fn append_job(body: &str, public_url: Option<&str>, run: CommentRun, key: &s
         run.started,
         Utc::now(),
         run.source,
+        run.trigger,
     )
 }
 
@@ -82,6 +132,7 @@ pub fn append_run(
     run_id: Option<i64>,
     started: Option<DateTime<Utc>>,
     source: &'static str,
+    trigger: Option<&Trigger>,
 ) -> String {
     let finished = Utc::now();
     append(
@@ -92,6 +143,7 @@ pub fn append_run(
         started.unwrap_or(finished),
         finished,
         source,
+        trigger,
     )
 }
 
@@ -108,6 +160,7 @@ pub fn render(
     started: DateTime<Utc>,
     finished: DateTime<Utc>,
     source: &'static str,
+    trigger: Option<&Trigger>,
 ) -> String {
     let run_line = match (public_url, run_id) {
         (Some(base), Some(id)) => {
@@ -129,8 +182,12 @@ pub fn render(
         (_, None) => "Run: no run id is available for this comment".to_string(),
     };
 
+    let trigger_line = trigger
+        .map(|t| format!("\nTrigger: {}", t.render()))
+        .unwrap_or_default();
+
     format!(
-        "\n\n{run_line}\nStarted: {}\nFinished: {}\nDuration: {}\nSource: {source}",
+        "\n\n{run_line}\nStarted: {}\nFinished: {}\nDuration: {}\nSource: {source}{trigger_line}",
         started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         finished.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         humanize(finished - started),
@@ -146,10 +203,11 @@ pub fn append(
     started: DateTime<Utc>,
     finished: DateTime<Utc>,
     source: &'static str,
+    trigger: Option<&Trigger>,
 ) -> String {
     format!(
         "{body}{}",
-        render(public_url, run_id, attempt, started, finished, source)
+        render(public_url, run_id, attempt, started, finished, source, trigger)
     )
 }
 
@@ -186,6 +244,7 @@ mod tests {
             started,
             finished,
             "youtrack",
+            None,
         );
         assert!(footer
             .contains("Run: https://claude-run.example.com/runs/42/jobs/CLAUDE-446/attempt/1"));
@@ -206,6 +265,7 @@ mod tests {
             started,
             finished,
             "closed-issue-summary",
+            None,
         );
         assert!(footer.contains("Run: https://claude-run.example.com/runs/7"));
         assert!(!footer.contains("/jobs/"));
@@ -227,6 +287,7 @@ mod tests {
             started,
             finished,
             "youtrack",
+            None,
         );
         assert!(footer
             .contains("link unavailable (CLAUDE_RUN_PUBLIC_URL is not set); run 7, attempt 2"));
@@ -243,6 +304,7 @@ mod tests {
             started,
             finished,
             "youtrack",
+            None,
         );
         assert!(footer.contains("Run: no run id is available for this comment"));
     }
@@ -269,6 +331,7 @@ mod tests {
                 started,
                 finished,
                 source,
+                None,
             );
             assert!(
                 footer.contains(&format!("Source: {source}")),
@@ -289,6 +352,7 @@ mod tests {
             started,
             finished,
             "youtrack",
+            None,
         );
         assert!(body.starts_with("Opened a PR.\n\n"));
         assert!(body.contains("Run: https://claude-run.example.com/runs/1"));
@@ -302,6 +366,7 @@ mod tests {
             attempt: 3,
             started: ts("2026-10-12T18:41:03Z"),
             source: "youtrack",
+            trigger: None,
         };
         let body = append_job(
             "Opened a PR.",
@@ -323,6 +388,7 @@ mod tests {
             Some(5),
             Some(ts("2026-10-12T18:41:03Z")),
             "closed-issue-summary",
+            None,
         );
         assert!(body.contains("Run: https://claude-run.example.com/runs/5"));
         assert!(!body.contains("/jobs/"));
@@ -337,8 +403,104 @@ mod tests {
             None,
             None,
             "ci-failure-webhook",
+            None,
         );
         assert!(body.contains("Run: no run id is available for this comment"));
         assert!(body.contains("Source: ci-failure-webhook"));
+    }
+
+    fn footer_with(trigger: Option<&Trigger>) -> String {
+        render(
+            Some("https://claude-run.example.com"),
+            Some(1),
+            None,
+            ts("2026-10-12T18:41:03Z"),
+            ts("2026-10-12T18:41:33Z"),
+            "youtrack",
+            trigger,
+        )
+    }
+
+    /// CLAUDE-556: each trigger variant prints its own `Trigger:` line right after `Source:`.
+    #[test]
+    fn footer_renders_each_trigger_variant_after_source() {
+        let cases = [
+            (Trigger::Scheduled, "Trigger: scheduled poll"),
+            (
+                Trigger::WebhookEvent {
+                    source: "CI failure on PR 42".to_string(),
+                },
+                "Trigger: webhook event (CI failure on PR 42)",
+            ),
+            (
+                Trigger::UserCommand {
+                    login: "alice".to_string(),
+                },
+                "Trigger: /claude command from alice",
+            ),
+            (
+                Trigger::Manual {
+                    by: "trigger".to_string(),
+                },
+                "Trigger: manual run (trigger)",
+            ),
+            (Trigger::AiAgentPickup, "Trigger: AI Agent pickup"),
+        ];
+        for (trigger, line) in cases {
+            let footer = footer_with(Some(&trigger));
+            assert!(
+                footer.ends_with(&format!("Source: youtrack\n{line}")),
+                "{trigger:?}: Trigger line must follow Source:\n{footer}"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_without_a_trigger_omits_the_line() {
+        let footer = footer_with(None);
+        assert!(!footer.contains("Trigger:"), "{footer}");
+        assert!(footer.ends_with("Source: youtrack"), "{footer}");
+    }
+
+    #[test]
+    fn append_job_prints_the_run_trigger() {
+        let trigger = Trigger::AiAgentPickup;
+        let run = CommentRun {
+            run_id: 9,
+            attempt: 1,
+            started: ts("2026-10-12T18:41:03Z"),
+            source: "youtrack",
+            trigger: Some(&trigger),
+        };
+        let body = append_job("Opened a PR.", None, run, "CLAUDE-556");
+        assert!(body.contains("\nTrigger: AI Agent pickup"), "{body}");
+    }
+
+    #[test]
+    fn append_run_prints_the_trigger() {
+        let trigger = Trigger::Scheduled;
+        let body = append_run(
+            "Filed a report.",
+            None,
+            Some(5),
+            None,
+            "closed-issue-summary",
+            Some(&trigger),
+        );
+        assert!(body.contains("\nTrigger: scheduled poll"), "{body}");
+    }
+
+    #[test]
+    fn from_run_origin_maps_scheduler_to_the_given_trigger_and_others_to_manual() {
+        assert_eq!(
+            Trigger::from_run_origin("scheduler", Trigger::AiAgentPickup),
+            Trigger::AiAgentPickup
+        );
+        assert_eq!(
+            Trigger::from_run_origin("trigger", Trigger::Scheduled),
+            Trigger::Manual {
+                by: "trigger".to_string()
+            }
+        );
     }
 }

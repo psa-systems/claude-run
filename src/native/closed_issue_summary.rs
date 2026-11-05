@@ -175,6 +175,10 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
     // this point stay allowed by design.
     drop(gather_guard);
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
+    let trigger = crate::run_footer::Trigger::from_run_origin(
+        ctx.triggered_by,
+        crate::run_footer::Trigger::Scheduled,
+    );
     // From here the row MUST be closed on every exit path, including
     // an early `?` out of the bookkeeping below.
     let run_guard = state::RunGuard::new(pool, run_id);
@@ -209,7 +213,7 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
         if run_pause.stop().await {
             break;
         }
-        match file_report(&tracker, &cfg, parent, window, run_id) {
+        match file_report(&tracker, &cfg, parent, window, run_id, &trigger) {
             Ok(Filing::Filed(key)) => {
                 info!(action = %action.name, parent, report = %key, "filed the closed-issue summary");
                 filed += 1;
@@ -313,6 +317,7 @@ fn file_report(
     parent: &str,
     window: Window,
     run_id: i64,
+    trigger: &crate::run_footer::Trigger,
 ) -> Result<Filing> {
     if already_filed(backend, parent, window) {
         return Ok(Filing::AlreadyFiled);
@@ -339,6 +344,7 @@ fn file_report(
         Some(run_id),
         None,
         "closed-issue-summary",
+        Some(trigger),
     );
     backend.comment(parent, &comment)?;
     Ok(Filing::Filed(report))
@@ -731,7 +737,15 @@ mod tests {
         );
         let backend = CliBackend::new(runner.clone());
 
-        let filed = file_report(&backend, &cfg(), "CLAUDE-100", window(), 1).unwrap();
+        let filed = file_report(
+            &backend,
+            &cfg(),
+            "CLAUDE-100",
+            window(),
+            1,
+            &crate::run_footer::Trigger::Scheduled,
+        )
+        .unwrap();
         assert_eq!(filed, Filing::Filed("CLAUDE-230".to_string()));
 
         let calls = runner.calls.lock().unwrap().clone();
@@ -779,7 +793,15 @@ mod tests {
         ));
         let backend = CliBackend::new(runner.clone());
 
-        let filed = file_report(&backend, &cfg(), "CLAUDE-100", window(), 1).unwrap();
+        let filed = file_report(
+            &backend,
+            &cfg(),
+            "CLAUDE-100",
+            window(),
+            1,
+            &crate::run_footer::Trigger::Scheduled,
+        )
+        .unwrap();
         assert_eq!(filed, Filing::AlreadyFiled);
 
         let calls = runner.calls.lock().unwrap();
@@ -816,7 +838,15 @@ mod tests {
         let backend = CliBackend::new(runner.clone());
         // The create call is unregistered, so this errors AFTER deciding to file.
         // Deciding to file is the assertion; the create shape is covered above.
-        assert!(file_report(&backend, &cfg(), "CLAUDE-100", window(), 1).is_err());
+        assert!(file_report(
+            &backend,
+            &cfg(),
+            "CLAUDE-100",
+            window(),
+            1,
+            &crate::run_footer::Trigger::Scheduled
+        )
+        .is_err());
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls.iter().any(|c| c.contains("issue create")),
@@ -883,7 +913,15 @@ mod tests {
                 .ok_prefix(&format!("yt issue comment CLAUDE-100 {comment}"), ""),
         );
         let backend = CliBackend::new(runner.clone());
-        file_report(&backend, &cfg(), "CLAUDE-100", window(), 1).unwrap();
+        file_report(
+            &backend,
+            &cfg(),
+            "CLAUDE-100",
+            window(),
+            1,
+            &crate::run_footer::Trigger::Scheduled,
+        )
+        .unwrap();
 
         let calls = runner.calls.lock().unwrap();
         assert!(
