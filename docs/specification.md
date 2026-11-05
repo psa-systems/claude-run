@@ -1195,13 +1195,13 @@ implementation.
   keeps every SQL-executing test on both backends while sparing the pure-logic tests a redundant second run. A guard
   test MUST fail if a source file gains a DB test no filter covers, or if a filter matches no DB-touching module.
 - **SPEC-5.6.9**: The Postgres CI leg's `--test-threads` count MUST be capped at 8, independent of the runner's
-  `CI_JOBS`, so that the thread count times a fixture pool's `max_connections` stays well under the managed Postgres
-  service's unconfigured `max_connections` (100), AND so the threads themselves do not contend for CPU badly enough
-  to starve a sibling task on the same per-test pool past its own `acquire_timeout`. Scaling the thread count
-  straight off `CI_JOBS` with no ceiling starves the service's connection slots on a HEAVY/MASSIVE runner, surfacing
-  only as a bare `PoolTimedOut` once sqlx's retry loop exhausts its `acquire_timeout` against the connection-limit
-  refusal; a looser cap of 16 was tried first and still left tests timing out acquiring from their OWN per-test
-  pool under CPU contention between threads, not the service's connection ceiling (CLAUDE-524).
+  `CI_JOBS`, for two reasons: so the thread count times a fixture pool's `max_connections` stays well under the
+  managed Postgres service's unconfigured `max_connections` (100), and so the threads themselves do not contend
+  for CPU badly enough to starve a sibling task on the same per-test pool past its own `acquire_timeout`. Scaling
+  the thread count straight off `CI_JOBS` with no ceiling starved the service's connection slots on a HEAVY/MASSIVE
+  runner, surfacing only as a bare `PoolTimedOut` once sqlx's retry loop exhausted its `acquire_timeout` against the
+  connection-limit refusal; a looser cap of 16 was tried first and still left tests timing out acquiring from their
+  OWN per-test pool under CPU contention between threads, not the service's connection ceiling (CLAUDE-524).
 
 ## 6. Configuration
 
