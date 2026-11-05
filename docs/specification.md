@@ -342,7 +342,10 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   (`docs/yt-workflow-resolve-on-pr-merge.js`). The legacy `states.state_done` key is deprecated and ignored (a
   load-time warning names it); loading still succeeds so an existing action file keeps working.
 - Optional `automerge` (default off): merge and set the field to done once checks pass. Finalize never polls for this;
-  a reconciler every 300 seconds and action-success webhooks drive the decision for recorded agent PRs. The legacy
+  a reconciler every 300 seconds and action-success webhooks drive the decision for recorded agent PRs. Finalize makes
+  at most one status read, bounded by `automerge.finalize_status_timeout_secs` (default 10, `0` skips it), right after
+  promoting a successful run's PR: a PR already green, not behind base and mergeable merges in the same tick; any other
+  answer, error or timeout leaves it at Code Review for the reconciler and webhooks (CLAUDE-549). The legacy
   `wait_seconds` / `check_interval_seconds` keys are deprecated and ignored (a load-time warning names them); loading
   still succeeds so an existing action file keeps working.
 - Automerge separates a behind-base PR (its branch is simply behind its base, `behind_base: true`) from a real

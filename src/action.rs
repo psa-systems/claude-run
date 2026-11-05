@@ -488,7 +488,16 @@ pub struct Automerge {
     pub wait_seconds: u64,
     /// Deprecated, same as `wait_seconds`.
     pub check_interval_seconds: u64,
+    /// CLAUDE-549: the most `finalize` waits for its single PR status read
+    /// before deciding whether a successful run's PR is already green and
+    /// can merge in the same tick. A read that has not answered by then
+    /// falls back to Code Review, leaving the merge to the webhook and the
+    /// reconciler. `0` skips the finalize-time merge entirely.
+    pub finalize_status_timeout_secs: u64,
 }
+
+/// CLAUDE-549: [`Automerge::finalize_status_timeout_secs`]'s default.
+pub const DEFAULT_FINALIZE_STATUS_TIMEOUT_SECS: u64 = 10;
 
 impl Default for Automerge {
     fn default() -> Self {
@@ -496,6 +505,7 @@ impl Default for Automerge {
             enabled: false,
             wait_seconds: 1800,
             check_interval_seconds: 30,
+            finalize_status_timeout_secs: DEFAULT_FINALIZE_STATUS_TIMEOUT_SECS,
         }
     }
 }

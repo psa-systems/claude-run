@@ -103,6 +103,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 
 - `pull_request` webhook deliveries record a merged or closed agent PR ([CLAUDE-277](docs/conventions/merge.md#pr-merge-deliveries-claude-277))
 - `finalize` never waits for CI; automerge is driven by Action Run webhook events ([CLAUDE-278](docs/conventions/merge.md#event-driven-automerge-claude-278))
+- `finalize` makes one bounded status read and merges a PR whose CI is already green in the same tick ([CLAUDE-549](docs/conventions/merge.md#finalize-time-merge-of-an-already-green-pr-claude-549))
 - A reconciler backstops webhook automerge so no green PR sits unwatched ([CLAUDE-328](docs/conventions/merge.md#automerge-reconciler-claude-328))
 - `PrStatus.behind_base` separates a behind-base PR from a real conflict ([CLAUDE-309, FJ-99](docs/conventions/merge.md#behind-base-prs-claude-309-fj-99))
 - At most `max_ci_in_flight_per_repo` runner PRs per repo have CI pending: pickups defer, branch updates wait ([CLAUDE-535](docs/conventions/merge.md#ci-in-flight-cap-claude-535))

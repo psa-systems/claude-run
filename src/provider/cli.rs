@@ -623,6 +623,24 @@ impl CliBackend {
         }
     }
 
+    /// CLAUDE-549: an owned, independent copy for
+    /// [`crate::provider::pr_status_on_thread`]: same runner, binaries, key
+    /// store, child env and read-retry schedule, with its own empty notice
+    /// buffer (a status read records none).
+    fn status_probe(&self) -> Self {
+        Self {
+            runner: self.runner.clone(),
+            yt: self.yt.clone(),
+            fj: self.fj.clone(),
+            keys_path: self.keys_path.clone(),
+            yt_env: self.yt_env.clone(),
+            fj_env: self.fj_env.clone(),
+            notices: std::sync::Mutex::new(Vec::new()),
+            fj_read_retry_waits: self.fj_read_retry_waits,
+            git_retry_waits: self.git_retry_waits,
+        }
+    }
+
     /// Override the binary names (config-driven later).
     pub fn with_binaries(mut self, yt: impl Into<String>, fj: impl Into<String>) -> Self {
         self.yt = yt.into();
@@ -2381,6 +2399,16 @@ impl Forge for CliBackend {
             behind_base: status.behind_base,
             head_sha: status.head_sha,
         })
+    }
+
+    fn pr_status_within(
+        &self,
+        host: &str,
+        repo: &str,
+        pr_number: u64,
+        timeout: Duration,
+    ) -> Result<super::PrStatus> {
+        super::pr_status_on_thread(self.status_probe(), host, repo, pr_number, timeout)
     }
 
     fn merge_pr(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {

@@ -657,6 +657,24 @@ pub trait Forge: Send + Sync {
         )))
     }
 
+    /// CLAUDE-549: [`Self::pr_status`] bounded by `timeout`, for the single
+    /// status read `finalize` makes before deciding whether to merge a green
+    /// PR in the same tick. A read that has not answered within `timeout`
+    /// returns [`Error::ForgeTimeout`] so the caller falls back to Code Review
+    /// instead of holding the worker. The default calls `pr_status` inline
+    /// with no bound (test fakes); the real backends override it to run the
+    /// read on a detached OS thread via [`pr_status_on_thread`].
+    fn pr_status_within(
+        &self,
+        host: &str,
+        repo: &str,
+        pr_number: u64,
+        timeout: Duration,
+    ) -> Result<PrStatus> {
+        let _ = timeout;
+        self.pr_status(host, repo, pr_number)
+    }
+
     /// Merge PR `pr_number` in `repo` on `host` as a merge-commit
     /// (never squash/rebase, so the single commit's bare `#<KEY>` reference
     /// survives in history). The default errors for backends without automerge.
@@ -705,6 +723,43 @@ pub trait Forge: Send + Sync {
 pub trait Backend: IssueTracker + Forge {
     /// Stable name for diagnostics / the `NoBackend` error message.
     fn name(&self) -> &'static str;
+}
+
+/// CLAUDE-549: run `probe.pr_status(host, repo, pr_number)` on a detached OS
+/// thread and wait at most `timeout` for its answer. `probe` is an owned,
+/// independent copy of the calling forge, so a read that outlives the
+/// deadline keeps running to completion on its own thread (its subprocess is
+/// never left half-read) while the caller moves on with
+/// [`Error::ForgeTimeout`]. A plain OS thread rather than a tokio task, so it
+/// holds no runtime worker either way (CLAUDE-228).
+pub(crate) fn pr_status_on_thread<F: Forge + 'static>(
+    probe: F,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    timeout: Duration,
+) -> Result<PrStatus> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (host, repo) = (host.to_string(), repo.to_string());
+    let spawned = std::thread::Builder::new()
+        .name("pr-status-probe".to_string())
+        .spawn(move || {
+            // The receiver is gone once the caller timed out; nothing to do.
+            let _ = tx.send(probe.pr_status(&host, &repo, pr_number));
+        });
+    if let Err(e) = spawned {
+        return Err(Error::Io(e));
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Error::ForgeTimeout {
+            op: "pr_status".to_string(),
+            timeout,
+        }),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Error::Other(anyhow::anyhow!(
+            "pr_status probe thread exited without an answer"
+        ))),
+    }
 }
 
 /// SPEC-8.2: ordered backend preference. The YouTrack / Forgejo provider resolution

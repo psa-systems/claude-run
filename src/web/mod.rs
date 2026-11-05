@@ -3639,8 +3639,23 @@ fn youtrack_form_to_yaml(
     // resets the (deprecated, ignored) timing fields to their defaults, which
     // is what clears the load-time deprecation warning for an action that
     // still carries non-default values from an older format.
+    // `finalize_status_timeout_secs` (CLAUDE-549) is not a form input, so
+    // it is carried forward from the file the way `prompt_preset` is; an
+    // invalid value rejects the save rather than silently resetting it.
+    let finalize_status_timeout_secs = match map
+        .get("native")
+        .and_then(|n| n.get("youtrack"))
+        .and_then(|y| y.get("automerge"))
+        .and_then(|a| a.get("finalize_status_timeout_secs"))
+    {
+        Some(v) => serde_yaml::from_value::<u64>(v.clone()).map_err(|e| {
+            format!("native.youtrack.automerge.finalize_status_timeout_secs is invalid: {e}")
+        })?,
+        None => crate::action::DEFAULT_FINALIZE_STATUS_TIMEOUT_SECS,
+    };
     youtrack.automerge = Automerge {
         enabled: form.is_automerge_enabled(),
+        finalize_status_timeout_secs,
         ..Automerge::default()
     };
     // Projects the agent may create issues in. Comma-separated,
@@ -9911,6 +9926,25 @@ mod tests {
             assert!(yt.youtrack.automerge.enabled);
             assert_eq!(yt.youtrack.automerge.wait_seconds, 1800);
             assert_eq!(yt.youtrack.automerge.check_interval_seconds, 30);
+        }
+
+        #[test]
+        fn automerge_form_save_keeps_finalize_status_timeout() {
+            // CLAUDE-549: the finalize status timeout is raw-YAML-only, so a
+            // structured-form save carries it forward from the file on disk
+            // instead of resetting it to the default.
+            let yaml = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\n      finalize_status_timeout_secs: 3\n";
+            let base: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let mut form = action_to_youtrack_form(&loaded.action).unwrap();
+            form.name = "yt".to_string();
+            let saved_yaml = youtrack_form_to_yaml(base, &form).unwrap();
+            let saved = crate::action::validate_str(&saved_yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = saved.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert!(yt.youtrack.automerge.enabled);
+            assert_eq!(yt.youtrack.automerge.finalize_status_timeout_secs, 3);
         }
 
         #[test]
