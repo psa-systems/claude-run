@@ -31,7 +31,10 @@ jobs:
     # MEDIUM: only diffs file paths, compiles nothing (DEV-769).
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
     outputs:
+      # `code` stays path-based (today's docs-only short-circuit). `run_gate`
+      # also looks inside code files for comment-only diffs (CLAUDE-560).
       code: ${{ steps.classify.outputs.code }}
+      run_gate: ${{ steps.classify.outputs.run_gate }}
     steps:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
@@ -71,14 +74,24 @@ jobs:
               and (($before | is-empty) or ($before == "0000000000000000000000000000000000000000"))
           )
 
-          let changed = if $no_previous_commit {
-              []
+          # Resolve base + head refs once so both the path-based classifier
+          # and the CLAUDE-560 content classifier work from the same range.
+          let base_head = if $no_previous_commit {
+              null
           } else if $event == "pull_request" {
               let fetch = (^git fetch origin $base_ref | complete)
               if $fetch.exit_code != 0 {
                   print --stderr $fetch.stderr
                   exit 1
               }
+              {base: "FETCH_HEAD", head: "HEAD"}
+          } else {
+              {base: $before, head: "HEAD"}
+          }
+
+          let changed = if $no_previous_commit {
+              []
+          } else if $event == "pull_request" {
               # Three-dot diff against the merge base, matching Forgejo's own
               # path-filter semantics.
               diff_names "FETCH_HEAD...HEAD"
@@ -87,7 +100,7 @@ jobs:
           }
 
           let code = if $no_previous_commit {
-              print "push event has no previous commit \(before is empty/all-zeros\); treating as code"
+              print "push event has no previous commit (before is empty/all-zeros); treating as code"
               true
           } else if ($changed | is-empty) {
               true
@@ -95,9 +108,35 @@ jobs:
               not ($changed | all {|p| is_doc $p})
           }
 
+          # CLAUDE-560: when the path-based classifier says "code changed"
+          # AND every `+`/`-` line inside the code files is a comment or
+          # whitespace, the run_gate is `false` and the expensive
+          # fmt/clippy/build/test steps are skipped. When the path-based
+          # classifier already said "docs-only" the content classifier is
+          # skipped: run_gate follows `code` directly.
+          let run_gate = if not $code {
+              false
+          } else if $no_previous_commit {
+              # No prior commit to classify against; be conservative.
+              true
+          } else {
+              let verdict = (nu scripts/classify-diff.nu $base_head.base $base_head.head | str trim)
+              print $"content classifier verdict: ($verdict)"
+              # "code" -> run; "comments-only" -> skip; "non-code" -> skip
+              # (the path-based classifier already covered the docs-only case,
+              # so "non-code" here means something odd; be conservative and
+              # treat it like `code`).
+              match $verdict {
+                  "code" => true,
+                  "comments-only" => false,
+                  _ => true,
+              }
+          }
+
           print $"changed files: ($changed)"
-          print $"code=($code)"
+          print $"code=($code) run_gate=($run_gate)"
           $"code=($code)\n" | save --append $env.GITHUB_OUTPUT
+          $"run_gate=($run_gate)\n" | save --append $env.GITHUB_OUTPUT
 
   claude-md:
     # CLAUDE-370: runs on every push and PR, docs-only ones included, since
@@ -118,7 +157,12 @@ jobs:
 
   check:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # CLAUDE-560: `run_gate` is `false` both for today's docs-only path
+    # (where `code` was already `false`) and for the new comment-only case
+    # (every `+`/`-` line in every touched code file is a comment or
+    # whitespace). Either skips the expensive compile + test steps; the
+    # CLAUDE.md guard and secrets scan still run unconditionally.
+    if: needs.changes.outputs.run_gate == 'true'
     name: fmt + clippy + build + tests
     # HEAVY: compiles natively and needs the dev image's `cc` for crate build
     # scripts (CLAUDE-203, DEV-769).
