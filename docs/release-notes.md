@@ -16,7 +16,7 @@ Everything is done in the web UI; the deployment needs no change.
 | Variable | Value |
 |---|---|
 | `FORGE_HOST` | your Forgejo host; fj must hold a token for it |
-| `RELEASE_SOURCES` | JSON list of `{"repo": "owner/name", "product": "Product name"}` |
+| `RELEASE_SOURCES` | one `owner/repo = Product` per line (a JSON list of `{"repo", "product"}` also works) |
 | `PRODUCT_NOTES` | one line per product: what it is, as a customer sees it |
 | `SENDER_NAME` | the name the newsletter goes out under |
 | `NEWSLETTER_URL` | your newsletter system's base URL |
@@ -24,6 +24,10 @@ Everything is done in the web UI; the deployment needs no change.
 | `DRAFT_ANY_DAY` | `"true"` to draft outside Mondays from 09:00 UTC, for a test; otherwise `"false"` |
 
 5. Trigger it once from the action's page and read the draft in your newsletter system.
+
+## Changing the repos or any other setting
+
+Open the action, **Edit**: the **Environment** card at the top lists every `env` value, a long one in a box. Change `RELEASE_SOURCES` (add or remove a line) or any other value and **Save environment**; only those values change in the file, and the next run uses them. Adding or removing a setting is still a YAML edit, below the card.
 
 ## When it runs
 

@@ -36,6 +36,7 @@ use crate::config::Paths;
 use crate::state;
 
 pub mod comment_webhooks;
+pub mod env_form;
 pub mod native_forms;
 pub mod webhooks;
 
@@ -110,6 +111,8 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             "/actions/{name}/edit",
             get(action_edit_page).post(action_edit_save),
         )
+        // CLAUDE-571: a scripted action's `env` values, from a form.
+        .route("/actions/{name}/env", post(action_env_save))
         // Dispatches to the structured editor for the action's own
         // native kind (raw editor for `scripted`).
         .route(
@@ -2778,6 +2781,28 @@ struct ActionEditorTpl {
     /// Link to the structured editor, shown when one applies (a `kind: youtrack`
     /// action being edited, or the new-action page offering a YouTrack form).
     form_url: Option<String>,
+    /// CLAUDE-571: a scripted action's `env` values, for the Environment
+    /// form; empty when there is no such block (or no form to show).
+    env_fields: Vec<EnvField>,
+}
+
+/// One `env` key on the Environment form.
+struct EnvField {
+    key: String,
+    value: String,
+    /// A long or multi-line value gets a box rather than one line.
+    multiline: bool,
+}
+
+/// The Environment form's fields for a scripted action's `env` block.
+fn env_fields(env: &std::collections::BTreeMap<String, String>) -> Vec<EnvField> {
+    env.iter()
+        .map(|(key, value)| EnvField {
+            key: key.clone(),
+            value: value.clone(),
+            multiline: value.contains('\n') || value.len() > 60,
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -2856,6 +2881,7 @@ fn editor_error(
         is_new,
         name,
         form_url: None,
+        env_fields: Vec::new(),
     };
     Ok((
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -2882,9 +2908,12 @@ async fn action_edit_page(
     // Offer the structured editor for any parseable native kind (the form route
     // dispatches to that kind's editor). `scripted` has none, so it stays on raw
     // YAML.
-    let form_url = match crate::action::validate_str(&yaml, &path) {
-        Ok(loaded) if loaded.action.native.is_some() => Some(format!("/actions/{name}/form")),
-        _ => None,
+    let (form_url, env) = match crate::action::validate_str(&yaml, &path) {
+        Ok(loaded) if loaded.action.native.is_some() => {
+            (Some(format!("/actions/{name}/form")), Vec::new())
+        }
+        Ok(loaded) => (None, env_fields(&loaded.action.env)),
+        _ => (None, Vec::new()),
     };
     let tpl = ActionEditorTpl {
         version: s.api.version,
@@ -2895,6 +2924,7 @@ async fn action_edit_page(
         is_new: false,
         name: Some(name),
         form_url,
+        env_fields: env,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
@@ -2924,6 +2954,70 @@ async fn action_edit_save(
     std::fs::write(&path, form.yaml.as_bytes()).map_err(WebError::from)?;
     // Re-index synchronously so the redirect reflects the edit immediately,
     // instead of waiting for the daemon's next periodic scan.
+    crate::daemon::scan_actions(&s.api.pool, &s.paths.actions_dir())
+        .await
+        .map_err(WebError::from)?;
+    Ok(Redirect::to(&format!("/actions/{name}")).into_response())
+}
+
+/// SPEC-4.3.3, CLAUDE-571: the Environment form's save. Rewrites only the
+/// submitted `env` values in place ([`env_form::set_env_values`]), then
+/// takes the raw editor's path: the same validation, and nothing is written
+/// unless the result parses to exactly the submitted `env`.
+async fn action_env_save(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+    Form(fields): Form<Vec<(String, String)>>,
+) -> Result<Response, WebError> {
+    if let Some(r) = reject_synthetic(&name) {
+        return Ok(r);
+    }
+    let Some(path) = indexed_action_path(&s.api.pool, &name).await? else {
+        return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
+    };
+    let yaml = std::fs::read_to_string(&path).map_err(WebError::from)?;
+    let current = match crate::action::validate_str(&yaml, &path) {
+        Ok(loaded) if loaded.action.native.is_none() => loaded.action.env,
+        Ok(_) => {
+            return editor_error(
+                s.api.version,
+                false,
+                Some(name),
+                yaml,
+                "only a scripted action's env block has this form".into(),
+            );
+        }
+        Err(e) => return editor_error(s.api.version, false, Some(name), yaml, e.to_string()),
+    };
+    // Browsers send a textarea's line breaks as CRLF.
+    let changes: std::collections::BTreeMap<String, String> = fields
+        .into_iter()
+        .filter_map(|(k, v)| Some((k.strip_prefix("env:")?.to_string(), v.replace("\r\n", "\n"))))
+        .filter(|(k, v)| current.get(k) != Some(v))
+        .collect();
+    if changes.is_empty() {
+        return Ok(Redirect::to(&format!("/actions/{name}")).into_response());
+    }
+    let updated = match env_form::set_env_values(&yaml, &changes) {
+        Ok(u) => u,
+        Err(e) => return editor_error(s.api.version, false, Some(name), yaml, e),
+    };
+    let mut expected = current;
+    expected.extend(changes);
+    match crate::action::validate_str(&updated, &path) {
+        Ok(loaded) if loaded.action.env == expected => {}
+        Ok(_) => {
+            return editor_error(
+                s.api.version,
+                false,
+                Some(name),
+                yaml,
+                "the rewritten env block did not read back as submitted; nothing was saved".into(),
+            );
+        }
+        Err(e) => return editor_error(s.api.version, false, Some(name), yaml, e.to_string()),
+    }
+    std::fs::write(&path, updated.as_bytes()).map_err(WebError::from)?;
     crate::daemon::scan_actions(&s.api.pool, &s.paths.actions_dir())
         .await
         .map_err(WebError::from)?;
@@ -2998,6 +3092,7 @@ async fn action_new_raw_page(State(s): State<WebState>) -> Result<Html<String>, 
         is_new: true,
         name: None,
         form_url: Some("/actions/new".into()),
+        env_fields: Vec::new(),
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
@@ -8166,12 +8261,12 @@ mod tests {
     mod editor {
         use super::super::{
             action_create, action_delete, action_detail, action_durations, action_edit_page,
-            action_edit_save, action_events_redirect, action_export, action_to_youtrack_form,
-            auth_claude_banner, auth_login_code, auth_login_start, auth_save_claude, dashboard,
-            logs, settings_page, settings_save, youtrack_create, youtrack_edit_page,
-            youtrack_edit_save, youtrack_form_to_yaml, youtrack_new_page, ActionDetailQuery,
-            ActionForm, AuthClaudeForm, AuthCodeForm, DashboardQuery, EventsView, LogsQuery,
-            SettingsForm, WebState, YoutrackEditForm,
+            action_edit_save, action_env_save, action_events_redirect, action_export,
+            action_to_youtrack_form, auth_claude_banner, auth_login_code, auth_login_start,
+            auth_save_claude, dashboard, logs, settings_page, settings_save, youtrack_create,
+            youtrack_edit_page, youtrack_edit_save, youtrack_form_to_yaml, youtrack_new_page,
+            ActionDetailQuery, ActionForm, AuthClaudeForm, AuthCodeForm, DashboardQuery,
+            EventsView, LogsQuery, SettingsForm, WebState, YoutrackEditForm,
         };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
@@ -9030,6 +9125,128 @@ mod tests {
             // The submitted draft is preserved in the re-rendered editor.
             let body = body_string(resp).await;
             assert!(body.contains("bogus_field"));
+        }
+
+        /// CLAUDE-571: the shipped release-notes example, a scripted action
+        /// whose `env` block has comments between its keys.
+        const RELEASE_NOTES: &str = include_str!("../../actions/examples/release-notes.yml");
+
+        async fn indexed_release_notes(s: &WebState) -> std::path::PathBuf {
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("release-notes.yml");
+            std::fs::write(&file, RELEASE_NOTES).unwrap();
+            index_action(&s.api.pool, "release-notes", file.to_str().unwrap()).await;
+            file
+        }
+
+        fn env_form(pairs: &[(&str, &str)]) -> Form<Vec<(String, String)>> {
+            Form(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (format!("env:{k}"), v.to_string()))
+                    .collect(),
+            )
+        }
+
+        #[tokio::test]
+        async fn a_scripted_action_edit_page_offers_its_env_values_as_a_form() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            indexed_release_notes(&s).await;
+            let resp = action_edit_page(State(s.clone()), AxumPath("release-notes".into()))
+                .await
+                .unwrap();
+            let body = body_string(resp).await;
+            assert!(
+                body.contains(r#"action="/actions/release-notes/env""#),
+                "{body}"
+            );
+            assert!(
+                body.contains(r#"<textarea name="env:RELEASE_SOURCES""#),
+                "a long value gets a box"
+            );
+            assert!(body.contains(r#"<input name="env:FORGE_HOST" value="forge.example.com""#));
+
+            // A native action has its structured form instead.
+            let file = s.paths.actions_dir().join("youtrack.yml");
+            std::fs::write(&file, NATIVE_MINIMAL).unwrap();
+            index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
+            let body = body_string(
+                action_edit_page(State(s.clone()), AxumPath("youtrack".into()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(!body.contains("/env\""));
+        }
+
+        #[tokio::test]
+        async fn env_save_rewrites_only_the_values_and_keeps_the_comments() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let file = indexed_release_notes(&s).await;
+            let sources = "psa-systems/bunyip = bunyip\r\npsa-systems/mirzam = Mirzam";
+            let resp = action_env_save(
+                State(s.clone()),
+                AxumPath("release-notes".into()),
+                env_form(&[
+                    ("FORGE_HOST", "dev.a8n.run"),
+                    ("RELEASE_SOURCES", sources),
+                    ("SENDER_NAME", "Your Company"),
+                ]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            let saved = std::fs::read_to_string(&file).unwrap();
+            let env = crate::action::validate_str(&saved, "x").unwrap().action.env;
+            assert_eq!(env["FORGE_HOST"], "dev.a8n.run");
+            assert_eq!(
+                env["RELEASE_SOURCES"], "psa-systems/bunyip = bunyip\npsa-systems/mirzam = Mirzam",
+                "CRLF from the browser is stored as LF"
+            );
+            assert_eq!(env["SENDER_NAME"], "Your Company");
+            // Every line but the two changed values is as it was.
+            let changed = |l: &&str| {
+                l.contains("FORGE_HOST:")
+                    || l.contains("RELEASE_SOURCES")
+                    || l.starts_with("    psa-systems/")
+                    || l.starts_with("    your-org/")
+            };
+            let before: Vec<&str> = RELEASE_NOTES.lines().filter(|l| !changed(l)).collect();
+            let after: Vec<&str> = saved.lines().filter(|l| !changed(l)).collect();
+            assert_eq!(before, after);
+        }
+
+        #[tokio::test]
+        async fn env_save_refuses_an_unknown_key_and_a_native_action() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let file = indexed_release_notes(&s).await;
+            let resp = action_env_save(
+                State(s.clone()),
+                AxumPath("release-notes".into()),
+                env_form(&[("NOT_THERE", "x")]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(body_string(resp).await.contains("NOT_THERE"));
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), RELEASE_NOTES);
+
+            let native = s.paths.actions_dir().join("youtrack.yml");
+            std::fs::write(&native, NATIVE_MINIMAL).unwrap();
+            index_action(&s.api.pool, "youtrack", native.to_str().unwrap()).await;
+            let resp = action_env_save(
+                State(s.clone()),
+                AxumPath("youtrack".into()),
+                env_form(&[("X", "y")]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(std::fs::read_to_string(&native).unwrap(), NATIVE_MINIMAL);
         }
 
         #[tokio::test]

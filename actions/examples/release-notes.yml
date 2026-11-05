@@ -31,8 +31,11 @@ kind: scripted
 env:
   # Replace all of these.
   FORGE_HOST: forge.example.com
-  # Which repos to read, and the product customers know each as. Repos sharing a product get one section.
-  RELEASE_SOURCES: '[{"repo": "your-org/your-app-ui", "product": "Your App"}, {"repo": "your-org/your-app-server", "product": "Your App"}]'
+  # Which repos to read, one `owner/repo = Product` per line, the product as customers know it. Repos sharing a
+  # product get one section. A JSON list of {"repo", "product"} also works.
+  RELEASE_SOURCES: |-
+    your-org/your-app-ui = Your App
+    your-org/your-app-server = Your App
   # One line per product: what it is, as a customer sees it.
   PRODUCT_NOTES: "Your App: what it does for your customers."
   SENDER_NAME: Your Company
@@ -55,7 +58,21 @@ input:
       [] | to json
     } else {
       let host = $env.FORGE_HOST
-      let repos = ($env.RELEASE_SOURCES | from json)
+      let sources = ($env.RELEASE_SOURCES | str trim)
+      let repos = if ($sources | str starts-with "[") {
+        $sources | from json
+      } else {
+        $sources | lines | each {|l| $l | str trim } | where {|l| ($l | is-not-empty) and not ($l | str starts-with "#") }
+        | each {|l|
+          let parts = ($l | split row "=")
+          let repo = ($parts | first | str trim)
+          let product = ($parts | skip 1 | str join "=" | str trim)
+          if ($repo | is-empty) or ($product | is-empty) or not ($repo | str contains "/") {
+            error make {msg: $"release-notes: RELEASE_SOURCES line `($l)` is not `owner/repo = Product`"}
+          }
+          {repo: $repo, product: $product}
+        }
+      }
       let data_home = ($env.XDG_DATA_HOME? | default ($nu.home-dir | path join ".local" "share"))
       let token = (open ($data_home | path join "forgejo-cli" "keys.json") | get hosts | get $host | get token)
       let site = ($env.NEWSLETTER_URL | url parse | get host)
