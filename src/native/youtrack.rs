@@ -67,7 +67,7 @@ use super::{HandlerFuture, NativeContext, NativeHandler};
 use crate::access;
 use crate::action::{self, NativeConfig, PromptPreset, YoutrackSource};
 use crate::cancel::{CancellationToken, RegistryGuard};
-use crate::claude::{raw_event_details, ClaudeInvoker, ClaudeResult};
+use crate::claude::{collapsed_details, raw_event_details, ClaudeInvoker, ClaudeResult};
 use crate::concurrency::Executor;
 use crate::config::Paths;
 use crate::error::{Error, Result};
@@ -4624,38 +4624,36 @@ fn timeout_salvage_pr_comment(
     .join("\n")
 }
 
-/// Timeout-specific issue comment. Surfaces the ambiguity (the work may be
-/// complete despite the kill, e.g. a backgrounded command held the process open
-/// past the limit), states the runner did NOT mark the issue Failed, names the
-/// salvage outcome (CLAUDE-379), and points a human at the branch/PR and the
-/// run log (`r.error` carries the log path).
+/// Timeout-specific issue comment. One-line outcome first, a short bullet
+/// list of the salvage result and the follow-up action, then the detail
+/// (the kill-time ambiguity paragraph, the agent's last summary, and the
+/// raw result event) under a collapsed `<details>` block. Points a human
+/// at the branch/PR and the run log (`r.error` carries the log path).
 fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport) -> String {
     let mut lines = vec![
-        "Claude AI agent run TIMED OUT (the run hit its time limit and was killed):".to_string(),
-        String::new(),
-        format!("Details: {}", r.error),
-        format!("Timeout limit: {}s", timeout.as_secs()),
-        String::new(),
-        "The agent may have completed all, some, or none of the work before being killed. A backgrounded command can hold the process open past the limit even after the functional work is done, so this is not necessarily a failure. The runner did NOT mark this issue Failed.".to_string(),
+        format!(
+            "Claude AI agent run TIMED OUT after {}s (the run hit its time limit and was killed).",
+            timeout.as_secs()
+        ),
         String::new(),
     ];
 
     if salvage.nothing_to_salvage {
-        lines.push("No local work was found to salvage (clean working tree, no commits ahead of the remote default branch).".to_string());
+        lines.push("- No local work to salvage (clean working tree, no commits ahead of the remote default branch).".to_string());
     } else {
         if let Some(e) = &salvage.commit_error {
             lines.push(format!(
-                "Committing the uncommitted working tree failed: {e}"
+                "- Committing the uncommitted working tree failed: {e}"
             ));
         }
         match (&salvage.pr_url, &salvage.open_error) {
             (Some(url), _) => {
                 lines.push(format!(
-                    "Work in progress was salvaged as a draft PR: {url}"
+                    "- Work in progress was salvaged as a draft PR: {url}"
                 ));
                 if let Some(e) = &salvage.comment_error {
                     lines.push(format!(
-                        "Posting the explanation comment on that PR failed: {e}"
+                        "- Posting the explanation comment on that PR failed: {e}"
                     ));
                 }
                 if let Some(e) = salvage
@@ -4663,35 +4661,44 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
                     .as_ref()
                     .and_then(|pr| pr.push_comment_failure.as_deref())
                 {
-                    lines.push(e.to_string());
+                    lines.push(format!("- {e}"));
                 }
             }
             (None, Some(e)) => {
-                lines.push(format!("Salvaging the work as a draft PR failed: {e}"));
+                lines.push(format!("- Salvaging the work as a draft PR failed: {e}"));
             }
             (None, None) => {}
         }
     }
-
-    lines.push(String::new());
-    lines.push("A human should inspect the branch/PR and the run log above, then either resolve the issue manually or re-queue it (set AI Agent = Queued); a re-queue resumes on the salvaged branch rather than starting over.".to_string());
-    lines.push(String::new());
-    lines.push(r.summary.clone());
-    lines.push(String::new());
-    lines.push(timeout_cost_line(r));
+    lines.push("- A human should inspect the branch/PR and the run log, then resolve the issue manually or re-queue it (set AI Agent = Queued); a re-queue resumes on the salvaged branch.".to_string());
+    lines.push(format!("- {}", timeout_cost_line(r)));
 
     let mut body = lines.join("\n");
+    let detail = [
+        format!("Details: {}", r.error),
+        String::new(),
+        "The agent may have completed all, some, or none of the work before being killed. A backgrounded command can hold the process open past the limit even after the functional work is done, so this is not necessarily a failure. The runner did NOT mark this issue Failed.".to_string(),
+        String::new(),
+        r.summary.clone(),
+    ]
+    .join("\n");
+    body.push_str(&collapsed_details("Run detail and agent summary", &detail));
     body.push_str(&raw_event_details(&r.raw));
     body
 }
 
+/// Failure issue comment. One-line outcome first, the agent's last
+/// summary inline, then a two-bullet action list (cost and what a human
+/// should do), and finally the raw terminal event in a collapsed block
+/// when one is present.
 fn failure_comment(r: &ClaudeResult) -> String {
     let mut body = [
-        format!("Claude AI agent run FAILED ({}):", r.error),
+        format!("Claude AI agent run FAILED ({}).", r.error),
         String::new(),
         r.summary.clone(),
         String::new(),
-        format!("Cost: ${} USD", r.cost),
+        format!("- Cost: ${} USD", r.cost),
+        "- A human should inspect the run log, then either resolve the issue manually or re-queue it (set AI Agent = Queued).".to_string(),
     ]
     .join("\n");
     body.push_str(&raw_event_details(&r.raw));
@@ -6296,9 +6303,10 @@ mod tests {
             exit_code: Some(1),
         };
         let body = failure_comment(&r);
-        assert!(body.starts_with("Claude AI agent run FAILED (claude exited 1, see stream.jsonl):"));
+        assert!(body.starts_with("Claude AI agent run FAILED (claude exited 1, see stream.jsonl)."));
         assert!(body.contains("API Error: 529 Overloaded."));
-        assert!(body.contains("Cost: $0.01 USD"));
+        assert!(body.contains("- Cost: $0.01 USD"));
+        assert!(body.contains("- A human should inspect the run log"));
         assert!(body.contains("<details>\n<summary>Raw result event</summary>"));
         assert!(body.contains("```json"));
         assert!(body.contains("\"api_error_status\": \"529\""));
@@ -6414,6 +6422,78 @@ mod tests {
             body.contains("Work in progress was salvaged as a draft PR:"),
             "{body}"
         );
+    }
+
+    /// CLAUDE-546: the timeout comment leads with a one-line outcome that
+    /// names the timeout, lists the salvage and follow-up as bullets, and
+    /// moves the kill-time ambiguity paragraph and agent summary under a
+    /// collapsed `<details>` block so a reviewer sees the outcome first.
+    #[test]
+    fn timeout_comment_leads_with_outcome_and_collapses_detail() {
+        let mut r = ClaudeResult::synthesized("claude exited 124, see stream.jsonl", "");
+        r.summary = "The agent was mid-write on src/foo.rs when the timeout fired.".into();
+        let salvage = SalvageReport {
+            nothing_to_salvage: true,
+            ..Default::default()
+        };
+        let body = timeout_comment(&r, Duration::from_secs(120), &salvage);
+        assert!(
+            body.starts_with("Claude AI agent run TIMED OUT after 120s"),
+            "{body}"
+        );
+        assert!(body.contains("- No local work to salvage"), "{body}");
+        assert!(body.contains("- A human should inspect"), "{body}");
+        assert!(
+            body.contains("<details>\n<summary>Run detail and agent summary</summary>"),
+            "{body}"
+        );
+        let detail_start = body
+            .find("<details>")
+            .expect("the detail block must be present");
+        let outcome_section = &body[..detail_start];
+        assert!(
+            !outcome_section.contains("The agent may have completed"),
+            "ambiguity paragraph must sit inside the collapsed block, not in the outcome section:\n{outcome_section}"
+        );
+        assert!(
+            !outcome_section.contains("mid-write on src/foo.rs"),
+            "agent summary must sit inside the collapsed block, not in the outcome section:\n{outcome_section}"
+        );
+        assert!(
+            body.contains("The agent may have completed"),
+            "ambiguity paragraph must still appear in the collapsed block:\n{body}"
+        );
+        assert!(
+            body.contains("mid-write on src/foo.rs"),
+            "agent summary must still appear in the collapsed block:\n{body}"
+        );
+    }
+
+    /// CLAUDE-546: the failure comment leads with a one-line outcome and
+    /// renders the cost and follow-up action as bullets rather than loose
+    /// trailing lines.
+    #[test]
+    fn failure_comment_leads_with_outcome_and_renders_bullets() {
+        let r = ClaudeResult {
+            ok: false,
+            summary: "The run failed before reaching a terminal event.".into(),
+            cost: 0.0,
+            usage: Default::default(),
+            raw: serde_json::Value::Null,
+            error: "pre step failed".into(),
+            transient: false,
+            timed_out: false,
+            login_required: false,
+            killed: false,
+            exit_code: Some(1),
+        };
+        let body = failure_comment(&r);
+        assert!(
+            body.starts_with("Claude AI agent run FAILED (pre step failed)."),
+            "{body}"
+        );
+        assert!(body.contains("- Cost: $0 USD"), "{body}");
+        assert!(body.contains("- A human should inspect"), "{body}");
     }
 
     /// A run with no `compact_boundary` event in its stream log
