@@ -149,6 +149,11 @@ enum Cmd {
         /// disabled, in the order given. Repeatable.
         #[arg(long = "init-sql")]
         init_sql: Vec<PathBuf>,
+        /// Docker network to put Postgres on, reached by container name,
+        /// instead of a port published on the Docker host's loopback. Needed
+        /// when this command itself runs in a container, as a CI job does.
+        #[arg(long)]
+        network: Option<String>,
         /// The command to run, with `DATABASE_URL` and
         /// `CLAUDE_RUN_TEST_DATABASE_URL` pointed at the throwaway Postgres.
         /// Everything after `--`.
@@ -553,9 +558,14 @@ async fn real_main(
         Cmd::TestPostgres {
             image,
             init_sql,
+            network,
             command,
         } => {
-            let opts = test_postgres::Opts { image, init_sql };
+            let opts = test_postgres::Opts {
+                image,
+                init_sql,
+                network,
+            };
             claude_run::blocking::in_place(|| test_postgres::run(&opts, &command))
         }
         Cmd::Migrate { from } => {
@@ -1540,6 +1550,8 @@ mod tests {
             "a.sql",
             "--init-sql",
             "b.sql",
+            "--network",
+            "WORKFLOW-abc",
             "--",
             "cargo",
             "test",
@@ -1551,9 +1563,11 @@ mod tests {
             Cmd::TestPostgres {
                 image,
                 init_sql,
+                network,
                 command,
             } => {
                 assert_eq!(image.as_deref(), Some("postgres:18.2-alpine3.23"));
+                assert_eq!(network.as_deref(), Some("WORKFLOW-abc"));
                 assert_eq!(
                     init_sql,
                     vec![PathBuf::from("a.sql"), PathBuf::from("b.sql")]
