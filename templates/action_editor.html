@@ -18,6 +18,29 @@
 </div>
 {% endif %}
 
+{% if let Some(n) = name %}{% if !env_fields.is_empty() %}
+{#- CLAUDE-571: a scripted action's env values, without editing YAML.
+    Saving rewrites only the changed values; comments and every other
+    line stay as they are. -#}
+<form method="post" action="/actions/{{ n }}/env" class="card" style="margin-bottom: 16px;">
+  <h3 style="margin-top: 0;">Environment</h3>
+  <p class="dim" style="margin-top: 0;">The values of this action's <code>env</code> block. Saving changes only these values; adding or removing a key is a YAML edit below.</p>
+  {% for f in env_fields %}
+  <label style="display: block; margin-bottom: 12px;">
+    <code>{{ f.key }}</code>
+    {% if f.multiline %}
+    <textarea name="env:{{ f.key }}" rows="4" spellcheck="false" autocomplete="off" style="display: block; width: 100%; margin-top: 4px; font-family: var(--mono); font-size: 13px;">{{ f.value }}</textarea>
+    {% else %}
+    <input name="env:{{ f.key }}" value="{{ f.value }}" spellcheck="false" autocomplete="off" style="display: block; width: 100%; margin-top: 4px; font-family: var(--mono); font-size: 13px;">
+    {% endif %}
+  </label>
+  {% endfor %}
+  <div class="row-actions">
+    <button class="btn" type="submit">Save environment</button>
+  </div>
+</form>
+{% endif %}{% endif %}
+
 {% if is_new %}
 <div class="card" style="margin-bottom: 16px;">
   <span class="dim">Paste an action's YAML below to import it. The file is saved as

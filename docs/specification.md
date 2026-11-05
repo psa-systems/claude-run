@@ -955,6 +955,11 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
   be reached through a stale name.
 - A synthetic action (`audit-run`, `closed-issue-summary` reporting) rejects edit, export and delete: there is no file
   backing it to touch.
+- The edit page of a `scripted` action with an `env` block offers an Environment form (CLAUDE-571): one field per key,
+  posted to `/actions/{name}/env`. Saving rewrites only the changed values in place, leaving comments, key order and
+  every other line as they were; the result goes through the same `validate_str` path, and nothing is written unless
+  its parsed `env` equals the submitted values. A key not already in the block, or a native action, is refused with
+  the editor's validation message. Keys are added or removed in the raw YAML only.
 
 #### 4.3.4 Native action editor forms (`SPEC-4.3.4`)
 
