@@ -796,6 +796,29 @@ the work is on any comment.
    resumed run (a resumed run continues the numbering of the branch's earlier attempts).
 6. Steps are ASCII only. A step with no recorded time because its data is incomplete shows `?:??`, not `0:00`.
 
+### 3.16 Comment brevity: verdict and failure (`SPEC-3.16`)
+
+A runner comment states the outcome and the one thing a reader needs next. Evidence stays in the run record and is
+linked, never pasted.
+
+1. **Verdict comment.** The post-success review's comment is at most 5 bullets. The first bullet is the verdict
+   (`Review: PASS` or `Review: FAIL`). Each following bullet is one finding as `file:line - what is wrong`, or, on a
+   pass, one criterion met. The last bullet links the full evidence on the run page. It contains no headings, no tables
+   and no restated invariant or search pattern.
+2. **Evidence file.** The review session writes its working (the invariant, the search pattern and the classified
+   hits of the sweep) to a separate evidence file in the scratch directory, not the workdir. The runner stores that
+   file with the attempt's stream log and serves it on the run page (`SPEC-4.3.10`). The review prompt requires the
+   sweep to be done in full; only its posting is capped. The pass and fail marker files hold the verdict bullets alone.
+3. **Failure comment.** A `FAILED` comment is at most 3 bullets: the cause first, then what was or was not pushed, then
+   the run link. The cause is one line from a closed set: `timed out` (with the limit and turn count), `push rejected`
+   (with the one-line git error), `<command> failed` (the gate or hook command), `cancelled`, `agent error` (with its
+   one-line message). The raw stream-log path is not in the comment, since the run link reaches it.
+4. **Over the cap.** A marker file over its bullet cap is posted truncated to the cap with a final bullet stating how
+   many bullets were dropped and linking the full text; the over-length is logged at `warn` with the issue key.
+   Truncation is never silent.
+5. **Scope.** The cap applies to the verdict, the failure comment and the `Needs Review` comment (`SPEC-3.12`). Push
+   comments (`SPEC-8.8`) keep their commit list.
+
 ## 4. Interfaces
 
 ### 4.1 CLI
