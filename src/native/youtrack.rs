@@ -3322,6 +3322,7 @@ fn final_push_failed(
 /// sets AI Agent to the configured `delivery_blocked` label (falling back
 /// to `needs_review` when none is configured, so an unset config still
 /// parks the issue for a human rather than stranding it at Working).
+#[allow(clippy::too_many_arguments)]
 fn finish_delivery_blocked(
     backend: &dyn IssueTracker,
     src: &YoutrackSource,
