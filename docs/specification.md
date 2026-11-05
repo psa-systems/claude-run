@@ -1773,7 +1773,6 @@ never write the same registry destination.
   `claude-run test-postgres --network <job network>` (`SPEC-6.6`), with the job container's network read from the
   container the runner names in `JOB_CONTAINER_NAME`, and MUST NOT use a `services: postgres` container: a service's
   `options` cannot turn durability off, and a durable server on the runner's shared array made the pass take an hour
-  (run #764) where the non-durable one took minutes (run #746). The unit-test steps MUST set `TMPDIR` to the job
-  container's RAM-backed `/dev/shm`, and each MUST carry a `timeout-minutes` far below the runner's 3 hour job limit.
-  Neither the non-durable server nor `TMPDIR` is a timeout increase, retry or skip: `SPEC-10.1.3` still holds for the
-  suite on slow storage.
+  (run #764) where the non-durable one took minutes (run #746). Each unit-test step MUST carry a `timeout-minutes` far
+  below the runner's 3 hour job limit. The non-durable server is not a timeout increase, retry or skip: `SPEC-10.1.3`
+  still holds for the suite on slow storage.
