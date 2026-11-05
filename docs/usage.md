@@ -99,6 +99,11 @@ tools with `Authorization: Bearer <token>` against `https://<public_url>/mcp`.
 The daemon's TCP web UI (loopback by default; see [Web UI / API auth](auth.md#web-ui--api-auth)) is more than the Dashboard. The pages an operator
 will want to know about:
 
+- **Landing page** (`/`, signed out). On an instance behind the web login, a signed-out browser at `/` sees a short
+  page describing claude-run, with **Sign in** and a link to the documentation, instead of being sent straight to
+  `/login`. It shows no instance data. Signed in, `/` is the Dashboard; an instance with no account yet still serves
+  only `/setup`. The mascot is a placeholder: replace `assets/mascot.svg` (served at `/static/mascot.svg`) and rebuild
+  to change it. See `SPEC-7.16`.
 - **Dashboard** (`/`) leads with the conditions that make work stop without anything failing: the global-pause card, the
   24h diagnostics banner (CLAUDE-216 / CLAUDE-235, see "Access check"), the stale-dependency-gate banner
   (CLAUDE-225), and the attempt-cap banner (CLAUDE-232). The diagnostics banner is one line: how many `warn`/`error`

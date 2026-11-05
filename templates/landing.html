@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>claude-run</title>
+  {# SPEC-7.16: the signed-out landing page. Static text only: nothing here
+     reads instance data (no action names, runs, status or version), and the
+     page needs no JavaScript. #}
+  <style>
+    :root {
+      --bg: #0f1115;
+      --bg-2: #13161c;
+      --panel: #181b22;
+      --border: #2a2f3a;
+      --fg: #d8dde7;
+      --fg-dim: #8b93a3;
+      --accent: #7ab7ff;
+      --accent-ink: #0a0c10;
+      --accent-soft: rgba(122, 183, 255, 0.14);
+      --shadow: rgba(0, 0, 0, 0.45);
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f7f9fc;
+        --bg-2: #eef3fa;
+        --panel: #ffffff;
+        --border: #dde3ec;
+        --fg: #141a24;
+        --fg-dim: #5a6475;
+        --accent: #2f6fc4;
+        --accent-ink: #ffffff;
+        --accent-soft: rgba(47, 111, 196, 0.12);
+        --shadow: rgba(20, 26, 36, 0.12);
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif; font-size: 15px; line-height: 1.5; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 0 16px; }
+    header.top { border-bottom: 1px solid var(--border); }
+    header.top .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+    .brand { color: var(--fg); font-weight: 700; font-size: 18px; letter-spacing: -0.01em; }
+    .brand span { color: var(--accent); }
+    .brand:hover { text-decoration: none; }
+    .btn { display: inline-block; border-radius: 6px; padding: 10px 18px; font-size: 14px; font-weight: 600; border: 1px solid var(--border); background: var(--panel); color: var(--fg); }
+    .btn:hover { text-decoration: none; filter: brightness(1.08); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+    .btn.small { padding: 6px 12px; font-size: 13px; }
+    .hero { display: grid; gap: 40px; align-items: center; padding-top: 72px; padding-bottom: 72px; grid-template-columns: 1.2fr 1fr; }
+    .pill { display: inline-flex; align-items: center; gap: 8px; background: var(--accent-soft); color: var(--accent); border-radius: 999px; padding: 4px 12px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+    .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+    h1 { font-size: clamp(32px, 5vw, 52px); line-height: 1.08; letter-spacing: -0.02em; margin: 20px 0 0; }
+    h1 .accent { display: block; color: var(--accent); }
+    .lede { color: var(--fg-dim); font-size: 17px; max-width: 34em; margin: 20px 0 0; }
+    .ctas { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
+    .art { display: flex; flex-direction: column; align-items: center; }
+    .art img { width: 100%; max-width: 360px; height: auto; filter: drop-shadow(0 18px 30px var(--shadow)); }
+    .quote { margin: -28px 0 0; position: relative; background: var(--panel); border: 1px solid var(--border); border-radius: 999px; padding: 6px 16px; font-size: 14px; font-style: italic; color: var(--fg-dim); box-shadow: 0 4px 14px var(--shadow); }
+    .inside { background: var(--bg-2); border-top: 1px solid var(--border); padding: 64px 0; }
+    .eyebrow { color: var(--accent); font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin: 0; }
+    h2 { font-size: clamp(24px, 4vw, 34px); letter-spacing: -0.01em; margin: 8px 0 0; }
+    .cards { display: grid; gap: 16px; margin-top: 32px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+    .card .icon { width: 36px; height: 36px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); display: flex; align-items: center; justify-content: center; }
+    .card .icon svg { width: 18px; height: 18px; }
+    .card h3 { font-size: 15px; margin: 14px 0 6px; }
+    .card p { color: var(--fg-dim); font-size: 14px; margin: 0; }
+    footer { border-top: 1px solid var(--border); }
+    footer .wrap { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; padding-top: 24px; padding-bottom: 24px; color: var(--fg-dim); font-size: 13px; }
+    @media (max-width: 760px) {
+      .hero { grid-template-columns: 1fr; padding-top: 40px; padding-bottom: 40px; text-align: center; }
+      .lede { margin-left: auto; margin-right: auto; }
+      .ctas { justify-content: center; }
+      .art { order: -1; }
+      .art img { max-width: 220px; }
+      .inside { padding: 48px 0; }
+    }
+  </style>
+</head>
+<body>
+  <header class="top">
+    <div class="wrap">
+      <a class="brand" href="/">claude-<span>run</span></a>
+      <a class="btn primary small" href="/login">Sign in</a>
+    </div>
+  </header>
+
+  <main>
+    <section class="wrap hero">
+      <div>
+        <span class="pill">Self-hosted runner</span>
+        <h1>Your queue, <span class="accent">worked by Claude Code.</span></h1>
+        <p class="lede">claude-run is a YAML-driven runner that feeds jobs from issue trackers, forges and other sources to Claude Code, on a schedule or a webhook, and acts on the result. A web UI shows every run as it happens.</p>
+        <div class="ctas">
+          <a class="btn primary" href="/login">Sign in</a>
+          <a class="btn" href="{{ docs_url }}">Documentation</a>
+        </div>
+      </div>
+      <div class="art">
+        {# Placeholder mascot: replace assets/mascot.svg (served at
+           /static/mascot.svg) to swap in the real art. Decorative, so the alt
+           text is empty. #}
+        <img src="/static/mascot.svg" alt="" width="320" height="320">
+        <p class="quote">"Queue it up. I'll take it from here."</p>
+      </div>
+    </section>
+
+    <section class="inside" id="inside">
+      <div class="wrap">
+        <p class="eyebrow">What's inside</p>
+        <h2>Everything a run needs, in one binary.</h2>
+        <div class="cards">
+          <div class="card">
+            <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M9 13h6M9 17h4"/></svg></div>
+            <h3>Actions in YAML</h3>
+            <p>Each action is one file: where its jobs come from, the prompt, and what happens with the result.</p>
+          </div>
+          <div class="card">
+            <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div>
+            <h3>Schedules and webhooks</h3>
+            <p>Poll on an interval or cron, or start the moment a forge or CI system calls in.</p>
+          </div>
+          <div class="card">
+            <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v18M17 7H9.5a3 3 0 0 0 0 6h5a3 3 0 0 1 0 6H6"/></svg></div>
+            <h3>Budgets and limits</h3>
+            <p>Spend ceilings per run and per day, attempt caps, and one pause switch honored everywhere.</p>
+          </div>
+          <div class="card">
+            <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg></div>
+            <h3>Web UI with live logs</h3>
+            <p>Watch each job's stream as it runs, then search past runs, reports and logs.</p>
+          </div>
+          <div class="card">
+            <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+            <h3>Secrets kept encrypted</h3>
+            <p>Tokens are stored encrypted at rest and handed to a job only for the run that needs them.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <span>claude-run</span>
+      <span><a href="{{ docs_url }}">Documentation</a> - <a href="/login">Sign in</a></span>
+    </div>
+  </footer>
+</body>
+</html>
