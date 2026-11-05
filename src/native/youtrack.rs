@@ -3139,6 +3139,76 @@ enum Finalized {
         head_branch: Option<String>,
         requeued: bool,
     },
+    /// The run cannot deliver a mergeable PR for a reason the runner itself
+    /// detected (wall-clock timeout with nothing to salvage, a checkpoint
+    /// push rejected by the hook and no PR adopted, a review session that
+    /// modified the read-only workdir, or a success path with no commits
+    /// ahead of the base). AI Agent lands on the configured
+    /// `delivery_blocked` label (or Needs Review when none is configured),
+    /// the issue is NOT left at Working, and no orphan draft PR is kept
+    /// open from this outcome.
+    DeliveryBlocked {
+        reason: DeliveryBlockedReason,
+        pr_url: Option<String>,
+        pr_number: Option<u64>,
+        head_branch: Option<String>,
+    },
+}
+
+/// Why a run ended in [`Finalized::DeliveryBlocked`]. One variant per
+/// runner-detected blocker named in the parent ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryBlockedReason {
+    /// The wall-clock limit fired and no local work was found to salvage,
+    /// so no draft PR was opened and nothing is on the forge from this run.
+    TimeoutNothingMergeable,
+    /// The periodic checkpoint-push watcher's push was rejected (typically
+    /// by the repo's pre-push hook) and no PR had been opened or adopted
+    /// yet, so the agent branch is still local-only.
+    PushRejected,
+    /// The CI-fix-attempts ceiling was reached without a green run; the
+    /// webhook path drives this outcome rather than `finalize`.
+    CiFixCeiling,
+    /// The post-success review session modified the workdir (SPEC: the
+    /// review workdir is read-only by contract), so its verdict is not
+    /// trustworthy and the PR is not promoted.
+    ReviewModifiedWorkdir,
+    /// A successful agent run reached the PR-open step with no commits
+    /// ahead of the base branch, so there is nothing to open a PR from.
+    NoCommitsAhead,
+}
+
+impl DeliveryBlockedReason {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            DeliveryBlockedReason::TimeoutNothingMergeable => "timeout-nothing-mergeable",
+            DeliveryBlockedReason::PushRejected => "push-rejected",
+            DeliveryBlockedReason::CiFixCeiling => "ci-fix-ceiling",
+            DeliveryBlockedReason::ReviewModifiedWorkdir => "review-modified-workdir",
+            DeliveryBlockedReason::NoCommitsAhead => "no-commits-ahead",
+        }
+    }
+
+    /// The one-line outcome a reviewer sees at the top of the comment.
+    pub(crate) fn outcome_line(&self) -> &'static str {
+        match self {
+            DeliveryBlockedReason::TimeoutNothingMergeable => {
+                "Claude AI agent run DELIVERY BLOCKED: timed out with no local work to salvage."
+            }
+            DeliveryBlockedReason::PushRejected => {
+                "Claude AI agent run DELIVERY BLOCKED: a checkpoint push was rejected and no PR had been opened for this run."
+            }
+            DeliveryBlockedReason::CiFixCeiling => {
+                "Claude AI agent run DELIVERY BLOCKED: the CI-fix attempt ceiling was reached without a green run."
+            }
+            DeliveryBlockedReason::ReviewModifiedWorkdir => {
+                "Claude AI agent run DELIVERY BLOCKED: the post-success review session modified the read-only review workdir, so its verdict is not trustworthy."
+            }
+            DeliveryBlockedReason::NoCommitsAhead => {
+                "Claude AI agent run DELIVERY BLOCKED: the agent's run ended with no commits ahead of the base, so no PR could be opened."
+            }
+        }
+    }
 }
 
 impl Finalized {
@@ -3156,6 +3226,7 @@ impl Finalized {
             Finalized::ReviewFailed {
                 requeued: false, ..
             } => "Needs Review (review)",
+            Finalized::DeliveryBlocked { .. } => "Delivery Blocked",
         }
     }
 }
@@ -3184,6 +3255,7 @@ fn record_finalize_outcome(
         Ok(Finalized::ReviewFailed { .. }) => {
             Some("the post-success review found problems; the PR was left as a draft")
         }
+        Ok(Finalized::DeliveryBlocked { reason, .. }) => Some(reason.outcome_line()),
         _ => None,
     };
     let ok = claude_result.ok && !post_failed && finalize_cause.is_none();
@@ -3241,6 +3313,37 @@ fn final_push_failed(
         cause: err.to_string(),
         pr_step: Some("push"),
         requeued: false,
+    })
+}
+
+/// CLAUDE-545: shared write-and-return path for every delivery-blocked
+/// blocker. Composes the short outcome comment (`delivery_blocked_comment`),
+/// appends the SPEC-3.9 run footer, posts the comment best-effort, then
+/// sets AI Agent to the configured `delivery_blocked` label (falling back
+/// to `needs_review` when none is configured, so an unset config still
+/// parks the issue for a human rather than stranding it at Working).
+fn finish_delivery_blocked(
+    backend: &dyn IssueTracker,
+    src: &YoutrackSource,
+    job: &YoutrackJob,
+    reason: DeliveryBlockedReason,
+    pr: Option<&PullRequest>,
+    pr_url_override: Option<&str>,
+    public_url: Option<&str>,
+    run: crate::run_footer::CommentRun,
+) -> Result<Finalized> {
+    let pr_url: Option<String> = pr_url_override
+        .map(str::to_string)
+        .or_else(|| pr.map(|p| p.url.clone()));
+    let body = delivery_blocked_comment(reason, pr_url.as_deref());
+    let body = crate::run_footer::append_job(&body, public_url, run, &job.key);
+    let label = src.states.delivery_blocked_label().to_string();
+    comment_then_field(backend, src, &job.key, &body, &label)?;
+    Ok(Finalized::DeliveryBlocked {
+        reason,
+        pr_url,
+        pr_number: pr.and_then(|p| p.number),
+        head_branch: pr.and_then(|p| p.head_branch.clone()),
     })
 }
 
@@ -3313,6 +3416,24 @@ fn finalize(
         // Review: SPEC-3.3.1 forbids reporting a failed push as anything
         // else.
         if let Err(e) = final_push(forge, job, workdir) {
+            // CLAUDE-545: when the checkpoint watcher's own push was
+            // already rejected earlier AND this final push now also
+            // fails, the pattern is a repo-level rejection the runner
+            // cannot clear on its own. Route to the delivery-blocked
+            // terminal state so the issue is parked explicitly rather
+            // than as a generic Failed.
+            if checkpoint_push_rejected.is_some() {
+                return finish_delivery_blocked(
+                    backend,
+                    src,
+                    job,
+                    DeliveryBlockedReason::PushRejected,
+                    None,
+                    None,
+                    public_url.as_deref(),
+                    run,
+                );
+            }
             return final_push_failed(
                 backend,
                 src,
@@ -3353,6 +3474,19 @@ fn finalize(
         // alone, so the issue stays In Progress until a human closes it. A
         // failed push overrides this outcome with Failed, per SPEC-3.3.1.
         if let Err(e) = final_push(forge, job, workdir) {
+            // CLAUDE-545: see the equivalent branch above.
+            if checkpoint_push_rejected.is_some() {
+                return finish_delivery_blocked(
+                    backend,
+                    src,
+                    job,
+                    DeliveryBlockedReason::PushRejected,
+                    None,
+                    None,
+                    public_url.as_deref(),
+                    run,
+                );
+            }
             return final_push_failed(
                 backend,
                 src,
@@ -3524,6 +3658,26 @@ fn finalize(
                                 error!(key = %job.key, pr_number, error = %e, "posting review findings on the PR failed (continuing)");
                             }
                         }
+                        // CLAUDE-545: a review session that modified the
+                        // read-only workdir (SPEC: review workdir is
+                        // read-only by contract) gets its own terminal
+                        // state so the dashboard can tell it apart from an
+                        // ordinary review failure; the PR is left as a
+                        // draft with findings posted, and the issue is
+                        // parked on the delivery-blocked label rather than
+                        // Needs Review.
+                        if no_verdict && findings.contains("read-only by contract") {
+                            return finish_delivery_blocked(
+                                backend,
+                                src,
+                                job,
+                                DeliveryBlockedReason::ReviewModifiedWorkdir,
+                                Some(&pr),
+                                Some(&url),
+                                public_url.as_deref(),
+                                run,
+                            );
+                        }
                         // A `NoVerdict` is the runner's own detected
                         // malfunction (timeout, no marker, a touched
                         // workdir), not a reviewer opinion on the work, so it
@@ -3565,6 +3719,24 @@ fn finalize(
                 warn!(key = %job.key, error = %e, "PR creation failed; finalizing as Failed");
                 let token_url = clone_url_for(forge, job);
                 let location = work_location(workdir, Some(&token_url));
+                // CLAUDE-545: PR-create failed with a clean working tree
+                // and no commits ahead of the base, i.e. the agent reached
+                // its stop condition with no code change. This is
+                // delivery-blocked (no PR to open), not a hard failure of
+                // the push or the forge, and the issue is parked on the
+                // delivery-blocked label rather than Failed.
+                if matches!(location, WorkLocation::None) {
+                    return finish_delivery_blocked(
+                        backend,
+                        src,
+                        job,
+                        DeliveryBlockedReason::NoCommitsAhead,
+                        None,
+                        None,
+                        public_url.as_deref(),
+                        run,
+                    );
+                }
                 // The push happens before the PR-create call in every
                 // strategy, so `RemoteBranch` (the push landed) means this
                 // failure is in the PR-create step; anything else means the
@@ -3685,16 +3857,46 @@ fn finalize(
             claude_result,
             claude_timeout,
         );
+        let current = backend
+            .get_field(&job.key, &src.custom_field)
+            .unwrap_or_default();
+        let is_working = current.trim() == src.states.working;
+        // CLAUDE-545: a timeout that found no local work to salvage has
+        // nothing for a human to pick up (no branch, no PR), so it ends in
+        // the explicit DeliveryBlocked terminal state rather than TimedOut
+        // + Needs Review. The human-override guard is preserved: when a
+        // human already advanced AI Agent off Working, the field is left
+        // alone (today's behavior), only the comment is posted. A timeout
+        // that DID salvage a draft PR keeps the existing TimedOut path,
+        // since the PR is the mergeable work.
+        if salvage.nothing_to_salvage && salvage.pr.is_none() {
+            let body =
+                delivery_blocked_comment(DeliveryBlockedReason::TimeoutNothingMergeable, None);
+            let body = note_checkpoint_rejection(body);
+            let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+            if let Err(e) = backend.comment(&job.key, &body) {
+                warn!(key = %job.key, error = %e, "delivery-blocked comment failed (continuing)");
+            }
+            if is_working {
+                let label = src.states.delivery_blocked_label().to_string();
+                backend.set_field(&job.key, &src.custom_field, &label)?;
+            } else {
+                info!(key = %job.key, current = %current, "timeout delivery-blocked: AI Agent already advanced off Working, leaving untouched");
+            }
+            return Ok(Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::TimeoutNothingMergeable,
+                pr_url: None,
+                pr_number: None,
+                head_branch: None,
+            });
+        }
         let body = timeout_comment(claude_result, claude_timeout, &salvage);
         let body = note_checkpoint_rejection(body);
         let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
         if let Err(e) = backend.comment(&job.key, &body) {
             warn!(key = %job.key, error = %e, "timeout comment failed (continuing)");
         }
-        let current = backend
-            .get_field(&job.key, &src.custom_field)
-            .unwrap_or_default();
-        if current.trim() == src.states.working {
+        if is_working {
             backend.set_field(&job.key, &src.custom_field, &src.states.needs_review)?;
         } else {
             info!(key = %job.key, current = %current, "timeout: AI Agent already advanced off Working, leaving untouched");
@@ -4696,6 +4898,41 @@ fn failure_comment(r: &ClaudeResult) -> String {
     .join("\n");
     body.push_str(&raw_event_details(&r.raw));
     body
+}
+
+/// Delivery-blocked issue comment (CLAUDE-545). One-line outcome naming
+/// the blocker, up to four action bullets (which PR to look at if any,
+/// what a human should do, and the machine-readable reason slug).
+/// Short by design: the long detail already lives in the run log.
+pub(crate) fn delivery_blocked_comment(
+    reason: DeliveryBlockedReason,
+    pr_url: Option<&str>,
+) -> String {
+    let mut lines = vec![reason.outcome_line().to_string(), String::new()];
+    match pr_url {
+        Some(url) => lines.push(format!("- Open PR: {url}")),
+        None => lines.push("- No PR was opened for this run.".to_string()),
+    }
+    let follow_up = match reason {
+        DeliveryBlockedReason::TimeoutNothingMergeable => {
+            "- Inspect the run log, then either resolve the issue manually or re-queue it (set AI Agent = Queued) to retry from scratch."
+        }
+        DeliveryBlockedReason::PushRejected => {
+            "- Inspect the run log and the pre-push hook output, fix the underlying rejection, then re-queue the issue (set AI Agent = Queued)."
+        }
+        DeliveryBlockedReason::CiFixCeiling => {
+            "- Inspect the CI failures on the PR; if they are the same root cause the agent cannot untangle, resolve manually; otherwise re-queue the issue (set AI Agent = Queued)."
+        }
+        DeliveryBlockedReason::ReviewModifiedWorkdir => {
+            "- The review session violated the read-only contract; inspect the review findings on the PR, then re-queue the issue (set AI Agent = Queued) to re-run the review."
+        }
+        DeliveryBlockedReason::NoCommitsAhead => {
+            "- The agent reached its stop condition with no code change; close the issue if intentional, otherwise re-queue it (set AI Agent = Queued) with clearer intent."
+        }
+    };
+    lines.push(follow_up.to_string());
+    lines.push(format!("- Reason: `{}`", reason.as_str()));
+    lines.join("\n")
 }
 
 /// Map a `ProcessedJob::Done` into the JSONL record + `job_outcomes` insert,
@@ -6416,6 +6653,55 @@ mod tests {
         );
     }
 
+    /// CLAUDE-545: the delivery-blocked comment leads with the reason's
+    /// one-line outcome, names the PR when one is available (and says so
+    /// when one is not), and ends with a machine-readable `Reason:` slug
+    /// so the dashboard filter can match on it.
+    #[test]
+    fn delivery_blocked_comment_leads_with_reason_outcome_and_slug() {
+        for reason in [
+            DeliveryBlockedReason::TimeoutNothingMergeable,
+            DeliveryBlockedReason::PushRejected,
+            DeliveryBlockedReason::CiFixCeiling,
+            DeliveryBlockedReason::ReviewModifiedWorkdir,
+            DeliveryBlockedReason::NoCommitsAhead,
+        ] {
+            let body = delivery_blocked_comment(reason, None);
+            assert!(
+                body.starts_with(reason.outcome_line()),
+                "{reason:?}: body must open with the reason's outcome line:\n{body}"
+            );
+            assert!(
+                body.contains("- No PR was opened for this run."),
+                "{reason:?}: missing no-PR bullet:\n{body}"
+            );
+            let slug = format!("- Reason: `{}`", reason.as_str());
+            assert!(
+                body.contains(&slug),
+                "{reason:?}: missing reason slug `{slug}`:\n{body}"
+            );
+        }
+    }
+
+    /// CLAUDE-545: when a PR URL is available the comment names it in
+    /// place of the "no PR" bullet, so a reviewer has a direct link to
+    /// whatever work the blocker left behind.
+    #[test]
+    fn delivery_blocked_comment_names_the_pr_when_available() {
+        let body = delivery_blocked_comment(
+            DeliveryBlockedReason::ReviewModifiedWorkdir,
+            Some("https://dev.a8n.run/contoso/claude-run/pulls/7"),
+        );
+        assert!(
+            body.contains("- Open PR: https://dev.a8n.run/contoso/claude-run/pulls/7"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("- No PR was opened for this run."),
+            "the no-PR bullet must be replaced when a PR URL is given:\n{body}"
+        );
+    }
+
     /// A run with no `compact_boundary` event in its stream log
     /// leaves the outcome comment untouched.
     #[test]
@@ -7918,6 +8204,80 @@ mod tests {
                 .iter()
                 .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
             "a failed final push must never be reported as Needs Review: {calls:?}"
+        );
+    }
+
+    /// CLAUDE-545: when the checkpoint watcher's own push was rejected
+    /// earlier AND the final push now also fails, the pattern is a
+    /// repo-level rejection the runner cannot clear on its own. The
+    /// terminal state is DeliveryBlocked{PushRejected}, not generic
+    /// Failed.
+    #[test]
+    fn finalize_needs_review_push_failure_after_checkpoint_rejection_is_delivery_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        std::fs::write(wd.join(NEEDS_REVIEW_MARKER), "need a decision on X").unwrap();
+        let runner = Arc::new(
+            stub_runner_for_a_clean_final_push()
+                .fail(
+                    "git",
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
+                    1,
+                    "remote: permission denied",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            wd,
+            &ClaudeResult::synthesized("e", "s"),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            Some("pre-push hook rejected: `cargo fmt` found diffs"),
+            None,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::PushRejected,
+                pr_url: None,
+                pr_number: None,
+                head_branch: None,
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "default delivery_blocked label (Needs Review fallback) must be set: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+            "a push-rejected + checkpoint-rejected pattern must not land on Failed: {calls:?}"
         );
     }
 
@@ -10368,8 +10728,13 @@ mod tests {
     }
 
     #[test]
-    fn finalize_pr_create_failure_sets_failed() {
-        // AGit strategy whose `fj pr create -aA` fails finalizes as Failed.
+    fn finalize_pr_create_failure_with_no_commits_ahead_is_delivery_blocked() {
+        // CLAUDE-545: AGit's `fj pr create -aA` fails with "no commits to
+        // push" when the agent's run ended with a clean working tree and
+        // no commits ahead of the base. That is delivery-blocked (nothing
+        // to open a PR from), not a hard push/PR-create failure of the
+        // forge, so the issue is parked on the delivery-blocked label
+        // rather than Failed.
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(
             StubRunner::new()
@@ -10381,7 +10746,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -10405,22 +10770,27 @@ mod tests {
             1000,
         )
         .unwrap();
-        assert!(
-            matches!(
-                &res,
-                Finalized::Failed {
-                    pr_step: Some(_),
-                    ..
-                }
-            ),
-            "{res:?}"
+        assert_eq!(
+            res,
+            Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::NoCommitsAhead,
+                pr_url: None,
+                pr_number: None,
+                head_branch: None,
+            }
         );
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls
                 .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "default delivery_blocked label (Needs Review fallback) must be set: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
                 .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
-            "{calls:?}"
+            "a no-commits-ahead case must not land on Failed: {calls:?}"
         );
     }
 
@@ -10687,8 +11057,11 @@ mod tests {
 
     #[test]
     fn finalize_timeout_sets_needs_review_when_still_working() {
-        // A timeout (exit 124) with AI Agent still on Working advances
-        // the field to Needs Review and posts the timeout comment - never Failed.
+        // CLAUDE-545: a timeout with no local work to salvage ends in the
+        // DeliveryBlocked{TimeoutNothingMergeable} terminal state. With no
+        // configured `delivery_blocked` label, the AI Agent write still
+        // lands on Needs Review (the default fallback); the issue is
+        // never marked Failed and no PR is opened.
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(
             StubRunner::new()
@@ -10725,9 +11098,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             res,
-            Finalized::TimedOut {
+            Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::TimeoutNothingMergeable,
+                pr_url: None,
                 pr_number: None,
-                head_branch: None
+                head_branch: None,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -10745,16 +11120,17 @@ mod tests {
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
-        // A timeout park also lands on Needs Review but is a different code
-        // path from the agent-signalled blocker; it never writes the
-        // Needs-Info tag (CLAUDE-373).
+        // The Needs-Info tag is reserved for the agent-signalled Needs
+        // Review path (CLAUDE-373); delivery-blocked never writes it.
         assert!(!calls.iter().any(|c| c.contains("tag add")), "{calls:?}");
     }
 
     #[test]
     fn finalize_timeout_leaves_field_when_already_advanced() {
-        // A timeout whose AI Agent has already moved off Working (e.g.
-        // a human/agent set Done) leaves the field untouched - only the comment
+        // CLAUDE-545: a timeout with no salvageable work still produces
+        // the DeliveryBlocked outcome, but the human-override guard is
+        // preserved: when AI Agent has already moved off Working (e.g. a
+        // human set Done), the field is left untouched - only the comment
         // is posted. No set-field write at all.
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(StubRunner::new().ok(
@@ -10784,9 +11160,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             res,
-            Finalized::TimedOut {
+            Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::TimeoutNothingMergeable,
+                pr_url: None,
                 pr_number: None,
-                head_branch: None
+                head_branch: None,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -10799,6 +11177,71 @@ mod tests {
         );
         assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+    }
+
+    /// CLAUDE-545: a configured `delivery_blocked` label on
+    /// `YoutrackStates` routes the AI Agent write to it instead of to the
+    /// default Needs Review fallback.
+    #[test]
+    fn finalize_timeout_uses_configured_delivery_blocked_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "yt",
+                    &[
+                        "issue",
+                        "set-field",
+                        "MK-16",
+                        "AI Agent",
+                        "Delivery Blocked",
+                    ],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let mut src = src();
+        src.states.delivery_blocked = Some("Delivery Blocked".to_string());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src,
+            &job(),
+            dir.path(),
+            &timed_out_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::TimeoutNothingMergeable,
+                pr_url: None,
+                pr_number: None,
+                head_branch: None,
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Delivery Blocked"),
+            "configured delivery_blocked label must be the AI Agent target: {calls:?}"
+        );
     }
 
     // ---- CLAUDE-379: salvage timed-out work as a draft PR -----------------
@@ -14648,6 +15091,159 @@ mod tests {
         assert!(
             logs.contains("ERROR") && logs.contains("the review session timed out"),
             "a NoVerdict must emit an error log naming the cause, got:\n{logs}"
+        );
+    }
+
+    /// CLAUDE-545: a NoVerdict whose cause string names the "read-only by
+    /// contract" invariant is the review-modified-workdir case and ends
+    /// in the DeliveryBlocked{ReviewModifiedWorkdir} terminal state, not
+    /// the generic ReviewFailed used by other NoVerdict causes. Keeps the
+    /// draft PR open (findings posted on it) and parks the issue on the
+    /// delivery-blocked label.
+    #[test]
+    fn finalize_review_modifying_the_workdir_is_delivery_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
+                    "",
+                )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: feat: x",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
+                )
+                .ok_prefix(
+                    &format!(
+                        "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {}",
+                        std::env::temp_dir()
+                            .join("claude-run-review-pr-comment-MK-16-")
+                            .display()
+                    ),
+                    "",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            Some(&ReviewOutcome::NoVerdict(
+                "the review session modified the workdir (it is read-only by contract)".to_string(),
+            )),
+            1,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::ReviewModifiedWorkdir,
+                pr_url: Some("https://dev.a8n.run/contoso/claude-run/pulls/7".into()),
+                pr_number: Some(7),
+                head_branch: Some("feat/x".into()),
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "default delivery_blocked label (Needs Review fallback) must be set: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("fj --host dev.a8n.run pr comment contoso/claude-run#7")),
+            "the findings must still be posted on the PR: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("pr edit")),
+            "a workdir-modified review must leave the PR as a draft: {calls:?}"
         );
     }
 }
