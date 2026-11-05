@@ -40,7 +40,9 @@ flowchart TD
         PR2 -- yes --> AG1{"agent_pull_requests row open for this PR?"}
         AG1 -- yes --> AG2{"fix_attempts below config.webhook.agent_pr_fix_attempts?"}
         AG2 -- yes --> AG3["comment the issue: run + failing tests + analysis; bump fix_attempts; AI Agent: Queued"]
-        AG2 -- no --> AG4["AI Agent: Needs Review; comment lists every attempt's run"]
+        AG2 -- no --> AG5{"failing tests overlap none of the PR's earlier attempts, and fix_attempts below agent_pr_fix_attempts_hard_cap?"}
+        AG5 -- yes --> AG3
+        AG5 -- no --> AG4["AI Agent: Needs Review; comment lists every attempt's run and failing-test set"]
         AG1 -- no --> H1{"failing tests match a ci_failure row?"}
         H1 -- "open" --> H2["comment PR: already tracked in KEY; attach run; no analysis"]
         H1 -- "pr_only, now 2+ distinct branches" --> H3["mint issue, point the store row at it, comment BOTH PRs"]
