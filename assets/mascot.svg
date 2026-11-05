@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" width="320" height="320">
+  <!-- Placeholder mascot for the signed-out landing page (CLAUDE-539): a soft
+       shape resting on a speech bubble. Replace this file to change the art. -->
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9cc9ff"/>
+      <stop offset="1" stop-color="#4f93e6"/>
+    </linearGradient>
+    <linearGradient id="bubble" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5a9ff0"/>
+      <stop offset="1" stop-color="#2f6fc4"/>
+    </linearGradient>
+  </defs>
+  <path d="M70 196c0-26 26-44 90-44s90 18 90 44-26 46-90 46c-12 0-23-1-33-3l-37 29 8-36c-18-8-28-20-28-36z" fill="url(#bubble)"/>
+  <ellipse cx="118" cy="182" rx="18" ry="7" fill="#ffffff" opacity="0.35"/>
+  <path d="M160 52c44 0 70 34 70 74 0 28-14 40-34 44-12 2-24 3-36 3s-24-1-36-3c-20-4-34-16-34-44 0-40 26-74 70-74z" fill="url(#body)"/>
+  <ellipse cx="136" cy="78" rx="20" ry="11" fill="#ffffff" opacity="0.3"/>
+  <circle cx="138" cy="118" r="7" fill="#1b2a44"/>
+  <circle cx="182" cy="118" r="7" fill="#1b2a44"/>
+  <path d="M150 140q10 9 20 0" fill="none" stroke="#1b2a44" stroke-width="4" stroke-linecap="round"/>
+</svg>
