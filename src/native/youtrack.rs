@@ -2023,7 +2023,7 @@ async fn record_new_pr(
     pr_number: u64,
     head_branch: &str,
     salvaged: bool,
-    run: crate::run_footer::CommentRun,
+    run: crate::run_footer::CommentRun<'_>,
 ) {
     use crate::ci_failure::store;
     let host = host_only(&job.repo_host);
@@ -2078,7 +2078,7 @@ async fn clear_salvaged_for_resume(
     action_name: &str,
     job: &YoutrackJob,
     pr_id: i64,
-    run: crate::run_footer::CommentRun,
+    run: crate::run_footer::CommentRun<'_>,
 ) {
     use crate::ci_failure::store;
     let now = state::now_iso();
@@ -3317,7 +3317,7 @@ fn final_push_failed(
     claude_result: &ClaudeResult,
     err: &Error,
     public_url: Option<&str>,
-    run: crate::run_footer::CommentRun,
+    run: crate::run_footer::CommentRun<'_>,
 ) -> Result<Finalized> {
     let body = [
         "**The final push failed (SPEC-3.3.1).**".to_string(),
@@ -3355,7 +3355,7 @@ fn finish_delivery_blocked(
     pr: Option<&PullRequest>,
     pr_url_override: Option<&str>,
     public_url: Option<&str>,
-    run: crate::run_footer::CommentRun,
+    run: crate::run_footer::CommentRun<'_>,
 ) -> Result<Finalized> {
     let pr_url: Option<String> = pr_url_override
         .map(str::to_string)
@@ -3402,7 +3402,7 @@ fn finalize(
     // both to decide whether a re-queue resumes a real PR instead of parking
     // at a terminal Failed, and to say so truthfully in the failure comment.
     resume_pr_url: Option<&str>,
-    run: crate::run_footer::CommentRun,
+    run: crate::run_footer::CommentRun<'_>,
     // CLAUDE-448: the reason the periodic checkpoint-push watcher stopped
     // checkpointing partway through this run (a rejected push), if any. Never
     // fails the job; named in whichever outcome comment this call produces so
