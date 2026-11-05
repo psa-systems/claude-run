@@ -34,7 +34,11 @@ loop-safety `bot_logins` (so the bot's own reply can never re-trigger a run).
 **Trigger.** The FIRST line of the comment, trimmed, must start with the configured `trigger` (default `/claude`)
 followed by whitespace or end-of-line; everything after it on that line plus the remaining lines is the instruction.
 `/claude help` (and a bare `/claude`) replies with usage and runs nothing, counting no attempt (the usage text differs
-by route). An instruction over `max_instruction_chars` (default 4000) is refused with a reply naming the limit. An
+by route). An instruction over `max_instruction_chars` (default 4000) is refused with a reply naming the limit.
+
+**Replies.** Every reply mentions the commenter (`@alice`), so they are notified, and opens with a one-word verdict:
+**Done.**, **No.**, **Blocked.**, or **Started.** for the acknowledgement posted as soon as an instruction is admitted,
+before any work begins; the explanation follows. The usage reply carries only the mention (CLAUDE-552). An
 edited or deleted comment does nothing: re-running work from an edit expresses no new human intent, so post a new
 comment instead.
 

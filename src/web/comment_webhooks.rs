@@ -1120,7 +1120,7 @@ async fn reply(
         return;
     }
     let path = dir.join(PR_COMMENT_FILE);
-    if let Err(e) = std::fs::write(&path, body) {
+    if let Err(e) = std::fs::write(&path, addressed(cmd, body)) {
         warn!(error = %e, "writing the reply body failed; skipping the reply");
     } else {
         let backend = &env.backend;
@@ -1197,6 +1197,18 @@ async fn run_instruction(
     }
     if let Err(e) = state::attempts_increment(&ctx.pool, WEBHOOK_COMMENT_ACTION, key).await {
         warn!(error = %e, "advancing the comment attempt counter failed");
+    }
+    // CLAUDE-552: admitted, so tell the asker the runner is on it before any
+    // work starts. A synthetic command has no asker to tell.
+    if !cmd.synthetic {
+        reply(
+            ctx,
+            env,
+            cmd,
+            key,
+            started_comment(&instruction, cmd.is_pull_request),
+        )
+        .await;
     }
 
     // `run` carries the `RunGuard` through to `finish_comment_run` below, so a
@@ -2312,7 +2324,7 @@ fn post_reply(backend: &dyn Backend, cmd: &VerifiedCommentCommand, dir: &FsPath,
         return;
     }
     let path = dir.join(PR_COMMENT_FILE);
-    match std::fs::write(&path, body) {
+    match std::fs::write(&path, addressed(cmd, body)) {
         Ok(()) => {
             if let Err(e) = post_on_thread(backend, cmd, &path) {
                 warn!(repo = %cmd.repo, number = cmd.number, error = %e, "posting the reply failed (continuing)");
@@ -2325,6 +2337,41 @@ fn post_reply(backend: &dyn Backend, cmd: &VerifiedCommentCommand, dir: &FsPath,
 }
 
 // ---- reply bodies ----------------------------------------------------------
+
+/// CLAUDE-552: every reply opens with a one-word verdict, so the asker sees
+/// the answer before the explanation; [`addressed`] puts `@<asker>` in front
+/// of it.
+fn with_verdict(verdict: &str, body: String) -> String {
+    format!("**{verdict}**\n\n{body}")
+}
+
+/// CLAUDE-552: `body` addressed to the commenter, so they are notified and
+/// see whom it answers. A synthetic command (the runner's own dispatch) has
+/// no human to mention and is left as it is.
+pub fn addressed(cmd: &VerifiedCommentCommand, body: String) -> String {
+    if cmd.synthetic {
+        body
+    } else {
+        format!("@{} {body}", cmd.author)
+    }
+}
+
+/// CLAUDE-552: the acknowledgement posted once a command is admitted, before
+/// any work, so the asker knows the runner is on it.
+pub fn started_comment(instruction: &str, is_pull_request: bool) -> String {
+    let what = first_line(instruction);
+    let what = if what.chars().count() > 200 {
+        format!("{}...", what.chars().take(200).collect::<String>())
+    } else {
+        what
+    };
+    let next = if is_pull_request {
+        "A reply follows here with the outcome: a pushed commit, or why not."
+    } else {
+        "A reply follows here naming the YouTrack issue it is filed as."
+    };
+    with_verdict("Started.", format!("Working on: {what}\n\n{next}"))
+}
 
 /// SPEC-4.4.5: "Every outcome of a comment command (help, refused as too
 /// long, denied, dropped for being busy or over cap, a run fault, or a
@@ -2362,32 +2409,38 @@ pub fn help_comment(trigger: &str, is_pull_request: bool) -> String {
 
 /// Reply naming the YouTrack issue a plain-issue command minted.
 pub fn minted_comment(key: &str, project: &str) -> String {
-    [
-        format!("**Filed as YouTrack issue `{key}`.**"),
-        String::new(),
-        format!("The request was filed in the `{project}` project with the instruction and a link back to this issue, and queued for the agent. The work will arrive as its own pull request; nothing was changed here."),
-    ]
-    .join("\n")
+    with_verdict(
+        "Done.",
+        [
+            format!("**Filed as YouTrack issue `{key}`.**"),
+            String::new(),
+            format!("The request was filed in the `{project}` project with the instruction and a link back to this issue, and queued for the agent. The work will arrive as its own pull request; nothing was changed here."),
+        ]
+        .join("\n"),
+    )
 }
 
 /// Reply when the issue was created but could not be queued. It
 /// names the issue (so the work is not lost) and the field to set by hand.
 pub fn mint_not_queued_comment(key: &str, field: &str, value: &str, detail: &str) -> String {
-    [
-        format!("**Filed as YouTrack issue `{key}`, but queueing it FAILED.**"),
-        String::new(),
-        format!("The issue exists and carries the request, but `{field}` could not be set to `{value}`, so the agent will not pick it up. Set that field by hand to queue it."),
-        String::new(),
-        "Error:".to_string(),
-        detail.to_string(),
-    ]
-    .join("\n")
+    with_verdict(
+        "Blocked.",
+        [
+            format!("**Filed as YouTrack issue `{key}`, but queueing it FAILED.**"),
+            String::new(),
+            format!("The issue exists and carries the request, but `{field}` could not be set to `{value}`, so the agent will not pick it up. Set that field by hand to queue it."),
+            String::new(),
+            "Error:".to_string(),
+            detail.to_string(),
+        ]
+        .join("\n"),
+    )
 }
 
 /// Reply for a commenter whose permission is not in `allowed`.
 pub fn denied_comment(verdict: &PermissionVerdict, allowed: &[String]) -> String {
     let list = allowed.join("`, `");
-    match verdict {
+    let body = match verdict {
         PermissionVerdict::LookupFailed(_) => [
             "**Command refused: could not verify your repository permission.**".to_string(),
             String::new(),
@@ -2400,64 +2453,80 @@ pub fn denied_comment(verdict: &PermissionVerdict, allowed: &[String]) -> String
             format!("Your effective permission on this repository is `{p}`; running a command needs one of `{list}`, or a higher permission."),
         ]
         .join("\n"),
-        PermissionVerdict::Allowed(_) => String::new(),
-    }
+        PermissionVerdict::Allowed(_) => return String::new(),
+    };
+    with_verdict("No.", body)
 }
 
 /// Reply for an instruction over the configured character limit.
 pub fn too_long_comment(chars: usize, limit: usize) -> String {
-    [
-        "**Command refused: the instruction is too long.**".to_string(),
-        String::new(),
-        format!("The instruction is {chars} characters; the configured limit is {limit}. Shorten it (or link to an issue that carries the detail) and comment again."),
-    ]
-    .join("\n")
+    with_verdict(
+        "No.",
+        [
+            "**Command refused: the instruction is too long.**".to_string(),
+            String::new(),
+            format!("The instruction is {chars} characters; the configured limit is {limit}. Shorten it (or link to an issue that carries the detail) and comment again."),
+        ]
+        .join("\n"),
+    )
 }
 
 /// Reply for a second command while one is already running on this thread.
 pub fn busy_comment(is_pull_request: bool) -> String {
     let thread = thread_label(is_pull_request);
-    [
-        format!("**Command dropped: a job is already running on this {thread}.**"),
-        String::new(),
-        format!("At most one comment command runs per {thread} at a time. Wait for the running job to report back, then comment again."),
-    ]
-    .join("\n")
+    with_verdict(
+        "Blocked.",
+        [
+            format!("**Command dropped: a job is already running on this {thread}.**"),
+            String::new(),
+            format!("At most one comment command runs per {thread} at a time. Wait for the running job to report back, then comment again."),
+        ]
+        .join("\n"),
+    )
 }
 
 /// Reply when the Claude login needs renewing, so the commenter
 /// is told why nothing ran instead of hearing silence.
 pub fn login_required_comment(reason: &str) -> String {
-    [
-        "**Command dropped: the runner's Claude login needs renewing.**".to_string(),
-        String::new(),
-        format!("{reason} Nothing was run; comment again once the operator has signed in."),
-    ]
-    .join("\n")
+    with_verdict(
+        "Blocked.",
+        [
+            "**Command dropped: the runner's Claude login needs renewing.**".to_string(),
+            String::new(),
+            format!("{reason} Nothing was run; comment again once the operator has signed in."),
+        ]
+        .join("\n"),
+    )
 }
 
 /// Reply when the daily run cap is already spent.
 pub fn cap_comment() -> String {
-    [
-        "**Command dropped: the runner's daily run cap for comment commands is reached.**"
-            .to_string(),
-        String::new(),
-        "Nothing was run. Try again after the cap resets, or raise `max_runs_per_day` in Settings -> Webhook comment."
-            .to_string(),
-    ]
-    .join("\n")
+    with_verdict(
+        "Blocked.",
+        [
+            "**Command dropped: the runner's daily run cap for comment commands is reached.**"
+                .to_string(),
+            String::new(),
+            "Nothing was run. Try again after the cap resets, or raise `max_runs_per_day` in Settings -> Webhook comment."
+                .to_string(),
+        ]
+        .join("\n"),
+    )
 }
 
 /// Reply for a fault before the agent could run.
 pub fn error_comment(detail: &str) -> String {
-    [
-        "**Command failed before the agent could run.**".to_string(),
-        String::new(),
-        detail.to_string(),
-        String::new(),
-        "Nothing was pushed. See the runner journal for full context.".to_string(),
-    ]
-    .join("\n")
+    with_verdict(
+        "Blocked.",
+        [
+            "**Command failed before the agent could run.**".to_string(),
+            String::new(),
+            detail.to_string(),
+            String::new(),
+            "Nothing was pushed. See the runner journal for full context.".to_string(),
+        ]
+        .join("\n"),
+    )
 }
 
 /// The PR reply for each decision-gate outcome. A comment is posted on EVERY
@@ -2469,7 +2538,14 @@ pub fn outcome_comment(
     push_comment_failure: Option<&str>,
     too_big_push: Option<&TooBigPush>,
 ) -> String {
-    match decision {
+    // CLAUDE-552: Done when a commit reached the PR, No when Claude decided
+    // or was held to make no change here, Blocked when something stopped it.
+    let verdict = match decision {
+        Decision::Push { .. } if push_err.is_none() => "Done.",
+        Decision::NoChanges | Decision::TooBig { .. } => "No.",
+        _ => "Blocked.",
+    };
+    let body = match decision {
         Decision::ClaudeFailed => {
             let mut lines = vec![format!("**Claude run FAILED ({}).**", claude.error)];
             lines.push(String::new());
@@ -2576,7 +2652,8 @@ pub fn outcome_comment(
                 lines.join("\n")
             }
         },
-    }
+    };
+    with_verdict(verdict, body)
 }
 
 /// First non-empty line of `s`, for the one-line run summary.
@@ -3671,6 +3748,154 @@ mod tests {
         assert!(dir.join(".git").join("MERGE_HEAD").exists());
         let unmerged = git_output(dir, &["diff", "--name-only", "--diff-filter=U"]).unwrap();
         assert_eq!(unmerged, "a.txt");
+    }
+
+    /// CLAUDE-552: the verdict a body opens with.
+    fn verdict_of(body: &str) -> &str {
+        body.lines().next().unwrap_or("")
+    }
+
+    #[test]
+    fn every_reply_opens_with_a_one_word_verdict() {
+        let ok = ClaudeResult {
+            ok: true,
+            summary: "did the thing".into(),
+            cost: 0.1,
+            usage: Default::default(),
+            raw: serde_json::Value::Null,
+            error: String::new(),
+            transient: false,
+            timed_out: false,
+            login_required: false,
+            killed: false,
+            exit_code: Some(0),
+        };
+        let failed = ClaudeResult::synthesized("claude exited 1", "tail");
+        let allowed = vec!["write".to_string()];
+        let cases: Vec<(String, &str)> = vec![
+            (minted_comment("CLAUDE-1", "CLAUDE"), "**Done.**"),
+            (
+                mint_not_queued_comment("CLAUDE-1", "AI Agent", "Queued", "boom"),
+                "**Blocked.**",
+            ),
+            (
+                denied_comment(&PermissionVerdict::Denied("read".into()), &allowed),
+                "**No.**",
+            ),
+            (
+                denied_comment(&PermissionVerdict::LookupFailed("x".into()), &allowed),
+                "**No.**",
+            ),
+            (too_long_comment(50, 10), "**No.**"),
+            (busy_comment(true), "**Blocked.**"),
+            (login_required_comment("expired."), "**Blocked.**"),
+            (cap_comment(), "**Blocked.**"),
+            (error_comment("boom"), "**Blocked.**"),
+            (started_comment("fix it", true), "**Started.**"),
+            (
+                outcome_comment(
+                    &Decision::Push { files: 1, lines: 2 },
+                    &ok,
+                    None,
+                    None,
+                    None,
+                ),
+                "**Done.**",
+            ),
+            (
+                outcome_comment(
+                    &Decision::Push { files: 1, lines: 2 },
+                    &ok,
+                    Some("rejected"),
+                    None,
+                    None,
+                ),
+                "**Blocked.**",
+            ),
+            (
+                outcome_comment(&Decision::NoChanges, &ok, None, None, None),
+                "**No.**",
+            ),
+            (
+                outcome_comment(
+                    &Decision::TooBig {
+                        files: 9,
+                        lines: 900,
+                    },
+                    &ok,
+                    None,
+                    None,
+                    None,
+                ),
+                "**No.**",
+            ),
+            (
+                outcome_comment(&Decision::ClaudeFailed, &failed, None, None, None),
+                "**Blocked.**",
+            ),
+            (
+                outcome_comment(
+                    &Decision::UnresolvedConflicts {
+                        paths: vec!["a".into()],
+                    },
+                    &ok,
+                    None,
+                    None,
+                    None,
+                ),
+                "**Blocked.**",
+            ),
+            (
+                outcome_comment(
+                    &Decision::MeasureFailed { reason: "x".into() },
+                    &ok,
+                    None,
+                    None,
+                    None,
+                ),
+                "**Blocked.**",
+            ),
+        ];
+        for (body, verdict) in cases {
+            assert_eq!(verdict_of(&body), verdict, "{body}");
+            // The longer explanation follows as its own paragraph.
+            assert!(body.lines().nth(2).is_some_and(|l| !l.is_empty()), "{body}");
+        }
+        // Help is the one reply with no verdict: it answers nothing.
+        assert!(help_comment("/claude", true).starts_with("**`/claude` usage**"));
+    }
+
+    #[test]
+    fn replies_mention_the_asker_except_on_a_synthetic_command() {
+        let mut cmd = command_of(&payload_json(
+            "created",
+            REPO,
+            "/claude fix it",
+            "alice",
+            true,
+        ))
+        .unwrap();
+        let body = addressed(&cmd, cap_comment());
+        assert!(body.starts_with("@alice **Blocked.**\n"), "{body}");
+        let help = addressed(&cmd, help_comment("/claude", true));
+        assert_eq!(
+            help,
+            format!("@alice {}", help_comment("/claude", true)),
+            "help unchanged but for the mention"
+        );
+        cmd.synthetic = true;
+        assert_eq!(addressed(&cmd, cap_comment()), cap_comment());
+    }
+
+    #[test]
+    fn the_acknowledgement_names_the_request_and_what_comes_next() {
+        let pr = started_comment("fix the flaky test\nmore detail", true);
+        assert!(pr.contains("Working on: fix the flaky test"), "{pr}");
+        assert!(!pr.contains("more detail"), "first line only: {pr}");
+        assert!(pr.contains("a pushed commit"), "{pr}");
+        assert!(started_comment("x", false).contains("YouTrack issue"));
+        let long = started_comment(&"y".repeat(300), true);
+        assert!(long.contains(&format!("{}...", "y".repeat(200))), "{long}");
     }
 
     #[test]
