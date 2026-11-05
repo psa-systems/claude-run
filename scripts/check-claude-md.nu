@@ -1,6 +1,9 @@
 #!/usr/bin/env nu
 # Guard CLAUDE.md against regrowth (CLAUDE-370): a byte cap, a per-line cap outside
 # fenced code, and every docs/ link and anchor from it must resolve.
+#
+# Also enforces that `docs/finalize-flow.md` names every `Finalized` variant in
+# `src/native/youtrack.rs`, so a new variant without a diagram update fails CI.
 
 const MAX_BYTES = 20000
 const MAX_LINE = 400
@@ -43,6 +46,45 @@ def anchors [text: string] {
     } | get out
 }
 
+# Every `Finalized` variant name declared in `src/native/youtrack.rs`, in
+# source order. The enum's variant declarations are indented four spaces and
+# start with a PascalCase identifier; struct fields (lowercase) and docstring
+# lines (`///`) are skipped by the regex.
+def finalize_variants [src_text: string] {
+    $src_text
+    | parse --regex '(?s)enum Finalized\s*\{(?P<body>.*?)\n\}'
+    | get body?
+    | default []
+    | each {|body|
+        $body | lines
+        | each {|l| $l | parse --regex '^    (?P<name>[A-Z][A-Za-z0-9_]*)[, {]' }
+        | flatten
+        | get name
+    }
+    | flatten
+}
+
+# Every violation of the `docs/finalize-flow.md` <-> `Finalized` invariant
+# (CLAUDE-554): the diagram must name every live variant. Missing file or
+# missing variant text both count. A new variant without a diagram node
+# fails CI; an obsolete node that no longer matches a variant does not
+# (removing a variant is rare and the extra node is harmless until cleaned
+# up by hand).
+def finalize_flow_violations [root: path] {
+    let src = ($root | path join src native youtrack.rs)
+    if not ($src | path exists) { return [] }
+    let doc = ($root | path join docs finalize-flow.md)
+    if not ($doc | path exists) { return ["docs/finalize-flow.md is missing (CLAUDE-554)"] }
+    let src_text = (open --raw $src)
+    let doc_text = (open --raw $doc)
+    let variants = (finalize_variants $src_text)
+    $variants | each {|v|
+        if not ($doc_text | str contains $v) {
+            $"docs/finalize-flow.md is missing a node for Finalized::($v) (CLAUDE-554)"
+        }
+    } | compact
+}
+
 # Every violation in <root>/CLAUDE.md, as a list of strings.
 def violations [root: path] {
     let file = ($root | path join CLAUDE.md)
@@ -67,7 +109,7 @@ def violations [root: path] {
         }
     } | flatten | compact)
 
-    $size_err ++ $line_errs ++ $link_errs
+    $size_err ++ $line_errs ++ $link_errs ++ (finalize_flow_violations $root)
 }
 
 # Fixture tree for the self-test: a CLAUDE.md plus docs/conventions/a.md.
