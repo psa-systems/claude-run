@@ -220,7 +220,7 @@ jobs:
         # the job's CPU share (CI_JOBS, which the build-parallelism action can
         # floor at nproc/4 = 2): the test threads mostly wait on Postgres, so
         # running several per core overlaps that wait. The thread count is
-        # capped at 16 regardless of CI_JOBS (CLAUDE-524): each test's fixture
+        # capped at 16 regardless of CI_JOBS (SPEC-5.6.9, CLAUDE-524): each test's fixture
         # pool can hold up to 4 connections, so 16 threads cannot ask the
         # service for more than 64 at once, leaving headroom under its
         # unconfigured default max_connections of 100 even with the drop

@@ -1194,6 +1194,11 @@ implementation.
   (`scripts/postgres-test-filters.txt`); the SQLite leg runs the whole suite. SQL runs only through a DB pool, so this
   keeps every SQL-executing test on both backends while sparing the pure-logic tests a redundant second run. A guard
   test MUST fail if a source file gains a DB test no filter covers, or if a filter matches no DB-touching module.
+- **SPEC-5.6.9**: The Postgres CI leg's `--test-threads` count MUST be capped independent of the runner's `CI_JOBS`,
+  so that the thread count times a fixture pool's `max_connections` stays under the managed Postgres service's
+  unconfigured `max_connections` (100). Scaling the thread count straight off `CI_JOBS` with no ceiling starves the
+  service's connection slots on a HEAVY/MASSIVE runner, surfacing only as a bare `PoolTimedOut` once sqlx's retry
+  loop exhausts its `acquire_timeout` against the connection-limit refusal (CLAUDE-524).
 
 ## 6. Configuration
 
