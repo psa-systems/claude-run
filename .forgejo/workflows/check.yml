@@ -220,15 +220,22 @@ jobs:
         # the job's CPU share (CI_JOBS, which the build-parallelism action can
         # floor at nproc/4 = 2): the test threads mostly wait on Postgres, so
         # running several per core overlaps that wait. The thread count is
-        # capped at 16 regardless of CI_JOBS (SPEC-5.6.9, CLAUDE-524): each test's fixture
-        # pool can hold up to 4 connections, so 16 threads cannot ask the
-        # service for more than 64 at once, leaving headroom under its
+        # capped at 8 regardless of CI_JOBS (SPEC-5.6.9, CLAUDE-524): each test's fixture
+        # pool can hold up to 4 connections, so 8 threads cannot ask the
+        # service for more than 32 at once, leaving headroom under its
         # unconfigured default max_connections of 100 even with the drop
-        # worker and template-clone connections added in. Before the cap, an
-        # 8-job HEAVY runner produced 32 threads (32 * 4 = 128), over that
-        # ceiling; sqlx's connect retry loop treats Postgres's connection-limit
-        # refusal as transient and retries it silently, so the exhaustion
-        # surfaced only as a bare PoolTimedOut once acquire_timeout elapsed.
+        # worker and template-clone connections added in. Before the first cap
+        # (16), an 8-job HEAVY runner produced 32 threads (32 * 4 = 128), over
+        # that ceiling; sqlx's connect retry loop treats Postgres's
+        # connection-limit refusal as transient and retries it silently, so the
+        # exhaustion surfaced only as a bare PoolTimedOut once acquire_timeout
+        # elapsed. A cap of 16 still left 13 tests timing out acquiring from
+        # their OWN per-test pool (size 4, idle 0) on a HEAVY runner under
+        # heavy load (CI run #774): the service's connection ceiling was not
+        # the limit there, CPU contention between 16 threads was, delaying
+        # each test's own queries long enough to starve its sibling tasks on
+        # the same 4-connection pool past even the 120s acquire_timeout.
+        # Halving the thread count halves that CPU contention.
         shell: nu {0}
         env:
           CLAUDE_RUN_TEST_DATABASE_URL: postgres://claude_run:claude_run@postgres:5432/claude_run
@@ -241,7 +248,7 @@ jobs:
           )
           let ci_jobs = ($env.CI_JOBS? | default "2" | into int)
           let uncapped = ([($ci_jobs * 4) 8] | math max)
-          let threads = ([$uncapped 16] | math min)
+          let threads = ([$uncapped 8] | math min)
           print $"postgres test threads: ($threads); filters: ($filters)"
           cargo test -- --test-threads $threads ...$filters
 
