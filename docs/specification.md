@@ -1202,6 +1202,12 @@ implementation.
   runner, surfacing only as a bare `PoolTimedOut` once sqlx's retry loop exhausted its `acquire_timeout` against the
   connection-limit refusal; a looser cap of 16 was tried first and still left tests timing out acquiring from their
   OWN per-test pool under CPU contention between threads, not the service's connection ceiling (CLAUDE-524).
+- **SPEC-5.6.10**: The SQLite CI leg's `RUST_TEST_THREADS` MUST be capped at 8 too, independent of
+  `NEXTEST_TEST_THREADS`, for the same CPU-contention reason as `SPEC-5.6.9`'s second half: `test_sqlite_pool()`'s
+  single-connection fixture tolerates a CPU-starved background rollback only up to its own `acquire_timeout` (120s),
+  and an uncapped thread count on a HEAVY/MASSIVE runner contends for CPU badly enough to starve a sibling test's
+  acquire past even that raised timeout, the same mechanism `SPEC-5.6.9` already had to lower its own cap from 16 to
+  8 to tolerate (CLAUDE-524).
 
 ## 6. Configuration
 
