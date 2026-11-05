@@ -5597,7 +5597,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
 
         let j = job();
         let s = src();
@@ -5694,7 +5694,7 @@ mod tests {
                     "boom",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
 
         let j = job();
         let s = src();
@@ -7358,7 +7358,7 @@ mod tests {
         // writes NO YouTrack field (the issues stay Queued), so the next poll
         // after the permission grant picks them up with no manual field change.
         let runner = Arc::new(access_runner());
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let denied = StubAccess::deny("forge token cannot read it (404)");
         let Gathered { jobs, events, .. } = gather(&backend, &src().query, Some(&denied)).unwrap();
         assert!(jobs.is_empty(), "{jobs:?}");
@@ -7772,7 +7772,7 @@ mod tests {
             &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
             "",
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -7857,7 +7857,7 @@ mod tests {
             &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
             "",
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -7902,7 +7902,7 @@ mod tests {
             &["issue", "set-field", "MK-16", "AI Agent", "Done"],
             "",
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -7962,7 +7962,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -8067,7 +8067,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -8117,7 +8117,7 @@ mod tests {
             &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
             "",
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let mut s = src();
         s.tags.needs_info = String::new();
         let res = finalize(
@@ -8173,7 +8173,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -8218,7 +8218,7 @@ mod tests {
             &["issue", "set-field", "MK-16", "AI Agent", "Done"],
             "",
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -8286,7 +8286,7 @@ mod tests {
             &["issue", "set-field", "MK-16", "AI Agent", "Reported"],
             "",
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let mut s = src();
         s.states.no_code = Some("Reported".into());
         let res = finalize(
@@ -8332,7 +8332,7 @@ mod tests {
             &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
             "",
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -8452,7 +8452,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -8595,7 +8595,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -8750,7 +8750,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -8925,7 +8925,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -8988,7 +8988,7 @@ mod tests {
                     "",
                 ),
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -9083,11 +9083,22 @@ mod tests {
     }
 
     fn repo_with_commit(dir: &Path) {
+        // CLAUDE-558: configure a local bare `origin` so that
+        // `workdir::local_only_work` (called from `work_location` in the
+        // finalize failure arm) can run `ls-remote origin` without failing
+        // and spinning through the 4-attempt / 0+2+5s retry schedule. The
+        // tests that use `repo_with_commit` never expect a remote tip, so
+        // the empty bare repo is as semantically appropriate as the
+        // original no-remote setup, just faster.
+        let origin = dir.join(".origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_in(&origin, &["init", "--bare"]);
         git_in(dir, &["init"]);
         set_identity(dir);
         std::fs::write(dir.join("f.txt"), "x").unwrap();
         git_in(dir, &["add", "."]);
         git_in(dir, &["commit", "-m", "feat: x"]);
+        git_in(dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
     }
 
     #[test]
@@ -9541,11 +9552,14 @@ mod tests {
     fn ls_remote_failure_errs_toward_preserve() {
         // A reachable local branch but an unreachable remote: the live-remote
         // query fails and the guard preserves rather than risk a wrong delete.
+        // `repo_with_commit` configures a working local bare origin for the
+        // common fixture path (CLAUDE-558); this test overrides it to the
+        // nonexistent URL that drives the ls-remote failure specifically.
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
         git_in(
             dir.path(),
-            &["remote", "add", "origin", "/nonexistent/repo.git"],
+            &["remote", "set-url", "origin", "/nonexistent/repo.git"],
         );
         assert!(has_local_only_work(dir.path()));
     }
@@ -9683,7 +9697,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -9786,7 +9800,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -9884,7 +9898,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -9979,7 +9993,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -10068,7 +10082,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -10159,7 +10173,7 @@ mod tests {
                     "Needs Review",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -10231,7 +10245,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -10417,7 +10431,7 @@ mod tests {
                     "",
                 ),
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -10465,7 +10479,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -10512,7 +10526,7 @@ mod tests {
             &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
             "",
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         // FJMCP-6 case: claude errored on the job.
         let claude = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "error tail");
         let res = finalize(
@@ -10566,7 +10580,7 @@ mod tests {
             &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
             "",
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let claude = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "error tail");
         let res = finalize(
             &backend,
@@ -10627,7 +10641,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let claude = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "error tail");
         let res = finalize(
             &backend,
@@ -10783,7 +10797,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -10842,7 +10856,7 @@ mod tests {
             &["issue", "get-field", "MK-16", "AI Agent"],
             "Done\n",
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -11027,7 +11041,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -11190,7 +11204,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -11293,7 +11307,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -11444,7 +11458,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -11675,7 +11689,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -11829,7 +11843,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -11996,7 +12010,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -12139,7 +12153,7 @@ mod tests {
                     "",
                 ),
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -12200,7 +12214,7 @@ mod tests {
             ],
             "",
         ));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         complete_automerge(
             &backend,
             &backend,
@@ -12309,7 +12323,7 @@ mod tests {
                 .ok("yt", &["issue", "inspect", "AUDIT-7", "--json"], inspect)
                 .ok("yt", &["issue", "comment", "AUDIT-7", &body], ""),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let mut s = src();
 
         let pool = mem_pool().await;
@@ -12343,7 +12357,7 @@ mod tests {
                 .ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect)
                 .ok("yt", &["issue", "comment", "MK-16", &body], ""),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
 
         let count = |needle: &str| {
@@ -12422,7 +12436,7 @@ mod tests {
                 .ok("yt", &["issue", "inspect", "AUD-31", "--json"], inspect)
                 .ok("yt", &["issue", "comment", "AUD-31", &body], ""),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
 
         // First block, then age it by three hours with an already-expired window.
@@ -12474,7 +12488,7 @@ mod tests {
     async fn dependency_gate_disabled_is_noop() {
         let pool = mem_pool().await;
         let runner = Arc::new(StubRunner::new());
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let mut s = src();
         s.dependencies.enabled = false;
         let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
@@ -12495,7 +12509,7 @@ mod tests {
         let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"YT-40","resolved":123}]}]}"#;
         let runner =
             Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
         // Seed a stale (expired) blocked row to prove it is cleared on the met path.
         state::dependency_gate_upsert(
@@ -12533,7 +12547,7 @@ mod tests {
         let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"YT-40","resolved":123}]}]}"#;
         let runner =
             Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
         // Seed a still-open backoff window (blocked_until in the future).
         state::dependency_gate_upsert(
@@ -12580,7 +12594,7 @@ mod tests {
         let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"YT-40","summary":"x"}]}]}"#;
         let runner =
             Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect));
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
         let seeded_until = state::now_epoch_ms() + 60_000;
         state::dependency_gate_upsert(&pool, "act", "MK-16", seeded_until, "YT-40 (depends on)")
@@ -12635,7 +12649,7 @@ mod tests {
     async fn dependency_gate_scheduler_replays_cached_signature_no_read() {
         let pool = mem_pool().await;
         let runner = Arc::new(StubRunner::new());
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
         state::dependency_gate_upsert(
             &pool,
@@ -12715,7 +12729,7 @@ mod tests {
                     workable_inspect,
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
 
         let jobs = vec![mk_job("TOOL-34"), mk_job("TOOL-33")];
@@ -12786,7 +12800,7 @@ mod tests {
                     r#"{"links":[]}"#,
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
 
         let jobs = vec![mk_job("TOOL-34"), mk_job("TOOL-33")];
@@ -14113,7 +14127,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -14248,7 +14262,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -14387,7 +14401,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -14544,7 +14558,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize(
             &backend,
             &backend,
@@ -14684,7 +14698,7 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = std::cell::RefCell::new(None);
         let logs = capture_logs(|| {
             *res.borrow_mut() = Some(finalize(
