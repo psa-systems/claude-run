@@ -745,6 +745,8 @@ pub async fn reconcile_restart_inflight(
                         crate::run_footer::resolved_public_url().as_deref(),
                         None,
                         None,
+                        "youtrack",
+                        None,
                     );
                     if let Err(e) = backend.comment(&key, &comment) {
                         warn!(action = %action_name, key = %key, error = %e, "restart reconcile: re-queue comment failed (field was already set to Queued)");
@@ -1166,6 +1168,15 @@ async fn process_job(
     let action = &loaded.action;
     let key = &job.key;
     let attempts = state::attempts_get(pool, &action.name, key).await?;
+    // CLAUDE-556: a scheduler pickup is the AI Agent = Queued pickup; any
+    // other origin (`bypass_backoff`) is an operator-initiated run.
+    let trigger = if bypass_backoff {
+        crate::run_footer::Trigger::Manual {
+            by: "operator command".to_string(),
+        }
+    } else {
+        crate::run_footer::Trigger::AiAgentPickup
+    };
 
     // YouTrack jobs always carry a stable key (idReadable), so the attempt cap
     // always applies.
@@ -1191,6 +1202,7 @@ async fn process_job(
             limits.max_attempts_per_key,
             run_id,
             started_wall,
+            &trigger,
         );
         return Ok(ProcessedJob::CapHit { key: key.clone() });
     }
@@ -1559,6 +1571,8 @@ async fn process_job(
                     run_id,
                     attempt: attempts + 1,
                     started: started_wall,
+                    source: "youtrack",
+                    trigger: Some(&trigger),
                 }),
             );
         });
@@ -1585,6 +1599,8 @@ async fn process_job(
                     run_id,
                     attempt: attempts + 1,
                     started: started_wall,
+                    source: "youtrack",
+                    trigger: Some(&trigger),
                 }),
             );
         });
@@ -1672,6 +1688,8 @@ async fn process_job(
                 run_id,
                 attempt: attempts + 1,
                 started: started_wall,
+                source: "youtrack",
+                trigger: Some(&trigger),
             },
             checkpoint_rejected.as_deref(),
             review.as_ref(),
@@ -1717,6 +1735,8 @@ async fn process_job(
                     run_id,
                     attempt: attempts + 1,
                     started: started_wall,
+                    source: "youtrack",
+                    trigger: Some(&trigger),
                 },
             )
             .await;
@@ -1737,6 +1757,8 @@ async fn process_job(
                     run_id,
                     attempt: attempts + 1,
                     started: started_wall,
+                    source: "youtrack",
+                    trigger: Some(&trigger),
                 },
             )
             .await;
@@ -2001,7 +2023,7 @@ async fn record_new_pr(
     pr_number: u64,
     head_branch: &str,
     salvaged: bool,
-    run: crate::run_footer::CommentRun,
+    run: crate::run_footer::CommentRun<'_>,
 ) {
     use crate::ci_failure::store;
     let host = host_only(&job.repo_host);
@@ -2056,7 +2078,7 @@ async fn clear_salvaged_for_resume(
     action_name: &str,
     job: &YoutrackJob,
     pr_id: i64,
-    run: crate::run_footer::CommentRun,
+    run: crate::run_footer::CommentRun<'_>,
 ) {
     use crate::ci_failure::store;
     let now = state::now_iso();
@@ -2355,6 +2377,8 @@ async fn dependency_gate(
             &blocked_comment(&blockers),
             crate::run_footer::resolved_public_url().as_deref(),
             run_id,
+            None,
+            "youtrack",
             None,
         );
         if let Err(e) = backend.comment(key, &body) {
@@ -3293,7 +3317,7 @@ fn final_push_failed(
     claude_result: &ClaudeResult,
     err: &Error,
     public_url: Option<&str>,
-    run: crate::run_footer::CommentRun,
+    run: crate::run_footer::CommentRun<'_>,
 ) -> Result<Finalized> {
     let body = [
         "**The final push failed (SPEC-3.3.1).**".to_string(),
@@ -3331,7 +3355,7 @@ fn finish_delivery_blocked(
     pr: Option<&PullRequest>,
     pr_url_override: Option<&str>,
     public_url: Option<&str>,
-    run: crate::run_footer::CommentRun,
+    run: crate::run_footer::CommentRun<'_>,
 ) -> Result<Finalized> {
     let pr_url: Option<String> = pr_url_override
         .map(str::to_string)
@@ -3378,7 +3402,7 @@ fn finalize(
     // both to decide whether a re-queue resumes a real PR instead of parking
     // at a terminal Failed, and to say so truthfully in the failure comment.
     resume_pr_url: Option<&str>,
-    run: crate::run_footer::CommentRun,
+    run: crate::run_footer::CommentRun<'_>,
     // CLAUDE-448: the reason the periodic checkpoint-push watcher stopped
     // checkpointing partway through this run (a rejected push), if any. Never
     // fails the job; named in whichever outcome comment this call produces so
@@ -4057,6 +4081,8 @@ pub(crate) fn complete_automerge(
         crate::run_footer::resolved_public_url().as_deref(),
         run_id,
         None,
+        "youtrack",
+        None,
     );
     if let Err(e) = backend.comment(issue_key, &body) {
         error!(key = %issue_key, error = %e, "post-automerge comment failed");
@@ -4258,6 +4284,7 @@ fn report_cap_reached(
     cap: u32,
     run_id: i64,
     started: chrono::DateTime<chrono::Utc>,
+    trigger: &crate::run_footer::Trigger,
 ) {
     let body = cap_reached_comment(attempts, cap);
     let body = crate::run_footer::append_run(
@@ -4265,6 +4292,8 @@ fn report_cap_reached(
         crate::run_footer::resolved_public_url().as_deref(),
         Some(run_id),
         Some(started),
+        "youtrack",
+        Some(trigger),
     );
     if let Err(e) = backend.comment(key, &body) {
         error!(action = %action, key = %key, error = %e, "attempt-cap comment failed");
@@ -4344,6 +4373,8 @@ fn requeue_off_working(
             body,
             crate::run_footer::resolved_public_url().as_deref(),
             None,
+            None,
+            "youtrack",
             None,
         ),
     };
@@ -6334,13 +6365,15 @@ mod tests {
         );
     }
 
-    fn test_comment_run() -> crate::run_footer::CommentRun {
+    fn test_comment_run() -> crate::run_footer::CommentRun<'static> {
         crate::run_footer::CommentRun {
             run_id: 1,
             attempt: 1,
             started: chrono::DateTime::parse_from_rfc3339("2026-10-12T18:41:03Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
+            source: "youtrack",
+            trigger: None,
         }
     }
 

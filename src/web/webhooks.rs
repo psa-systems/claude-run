@@ -1835,6 +1835,8 @@ async fn attach_to_open_failure(
         crate::run_footer::resolved_public_url().as_deref(),
         run_id,
         None,
+        "ci-failure-webhook",
+        Some(&ci_failure_trigger(ev.index_in_repo)),
     );
     let key_for_comment = key.clone();
     let result =
@@ -1931,6 +1933,8 @@ async fn reopen_resolved_failure(
                 public_url.as_deref(),
                 run_id,
                 None,
+                "ci-failure-webhook",
+                Some(&ci_failure_trigger(event.index_in_repo)),
             );
             backend.comment(&key2, &regression_body)?;
             let has_open_pr = resolve_has_open_pr(forge.as_ref(), &event);
@@ -1958,6 +1962,8 @@ async fn reopen_resolved_failure(
                 public_url.as_deref(),
                 run_id,
                 None,
+                "ci-failure-webhook",
+                Some(&ci_failure_trigger(event.index_in_repo)),
             );
             backend.comment(&key2, &analysis)?;
             if mint::queues_for_fix(verdict.bucket) && auto_fix_enabled {
@@ -2438,6 +2444,8 @@ async fn route_agent_pr_failure(
             crate::run_footer::resolved_public_url().as_deref(),
             webhook_run_id,
             None,
+            "ci-failure-webhook",
+            Some(&ci_failure_trigger(ev.index_in_repo)),
         );
         let backend = ctx.backend.clone();
         let mint_cfg = ctx.mint_cfg.read().await.clone();
@@ -2512,6 +2520,8 @@ async fn route_agent_pr_failure(
                 crate::run_footer::resolved_public_url().as_deref(),
                 webhook_run_id,
                 None,
+                "ci-failure-webhook",
+                Some(&ci_failure_trigger(event.index_in_repo)),
             );
             backend.comment(&key, &body)?;
             backend.set_field(&key, &mint_cfg.ai_agent_field, &mint_cfg.queued_value)?;
@@ -2570,6 +2580,8 @@ async fn route_agent_pr_failure(
             crate::run_footer::resolved_public_url().as_deref(),
             webhook_run_id,
             None,
+            "ci-failure-webhook",
+            Some(&ci_failure_trigger(ev.index_in_repo)),
         );
         let backend = ctx.backend.clone();
         let mint_cfg = ctx.mint_cfg.read().await.clone();
@@ -5264,6 +5276,13 @@ async fn list_open_pr_numbers(
     None
 }
 
+/// CLAUDE-556: the footer trigger for a comment a CI-failure webhook run posts.
+fn ci_failure_trigger(index_in_repo: i64) -> crate::run_footer::Trigger {
+    crate::run_footer::Trigger::WebhookEvent {
+        source: format!("CI failure run #{index_in_repo}"),
+    }
+}
+
 /// SPEC-4.4.3: posts an issue comment through the resolved forge backend, as part of an automerge or routing decision.
 /// Post a best-effort issue comment on an automerge decision path. A
 /// failed comment (write error, or the blocking task itself panicking) logs at
@@ -5284,6 +5303,8 @@ async fn post_issue_comment(
         &body,
         crate::run_footer::resolved_public_url().as_deref(),
         None,
+        None,
+        "automerge-reconciler",
         None,
     );
     match tokio::task::spawn_blocking(move || backend.comment(&key, &body)).await {
