@@ -35,6 +35,7 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 - Web: `web/mod.rs` (axum + askama templates from `templates/`, compiled into the binary) mounts `api::router` under `/api` plus the two webhook listeners. `settings.rs` owns DB-backed runtime config; `config.rs` holds the serde schema and bootstrap file.
 - DB: `db.rs` holds the pool and two embedded migrators, `migrations/sqlite/` and `migrations/postgres/`. Every schema change needs a matching migration in BOTH directories. Queries are runtime `sqlx::query` (no compile-time macros, no offline `.sqlx` data).
 - Shipped actions in `actions/*.yml` are `include_str!`'d by tests in `action.rs`, so editing one can break a unit test.
+- `finalize` is a ~700-line state machine; the overview with every branch and terminal state is [docs/finalize-flow.md](docs/finalize-flow.md). Open that first before adding or removing a `Finalized` variant.
 
 ## Conventions
 
