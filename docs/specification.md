@@ -1529,7 +1529,9 @@ non-durable PostgreSQL container in the Docker-in-Docker sidecar, runs `<command
 `CLAUDE_RUN_TEST_DATABASE_URL` and `CLAUDE_RUN_TEST_POSTGRES_CONTAINER` set, and tears the container down however
 the command ends (normal exit, command failure, `SIGINT`/`SIGTERM`, or a setup error), propagating the command's
 exit code (128 + signal if it was killed by one) and failing the run if teardown itself fails even when the command
-succeeded. It sweeps orphaned containers from earlier runs whose owning pid is no longer alive first, starts the
+succeeded. It sweeps orphaned containers from earlier runs first: one labelled with this process's own pid namespace
+is an orphan when its owning pid is dead; any other (another CI job's container on the same Docker daemon, or one
+from before the namespace label) only when older than 6 hours, since its pid means nothing here (CLAUDE-573). It starts the
 container with a loopback-only ephemeral published port (or, with the optional `--network`, on that Docker network
 with nothing published, reached by container name on port 5432, for a caller that is itself a container on that
 network), `--rm`, no volume (the writable layer and data directory are both discarded on teardown) and a raised

@@ -29,6 +29,13 @@ use crate::error::{Error, Result};
 pub const DEFAULT_IMAGE: &str = "docker.io/postgres:18.4-alpine3.23";
 /// SPEC-6.6.
 pub const LABEL_KEY: &str = "claude-run.test-postgres";
+/// SPEC-6.6, CLAUDE-573: the owning process's pid namespace. A pid means
+/// something only inside its own namespace, and every CI job is a container
+/// with its own, on one shared Docker daemon.
+pub const LABEL_PIDNS_KEY: &str = "claude-run.test-postgres.pidns";
+/// A container not from this pid namespace is swept only once older than
+/// this, far past the CI job limit, so a killed job's leftovers still go.
+const FOREIGN_MAX_AGE_SECS: i64 = 6 * 60 * 60;
 
 const PG_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -164,6 +171,8 @@ pub fn docker_run_args(
         name.into(),
         "--label".into(),
         format!("{LABEL_KEY}={pid}"),
+        "--label".into(),
+        format!("{LABEL_PIDNS_KEY}={}", own_pid_namespace()),
         reach_flag.into(),
         reach_value,
         "--shm-size".into(),
@@ -201,19 +210,62 @@ fn random_hex(bytes: usize) -> Result<String> {
     Ok(hex::encode(buf))
 }
 
-/// Parse one `docker ps --filter label=claude-run.test-postgres --format
-/// {{.Names}}\t{{.Label "claude-run.test-postgres"}}` line into (name, pid).
-/// A line whose label value is not a plain integer is skipped rather than
-/// failing the whole sweep: a hand-run container sharing the label prefix by
-/// coincidence should not abort cleanup of the ones we understand. SPEC-6.6.
-pub fn parse_ps_line(line: &str) -> Option<(String, u32)> {
-    let (name, pid) = line.split_once('\t')?;
-    let pid: u32 = pid.trim().parse().ok()?;
-    Some((name.trim().to_string(), pid))
+/// This process's pid namespace, as `/proc/self/ns/pid` names it
+/// (`pid:[4026531836]`); empty where it cannot be read. SPEC-6.6.
+pub fn own_pid_namespace() -> String {
+    std::fs::read_link("/proc/self/ns/pid")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// One labelled container as `docker ps` lists it. SPEC-6.6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PsEntry {
+    pub name: String,
+    /// The owning pid, when the label is a plain integer.
+    pub pid: Option<u32>,
+    /// The owner's pid namespace; empty on a container that predates the
+    /// label.
+    pub pidns: String,
+    /// Creation time, Unix seconds, when docker's `CreatedAt` parses.
+    pub created: Option<i64>,
+}
+
+/// The `docker ps --format` that [`parse_ps_line`] reads.
+fn ps_format() -> String {
+    format!(
+        "{{{{.Names}}}}\t{{{{.Label \"{LABEL_KEY}\"}}}}\t{{{{.Label \"{LABEL_PIDNS_KEY}\"}}}}\t{{{{.CreatedAt}}}}"
+    )
+}
+
+/// Parse one `docker ps` line in [`ps_format`]: name, pid label, pid
+/// namespace label, `CreatedAt` (`2026-11-05 17:09:05 +0000 UTC`). SPEC-6.6.
+pub fn parse_ps_line(line: &str) -> Option<PsEntry> {
+    let mut parts = line.split('\t');
+    let name = parts.next()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let pid = parts.next().and_then(|p| p.trim().parse().ok());
+    let pidns = parts.next().unwrap_or("").trim().to_string();
+    let created = parts.next().and_then(|c| {
+        // Drop the trailing zone name, which chrono cannot parse.
+        let c = c.trim();
+        let c = c.rsplit_once(' ').map_or(c, |(head, _)| head);
+        chrono::DateTime::parse_from_str(c, "%Y-%m-%d %H:%M:%S %z")
+            .ok()
+            .map(|t| t.timestamp())
+    });
+    Some(PsEntry {
+        name: name.to_string(),
+        pid,
+        pidns,
+        created,
+    })
 }
 
 /// SPEC-6.6.
-pub fn parse_ps_output(output: &str) -> Vec<(String, u32)> {
+pub fn parse_ps_output(output: &str) -> Vec<PsEntry> {
     output.lines().filter_map(parse_ps_line).collect()
 }
 
@@ -228,17 +280,32 @@ fn pid_is_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-/// Stop every labelled container whose owning pid is no longer alive, and
-/// return the names stopped (for the "one line per container stopped"
-/// requirement; the caller prints them). SPEC-6.6.
+/// SPEC-6.6, CLAUDE-573: whether `entry` is an orphan this run may stop. A
+/// container from this pid namespace is one when its owning pid is dead. Any
+/// other one, from another namespace (another CI job's container on the same
+/// Docker daemon) or from before the namespace label, is judged by age alone:
+/// its pid means nothing here, and stopping it would kill another live run.
+pub fn is_orphan(entry: &PsEntry, own_pidns: &str, now: i64, alive: impl Fn(u32) -> bool) -> bool {
+    if !own_pidns.is_empty() && entry.pidns == own_pidns {
+        return entry.pid.is_some_and(|pid| !alive(pid));
+    }
+    entry
+        .created
+        .is_some_and(|created| now - created > FOREIGN_MAX_AGE_SECS)
+}
+
+/// Stop every labelled container that [`is_orphan`] says is one, and return
+/// the names stopped (for the "one line per container stopped" requirement;
+/// the caller prints them). SPEC-6.6.
 pub fn sweep_orphans() -> Result<Vec<String>> {
+    let format = ps_format();
     let out = docker(
         &[
             "ps",
             "--filter",
             &format!("label={LABEL_KEY}"),
             "--format",
-            &format!("{{{{.Names}}}}\t{{{{.Label \"{LABEL_KEY}\"}}}}"),
+            &format,
         ],
         &[],
     )?;
@@ -250,12 +317,13 @@ pub fn sweep_orphans() -> Result<Vec<String>> {
             &[],
         ));
     }
-    let listed = parse_ps_output(&String::from_utf8_lossy(&out.stdout));
+    let own = own_pid_namespace();
+    let now = chrono::Utc::now().timestamp();
     let mut stopped = Vec::new();
-    for (name, pid) in listed {
-        if !pid_is_alive(pid) {
-            stop_container(&name)?;
-            stopped.push(name);
+    for entry in parse_ps_output(&String::from_utf8_lossy(&out.stdout)) {
+        if is_orphan(&entry, &own, now, pid_is_alive) {
+            stop_container(&entry.name)?;
+            stopped.push(entry.name);
         }
     }
     Ok(stopped)
@@ -631,6 +699,8 @@ mod tests {
                 "claude-run-test-postgres-123-abcd",
                 "--label",
                 "claude-run.test-postgres=123",
+                "--label",
+                &format!("claude-run.test-postgres.pidns={}", own_pid_namespace()),
                 "--publish",
                 "127.0.0.1::5432",
                 "--shm-size",
@@ -713,23 +783,88 @@ mod tests {
     }
 
     #[test]
-    fn parse_ps_output_reads_name_and_pid_pairs() {
-        let out = "claude-run-test-postgres-10-aaaa\t10\nclaude-run-test-postgres-20-bbbb\t20\n";
+    fn parse_ps_output_reads_name_pid_namespace_and_age() {
+        let out = "claude-run-test-postgres-10-aaaa\t10\tpid:[4026531836]\t2026-11-05 17:09:05 +0000 UTC\n\
+                   legacy\t20\t\t2026-11-05 17:09:05 +0000 UTC\n\
+                   odd\tnot-a-pid\t\tnonsense\n";
+        let created = chrono::DateTime::parse_from_rfc3339("2026-11-05T17:09:05Z")
+            .unwrap()
+            .timestamp();
         assert_eq!(
             parse_ps_output(out),
             vec![
-                ("claude-run-test-postgres-10-aaaa".to_string(), 10),
-                ("claude-run-test-postgres-20-bbbb".to_string(), 20),
+                PsEntry {
+                    name: "claude-run-test-postgres-10-aaaa".into(),
+                    pid: Some(10),
+                    pidns: "pid:[4026531836]".into(),
+                    created: Some(created),
+                },
+                PsEntry {
+                    name: "legacy".into(),
+                    pid: Some(20),
+                    pidns: String::new(),
+                    created: Some(created),
+                },
+                PsEntry {
+                    name: "odd".into(),
+                    pid: None,
+                    pidns: String::new(),
+                    created: None,
+                },
             ]
         );
     }
 
+    /// CLAUDE-573: run #867 stopped run #863's live Postgres because its pid
+    /// was dead in #867's namespace. Only this namespace's containers are
+    /// judged by pid; any other only by age.
     #[test]
-    fn parse_ps_output_skips_a_non_numeric_label() {
-        let out = "some-other-container\tnot-a-pid\nclaude-run-test-postgres-20-bbbb\t20\n";
-        assert_eq!(
-            parse_ps_output(out),
-            vec![("claude-run-test-postgres-20-bbbb".to_string(), 20)]
+    fn only_this_namespaces_containers_are_judged_by_pid() {
+        let now = 1_000_000;
+        let entry = |pidns: &str, pid: Option<u32>, age: i64| PsEntry {
+            name: "c".into(),
+            pid,
+            pidns: pidns.into(),
+            created: Some(now - age),
+        };
+        let dead = |_| false;
+        let alive = |_| true;
+        let own = "pid:[1]";
+        assert!(
+            is_orphan(&entry(own, Some(5), 60), own, now, dead),
+            "ours, dead pid"
+        );
+        assert!(
+            !is_orphan(&entry(own, Some(5), 60), own, now, alive),
+            "ours, live pid"
+        );
+        assert!(
+            !is_orphan(&entry("pid:[2]", Some(5), 60), own, now, dead),
+            "another job's, however its pid looks here"
+        );
+        assert!(
+            !is_orphan(&entry("", Some(5), 60), own, now, dead),
+            "legacy, recent"
+        );
+        assert!(
+            is_orphan(&entry("pid:[2]", Some(5), 7 * 3600), own, now, alive),
+            "another job's, past six hours"
+        );
+        assert!(
+            is_orphan(&entry("", None, 7 * 3600), own, now, alive),
+            "legacy, past six hours"
+        );
+        let unknown_age = PsEntry {
+            created: None,
+            ..entry("pid:[2]", Some(5), 0)
+        };
+        assert!(
+            !is_orphan(&unknown_age, own, now, dead),
+            "no age, never swept"
+        );
+        assert!(
+            !is_orphan(&entry("", Some(5), 60), "", now, dead),
+            "an unreadable own namespace matches nothing"
         );
     }
 
@@ -1001,7 +1136,7 @@ exit 0
             let script = format!(
                 r#"#!/bin/sh
 case "$1" in
-  ps) printf 'live-container\t{alive}\ndead-container\t{dead}\n' ;;
+  ps) printf 'live-container\t{alive}\t{ns}\t{created}\ndead-container\t{dead}\t{ns}\t{created}\nother-job\t{dead}\tpid:[1]\t{created}\n' ;;
   stop) echo "$2" >> "{log}" ;;
   *) : ;;
 esac
@@ -1009,6 +1144,8 @@ exit 0
 "#,
                 alive = alive_pid,
                 dead = dead_pid,
+                ns = own_pid_namespace(),
+                created = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S +0000 UTC"),
                 log = stop_log.display()
             );
             write_stub(&dir.path().join("docker"), &script);
