@@ -14,6 +14,7 @@
 //! died, since containers started by hand are not reliably removed.
 
 use std::io::Write as _;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -31,12 +32,19 @@ pub const LABEL_KEY: &str = "claude-run.test-postgres";
 
 const PG_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long the URL handed to the command may stay unreachable from this
+/// process after `psql` inside the container already answers. SPEC-6.6.
+const REACH_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// `--image` / `--init-sql` options for a `test-postgres` invocation. SPEC-6.6.
+/// `--image` / `--init-sql` / `--network` options for a `test-postgres`
+/// invocation. SPEC-6.6.
 #[derive(Debug, Clone, Default)]
 pub struct Opts {
     pub image: Option<String>,
     pub init_sql: Vec<PathBuf>,
+    /// Join this Docker network instead of publishing a loopback port, for a
+    /// caller that is itself a container on that network (CI, CLAUDE-541).
+    pub network: Option<String>,
 }
 
 impl Opts {
@@ -134,8 +142,20 @@ fn fail(stage: impl Into<String>, message: impl Into<String>) -> Error {
 /// Exact `docker run` arguments for the container. Pure and unit-testable
 /// without a docker binary; `password` is accepted as an owned string so a
 /// test can pick a non-secret value and assert the exact argument list.
-/// SPEC-6.6.
-pub fn docker_run_args(name: &str, pid: u32, image: &str, password: &str) -> Vec<String> {
+/// With `network`, the container joins that network and nothing is
+/// published; without it, port 5432 is published on the Docker host's
+/// loopback. SPEC-6.6.
+pub fn docker_run_args(
+    name: &str,
+    pid: u32,
+    image: &str,
+    password: &str,
+    network: Option<&str>,
+) -> Vec<String> {
+    let (reach_flag, reach_value) = match network {
+        Some(net) => ("--network", net.to_string()),
+        None => ("--publish", "127.0.0.1::5432".to_string()),
+    };
     vec![
         "run".into(),
         "--detach".into(),
@@ -144,8 +164,8 @@ pub fn docker_run_args(name: &str, pid: u32, image: &str, password: &str) -> Vec
         name.into(),
         "--label".into(),
         format!("{LABEL_KEY}={pid}"),
-        "--publish".into(),
-        "127.0.0.1::5432".into(),
+        reach_flag.into(),
+        reach_value,
         "--shm-size".into(),
         "256m".into(),
         "--memory".into(),
@@ -157,6 +177,13 @@ pub fn docker_run_args(name: &str, pid: u32, image: &str, password: &str) -> Vec
         "-e".into(),
         format!("POSTGRES_PASSWORD={password}"),
         image.into(),
+        // CLAUDE-540: the Postgres test leg runs many fixtures in parallel,
+        // each with its own small pool, plus the clone/cleanup connections;
+        // 100 (the default) is too few once that parallelism is raised. A
+        // throwaway server can afford the headroom. Server flags follow the
+        // image name, which the official entrypoint forwards to `postgres`.
+        "-c".into(),
+        "max_connections=200".into(),
     ]
 }
 
@@ -302,6 +329,42 @@ fn wait_pg_ready(name: &str) -> Result<()> {
             return Err(fail(
                 "pg ready",
                 format!("postgres did not become ready within {PG_READY_TIMEOUT:?}: {logs}"),
+            ));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Open a TCP connection to `host:port` from this process, the way the
+/// command will. `psql` inside the container answering says nothing about
+/// whether the command can reach the server: when this process runs in a
+/// container of its own (a CI job), the loopback a published port sits on is
+/// the Docker host's, not ours (CLAUDE-541). Failing here, within seconds and
+/// with the cause named, beats every test timing out on its pool. SPEC-6.6.
+fn wait_reachable(host: &str, port: u16) -> Result<()> {
+    let deadline = Instant::now() + REACH_TIMEOUT;
+    let mut last_err = String::from("no address resolved");
+    loop {
+        if let Some(sig) = caught_signal() {
+            return Err(fail("reachable", format!("interrupted by signal {sig}")));
+        }
+        match (host, port).to_socket_addrs() {
+            Ok(addrs) => {
+                for addr in addrs {
+                    match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                        Ok(_) => return Ok(()),
+                        Err(e) => last_err = format!("{addr}: {e}"),
+                    }
+                }
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+        if Instant::now() >= deadline {
+            return Err(fail(
+                "reachable",
+                format!(
+                    "postgres answers inside its container but {host}:{port} is not reachable from here within {REACH_TIMEOUT:?} ({last_err}); if this runs in a container, pass --network with that container's Docker network"
+                ),
             ));
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -499,7 +562,7 @@ pub fn run(opts: &Opts, command: &[String]) -> Result<i32> {
     let password = random_hex(16)?;
     let image = opts.image().to_string();
 
-    let run_args = docker_run_args(&name, pid, &image, &password);
+    let run_args = docker_run_args(&name, pid, &image, &password, opts.network.as_deref());
     let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
     let out = docker(&run_args_ref, &[&password])?;
     if !out.status.success() {
@@ -515,12 +578,18 @@ pub fn run(opts: &Opts, command: &[String]) -> Result<i32> {
     // happens next; `result` captures the outcome and teardown always runs
     // before we return it.
     let result = (|| -> Result<i32> {
-        let port = read_host_port(&name)?;
+        // On a shared network the container is reached by name on its own
+        // port; otherwise through the port published on the loopback.
+        let (host, port) = match opts.network {
+            Some(_) => (name.clone(), 5432),
+            None => ("127.0.0.1".to_string(), read_host_port(&name)?),
+        };
         wait_pg_ready(&name)?;
+        wait_reachable(&host, port)?;
         disable_durability(&name)?;
         apply_init_files(&name, &opts.init_sql)?;
 
-        let url = format!("postgres://postgres:{password}@127.0.0.1:{port}/postgres");
+        let url = format!("postgres://postgres:{password}@{host}:{port}/postgres");
         let child = spawn_command(command, &url, &name)?;
         wait_for_child(child)
     })();
@@ -550,6 +619,7 @@ mod tests {
             123,
             DEFAULT_IMAGE,
             "sekret",
+            None,
         );
         assert_eq!(
             args,
@@ -574,6 +644,8 @@ mod tests {
                 "-e",
                 "POSTGRES_PASSWORD=sekret",
                 DEFAULT_IMAGE,
+                "-c",
+                "max_connections=200",
             ]
         );
         assert!(!args
@@ -583,8 +655,53 @@ mod tests {
 
     #[test]
     fn docker_run_args_honor_image_override() {
-        let args = docker_run_args("n", 1, "postgres:18.2-alpine3.23", "x");
-        assert_eq!(args.last().unwrap(), "postgres:18.2-alpine3.23");
+        let args = docker_run_args("n", 1, "postgres:18.2-alpine3.23", "x", None);
+        let image_at = args
+            .iter()
+            .position(|a| a == "postgres:18.2-alpine3.23")
+            .expect("the image override appears in the args");
+        // Server flags follow the image name, so the image is no longer last.
+        assert_eq!(&args[image_at + 1..], &["-c", "max_connections=200"]);
+    }
+
+    #[test]
+    fn docker_run_args_join_a_network_instead_of_publishing() {
+        let args = docker_run_args("n", 1, DEFAULT_IMAGE, "x", Some("WORKFLOW-abc"));
+        let at = args.iter().position(|a| a == "--network").unwrap();
+        assert_eq!(args[at + 1], "WORKFLOW-abc");
+        assert!(!args.iter().any(|a| a == "--publish"));
+    }
+
+    #[test]
+    fn wait_reachable_names_the_cause_and_the_fix() {
+        // Bind then drop: nothing listens on that port any more.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let start = Instant::now();
+        let err = wait_reachable("127.0.0.1", port).unwrap_err().to_string();
+        assert!(start.elapsed() < REACH_TIMEOUT + Duration::from_secs(5));
+        assert!(err.contains("not reachable from here"), "{err}");
+        assert!(err.contains("--network"), "{err}");
+    }
+
+    #[test]
+    fn wait_reachable_accepts_a_listening_port() {
+        wait_reachable("127.0.0.1", stub_pg_port()).unwrap();
+    }
+
+    /// A port that accepts connections for the whole test run, so the stubbed
+    /// `docker port` answer passes `wait_reachable`. The listener is never
+    /// accepted from; the kernel completes the handshake from its backlog.
+    fn stub_pg_port() -> u16 {
+        static LISTENER: std::sync::OnceLock<std::net::TcpListener> = std::sync::OnceLock::new();
+        LISTENER
+            .get_or_init(|| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .local_addr()
+            .unwrap()
+            .port()
     }
 
     #[test]
@@ -645,7 +762,7 @@ mod tests {
 echo "$@" >> "{log}"
 case "$1" in
   run) echo "stubcontainer" ;;
-  port) echo "127.0.0.1:55432" ;;
+  port) echo "127.0.0.1:{pg_port}" ;;
   exec)
     shift
     if [ "$1" = "-i" ]; then shift; fi
@@ -662,7 +779,8 @@ case "$1" in
 esac
 exit 0
 "#,
-            log = log_path.display()
+            log = log_path.display(),
+            pg_port = stub_pg_port()
         );
         write_stub(&dir.join("docker"), &script);
     }
@@ -737,7 +855,7 @@ exit 0
                 r#"#!/bin/sh
 case "$1" in
   run) echo "stubcontainer" ;;
-  port) echo "127.0.0.1:55432" ;;
+  port) echo "127.0.0.1:{pg_port}" ;;
   exec)
     body=$(cat)
     echo "$body" >> "{log}"
@@ -752,7 +870,8 @@ case "$1" in
 esac
 exit 0
 "#,
-                log = log_path.display()
+                log = log_path.display(),
+                pg_port = stub_pg_port()
             );
             write_stub(&dir.path().join("docker"), &script);
             let old_path = std::env::var("PATH").unwrap_or_default();
@@ -768,6 +887,7 @@ exit 0
             let opts = Opts {
                 image: None,
                 init_sql: vec![a, b],
+                network: None,
             };
             let code = run(&opts, &["true".into()]).unwrap();
             assert_eq!(code, 0);
@@ -801,14 +921,15 @@ exit 0
                 r#"#!/bin/sh
 case "$1" in
   run) echo "stubcontainer" ;;
-  port) echo "127.0.0.1:55432" ;;
+  port) echo "127.0.0.1:{pg_port}" ;;
   exec) cat > /dev/null; case "$*" in *"SHOW fsync"*) echo off ;; esac ;;
   stop) echo "$2" >> "{log}" ;;
   *) : ;;
 esac
 exit 0
 "#,
-                log = stop_log.display()
+                log = stop_log.display(),
+                pg_port = stub_pg_port()
             );
             write_stub(&dir.path().join("docker"), &script);
             let old_path = std::env::var("PATH").unwrap_or_default();

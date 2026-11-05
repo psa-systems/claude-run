@@ -1,0 +1,38 @@
+# CLAUDE-540: the test files that touch a DB pool.
+#
+# The Postgres CI leg (.forgejo/workflows/check.yml, "Unit tests (PostgreSQL)")
+# re-runs only the tests matched here, so pure-logic tests - which execute no
+# SQL and would do identical work on both backends - are not re-run on
+# Postgres. The SQLite leg still runs the whole suite. This preserves the
+# SPEC-5.6 both-backends guarantee: every test that runs SQL does so on both
+# backends, because SQL only ever runs through a DB pool and only these files
+# build one in a test.
+#
+# A guard test (db::tests::every_db_touching_file_is_in_the_postgres_test_filter)
+# fails if a source file gains a DB test not covered here, or if a line here
+# matches no DB-touching module, so this list cannot silently drift from the
+# code.
+#
+# Each line is a `cargo test` name filter: a substring of a test's full module
+# path, so a trailing `::` pins it to that module and its children.
+api::
+auth::
+ci_failure::store::
+concurrency::
+daemon::
+db::
+import::
+mcp::
+mcp_http::
+native::youtrack::
+pause::
+report::
+retention::
+secrets::
+service_auth::
+settings::
+state::
+triage::
+usage::
+web::
+web_admin::

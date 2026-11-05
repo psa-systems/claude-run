@@ -1558,10 +1558,18 @@ fn last_assistant_text(stream_log: &Path) -> std::io::Result<Option<String>> {
     Ok(None)
 }
 
+/// Wrap `body` in a `<details>` block with `summary` as the clickable heading.
+/// YouTrack and Forgejo both render Markdown + the HTML `<details>` element,
+/// so a long detail block collapses out of a reviewer's scroll by default.
+/// Leading blank line included so callers can append it to an existing body.
+pub fn collapsed_details(summary: &str, body: &str) -> String {
+    format!("\n\n<details>\n<summary>{summary}</summary>\n\n{body}\n\n</details>")
+}
+
 /// Render the final result event as a collapsed, pretty-printed JSON
-/// block for failure comments (YouTrack and Forgejo both render Markdown + the
-/// `<details>` HTML element). Returns an empty string for synthesized results
-/// (`Value::Null` or an empty object) so callers can append it unconditionally.
+/// block for failure comments. Returns an empty string for synthesized
+/// results (`Value::Null` or an empty object) so callers can append it
+/// unconditionally.
 ///
 /// SPEC-3.2.5: renders the `raw` terminal event a classified outcome carries,
 /// empty for the synthesized results `login_required_result` and friends
@@ -1575,9 +1583,7 @@ pub fn raw_event_details(raw: &Value) -> String {
     let Ok(pretty) = serde_json::to_string_pretty(raw) else {
         return String::new();
     };
-    format!(
-        "\n\n<details>\n<summary>Raw result event</summary>\n\n```json\n{pretty}\n```\n\n</details>"
-    )
+    collapsed_details("Raw result event", &format!("```json\n{pretty}\n```"))
 }
 
 #[cfg(test)]
@@ -1728,7 +1734,11 @@ mod tests {
                 &cfg,
                 // A budget the orphaned watchdog would have blocked for if it
                 // survived being killed; the assertion below is well under it.
-                Duration::from_secs(10),
+                // The budget and threshold are generous (and far apart) so a
+                // scheduler-starved CI host cannot push a genuinely prompt exit
+                // past the threshold while the orphan bug would still block for
+                // the full budget (CLAUDE-542, SPEC-10.1.4 slow-IO class).
+                Duration::from_secs(60),
                 dir.path(),
                 &log,
                 &cancel,
@@ -1738,7 +1748,7 @@ mod tests {
             .unwrap();
         assert!(res.ok, "a clean immediate exit is ok");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(30),
             "invoke took {:?}, which means something still holds the stdout \
              pipe open past the stub's own exit",
             started.elapsed()
@@ -2158,7 +2168,11 @@ mod tests {
             .invoke(
                 "hi",
                 cfg,
-                Duration::from_secs(10),
+                // Generous budget: these tests assert on the captured argv, not
+                // on timing, so a scheduler-starved CI host must not let the
+                // stub hit the budget and report a timeout instead of success
+                // (CLAUDE-542, SPEC-10.1.4 slow-IO class).
+                Duration::from_secs(120),
                 dir,
                 &dir.join("stream.jsonl"),
                 &CancellationToken::new(),
