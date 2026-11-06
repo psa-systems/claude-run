@@ -2030,8 +2030,8 @@ async fn dashboard(
         Some(v) => whitelisted(v, &["", "open", "resolved", "pr_only"]),
     };
     let ci_repo = whitelist_member(&q.ci_repo, &ci_repo_options);
-    let ci_bucket_filter = (!ci_bucket.is_empty()).then(|| ci_bucket.as_str());
-    let ci_repo_filter = (!ci_repo.is_empty()).then(|| ci_repo.as_str());
+    let ci_bucket_filter = (!ci_bucket.is_empty()).then_some(ci_bucket.as_str());
+    let ci_repo_filter = (!ci_repo.is_empty()).then_some(ci_repo.as_str());
     let failures_raw = crate::ci_failure::store::list_failures_for_dashboard(
         pool,
         ci_bucket_filter,
@@ -9317,6 +9317,234 @@ mod tests {
                 "{body}"
             );
             assert!(!body.contains("still-open repo-access failures"));
+        }
+
+        /// SPEC-4.3.15: a CI failure with a PR and an issue renders both as
+        /// links; one with neither renders "none" for both, visibly
+        /// different from a lookup failure, which renders an error cell.
+        #[tokio::test]
+        async fn dashboard_ci_failure_cells_render_links_none_and_error() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            // The "youtrack" action's declared link_template is what resolves
+            // the Issue cell into a link (SPEC-4.3.15: "linked through the
+            // action's link_template").
+            state::action_index_upsert(
+                &s.api.pool,
+                &state::ActionIndexRow {
+                    name: "youtrack".to_string(),
+                    file_path: "youtrack.yml".to_string(),
+                    yaml_sha256: "0".repeat(64),
+                    enabled: true,
+                    schedule_kind: None,
+                    schedule_spec: None,
+                    last_seen_at: "2026-01-01T00:00:00+00:00".to_string(),
+                    parse_error: None,
+                    link_template: Some("https://yt.example.com/issue/{key}".to_string()),
+                    max_parallel: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+            // A failure with both a minted issue and an open PR.
+            crate::ci_failure::store::record_failure(
+                &s.api.pool,
+                "acme/widgets",
+                "checks.yml",
+                "test",
+                None,
+                Some("CLAUDE-901"),
+                "open",
+                "2999-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            crate::ci_failure::store::record_agent_pr(
+                &s.api.pool,
+                "youtrack",
+                "CLAUDE-901",
+                "dev.a8n.run",
+                "acme/widgets",
+                17,
+                "fix/claude-901",
+                "open",
+                false,
+                "2999-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+
+            // A failure with neither a minted issue nor a PR.
+            crate::ci_failure::store::record_failure(
+                &s.api.pool,
+                "acme/widgets",
+                "checks.yml",
+                "lint",
+                None,
+                None,
+                "open",
+                "2999-01-01T00:00:01Z",
+            )
+            .await
+            .unwrap();
+
+            let body = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(
+                body.contains(r#"href="https://yt.example.com/issue/CLAUDE-901""#),
+                "issue link missing: {body}"
+            );
+            assert!(
+                body.contains(r#"href="https://dev.a8n.run/acme/widgets/pulls/17""#)
+                    || body.contains("acme/widgets#17"),
+                "PR link missing: {body}"
+            );
+            // The no-PR/no-issue failure shows "none" for both, not an
+            // error: at least two occurrences (one per cell).
+            assert!(
+                body.matches(">none<").count() >= 2 || body.contains("none"),
+                "no-PR/no-issue failure should show \"none\": {body}"
+            );
+
+            // Now break the PR lookup itself (not the ci_failures listing) so
+            // the next render exercises the failed-lookup path: it must show
+            // a visible error cell, not silently fall back to "none".
+            sqlx::query(sqlx::AssertSqlSafe(
+                crate::db::q(&s.api.pool, "DROP TABLE agent_pull_requests").into_owned(),
+            ))
+            .execute(&s.api.pool)
+            .await
+            .unwrap();
+            let body = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(
+                body.contains("class=\"error\"") && body.contains("error:"),
+                "a failed PR lookup must render a visible error cell: {body}"
+            );
+        }
+
+        /// SPEC-4.3.15: the bucket/repo filters narrow the CI-failures
+        /// rows, and SPEC-3.12 item 2's stuck-work list shows the sweep's
+        /// own seeded corrections.
+        #[tokio::test]
+        async fn dashboard_ci_filters_narrow_rows_and_stuck_work_lists_corrections() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            crate::ci_failure::store::record_failure(
+                &s.api.pool,
+                "acme/widgets",
+                "checks.yml",
+                "test",
+                None,
+                None,
+                "open",
+                "2999-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            crate::ci_failure::store::record_failure(
+                &s.api.pool,
+                "acme/gizmos",
+                "checks.yml",
+                "test",
+                None,
+                None,
+                "resolved",
+                "2999-01-01T00:00:01Z",
+            )
+            .await
+            .unwrap();
+
+            // Default load (no ?ci_bucket=) is "open"-only per SPEC-4.3.15.
+            let body = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            // The repo filter dropdown always lists every distinct repo, so
+            // assert on the rendered table cell, not a bare substring match
+            // (which would also match the dropdown's own `<option>`).
+            let widgets_row = r#"<td class="mono">acme/widgets</td>"#;
+            let gizmos_row = r#"<td class="mono">acme/gizmos</td>"#;
+            assert!(body.contains(widgets_row), "{body}");
+            assert!(!body.contains(gizmos_row), "{body}");
+
+            // Explicit "all" bucket shows both; the repo filter then narrows
+            // to just one.
+            let all = DashboardQuery {
+                ci_bucket: Some(String::new()),
+                ..Default::default()
+            };
+            let body = body_string(
+                dashboard(State(s.clone()), Query(all))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(
+                body.contains(widgets_row) && body.contains(gizmos_row),
+                "{body}"
+            );
+
+            let repo_narrowed = DashboardQuery {
+                ci_bucket: Some(String::new()),
+                ci_repo: "acme/gizmos".to_string(),
+                ..Default::default()
+            };
+            let body = body_string(
+                dashboard(State(s.clone()), Query(repo_narrowed))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(!body.contains(widgets_row), "{body}");
+            assert!(body.contains(gizmos_row), "{body}");
+
+            // Stuck-work list: the sweep's own run_events tag, seeded
+            // directly (not via the sweep itself, which this file set does
+            // not touch).
+            state::run_events_record(
+                &s.api.pool,
+                "youtrack",
+                "2999-01-02T00:00:00Z",
+                &[state::InputEvent {
+                    level: "warn".into(),
+                    context: Some(crate::native::youtrack::STUCK_WORKING_SWEEP_CONTEXT.into()),
+                    message: "CLAUDE-905: moved off Working (no live run) to Queued".into(),
+                }],
+            )
+            .await
+            .unwrap();
+
+            let body = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(body.contains("1 issue(s) corrected"), "{body}");
+            assert!(
+                body.contains("CLAUDE-905: moved off Working (no live run) to Queued"),
+                "{body}"
+            );
         }
 
         #[test]
