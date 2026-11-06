@@ -2630,6 +2630,13 @@ async fn route_agent_pr_failure(
             },
         )
         .await;
+        // SPEC-3.13: the remediation dispatch tells the issue the stage and the
+        // expected duration of the attempt it queues; the pickup that follows
+        // posts its own start notice with the attempt and the session timeout.
+        let expected_duration =
+            state::expected_duration(&ctx.pool, "youtrack", "ci-remediation")
+                .await
+                .render();
         let backend = ctx.backend.clone();
         let classifier = ctx.classifier.clone();
         let mint_cfg = ctx.mint_cfg.read().await.clone();
@@ -2669,7 +2676,7 @@ async fn route_agent_pr_failure(
                 ""
             };
             let body = format!(
-                "CI failed again on this PR (run #{}, branch `{branch_owned}`).\n- Run: {}\n- Failing tests: {tests_display}{extra}\n\n{}",
+                "CI failed again on this PR (run #{}, branch `{branch_owned}`).\n- Run: {}\n- Failing tests: {tests_display}{extra}\n- Stage: ci-remediation, expected duration: {expected_duration}\n\n{}",
                 event.index_in_repo, event.html_url, verdict.analysis
             );
             let body = crate::run_footer::append_run(

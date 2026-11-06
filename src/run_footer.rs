@@ -105,6 +105,12 @@ pub fn resolved_public_url() -> Option<String> {
 /// with "now" as the finish time. The `source` for the `Source:` line is
 /// taken from the `CommentRun` itself (CLAUDE-555).
 pub fn append_job(body: &str, public_url: Option<&str>, run: CommentRun<'_>, key: &str) -> String {
+    // SPEC-3.13: the first progress comment after a failed start notice says so.
+    let body = if take_start_notice_missing(key) {
+        format!("{body}\n\nNote: the start notice for this run could not be posted; see the runner log.")
+    } else {
+        body.to_string()
+    };
     let footer = render(
         public_url,
         Some(run.run_id),
@@ -118,6 +124,54 @@ pub fn append_job(body: &str, public_url: Option<&str>, run: CommentRun<'_>, key
         run.trigger,
     );
     format!("{body}{footer}")
+}
+
+/// SPEC-3.13: the start notice body for one attempt: the action, the attempt
+/// and its stage, the session timeout and the expected duration, then the
+/// SPEC-3.15 step list when there is one. The caller appends the SPEC-3.9
+/// footer ([`append_job`] / [`append_run`]), which carries the run link.
+pub fn start_notice(
+    action: &str,
+    attempt: u32,
+    stage: &str,
+    timeout: Duration,
+    expected: &crate::state::ExpectedDuration,
+    progress: Option<&str>,
+) -> String {
+    let mut body = format!(
+        "**Started.**\n\nAction: {action}\nAttempt: {attempt} (stage: {stage})\nSession timeout: {}s\nExpected duration: {}",
+        timeout.as_secs(),
+        expected.render()
+    );
+    if let Some(progress) = progress {
+        body.push_str("\n\n");
+        body.push_str(progress);
+    }
+    body
+}
+
+type MissingStartNotices = std::sync::Mutex<std::collections::HashSet<String>>;
+
+fn missing_start_notices() -> &'static MissingStartNotices {
+    static M: std::sync::OnceLock<MissingStartNotices> = std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// SPEC-3.13: record that the start notice for `key` could not be posted, so
+/// the next lifecycle comment for the key states so. Keyed because the
+/// comments are composed in synchronous code far from the pickup path.
+pub fn mark_start_notice_missing(key: &str) {
+    missing_start_notices()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.to_string());
+}
+
+fn take_start_notice_missing(key: &str) -> bool {
+    missing_start_notices()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(key)
 }
 
 /// SPEC-3.9: the run-page `Run:` line for a comment about a run as a whole.

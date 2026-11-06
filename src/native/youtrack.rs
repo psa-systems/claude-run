@@ -1436,6 +1436,18 @@ async fn process_job(
     let action = &loaded.action;
     let key = &job.key;
     let attempts = state::attempts_get(pool, &action.name, key).await?;
+    // SPEC-3.14 item 1: an attempt that continues a PR whose CI failed (the
+    // recorded PR has spent a fix attempt) is the `ci-remediation` stage; any
+    // other attempt is `initial`, `retry-2` or `retry-3` by its number. A store
+    // read failure is logged and falls back to the numbered stage.
+    let stage: &'static str = match crate::ci_failure::store::agent_pr_for_issue(pool, key).await {
+        Ok(Some(rec)) if rec.state == "open" && rec.fix_attempts > 0 => "ci-remediation",
+        Ok(_) => crate::attempt_steps::stage_for_attempt(attempts + 1),
+        Err(e) => {
+            error!(action = %action.name, key = %key, error = %e, "reading the agent PR record for the attempt stage failed; using the numbered stage");
+            crate::attempt_steps::stage_for_attempt(attempts + 1)
+        }
+    };
     // CLAUDE-556: a scheduler pickup is the AI Agent = Queued pickup; any
     // other origin (`bypass_backoff`) is an operator-initiated run.
     let trigger = if bypass_backoff {
@@ -1654,6 +1666,46 @@ async fn process_job(
         };
         info!(action = %action.name, key = %key, reason, "run stopped before Working; left Queued, no attempt consumed");
         return Ok(ProcessedJob::Filtered { key: key.clone() });
+    }
+
+    // SPEC-3.13: the start notice is the first runner write for this attempt,
+    // posted before the `Working` field write and the clone. A failed post is
+    // logged at `error` with the issue key, the run proceeds, and the first
+    // progress comment states the notice is missing.
+    {
+        let expected = state::expected_duration(pool, &action.name, stage).await;
+        let current = if stage == "ci-remediation" {
+            "CI remediation".to_string()
+        } else if attempts == 0 {
+            crate::progress_list::HAPPY_PATH[0].to_string()
+        } else {
+            format!("Retry {}", attempts + 1)
+        };
+        let progress = crate::progress_list::render_for(pool, &action.name, key, &current).await;
+        let body = crate::run_footer::start_notice(
+            &action.name,
+            attempts + 1,
+            stage,
+            limits.claude_timeout,
+            &expected,
+            Some(&progress),
+        );
+        let body = crate::run_footer::append_job(
+            &body,
+            crate::run_footer::resolved_public_url().as_deref(),
+            crate::run_footer::CommentRun {
+                run_id,
+                attempt: attempts + 1,
+                started: started_wall,
+                source: "youtrack",
+                trigger: Some(&trigger),
+            },
+            key,
+        );
+        if let Err(e) = crate::blocking::in_place(|| backend.comment(key, &body)) {
+            error!(action = %action.name, key = %key, error = %e, "SPEC-3.13: posting the start notice failed; the run proceeds");
+            crate::run_footer::mark_start_notice_missing(key);
+        }
     }
 
     // A preserved workdir from a failed finalize (unpushed commits)
@@ -2210,7 +2262,6 @@ async fn process_job(
     // timing never leaks into the next attempt of the same key.
     let gate_timings = crate::attempt_steps::take_gate_timings(key);
     if !skip_attempt {
-        let stage = crate::attempt_steps::stage_for_attempt(attempts + 1);
         let mut recorder =
             crate::attempt_steps::StepRecorder::new(pool, run_id, &action.name, key, attempts + 1);
         if let Some((clone_start, clone_end, clone_ok)) = clone_timing {
@@ -2332,7 +2383,7 @@ async fn process_job(
         stream_log_path,
         duration_ms: started.elapsed().as_millis() as i64,
         timed_out: claude_result.timed_out,
-        stage: crate::attempt_steps::stage_for_attempt(attempts + 1),
+        stage,
         outcome: attempt_outcome,
     })
 }
@@ -6944,6 +6995,57 @@ mod tests {
         );
         assert!(tracker.comments.lock().unwrap().is_empty());
         assert_eq!(state::attempts_get(&pool, "yt", "MK-16").await.unwrap(), 0);
+    }
+
+    /// CLAUDE-584 / SPEC-3.13: the pickup posts the start notice, naming the
+    /// attempt, stage, timeout and expected duration, before it clones: the
+    /// clone fails here, and the notice is still the first comment.
+    #[tokio::test]
+    async fn process_job_posts_the_start_notice_before_it_clones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = ClaudeInvoker::new(Some("/nonexistent/claude-stub-should-never-run.sh"));
+        let tracker = FakeTracker::new("Queued");
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let mut j = job();
+        j.clone_url = "/nonexistent/claude-run-584.git".into();
+        let mut s = src();
+        s.dependencies.enabled = false;
+        let pool = mem_pool().await;
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout: Duration::from_secs(30),
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+            review_timeout: Duration::from_secs(1800),
+        };
+        let cancel = CancellationToken::new();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+        let gate = crate::pause::PauseGate::new(pool.clone());
+        let pause = gate.for_action_run("yt");
+        let _ = process_job(
+            &loaded, &paths, &pool, &claude, &tracker, &forge, &s, &limits, &cancel, &pause,
+            &spend, &j, PrStrategy::Branch, false, 1,
+        )
+        .await;
+        let comments = tracker.comments.lock().unwrap();
+        let first = comments.first().expect("the start notice was posted");
+        assert!(first.contains("**Started.**"), "{first:?}");
+        assert!(first.contains("Attempt: 1 (stage: initial)"), "{first:?}");
+        assert!(first.contains("Session timeout: 30s"), "{first:?}");
+        assert!(first.contains("Expected duration: no history"), "{first:?}");
+        assert!(first.contains("1. Initial commit: <-- This comment"), "{first:?}");
     }
 
     /// CLAUDE-535 fixture: a forge whose PRs report the CI state listed in

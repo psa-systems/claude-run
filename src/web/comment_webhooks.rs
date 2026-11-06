@@ -1259,11 +1259,14 @@ async fn run_instruction(
         let trigger = crate::run_footer::Trigger::UserCommand {
             login: cmd.author.clone(),
         };
+        let expected =
+            state::expected_duration(&ctx.pool, WEBHOOK_COMMENT_ACTION, "initial").await;
         let body = started_comment(
             COMMENT_WEBHOOK_SOURCE,
             &trigger_word,
             &instruction,
             Duration::from_secs(u64::from(claude_timeout_seconds)),
+            &expected,
             cmd.is_pull_request,
         );
         let body = crate::run_footer::append_run(
@@ -2593,14 +2596,14 @@ pub fn addressed(cmd: &VerifiedCommentCommand, body: String) -> String {
 /// (`/claude`) and the instruction length." The commenter mention is left to
 /// [`addressed`], applied by the caller; this builds the rest of the body:
 /// the action, the trigger word, the instruction length, the session
-/// timeout, and an expected duration. `expected_duration` says "no history"
-/// here: the median-of-last-20-attempts case belongs to the youtrack
-/// start-notice issue in this epic, not this one.
+/// timeout, and an expected duration (the median of the last 20 completed
+/// attempts of the action and stage, [`crate::state::expected_duration`]).
 pub fn started_comment(
     action: &str,
     trigger: &str,
     instruction: &str,
     timeout: Duration,
+    expected: &crate::state::ExpectedDuration,
     is_pull_request: bool,
 ) -> String {
     let what = first_line(instruction);
@@ -2619,12 +2622,14 @@ pub fn started_comment(
         format!(
             "Working on: {what}\n\n\
              Action: {action}\n\
+             Attempt: 1 (stage: initial)\n\
              Command: {trigger}\n\
              Instruction length: {len} characters\n\
              Session timeout: {timeout_s}s\n\
-             Expected duration: no history\n\n{next}",
+             Expected duration: {expected_s}\n\n{next}",
             len = instruction.chars().count(),
             timeout_s = timeout.as_secs(),
+            expected_s = expected.render(),
         ),
     )
 }
@@ -4119,6 +4124,7 @@ mod tests {
                     "/claude",
                     "fix it",
                     Duration::from_secs(600),
+                    &crate::state::ExpectedDuration::NoHistory,
                     true,
                 ),
                 "**Started.**",
@@ -4257,6 +4263,7 @@ mod tests {
             "/claude",
             "fix the flaky test\nmore detail",
             Duration::from_secs(600),
+            &crate::state::ExpectedDuration::NoHistory,
             true,
         );
         assert!(pr.contains("Working on: fix the flaky test"), "{pr}");
@@ -4267,6 +4274,7 @@ mod tests {
             "/claude",
             "x",
             Duration::from_secs(600),
+            &crate::state::ExpectedDuration::NoHistory,
             false
         )
         .contains("YouTrack issue"));
@@ -4275,6 +4283,7 @@ mod tests {
             "/claude",
             &"y".repeat(300),
             Duration::from_secs(600),
+            &crate::state::ExpectedDuration::NoHistory,
             true,
         );
         assert!(long.contains(&format!("{}...", "y".repeat(200))), "{long}");
@@ -4290,6 +4299,7 @@ mod tests {
             "/claude",
             "fix it",
             Duration::from_secs(900),
+            &crate::state::ExpectedDuration::NoHistory,
             true,
         );
         assert!(body.contains("Action: comment-webhook"), "{body}");
