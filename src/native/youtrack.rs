@@ -1637,12 +1637,17 @@ async fn process_job(
             key,
             attempts + 1,
         );
-        let review_retry_stream_log = ClaudeInvoker::review_retry_stream_log_path(
-            &paths.logs_dir(),
-            &action.name,
-            key,
-            attempts + 1,
-        );
+        // SPEC-3.12 item 9: the one retry a workdir-modifying review gets
+        // logs to its own file, alongside the first attempt's, rather than
+        // overwriting it.
+        let review_retry_stream_log = {
+            let mut name = review_stream_log
+                .file_name()
+                .unwrap_or_default()
+                .to_os_string();
+            name.push("-retry");
+            review_stream_log.with_file_name(name)
+        };
         let (outcome, review_results) = crate::blocking::in_place(|| {
             run_review_session_with_retry(
                 claude,
