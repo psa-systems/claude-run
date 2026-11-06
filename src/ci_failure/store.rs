@@ -51,6 +51,17 @@ pub struct AgentPullRequest {
     /// and not yet cleared by a resumed run's successful finish (CLAUDE-429).
     /// Blocks automerge regardless of draft status. See `crate::db::flag`.
     pub salvaged: bool,
+    /// CLAUDE-550: automerge conflict auto-resolve runs dispatched for this
+    /// PR, across every head commit. Capped by
+    /// `webhook_comment.agent_conflict_resolve_attempts`.
+    pub conflict_resolve_attempts: i64,
+    /// CLAUDE-550: when the latest conflict auto-resolve run was dispatched,
+    /// `None` once it finished. A stamp older than the comment run's own
+    /// timeout plus a margin is stale (a dropped or crashed run).
+    pub conflict_resolve_started_at: Option<String>,
+    /// CLAUDE-550: the paths the last conflict auto-resolve run left
+    /// unresolved; empty when it resolved them or never reported.
+    pub conflict_files: Vec<String>,
 }
 
 fn failure_from_row(row: &sqlx::any::AnyRow) -> Result<Failure> {
@@ -81,6 +92,18 @@ fn agent_pr_from_row(row: &sqlx::any::AnyRow) -> Result<AgentPullRequest> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         salvaged: db::flag(row, "salvaged")?,
+        conflict_resolve_attempts: row.try_get("conflict_resolve_attempts")?,
+        conflict_resolve_started_at: row.try_get("conflict_resolve_started_at")?,
+        conflict_files: row
+            .try_get::<Option<String>, _>("conflict_files")?
+            .map(|s| {
+                s.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -513,7 +536,8 @@ pub async fn agent_pr(
 ) -> Result<Option<AgentPullRequest>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at, \
+         conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
          FROM agent_pull_requests WHERE host = ? AND repo = ? AND pr_number = ?",
     ).into_owned()))
     .bind(host)
@@ -542,7 +566,8 @@ pub async fn agent_pr_for_issue(
 ) -> Result<Option<AgentPullRequest>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at, \
+         conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
          FROM agent_pull_requests WHERE issue_key = ? \
          ORDER BY CASE WHEN state = 'open' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1",
     ).into_owned()))
@@ -559,7 +584,8 @@ pub async fn agent_pr_for_issue(
 pub async fn open_agent_prs(pool: &DbPool) -> Result<Vec<AgentPullRequest>> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at, \
+         conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
          FROM agent_pull_requests WHERE state = 'open' ORDER BY id",
     ).into_owned()))
     .fetch_all(pool)
@@ -575,6 +601,51 @@ pub async fn bump_fix_attempts(pool: &DbPool, id: i64, now: &str) -> Result<()> 
     ).into_owned()))
     .bind(now)
     .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// CLAUDE-550: record one dispatched automerge conflict auto-resolve run on
+/// row `id`: bump `conflict_resolve_attempts` and stamp
+/// `conflict_resolve_started_at` with `now`, marking it in flight.
+pub async fn begin_conflict_resolve(pool: &DbPool, id: i64, now: &str) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(db::q(
+        pool,
+        "UPDATE agent_pull_requests SET conflict_resolve_attempts = conflict_resolve_attempts + 1, \
+         conflict_resolve_started_at = ?, updated_at = ? WHERE id = ?",
+    ).into_owned()))
+    .bind(now)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// CLAUDE-550: a conflict auto-resolve run on `(host, repo, pr_number)`
+/// finished: clear its in-flight stamp and record the paths it left
+/// unresolved (empty when it resolved them, or when the run never got far
+/// enough to tell). A PR with no row (not an agent PR) is a no-op.
+pub async fn finish_conflict_resolve(
+    pool: &DbPool,
+    host: &str,
+    repo: &str,
+    pr_number: i64,
+    unresolved: &[String],
+    now: &str,
+) -> Result<()> {
+    let files = (!unresolved.is_empty()).then(|| unresolved.join("\n"));
+    sqlx::query(sqlx::AssertSqlSafe(db::q(
+        pool,
+        "UPDATE agent_pull_requests SET conflict_resolve_started_at = NULL, conflict_files = ?, \
+         updated_at = ? WHERE host = ? AND repo = ? AND pr_number = ?",
+    ).into_owned()))
+    .bind(files)
+    .bind(now)
+    .bind(host)
+    .bind(repo)
+    .bind(pr_number)
     .execute(pool)
     .await?;
     Ok(())

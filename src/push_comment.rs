@@ -31,6 +31,9 @@ pub enum PushEvent {
     MergedRemoteBranchBeforePush,
     BranchUpdatedFromBase,
     CheckpointPush,
+    /// CLAUDE-550: an automerge conflict auto-resolve run (CLAUDE-380)
+    /// pushed its merge of the base branch.
+    ConflictResolvePush,
 }
 
 impl PushEvent {
@@ -43,6 +46,7 @@ impl PushEvent {
             PushEvent::MergedRemoteBranchBeforePush => "merged remote branch before push",
             PushEvent::BranchUpdatedFromBase => "branch updated from base",
             PushEvent::CheckpointPush => "checkpoint push",
+            PushEvent::ConflictResolvePush => "conflict auto-resolve push",
         }
     }
 }
@@ -297,6 +301,7 @@ mod tests {
             PushEvent::MergedRemoteBranchBeforePush,
             PushEvent::BranchUpdatedFromBase,
             PushEvent::CheckpointPush,
+            PushEvent::ConflictResolvePush,
         ];
         for event in events {
             let body = build_body(&ctx(event, CommitSubjects::Listed(vec!["one".into()])));

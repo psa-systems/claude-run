@@ -4804,6 +4804,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "per-run claude session timeout for the PR-comment route, read live per command (default 600, at least 1).",
             },
             FieldDoc {
+                name: "agent_conflict_resolve_attempts",
+                badge: "next event",
+                note: "automerge conflict auto-resolve runs per agent PR before its issue is parked delivery-blocked with the unresolved files named (default 2, at least 1).",
+            },
+            FieldDoc {
                 name: "sources",
                 badge: "live",
                 note: "a saved source puts webhook-comment on the dashboard immediately; per-source secret_ref, allowed_repos, rate_limit_per_min, write_token_ref (WRITE scope), allowed_permissions, max_files, max_lines.",

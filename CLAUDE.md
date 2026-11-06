@@ -106,6 +106,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - `finalize` makes one bounded status read and merges a PR whose CI is already green in the same tick ([CLAUDE-549](docs/conventions/merge.md#finalize-time-merge-of-an-already-green-pr-claude-549))
 - A reconciler backstops webhook automerge so no green PR sits unwatched ([CLAUDE-328](docs/conventions/merge.md#automerge-reconciler-claude-328))
 - `PrStatus.behind_base` separates a behind-base PR from a real conflict ([CLAUDE-309, FJ-99](docs/conventions/merge.md#behind-base-prs-claude-309-fj-99))
+- Conflict auto-resolve runs are capped per PR, one at a time; a spent cap parks the issue delivery-blocked ([CLAUDE-550](docs/conventions/merge.md#bounded-conflict-auto-resolve-claude-550))
 - At most `max_ci_in_flight_per_repo` runner PRs per repo have CI pending: pickups defer, branch updates wait ([CLAUDE-535](docs/conventions/merge.md#ci-in-flight-cap-claude-535))
 - The runner writes no `State` on merge; a YouTrack workflow resolves the issue ([CLAUDE-327](docs/conventions/merge.md#state-on-merge-is-a-youtrack-workflow-claude-327))
 - A checkpoint-opened PR is `salvaged` from the moment it is opened, not only after a timeout ([CLAUDE-448](docs/conventions/merge.md#salvaged-prs-block-automerge-claude-429))
@@ -156,6 +157,6 @@ Cross-cutting (not a numbered phase): a container runtime (CLAUDE-37, made self-
   `justfile` configures it through variables (`pre_commit_mode := "docker"` + `dev_image` because there is no `compose.dev.yml`, `test_args := ""` so the library-target unit tests are not skipped) and overrides only `default`, `check`, and `run`. Prefer setting a common variable over shadowing a shared recipe.
   `default` is redefined locally (as the file's first recipe) because just resolves the default recipe by source order and a top-level definition outranks the imported one, so without it a bare `just` runs whichever local recipe comes first instead of common's `just --list` (CLAUDE-201).
   CI keeps its own `.forgejo/workflows/check.yml` rather than calling common's reusable one, which hardcodes `cargo test --bins`; making that configurable is tracked in #PC-6. It also deviates from governance `CI.md` ("Check runs on every push / PR"):
-  the workflow still runs on every push and PR to `main`, but its compile job is skipped (via a leading `changes` job and an `if:`, not a workflow-level `paths-ignore`) when only `docs/**`, `README.md`, or `CLAUDE.md` changed (CLAUDE-286).
+  the workflow still runs on every push and PR to `main`, but common's shared `classify-diff` action (a leading `changes` job and an `if:`, not a workflow-level `paths-ignore`) skips the compile job for a docs-only PR and everything but `cargo fmt --check` for a comment-only one (CLAUDE-570).
 - Daemon smoke-test pattern: `CLAUDE_RUN_*_DIR=/tmp/...` env vars + a stub `claude` on `PATH` (see `src/bin/claude-run.rs` smoke tests for the shape).
 - The legacy `scripts/claude-run.nu` is gone as of the governance-conformance PR. The Rust binary is the only runner.
