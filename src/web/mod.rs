@@ -192,6 +192,10 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             get(job_stream_page),
         )
         .route(
+            "/runs/{id}/jobs/{key}/attempt/{attempt}/review-evidence",
+            get(job_review_evidence),
+        )
+        .route(
             "/sse/runs/{id}/jobs/{key}/attempt/{attempt}",
             get(job_stream_sse),
         )
@@ -311,6 +315,14 @@ struct JobOutcomeRow {
     /// stream log, so this carries the triage bucket + mint result + redacted
     /// log artifact reference; rendered on the run-detail outcomes table.
     summary: Option<String>,
+    /// SPEC-3.16 item 3: whether the post-success review session for this
+    /// attempt left an evidence file on disk. Not a DB column: set by
+    /// `run_detail` after the fetch, by checking
+    /// `ClaudeInvoker::review_evidence_path` for existence, so the template
+    /// can link it next to "view stream" without the route itself touching
+    /// the filesystem every page load for jobs that never ran a review.
+    #[serde(skip)]
+    has_evidence: bool,
 }
 
 // By hand rather than derived, because `ok` / `claude_ran` /
@@ -331,6 +343,7 @@ impl sqlx::FromRow<'_, sqlx::any::AnyRow> for JobOutcomeRow {
             duration_ms: row.try_get("duration_ms")?,
             timed_out: crate::db::flag(row, "timed_out")?,
             summary: row.try_get("summary")?,
+            has_evidence: false,
         })
     }
 }
@@ -6721,12 +6734,25 @@ async fn run_detail(
     else {
         return Ok((StatusCode::NOT_FOUND, format!("no run #{id}")).into_response());
     };
-    let outcomes = sqlx::query_as::<_, JobOutcomeRow>(sqlx::AssertSqlSafe(crate::db::q(pool,
+    let mut outcomes = sqlx::query_as::<_, JobOutcomeRow>(sqlx::AssertSqlSafe(crate::db::q(pool,
         "SELECT job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, attempt_counted, duration_ms, timed_out, summary FROM job_outcomes WHERE run_id = ? ORDER BY id ASC",
     ).into_owned()))
     .bind(id)
     .fetch_all(pool)
     .await?;
+    // SPEC-3.16 item 3: link an attempt's review evidence file only when one
+    // was actually written (a job with no post-success review, or one that
+    // never reached that step, has none).
+    let logs_dir = s.paths.logs_dir();
+    for o in &mut outcomes {
+        o.has_evidence = ClaudeInvoker::review_evidence_authoritative(
+            &logs_dir,
+            &run.action_name,
+            &o.job_key,
+            o.attempt as u32,
+        )
+        .is_some();
+    }
 
     // Look up the action's link_template once and reuse for both planned
     // jobs and the outcomes table. YouTrack-keyed actions with no template
@@ -6773,7 +6799,6 @@ async fn run_detail(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let logs_dir = s.paths.logs_dir();
     let mut planned_jobs: Vec<PlannedJob> = planned_keys
         .into_iter()
         .map(|k| {
@@ -6852,7 +6877,6 @@ async fn run_detail(
     // Job outcomes: filter on the OK / Claude / Counted dropdowns, then sort by
     // the chosen column. Default (no `out_sort`) keeps the `id ASC` order from
     // the query above.
-    let mut outcomes = outcomes;
     let has_outcomes = !outcomes.is_empty();
     if !sort.out_ok.is_empty() {
         let want = sort.out_ok == "true";
@@ -6941,6 +6965,47 @@ async fn job_stream_page(
         href,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
+}
+
+/// SPEC-3.16 item 3: serves an attempt's post-success review evidence file
+/// (the full sweep the capped verdict marker links to) as plain text. 404s
+/// when the run is unknown or the attempt wrote no evidence file, mirroring
+/// [`job_stream_page`]'s action-name lookup.
+async fn job_review_evidence(
+    State(s): State<WebState>,
+    AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
+) -> Result<Response, WebError> {
+    let action_name: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(&s.api.pool, "SELECT action_name FROM runs WHERE id = ?").into_owned(),
+    ))
+    .bind(id)
+    .fetch_optional(&s.api.pool)
+    .await?;
+    let action_name = action_name.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
+    // Resolves to the retry's file when a review retry ran, so the served
+    // sweep is the one that backs the posted verdict.
+    let not_found = || {
+        WebError::not_found(format!(
+            "no review evidence file for run #{id}, job {key}, attempt {attempt}"
+        ))
+    };
+    let path = ClaudeInvoker::review_evidence_authoritative(
+        &s.paths.logs_dir(),
+        &action_name,
+        &key,
+        attempt,
+    )
+    .ok_or_else(not_found)?;
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        tracing::error!(path = %path.display(), error = %e, "review evidence file unreadable");
+        not_found()
+    })?;
+    let mut resp = Response::new(Body::from(content));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    Ok(resp)
 }
 
 // SPEC-4.3.10: "The live job stream is a server-sent events feed over the
@@ -7325,6 +7390,7 @@ mod tests {
             duration_ms: Some(1000),
             timed_out: false,
             summary: Some("did the thing".to_string()),
+            has_evidence: false,
         };
         let job_links = std::collections::BTreeMap::from([(
             "CLAUDE-108".to_string(),
@@ -7551,6 +7617,7 @@ mod tests {
             duration_ms: Some(1000),
             timed_out: false,
             summary: Some("analyzed".to_string()),
+            has_evidence: false,
         };
         let planned = PlannedJob {
             key: "CLAUDE-222".to_string(),
@@ -7611,6 +7678,7 @@ mod tests {
             duration_ms: Some(1),
             timed_out: false,
             summary: None,
+            has_evidence: false,
         };
         let skip = row(1, false, false);
         let ran_err = row(2, true, false);
@@ -13285,6 +13353,165 @@ mod tests {
             let s = match_snippet(line, "no space left on device");
             assert!(s.contains("No space left on device"));
             assert!(!s.contains('\n'));
+        }
+    }
+
+    /// SPEC-3.16 item 3: the run-detail attempt route that serves the
+    /// post-success review's evidence file.
+    mod review_evidence_route {
+        use super::super::{job_review_evidence, WebState};
+        use crate::api::AppState;
+        use crate::cancel::RunRegistry;
+        use crate::claude::ClaudeInvoker;
+        use crate::config::Paths;
+        use axum::extract::{Path as AxumPath, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+
+        async fn web_state(tmp: &std::path::Path) -> WebState {
+            let pool = crate::db::test_pool().await;
+            let (trigger_tx, _rx) = tokio::sync::mpsc::channel(8);
+            let api = Arc::new(AppState {
+                pool: pool.clone(),
+                trigger_tx,
+                version: "test",
+                runs: Arc::new(RunRegistry::new()),
+                in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                anthropic_key: None,
+                readiness: None,
+                claude_login: None,
+                fj_data_home: tmp.join("fj-data"),
+                claude_binary: "claude".to_string(),
+                gh_binary: "gh".to_string(),
+                agent_config_dir: None,
+                settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
+                paths: Paths {
+                    config_dir: tmp.join("config"),
+                    data_dir: tmp.join("data"),
+                    state_dir: tmp.join("state"),
+                    runtime_dir: tmp.join("runtime"),
+                },
+            });
+            let paths = crate::config::Paths {
+                config_dir: tmp.join("config"),
+                data_dir: tmp.join("data"),
+                state_dir: tmp.join("state"),
+                runtime_dir: tmp.join("runtime"),
+            };
+            WebState { api, paths }
+        }
+
+        async fn seed_run(pool: &crate::db::DbPool, id: i64) {
+            sqlx::query(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    pool,
+                    "INSERT INTO runs (id, action_name, started_at, triggered_by) \
+                 VALUES (?, 'act', '2026-06-26T00:00:00+00:00', 'schedule')",
+                )
+                .into_owned(),
+            ))
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn serves_the_evidence_file_when_present() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_run(&s.api.pool, 1).await;
+            let path =
+                ClaudeInvoker::review_evidence_path(&s.paths.logs_dir(), "act", "CLAUDE-1", 1);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "the full sweep goes here").unwrap();
+
+            let resp = job_review_evidence(State(s), AxumPath((1, "CLAUDE-1".to_string(), 1)))
+                .await
+                .unwrap()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"the full sweep goes here");
+        }
+
+        /// A retried review serves the retry's evidence, never the discarded
+        /// first session's file.
+        #[tokio::test]
+        async fn serves_the_retry_evidence_when_a_review_retry_ran() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_run(&s.api.pool, 1).await;
+            let logs = s.paths.logs_dir();
+            let primary = ClaudeInvoker::review_evidence_path(&logs, "act", "CLAUDE-1", 1);
+            std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+            std::fs::write(&primary, "first session sweep").unwrap();
+            let stream = ClaudeInvoker::review_stream_log_path(&logs, "act", "CLAUDE-1", 1);
+            std::fs::write(ClaudeInvoker::review_retry_sibling(&stream), "").unwrap();
+            std::fs::write(
+                ClaudeInvoker::review_retry_sibling(&primary),
+                "retry session sweep",
+            )
+            .unwrap();
+
+            let resp = job_review_evidence(State(s), AxumPath((1, "CLAUDE-1".to_string(), 1)))
+                .await
+                .unwrap()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"retry session sweep");
+        }
+
+        /// A retry that wrote no evidence is a 404, not the first session's
+        /// file, since that sweep does not back the posted verdict.
+        #[tokio::test]
+        async fn retry_without_evidence_does_not_fall_back_to_the_first_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_run(&s.api.pool, 1).await;
+            let logs = s.paths.logs_dir();
+            let primary = ClaudeInvoker::review_evidence_path(&logs, "act", "CLAUDE-1", 1);
+            std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+            std::fs::write(&primary, "first session sweep").unwrap();
+            let stream = ClaudeInvoker::review_stream_log_path(&logs, "act", "CLAUDE-1", 1);
+            std::fs::write(ClaudeInvoker::review_retry_sibling(&stream), "").unwrap();
+
+            let resp = job_review_evidence(State(s), AxumPath((1, "CLAUDE-1".to_string(), 1)))
+                .await
+                .unwrap_err()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn missing_evidence_file_is_a_404() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_run(&s.api.pool, 1).await;
+
+            let resp = job_review_evidence(State(s), AxumPath((1, "CLAUDE-1".to_string(), 1)))
+                .await
+                .unwrap_err()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn unknown_run_is_a_404() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            let resp = job_review_evidence(State(s), AxumPath((99, "CLAUDE-1".to_string(), 1)))
+                .await
+                .unwrap_err()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         }
     }
 }

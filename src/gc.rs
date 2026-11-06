@@ -187,8 +187,8 @@ where
     stats
 }
 
-/// SPEC-3.8.2: walk `<logs_dir>/<action>/streams/*.jsonl` and delete every
-/// stream log older than the retention window.
+/// SPEC-3.8.2: walk `<logs_dir>/<action>/streams/*` and delete every file
+/// older than the retention window.
 ///
 /// `in_flight` is the set of `(action, job_key)` pairs whose job is still
 /// running, read by the caller from `run_inflight_jobs` joined to the runs that
@@ -196,10 +196,10 @@ where
 /// long `claude_timeout_seconds` can outlive any window while its log is being
 /// appended to, and deleting it mid-run destroys the only record of it. The
 /// sweep runs in the daemon that owns those runs, so that table is the
-/// authority, and anything it names is kept regardless of age. A log path is
-/// `<key>-attempt-<n>.jsonl` ([`crate::claude::ClaudeInvoker::stream_log_path`]),
-/// so the key is the stem up to the last `-attempt-`; a file that does not match
-/// that shape was not written by a run and is swept on age alone.
+/// authority, and anything it names is kept regardless of age. [`streams_file_key`]
+/// maps every file shape the runner writes under `streams/` back to its job
+/// key; a file that matches none of those shapes was not written by a run,
+/// logs at `warn` naming it (SPEC-3.8.2), and is swept on age alone.
 ///
 /// `now` is injected the same way [`sweep`] injects it, so a test can age a file
 /// by passing a future instant. Per-entry filesystem errors are logged and
@@ -241,12 +241,22 @@ pub fn sweep_stream_logs(
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            // The directory holds only stream logs; anything else is left alone.
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            if !path.is_file() {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            let key = stream_log_key(&name);
+            // SPEC-3.8.2: a file matching none of the known streams/ shapes is
+            // not something a prior sweep ever skipped on purpose; it is an
+            // unswept kind that should be findable, so it is logged here
+            // rather than silently aged out like a recognized one.
+            if streams_file_stem(&name).is_none() {
+                warn!(
+                    action = %action_name,
+                    path = %path.display(),
+                    "stream-log GC: unrecognized file shape in streams/; sweeping on age alone"
+                );
+            }
+            let key = streams_file_key(&name);
             if let Some(k) = &key {
                 if in_flight.contains(&(action_name.clone(), k.clone())) {
                     debug!(
@@ -287,10 +297,31 @@ pub fn sweep_stream_logs(
     stats
 }
 
-/// Job key encoded in a stream-log file name (`<key>-attempt-<n>.jsonl`), or
-/// `None` when the name does not carry one.
-fn stream_log_key(file_name: &str) -> Option<String> {
-    let stem = file_name.strip_suffix(".jsonl")?;
+/// Content-type suffix recognized under `streams/`, stripped of its optional
+/// SPEC-3.12 item 9 `-retry` sibling marker
+/// ([`crate::claude::ClaudeInvoker::review_retry_sibling`]) so the job-key
+/// shape underneath can be read from what is left. Covers every kind the
+/// runner writes there: the main attempt log
+/// (`<key>-attempt-<n>.jsonl`, [`crate::claude::ClaudeInvoker::stream_log_path`]),
+/// the post-success review session's own log
+/// (`<key>-attempt-<n>-review.jsonl`, [`crate::claude::ClaudeInvoker::review_stream_log_path`]),
+/// and the SPEC-3.16 item 2 evidence file
+/// (`<key>-attempt-<n>-review-evidence.md`, [`crate::claude::ClaudeInvoker::review_evidence_path`]).
+/// `None` means the name matches none of those shapes. Longer, more specific
+/// suffixes are tried before the plain `.jsonl` one so a review log is not
+/// mistaken for a main attempt log missing its `-review` tag.
+fn streams_file_stem(file_name: &str) -> Option<&str> {
+    let name = file_name.strip_suffix("-retry").unwrap_or(file_name);
+    ["-review.jsonl", "-review-evidence.md", ".jsonl"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+}
+
+/// Job key encoded in a `streams/` file name recognized by [`streams_file_stem`],
+/// or `None` when the name does not carry one, including when the shape itself
+/// is unrecognized.
+fn streams_file_key(file_name: &str) -> Option<String> {
+    let stem = streams_file_stem(file_name)?;
     let (key, attempt) = stem.rsplit_once("-attempt-")?;
     // Only a numeric attempt suffix is ours; `foo-attempt-bogus.jsonl` is not.
     if key.is_empty() || attempt.is_empty() || !attempt.bytes().all(|b| b.is_ascii_digit()) {
@@ -2076,6 +2107,108 @@ mod tests {
         assert_eq!(stats, SweepStats::default());
     }
 
+    /// Create the SPEC-3.16 item 2 evidence file, its SPEC-3.12 item 9
+    /// `-retry` sibling, and the retried review session's own stream log
+    /// (`<key>-attempt-<n>-review.jsonl-retry`) for one attempt.
+    fn make_review_evidence_and_retry_files(
+        logs: &Path,
+        action: &str,
+        key: &str,
+        attempt: u32,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let dir = logs.join(action).join("streams");
+        std::fs::create_dir_all(&dir).unwrap();
+        let evidence = dir.join(format!("{key}-attempt-{attempt}-review-evidence.md"));
+        let evidence_retry = dir.join(format!("{key}-attempt-{attempt}-review-evidence.md-retry"));
+        let review_log_retry = dir.join(format!("{key}-attempt-{attempt}-review.jsonl-retry"));
+        std::fs::write(&evidence, b"evidence").unwrap();
+        std::fs::write(&evidence_retry, b"retried evidence").unwrap();
+        std::fs::write(&review_log_retry, b"{}").unwrap();
+        (evidence, evidence_retry, review_log_retry)
+    }
+
+    /// AC: an aged evidence file, its `-retry` sibling and a
+    /// `review.jsonl-retry` log for an attempt not in flight are all deleted.
+    #[test]
+    fn aged_review_evidence_and_retry_files_are_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (evidence, evidence_retry, review_log_retry) =
+            make_review_evidence_and_retry_files(tmp.path(), "youtrack", "CLAUDE-6", 1);
+        let stats = sweep_stream_logs(
+            tmp.path(),
+            &log_cfg(true),
+            SystemTime::now() + days(60),
+            &in_flight(&[]),
+        );
+        assert!(!evidence.exists(), "an aged evidence file must be swept");
+        assert!(
+            !evidence_retry.exists(),
+            "an aged evidence-retry sibling must be swept"
+        );
+        assert!(
+            !review_log_retry.exists(),
+            "an aged review.jsonl-retry log must be swept"
+        );
+        assert_eq!(stats.deleted, 3);
+        assert_eq!(stats.kept, 0);
+    }
+
+    /// AC: the same three files are kept, regardless of age, while their
+    /// `(action, job key)` pair is still in flight.
+    #[test]
+    fn in_flight_review_evidence_and_retry_files_are_kept_regardless_of_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (evidence, evidence_retry, review_log_retry) =
+            make_review_evidence_and_retry_files(tmp.path(), "youtrack", "CLAUDE-7", 1);
+        let stats = sweep_stream_logs(
+            tmp.path(),
+            &log_cfg(true),
+            SystemTime::now() + days(365),
+            &in_flight(&[("youtrack", "CLAUDE-7")]),
+        );
+        assert!(evidence.exists(), "an in-flight evidence file must be kept");
+        assert!(
+            evidence_retry.exists(),
+            "an in-flight evidence-retry sibling must be kept"
+        );
+        assert!(
+            review_log_retry.exists(),
+            "an in-flight review.jsonl-retry log must be kept"
+        );
+        assert_eq!(stats.kept, 3);
+        assert_eq!(stats.deleted, 0);
+    }
+
+    /// AC: a file whose name matches none of the known streams/ shapes is
+    /// still swept on age alone, and the pass logs it at `warn` naming it so
+    /// a future unswept kind is findable.
+    #[test]
+    fn unknown_shaped_file_is_swept_on_age_alone_and_logged_at_warn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("youtrack").join("streams");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mystery = dir.join("CLAUDE-8-attempt-1-mystery.txt");
+        std::fs::write(&mystery, b"???").unwrap();
+        let (stats, logs) = crate::testutil::capture_logs(|| {
+            sweep_stream_logs(
+                tmp.path(),
+                &log_cfg(true),
+                SystemTime::now() + days(60),
+                &in_flight(&[]),
+            )
+        });
+        assert!(
+            !mystery.exists(),
+            "an unknown-shaped aged file is still swept"
+        );
+        assert_eq!(stats.deleted, 1);
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(
+            logs.contains("CLAUDE-8-attempt-1-mystery.txt"),
+            "the warn log must name the file: {logs}"
+        );
+    }
+
     // ---- snippet directories --------------------------------------------------
 
     /// Create `<base>/<action>/<key>/` with one file of `bytes` bytes inside,
@@ -2487,19 +2620,35 @@ mod tests {
     }
 
     #[test]
-    fn stream_log_key_parses_only_our_shape() {
+    fn streams_file_key_parses_only_our_shapes() {
         assert_eq!(
-            stream_log_key("CLAUDE-9-attempt-2.jsonl").as_deref(),
+            streams_file_key("CLAUDE-9-attempt-2.jsonl").as_deref(),
             Some("CLAUDE-9")
         );
         // A key that itself contains the separator: the LAST one wins.
         assert_eq!(
-            stream_log_key("odd-attempt-key-attempt-1.jsonl").as_deref(),
+            streams_file_key("odd-attempt-key-attempt-1.jsonl").as_deref(),
             Some("odd-attempt-key")
         );
-        assert_eq!(stream_log_key("CLAUDE-9-attempt-bogus.jsonl"), None);
-        assert_eq!(stream_log_key("CLAUDE-9.jsonl"), None);
-        assert_eq!(stream_log_key("CLAUDE-9-attempt-1.txt"), None);
+        assert_eq!(
+            streams_file_key("CLAUDE-9-attempt-2-review.jsonl").as_deref(),
+            Some("CLAUDE-9")
+        );
+        assert_eq!(
+            streams_file_key("CLAUDE-9-attempt-2-review.jsonl-retry").as_deref(),
+            Some("CLAUDE-9")
+        );
+        assert_eq!(
+            streams_file_key("CLAUDE-9-attempt-2-review-evidence.md").as_deref(),
+            Some("CLAUDE-9")
+        );
+        assert_eq!(
+            streams_file_key("CLAUDE-9-attempt-2-review-evidence.md-retry").as_deref(),
+            Some("CLAUDE-9")
+        );
+        assert_eq!(streams_file_key("CLAUDE-9-attempt-bogus.jsonl"), None);
+        assert_eq!(streams_file_key("CLAUDE-9.jsonl"), None);
+        assert_eq!(streams_file_key("CLAUDE-9-attempt-1.txt"), None);
     }
 
     // ---- docker volume sweep --------------------------------------------------
