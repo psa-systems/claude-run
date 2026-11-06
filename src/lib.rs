@@ -52,6 +52,7 @@ pub mod mint;
 pub mod native;
 pub mod paint;
 pub mod pause;
+pub mod progress_list;
 pub mod provider;
 pub mod push_comment;
 pub mod readiness;

@@ -6070,6 +6070,8 @@ async fn post_branch_updated_push_comment(
             public_url: public_url.as_deref(),
             run_id: None,
             started: None,
+            // FOLLOWUP-PROGRESS: no stored step rows reach this provider-level site yet.
+            progress: None,
         };
         // A directory scoped to this one call, not the bare shared
         // `std::env::temp_dir()` (CLAUDE-519): `push_comment::post` names its

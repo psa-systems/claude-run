@@ -1116,6 +1116,8 @@ impl CliBackend {
             public_url: public_url.as_deref(),
             run_id: None,
             started: None,
+            // FOLLOWUP-PROGRESS: no stored step rows reach this provider-level site yet.
+            progress: None,
         };
         pr.push_comment_failure =
             crate::push_comment::post(self, host, repo, pr_number, &scratch, &ctx);
@@ -2322,6 +2324,8 @@ impl Forge for CliBackend {
                         public_url: public_url.as_deref(),
                         run_id,
                         started: run_started,
+                        // FOLLOWUP-PROGRESS: no stored step rows reach this provider-level site yet.
+                        progress: None,
                     };
                     pr.push_comment_failure =
                         crate::push_comment::post(self, host, &repo, pr_number, &scratch, &ctx);

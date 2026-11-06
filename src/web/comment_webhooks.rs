@@ -2416,6 +2416,8 @@ fn post_fix_push_comment(
         public_url: public_url.as_deref(),
         run_id: None,
         started: None,
+        // FOLLOWUP-PROGRESS: no stored step rows reach this provider-level site yet.
+        progress: None,
     };
     let scratch = git_dir_scratch(workdir).unwrap_or_else(|_| std::env::temp_dir());
     crate::push_comment::post(backend, &cmd.host, &cmd.repo, cmd.number, &scratch, &ctx)

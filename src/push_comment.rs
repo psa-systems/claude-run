@@ -105,6 +105,10 @@ pub struct PushCommentContext<'a> {
     pub public_url: Option<&'a str>,
     pub run_id: Option<i64>,
     pub started: Option<chrono::DateTime<chrono::Utc>>,
+    /// SPEC-3.15: the rendered step list ([`crate::progress_list`]) with this
+    /// comment's own line marked, appended before the run footer. `None` when
+    /// the caller has no stored step rows to render from.
+    pub progress: Option<&'a str>,
 }
 
 /// One-line outcome a reviewer can read at a glance: how many commits
@@ -148,12 +152,18 @@ pub fn build_body(ctx: &PushCommentContext<'_>) -> String {
         Some(old) => format!("{}..{new}", short(old)),
         None => format!("(new branch) {new}"),
     };
-    let body = format!(
+    let mut body = format!(
         "{}\n\nIssue: {}\nPR state: {state}\nRange: {range}\n\n{}",
         outcome_headline(ctx),
         ctx.issue_key,
         format_subjects(&ctx.subjects),
     );
+    // SPEC-3.15 / SPEC-8.8: the step list sits between the commit subjects
+    // and the SPEC-3.9 footer.
+    if let Some(progress) = ctx.progress {
+        body.push_str("\n\n");
+        body.push_str(progress);
+    }
     crate::run_footer::append_run(
         &body,
         ctx.public_url,
@@ -243,7 +253,25 @@ mod tests {
                     .unwrap()
                     .with_timezone(&chrono::Utc),
             ),
+            progress: None,
         }
+    }
+
+    /// SPEC-3.15 / SPEC-8.8: the list appears with the marker on the current
+    /// step, before the SPEC-3.9 footer.
+    #[test]
+    fn the_step_list_precedes_the_footer_with_the_marker_on_the_current_step() {
+        let list = "1. Initial commit: 0:02 / 0:02\n2. Checkpoint 1: <-- This comment\n3. Checks 1:";
+        let mut c = ctx(
+            PushEvent::CheckpointPush,
+            CommitSubjects::Listed(vec!["Add thing".into()]),
+        );
+        c.progress = Some(list);
+        let body = build_body(&c);
+        let list_at = body.find(list).expect("the list is in the body");
+        let footer_at = body.find("Run: ").expect("the footer is in the body");
+        assert!(list_at < footer_at, "{body}");
+        assert!(body.contains("2. Checkpoint 1: <-- This comment"), "{body}");
     }
 
     #[test]
