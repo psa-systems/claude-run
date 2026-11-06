@@ -770,6 +770,238 @@ fn sanitize_key(key: &str) -> String {
     key.replace(['/', '\\', '.'], "_")
 }
 
+/// `run_events` context tag for every correction the stuck-Working sweep
+/// records, so the dashboard can list them as one group (SPEC-3.12 item 2).
+const STUCK_WORKING_SWEEP_CONTEXT: &str = "stuck-working-sweep";
+
+/// Comment posted when the sweep moves an issue off `Working` because no
+/// live run backs it. SPEC-3.12 item 2: "a comment naming the cause and the
+/// last recorded step".
+fn stuck_working_comment(last_step: Option<&str>) -> String {
+    let step = last_step.unwrap_or("no recorded step");
+    format!(
+        "This issue was left on `AI Agent = Working` with no live run backing it: the \
+         attempt that set it ended without finalizing. Last recorded step: {step}."
+    )
+}
+
+/// SPEC-3.12 item 2: the periodic reconcile sweep for a daemon that stays up
+/// while a run exits without finalizing (a crash, a kill outside the
+/// runner's own exit paths, or a bug). Unlike [`reconcile_restart_inflight`]
+/// (startup only, driven by leftover `run_inflight_jobs` rows a dead process
+/// left behind), this runs on every tick of a LIVE daemon
+/// ([`crate::daemon::AUTOMERGE_RECONCILE_TICK_SECS`]): for each `kind:
+/// youtrack` action it lists every issue that action's own tracker reports
+/// as `Working`, and corrects any key with no row in `run_inflight_jobs`
+/// among that action's currently open runs. A key with a live in-flight row
+/// is backed by a real run and is left untouched.
+///
+/// Each stuck key is moved to `states.queued` when its recorded attempt
+/// count is below the action's `max_attempts_per_key`, else
+/// `states.needs_review`, with a comment naming the cause and the last
+/// recorded step, and a `run_events` row (fixed [`STUCK_WORKING_SWEEP_CONTEXT`])
+/// so the dashboard can list the correction. Writes go through
+/// [`provider::AuditedTracker`] with no run id, exactly like the webhook
+/// mint path's own run-less writes: every write is still journaled and
+/// capped (CLAUDE-234) even though this correction belongs to no run.
+///
+/// Never aborts on one action's or one key's failure: a tracker read
+/// failure is logged at `error` and that action's issues are left for the
+/// next tick, never treated as "nothing stuck" (SPEC-3.12 item 2); a
+/// credential or write failure for one action or key is logged and the next
+/// one is still tried.
+pub async fn reconcile_stuck_working(
+    pool: &DbPool,
+    paths: &Paths,
+    runner: &Arc<dyn CommandRunner>,
+) {
+    let rows = match state::action_index_list(pool).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!(error = %e, "stuck-working sweep: reading the action index failed; nothing swept this tick");
+            return;
+        }
+    };
+
+    let cred_root = paths
+        .runtime_dir
+        .join("credentials")
+        .join("stuck-working-sweep");
+    let defaults = RunnerDefaults::default();
+
+    for row in rows.iter().filter(|r| r.parse_error.is_none()) {
+        let loaded = match action::load_from_path(Path::new(&row.file_path)) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(action = %row.name, error = %e, "stuck-working sweep: action failed to parse; skipped this tick");
+                continue;
+            }
+        };
+        let cfg = match &loaded.action.native {
+            Some(NativeConfig::Youtrack(cfg)) => cfg,
+            _ => continue,
+        };
+        let src = &cfg.youtrack;
+        let action_name = &loaded.action.name;
+        let max_attempts_per_key = job::effective_limits(&defaults, &loaded).max_attempts_per_key;
+
+        let creds = match secrets::resolve_youtrack_credentials(
+            pool,
+            src,
+            &cfg.forgejo,
+            &cfg.github,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                error!(action = %action_name, error = %e, "stuck-working sweep: resolving credentials failed; action skipped this tick");
+                continue;
+            }
+        };
+        // Held alive for the whole action so its temp credential files
+        // outlive every key's tracker call below; dropped (and scrubbed) at
+        // the end of this action's iteration.
+        let mut _guard: Option<JobCredentials> = None;
+        let backend: CliBackend = if creds.is_empty() {
+            CliBackend::new(runner.clone())
+        } else {
+            let dir = cred_root.join(format!(
+                "{}-{}",
+                sanitize_key(action_name),
+                secrets::unique_suffix()
+            ));
+            match JobCredentials::materialize(&dir, &creds, None) {
+                Ok(g) => {
+                    let b = credentialed_backend(runner, &g);
+                    _guard = Some(g);
+                    b
+                }
+                Err(e) => {
+                    error!(action = %action_name, error = %e, "stuck-working sweep: materializing credentials failed; action skipped this tick");
+                    continue;
+                }
+            }
+        };
+
+        let audit = IssueWriteAudit::new(None, defaults.max_issues_per_run);
+        let tracker = AuditedTracker::new(&backend, audit);
+
+        let query = format!("{}: {}", src.custom_field, src.states.working);
+        let issues = match tracker.list_queued(&query) {
+            Ok(i) => i,
+            Err(e) => {
+                error!(action = %action_name, query = %query, error = %e, "stuck-working sweep: tracker read failed; nothing swept this tick for this action");
+                continue;
+            }
+        };
+        if issues.is_empty() {
+            continue;
+        }
+
+        let inflight: std::collections::HashSet<String> = match state::action_inflight_keys(
+            pool,
+            action_name,
+        )
+        .await
+        {
+            Ok(keys) => keys.into_iter().collect(),
+            Err(e) => {
+                error!(action = %action_name, error = %e, "stuck-working sweep: reading in-flight keys failed; action skipped this tick");
+                continue;
+            }
+        };
+
+        for issue in &issues {
+            let Some(key) = issue.get("idReadable").and_then(|v| v.as_str()) else {
+                warn!(action = %action_name, "stuck-working sweep: skipping issue with no idReadable");
+                continue;
+            };
+            if inflight.contains(key) {
+                info!(action = %action_name, key = %key, "stuck-working sweep: Working and backed by a live run; left alone");
+                continue;
+            }
+
+            // A run adds its in-flight row BEFORE it sets Working and drops it
+            // AFTER it moves the field off Working. Checking the row, then the
+            // live field, then the row again therefore closes both windows: a
+            // run that finalized after the list read has already left Working,
+            // and a run that started after it has already re-added its row.
+            match backend.get_field(key, &src.custom_field) {
+                Ok(v) if v.trim() == src.states.working => {}
+                Ok(v) => {
+                    info!(action = %action_name, key = %key, current = %v, "stuck-working sweep: already advanced off Working; left alone");
+                    continue;
+                }
+                Err(e) => {
+                    error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: re-reading the AI Agent field failed; key left on Working until the next tick");
+                    continue;
+                }
+            }
+            match state::action_inflight_keys(pool, action_name).await {
+                Ok(keys) if keys.iter().any(|k| k == key) => {
+                    info!(action = %action_name, key = %key, "stuck-working sweep: a run picked the issue up during the sweep; left alone");
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: re-reading in-flight keys failed; key left on Working until the next tick");
+                    continue;
+                }
+            }
+
+            let attempts = match state::attempts_get(pool, action_name, key).await {
+                Ok(a) => a,
+                Err(e) => {
+                    error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: reading the attempt count failed; key left on Working until the next tick");
+                    continue;
+                }
+            };
+            let target = if attempts < max_attempts_per_key {
+                &src.states.queued
+            } else {
+                &src.states.needs_review
+            };
+
+            // The correction must still post when the lookup fails, so the
+            // comment says the step is unreadable instead of "no recorded step".
+            let last_step = match state::last_job_outcome_summary(pool, key).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: reading the last recorded step failed; correcting without it");
+                    Some("unreadable (the lookup failed; see the daemon log)".to_string())
+                }
+            };
+            let comment = stuck_working_comment(last_step.as_deref());
+            let comment = crate::run_footer::append_run(
+                &comment,
+                crate::run_footer::resolved_public_url().as_deref(),
+                None,
+                None,
+                "youtrack",
+                None,
+            );
+
+            if let Err(e) = comment_then_field(&tracker, src, key, &comment, target) {
+                error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: correction write failed; key left on Working until the next tick");
+                continue;
+            }
+            warn!(action = %action_name, key = %key, target = %target, "stuck-working sweep: corrected an issue stranded on Working with no live run backing it");
+
+            let event = state::InputEvent {
+                level: "warn".into(),
+                context: Some(STUCK_WORKING_SWEEP_CONTEXT.into()),
+                message: format!("{key}: moved off Working (no live run) to {target}"),
+            };
+            if let Err(e) =
+                state::run_events_record(pool, action_name, &state::now_iso(), &[event]).await
+            {
+                warn!(action = %action_name, key = %key, error = %e, "stuck-working sweep: recording the run_events row failed (the correction itself already landed)");
+            }
+        }
+    }
+}
+
 /// The gather step's credential directory, unique per poll.
 ///
 /// Every [`JobCredentials::materialize`] path must be unique per guard, because
@@ -15269,6 +15501,228 @@ mod tests {
         reconcile_restart_inflight(&pool, &paths, &dyn_runner).await;
 
         assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    // ---- SPEC-3.12 item 2: periodic sweep of stuck Working issues ----
+
+    /// A `Working` issue with no `run_inflight_jobs` row for its action's
+    /// open runs is moved to `Queued` (attempts below the cap) and gets
+    /// exactly one comment.
+    #[tokio::test]
+    async fn reconcile_stuck_working_requeues_an_unbacked_working_issue() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-20"}]"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-20", "AI Agent"],
+                    "Working\n",
+                )
+                .ok_prefix("yt issue comment MK-20", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-20", "AI Agent", "Queued"],
+                    "",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        {
+            let calls = runner.calls.lock().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c == "yt issue set-field MK-20 AI Agent Queued"),
+                "{calls:?}"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.starts_with("yt issue comment MK-20"))
+                    .count(),
+                1,
+                "exactly one correction comment; {calls:?}"
+            );
+        }
+        let events = state::run_events_for_action(&pool, "yt-action", 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            events[0].context.as_deref(),
+            Some(STUCK_WORKING_SWEEP_CONTEXT),
+            "{events:?}"
+        );
+        assert_eq!(events[0].level, "warn", "{events:?}");
+        assert!(events[0].message.starts_with("MK-20:"), "{events:?}");
+    }
+
+    /// An issue the list read saw on `Working` but whose live field has since
+    /// moved on (a run finalized mid-sweep) is left alone: no write, no
+    /// `run_events` row.
+    #[tokio::test]
+    async fn reconcile_stuck_working_leaves_an_already_advanced_issue_alone() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-23"}]"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-23", "AI Agent"],
+                    "Code Review\n",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        {
+            let calls = runner.calls.lock().unwrap();
+            assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+        }
+        let events = state::run_events_for_action(&pool, "yt-action", 10)
+            .await
+            .unwrap();
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// An issue at its action's `max_attempts_per_key` is parked at `Needs
+    /// Review` instead of requeued.
+    #[tokio::test]
+    async fn reconcile_stuck_working_at_the_attempt_cap_parks_needs_review() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        // Default `max_attempts_per_key` is 3 (`RunnerDefaults::default`).
+        for _ in 0..3 {
+            state::attempts_increment(&pool, "yt-action", "MK-22")
+                .await
+                .unwrap();
+        }
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-22"}]"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-22", "AI Agent"],
+                    "Working\n",
+                )
+                .ok_prefix("yt issue comment MK-22", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-22", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-22 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+    }
+
+    /// A `Working` issue with a live `run_inflight_jobs` row for its
+    /// action's open run is backed by a real run and is left untouched: no
+    /// `set-field`, no comment.
+    #[tokio::test]
+    async fn reconcile_stuck_working_leaves_an_inflight_backed_issue_alone() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let run_id = state::run_begin(&pool, "yt-action", "scheduler")
+            .await
+            .unwrap();
+        state::run_inflight_add(&pool, run_id, "MK-21", "MK")
+            .await
+            .unwrap();
+
+        let runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["list", "--query=AI Agent: Working", "--json"],
+            r#"[{"idReadable":"MK-21"}]"#,
+        ));
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+    }
+
+    /// A tracker read failure (`yt list` erroring) is logged and changes
+    /// nothing: no `set-field`, no comment, and the next tick still gets a
+    /// chance (SPEC-3.12 item 2: never treated as "nothing stuck").
+    #[tokio::test]
+    async fn reconcile_stuck_working_tracker_read_failure_changes_nothing() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let runner = Arc::new(StubRunner::new().fail(
+            "yt",
+            &["list", "--query=AI Agent: Working", "--json"],
+            1,
+            "boom",
+        ));
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
     }
 
     // --- CLAUDE-449: the post-success review session ---

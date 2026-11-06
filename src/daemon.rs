@@ -541,6 +541,12 @@ impl Daemon {
             mint_ctx.clone(),
             keygate.clone(),
         ));
+        // SPEC-3.12 item 2: the live-daemon backstop for an issue left on
+        // Working by a run that exited without finalizing. Same cadence as
+        // the automerge reconciler above; the first tick fires immediately,
+        // so a sweep also runs on serve start.
+        let stuck_working_sweep_task =
+            tokio::spawn(stuck_working_sweep_loop(pool.clone(), self.paths.clone()));
         let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(
             webhook_rx,
             pool.clone(),
@@ -766,6 +772,7 @@ impl Daemon {
         pr_consumer.abort();
         success_consumer.abort();
         automerge_reconciler_task.abort();
+        stuck_working_sweep_task.abort();
         comment_consumer.abort();
         // pidfile lock released on drop
         if unix_socket {
@@ -2239,6 +2246,39 @@ async fn automerge_reconciler_loop(
         ticker.tick().await;
         crate::web::webhooks::reconcile_automerge(&pool, &mint, &keygate, &mut listing_failures)
             .await;
+    }
+}
+
+/// SPEC-3.12 item 2: the stuck-Working sweep's tick, the same cadence as the
+/// automerge reconciler (`AUTOMERGE_RECONCILE_TICK_SECS`) since both are a
+/// live-daemon backstop with no reason to run on a different schedule.
+///
+/// Periodic sweep for an issue left at `AI Agent = Working` by a run that
+/// exited without finalizing while the daemon stayed up (the gap the
+/// startup-only [`crate::native::youtrack::reconcile_restart_inflight`]
+/// cannot cover). Ticks independently of any run's own finalize path, on
+/// [`AUTOMERGE_RECONCILE_TICK_SECS`] (first tick immediate, so a sweep also
+/// runs on serve start), and calls
+/// [`crate::native::youtrack::reconcile_stuck_working`], which lists every
+/// `kind: youtrack` action's `Working` issues and corrects any with no
+/// matching `run_inflight_jobs` row. The shared `CommandRunner` is resolved
+/// fresh each tick (never cached): a host with no usable `yt`/`fj` binary at
+/// serve start may still gain one later, and a tick that cannot resolve one
+/// logs and skips rather than blocking the daemon.
+async fn stuck_working_sweep_loop(pool: DbPool, paths: crate::config::Paths) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+        AUTOMERGE_RECONCILE_TICK_SECS,
+    ));
+    loop {
+        ticker.tick().await;
+        match crate::provider::resolve_runner(crate::provider::DEFAULT_PRIORITY) {
+            Ok(runner) => {
+                crate::native::youtrack::reconcile_stuck_working(&pool, &paths, &runner).await;
+            }
+            Err(e) => {
+                warn!(error = %e, "stuck-working sweep: no command runner available; skipped this tick");
+            }
+        }
     }
 }
 
