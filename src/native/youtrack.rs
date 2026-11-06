@@ -795,13 +795,29 @@ pub(crate) const STUCK_WORKING_SWEEP_CONTEXT: &str = "stuck-working-sweep";
 
 /// Comment posted when the sweep moves an issue off `Working` because no
 /// live run backs it. SPEC-3.12 item 2: "a comment naming the cause and the
-/// last recorded step".
-fn stuck_working_comment(last_step: Option<&str>) -> String {
+/// last recorded step". When the correction lands on `Needs Review` (the key
+/// is at its attempt cap), SPEC-3.12 item 6 also requires the comment to name
+/// the one action a human can take; `at_cap` adds the same action line
+/// [`cap_reached_comment`] uses for the pickup-time attempt-cap park, since
+/// this is that same park reached from the sweep instead of pickup. No
+/// `Needs-Info` tag is added for either park: CLAUDE-373 (`actions/SCHEMA.md`)
+/// documents that the attempt-cap park never writes it.
+fn stuck_working_comment(last_step: Option<&str>, at_cap: bool) -> String {
     let step = last_step.unwrap_or("no recorded step");
-    format!(
+    let mut body = format!(
         "This issue was left on `AI Agent = Working` with no live run backing it: the \
          attempt that set it ended without finalizing. Last recorded step: {step}."
-    )
+    );
+    if at_cap {
+        body.push_str(
+            "\n\nThis was also its last attempt under the action's attempt cap: \
+             re-queueing it alone will not retry it, since the attempt counter is not \
+             cleared by re-queueing or by a successful run. To retry it, raise the \
+             action's `limits.max_attempts_per_key`, or reset this key's counter once \
+             CLAUDE-238 lands.",
+        );
+    }
+    body
 }
 
 /// SPEC-3.12 item 2: the periodic reconcile sweep for a daemon that stays up
@@ -976,10 +992,11 @@ pub async fn reconcile_stuck_working(
                     continue;
                 }
             };
-            let target = if attempts < max_attempts_per_key {
-                &src.states.queued
-            } else {
+            let at_cap = attempts >= max_attempts_per_key;
+            let target = if at_cap {
                 &src.states.needs_review
+            } else {
+                &src.states.queued
             };
 
             // The correction must still post when the lookup fails, so the
@@ -991,7 +1008,7 @@ pub async fn reconcile_stuck_working(
                     Some("unreadable (the lookup failed; see the daemon log)".to_string())
                 }
             };
-            let comment = stuck_working_comment(last_step.as_deref());
+            let comment = stuck_working_comment(last_step.as_deref(), at_cap);
             let comment = crate::run_footer::append_run(
                 &comment,
                 crate::run_footer::resolved_public_url().as_deref(),
@@ -5169,6 +5186,13 @@ pub(crate) fn automerge_merge_failed_comment(pr_url: &str, error: &str) -> Strin
 /// stale-attempts banner keeps showing the key), so each write is attempted
 /// independently and a failure of either logs at `error` naming the key and
 /// the cause.
+///
+/// SPEC-3.12 item 6 audit (CLAUDE-582): [`cap_reached_comment`] already names
+/// the one action a human can take (raise the cap or reset the counter), so
+/// this site satisfies the "states one action" half of item 6. It does not
+/// write the `Needs-Info` tag; that is CLAUDE-373's documented carve-out
+/// (`actions/SCHEMA.md`: "the attempt-cap park... never write[s] this tag"),
+/// not an oversight this issue should change.
 #[allow(clippy::too_many_arguments)]
 fn report_cap_reached(
     backend: &dyn IssueTracker,
@@ -16554,6 +16578,16 @@ mod tests {
                 .any(|c| c == "yt issue set-field MK-22 AI Agent Needs Review"),
             "{calls:?}"
         );
+        // SPEC-3.12 item 6: the comment that parks the issue at Needs Review
+        // must name the one action a human can take.
+        assert!(
+            calls.iter().any(|c| c.starts_with("yt issue comment MK-22")
+                && c.contains("limits.max_attempts_per_key")),
+            "{calls:?}"
+        );
+        // CLAUDE-373 (`actions/SCHEMA.md`): the attempt-cap park never writes
+        // the Needs-Info tag, whether reached at pickup or from this sweep.
+        assert!(!calls.iter().any(|c| c.contains("tag add")), "{calls:?}");
     }
 
     /// A `Working` issue with a live `run_inflight_jobs` row for its
