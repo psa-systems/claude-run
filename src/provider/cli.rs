@@ -4283,7 +4283,14 @@ mod tests {
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         let result = b
-            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"), "MK-16", None, None)
+            .checkpoint_push(
+                wd.path(),
+                "dev.a8n.run",
+                Some("## Summary\n\n#MK-16"),
+                "MK-16",
+                None,
+                None,
+            )
             .unwrap();
         assert!(result.is_none());
         let calls = runner.calls.lock().unwrap();
@@ -4309,7 +4316,14 @@ mod tests {
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         let result = b
-            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"), "MK-16", None, None)
+            .checkpoint_push(
+                wd.path(),
+                "dev.a8n.run",
+                Some("## Summary\n\n#MK-16"),
+                "MK-16",
+                None,
+                None,
+            )
             .unwrap();
         assert!(result.is_none());
         let calls = runner.calls.lock().unwrap();
@@ -4396,7 +4410,14 @@ mod tests {
         let b = CliBackend::new(runner.clone());
 
         let first = b
-            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"), "MK-16", None, None)
+            .checkpoint_push(
+                wd.path(),
+                "dev.a8n.run",
+                Some("## Summary\n\n#MK-16"),
+                "MK-16",
+                None,
+                None,
+            )
             .unwrap()
             .expect("first tick landed new commits and must push");
         assert_eq!(first.number, Some(77));
@@ -4445,7 +4466,14 @@ mod tests {
         let runner2 = Arc::new(runner2);
         let b2 = CliBackend::new(runner2.clone());
         let second = b2
-            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"), "MK-16", None, None)
+            .checkpoint_push(
+                wd.path(),
+                "dev.a8n.run",
+                Some("## Summary\n\n#MK-16"),
+                "MK-16",
+                None,
+                None,
+            )
             .unwrap()
             .expect("second tick landed further new commits and must push");
         assert_eq!(
