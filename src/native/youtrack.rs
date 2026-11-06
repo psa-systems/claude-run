@@ -1596,6 +1596,10 @@ async fn process_job(
     // `yt` field writes plus a full `git clone` of the target repo,
     // all synchronous; keep them off the async worker thread.
     let resume_branch = resume.as_ref().map(|r| r.branch.as_str());
+    // SPEC-3.14: the `clone` runner-owned step, timed around the whole
+    // `run_pre` call (field writes, clone, hook install); recorded below once
+    // this attempt is known to count.
+    let clone_step_start = chrono::Utc::now();
     let pre_result = crate::blocking::in_place(|| {
         run_pre(
             backend,
@@ -1607,6 +1611,8 @@ async fn process_job(
             &action.name,
         )
     });
+    let clone_step_end = chrono::Utc::now();
+    let clone_ok = pre_result.is_ok();
 
     // ---- prompt + claude (skipped on pre failure / cancel / global pause) ----
     // The gate is read once here (not in a match guard, which cannot
@@ -1616,6 +1622,15 @@ async fn process_job(
     // watcher's own outcome; every other arm never checkpoints, so this
     // stays `None` for them, which `finalize` treats as "nothing rejected".
     let mut checkpoint_rejected: Option<String> = None;
+    // SPEC-3.14: the stream-log path plus the `claude.invoke` call's own
+    // start/end, set only in the claude-ran arm below. `coding`/`check`/
+    // `build` steps are derived from this span's stream log once this
+    // attempt is known to count.
+    let mut claude_span: Option<(
+        PathBuf,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    )> = None;
     // Computed once regardless of `pre_result`, so the match below never
     // calls the fallible I/O twice for one attempt.
     let cargo_target_dir_result = ensure_cargo_target_dir(&cargo_target_dir);
@@ -1704,6 +1719,7 @@ async fn process_job(
             let (stop_tx, stop_rx) = std::sync::mpsc::channel();
             let pool_handle = tokio::runtime::Handle::current();
             let already_resuming = resume.is_some();
+            let invoke_step_start = chrono::Utc::now();
             let (invoke_result, checkpoint_outcome) = std::thread::scope(|scope| {
                 let watcher = scope.spawn(|| {
                     run_checkpoint_watcher(
@@ -1741,6 +1757,7 @@ async fn process_job(
                 (invoke_result, outcome)
             });
             let r = invoke_result?;
+            claude_span = Some((stream_log.clone(), invoke_step_start, chrono::Utc::now()));
             checkpoint_rejected = checkpoint_outcome.rejected;
             if resume.is_none() {
                 resume = checkpoint_outcome.opened;
@@ -1858,6 +1875,13 @@ async fn process_job(
     // succeeded with no outstanding blocker/no-code marker (a blocker or a
     // deliberate no-code run never opens a PR, so there is nothing to
     // review). Billed exactly like the main invocation.
+    // SPEC-3.14: the `review` runner-owned step's start/end/ok, set only when
+    // this branch runs.
+    let mut review_span: Option<(
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        bool,
+    )> = None;
     let review = if claude_ran
         && claude_result.ok
         && !workdir_path.join(NEEDS_REVIEW_MARKER).exists()
@@ -1880,6 +1904,7 @@ async fn process_job(
             name.push("-retry");
             review_stream_log.with_file_name(name)
         };
+        let review_step_start = chrono::Utc::now();
         let (outcome, review_results) = crate::blocking::in_place(|| {
             run_review_session_with_retry(
                 claude,
@@ -1894,6 +1919,13 @@ async fn process_job(
                 Some(cargo_target_dir.as_path()),
             )
         });
+        // SPEC-3.14: the `review` runner-owned step, recorded below once this
+        // attempt is known to count.
+        review_span = Some((
+            review_step_start,
+            chrono::Utc::now(),
+            matches!(outcome, ReviewOutcome::Pass(_)),
+        ));
         for review_result in &review_results {
             spend.record(review_result);
         }
@@ -2071,7 +2103,7 @@ async fn process_job(
         info!(action = %action.name, key = %key, cancelled, paused = paused_before_claude, "not counting attempt");
     }
 
-    let (ok, summary) = record_finalize_outcome(&claude_result, &finalize_res, post_failed);
+    let (ok, mut summary) = record_finalize_outcome(&claude_result, &finalize_res, post_failed);
     let stream_log_path = stream_log.as_deref().map(|p| p.display().to_string());
 
     if !skip_attempt {
@@ -2079,6 +2111,70 @@ async fn process_job(
     }
     if claude_ran {
         state::daily_count_increment(pool, &action.name).await?;
+    }
+
+    // SPEC-3.14: record this attempt's steps (clone, the claude invocation's
+    // derived coding/check/build steps, and the post-success review), only
+    // for an attempt that counts. Scope: finalize's own PR-path steps (push,
+    // pr_create, gate, ci_wait, conflict_resolution) and hook_install /
+    // postgres_* are tracked in a follow-up issue, not here.
+    if !skip_attempt {
+        let stage = match attempts + 1 {
+            1 => "initial",
+            2 => "retry-2",
+            _ => "retry-3",
+        };
+        let mut recorder =
+            crate::attempt_steps::StepRecorder::new(pool, run_id, &action.name, key, attempts + 1);
+        recorder
+            .record(
+                stage,
+                crate::attempt_steps::StepKind::Clone,
+                "clone",
+                clone_step_start,
+                clone_step_end,
+                clone_ok,
+                None,
+            )
+            .await;
+        if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
+            match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
+                Ok(steps) => {
+                    for (kind, label, start, end) in steps {
+                        recorder
+                            .record(stage, kind, label, start, end, true, None)
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        action = %action.name,
+                        key = %key,
+                        error = %e,
+                        "deriving claude steps from the stream log failed; coding/check/build steps for this attempt fall into unaccounted"
+                    );
+                }
+            }
+        }
+        if let Some((review_start, review_end, review_ok)) = review_span {
+            recorder
+                .record(
+                    "review",
+                    crate::attempt_steps::StepKind::Review,
+                    "review",
+                    review_start,
+                    review_end,
+                    review_ok,
+                    None,
+                )
+                .await;
+        }
+        let incomplete = recorder
+            .finish(stage, started_wall, chrono::Utc::now())
+            .await;
+        if incomplete {
+            summary.push_str(" (step data incomplete)");
+        }
     }
 
     // A finalize failure can cost a retry, never the work. Only a
