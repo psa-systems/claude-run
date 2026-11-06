@@ -322,6 +322,22 @@ impl ClaudeInvoker {
             .join(format!("{key}-attempt-{attempt}-review.jsonl"))
     }
 
+    /// Stream log for the one retry a review session gets when it modifies
+    /// the read-only workdir (SPEC-3.12 item 9): its own file, never the
+    /// first review attempt's, so a successful retry's trace is not lost
+    /// under the discarded attempt's log.
+    pub fn review_retry_stream_log_path(
+        logs_dir: &Path,
+        action: &str,
+        key: &str,
+        attempt: u32,
+    ) -> PathBuf {
+        logs_dir
+            .join(action)
+            .join("streams")
+            .join(format!("{key}-attempt-{attempt}-review-retry.jsonl"))
+    }
+
     /// Spawn claude, relay its stdout to `stream_log` stamping each JSON event
     /// line with an arrival-time `ts` (stderr is a direct, unstamped redirect to
     /// the same file), wait, then scan the stream for the terminal `result`
