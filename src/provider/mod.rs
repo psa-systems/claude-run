@@ -37,7 +37,9 @@ use tracing::{info, warn};
 use crate::error::{Error, Result};
 
 pub use audit::{AuditedTracker, IssueWriteAudit, DEFAULT_MAX_ISSUES_PER_RUN};
-pub use cli::{CliBackend, CmdOutput, CommandRunner, FjForgeReads, ProcessRunner};
+pub use cli::{
+    CliBackend, CmdOutput, CommandRunner, ConflictResolver, FjForgeReads, ProcessRunner,
+};
 pub use github::{
     is_github_host, pr_web_url, GhForgeReads, GithubForge, HttpMcpTransport, McpTransport,
 };

@@ -73,8 +73,8 @@ use crate::config::Paths;
 use crate::error::{Error, Result};
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
 use crate::provider::{
-    self, AuditedTracker, CliBackend, CommandRunner, Forge, IssueTracker, IssueWriteAudit,
-    PullRequest,
+    self, AuditedTracker, CliBackend, CommandRunner, ConflictResolver, Forge, IssueTracker,
+    IssueWriteAudit, PullRequest,
 };
 use crate::secrets::{self, JobCredentials};
 use crate::state;
@@ -434,6 +434,25 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                     let backend = credentialed_backend(&runner, &guard);
                     (backend, Some(guard))
                 };
+            // SPEC-3.12 item 4: wire the bounded conflict-resolution pass
+            // in here, the one place this job's `CliBackend` is
+            // constructed, where `ClaudeInvoker`, this job's claude config,
+            // its timeout, cancellation and spend ledger are all already in
+            // scope. `finalize` (called at the end of `process_job`, below)
+            // is the only caller that can reach the diverged-push path that
+            // uses it.
+            let job_backend =
+                job_backend.with_conflict_resolver(Arc::new(FinalPushConflictResolver {
+                    claude: claude.clone(),
+                    claude_cfg: action.claude.clone(),
+                    timeout: limits.claude_timeout,
+                    cancel: job_cancel.clone(),
+                    spend: job_spend.clone(),
+                    key: job.key.clone(),
+                    pool: pool.clone(),
+                    run_id,
+                    action_name: action.name.clone(),
+                }));
             if let Err(e) = state::run_inflight_add(&pool, run_id, &job.key, &inflight_ckey).await {
                 warn!(error = %e, "run_inflight_add failed (non-fatal)");
             }
@@ -3453,6 +3472,109 @@ fn run_review_session(
     (outcome, result)
 }
 
+/// SPEC-3.12 item 4: the instruction for the bounded conflict-resolution
+/// pass, modeled on CLAUDE-550's `CONFLICT_RESOLVE_INSTRUCTION`
+/// (`src/web/comment_webhooks.rs`) but for the opposite merge direction:
+/// here the local branch's own work is merging in a newer copy of itself
+/// that the remote already carries (typically the runner's own periodic
+/// checkpoint push), not a PR branch merging its base.
+const FINAL_PUSH_CONFLICT_RESOLVE_INSTRUCTION: &str =
+    "A `git merge` of the remote copy of this branch into the local work is in progress and has \
+     left conflict markers. Resolve every conflict, keeping the intent of both sides, change \
+     nothing that is not needed to resolve a conflict, then conclude the merge with a commit. Run \
+     the project's build and test gate once afterward and fix only what the merge broke. If a \
+     conflict cannot be resolved safely, leave it unresolved and say which files in your summary.";
+
+/// SPEC-3.12 item 4: the bounded, one-shot conflict-resolution pass run in
+/// the same clone when the final push finds the remote branch diverged and
+/// the local merge of it conflicts. Implements [`ConflictResolver`], the
+/// provider-layer seam `CliBackend::merge_remote_branch` calls through, so
+/// `src/provider/cli.rs` never has to depend on `ClaudeInvoker`, budget or
+/// cancellation.
+struct FinalPushConflictResolver {
+    claude: Arc<ClaudeInvoker>,
+    claude_cfg: action::ClaudeBlock,
+    timeout: Duration,
+    cancel: CancellationToken,
+    spend: crate::usage::RunSpend,
+    key: String,
+    pool: crate::db::DbPool,
+    run_id: i64,
+    action_name: String,
+}
+
+impl ConflictResolver for FinalPushConflictResolver {
+    fn resolve(
+        &self,
+        workdir: &Path,
+        branch: &str,
+        local_sha: &str,
+        remote_sha: &str,
+    ) -> Result<()> {
+        // A dedicated stream log local to the workdir: this pass is a
+        // one-off, bounded side effect of the final push rather than the
+        // job's main attempt, so it is not folded into the job's own
+        // rotated stream log.
+        let stream_log = workdir.join(".claude-run-conflict-resolve-stream.jsonl");
+        info!(
+            key = %self.key,
+            branch = %branch,
+            local_sha = %local_sha,
+            remote_sha = %remote_sha,
+            "running the bounded conflict-resolution pass (SPEC-3.12 item 4)"
+        );
+        let result = self.claude.invoke(
+            FINAL_PUSH_CONFLICT_RESOLVE_INSTRUCTION,
+            &self.claude_cfg,
+            self.timeout,
+            workdir,
+            &stream_log,
+            &self.cancel,
+            Some(self.spend.remaining_usd()),
+            // No shared cargo cache: this bounded pass is spawned too late
+            // to know the job's own `cargo_target_dir`, and is rare enough
+            // that losing that cache here is not worth threading it through.
+            None,
+        )?;
+        self.spend.record(&result);
+        // SPEC-3.12 item 4: this pass is a `claude` invocation like any
+        // other, so it leaves a `claude_invocations` row the same way the
+        // job's main attempt and review session do.
+        tokio::runtime::Handle::current().block_on(crate::usage::record_invocation(
+            &self.pool,
+            &self.action_name,
+            Some(&self.key),
+            Some(self.run_id),
+            &stream_log,
+            &result,
+        ));
+        if result.timed_out {
+            return Err(Error::Other(anyhow::anyhow!(
+                "the conflict-resolution pass timed out"
+            )));
+        }
+        if !result.ok {
+            return Err(Error::Other(anyhow::anyhow!(
+                "the conflict-resolution pass did not conclude successfully"
+            )));
+        }
+        // SPEC-3.3.2: re-run the repository's own pre-push gate in the
+        // clone, exactly as the normal (non-conflict) path does after its
+        // push, rather than trusting the agent's own report; here it runs
+        // before the push because a merge resolution that breaks the build
+        // must not land as a fast-forward.
+        let gate = run_verification_gate(workdir);
+        if let Some(output) = gate.failure {
+            let command = gate.command.unwrap_or("none");
+            return Err(Error::Other(anyhow::anyhow!(
+                "the conflict-resolution pass's merge commit failed the SPEC-3.3.2 verification \
+                 gate (`just {command}`): {output}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// The current branch `workdir` has checked out, or `None` when it is
 /// detached (or `git` fails). Used only to roll a stray review-session commit
 /// back to `pre_review_sha` in [`discard_review_changes`].
@@ -4382,6 +4504,46 @@ fn finalize(
                         })
                     }
                 }
+            }
+            Err(Error::ConflictResolutionFailed {
+                branch,
+                local_sha,
+                remote_sha,
+                files,
+                detail,
+            }) => {
+                // SPEC-3.12 item 4: distinct from the generic push/
+                // PR-create failure below. `merge_remote_branch` already
+                // aborted the merge before returning this, so the agent's
+                // local commits are exactly as they were; this is a human
+                // decision (how to land past the divergence), not a hard
+                // failure of the run's own work, so it goes to Needs
+                // Review rather than Failed or a requeue.
+                warn!(
+                    key = %job.key,
+                    branch = %branch,
+                    local_sha = %local_sha,
+                    remote_sha = %remote_sha,
+                    files = %files,
+                    error = %detail,
+                    "bounded conflict-resolution pass failed; parking Needs Review"
+                );
+                let body = conflict_resolution_failed_comment(
+                    claude_result,
+                    &branch,
+                    &local_sha,
+                    &remote_sha,
+                    &files,
+                    &detail,
+                );
+                let body = note_checkpoint_rejection(body);
+                let body =
+                    crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+                if let Err(ce) = backend.comment(&job.key, &body) {
+                    warn!(key = %job.key, error = %ce, "issue comment failed (continuing to AI Agent write)");
+                }
+                backend.set_field(&job.key, &src.custom_field, &src.states.needs_review)?;
+                Ok(Finalized::NeedsReview)
             }
             Err(e) => {
                 // The error reaches the journal here (the run loop only records
@@ -5416,6 +5578,43 @@ fn pr_failure_comment(
     ]
     .join("\n");
     body.push_str(&collapsed_details("Run detail and agent summary", &detail));
+    body
+}
+
+/// SPEC-3.12 item 4: the issue comment for a diverged final push whose
+/// bounded conflict-resolution pass failed (or found its cap already
+/// spent), distinct from the generic push/PR-create failure comment: names
+/// the conflicting files and both SHAs, since that is exactly what a human
+/// resolving this by hand needs, and says the merge was aborted so the
+/// agent's local work is unchanged.
+fn conflict_resolution_failed_comment(
+    r: &ClaudeResult,
+    branch: &str,
+    local_sha: &str,
+    remote_sha: &str,
+    files: &str,
+    detail: &str,
+) -> String {
+    let mut body = [
+        format!(
+            "Claude AI agent run completed, but the final push found branch `{branch}` had \
+             diverged from the remote and the runner's bounded conflict-resolution pass \
+             (SPEC-3.12 item 4) could not resolve it. The merge was aborted; nothing was \
+             force-pushed, and the agent's local commits are unchanged."
+        ),
+        String::new(),
+        format!("Local SHA: `{local_sha}`"),
+        format!("Remote SHA: `{remote_sha}`"),
+        format!("Conflicting file(s): {files}"),
+        String::new(),
+        format!("Conflict-resolution pass failure: {detail}"),
+        String::new(),
+        r.summary.clone(),
+        String::new(),
+        format!("Cost: ${} USD", r.cost),
+    ]
+    .join("\n");
+    body.push_str(&raw_event_details(&r.raw));
     body
 }
 
@@ -10368,6 +10567,174 @@ mod tests {
             calls
                 .iter()
                 .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+            "{calls:?}"
+        );
+    }
+
+    /// A [`ConflictResolver`] that always refuses, so `finalize` falls
+    /// through to the abort path exactly as it would with no resolver
+    /// configured, but with `Error::ConflictResolutionFailed` naming the
+    /// pass's own failure instead of the generic divergence message.
+    struct AlwaysFailsResolver;
+
+    impl ConflictResolver for AlwaysFailsResolver {
+        fn resolve(
+            &self,
+            _workdir: &Path,
+            _branch: &str,
+            _local_sha: &str,
+            _remote_sha: &str,
+        ) -> Result<()> {
+            Err(Error::Other(anyhow::anyhow!(
+                "stub: the pass could not resolve this safely"
+            )))
+        }
+    }
+
+    /// SPEC-3.12 item 4, acceptance criterion 2: the final push finds the
+    /// remote branch diverged, the local merge conflicts, and the bounded
+    /// conflict-resolution pass fails. `finalize` must abort the merge
+    /// (preserving the agent's local commits), park the issue at Needs
+    /// Review rather than Failed or a requeue, and name the conflicting
+    /// file and both SHAs in the posted comment.
+    #[test]
+    fn finalize_conflict_resolution_pass_failure_parks_needs_review_naming_files_and_shas() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "localsha\n")
+                .ok(
+                    "git",
+                    &["ls-remote", "--heads", "origin", "feat/x"],
+                    "remotesha\trefs/heads/feat/x\n",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &[
+                        "fetch",
+                        "origin",
+                        "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                    ],
+                    "",
+                )
+                .fail(
+                    "git",
+                    &["merge-base", "--is-ancestor", "remotesha", "localsha"],
+                    1,
+                    "",
+                )
+                .fail(
+                    "git",
+                    &["merge", "--no-edit", "origin/feat/x"],
+                    1,
+                    "CONFLICT (content): Merge conflict in src/lib.rs",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+                    "",
+                )
+                .ok(
+                    "git",
+                    &["diff", "--name-only", "--diff-filter=U"],
+                    "src/lib.rs\n",
+                )
+                .ok("git", &["merge", "--abort"], "")
+                .ok_prefix("yt issue comment MK-16", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone())
+            .with_git_retry_waits([Duration::ZERO; 3])
+            .with_conflict_resolver(Arc::new(AlwaysFailsResolver));
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::NeedsReview);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c == "git merge --abort"),
+            "a failed pass must still abort the merge: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "a diverged conflict must never push: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("--force")),
+            "no force anywhere: {calls:?}"
+        );
+        let comment_call = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .unwrap_or_else(|| panic!("no issue comment call found: {calls:?}"));
+        assert!(
+            comment_call.contains("src/lib.rs"),
+            "names the conflicting file: {comment_call}"
+        );
+        assert!(
+            comment_call.contains("localsha"),
+            "names the local SHA: {comment_call}"
+        );
+        assert!(
+            comment_call.contains("remotesha"),
+            "names the remote SHA: {comment_call}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
             "{calls:?}"
         );
     }

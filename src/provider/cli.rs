@@ -456,6 +456,28 @@ impl CommandRunner for ProcessRunner {
     }
 }
 
+/// SPEC-3.12 item 4: a bounded, one-shot pass that resolves a real merge
+/// conflict found while landing the final push, in the same clone, instead
+/// of the runner aborting the merge immediately. The real implementation (a
+/// `claude` invocation with budget, timeout and cancellation, followed by
+/// the SPEC-3.3.2 verification gate) lives in `native::youtrack`, which
+/// alone owns `ClaudeInvoker`; this provider-layer trait is the seam that
+/// lets [`CliBackend::merge_remote_branch`] call it without this module
+/// depending on that layer. `workdir` has a conflicted merge in progress
+/// (`MERGE_HEAD` present) between the local branch and `origin/<branch>`;
+/// an implementation is expected to resolve every conflict and conclude the
+/// merge with a commit. `Ok(())` is not trusted blindly: the caller
+/// independently re-checks the merge actually concluded before proceeding.
+pub trait ConflictResolver: Send + Sync {
+    fn resolve(
+        &self,
+        workdir: &Path,
+        branch: &str,
+        local_sha: &str,
+        remote_sha: &str,
+    ) -> Result<()>;
+}
+
 /// CLI-backed provider. Holds the configurable binary names and the forge
 /// credential store path, plus the [`CommandRunner`] used to invoke them.
 pub struct CliBackend {
@@ -484,6 +506,15 @@ pub struct CliBackend {
     /// [`crate::provider::GIT_NETWORK_RETRY_WAITS`]; overridable so tests run
     /// with no delay.
     git_retry_waits: [Duration; 3],
+    /// SPEC-3.12 item 4: the bounded conflict-resolution pass to try before
+    /// [`Self::merge_remote_branch`] aborts a conflicted merge. `None` (the
+    /// default) keeps that method aborting on the first conflict exactly as
+    /// it always has.
+    conflict_resolver: Option<Arc<dyn ConflictResolver>>,
+    /// Caps the pass to one attempt per `CliBackend` instance (SPEC-3.12
+    /// item 4: "a second divergence ... aborts the merge as before"), since
+    /// one instance lives for exactly one job attempt.
+    conflict_resolve_spent: std::sync::atomic::AtomicBool,
 }
 
 /// Shape of the forge CLI key store (`~/.local/share/forgejo-cli/keys.json`):
@@ -633,6 +664,8 @@ impl CliBackend {
             notices: std::sync::Mutex::new(Vec::new()),
             fj_read_retry_waits: DEFAULT_READ_RETRY_WAITS,
             git_retry_waits: crate::provider::GIT_NETWORK_RETRY_WAITS,
+            conflict_resolver: None,
+            conflict_resolve_spent: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -651,6 +684,11 @@ impl CliBackend {
             notices: std::sync::Mutex::new(Vec::new()),
             fj_read_retry_waits: self.fj_read_retry_waits,
             git_retry_waits: self.git_retry_waits,
+            // A status probe never pushes or merges, so it never spends
+            // the resolver it was handed; each probe gets its own unspent
+            // cap regardless.
+            conflict_resolver: self.conflict_resolver.clone(),
+            conflict_resolve_spent: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -692,6 +730,16 @@ impl CliBackend {
     /// this to all-zero so a retried git call runs with no delay).
     pub fn with_git_retry_waits(mut self, waits: [Duration; 3]) -> Self {
         self.git_retry_waits = waits;
+        self
+    }
+
+    /// Inject the SPEC-3.12 item 4 bounded conflict-resolution pass (the
+    /// real `native::youtrack` implementation in production, a stub in
+    /// tests). Leaving this unset keeps [`Self::merge_remote_branch`]
+    /// aborting a conflicted merge on first sight, exactly as before this
+    /// feature existed.
+    pub fn with_conflict_resolver(mut self, resolver: Arc<dyn ConflictResolver>) -> Self {
+        self.conflict_resolver = Some(resolver);
         self
     }
 
@@ -1294,6 +1342,23 @@ impl CliBackend {
         }
     }
 
+    /// SPEC-3.12 item 4: the files `git` still lists as unmerged while a
+    /// merge conflict is open, named in the `Needs Review` comment when the
+    /// conflict-resolution pass does not clear them, and used to
+    /// independently verify a resolver's claimed success rather than
+    /// trusting its bare `Ok(())`.
+    fn conflicted_paths(&self, workdir: &Path) -> Result<Vec<String>> {
+        let args = ["diff", "--name-only", "--diff-filter=U"];
+        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        let stdout = Self::checked("git", out, &args)?;
+        Ok(stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Merge `origin/<branch>` into the local branch (CLAUDE-382),
     /// called only once `is_ancestor` has ruled out a plain fast-forward: the
     /// remote gained commits (typically the runner's own "branch was behind
@@ -1346,22 +1411,93 @@ impl CliBackend {
             remote_sha = %remote_sha,
             workdir = %workdir.display(),
             stderr = %merge_stderr,
-            "merging the remote branch into the local work conflicted; aborting the merge"
+            "merging the remote branch into the local work conflicted"
         );
-        let abort_args = ["merge", "--abort"];
-        let abort_out = self
-            .runner
-            .run_in_env(Some(workdir), "git", &abort_args, &[])?;
-        if !abort_out.ok {
-            let abort_stderr = abort_out.stderr.trim();
-            return Err(Error::Other(anyhow::anyhow!(
-                "remote branch `{branch}` has diverged from the local work (local {local_sha}, \
-                 remote {remote_sha}) and merging origin/{branch} into it conflicted \
-                 ({merge_stderr}); aborting that merge then also failed (exit {}, \
-                 {abort_stderr}). The workdir `{}` may be left mid-merge.",
-                abort_out.exit_code,
-                workdir.display()
-            )));
+
+        // SPEC-3.12 item 4: before aborting, give the configured resolver
+        // one bounded pass per `CliBackend` instance (i.e. per attempt).
+        // With no resolver configured, or the cap already spent (a second
+        // divergence in this same clone), this falls straight through to
+        // the abort-as-before path below, byte-identical to the pre-feature
+        // behavior.
+        let mut resolve_failure: Option<String> = None;
+        let mut conflicting_files: Vec<String> = Vec::new();
+        if let Some(resolver) = self.conflict_resolver.as_ref() {
+            if !self
+                .conflict_resolve_spent
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let files = self.conflicted_paths(workdir)?;
+                conflicting_files = files.clone();
+                info!(
+                    branch = %branch,
+                    files = %files.join(", "),
+                    "dispatching the bounded conflict-resolution pass (SPEC-3.12 item 4)"
+                );
+                let outcome = resolver
+                    .resolve(workdir, branch, local_sha, remote_sha)
+                    .and_then(|()| {
+                        // Never trust a resolver's bare `Ok(())`: an
+                        // unconcluded merge (or one it merely claims to
+                        // have cleared without committing) must still be
+                        // treated as a failed pass.
+                        if self.merge_head_present(workdir)? {
+                            return Err(Error::Other(anyhow::anyhow!(
+                                "the pass reported success but never concluded the merge"
+                            )));
+                        }
+                        let remaining = self.conflicted_paths(workdir)?;
+                        if !remaining.is_empty() {
+                            return Err(Error::Other(anyhow::anyhow!(
+                                "the pass reported success but left unresolved paths: {}",
+                                remaining.join(", ")
+                            )));
+                        }
+                        Ok(())
+                    });
+                match outcome {
+                    Ok(()) => {
+                        info!(branch = %branch, "conflict-resolution pass resolved the conflict; proceeding with the push");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        error!(branch = %branch, error = %e, "conflict-resolution pass failed; falling back to aborting the merge");
+                        resolve_failure =
+                            Some(format!("{e} (conflicting files: {})", files.join(", ")));
+                    }
+                }
+            }
+        }
+
+        // The resolver may have left the merge mid-flight (a failed pass
+        // that never concluded it) or already concluded it one way or
+        // another (CLAUDE-458: only abort a merge that is actually still in
+        // progress).
+        if self.merge_head_present(workdir)? {
+            let abort_args = ["merge", "--abort"];
+            let abort_out = self
+                .runner
+                .run_in_env(Some(workdir), "git", &abort_args, &[])?;
+            if !abort_out.ok {
+                let abort_stderr = abort_out.stderr.trim();
+                return Err(Error::Other(anyhow::anyhow!(
+                    "remote branch `{branch}` has diverged from the local work (local {local_sha}, \
+                     remote {remote_sha}) and merging origin/{branch} into it conflicted \
+                     ({merge_stderr}); aborting that merge then also failed (exit {}, \
+                     {abort_stderr}). The workdir `{}` may be left mid-merge.",
+                    abort_out.exit_code,
+                    workdir.display()
+                )));
+            }
+        }
+        if let Some(detail) = resolve_failure {
+            return Err(Error::ConflictResolutionFailed {
+                branch: branch.to_string(),
+                local_sha: local_sha.to_string(),
+                remote_sha: remote_sha.to_string(),
+                files: conflicting_files.join(", "),
+                detail,
+            });
         }
         Err(Error::Other(anyhow::anyhow!(
             "remote branch `{branch}` has diverged from the local work (local {local_sha}, \
@@ -6452,6 +6588,275 @@ mod tests {
             .to_string()
         };
         assert_eq!(pushed_sha, merged_local_sha);
+    }
+
+    /// Test double for [`ConflictResolver`]: actually resolves the
+    /// conflict `merge_remote_branch` left in `workdir`'s index, by writing
+    /// `resolved_content` to `path` and concluding the merge with a commit,
+    /// exactly like a real `claude` pass is expected to.
+    struct ResolvingTestResolver {
+        path: &'static str,
+        resolved_content: &'static str,
+    }
+
+    impl ConflictResolver for ResolvingTestResolver {
+        fn resolve(
+            &self,
+            workdir: &Path,
+            _branch: &str,
+            _local_sha: &str,
+            _remote_sha: &str,
+        ) -> Result<()> {
+            let _path_guard = crate::testutil::path_env_lock();
+            std::fs::write(workdir.join(self.path), self.resolved_content).unwrap();
+            let add = std::process::Command::new("git")
+                .arg("-C")
+                .arg(workdir)
+                .args(["add", self.path])
+                .output()
+                .unwrap();
+            assert!(add.status.success());
+            let commit = std::process::Command::new("git")
+                .arg("-C")
+                .arg(workdir)
+                .args(["commit", "--no-edit"])
+                .output()
+                .unwrap();
+            assert!(
+                commit.status.success(),
+                "{}",
+                String::from_utf8_lossy(&commit.stderr)
+            );
+            Ok(())
+        }
+    }
+
+    /// Test double for [`ConflictResolver`]: simulates the pass failing
+    /// outright (an unsafe conflict, a `claude` crash, a failed
+    /// SPEC-3.3.2 gate), leaving the conflicted merge exactly as
+    /// `merge_remote_branch` handed it over.
+    struct FailingTestResolver;
+
+    impl ConflictResolver for FailingTestResolver {
+        fn resolve(
+            &self,
+            _workdir: &Path,
+            _branch: &str,
+            _local_sha: &str,
+            _remote_sha: &str,
+        ) -> Result<()> {
+            Err(Error::Other(anyhow::anyhow!(
+                "stub: the pass could not resolve this safely"
+            )))
+        }
+    }
+
+    /// Shared setup for the two SPEC-3.12 item 4 real-conflict tests below:
+    /// two clones of the same origin both edit `g.txt`, diverging with a
+    /// genuine content conflict (not merely divergent history), then
+    /// returns `(origin, workdir, local_sha, remote_sha)`.
+    fn two_clones_real_conflict_setup(tmp: &Path) -> (PathBuf, PathBuf, String, String) {
+        let origin = tmp.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let git_in = |dir: &Path, args: &[&str]| {
+            let _path_guard = crate::testutil::path_env_lock();
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let rev_parse = |dir: &Path, rev: &str| -> String {
+            let _path_guard = crate::testutil::path_env_lock();
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(["rev-parse", rev])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .trim()
+            .to_string()
+        };
+
+        git_in(&origin, &["init", "-q", "-b", "main"]);
+        git_in(&origin, &["config", "user.name", "t"]);
+        git_in(&origin, &["config", "user.email", "t@t.example"]);
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-q", "-m", "init"]);
+
+        let url = format!("file://{}", origin.display());
+        let workdir = tmp.join("workdir");
+        crate::provider::shallow_clone(&url, Some("main"), &workdir, 50).unwrap();
+        git_in(&workdir, &["config", "user.name", "t"]);
+        git_in(&workdir, &["config", "user.email", "t@t.example"]);
+
+        // Common ancestor: both sides will edit this same line next.
+        git_in(&workdir, &["checkout", "-q", "-b", "feat/x"]);
+        std::fs::write(workdir.join("g.txt"), "base").unwrap();
+        git_in(&workdir, &["add", "."]);
+        git_in(&workdir, &["commit", "-q", "-m", "feat commit"]);
+        git_in(&workdir, &["push", "-q", "origin", "feat/x:feat/x"]);
+
+        // The checkpoint watcher's own edit, landing straight on the remote
+        // branch, same file as the local edit below.
+        let origin_feat = tmp.join("origin-feat-worktree");
+        git_in(
+            &origin,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                origin_feat.to_str().unwrap(),
+                "feat/x",
+            ],
+        );
+        std::fs::write(origin_feat.join("g.txt"), "remote-edit").unwrap();
+        git_in(&origin_feat, &["add", "."]);
+        git_in(&origin_feat, &["commit", "-q", "-m", "checkpoint push"]);
+        let remote_sha = rev_parse(&origin_feat, "feat/x");
+        git_in(
+            &origin,
+            &["worktree", "remove", origin_feat.to_str().unwrap()],
+        );
+
+        // The local, still-unfetched side's own edit to the same file.
+        std::fs::write(workdir.join("g.txt"), "local-edit").unwrap();
+        git_in(&workdir, &["add", "."]);
+        git_in(&workdir, &["commit", "-q", "-m", "local v2"]);
+        let local_sha = rev_parse(&workdir, "feat/x");
+
+        assert_ne!(local_sha, remote_sha, "setup must diverge");
+        (origin, workdir, local_sha, remote_sha)
+    }
+
+    /// SPEC-3.12 item 4, acceptance criterion 1: two clones editing the same
+    /// file produce a real conflict; the configured resolver resolves it and
+    /// concludes the merge, and the caller's subsequent push is a plain
+    /// fast-forward with no `--force`.
+    #[test]
+    fn merge_remote_branch_resolves_a_real_conflict_via_the_configured_resolver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (origin, workdir, local_sha, remote_sha) = two_clones_real_conflict_setup(tmp.path());
+
+        let b = CliBackend::new(Arc::new(ProcessRunner::new())).with_conflict_resolver(Arc::new(
+            ResolvingTestResolver {
+                path: "g.txt",
+                resolved_content: "merged",
+            },
+        ));
+        b.fetch_branch(&workdir, "feat/x", None).unwrap();
+        b.merge_remote_branch(&workdir, "feat/x", &local_sha, &remote_sha)
+            .unwrap();
+
+        assert!(!b.merge_head_present(&workdir).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("g.txt")).unwrap(),
+            "merged"
+        );
+
+        let _path_guard = crate::testutil::path_env_lock();
+        let push = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workdir)
+            .args(["push", "origin", "feat/x:feat/x"])
+            .output()
+            .unwrap();
+        assert!(
+            push.status.success(),
+            "push after a resolved conflict must be a plain fast-forward: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&push.stderr).contains("force"),
+            "no `--force` was ever used"
+        );
+        let pushed_sha = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["rev-parse", "feat/x"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let merged_local_sha = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&workdir)
+                .args(["rev-parse", "feat/x"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(pushed_sha, merged_local_sha);
+    }
+
+    /// SPEC-3.12 item 4, acceptance criterion 2: a resolver that fails
+    /// leaves the merge aborted exactly as the no-resolver path always has,
+    /// preserves the local work untouched, and the returned error names the
+    /// conflicting file and both SHAs.
+    #[test]
+    fn merge_remote_branch_failed_resolver_aborts_and_names_files_and_shas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_origin, workdir, local_sha, remote_sha) = two_clones_real_conflict_setup(tmp.path());
+
+        let b = CliBackend::new(Arc::new(ProcessRunner::new()))
+            .with_conflict_resolver(Arc::new(FailingTestResolver));
+        b.fetch_branch(&workdir, "feat/x", None).unwrap();
+        let err = b
+            .merge_remote_branch(&workdir, "feat/x", &local_sha, &remote_sha)
+            .unwrap_err();
+
+        match &err {
+            Error::ConflictResolutionFailed {
+                branch,
+                local_sha: got_local,
+                remote_sha: got_remote,
+                files,
+                detail,
+            } => {
+                assert_eq!(branch, "feat/x");
+                assert_eq!(got_local, &local_sha);
+                assert_eq!(got_remote, &remote_sha);
+                assert!(files.contains("g.txt"), "files: {files}");
+                assert!(detail.contains("could not resolve this safely"), "{detail}");
+            }
+            other => panic!("expected ConflictResolutionFailed, got: {other}"),
+        }
+
+        // Work preserved: the merge was aborted, so the local branch is
+        // exactly back to its own commit, with nothing left mid-merge.
+        assert!(!b.merge_head_present(&workdir).unwrap());
+        let head_sha = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&workdir)
+                .args(["rev-parse", "feat/x"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(head_sha, local_sha);
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("g.txt")).unwrap(),
+            "local-edit"
+        );
     }
 
     #[test]
