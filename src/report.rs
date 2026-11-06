@@ -566,6 +566,54 @@ pub async fn claude_usage(
     })
 }
 
+/// CLAUDE-601 / SPEC-3.14 items 1 and 7: attempts counted by `(stage,
+/// outcome)` straight from `job_outcomes`, so "succeeded on the first try" is
+/// a query and not a re-derivation from `attempt_steps`.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct StageOutcomeCount {
+    pub stage: String,
+    pub outcome: String,
+    pub count: i64,
+}
+
+/// SPEC-3.14 item 7: attempt counts by stage and outcome over the window.
+/// A row with a NULL stage or outcome (it cannot exist after the backfill
+/// migration) is an error, never silently bucketed.
+pub async fn attempts_by_outcome(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+) -> Result<Vec<StageOutcomeCount>> {
+    let cutoff = ts_cutoff(range);
+    let mut sql = String::from(
+        "SELECT stage, outcome, COUNT(*) FROM job_outcomes WHERE attempt_counted = 1",
+    );
+    if cutoff.is_some() {
+        sql.push_str(" AND ts >= ?");
+    }
+    if action.is_some() {
+        sql.push_str(" AND action_name = ?");
+    }
+    sql.push_str(" GROUP BY stage, outcome ORDER BY stage, outcome");
+    let sql = crate::db::q(pool, &sql).into_owned();
+    let mut q = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql.as_str()));
+    if let Some(c) = &cutoff {
+        q = q.bind(c);
+    }
+    if let Some(a) = action {
+        q = q.bind(a);
+    }
+    Ok(q.fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|(stage, outcome, count)| StageOutcomeCount {
+            stage,
+            outcome,
+            count,
+        })
+        .collect())
+}
+
 /// SPEC-4.3.14: one `kind`'s total duration over the window.
 #[derive(Debug, Serialize)]
 pub struct KindDuration {
@@ -711,6 +759,55 @@ mod tests {
         crate::db::test_pool().await
     }
 
+    /// CLAUDE-601: "succeeded on the first try" is a query on `job_outcomes`.
+    #[tokio::test]
+    async fn attempts_by_outcome_counts_first_try_successes() {
+        let pool = mem_pool().await;
+        let run_id = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
+        let seed = |key: &'static str, attempt: u32, stage: &'static str, outcome: &'static str| {
+            let pool = pool.clone();
+            async move {
+                state::job_outcome_insert(
+                    &pool,
+                    &JobOutcome {
+                        run_id,
+                        action_name: "alpha",
+                        job_key: key,
+                        attempt,
+                        ok: outcome == "code_review",
+                        claude_ran: true,
+                        claude_ok: true,
+                        claude_cost_usd: 0.0,
+                        attempt_counted: true,
+                        summary: None,
+                        stream_log_path: None,
+                        duration_ms: 1000,
+                        timed_out: false,
+                        stage,
+                        outcome,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+        seed("A-1", 1, "initial", "code_review").await;
+        seed("A-2", 1, "initial", "queued").await;
+        seed("A-2", 2, "retry-2", "code_review").await;
+        seed("A-3", 1, "initial", "code_review").await;
+        let rows = attempts_by_outcome(&pool, Range::All, None).await.unwrap();
+        let first_try = rows
+            .iter()
+            .find(|r| r.stage == "initial" && r.outcome == "code_review")
+            .map(|r| r.count);
+        assert_eq!(first_try, Some(2));
+        let second_try = rows
+            .iter()
+            .find(|r| r.stage == "retry-2" && r.outcome == "code_review")
+            .map(|r| r.count);
+        assert_eq!(second_try, Some(1));
+    }
+
     /// The core AC. A timestamp at 02:30 UTC on a Sunday lands on
     /// Saturday 21:30 at UTC-5 and Sunday 11:30 at UTC+9, so the weekday/hour it
     /// buckets into depends on the timezone the conversion uses, proving the
@@ -822,6 +919,8 @@ mod tests {
                 stream_log_path: None,
                 duration_ms: 1000,
                 timed_out: false,
+                stage: "initial",
+                outcome: "success",
             },
         )
         .await
@@ -1107,6 +1206,8 @@ mod tests {
                 stream_log_path: None,
                 duration_ms: 35_000,
                 timed_out: false,
+                stage: "initial",
+                outcome: "success",
             },
         )
         .await
@@ -1129,6 +1230,8 @@ mod tests {
                 stream_log_path: None,
                 duration_ms: 1000,
                 timed_out: false,
+                stage: "initial",
+                outcome: "success",
             },
         )
         .await

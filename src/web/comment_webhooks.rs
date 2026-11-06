@@ -2927,6 +2927,8 @@ async fn finish_comment_run(
         stream_log_path: stream.as_deref(),
         duration_ms: 0,
         timed_out: outcome.timed_out,
+        stage: "initial",
+        outcome: crate::attempt_steps::Outcome::from_ok(outcome.ok).as_str(),
     };
     if let Err(e) = state::job_outcome_insert(pool, &record).await {
         warn!(error = %e, "recording the comment run outcome failed");

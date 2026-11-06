@@ -1233,6 +1233,11 @@ pub struct JobOutcome<'a> {
     /// was SIGKILLed. Distinct from a hard failure (`ok = 0`, `timed_out = 0`):
     /// the UI badges it separately and the failed-job count excludes it.
     pub timed_out: bool,
+    /// SPEC-3.14 item 1: the attempt's stage (`initial`, `retry-2`, ...).
+    pub stage: &'a str,
+    /// SPEC-3.14 item 7: the attempt's outcome, an
+    /// [`crate::attempt_steps::Outcome`] string.
+    pub outcome: &'a str,
 }
 
 /// SPEC-5.2.
@@ -1245,8 +1250,8 @@ pub async fn job_outcome_insert(pool: &DbPool, r: &JobOutcome<'_>) -> Result<()>
         INSERT INTO job_outcomes (
             run_id, action_name, job_key, attempt, ts, ok,
             claude_ran, claude_ok, claude_cost_usd, attempt_counted,
-            summary, stream_log_path, duration_ms, timed_out
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            summary, stream_log_path, duration_ms, timed_out, stage, outcome
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         )
         .into_owned(),
@@ -1265,6 +1270,8 @@ pub async fn job_outcome_insert(pool: &DbPool, r: &JobOutcome<'_>) -> Result<()>
     .bind(r.stream_log_path)
     .bind(r.duration_ms)
     .bind(r.timed_out as i64)
+    .bind(r.stage)
+    .bind(r.outcome)
     .execute(pool)
     .await?;
     Ok(())
@@ -2491,6 +2498,8 @@ mod tests {
             stream_log_path: None,
             duration_ms: 10,
             timed_out: false,
+            stage: "initial",
+            outcome: "success",
         };
         // A hard failure and a timeout in the same run.
         job_outcome_insert(
@@ -2507,6 +2516,8 @@ mod tests {
             &JobOutcome {
                 job_key: "TIMEOUT-1",
                 timed_out: true,
+                stage: "initial",
+                outcome: "success",
                 ..base
             },
         )

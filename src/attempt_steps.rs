@@ -58,6 +58,60 @@ impl StepKind {
     }
 }
 
+/// SPEC-3.14 item 1: the stage an attempt belongs to, from its 1-based attempt
+/// number. `ci-remediation`, `conflict-resolution`, `review` and `final` are
+/// set by their own paths, never derived from a count.
+pub fn stage_for_attempt(attempt: u32) -> &'static str {
+    match attempt {
+        0 | 1 => "initial",
+        2 => "retry-2",
+        _ => "retry-3",
+    }
+}
+
+/// SPEC-3.14 item 7: the closed set of attempt outcomes stored in
+/// `job_outcomes.outcome`, each a row of the SPEC-3.12 table folded to what a
+/// funnel needs. `Queued` is the only non-terminal value: the issue goes back
+/// for another attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// A non-tracker job (scripted action, comment or triage run) succeeded.
+    Success,
+    /// The PR is open for review (SPEC-3.12 "Code Review").
+    CodeReview,
+    /// The `.claude-run-no-code-change` marker.
+    NoCodeChange,
+    /// Terminal, a person must act: the `Needs Review` rows (marker, timeout,
+    /// review at the cap, delivery blocked).
+    NeedsReview,
+    /// Not terminal: re-queued for another attempt.
+    Queued,
+    /// Terminal hard failure.
+    Failed,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Success => "success",
+            Outcome::CodeReview => "code_review",
+            Outcome::NoCodeChange => "no_code_change",
+            Outcome::NeedsReview => "needs_review",
+            Outcome::Queued => "queued",
+            Outcome::Failed => "failed",
+        }
+    }
+
+    /// The outcome of a job that has no tracker state machine.
+    pub fn from_ok(ok: bool) -> Self {
+        if ok {
+            Outcome::Success
+        } else {
+            Outcome::Failed
+        }
+    }
+}
+
 /// One derived step from [`derive_claude_steps`]: kind, label, start, end.
 pub type ClaudeStep = (StepKind, &'static str, DateTime<Utc>, DateTime<Utc>);
 

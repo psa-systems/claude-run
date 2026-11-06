@@ -2191,6 +2191,7 @@ async fn process_job(
     }
 
     let (ok, mut summary) = record_finalize_outcome(&claude_result, &finalize_res, post_failed);
+    let attempt_outcome = attempt_outcome_of(&finalize_res);
     let stream_log_path = stream_log.as_deref().map(|p| p.display().to_string());
 
     if !skip_attempt {
@@ -2324,6 +2325,8 @@ async fn process_job(
         stream_log_path,
         duration_ms: started.elapsed().as_millis() as i64,
         timed_out: claude_result.timed_out,
+        stage: crate::attempt_steps::stage_for_attempt(attempts + 1),
+        outcome: attempt_outcome,
     })
 }
 
@@ -4152,6 +4155,29 @@ impl Finalized {
             } => "Needs Review (review)",
             Finalized::DeliveryBlocked { .. } => "Delivery Blocked",
         }
+    }
+}
+
+/// SPEC-3.14 item 7 / SPEC-3.12 item 3: the stored outcome of an attempt, one
+/// arm per [`Finalized`] variant with no wildcard. A `finalize` that returned
+/// `Err` is a hard failure.
+fn attempt_outcome_of(finalize_res: &Result<Finalized>) -> crate::attempt_steps::Outcome {
+    use crate::attempt_steps::Outcome;
+    match finalize_res {
+        Err(_) => Outcome::Failed,
+        Ok(Finalized::NeedsReview) => Outcome::NeedsReview,
+        Ok(Finalized::NoCodeChange) => Outcome::NoCodeChange,
+        Ok(Finalized::CodeReview { .. }) => Outcome::CodeReview,
+        Ok(Finalized::Failed { requeued: true, .. }) => Outcome::Queued,
+        Ok(Finalized::Failed {
+            requeued: false, ..
+        }) => Outcome::Failed,
+        Ok(Finalized::TimedOut { .. }) => Outcome::NeedsReview,
+        Ok(Finalized::ReviewFailed { requeued: true, .. }) => Outcome::Queued,
+        Ok(Finalized::ReviewFailed {
+            requeued: false, ..
+        }) => Outcome::NeedsReview,
+        Ok(Finalized::DeliveryBlocked { .. }) => Outcome::NeedsReview,
     }
 }
 
@@ -6287,6 +6313,8 @@ async fn record_outcome(
         stream_log_path,
         duration_ms,
         timed_out,
+        stage,
+        outcome: attempt_outcome,
     } = outcome
     {
         state::job_outcome_insert(
@@ -6305,6 +6333,8 @@ async fn record_outcome(
                 stream_log_path: stream_log_path.as_deref(),
                 duration_ms: *duration_ms,
                 timed_out: *timed_out,
+                stage,
+                outcome: attempt_outcome.as_str(),
             },
         )
         .await?;

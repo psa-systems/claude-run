@@ -8607,6 +8607,8 @@ mod tests {
                         stream_log_path: None,
                         duration_ms: 1,
                         timed_out: *timed_out,
+                        stage: "initial",
+                        outcome: "success",
                     },
                 )
                 .await

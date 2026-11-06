@@ -1406,6 +1406,9 @@ async fn finish_webhook_run(
         stream_log_path: None,
         duration_ms: 0,
         timed_out: false,
+        // SPEC-3.14: the triage run belongs to the CI-failure remediation stage.
+        stage: "ci-remediation",
+        outcome: crate::attempt_steps::Outcome::from_ok(ok).as_str(),
     };
     if let Err(e) = state::job_outcome_insert(pool, &outcome).await {
         warn!(error = %e, "recording webhook run outcome failed");
