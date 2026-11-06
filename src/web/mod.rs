@@ -6877,7 +6877,6 @@ async fn run_detail(
     // Job outcomes: filter on the OK / Claude / Counted dropdowns, then sort by
     // the chosen column. Default (no `out_sort`) keeps the `id ASC` order from
     // the query above.
-    let mut outcomes = outcomes;
     let has_outcomes = !outcomes.is_empty();
     if !sort.out_ok.is_empty() {
         let want = sort.out_ok == "true";
