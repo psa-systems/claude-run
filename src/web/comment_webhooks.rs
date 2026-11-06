@@ -1132,7 +1132,7 @@ async fn reply(
         return;
     }
     let path = dir.join(PR_COMMENT_FILE);
-    if let Err(e) = std::fs::write(&path, addressed(cmd, body)) {
+    if let Err(e) = std::fs::write(&path, addressed(cmd, with_run_footer(cmd, body))) {
         warn!(error = %e, "writing the reply body failed; skipping the reply");
     } else {
         let backend = &env.backend;
@@ -2523,7 +2523,7 @@ fn post_reply(backend: &dyn Backend, cmd: &VerifiedCommentCommand, dir: &FsPath,
         return;
     }
     let path = dir.join(PR_COMMENT_FILE);
-    match std::fs::write(&path, addressed(cmd, body)) {
+    match std::fs::write(&path, addressed(cmd, with_run_footer(cmd, body))) {
         Ok(()) => {
             if let Err(e) = post_on_thread(backend, cmd, &path) {
                 warn!(repo = %cmd.repo, number = cmd.number, error = %e, "posting the reply failed (continuing)");
@@ -2542,6 +2542,31 @@ fn post_reply(backend: &dyn Backend, cmd: &VerifiedCommentCommand, dir: &FsPath,
 /// of it.
 fn with_verdict(verdict: &str, body: String) -> String {
     format!("**{verdict}**\n\n{body}")
+}
+
+/// SPEC-3.9: "Every runner-posted comment ... webhook replies ... appends a
+/// footer." The rejection, help and outcome replies post before (or beside) a
+/// run row and have no run id to hand, so the footer says so explicitly
+/// ("no run id is available") instead of omitting the line. The trigger is the
+/// asker's `/claude` command, or the runner's own dispatch for a synthetic one.
+fn with_run_footer(cmd: &VerifiedCommentCommand, body: String) -> String {
+    let trigger = if cmd.synthetic {
+        crate::run_footer::Trigger::WebhookEvent {
+            source: "runner-dispatched comment command".to_string(),
+        }
+    } else {
+        crate::run_footer::Trigger::UserCommand {
+            login: cmd.author.clone(),
+        }
+    };
+    crate::run_footer::append_run(
+        &body,
+        crate::run_footer::resolved_public_url().as_deref(),
+        None,
+        None,
+        COMMENT_WEBHOOK_SOURCE,
+        Some(&trigger),
+    )
 }
 
 /// CLAUDE-552: `body` addressed to the commenter, so they are notified and
@@ -4184,6 +4209,38 @@ mod tests {
         );
         cmd.synthetic = true;
         assert_eq!(addressed(&cmd, cap_comment()), cap_comment());
+    }
+
+    /// CLAUDE-602 / SPEC-3.9: a rejection reply carries the run footer, with
+    /// the explicit no-run-id line, and still opens with the asker's mention.
+    #[test]
+    fn rejection_replies_carry_the_run_footer() {
+        let cmd = command_of(&payload_json(
+            "created",
+            REPO,
+            "/claude fix it",
+            "alice",
+            true,
+        ))
+        .unwrap();
+        for body in [
+            busy_comment(true),
+            denied_comment(&PermissionVerdict::Denied("read".to_string()), &[]),
+            too_long_comment(9000, 4000),
+            cap_comment(),
+            login_required_comment("Claude login required"),
+        ] {
+            let posted = addressed(&cmd, with_run_footer(&cmd, body));
+            assert!(posted.starts_with("@alice "), "{posted}");
+            assert!(
+                posted.contains("Run: ") && posted.contains("Source: comment-webhook"),
+                "{posted}"
+            );
+            assert!(
+                posted.contains("Trigger: /claude command from alice"),
+                "{posted}"
+            );
+        }
     }
 
     #[test]
