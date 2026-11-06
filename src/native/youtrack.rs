@@ -4483,8 +4483,13 @@ fn finalize(
                         } else {
                             &src.states.needs_review
                         };
-                        let body =
-                            review_findings_comment(claude_result, &url, findings, no_verdict);
+                        let body = review_findings_comment(
+                            claude_result,
+                            &url,
+                            findings,
+                            no_verdict,
+                            requeued,
+                        );
                         let body = text_refresh_note(body);
                         let body = push_comment_note(body);
                         let body = append_compaction_note(&body, stream_log, &job.key);
@@ -5468,15 +5473,35 @@ fn review_findings_comment(
     pr_url: &str,
     findings: &str,
     no_verdict: bool,
+    // SPEC-3.12 item 6: whether this outcome requeues automatically (below
+    // the attempt cap) or parks for a human, so the single named action
+    // matches what `finalize` actually does instead of always claiming a
+    // human decision is pending even when the issue is about to retry on
+    // its own.
+    requeued: bool,
 ) -> String {
     let cause = if no_verdict {
         "the post-success review gave no usable verdict"
     } else {
         "the post-success review found problems"
     };
-    let outcome = format!("The PR is left as a draft pending a human decision: {pr_url}");
-    let mut body =
-        format!("**Claude AI agent run completed; Needs Review.**\n\n- {cause}\n- {outcome}");
+    let outcome = if requeued {
+        format!(
+            "The PR is left as a draft and this issue is re-queued to retry below its attempt cap: {pr_url}"
+        )
+    } else {
+        format!(
+            "The PR is left as a draft pending a human decision: fix the findings and re-queue it (set AI Agent = Queued), or close the PR: {pr_url}"
+        )
+    };
+    let label = if no_verdict {
+        "**Claude AI agent run completed; Needs Review.**"
+    } else if requeued {
+        "**Claude AI agent run completed; re-queued for retry.**"
+    } else {
+        "**Claude AI agent run completed; Needs Review.**"
+    };
+    let mut body = format!("{label}\n\n- {cause}\n- {outcome}");
     let detail = [
         "Review findings:".to_string(),
         String::new(),
@@ -11376,12 +11401,16 @@ mod tests {
 
     #[test]
     fn review_findings_comment_is_capped_at_three_bullets_and_leads_with_the_cause() {
-        for no_verdict in [false, true] {
+        // `requeued` is only ever `true` when `no_verdict` is `false` (a
+        // `NoVerdict` always parks for a human), mirroring the real call
+        // site's `requeued = !no_verdict && attempts_after < cap`.
+        for (no_verdict, requeued) in [(false, false), (false, true), (true, false)] {
             let body = review_findings_comment(
                 &ok_result(),
                 "https://dev.a8n.run/contoso/claude-run/pulls/42",
                 "- some finding\n- another finding",
                 no_verdict,
+                requeued,
             );
             let lead = body
                 .split("\n\n<details>")
@@ -11406,6 +11435,20 @@ mod tests {
                 lead.contains("https://dev.a8n.run/contoso/claude-run/pulls/42"),
                 "the draft PR must still be named outside <details>: {body}"
             );
+            // SPEC-3.12 item 6: the comment must name the one true action,
+            // never claim a human decision is pending when this issue is
+            // about to retry on its own.
+            if requeued {
+                assert!(
+                    body.contains("re-queued to retry") && !body.contains("human decision"),
+                    "requeued={requeued}: must not claim a pending human decision: {body}"
+                );
+            } else {
+                assert!(
+                    body.contains("human decision"),
+                    "requeued={requeued}: must name the pending human decision: {body}"
+                );
+            }
             assert!(
                 body.contains("some finding"),
                 "the findings must still be reachable, in the collapsed detail: {body}"
