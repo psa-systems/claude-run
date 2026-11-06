@@ -1252,6 +1252,7 @@ impl Forge for GithubForge {
                 state: "merged".to_string(),
                 mergeable: None,
                 behind_base: None,
+                conflicted: None,
                 head_sha: None,
             });
         }
@@ -1275,11 +1276,14 @@ impl Forge for GithubForge {
                 )))
             }
         };
+        // Only `DIRTY` is a conflict verdict; anything else stays unknown.
+        let conflicted = (doc.merge_state_status == "DIRTY").then_some(true);
         if state_upper == "CLOSED" {
             return Ok(super::PrStatus {
                 state: "closed".to_string(),
                 mergeable,
                 behind_base,
+                conflicted,
                 head_sha: Some(doc.head_ref_oid),
             });
         }
@@ -1326,6 +1330,7 @@ impl Forge for GithubForge {
             state,
             mergeable,
             behind_base,
+            conflicted,
             head_sha: Some(sha),
         })
     }
@@ -4017,6 +4022,7 @@ mod tests {
                 state: "success".to_string(),
                 mergeable: Some(true),
                 behind_base: Some(false),
+                conflicted: None,
                 head_sha: Some("abc123".to_string()),
             }
         );
@@ -4078,6 +4084,16 @@ mod tests {
         let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.mergeable, Some(false));
+        assert_eq!(status.conflicted, Some(true), "DIRTY is a conflict verdict");
+    }
+
+    #[test]
+    fn pr_status_non_dirty_leaves_conflicted_unknown() {
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(status.conflicted, None);
     }
 
     #[test]
@@ -4104,6 +4120,7 @@ mod tests {
                 state: "merged".to_string(),
                 mergeable: None,
                 behind_base: None,
+                conflicted: None,
                 head_sha: None,
             }
         );

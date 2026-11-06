@@ -2387,6 +2387,10 @@ impl Forge for CliBackend {
             // `None`: unknown, never collapsed to `false`.
             #[serde(default)]
             behind_base: Option<bool>,
+            // Absent (an `fj` predating FJ-124) or explicit `null` parse to
+            // `None`: unknown, never `false`.
+            #[serde(default)]
+            conflicted: Option<bool>,
             // Absent (an `fj` predating this field) or explicit `null` (a merged
             // PR) both parse to `None`.
             #[serde(default)]
@@ -2397,6 +2401,7 @@ impl Forge for CliBackend {
             state: status.state,
             mergeable: status.mergeable,
             behind_base: status.behind_base,
+            conflicted: status.conflicted,
             head_sha: status.head_sha,
         })
     }
@@ -6743,6 +6748,38 @@ mod tests {
             .pr_status("dev.a8n.run", "contoso/claude-run", 52)
             .unwrap();
         assert_eq!(st.behind_base, None);
+    }
+
+    #[test]
+    fn pr_status_conflicted_true_false_null_and_absent() {
+        // FJ-124: `true`/`false` parse as given; `null` and an absent key (an
+        // older `fj`) are unknown (`None`), never `false`.
+        for (extra, want) in [
+            (r#","conflicted":true"#, Some(true)),
+            (r#","conflicted":false"#, Some(false)),
+            (r#","conflicted":null"#, None),
+            ("", None),
+        ] {
+            let json = format!(
+                r#"{{"pr":52,"head_sha":"abc","state":"success","statuses":[],"mergeable":false,"merged":false{extra}}}"#
+            );
+            let b = backend(StubRunner::new().ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "status",
+                    "contoso/claude-run#52",
+                    "--json",
+                ],
+                &json,
+            ));
+            let st = b
+                .pr_status("dev.a8n.run", "contoso/claude-run", 52)
+                .unwrap();
+            assert_eq!(st.conflicted, want, "payload extra {extra:?}");
+        }
     }
 
     #[test]

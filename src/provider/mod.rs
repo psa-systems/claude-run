@@ -122,6 +122,12 @@ pub struct PrStatus {
     /// `fj` predating that field, or a value Forgejo has not computed yet).
     #[serde(default)]
     pub behind_base: Option<bool>,
+    /// Whether the PR's head conflicts with its base, separate from
+    /// `mergeable` (a draft PR reports `mergeable: false` conflict or not).
+    /// `None` is unknown (an `fj` predating FJ-124, or no verdict yet), never
+    /// collapsed to `false`.
+    #[serde(default)]
+    pub conflicted: Option<bool>,
     /// The PR head commit SHA. `None` for a merged PR or an `fj` predating
     /// this field; used to bound a conflict auto-resolve dispatch to one
     /// attempt per head commit (CLAUDE-380).

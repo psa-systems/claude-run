@@ -353,8 +353,9 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   later success event re-evaluates and merges once that run goes green; a PR whose checks are green but the forge
   still reports it not mergeable (`mergeable: false`) gets a `/claude` conflict-resolution run, as does a non-WIP
   runner PR whose checks failed and that reports `mergeable: false`; a PR with no run to send is left at Code Review
-  for a human, as is a merge call that fails after the mergeable check passed. A Forgejo WIP PR reports `mergeable: false` whether or not it conflicts,
-  so it is not routed until `fj` reports a conflict field (FJ-124, CLAUDE-572). The conflict run clones the head
+  for a human, as is a merge call that fails after the mergeable check passed. A Forgejo WIP PR reports
+  `mergeable: false` whether or not it conflicts, so it is routed only when `fj` reports `conflicted: true` (FJ-124,
+  CLAUDE-572), under the same per-PR bound as any other PR. The conflict run clones the head
   branch with the base branch's full history, so the merge base is present. When the behind-base update
   itself fails because of a merge conflict, the runner dispatches the same `/claude` conflict-resolution run instead
   of leaving it to a human. Conflict-resolution runs are bounded per PR, not per head commit (CLAUDE-550): at most

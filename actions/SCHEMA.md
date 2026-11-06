@@ -479,10 +479,10 @@ and dispatches on `behind_base` first, since Forgejo's `mergeable` never reflect
 - **Green, `behind_base: false`, and not mergeable** (a real conflict, still-checking, or a WIP PR): the handler
   dispatches a conflict-resolution run through the `concurrency.max_ci_in_flight_per_repo` gate (CLAUDE-547) and
   comments that it is resolving the conflict (attempt n of `webhook_comment.agent_conflict_resolve_attempts`,
-  CLAUDE-550); a WIP PR is skipped. With no run to send it comments
-  that the PR is not mergeable and leaves the issue at Code Review.
-- **Failed checks and not mergeable** (CLAUDE-547): a non-WIP PR gets the same resolution run; with none to send,
-  no action.
+  CLAUDE-550); a WIP PR is skipped unless `fj` reports `conflicted: true` (CLAUDE-572). With no run to send it
+  comments that the PR is not mergeable and leaves the issue at Code Review.
+- **Failed checks and not mergeable** (CLAUDE-547): a non-WIP PR (or a WIP PR with `conflicted: true`) gets the same
+  resolution run; with none to send, no action.
 - **Conflict-resolution bound** (CLAUDE-550): every path above that dispatches a conflict-resolution run (including
   a branch update that fails on a conflict) shares one per-PR budget, `webhook_comment.agent_conflict_resolve_attempts`
   (default 2), and never runs two at once. When the budget is spent and the PR still conflicts, the issue gets one
