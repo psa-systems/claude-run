@@ -1933,6 +1933,25 @@ pub async fn run_events_for_run(pool: &DbPool, run_id: i64) -> Result<Vec<RunEve
     Ok(rows)
 }
 
+/// The most recently recorded `job_outcomes.summary` for `job_key`, across
+/// every action and run, or `None` when the key has never completed a
+/// counted attempt. Backs the stuck-Working sweep's correction comment
+/// (SPEC-3.12 item 2), which names the last recorded step alongside the
+/// cause rather than only the cause.
+pub async fn last_job_outcome_summary(pool: &DbPool, job_key: &str) -> Result<Option<String>> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT summary FROM job_outcomes WHERE job_key = ? ORDER BY id DESC LIMIT 1",
+        )
+        .into_owned(),
+    ))
+    .bind(job_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(s,)| s))
+}
+
 /// The recorded `stream_log_path` (and the attempt it belongs to) for one
 /// job's attempt in one run. `attempt = None` resolves to that job's latest
 /// attempt. Returns `None` when no `job_outcomes` row matches at all (unknown

@@ -770,6 +770,204 @@ fn sanitize_key(key: &str) -> String {
     key.replace(['/', '\\', '.'], "_")
 }
 
+/// `run_events` context tag for every correction the stuck-Working sweep
+/// records, so the dashboard can list them as one group (SPEC-3.12 item 2).
+const STUCK_WORKING_SWEEP_CONTEXT: &str = "stuck-working-sweep";
+
+/// Comment posted when the sweep moves an issue off `Working` because no
+/// live run backs it. SPEC-3.12 item 2: "a comment naming the cause and the
+/// last recorded step".
+fn stuck_working_comment(last_step: Option<&str>) -> String {
+    let step = last_step.unwrap_or("no recorded step");
+    format!(
+        "This issue was left on `AI Agent = Working` with no live run backing it: the \
+         attempt that set it ended without finalizing. Last recorded step: {step}."
+    )
+}
+
+/// SPEC-3.12 item 2: the periodic reconcile sweep for a daemon that stays up
+/// while a run exits without finalizing (a crash, a kill outside the
+/// runner's own exit paths, or a bug). Unlike [`reconcile_restart_inflight`]
+/// (startup only, driven by leftover `run_inflight_jobs` rows a dead process
+/// left behind), this runs on every tick of a LIVE daemon
+/// ([`crate::daemon::AUTOMERGE_RECONCILE_TICK_SECS`]): for each `kind:
+/// youtrack` action it lists every issue that action's own tracker reports
+/// as `Working`, and corrects any key with no row in `run_inflight_jobs`
+/// among that action's currently open runs. A key with a live in-flight row
+/// is backed by a real run and is left untouched.
+///
+/// Each stuck key is moved to `states.queued` when its recorded attempt
+/// count is below the action's `max_attempts_per_key`, else
+/// `states.needs_review`, with a comment naming the cause and the last
+/// recorded step, and a `run_events` row (fixed [`STUCK_WORKING_SWEEP_CONTEXT`])
+/// so the dashboard can list the correction. Writes go through
+/// [`provider::AuditedTracker`] with no run id, exactly like the webhook
+/// mint path's own run-less writes: every write is still journaled and
+/// capped (CLAUDE-234) even though this correction belongs to no run.
+///
+/// Never aborts on one action's or one key's failure: a tracker read
+/// failure is logged at `error` and that action's issues are left for the
+/// next tick, never treated as "nothing stuck" (SPEC-3.12 item 2); a
+/// credential or write failure for one action or key is logged and the next
+/// one is still tried.
+pub async fn reconcile_stuck_working(
+    pool: &DbPool,
+    paths: &Paths,
+    runner: &Arc<dyn CommandRunner>,
+) {
+    let rows = match state::action_index_list(pool).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!(error = %e, "stuck-working sweep: reading the action index failed; nothing swept this tick");
+            return;
+        }
+    };
+
+    let cred_root = paths
+        .runtime_dir
+        .join("credentials")
+        .join("stuck-working-sweep");
+    let defaults = RunnerDefaults::default();
+
+    for row in rows.iter().filter(|r| r.parse_error.is_none()) {
+        let loaded = match action::load_from_path(Path::new(&row.file_path)) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(action = %row.name, error = %e, "stuck-working sweep: action failed to parse; skipped this tick");
+                continue;
+            }
+        };
+        let cfg = match &loaded.action.native {
+            Some(NativeConfig::Youtrack(cfg)) => cfg,
+            _ => continue,
+        };
+        let src = &cfg.youtrack;
+        let action_name = &loaded.action.name;
+        let max_attempts_per_key = job::effective_limits(&defaults, &loaded).max_attempts_per_key;
+
+        let creds = match secrets::resolve_youtrack_credentials(
+            pool,
+            src,
+            &cfg.forgejo,
+            &cfg.github,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                error!(action = %action_name, error = %e, "stuck-working sweep: resolving credentials failed; action skipped this tick");
+                continue;
+            }
+        };
+        // Held alive for the whole action so its temp credential files
+        // outlive every key's tracker call below; dropped (and scrubbed) at
+        // the end of this action's iteration.
+        let mut _guard: Option<JobCredentials> = None;
+        let backend: CliBackend = if creds.is_empty() {
+            CliBackend::new(runner.clone())
+        } else {
+            let dir = cred_root.join(format!(
+                "{}-{}",
+                sanitize_key(action_name),
+                secrets::unique_suffix()
+            ));
+            match JobCredentials::materialize(&dir, &creds, None) {
+                Ok(g) => {
+                    let b = credentialed_backend(runner, &g);
+                    _guard = Some(g);
+                    b
+                }
+                Err(e) => {
+                    error!(action = %action_name, error = %e, "stuck-working sweep: materializing credentials failed; action skipped this tick");
+                    continue;
+                }
+            }
+        };
+
+        let audit = IssueWriteAudit::new(None, defaults.max_issues_per_run);
+        let tracker = AuditedTracker::new(&backend, audit);
+
+        let query = format!("{}: {}", src.custom_field, src.states.working);
+        let issues = match tracker.list_queued(&query) {
+            Ok(i) => i,
+            Err(e) => {
+                error!(action = %action_name, query = %query, error = %e, "stuck-working sweep: tracker read failed; nothing swept this tick for this action");
+                continue;
+            }
+        };
+        if issues.is_empty() {
+            continue;
+        }
+
+        let inflight: std::collections::HashSet<String> = match state::action_inflight_keys(
+            pool,
+            action_name,
+        )
+        .await
+        {
+            Ok(keys) => keys.into_iter().collect(),
+            Err(e) => {
+                error!(action = %action_name, error = %e, "stuck-working sweep: reading in-flight keys failed; action skipped this tick");
+                continue;
+            }
+        };
+
+        for issue in &issues {
+            let Some(key) = issue.get("idReadable").and_then(|v| v.as_str()) else {
+                warn!(action = %action_name, "stuck-working sweep: skipping issue with no idReadable");
+                continue;
+            };
+            if inflight.contains(key) {
+                info!(action = %action_name, key = %key, "stuck-working sweep: Working and backed by a live run; left alone");
+                continue;
+            }
+
+            let attempts = match state::attempts_get(pool, action_name, key).await {
+                Ok(a) => a,
+                Err(e) => {
+                    error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: reading the attempt count failed; key left on Working until the next tick");
+                    continue;
+                }
+            };
+            let target = if attempts < max_attempts_per_key {
+                &src.states.queued
+            } else {
+                &src.states.needs_review
+            };
+
+            let last_step = state::last_job_outcome_summary(pool, key)
+                .await
+                .unwrap_or(None);
+            let comment = stuck_working_comment(last_step.as_deref());
+            let comment = crate::run_footer::append_run(
+                &comment,
+                crate::run_footer::resolved_public_url().as_deref(),
+                None,
+                None,
+                "youtrack",
+                None,
+            );
+
+            if let Err(e) = comment_then_field(&tracker, src, key, &comment, target) {
+                error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: correction write failed; key left on Working until the next tick");
+                continue;
+            }
+            warn!(action = %action_name, key = %key, target = %target, "stuck-working sweep: corrected an issue stranded on Working with no live run backing it");
+
+            let event = state::InputEvent {
+                level: "warn".into(),
+                context: Some(STUCK_WORKING_SWEEP_CONTEXT.into()),
+                message: format!("{key}: moved off Working (no live run) to {target}"),
+            };
+            if let Err(e) =
+                state::run_events_record(pool, action_name, &state::now_iso(), &[event]).await
+            {
+                warn!(action = %action_name, key = %key, error = %e, "stuck-working sweep: recording the run_events row failed (the correction itself already landed)");
+            }
+        }
+    }
+}
+
 /// The gather step's credential directory, unique per poll.
 ///
 /// Every [`JobCredentials::materialize`] path must be unique per guard, because
