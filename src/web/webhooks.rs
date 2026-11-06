@@ -5461,6 +5461,7 @@ async fn apply_automerge_decision(
                         )
                         .await;
                         let push_comment_failure = post_branch_updated_push_comment(
+                            pool,
                             forge.clone(),
                             host,
                             repo,
@@ -6079,6 +6080,7 @@ async fn post_issue_comment(
 /// on: it is logged at `error` inside [`crate::push_comment::post`] and
 /// returned here for the caller to fold into its own outcome.
 async fn post_branch_updated_push_comment(
+    pool: &DbPool,
     forge: Arc<dyn Forge>,
     host: &str,
     repo: &str,
@@ -6090,6 +6092,13 @@ async fn post_branch_updated_push_comment(
     let repo = repo.to_string();
     let issue_key = issue_key.to_string();
     let old_sha = old_sha.map(str::to_string);
+    // SPEC-3.15 item 5, SPEC-8.8: the list is rendered from the key's stored
+    // `attempt_steps` rows, read here because the blocking task has no pool.
+    let list_ctx = crate::progress_list::context_for(pool, None, &issue_key).await;
+    let progress = crate::progress_list::render_push_with(
+        &list_ctx,
+        crate::push_comment::PushEvent::BranchUpdatedFromBase,
+    );
     tokio::task::spawn_blocking(move || {
         let public_url = crate::run_footer::resolved_public_url();
         let ctx = crate::push_comment::PushCommentContext {
@@ -6102,8 +6111,7 @@ async fn post_branch_updated_push_comment(
             public_url: public_url.as_deref(),
             run_id: None,
             started: None,
-            // TODO(CLAUDE-603): no stored step rows reach this provider-level site yet.
-            progress: None,
+            progress: Some(&progress),
         };
         // A directory scoped to this one call, not the bare shared
         // `std::env::temp_dir()` (CLAUDE-519): `push_comment::post` names its
@@ -12823,10 +12831,12 @@ mod tests {
         #[tokio::test]
         async fn concurrent_branch_updated_push_comments_for_the_same_pr_do_not_corrupt_each_other()
         {
+            let pool = crate::db::test_pool().await;
             let backend = Arc::new(StoreBackend::new());
             let forge: Arc<dyn crate::provider::Forge> = backend.clone();
             let (left, right) = tokio::join!(
                 post_branch_updated_push_comment(
+                    &pool,
                     forge.clone(),
                     "dev.a8n.run",
                     "contoso/claude-run",
@@ -12835,6 +12845,7 @@ mod tests {
                     Some("aaaaaaaaaaaaaaaa"),
                 ),
                 post_branch_updated_push_comment(
+                    &pool,
                     forge.clone(),
                     "dev.a8n.run",
                     "contoso/claude-run",

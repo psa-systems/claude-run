@@ -2402,14 +2402,18 @@ fn post_fix_push_comment(
         Err(_) => crate::push_comment::CommitSubjects::Unavailable,
     };
     let public_url = crate::run_footer::resolved_public_url();
+    // CLAUDE-550: a synthetic command is the automerge conflict
+    // auto-resolve, the only runner-dispatched command today.
+    let event = if cmd.synthetic {
+        crate::push_comment::PushEvent::ConflictResolvePush
+    } else {
+        crate::push_comment::PushEvent::CommentWebhookFixPush
+    };
+    // SPEC-3.15 item 5, SPEC-8.8: a comment-driven run stores no steps, so the
+    // list is this comment's own line unless a context was stashed for the key.
+    let progress = crate::progress_list::render_push(&issue_key, event);
     let ctx = crate::push_comment::PushCommentContext {
-        // CLAUDE-550: a synthetic command is the automerge conflict
-        // auto-resolve, the only runner-dispatched command today.
-        event: if cmd.synthetic {
-            crate::push_comment::PushEvent::ConflictResolvePush
-        } else {
-            crate::push_comment::PushEvent::CommentWebhookFixPush
-        },
+        event,
         issue_key: &issue_key,
         draft: false,
         old_sha: Some(cloned_head),
@@ -2418,8 +2422,7 @@ fn post_fix_push_comment(
         public_url: public_url.as_deref(),
         run_id: None,
         started: None,
-        // TODO(CLAUDE-603): no stored step rows reach this provider-level site yet.
-        progress: None,
+        progress: Some(&progress),
     };
     let scratch = git_dir_scratch(workdir).unwrap_or_else(|_| std::env::temp_dir());
     crate::push_comment::post(backend, &cmd.host, &cmd.repo, cmd.number, &scratch, &ctx)
