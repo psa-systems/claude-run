@@ -669,6 +669,13 @@ pub struct MintConfig {
     /// routes to `human_action` instead, naming the base branch as the place to
     /// fix. Default `["renovate/"]`.
     pub bot_branch_prefixes: Vec<String>,
+    /// Tag added alongside the `Needs Review` write when the agent's own PR
+    /// hits the CI-fix attempt ceiling (the loop-breaker or the hard-cap
+    /// park in [`crate::web::webhooks::route_agent_pr_failure`]), mirroring
+    /// `tags.needs_info` on the `youtrack` action (CLAUDE-373). An empty
+    /// value disables the tag write. SPEC-3.12 item 3: "CI remediation
+    /// ceiling reached | `Needs Review` with `Needs-Info`".
+    pub needs_info_tag: String,
 }
 
 impl Default for MintConfig {
@@ -684,6 +691,7 @@ impl Default for MintConfig {
             queued_value: "Queued".to_string(),
             auto_fix: AutoFixConfig::default(),
             bot_branch_prefixes: vec!["renovate/".to_string()],
+            needs_info_tag: "Needs-Info".to_string(),
         }
     }
 }

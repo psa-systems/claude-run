@@ -795,13 +795,29 @@ pub(crate) const STUCK_WORKING_SWEEP_CONTEXT: &str = "stuck-working-sweep";
 
 /// Comment posted when the sweep moves an issue off `Working` because no
 /// live run backs it. SPEC-3.12 item 2: "a comment naming the cause and the
-/// last recorded step".
-fn stuck_working_comment(last_step: Option<&str>) -> String {
+/// last recorded step". When the correction lands on `Needs Review` (the key
+/// is at its attempt cap), SPEC-3.12 item 6 also requires the comment to name
+/// the one action a human can take; `at_cap` adds the same action line
+/// [`cap_reached_comment`] uses for the pickup-time attempt-cap park, since
+/// this is that same park reached from the sweep instead of pickup. No
+/// `Needs-Info` tag is added for either park: CLAUDE-373 (`actions/SCHEMA.md`)
+/// documents that the attempt-cap park never writes it.
+fn stuck_working_comment(last_step: Option<&str>, at_cap: bool) -> String {
     let step = last_step.unwrap_or("no recorded step");
-    format!(
+    let mut body = format!(
         "This issue was left on `AI Agent = Working` with no live run backing it: the \
          attempt that set it ended without finalizing. Last recorded step: {step}."
-    )
+    );
+    if at_cap {
+        body.push_str(
+            "\n\nThis was also its last attempt under the action's attempt cap: \
+             re-queueing it alone will not retry it, since the attempt counter is not \
+             cleared by re-queueing or by a successful run. To retry it, raise the \
+             action's `limits.max_attempts_per_key`, or reset this key's counter once \
+             CLAUDE-238 lands.",
+        );
+    }
+    body
 }
 
 /// SPEC-3.12 item 2: the periodic reconcile sweep for a daemon that stays up
@@ -976,10 +992,11 @@ pub async fn reconcile_stuck_working(
                     continue;
                 }
             };
-            let target = if attempts < max_attempts_per_key {
-                &src.states.queued
-            } else {
+            let at_cap = attempts >= max_attempts_per_key;
+            let target = if at_cap {
                 &src.states.needs_review
+            } else {
+                &src.states.queued
             };
 
             // The correction must still post when the lookup fails, so the
@@ -991,7 +1008,7 @@ pub async fn reconcile_stuck_working(
                     Some("unreadable (the lookup failed; see the daemon log)".to_string())
                 }
             };
-            let comment = stuck_working_comment(last_step.as_deref());
+            let comment = stuck_working_comment(last_step.as_deref(), at_cap);
             let comment = crate::run_footer::append_run(
                 &comment,
                 crate::run_footer::resolved_public_url().as_deref(),
@@ -4596,8 +4613,13 @@ fn finalize(
                         } else {
                             &src.states.needs_review
                         };
-                        let body =
-                            review_findings_comment(claude_result, &url, findings, no_verdict);
+                        let body = review_findings_comment(
+                            claude_result,
+                            &url,
+                            findings,
+                            no_verdict,
+                            requeued,
+                        );
                         let body = text_refresh_note(body);
                         let body = push_comment_note(body);
                         let body = append_compaction_note(&body, stream_log, &job.key);
@@ -4904,6 +4926,10 @@ fn finalize(
         if let Err(e) = backend.comment(&job.key, &body) {
             warn!(key = %job.key, error = %e, "timeout comment failed (continuing)");
         }
+        // SPEC-3.12 item 5: a draft PR opened by the salvage above is never
+        // left standing in for a state; this write (or the deliberate
+        // human-override skip) always pairs it with a field from the closed
+        // set.
         if is_working {
             backend.set_field(&job.key, &src.custom_field, &src.states.needs_review)?;
         } else {
@@ -5273,6 +5299,13 @@ pub(crate) fn automerge_merge_failed_comment(pr_url: &str, error: &str) -> Strin
 /// stale-attempts banner keeps showing the key), so each write is attempted
 /// independently and a failure of either logs at `error` naming the key and
 /// the cause.
+///
+/// SPEC-3.12 item 6 audit (CLAUDE-582): [`cap_reached_comment`] already names
+/// the one action a human can take (raise the cap or reset the counter), so
+/// this site satisfies the "states one action" half of item 6. It does not
+/// write the `Needs-Info` tag; that is CLAUDE-373's documented carve-out
+/// (`actions/SCHEMA.md`: "the attempt-cap park... never write[s] this tag"),
+/// not an oversight this issue should change.
 #[allow(clippy::too_many_arguments)]
 fn report_cap_reached(
     backend: &dyn IssueTracker,
@@ -5581,15 +5614,35 @@ fn review_findings_comment(
     pr_url: &str,
     findings: &str,
     no_verdict: bool,
+    // SPEC-3.12 item 6: whether this outcome requeues automatically (below
+    // the attempt cap) or parks for a human, so the single named action
+    // matches what `finalize` actually does instead of always claiming a
+    // human decision is pending even when the issue is about to retry on
+    // its own.
+    requeued: bool,
 ) -> String {
     let cause = if no_verdict {
         "the post-success review gave no usable verdict"
     } else {
         "the post-success review found problems"
     };
-    let outcome = format!("The PR is left as a draft pending a human decision: {pr_url}");
-    let mut body =
-        format!("**Claude AI agent run completed; Needs Review.**\n\n- {cause}\n- {outcome}");
+    let outcome = if requeued {
+        format!(
+            "The PR is left as a draft and this issue is re-queued to retry below its attempt cap: {pr_url}"
+        )
+    } else {
+        format!(
+            "The PR is left as a draft pending a human decision: fix the findings and re-queue it (set AI Agent = Queued), or close the PR: {pr_url}"
+        )
+    };
+    let label = if no_verdict {
+        "**Claude AI agent run completed; Needs Review.**"
+    } else if requeued {
+        "**Claude AI agent run completed; re-queued for retry.**"
+    } else {
+        "**Claude AI agent run completed; Needs Review.**"
+    };
+    let mut body = format!("{label}\n\n- {cause}\n- {outcome}");
     let detail = [
         "Review findings:".to_string(),
         String::new(),
@@ -5721,6 +5774,13 @@ fn conflict_resolution_failed_comment(
         format!("Conflicting file(s): {files}"),
         String::new(),
         format!("Conflict-resolution pass failure: {detail}"),
+        String::new(),
+        // SPEC-3.12 item 6: name the single action a human takes next,
+        // rather than only describing the state.
+        format!(
+            "Resolve the conflict by hand (merge `origin/{branch}` into `{branch}`, fix {files}, \
+             and push), or re-queue the issue (set AI Agent = Queued) to retry from a fresh clone."
+        ),
         String::new(),
         r.summary.clone(),
         String::new(),
@@ -10901,6 +10961,13 @@ mod tests {
             comment_call.contains("remotesha"),
             "names the remote SHA: {comment_call}"
         );
+        // SPEC-3.12 item 6: the comment must name the one action a human
+        // takes next, not just describe the aborted state.
+        assert!(
+            comment_call.contains("Resolve the conflict by hand")
+                && comment_call.contains("re-queue the issue"),
+            "names the single next action: {comment_call}"
+        );
         assert!(
             calls
                 .iter()
@@ -11546,12 +11613,16 @@ mod tests {
 
     #[test]
     fn review_findings_comment_is_capped_at_three_bullets_and_leads_with_the_cause() {
-        for no_verdict in [false, true] {
+        // `requeued` is only ever `true` when `no_verdict` is `false` (a
+        // `NoVerdict` always parks for a human), mirroring the real call
+        // site's `requeued = !no_verdict && attempts_after < cap`.
+        for (no_verdict, requeued) in [(false, false), (false, true), (true, false)] {
             let body = review_findings_comment(
                 &ok_result(),
                 "https://dev.a8n.run/contoso/claude-run/pulls/42",
                 "- some finding\n- another finding",
                 no_verdict,
+                requeued,
             );
             let lead = body
                 .split("\n\n<details>")
@@ -11576,6 +11647,20 @@ mod tests {
                 lead.contains("https://dev.a8n.run/contoso/claude-run/pulls/42"),
                 "the draft PR must still be named outside <details>: {body}"
             );
+            // SPEC-3.12 item 6: the comment must name the one true action,
+            // never claim a human decision is pending when this issue is
+            // about to retry on its own.
+            if requeued {
+                assert!(
+                    body.contains("re-queued to retry") && !body.contains("human decision"),
+                    "requeued={requeued}: must not claim a pending human decision: {body}"
+                );
+            } else {
+                assert!(
+                    body.contains("human decision"),
+                    "requeued={requeued}: must name the pending human decision: {body}"
+                );
+            }
             assert!(
                 body.contains("some finding"),
                 "the findings must still be reachable, in the collapsed detail: {body}"
@@ -16663,6 +16748,16 @@ mod tests {
                 .any(|c| c == "yt issue set-field MK-22 AI Agent Needs Review"),
             "{calls:?}"
         );
+        // SPEC-3.12 item 6: the comment that parks the issue at Needs Review
+        // must name the one action a human can take.
+        assert!(
+            calls.iter().any(|c| c.starts_with("yt issue comment MK-22")
+                && c.contains("limits.max_attempts_per_key")),
+            "{calls:?}"
+        );
+        // CLAUDE-373 (`actions/SCHEMA.md`): the attempt-cap park never writes
+        // the Needs-Info tag, whether reached at pickup or from this sweep.
+        assert!(!calls.iter().any(|c| c.contains("tag add")), "{calls:?}");
     }
 
     /// A `Working` issue with a live `run_inflight_jobs` row for its
@@ -18224,5 +18319,261 @@ mod tests {
             !calls.iter().any(|c| c.contains("pr edit")),
             "a workdir-modified review must leave the PR as a draft: {calls:?}"
         );
+    }
+
+    /// SPEC-3.12 item 3: the field category `finalize` writes for a given
+    /// [`Finalized`] outcome, named generically (the SPEC table's own
+    /// vocabulary, not an action's configured label text) so the match in
+    /// [`finalized_outcomes_cover_every_spec_3_12_row`] below is exhaustive
+    /// with no wildcard arm: adding a `Finalized` variant, or a
+    /// `DeliveryBlockedReason`, without extending this match is a compile
+    /// error, so a finalize path can never ship uncovered by this table.
+    ///
+    /// `DeliveryBlocked` (CLAUDE-545) is a refinement layered on top of the
+    /// item 3 table after it was written: each reason substitutes for the
+    /// table row it replaces (named per-arm below) with an operator
+    /// label that falls back to `Needs Review`, and carries its own single
+    /// named action (`delivery_blocked_comment`). It is asserted here as
+    /// this epic's own already-landed behavior rather than forced back onto
+    /// the table's literal "Queued below the cap, else Failed" wording.
+    fn spec_3_12_field_category(f: &Finalized) -> &'static str {
+        match f {
+            // row: "marker `.claude-run-needs-review`"
+            // row: "push rejected, remote diverged" (conflict pass failed)
+            Finalized::NeedsReview => "Needs Review",
+            // row: "marker `.claude-run-no-code-change`"
+            Finalized::NoCodeChange => "done label",
+            // row: "success, verification gate and review pass"
+            // (CLAUDE-549's `merged` flag never changes the field itself;
+            // CLAUDE-327: a YouTrack workflow resolves the issue on merge)
+            Finalized::CodeReview { .. } => "Code Review",
+            // row: "success, gate failed" (pr_step = "verify")
+            // row: "push or PR create failed, other cause", at the cap
+            // row: "hard failure" (pr_step = None)
+            Finalized::Failed {
+                requeued: false, ..
+            } => "Failed",
+            // row: "push or PR create failed, other cause", below the cap
+            Finalized::Failed { requeued: true, .. } => "Queued",
+            // row: "timeout or cancel with commits" (CLAUDE-379 salvage)
+            Finalized::TimedOut { .. } => "Needs Review",
+            // row: "review fail marker", below the cap
+            Finalized::ReviewFailed { requeued: true, .. } => "Queued",
+            // row: "review fail marker", at the cap
+            // row: "review gave no verdict"
+            Finalized::ReviewFailed {
+                requeued: false, ..
+            } => "Needs Review",
+            Finalized::DeliveryBlocked { reason, .. } => match reason {
+                // substitutes for "timeout or cancel without commits"
+                DeliveryBlockedReason::TimeoutNothingMergeable
+                // substitutes for "push or PR create failed, other cause"
+                // when the checkpoint watcher's own push was also rejected
+                | DeliveryBlockedReason::PushRejected
+                // driven by the CI webhook path, not `finalize`; included
+                // for an exhaustive inventory (docs/finalize-flow.md)
+                | DeliveryBlockedReason::CiFixCeiling
+                // substitutes for the no-verdict row's read-only-contract case
+                | DeliveryBlockedReason::ReviewModifiedWorkdir
+                // substitutes for "success, verification gate and review
+                // pass" when there are no commits ahead of the base to open
+                // a PR from
+                | DeliveryBlockedReason::NoCommitsAhead
+                // driven by the automerge conflict auto-resolve ceiling,
+                // not `finalize`; included for an exhaustive inventory
+                | DeliveryBlockedReason::UnresolvedConflicts => {
+                    "Needs Review (configured delivery-blocked label)"
+                }
+            },
+        }
+    }
+
+    /// SPEC-3.12 item 3: one sample outcome per table row (plus every
+    /// `DeliveryBlockedReason`), asserting the field category
+    /// [`spec_3_12_field_category`] assigns it. The match that function
+    /// contains has no wildcard arm, so this test (and every other caller)
+    /// fails to compile, rather than silently passing, the moment a new
+    /// `Finalized` variant or `DeliveryBlockedReason` is added with no row.
+    #[test]
+    fn finalized_outcomes_cover_every_spec_3_12_row() {
+        let pr = || Some("https://dev.a8n.run/contoso/claude-run/pulls/7".to_string());
+        let cases: Vec<(&str, Finalized, &str)> = vec![
+            (
+                "marker .claude-run-needs-review",
+                Finalized::NeedsReview,
+                "Needs Review",
+            ),
+            (
+                "push rejected, remote diverged (conflict pass failed)",
+                Finalized::NeedsReview,
+                "Needs Review",
+            ),
+            (
+                "marker .claude-run-no-code-change",
+                Finalized::NoCodeChange,
+                "done label",
+            ),
+            (
+                "success, verification gate and review pass",
+                Finalized::CodeReview {
+                    pr_url: pr().unwrap(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                    merged: false,
+                },
+                "Code Review",
+            ),
+            (
+                "success, verification gate and review pass, merged at finalize",
+                Finalized::CodeReview {
+                    pr_url: pr().unwrap(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                    merged: true,
+                },
+                "Code Review",
+            ),
+            (
+                "success, gate failed",
+                Finalized::Failed {
+                    cause: "gate".into(),
+                    pr_step: Some("verify"),
+                    requeued: false,
+                },
+                "Failed",
+            ),
+            (
+                "push or PR create failed, other cause, at the cap",
+                Finalized::Failed {
+                    cause: "push".into(),
+                    pr_step: Some("push"),
+                    requeued: false,
+                },
+                "Failed",
+            ),
+            (
+                "push or PR create failed, other cause, below the cap",
+                Finalized::Failed {
+                    cause: "push".into(),
+                    pr_step: Some("pr_create"),
+                    requeued: true,
+                },
+                "Queued",
+            ),
+            (
+                "hard failure",
+                Finalized::Failed {
+                    cause: "crash".into(),
+                    pr_step: None,
+                    requeued: false,
+                },
+                "Failed",
+            ),
+            (
+                "timeout or cancel with commits",
+                Finalized::TimedOut {
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                },
+                "Needs Review",
+            ),
+            (
+                "review fail marker, below the cap",
+                Finalized::ReviewFailed {
+                    pr_url: pr().unwrap(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                    requeued: true,
+                },
+                "Queued",
+            ),
+            (
+                "review fail marker, at the cap",
+                Finalized::ReviewFailed {
+                    pr_url: pr().unwrap(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                    requeued: false,
+                },
+                "Needs Review",
+            ),
+            (
+                "review gave no verdict",
+                Finalized::ReviewFailed {
+                    pr_url: pr().unwrap(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                    requeued: false,
+                },
+                "Needs Review",
+            ),
+            (
+                "delivery-blocked: timeout, nothing to salvage",
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::TimeoutNothingMergeable,
+                    pr_url: None,
+                    pr_number: None,
+                    head_branch: None,
+                },
+                "Needs Review (configured delivery-blocked label)",
+            ),
+            (
+                "delivery-blocked: checkpoint push rejected",
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::PushRejected,
+                    pr_url: None,
+                    pr_number: None,
+                    head_branch: None,
+                },
+                "Needs Review (configured delivery-blocked label)",
+            ),
+            (
+                "delivery-blocked: CI-fix attempt ceiling",
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::CiFixCeiling,
+                    pr_url: pr(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                },
+                "Needs Review (configured delivery-blocked label)",
+            ),
+            (
+                "delivery-blocked: review modified the read-only workdir",
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::ReviewModifiedWorkdir,
+                    pr_url: pr(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                },
+                "Needs Review (configured delivery-blocked label)",
+            ),
+            (
+                "delivery-blocked: no commits ahead of base",
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::NoCommitsAhead,
+                    pr_url: None,
+                    pr_number: None,
+                    head_branch: None,
+                },
+                "Needs Review (configured delivery-blocked label)",
+            ),
+            (
+                "delivery-blocked: unresolved automerge conflicts",
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::UnresolvedConflicts,
+                    pr_url: pr(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                },
+                "Needs Review (configured delivery-blocked label)",
+            ),
+        ];
+        for (row, outcome, expected) in cases {
+            assert_eq!(
+                spec_3_12_field_category(&outcome),
+                expected,
+                "row {row:?}: {outcome:?}"
+            );
+        }
     }
 }
