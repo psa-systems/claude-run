@@ -6458,6 +6458,118 @@ mod tests {
         );
     }
 
+    /// SPEC-3.12 item 7 test harness: a pickup whose tracker reports
+    /// `estimation_minutes` for `Estimation`, under a `claude_timeout` session
+    /// limit. The cancel token is always set, so a pickup that is NOT parked
+    /// over the estimate instead stops at the next checkpoint (`Filtered`),
+    /// before any clone, the same way `run_gated_process_job` does for the CI
+    /// cap.
+    async fn run_estimation_gated_process_job(
+        pool: &DbPool,
+        estimation_minutes: Option<i64>,
+        claude_timeout: Duration,
+    ) -> (ProcessedJob, FakeTracker) {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = ClaudeInvoker::new(Some("/nonexistent/claude-stub-should-never-run.sh"));
+        let tracker = FakeTracker {
+            estimation_minutes: Mutex::new(estimation_minutes),
+            ..FakeTracker::new("Queued")
+        };
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let mut s = src();
+        s.dependencies.enabled = false;
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout,
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+            review_timeout: Duration::from_secs(1800),
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+        let pause = crate::pause::PauseGate::new(pool.clone()).for_action_run("yt");
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            pool,
+            &claude,
+            &tracker,
+            &forge,
+            &s,
+            &limits,
+            &cancel,
+            &pause,
+            &spend,
+            &job(),
+            PrStrategy::Branch,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+        (outcome, tracker)
+    }
+
+    /// SPEC-3.12 item 7: an issue whose `Estimation` exceeds the action's
+    /// session timeout is parked `Needs Review` with `Needs-Info`, a comment
+    /// naming both numbers, and no attempt consumed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_job_parks_needs_review_when_estimate_exceeds_timeout() {
+        let pool = mem_pool().await;
+        let (outcome, tracker) =
+            run_estimation_gated_process_job(&pool, Some(60), Duration::from_secs(1800)).await;
+        assert!(
+            matches!(&outcome, ProcessedJob::EstimateOverTimeout { key } if key == "MK-16"),
+            "got {outcome:?}"
+        );
+        assert_eq!(tracker.field(), "Needs Review");
+        let comments = tracker.comments.lock().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].contains("60 minutes"), "{comments:?}");
+        assert!(comments[0].contains("30 minutes"), "{comments:?}");
+        assert_eq!(tracker.tags.lock().unwrap().as_slice(), ["Needs-Info"]);
+        assert_eq!(
+            state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
+            0,
+            "no attempt is spent when the estimate parks the issue"
+        );
+    }
+
+    /// SPEC-3.12 item 7: an issue with no `Estimation`, and one at or below
+    /// the timeout, is picked up as before (here: proceeding past this gate to
+    /// the cancel checkpoint, never parked over the estimate).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_job_proceeds_with_no_estimation_or_at_the_timeout() {
+        let pool = mem_pool().await;
+
+        let (no_estimate, _) =
+            run_estimation_gated_process_job(&pool, None, Duration::from_secs(1800)).await;
+        assert!(
+            matches!(no_estimate, ProcessedJob::Filtered { .. }),
+            "got {no_estimate:?}"
+        );
+
+        let (at_timeout, _) =
+            run_estimation_gated_process_job(&pool, Some(30), Duration::from_secs(1800)).await;
+        assert!(
+            matches!(at_timeout, ProcessedJob::Filtered { .. }),
+            "got {at_timeout:?}"
+        );
+    }
+
     /// The Claude login needing renewal mid-run trips the readiness gate
     /// AFTER `run_pre` has already written AI Agent=Working and cloned, but
     /// BEFORE claude is invoked: the issue is reverted to Queued with a
@@ -7098,6 +7210,10 @@ mod tests {
         /// written, so a test can trip state deterministically from inside
         /// `run_pre` instead of racing a background sleep against it.
         on_set_field: Mutex<Option<Box<dyn FnMut() + Send>>>,
+        /// Canned `Estimation` reading, in minutes; `None` means the field is
+        /// unset, backing [`IssueTracker::get_estimation_minutes`].
+        estimation_minutes: Mutex<Option<i64>>,
+        tags: Mutex<Vec<String>>,
     }
 
     impl FakeTracker {
@@ -7187,6 +7303,15 @@ mod tests {
 
         fn attach_file(&self, _key: &str, _file: &Path) -> Result<()> {
             Ok(())
+        }
+
+        fn add_tag(&self, _key: &str, tag: &str) -> Result<()> {
+            self.tags.lock().unwrap().push(tag.to_string());
+            Ok(())
+        }
+
+        fn get_estimation_minutes(&self, _key: &str) -> Result<Option<i64>> {
+            Ok(*self.estimation_minutes.lock().unwrap())
         }
     }
 

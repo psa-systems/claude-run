@@ -3275,6 +3275,26 @@ mod tests {
     }
 
     #[test]
+    fn get_estimation_minutes_parses_raw_minutes() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &["issue", "get-field", "MK-16", "Estimation", "--json"],
+            r#"{"field":"Estimation","value":"2h","type":"PeriodValue","raw":{"presentation":"2h","minutes":120,"$type":"PeriodValue"}}"#,
+        ));
+        assert_eq!(b.get_estimation_minutes("MK-16").unwrap(), Some(120));
+    }
+
+    #[test]
+    fn get_estimation_minutes_is_none_when_unset() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &["issue", "get-field", "MK-16", "Estimation", "--json"],
+            r#"{"field":"Estimation","value":null,"type":"","raw":null}"#,
+        ));
+        assert_eq!(b.get_estimation_minutes("MK-16").unwrap(), None);
+    }
+
+    #[test]
     fn nonzero_exit_is_typed_cli_failure() {
         let b = backend(StubRunner::new().fail(
             "yt",
