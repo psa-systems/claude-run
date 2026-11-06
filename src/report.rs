@@ -566,6 +566,141 @@ pub async fn claude_usage(
     })
 }
 
+/// SPEC-4.3.14: one `kind`'s total duration over the window.
+#[derive(Debug, Serialize)]
+pub struct KindDuration {
+    pub kind: String,
+    pub seconds: f64,
+}
+
+/// SPEC-4.3.14: one `check` sub-step `label`'s total duration + occurrence
+/// count over the window.
+#[derive(Debug, Serialize)]
+pub struct CheckLabelDuration {
+    pub label: String,
+    pub seconds: f64,
+    pub count: i64,
+}
+
+/// SPEC-4.3.14 "where the time goes": CLAUDE-575's own two series (time by
+/// `kind`, and the `check` breakdown by `label`), plus the count of attempts
+/// in the window with no `attempt_steps` rows at all. That count is reported
+/// as its own figure, never folded into the series as a zero (an attempt with
+/// no step data recorded nothing, which is not the same as an attempt whose
+/// steps summed to zero seconds).
+#[derive(Debug, Default, Serialize)]
+pub struct StepTimingReport {
+    pub time_by_kind: Vec<KindDuration>,
+    pub checks: Vec<CheckLabelDuration>,
+    pub attempts_with_no_step_data: i64,
+}
+
+/// `(kind, label, started_at, ended_at)` rows from `attempt_steps` over the
+/// window, optionally filtered to one action.
+async fn attempt_step_rows(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+) -> Result<Vec<(String, String, String, String)>> {
+    let cutoff = ts_cutoff(range);
+    let mut sql =
+        String::from("SELECT kind, label, started_at, ended_at FROM attempt_steps WHERE 1 = 1");
+    if cutoff.is_some() {
+        sql.push_str(" AND started_at >= ?");
+    }
+    if action.is_some() {
+        sql.push_str(" AND action_name = ?");
+    }
+    let sql = crate::db::q(pool, &sql).into_owned();
+    let mut q =
+        sqlx::query_as::<_, (String, String, String, String)>(sqlx::AssertSqlSafe(sql.as_str()));
+    if let Some(c) = &cutoff {
+        q = q.bind(c);
+    }
+    if let Some(a) = action {
+        q = q.bind(a);
+    }
+    Ok(q.fetch_all(pool).await?)
+}
+
+/// SPEC-4.3.14: time-by-kind + checks series for CLAUDE-575's own AC, plus the
+/// "no step data" count (older attempts recorded before this feature shipped,
+/// or an attempt whose step writes all failed, never shown as zero).
+pub async fn step_timing(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+) -> Result<StepTimingReport> {
+    let mut by_kind: BTreeMap<String, f64> = BTreeMap::new();
+    let mut by_check_label: BTreeMap<String, (f64, i64)> = BTreeMap::new();
+    for (kind, label, started, ended) in attempt_step_rows(pool, range, action).await? {
+        let Some(minutes) = span_minutes(&started, &ended) else {
+            continue;
+        };
+        let seconds = minutes * 60.0;
+        *by_kind.entry(kind.clone()).or_default() += seconds;
+        if kind == "check" {
+            let e = by_check_label.entry(label).or_default();
+            e.0 += seconds;
+            e.1 += 1;
+        }
+    }
+
+    let cutoff = ts_cutoff(range);
+    let mut total_sql = String::from("SELECT COUNT(*) FROM job_outcomes WHERE attempt_counted = 1");
+    if cutoff.is_some() {
+        total_sql.push_str(" AND ts >= ?");
+    }
+    if action.is_some() {
+        total_sql.push_str(" AND action_name = ?");
+    }
+    let total_sql = crate::db::q(pool, &total_sql).into_owned();
+    let mut tq = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(total_sql.as_str()));
+    if let Some(c) = &cutoff {
+        tq = tq.bind(c);
+    }
+    if let Some(a) = action {
+        tq = tq.bind(a);
+    }
+    let total_attempts: i64 = tq.fetch_one(pool).await?;
+
+    let mut with_steps_sql = String::from(
+        "SELECT COUNT(DISTINCT action_name || '|' || job_key || '|' || attempt) \
+         FROM attempt_steps WHERE 1 = 1",
+    );
+    if cutoff.is_some() {
+        with_steps_sql.push_str(" AND started_at >= ?");
+    }
+    if action.is_some() {
+        with_steps_sql.push_str(" AND action_name = ?");
+    }
+    let with_steps_sql = crate::db::q(pool, &with_steps_sql).into_owned();
+    let mut wq = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(with_steps_sql.as_str()));
+    if let Some(c) = &cutoff {
+        wq = wq.bind(c);
+    }
+    if let Some(a) = action {
+        wq = wq.bind(a);
+    }
+    let attempts_with_steps: i64 = wq.fetch_one(pool).await?;
+
+    Ok(StepTimingReport {
+        time_by_kind: by_kind
+            .into_iter()
+            .map(|(kind, seconds)| KindDuration { kind, seconds })
+            .collect(),
+        checks: by_check_label
+            .into_iter()
+            .map(|(label, (seconds, count))| CheckLabelDuration {
+                label,
+                seconds,
+                count,
+            })
+            .collect(),
+        attempts_with_no_step_data: (total_attempts - attempts_with_steps).max(0),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,5 +1012,153 @@ mod tests {
         assert!(report.points.is_empty());
         assert_eq!(report.missing_data_count, 0);
         assert!(report.recent.is_empty());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_attempt_step(
+        pool: &DbPool,
+        run_id: i64,
+        action: &str,
+        job_key: &str,
+        attempt: i64,
+        seq: i64,
+        kind: &str,
+        label: &str,
+        started: &str,
+        ended: &str,
+    ) {
+        sqlx::query(sqlx::AssertSqlSafe(crate::db::q(pool, "INSERT INTO attempt_steps (run_id, action_name, job_key, attempt, seq, stage, kind, label, started_at, ended_at, ok) VALUES (?, ?, ?, ?, ?, 'initial', ?, ?, ?, ?, 1)").into_owned()))
+            .bind(run_id)
+            .bind(action)
+            .bind(job_key)
+            .bind(attempt)
+            .bind(seq)
+            .bind(kind)
+            .bind(label)
+            .bind(started)
+            .bind(ended)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// SPEC-4.3.14: time-by-kind sums seconds per `kind`, the `checks` series
+    /// breaks `kind = check` down by `label`, and an attempt with no
+    /// `attempt_steps` rows at all (an older attempt, predating this feature)
+    /// is counted separately rather than folded into either series as zero.
+    #[tokio::test]
+    async fn step_timing_splits_kinds_and_counts_attempts_with_no_step_data() {
+        let pool = mem_pool().await;
+        let run_id = seed_run(&pool, "alpha").await;
+
+        // TEST-1: clone (10s) + check/pre-push (20s) + check/ad-hoc (5s).
+        insert_attempt_step(
+            &pool,
+            run_id,
+            "alpha",
+            "TEST-1",
+            1,
+            1,
+            "clone",
+            "clone",
+            "2026-06-14T00:00:00Z",
+            "2026-06-14T00:00:10Z",
+        )
+        .await;
+        insert_attempt_step(
+            &pool,
+            run_id,
+            "alpha",
+            "TEST-1",
+            1,
+            2,
+            "check",
+            "pre-push",
+            "2026-06-14T00:00:10Z",
+            "2026-06-14T00:00:30Z",
+        )
+        .await;
+        insert_attempt_step(
+            &pool,
+            run_id,
+            "alpha",
+            "TEST-1",
+            1,
+            3,
+            "check",
+            "ad-hoc",
+            "2026-06-14T00:00:30Z",
+            "2026-06-14T00:00:35Z",
+        )
+        .await;
+        state::job_outcome_insert(
+            &pool,
+            &JobOutcome {
+                run_id,
+                action_name: "alpha",
+                job_key: "TEST-1",
+                attempt: 1,
+                ok: true,
+                claude_ran: true,
+                claude_ok: true,
+                claude_cost_usd: 0.1,
+                attempt_counted: true,
+                summary: None,
+                stream_log_path: None,
+                duration_ms: 35_000,
+                timed_out: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // TEST-2: an older, counted attempt with no attempt_steps rows.
+        state::job_outcome_insert(
+            &pool,
+            &JobOutcome {
+                run_id,
+                action_name: "alpha",
+                job_key: "TEST-2",
+                attempt: 1,
+                ok: true,
+                claude_ran: true,
+                claude_ok: true,
+                claude_cost_usd: 0.1,
+                attempt_counted: true,
+                summary: None,
+                stream_log_path: None,
+                duration_ms: 1000,
+                timed_out: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let report = step_timing(&pool, Range::All, Some("alpha")).await.unwrap();
+        let clone_seconds = report
+            .time_by_kind
+            .iter()
+            .find(|k| k.kind == "clone")
+            .map(|k| k.seconds)
+            .unwrap_or(0.0);
+        assert!((clone_seconds - 10.0).abs() < 1e-6, "{report:?}");
+        let check_seconds: f64 = report
+            .time_by_kind
+            .iter()
+            .filter(|k| k.kind == "check")
+            .map(|k| k.seconds)
+            .sum();
+        assert!((check_seconds - 25.0).abs() < 1e-6, "{report:?}");
+
+        assert_eq!(report.checks.len(), 2);
+        let pre_push = report
+            .checks
+            .iter()
+            .find(|c| c.label == "pre-push")
+            .unwrap();
+        assert!((pre_push.seconds - 20.0).abs() < 1e-6);
+        assert_eq!(pre_push.count, 1);
+
+        assert_eq!(report.attempts_with_no_step_data, 1, "{report:?}");
     }
 }

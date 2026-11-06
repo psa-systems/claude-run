@@ -52,6 +52,7 @@ pub const TABLES: &[&str] = &[
     "web_invites",
     "runs",
     "job_outcomes",
+    "attempt_steps",
     "run_events",
     "run_inflight_jobs",
     "ci_failures",
@@ -73,6 +74,7 @@ const MIGRATIONS_TABLE: &str = "_sqlx_migrations";
 const IDENTITY_COLUMNS: &[(&str, &str)] = &[
     ("runs", "id"),
     ("job_outcomes", "id"),
+    ("attempt_steps", "id"),
     ("secrets", "id"),
     ("web_admin_recovery_codes", "id"),
     ("web_accounts", "id"),
@@ -671,6 +673,11 @@ mod tests {
         sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO job_outcomes (run_id, action_name, job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, summary, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")))
             .bind(run_id).bind("youtrack").bind("CLAUDE-1").bind(1i64).bind("2026-09-01T00:00:00Z")
             .bind(1i64).bind(1i64).bind(1i64).bind(0.5f64).bind("done").bind(1234i64)
+            .execute(pool).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO attempt_steps (run_id, action_name, job_key, attempt, seq, stage, kind, label, started_at, ended_at, ok, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")))
+            .bind(run_id).bind("youtrack").bind("CLAUDE-1").bind(1i64).bind(1i64).bind("initial")
+            .bind("clone").bind("clone").bind("2026-09-01T00:00:00Z").bind("2026-09-01T00:00:10Z")
+            .bind(1i64).bind(None::<String>)
             .execute(pool).await.unwrap();
         sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO run_events (run_id, action_name, ts, level, context, message) VALUES (?, ?, ?, ?, ?, ?)")))
             .bind(run_id).bind("youtrack").bind("2026-09-01T00:00:00Z").bind("info").bind(None::<String>).bind("started")

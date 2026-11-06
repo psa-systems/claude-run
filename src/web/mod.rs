@@ -2842,6 +2842,25 @@ struct WeekdayBar {
     pct: u32,
 }
 
+/// SPEC-4.3.14: one `kind`'s total duration, with a precomputed bar width
+/// relative to the window's busiest kind.
+#[derive(Serialize)]
+struct KindBar {
+    kind: String,
+    seconds: f64,
+    pct: u32,
+}
+
+/// SPEC-4.3.14: one `check` sub-step `label`'s total duration + occurrence
+/// count, with a precomputed bar width relative to the window's busiest label.
+#[derive(Serialize)]
+struct CheckBar {
+    label: String,
+    seconds: f64,
+    count: i64,
+    pct: u32,
+}
+
 /// One row of the "recent invocations" table, with the fields the template
 /// prints already formatted (the DB stores fractions; the table shows
 /// percentages, and a missing reading prints as an em-dash string rather than
@@ -2884,6 +2903,16 @@ struct ReportsTpl {
     /// Count of charted invocations with no rate-limit data at all.
     usage_missing_count: usize,
     usage_recent: Vec<RecentInvocationRow>,
+    /// SPEC-4.3.14: total duration per step `kind`, oldest-feature-first
+    /// ordering not required, so by descending seconds.
+    time_by_kind: Vec<KindBar>,
+    /// SPEC-4.3.14: the `check` step breakdown by `label`.
+    checks: Vec<CheckBar>,
+    /// SPEC-4.3.14: counted attempts in the window with no `attempt_steps`
+    /// rows at all (an attempt that predates this feature, or whose step
+    /// writes all failed); shown as its own figure, never folded into either
+    /// series above as zero.
+    attempts_with_no_step_data: i64,
 }
 
 /// Query params for `/reports`: `range` (default all-time) and an optional
@@ -2974,6 +3003,40 @@ async fn reports_page(
         .map(|a| a.name)
         .collect();
 
+    let step_timing = crate::report::step_timing(pool, range, action_filter).await?;
+    let kind_max = step_timing
+        .time_by_kind
+        .iter()
+        .map(|k| k.seconds)
+        .fold(0.0, f64::max);
+    let mut time_by_kind: Vec<KindBar> = step_timing
+        .time_by_kind
+        .iter()
+        .map(|k| KindBar {
+            kind: k.kind.clone(),
+            seconds: k.seconds,
+            pct: bar_pct(k.seconds, kind_max),
+        })
+        .collect();
+    time_by_kind.sort_by(|a, b| b.seconds.partial_cmp(&a.seconds).unwrap());
+
+    let check_max = step_timing
+        .checks
+        .iter()
+        .map(|c| c.seconds)
+        .fold(0.0, f64::max);
+    let mut checks: Vec<CheckBar> = step_timing
+        .checks
+        .iter()
+        .map(|c| CheckBar {
+            label: c.label.clone(),
+            seconds: c.seconds,
+            count: c.count,
+            pct: bar_pct(c.seconds, check_max),
+        })
+        .collect();
+    checks.sort_by(|a, b| b.seconds.partial_cmp(&a.seconds).unwrap());
+
     let usage = crate::report::claude_usage(pool, range, action_filter).await?;
     let usage_chart = (!usage.points.is_empty()).then(|| build_usage_chart(&usage.points));
 
@@ -3043,6 +3106,9 @@ async fn reports_page(
         usage_chart,
         usage_missing_count: usage.missing_data_count,
         usage_recent,
+        time_by_kind,
+        checks,
+        attempts_with_no_step_data: step_timing.attempts_with_no_step_data,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }

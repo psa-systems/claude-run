@@ -1648,6 +1648,11 @@ async fn process_job(
     // `yt` field writes plus a full `git clone` of the target repo,
     // all synchronous; keep them off the async worker thread.
     let resume_branch = resume.as_ref().map(|r| r.branch.as_str());
+    // SPEC-3.14: the `clone` runner-owned step, timed by `run_pre` around the
+    // `clone_repo` call alone (not the field writes before it or the hook
+    // install after it, both of which fall into `unaccounted` honestly);
+    // recorded below once this attempt is known to count.
+    let mut clone_timing = None;
     let pre_result = crate::blocking::in_place(|| {
         run_pre(
             backend,
@@ -1657,6 +1662,7 @@ async fn process_job(
             &workdir_path,
             resume_branch,
             &action.name,
+            &mut clone_timing,
         )
     });
 
@@ -1668,6 +1674,15 @@ async fn process_job(
     // watcher's own outcome; every other arm never checkpoints, so this
     // stays `None` for them, which `finalize` treats as "nothing rejected".
     let mut checkpoint_rejected: Option<String> = None;
+    // SPEC-3.14: the stream-log path plus the `claude.invoke` call's own
+    // start/end, set only in the claude-ran arm below. `coding`/`check`/
+    // `build` steps are derived from this span's stream log once this
+    // attempt is known to count.
+    let mut claude_span: Option<(
+        PathBuf,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    )> = None;
     // Computed once regardless of `pre_result`, so the match below never
     // calls the fallible I/O twice for one attempt.
     let cargo_target_dir_result = ensure_cargo_target_dir(&cargo_target_dir);
@@ -1756,6 +1771,7 @@ async fn process_job(
             let (stop_tx, stop_rx) = std::sync::mpsc::channel();
             let pool_handle = tokio::runtime::Handle::current();
             let already_resuming = resume.is_some();
+            let invoke_step_start = chrono::Utc::now();
             let (invoke_result, checkpoint_outcome) = std::thread::scope(|scope| {
                 let watcher = scope.spawn(|| {
                     run_checkpoint_watcher(
@@ -1793,6 +1809,7 @@ async fn process_job(
                 (invoke_result, outcome)
             });
             let r = invoke_result?;
+            claude_span = Some((stream_log.clone(), invoke_step_start, chrono::Utc::now()));
             checkpoint_rejected = checkpoint_outcome.rejected;
             if resume.is_none() {
                 resume = checkpoint_outcome.opened;
@@ -1910,6 +1927,13 @@ async fn process_job(
     // succeeded with no outstanding blocker/no-code marker (a blocker or a
     // deliberate no-code run never opens a PR, so there is nothing to
     // review). Billed exactly like the main invocation.
+    // SPEC-3.14: the `review` runner-owned step's start/end/ok, set only when
+    // this branch runs.
+    let mut review_span: Option<(
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        bool,
+    )> = None;
     let review = if claude_ran
         && claude_result.ok
         && !workdir_path.join(NEEDS_REVIEW_MARKER).exists()
@@ -1931,6 +1955,7 @@ async fn process_job(
         let review_evidence =
             ClaudeInvoker::review_evidence_path(&paths.logs_dir(), &action.name, key, attempts + 1);
         let review_retry_evidence = ClaudeInvoker::review_retry_sibling(&review_evidence);
+        let review_step_start = chrono::Utc::now();
         let (outcome, review_results) = crate::blocking::in_place(|| {
             run_review_session_with_retry(
                 claude,
@@ -1947,6 +1972,13 @@ async fn process_job(
                 Some(cargo_target_dir.as_path()),
             )
         });
+        // SPEC-3.14: the `review` runner-owned step, recorded below once this
+        // attempt is known to count.
+        review_span = Some((
+            review_step_start,
+            chrono::Utc::now(),
+            matches!(outcome, ReviewOutcome::Pass(_)),
+        ));
         for review_result in &review_results {
             spend.record(review_result);
         }
@@ -2141,7 +2173,7 @@ async fn process_job(
         info!(action = %action.name, key = %key, cancelled, paused = paused_before_claude, "not counting attempt");
     }
 
-    let (ok, summary) = record_finalize_outcome(&claude_result, &finalize_res, post_failed);
+    let (ok, mut summary) = record_finalize_outcome(&claude_result, &finalize_res, post_failed);
     let stream_log_path = stream_log.as_deref().map(|p| p.display().to_string());
 
     if !skip_attempt {
@@ -2149,6 +2181,72 @@ async fn process_job(
     }
     if claude_ran {
         state::daily_count_increment(pool, &action.name).await?;
+    }
+
+    // SPEC-3.14: record this attempt's steps (clone, the claude invocation's
+    // derived coding/check/build steps, and the post-success review), only
+    // for an attempt that counts. Scope: finalize's own PR-path steps (push,
+    // pr_create, gate, ci_wait, conflict_resolution) and hook_install /
+    // postgres_* are tracked in a follow-up issue, not here.
+    if !skip_attempt {
+        let stage = match attempts + 1 {
+            1 => "initial",
+            2 => "retry-2",
+            _ => "retry-3",
+        };
+        let mut recorder =
+            crate::attempt_steps::StepRecorder::new(pool, run_id, &action.name, key, attempts + 1);
+        if let Some((clone_start, clone_end, clone_ok)) = clone_timing {
+            recorder
+                .record(
+                    stage,
+                    crate::attempt_steps::StepKind::Clone,
+                    "clone",
+                    clone_start,
+                    clone_end,
+                    clone_ok,
+                    None,
+                )
+                .await;
+        }
+        if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
+            match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
+                Ok(steps) => {
+                    for (kind, label, start, end) in steps {
+                        recorder
+                            .record(stage, kind, label, start, end, true, None)
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        action = %action.name,
+                        key = %key,
+                        error = %e,
+                        "deriving claude steps from the stream log failed; coding/check/build steps for this attempt fall into unaccounted"
+                    );
+                }
+            }
+        }
+        if let Some((review_start, review_end, review_ok)) = review_span {
+            recorder
+                .record(
+                    "review",
+                    crate::attempt_steps::StepKind::Review,
+                    "review",
+                    review_start,
+                    review_end,
+                    review_ok,
+                    None,
+                )
+                .await;
+        }
+        let incomplete = recorder
+            .finish(stage, started_wall, chrono::Utc::now())
+            .await;
+        if incomplete {
+            summary.push_str(" (step data incomplete)");
+        }
     }
 
     // A finalize failure can cost a retry, never the work. Only a
@@ -2801,6 +2899,7 @@ fn log_held(action: &str, key: &str, signature: &str, blocked_since_ms: i64, now
 /// Pre steps: mark the issue Working + In Progress, then clone the repo into
 /// `workdir`. Returns the failure reason on any step error so the caller can
 /// synthesize a failed claude result and still finalize.
+#[allow(clippy::too_many_arguments)]
 fn run_pre(
     backend: &dyn IssueTracker,
     forge: &dyn Forge,
@@ -2811,6 +2910,17 @@ fn run_pre(
     // default-branch clone this always used to be.
     resume_branch: Option<&str>,
     action_name: &str,
+    // SPEC-3.14: filled with the `clone_repo` call's own start/end/ok,
+    // timed around that call alone so the `clone` step never blends in the
+    // field writes above it or the hook install below it (both of which are
+    // left to fall into `unaccounted` honestly until they get their own
+    // runner-owned steps). Left `None` when a field write fails before
+    // `clone_repo` is ever reached.
+    clone_timing: &mut Option<(
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        bool,
+    )>,
 ) -> std::result::Result<(), String> {
     backend
         .set_field(&job.key, &src.custom_field, &src.states.working)
@@ -2826,8 +2936,11 @@ fn run_pre(
             .set_assignee(&job.key, login)
             .map_err(|e| format!("set Assignee={login}: {e}"))?;
     }
-    clone_repo(&clone_url_for(forge, job), workdir, resume_branch)
-        .map_err(|e| format!("git clone: {e}"))?;
+    let clone_start = chrono::Utc::now();
+    let clone_result = clone_repo(&clone_url_for(forge, job), workdir, resume_branch);
+    let clone_end = chrono::Utc::now();
+    *clone_timing = Some((clone_start, clone_end, clone_result.is_ok()));
+    clone_result.map_err(|e| format!("git clone: {e}"))?;
     if src.install_hooks {
         install_hooks(workdir);
     } else {
@@ -9267,7 +9380,17 @@ mod tests {
         let mut j = job();
         // Bogus local path: `git clone` fails immediately with no network.
         j.clone_url = "/nonexistent/claude-run-131.git".into();
-        let _ = run_pre(&backend, &backend, &s, &j, &wd, None, "test-action");
+        let mut clone_timing = None;
+        let _ = run_pre(
+            &backend,
+            &backend,
+            &s,
+            &j,
+            &wd,
+            None,
+            "test-action",
+            &mut clone_timing,
+        );
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls
@@ -9301,7 +9424,17 @@ mod tests {
         assert!(s.assignee.is_none());
         let mut j = job();
         j.clone_url = "/nonexistent/claude-run-131.git".into();
-        let _ = run_pre(&backend, &backend, &s, &j, &wd, None, "test-action");
+        let mut clone_timing = None;
+        let _ = run_pre(
+            &backend,
+            &backend,
+            &s,
+            &j,
+            &wd,
+            None,
+            "test-action",
+            &mut clone_timing,
+        );
         let calls = runner.calls.lock().unwrap();
         assert!(!calls.iter().any(|c| c.contains("--assignee")), "{calls:?}");
     }
@@ -9336,10 +9469,29 @@ mod tests {
         s.assignee = Some("octocat".into());
         let mut j = job();
         j.clone_url = "/nonexistent/claude-run-131.git".into();
-        let err = run_pre(&backend, &backend, &s, &j, &wd, None, "test-action").unwrap_err();
+        let mut clone_timing = None;
+        let err = run_pre(
+            &backend,
+            &backend,
+            &s,
+            &j,
+            &wd,
+            None,
+            "test-action",
+            &mut clone_timing,
+        )
+        .unwrap_err();
         assert!(err.starts_with("set Assignee=octocat:"), "{err}");
         // The clone is never attempted: the workdir stays absent.
         assert!(!wd.exists(), "clone must not run after an assignee failure");
+        // SPEC-3.14: the `clone` step must never be recorded as covering time
+        // spent on the field writes above it, so a failure before `clone_repo`
+        // is ever reached leaves no clone timing to record at all (that time
+        // falls into `unaccounted` honestly instead).
+        assert!(
+            clone_timing.is_none(),
+            "a pre-clone failure must not produce clone timing"
+        );
     }
 
     /// With a resume branch set, `run_pre` clones THAT branch rather
@@ -9375,6 +9527,7 @@ mod tests {
         let mut j = job();
         j.clone_url = origin.to_str().unwrap().to_string();
 
+        let mut clone_timing = None;
         run_pre(
             &backend,
             &backend,
@@ -9383,6 +9536,7 @@ mod tests {
             &wd,
             Some("fix/existing"),
             "test-action",
+            &mut clone_timing,
         )
         .unwrap();
 
@@ -9397,6 +9551,11 @@ mod tests {
         };
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "fix/existing");
         assert_eq!(std::fs::read_to_string(wd.join("f.txt")).unwrap(), "fix");
+        // SPEC-3.14: a successful clone must record its own timing, bracketing
+        // only the `clone_repo` call rather than the whole `run_pre` span.
+        let (start, end, ok) = clone_timing.expect("a successful clone must record timing");
+        assert!(ok, "a successful clone must be recorded as ok");
+        assert!(end >= start, "clone end must not precede its start");
     }
 
     /// `native.youtrack.install_hooks: false` makes `run_pre` skip the hook
@@ -9439,7 +9598,18 @@ mod tests {
         let mut s = src();
         s.install_hooks = false;
 
-        run_pre(&backend, &backend, &s, &j, &wd, None, "test-action").unwrap();
+        let mut clone_timing = None;
+        run_pre(
+            &backend,
+            &backend,
+            &s,
+            &j,
+            &wd,
+            None,
+            "test-action",
+            &mut clone_timing,
+        )
+        .unwrap();
 
         assert!(
             !wd.join(".git/hooks/pre-commit").exists(),

@@ -22,6 +22,7 @@ pub mod access;
 pub mod action;
 pub mod agent_home;
 pub mod api;
+pub mod attempt_steps;
 pub mod auth;
 pub mod autofix;
 pub mod blocking;

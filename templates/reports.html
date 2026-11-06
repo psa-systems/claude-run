@@ -196,4 +196,44 @@
   </tbody>
 </table>
 
+<h2>Where the time goes</h2>
+{% if attempts_with_no_step_data > 0 %}
+  <div class="card"><span class="dim">{{ attempts_with_no_step_data }} attempt(s) in this window have no step data (recorded before step timing shipped, or a step write failed) and are excluded from the series below.</span></div>
+{% endif %}
+{% if time_by_kind.is_empty() %}
+  <div class="card"><span class="dim">No step data recorded in this window.</span></div>
+{% else %}
+  <table>
+    <thead><tr><th>Kind</th><th>Time</th><th style="width: 40%;"></th></tr></thead>
+    <tbody>
+      {% for k in time_by_kind %}
+        <tr>
+          <td class="mono dim">{{ k.kind }}</td>
+          <td class="mono">{{ "{:.1}"|format(k.seconds) }}s</td>
+          <td><div style="background: var(--accent); height: 8px; border-radius: 2px; width: {{ k.pct }}%;"></div></td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+<h3>Checks</h3>
+{% if checks.is_empty() %}
+  <div class="card"><span class="dim">No check steps recorded in this window.</span></div>
+{% else %}
+  <table>
+    <thead><tr><th>Label</th><th>Time</th><th style="width: 40%;"></th><th>Count</th></tr></thead>
+    <tbody>
+      {% for c in checks %}
+        <tr>
+          <td class="mono dim">{{ c.label }}</td>
+          <td class="mono">{{ "{:.1}"|format(c.seconds) }}s</td>
+          <td><div style="background: var(--accent); height: 8px; border-radius: 2px; width: {{ c.pct }}%;"></div></td>
+          <td class="mono">{{ c.count }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
 {% endblock %}

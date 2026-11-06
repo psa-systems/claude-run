@@ -3332,6 +3332,113 @@ mod tests {
         );
     }
 
+    /// SPEC-3.14 item 4: a scripted action's attempt (the other half of
+    /// `ActionKind`, alongside `youtrack`) must get step data too, not only
+    /// the native `youtrack` handler's attempts. Runs a real scripted job
+    /// through `run_action_inner` -> `job::process_job` with a stub claude
+    /// whose stream log contains one recognizable `just pre-push` Bash call,
+    /// then asserts the resulting `attempt_steps` rows cover the full
+    /// attempt wall time with a `check`/`pre-push` row among them.
+    #[tokio::test]
+    async fn a_scripted_job_records_attempt_steps_from_its_stream_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
+        let snippet = SnippetRunner::new(None);
+
+        let stub = tmp.path().join("claude-stub.sh");
+        crate::testutil::write_stub(
+            &stub,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"just pre-push\"}}]}}'\n\
+             sleep 0.05\n\
+             printf '%s\\n' '{\"type\":\"user\",\"message\":{\"content\":[]}}'\n\
+             sleep 0.05\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"done\"}'\n\
+             exit 0\n",
+        );
+        let raw =
+            "name: t\ninput:\n  command:\n    run: printf '[{}]'\n    shell: sh\nprompt:\n  run: echo hi\n  shell: sh\n";
+        let loaded = crate::action::validate_str(raw, "<test>").unwrap();
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+
+        let exit_code = run_action_inner(
+            &loaded,
+            &paths,
+            &pool,
+            Arc::new(snippet),
+            Arc::new(claude),
+            "test",
+            None,
+            &KeyGate::new(),
+            &Limiter::new(1),
+            &crate::pause::PauseGate::never(),
+            &GatherGate::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit_code, crate::exit::OK);
+
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "SELECT kind, label, started_at, ended_at FROM attempt_steps \
+                 WHERE action_name = ? AND job_key = ? AND attempt = ? ORDER BY seq",
+            )
+            .into_owned(),
+        ))
+        .bind("t")
+        .bind("job-0")
+        .bind(1_i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            rows.iter()
+                .any(|(kind, label, _, _)| kind == "check" && label == "pre-push"),
+            "expected a check/pre-push row derived from the stream log: {rows:?}"
+        );
+
+        let total: chrono::Duration = rows
+            .iter()
+            .map(|(_, _, s, e)| {
+                let s = chrono::DateTime::parse_from_rfc3339(s)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc);
+                let e = chrono::DateTime::parse_from_rfc3339(e)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc);
+                e - s
+            })
+            .sum();
+        let wall: (String, String) = sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "SELECT MIN(started_at), MAX(ended_at) FROM attempt_steps \
+                 WHERE action_name = ? AND job_key = ? AND attempt = ?",
+            )
+            .into_owned(),
+        ))
+        .bind("t")
+        .bind("job-0")
+        .bind(1_i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let wall_start = chrono::DateTime::parse_from_rfc3339(&wall.0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let wall_end = chrono::DateTime::parse_from_rfc3339(&wall.1)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            total,
+            wall_end - wall_start,
+            "recorded steps plus the unaccounted remainder must equal the attempt's wall time: {rows:?}"
+        );
+    }
+
     // An out-of-band `rm` of an action file must be reconciled by the
     // next scan, which prunes the stale index row while leaving run history.
     #[tokio::test]

@@ -1488,6 +1488,11 @@ fn serve_run(
     paths: &Paths,
 ) -> RunOutcome {
     let cancel = CancellationToken::new();
+    // SPEC-3.14 item 4: wall-clock start for this delivery, so the
+    // `coding`/`check`/`build` steps derived below (and the `unaccounted`
+    // remainder around them) can be anchored the same way a native-action
+    // attempt anchors its own.
+    let served_start = chrono::Utc::now();
 
     let (branch, base) = match pr_branches(backend, cmd) {
         Ok(b) => b,
@@ -1534,6 +1539,11 @@ fn serve_run(
 
     let mut claude_ran = false;
     let mut cloned_head = None;
+    // SPEC-3.14 item 4: set only on the branch below that actually calls
+    // `claude.invoke`, so the step derivation at the end of this function has
+    // a span to classify.
+    let mut claude_span: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
+        None;
     let claude_result = match clone {
         Err(reason) => {
             warn!(repo = %cmd.repo, pr = cmd.number, %reason, "clone or setup failed (the PR reply still runs)");
@@ -1588,6 +1598,7 @@ fn serve_run(
                             ci_failure_path.as_deref(),
                         );
                         info!(repo = %cmd.repo, pr = cmd.number, stream_log = %stream_log.display(), cargo_target_dir = %cargo_target_dir.display(), "invoking claude for a comment command");
+                        let invoke_start = chrono::Utc::now();
                         let result = match claude.invoke(
                             &prompt,
                             &crate::action::ClaudeBlock::default(),
@@ -1603,6 +1614,7 @@ fn serve_run(
                         ) {
                             Ok(r) => {
                                 claude_ran = true;
+                                claude_span = Some((invoke_start, chrono::Utc::now()));
                                 // Bill the run with what the session spent.
                                 spend.record(&r);
                                 r
@@ -1713,11 +1725,52 @@ fn serve_run(
         ),
     );
 
-    let summary = format!(
+    let mut summary = format!(
         "{}: {}",
         decision.as_str(),
         first_line(&claude_result.summary)
     );
+
+    // SPEC-3.14 item 4: derive this delivery's `coding`/`check`/`build` steps
+    // from the stream log, same as the `youtrack` native action and the
+    // scripted-action pipeline, so a comment-command run carries step data
+    // too instead of falling permanently into `/reports`' "no step data"
+    // bucket. No `run_id` (the run-begin failed) means nothing to attribute
+    // the rows to, so this is skipped rather than attributed to a fake run.
+    if let Some(run_id) = run_id {
+        let incomplete = tokio::runtime::Handle::current().block_on(async {
+            let mut recorder = crate::attempt_steps::StepRecorder::new(
+                pool,
+                run_id,
+                WEBHOOK_COMMENT_ACTION,
+                key,
+                1,
+            );
+            if let Some((invoke_start, invoke_end)) = claude_span {
+                match crate::attempt_steps::derive_claude_steps(stream_log, invoke_start, invoke_end)
+                {
+                    Ok(steps) => {
+                        for (kind, label, start, end) in steps {
+                            recorder.record("initial", kind, label, start, end, true, None).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            repo = %cmd.repo, pr = cmd.number, error = %e,
+                            "deriving claude steps from the stream log failed; coding/check/build steps for this delivery fall into unaccounted"
+                        );
+                    }
+                }
+            }
+            recorder
+                .finish("initial", served_start, chrono::Utc::now())
+                .await
+        });
+        if incomplete {
+            summary.push_str(" (step data incomplete)");
+        }
+    }
+
     RunOutcome {
         summary,
         ok: claude_result.ok
