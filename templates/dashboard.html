@@ -11,7 +11,7 @@
      {# Pull the live search state (q / in_stream / show_empty) from
         the search form so the 5s morph poll preserves an active search instead
         of wiping it back to the plain runs view. #}
-     hx-include="#search-form"
+     hx-include="#search-form, #ci-failures-form"
      {# Carry the current Recent-runs page through the poll. It is
         re-rendered on every morph swap, so paging via Prev/Next sticks instead
         of being reset to page 1 by the next 5s refresh. Kept out of the search
@@ -215,6 +215,84 @@
   {% endif %}
 </div>
 
+{# SPEC-4.3.15: the CI-failures table, with its own filter form so the
+   state/repo selection round-trips through the 5s poll and every other
+   dashboard control the same way the search form does (hx-include widened
+   below to carry both). The Background also calls for a separate "triage
+   bucket" column, but `ci_failures` persists no such value (see
+   `CiFailureRow::state()`), so this filters and renders lifecycle `state`
+   instead, labeled "State". #}
+<h2>CI failures</h2>
+<form id="ci-failures-form"
+      style="margin: 4px 0 14px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+  <label style="font-size: 12px; text-transform: none; letter-spacing: 0; font-weight: normal;">
+    State
+    <select name="ci_state" hx-trigger="change"
+            hx-get="/" hx-include="#ci-failures-form, #search-form"
+            hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
+      <option value=""{% if ci_state.is_empty() %} selected{% endif %}>all</option>
+      <option value="open"{% if ci_state.as_str() == "open" %} selected{% endif %}>open</option>
+      <option value="resolved"{% if ci_state.as_str() == "resolved" %} selected{% endif %}>resolved</option>
+      <option value="pr_only"{% if ci_state.as_str() == "pr_only" %} selected{% endif %}>pr_only</option>
+    </select>
+  </label>
+  <label style="font-size: 12px; text-transform: none; letter-spacing: 0; font-weight: normal;">
+    Repo
+    <select name="ci_repo" hx-trigger="change"
+            hx-get="/" hx-include="#ci-failures-form, #search-form"
+            hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
+      <option value=""{% if ci_repo.is_empty() %} selected{% endif %}>all</option>
+      {% for r in ci_repo_options %}
+        <option value="{{ r }}"{% if ci_repo.as_str() == r.as_str() %} selected{% endif %}>{{ r }}</option>
+      {% endfor %}
+    </select>
+  </label>
+</form>
+{% if ci_failures.is_empty() %}
+  <div class="card"><span class="dim">No CI failures under the active filter.</span></div>
+{% else %}
+  <table style="margin-bottom: 16px;">
+    <thead><tr><th>Repo</th><th>Workflow</th><th>Job</th><th>State</th><th>Infra</th><th>PR</th><th>Issue</th><th>Remediations</th></tr></thead>
+    <tbody>
+      {% for f in ci_failures %}
+      <tr>
+        <td class="mono">{{ f.repo() }}</td>
+        <td class="mono">{{ f.workflow_id() }}</td>
+        <td class="mono">{{ f.job_name() }}</td>
+        <td><span class="badge neutral">{{ f.state() }}</span></td>
+        <td class="dim">{{ f.infra_kind() }}</td>
+        <td class="mono">{{ f.pr_html()|safe }}</td>
+        <td class="mono">{{ f.issue_html()|safe }}</td>
+        <td class="mono">{{ f.fix_attempts() }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+{# SPEC-3.12 item 2 / SPEC-4.3.15: a count and list of issues the
+   stuck-Working reconcile sweep corrected in the last 7 days. #}
+<h2>Stuck work (last 7 days)</h2>
+{% if stuck_count == 0 %}
+  <div class="card"><span class="dim">No stuck-Working corrections in the last 7 days.</span></div>
+{% else %}
+  <div class="card" style="margin-bottom: 16px;">
+    <strong>{{ stuck_count }} issue(s) corrected</strong>
+    <table style="margin-top: 8px;">
+      <thead><tr><th>When</th><th>Action</th><th>Correction</th></tr></thead>
+      <tbody>
+        {% for row in stuck_rows %}
+        <tr>
+          <td class="mono dim">{{ row.ts()|datetime }}</td>
+          <td class="mono"><a href="/actions/{{ row.action_name() }}">{{ row.action_name() }}</a></td>
+          <td>{{ row.message() }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+
 <h2>{% if search.is_some() %}Search results{% else %}Recent runs{% endif %}</h2>
 
 {# Content search over job summaries, with an opt-in checkbox to
@@ -240,7 +318,7 @@
     <input type="checkbox" name="show_empty" value="true"
            {% if show_empty %}checked{% endif %}
            hx-get="/"
-           hx-include="#search-form"
+           hx-include="#search-form, #ci-failures-form"
            hx-target="#poll-region"
            hx-select="#poll-region"
            {# Morph the same poll-region in place so the toggle
@@ -320,16 +398,16 @@
          page is intentionally omitted so changing sort/filter resets to page 1. #}
       <thead><tr>
         <th><a href="#" class="sort-link"
-               hx-get="/?{{ view.sort_query("run") }}" hx-include="#search-form"
+               hx-get="/?{{ view.sort_query("run") }}" hx-include="#search-form, #ci-failures-form"
                hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
                >Run{{ view.arrow("run") }}</a></th>
         <th>
           <a href="#" class="sort-link"
-             hx-get="/?{{ view.sort_query("action") }}" hx-include="#search-form"
+             hx-get="/?{{ view.sort_query("action") }}" hx-include="#search-form, #ci-failures-form"
              hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
              >Action{{ view.arrow("action") }}</a>
           <select name="action" hx-trigger="change"
-                  hx-get="/?{{ view.query_without("action") }}" hx-include="#search-form"
+                  hx-get="/?{{ view.query_without("action") }}" hx-include="#search-form, #ci-failures-form"
                   hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
             <option value=""{% if view.action.is_empty() %} selected{% endif %}>all</option>
             {% for a in action_options %}
@@ -338,21 +416,21 @@
           </select>
         </th>
         <th><a href="#" class="sort-link"
-               hx-get="/?{{ view.sort_query("started") }}" hx-include="#search-form"
+               hx-get="/?{{ view.sort_query("started") }}" hx-include="#search-form, #ci-failures-form"
                hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
                >Started{{ view.arrow("started") }}</a></th>
         <th><a href="#" class="sort-link"
-               hx-get="/?{{ view.sort_query("ended") }}" hx-include="#search-form"
+               hx-get="/?{{ view.sort_query("ended") }}" hx-include="#search-form, #ci-failures-form"
                hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
                >Ended{{ view.arrow("ended") }}</a></th>
         <th><a href="#" class="sort-link"
-               hx-get="/?{{ view.sort_query("duration") }}" hx-include="#search-form"
+               hx-get="/?{{ view.sort_query("duration") }}" hx-include="#search-form, #ci-failures-form"
                hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
                >Duration{{ view.arrow("duration") }}</a></th>
         <th>
           Triggered
           <select name="triggered" hx-trigger="change"
-                  hx-get="/?{{ view.query_without("triggered") }}" hx-include="#search-form"
+                  hx-get="/?{{ view.query_without("triggered") }}" hx-include="#search-form, #ci-failures-form"
                   hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
             <option value=""{% if view.triggered.is_empty() %} selected{% endif %}>all</option>
             {% for t in triggered_options %}
@@ -362,17 +440,17 @@
         </th>
         <th>
           <a href="#" class="sort-link"
-             hx-get="/?{{ view.sort_query("jobs") }}" hx-include="#search-form"
+             hx-get="/?{{ view.sort_query("jobs") }}" hx-include="#search-form, #ci-failures-form"
              hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
              >Jobs{{ view.arrow("jobs") }}</a>
           {# Sort worst-first by the derived failed-job count. #}
           <a href="#" class="sort-link" style="color: var(--fg-dim);"
-             hx-get="/?{{ view.sort_query("failed") }}" hx-include="#search-form"
+             hx-get="/?{{ view.sort_query("failed") }}" hx-include="#search-form, #ci-failures-form"
              hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
              >failed{{ view.arrow("failed") }}</a>
           {# Job-level outcome, independent of the run's Exit code. #}
           <select name="outcome" hx-trigger="change"
-                  hx-get="/?{{ view.query_without("outcome") }}" hx-include="#search-form"
+                  hx-get="/?{{ view.query_without("outcome") }}" hx-include="#search-form, #ci-failures-form"
                   hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
             <option value=""{% if view.outcome.is_empty() %} selected{% endif %}>all</option>
             <option value="failed"{% if view.outcome == "failed" %} selected{% endif %}>failed</option>
@@ -381,11 +459,11 @@
         </th>
         <th>
           <a href="#" class="sort-link"
-             hx-get="/?{{ view.sort_query("exit") }}" hx-include="#search-form"
+             hx-get="/?{{ view.sort_query("exit") }}" hx-include="#search-form, #ci-failures-form"
              hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
              >Exit{{ view.arrow("exit") }}</a>
           <select name="exit" hx-trigger="change"
-                  hx-get="/?{{ view.query_without("exit") }}" hx-include="#search-form"
+                  hx-get="/?{{ view.query_without("exit") }}" hx-include="#search-form, #ci-failures-form"
                   hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
             <option value=""{% if view.exit.is_empty() %} selected{% endif %}>all</option>
             <option value="success"{% if view.exit == "success" %} selected{% endif %}>success</option>
@@ -436,7 +514,7 @@
        COUNT over the same filter as the listing. #}
     <div class="pagination" style="display: flex; gap: 12px; align-items: center; margin: 12px 0; font-size: 12px;">
       {% if page.has_prev %}
-        <a class="btn" hx-get="/?{{ view.poll_query() }}" hx-include="#search-form"
+        <a class="btn" hx-get="/?{{ view.poll_query() }}" hx-include="#search-form, #ci-failures-form"
            hx-vals='{"page": {{ page.page - 1 }}}'
            hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">Prev</a>
       {% else %}
@@ -444,7 +522,7 @@
       {% endif %}
       <span class="meta">{{ page.start }}-{{ page.end }} of {{ page.total }} (page {{ page.page }} of {{ page.total_pages }})</span>
       {% if page.has_next %}
-        <a class="btn" hx-get="/?{{ view.poll_query() }}" hx-include="#search-form"
+        <a class="btn" hx-get="/?{{ view.poll_query() }}" hx-include="#search-form, #ci-failures-form"
            hx-vals='{"page": {{ page.page + 1 }}}'
            hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">Next</a>
       {% else %}

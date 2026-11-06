@@ -772,7 +772,7 @@ fn sanitize_key(key: &str) -> String {
 
 /// `run_events` context tag for every correction the stuck-Working sweep
 /// records, so the dashboard can list them as one group (SPEC-3.12 item 2).
-const STUCK_WORKING_SWEEP_CONTEXT: &str = "stuck-working-sweep";
+pub(crate) const STUCK_WORKING_SWEEP_CONTEXT: &str = "stuck-working-sweep";
 
 /// Comment posted when the sweep moves an issue off `Working` because no
 /// live run backs it. SPEC-3.12 item 2: "a comment naming the cause and the
