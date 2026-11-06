@@ -18116,4 +18116,260 @@ mod tests {
             "a workdir-modified review must leave the PR as a draft: {calls:?}"
         );
     }
+
+    /// SPEC-3.12 item 3: the field category `finalize` writes for a given
+    /// [`Finalized`] outcome, named generically (the SPEC table's own
+    /// vocabulary, not an action's configured label text) so the match in
+    /// [`finalized_outcomes_cover_every_spec_3_12_row`] below is exhaustive
+    /// with no wildcard arm: adding a `Finalized` variant, or a
+    /// `DeliveryBlockedReason`, without extending this match is a compile
+    /// error, so a finalize path can never ship uncovered by this table.
+    ///
+    /// `DeliveryBlocked` (CLAUDE-545) is a refinement layered on top of the
+    /// item 3 table after it was written: each reason substitutes for the
+    /// table row it replaces (named per-arm below) with an operator
+    /// label that falls back to `Needs Review`, and carries its own single
+    /// named action (`delivery_blocked_comment`). It is asserted here as
+    /// this epic's own already-landed behavior rather than forced back onto
+    /// the table's literal "Queued below the cap, else Failed" wording.
+    fn spec_3_12_field_category(f: &Finalized) -> &'static str {
+        match f {
+            // row: "marker `.claude-run-needs-review`"
+            // row: "push rejected, remote diverged" (conflict pass failed)
+            Finalized::NeedsReview => "Needs Review",
+            // row: "marker `.claude-run-no-code-change`"
+            Finalized::NoCodeChange => "done label",
+            // row: "success, verification gate and review pass"
+            // (CLAUDE-549's `merged` flag never changes the field itself;
+            // CLAUDE-327: a YouTrack workflow resolves the issue on merge)
+            Finalized::CodeReview { .. } => "Code Review",
+            // row: "success, gate failed" (pr_step = "verify")
+            // row: "push or PR create failed, other cause", at the cap
+            // row: "hard failure" (pr_step = None)
+            Finalized::Failed {
+                requeued: false, ..
+            } => "Failed",
+            // row: "push or PR create failed, other cause", below the cap
+            Finalized::Failed { requeued: true, .. } => "Queued",
+            // row: "timeout or cancel with commits" (CLAUDE-379 salvage)
+            Finalized::TimedOut { .. } => "Needs Review",
+            // row: "review fail marker", below the cap
+            Finalized::ReviewFailed { requeued: true, .. } => "Queued",
+            // row: "review fail marker", at the cap
+            // row: "review gave no verdict"
+            Finalized::ReviewFailed {
+                requeued: false, ..
+            } => "Needs Review",
+            Finalized::DeliveryBlocked { reason, .. } => match reason {
+                // substitutes for "timeout or cancel without commits"
+                DeliveryBlockedReason::TimeoutNothingMergeable
+                // substitutes for "push or PR create failed, other cause"
+                // when the checkpoint watcher's own push was also rejected
+                | DeliveryBlockedReason::PushRejected
+                // driven by the CI webhook path, not `finalize`; included
+                // for an exhaustive inventory (docs/finalize-flow.md)
+                | DeliveryBlockedReason::CiFixCeiling
+                // substitutes for the no-verdict row's read-only-contract case
+                | DeliveryBlockedReason::ReviewModifiedWorkdir
+                // substitutes for "success, verification gate and review
+                // pass" when there are no commits ahead of the base to open
+                // a PR from
+                | DeliveryBlockedReason::NoCommitsAhead
+                // driven by the automerge conflict auto-resolve ceiling,
+                // not `finalize`; included for an exhaustive inventory
+                | DeliveryBlockedReason::UnresolvedConflicts => {
+                    "Needs Review (configured delivery-blocked label)"
+                }
+            },
+        }
+    }
+
+    /// SPEC-3.12 item 3: one sample outcome per table row (plus every
+    /// `DeliveryBlockedReason`), asserting the field category
+    /// [`spec_3_12_field_category`] assigns it. The match that function
+    /// contains has no wildcard arm, so this test (and every other caller)
+    /// fails to compile, rather than silently passing, the moment a new
+    /// `Finalized` variant or `DeliveryBlockedReason` is added with no row.
+    #[test]
+    fn finalized_outcomes_cover_every_spec_3_12_row() {
+        let pr = || Some("https://dev.a8n.run/contoso/claude-run/pulls/7".to_string());
+        let cases: Vec<(&str, Finalized, &str)> = vec![
+            (
+                "marker .claude-run-needs-review",
+                Finalized::NeedsReview,
+                "Needs Review",
+            ),
+            (
+                "push rejected, remote diverged (conflict pass failed)",
+                Finalized::NeedsReview,
+                "Needs Review",
+            ),
+            (
+                "marker .claude-run-no-code-change",
+                Finalized::NoCodeChange,
+                "done label",
+            ),
+            (
+                "success, verification gate and review pass",
+                Finalized::CodeReview {
+                    pr_url: pr().unwrap(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                    merged: false,
+                },
+                "Code Review",
+            ),
+            (
+                "success, verification gate and review pass, merged at finalize",
+                Finalized::CodeReview {
+                    pr_url: pr().unwrap(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                    merged: true,
+                },
+                "Code Review",
+            ),
+            (
+                "success, gate failed",
+                Finalized::Failed {
+                    cause: "gate".into(),
+                    pr_step: Some("verify"),
+                    requeued: false,
+                },
+                "Failed",
+            ),
+            (
+                "push or PR create failed, other cause, at the cap",
+                Finalized::Failed {
+                    cause: "push".into(),
+                    pr_step: Some("push"),
+                    requeued: false,
+                },
+                "Failed",
+            ),
+            (
+                "push or PR create failed, other cause, below the cap",
+                Finalized::Failed {
+                    cause: "push".into(),
+                    pr_step: Some("pr_create"),
+                    requeued: true,
+                },
+                "Queued",
+            ),
+            (
+                "hard failure",
+                Finalized::Failed {
+                    cause: "crash".into(),
+                    pr_step: None,
+                    requeued: false,
+                },
+                "Failed",
+            ),
+            (
+                "timeout or cancel with commits",
+                Finalized::TimedOut {
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                },
+                "Needs Review",
+            ),
+            (
+                "review fail marker, below the cap",
+                Finalized::ReviewFailed {
+                    pr_url: pr().unwrap(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                    requeued: true,
+                },
+                "Queued",
+            ),
+            (
+                "review fail marker, at the cap",
+                Finalized::ReviewFailed {
+                    pr_url: pr().unwrap(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                    requeued: false,
+                },
+                "Needs Review",
+            ),
+            (
+                "review gave no verdict",
+                Finalized::ReviewFailed {
+                    pr_url: pr().unwrap(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                    requeued: false,
+                },
+                "Needs Review",
+            ),
+            (
+                "delivery-blocked: timeout, nothing to salvage",
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::TimeoutNothingMergeable,
+                    pr_url: None,
+                    pr_number: None,
+                    head_branch: None,
+                },
+                "Needs Review (configured delivery-blocked label)",
+            ),
+            (
+                "delivery-blocked: checkpoint push rejected",
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::PushRejected,
+                    pr_url: None,
+                    pr_number: None,
+                    head_branch: None,
+                },
+                "Needs Review (configured delivery-blocked label)",
+            ),
+            (
+                "delivery-blocked: CI-fix attempt ceiling",
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::CiFixCeiling,
+                    pr_url: pr(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                },
+                "Needs Review (configured delivery-blocked label)",
+            ),
+            (
+                "delivery-blocked: review modified the read-only workdir",
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::ReviewModifiedWorkdir,
+                    pr_url: pr(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                },
+                "Needs Review (configured delivery-blocked label)",
+            ),
+            (
+                "delivery-blocked: no commits ahead of base",
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::NoCommitsAhead,
+                    pr_url: None,
+                    pr_number: None,
+                    head_branch: None,
+                },
+                "Needs Review (configured delivery-blocked label)",
+            ),
+            (
+                "delivery-blocked: unresolved automerge conflicts",
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::UnresolvedConflicts,
+                    pr_url: pr(),
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
+                },
+                "Needs Review (configured delivery-blocked label)",
+            ),
+        ];
+        for (row, outcome, expected) in cases {
+            assert_eq!(
+                spec_3_12_field_category(&outcome),
+                expected,
+                "row {row:?}: {outcome:?}"
+            );
+        }
+    }
 }
