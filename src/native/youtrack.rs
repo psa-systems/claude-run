@@ -5006,7 +5006,7 @@ fn push_failure_requeue_comment(
 /// recorded separately, never swallowed into one generic "salvage failed", so
 /// the issue's timeout comment can name exactly which step a human needs to
 /// redo by hand.
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct SalvageReport {
     /// Nothing local beyond the remote default branch and a clean working
     /// tree: no salvage was attempted.
@@ -5258,36 +5258,31 @@ fn timeout_salvage_pr_comment(
     .join("\n")
 }
 
-/// Timeout-specific issue comment. One-line outcome first, a short bullet
-/// list of the salvage result and the follow-up action, then the detail
-/// (the kill-time ambiguity paragraph, the agent's last summary, and the
-/// raw result event) under a collapsed `<details>` block. Points a human
-/// at the branch/PR and the run log (`r.error` carries the log path).
+/// SPEC-3.12 item 3, the "timeout or cancel with commits" row: the
+/// Needs-Review comment for a timed-out run. SPEC-3.16.3/5: capped at 3
+/// bullets (the cause, the salvage outcome, the follow-up action), the cause
+/// first; the run link comes from the SPEC-3.9 footer the caller appends.
+/// Neither the raw stream-log path (`r.error`) nor the raw terminal event
+/// reaches the comment: the kill-time ambiguity paragraph and the agent's
+/// last summary move to a collapsed `<details>` block instead, which is not
+/// a bullet and so is not bound by the cap.
 fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport) -> String {
-    let mut lines = vec![
-        format!(
-            "Claude AI agent run TIMED OUT after {}s (the run hit its time limit and was killed).",
-            timeout.as_secs()
-        ),
-        String::new(),
-    ];
+    let cause = format!(
+        "timed out after {}s (the run hit its time limit and was killed)",
+        timeout.as_secs()
+    );
 
-    if salvage.nothing_to_salvage {
-        lines.push("- No local work to salvage (clean working tree, no commits ahead of the remote default branch).".to_string());
+    let salvage_line = if salvage.nothing_to_salvage {
+        "No local work to salvage (clean working tree, no commits ahead of the remote default branch).".to_string()
+    } else if let Some(e) = &salvage.commit_error {
+        format!("Committing the uncommitted working tree failed: {e}")
     } else {
-        if let Some(e) = &salvage.commit_error {
-            lines.push(format!(
-                "- Committing the uncommitted working tree failed: {e}"
-            ));
-        }
         match (&salvage.pr_url, &salvage.open_error) {
             (Some(url), _) => {
-                lines.push(format!(
-                    "- Work in progress was salvaged as a draft PR: {url}"
-                ));
+                let mut line = format!("Work in progress was salvaged as a draft PR: {url}");
                 if let Some(e) = &salvage.comment_error {
-                    lines.push(format!(
-                        "- Posting the explanation comment on that PR failed: {e}"
+                    line.push_str(&format!(
+                        " Posting the explanation comment on that PR failed: {e}"
                     ));
                 }
                 if let Some(e) = salvage
@@ -5295,29 +5290,31 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
                     .as_ref()
                     .and_then(|pr| pr.push_comment_failure.as_deref())
                 {
-                    lines.push(format!("- {e}"));
+                    line.push_str(&format!(" {e}"));
                 }
+                line
             }
-            (None, Some(e)) => {
-                lines.push(format!("- Salvaging the work as a draft PR failed: {e}"));
-            }
-            (None, None) => {}
+            (None, Some(e)) => format!("Salvaging the work as a draft PR failed: {e}"),
+            (None, None) => "No local work to salvage.".to_string(),
         }
-    }
-    lines.push("- A human should inspect the branch/PR and the run log, then resolve the issue manually or re-queue it (set AI Agent = Queued); a re-queue resumes on the salvaged branch.".to_string());
-    lines.push(format!("- {}", timeout_cost_line(r)));
+    };
 
-    let mut body = lines.join("\n");
+    let action = format!(
+        "A human should inspect the branch/PR and the run log, then resolve the issue manually \
+         or re-queue it (set AI Agent = Queued); a re-queue resumes on the salvaged branch. {}.",
+        timeout_cost_line(r)
+    );
+
+    let mut body =
+        format!("**Claude AI agent run TIMED OUT.**\n\n- {cause}\n- {salvage_line}\n- {action}");
+
     let detail = [
-        format!("Details: {}", r.error),
-        String::new(),
         "The agent may have completed all, some, or none of the work before being killed. A backgrounded command can hold the process open past the limit even after the functional work is done, so this is not necessarily a failure. The runner did NOT mark this issue Failed.".to_string(),
         String::new(),
         r.summary.clone(),
     ]
     .join("\n");
     body.push_str(&collapsed_details("Run detail and agent summary", &detail));
-    body.push_str(&raw_event_details(&r.raw));
     body
 }
 
@@ -7105,10 +7102,10 @@ mod tests {
         );
     }
 
-    /// CLAUDE-546: the timeout comment leads with a one-line outcome that
-    /// names the timeout, lists the salvage and follow-up as bullets, and
-    /// moves the kill-time ambiguity paragraph and agent summary under a
-    /// collapsed `<details>` block so a reviewer sees the outcome first.
+    /// CLAUDE-546: the timeout comment leads with a one-line outcome, lists
+    /// the cause, salvage and follow-up as bullets, and moves the kill-time
+    /// ambiguity paragraph and agent summary under a collapsed `<details>`
+    /// block so a reviewer sees the outcome first.
     #[test]
     fn timeout_comment_leads_with_outcome_and_collapses_detail() {
         let mut r = ClaudeResult::synthesized("claude exited 124, see stream.jsonl", "");
@@ -7119,9 +7116,10 @@ mod tests {
         };
         let body = timeout_comment(&r, Duration::from_secs(120), &salvage);
         assert!(
-            body.starts_with("Claude AI agent run TIMED OUT after 120s"),
+            body.starts_with("**Claude AI agent run TIMED OUT.**"),
             "{body}"
         );
+        assert!(body.contains("- timed out after 120s"), "{body}");
         assert!(body.contains("- No local work to salvage"), "{body}");
         assert!(body.contains("- A human should inspect"), "{body}");
         assert!(
@@ -7148,6 +7146,63 @@ mod tests {
             body.contains("mid-write on src/foo.rs"),
             "agent summary must still appear in the collapsed block:\n{body}"
         );
+    }
+
+    /// SPEC-3.16.3/5: the timeout Needs-Review comment is at most 3 bullets,
+    /// the cause first, and never carries the raw stream-log path or the raw
+    /// terminal result event, across every salvage outcome.
+    #[test]
+    fn timeout_comment_per_salvage_outcome_is_capped_and_leads_with_the_cause() {
+        let r = ClaudeResult::synthesized("claude exited 124, see stream.jsonl", "summary");
+        let cases: &[SalvageReport] = &[
+            SalvageReport {
+                nothing_to_salvage: true,
+                ..Default::default()
+            },
+            SalvageReport {
+                commit_error: Some("working tree commit failed".to_string()),
+                ..Default::default()
+            },
+            SalvageReport {
+                pr_url: Some("https://dev.a8n.run/contoso/claude-run/pulls/9".to_string()),
+                pr: Some(PullRequest {
+                    number: Some(9),
+                    url: "https://dev.a8n.run/contoso/claude-run/pulls/9".into(),
+                    head_branch: Some("feat/x".into()),
+                    push_comment_failure: None,
+                }),
+                ..Default::default()
+            },
+            SalvageReport {
+                open_error: Some("opening the draft PR failed".to_string()),
+                ..Default::default()
+            },
+        ];
+        for salvage in cases {
+            let body = timeout_comment(&r, Duration::from_secs(1800), salvage);
+            let bullets: Vec<&str> = body.lines().filter(|l| l.starts_with("- ")).collect();
+            assert!(
+                bullets.len() <= 3,
+                "{salvage:?}: at most 3 bullets:\n{body}"
+            );
+            assert_eq!(
+                bullets.first().copied(),
+                Some("- timed out after 1800s (the run hit its time limit and was killed)"),
+                "{salvage:?}: the cause must be the first bullet:\n{body}"
+            );
+            assert!(
+                !body.contains(".jsonl") && !body.contains("/streams/"),
+                "{salvage:?}: no raw stream-log path:\n{body}"
+            );
+            assert!(
+                !body.contains("claude exited 124"),
+                "{salvage:?}: the raw `r.error` text must not appear:\n{body}"
+            );
+            assert!(
+                body.starts_with("**Claude AI agent run TIMED OUT.**"),
+                "{body}"
+            );
+        }
     }
 
     /// CLAUDE-546: the failure comment leads with a one-line outcome and
