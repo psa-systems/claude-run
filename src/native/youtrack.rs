@@ -15776,6 +15776,84 @@ mod tests {
         );
     }
 
+    /// SPEC-3.16 item 1: a marker with more findings than the cap allows is
+    /// truncated to 5 total bullets, the final bullet names the dropped
+    /// count and links the evidence file, and the drop is logged at `warn`
+    /// with the issue key.
+    #[test]
+    fn cap_verdict_bullets_truncates_over_cap_marker_and_warns() {
+        let text = "Review: FAIL\n\
+            a.rs:1 - finding one\n\
+            a.rs:2 - finding two\n\
+            a.rs:3 - finding three\n\
+            a.rs:4 - finding four\n\
+            a.rs:5 - finding five\n\
+            a.rs:6 - finding six";
+        let link = "https://example.test/runs/1/jobs/mk-16/attempt/1/review-evidence";
+        let logs = capture_logs(|| {
+            let capped = cap_verdict_bullets(text, "MK-16", Some(link));
+            let lines: Vec<&str> = capped.lines().collect();
+            assert_eq!(lines[0], "Review: FAIL");
+            assert_eq!(
+                lines.len(),
+                5,
+                "capped marker must have at most 5 bullets total, got:\n{capped}"
+            );
+            assert!(
+                lines.last().unwrap().contains("3 more finding(s) dropped"),
+                "final bullet must name the dropped count, got:\n{capped}"
+            );
+            assert!(
+                lines.last().unwrap().contains(link),
+                "final bullet must link the evidence file, got:\n{capped}"
+            );
+        });
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("MK-16"), "{logs}");
+    }
+
+    /// SPEC-3.16 items 1 and 2: `cap_verdict_outcome` applies the cap to
+    /// both `Pass` and `Fail` text, leaves `NoVerdict` untouched, and the
+    /// non-overflow case appends a single evidence-link bullet rather than
+    /// truncating anything.
+    #[test]
+    fn cap_verdict_outcome_caps_pass_and_fail_and_passes_through_no_verdict() {
+        let link = "https://example.test/runs/1/jobs/mk-16/attempt/1/review-evidence";
+
+        let capped = cap_verdict_outcome(
+            ReviewOutcome::Pass("Review: PASS\na.rs:1 - ok".to_string()),
+            "MK-16",
+            Some(link),
+        );
+        match capped {
+            ReviewOutcome::Pass(text) => {
+                assert!(text.contains("Review: PASS"));
+                assert!(text.contains(&format!("full sweep: {link}")));
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+
+        let capped = cap_verdict_outcome(
+            ReviewOutcome::Fail("Review: FAIL\na.rs:1 - bad".to_string()),
+            "MK-16",
+            Some(link),
+        );
+        match capped {
+            ReviewOutcome::Fail(text) => {
+                assert!(text.contains("Review: FAIL"));
+                assert!(text.contains(&format!("full sweep: {link}")));
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+
+        let no_verdict = cap_verdict_outcome(
+            ReviewOutcome::NoVerdict("no marker written".to_string()),
+            "MK-16",
+            Some(link),
+        );
+        assert!(matches!(no_verdict, ReviewOutcome::NoVerdict(ref t) if t == "no marker written"));
+    }
+
     /// CLAUDE-471 criterion: a fail marker written alongside all-satisfied
     /// criteria (the sweep is the only thing finding a problem) still yields
     /// `ReviewOutcome::Fail` and the existing fail routing - no new routing
