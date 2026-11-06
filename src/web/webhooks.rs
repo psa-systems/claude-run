@@ -2528,6 +2528,11 @@ async fn route_agent_pr_failure(
             "CI failed the same way as the previous attempt on this PR (branch `{branch}`); stopping the fix-attempt loop instead of re-queueing.\n- Repeated failing tests: {tests_display}\n- This run: {}\n- Previous run: {previous_link}\n- Inspect the repeated failure and fix it by hand, then re-queue the issue (set AI Agent = Queued) once it is resolved.",
             ev.html_url
         );
+        // SPEC-3.15: the run ends in Needs Review, so the list ends with that line.
+        let list =
+            crate::progress_list::render_for(&ctx.pool, "youtrack", &record.issue_key, "Needs Review")
+                .await;
+        let body = format!("{body}\n\n{list}");
         let body = crate::run_footer::append_run(
             &body,
             crate::run_footer::resolved_public_url().as_deref(),
@@ -2637,6 +2642,14 @@ async fn route_agent_pr_failure(
             state::expected_duration(&ctx.pool, "youtrack", "ci-remediation")
                 .await
                 .render();
+        // SPEC-3.15 item 4: this comment is the `CI remediation N` line.
+        let step_list = crate::progress_list::render_for(
+            &ctx.pool,
+            "youtrack",
+            &record.issue_key,
+            &format!("CI remediation {}", attempts + 1),
+        )
+        .await;
         let backend = ctx.backend.clone();
         let classifier = ctx.classifier.clone();
         let mint_cfg = ctx.mint_cfg.read().await.clone();
@@ -2679,6 +2692,7 @@ async fn route_agent_pr_failure(
                 "CI failed again on this PR (run #{}, branch `{branch_owned}`).\n- Run: {}\n- Failing tests: {tests_display}{extra}\n- Stage: ci-remediation, expected duration: {expected_duration}\n\n{}",
                 event.index_in_repo, event.html_url, verdict.analysis
             );
+            let body = format!("{body}\n\n{step_list}");
             let body = crate::run_footer::append_run(
                 &body,
                 crate::run_footer::resolved_public_url().as_deref(),
@@ -2778,6 +2792,10 @@ async fn route_agent_pr_failure(
                 Some(&ev.html_url),
             ),
         );
+        let list =
+            crate::progress_list::render_for(&ctx.pool, "youtrack", &record.issue_key, "Needs Review")
+                .await;
+        let body = format!("{body}\n\n{list}");
         let body = crate::run_footer::append_run(
             &body,
             crate::run_footer::resolved_public_url().as_deref(),
@@ -9537,6 +9555,14 @@ mod tests {
                 .iter()
                 .any(|c| c.starts_with("comment CLAUDE-40") && c.contains("Run: ")),
             "the requeue comment carries the run footer: {calls:?}"
+        );
+        // CLAUDE-587 / SPEC-3.15 item 4: the remediation comment carries the
+        // step list with its own `CI remediation N` line marked, before the footer.
+        assert!(
+            calls.iter().any(|c| c.starts_with("comment CLAUDE-40")
+                && c.contains("1. CI remediation 1: <-- This comment")
+                && c.find("<-- This comment") < c.find("Run: ")),
+            "the requeue comment carries the step list: {calls:?}"
         );
         assert!(
             calls

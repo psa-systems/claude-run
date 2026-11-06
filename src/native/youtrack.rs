@@ -2095,6 +2095,56 @@ async fn process_job(
     // this issue, whether from a re-queue or a checkpoint push opened one
     // mid-run, so a PR-step failure comment can say truthfully whether a
     // re-queue resumes that PR's branch.
+    // SPEC-3.15 item 5: the steps `finalize`'s comments list: the stored rows
+    // of earlier attempts plus this attempt's steps derived so far (they are
+    // written to `attempt_steps` right after `finalize` returns). Handed over
+    // through a keyed stash because `finalize` is synchronous with no pool.
+    {
+        let (mut rows, mut incomplete) =
+            match crate::progress_list::load_rows(pool, &action.name, key).await {
+                Ok(rows) => (rows, false),
+                Err(e) => {
+                    error!(action = %action.name, key = %key, error = %e, "reading the stored steps for the step list failed; its times render as unknown");
+                    (Vec::new(), true)
+                }
+            };
+        let attempt_no = i64::from(attempts + 1);
+        let mut push_row = |kind: &str,
+                            start: chrono::DateTime<chrono::Utc>,
+                            end: chrono::DateTime<chrono::Utc>,
+                            ok: bool| {
+            rows.push(crate::progress_list::StepRow {
+                attempt: attempt_no,
+                kind: kind.to_string(),
+                started_at: start,
+                ended_at: end,
+                ok,
+            });
+        };
+        if let Some((clone_start, clone_end, clone_ok)) = clone_timing {
+            push_row("clone", clone_start, clone_end, clone_ok);
+        }
+        if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
+            match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
+                Ok(steps) => {
+                    for step in steps {
+                        push_row(step.kind.as_str(), step.start, step.end, true);
+                    }
+                }
+                Err(e) => {
+                    error!(action = %action.name, key = %key, error = %e, "deriving claude steps for the step list failed; its times render as unknown");
+                    incomplete = true;
+                }
+            }
+        }
+        crate::progress_list::stash_context(
+            key,
+            crate::progress_list::ListContext {
+                done: crate::progress_list::milestones(&rows),
+                incomplete,
+            },
+        );
+    }
     let finalize_res = crate::blocking::in_place(|| {
         finalize(
             backend,
@@ -2121,6 +2171,7 @@ async fn process_job(
             limits.max_attempts_per_key,
         )
     });
+    crate::progress_list::clear_context(key);
     // ---- record a newly opened PR against its issue ----
     // Only for a fresh PR (`resume` is `None`): a resumed job's PR is already
     // recorded, and re-inserting it would collide with the store's
@@ -4261,6 +4312,43 @@ impl DeliveryBlockedReason {
     }
 }
 
+/// SPEC-3.15 item 4: the step-list line a lifecycle comment about `f` is
+/// marked with. One arm per [`Finalized`] variant, no wildcard. A re-queue
+/// announces the next attempt's `Retry N`; a run that ends in `Needs Review` or
+/// `Failed` ends its list with that line.
+fn finalized_line(f: &Finalized, attempt: u32) -> String {
+    let retry = || format!("Retry {}", attempt + 1);
+    match f {
+        Finalized::NeedsReview => "Needs Review".to_string(),
+        Finalized::NoCodeChange => "No code change".to_string(),
+        Finalized::CodeReview { .. } => "PR ready".to_string(),
+        Finalized::Failed { requeued: true, .. } => retry(),
+        Finalized::Failed {
+            requeued: false, ..
+        } => "Failed".to_string(),
+        Finalized::TimedOut { .. } => "Needs Review".to_string(),
+        Finalized::ReviewFailed { requeued: true, .. } => retry(),
+        Finalized::ReviewFailed {
+            requeued: false, ..
+        } => "Needs Review".to_string(),
+        Finalized::DeliveryBlocked { .. } => "Needs Review".to_string(),
+    }
+}
+
+/// SPEC-3.15 + SPEC-3.9: `body`, the numbered step list with `line` marked as
+/// this comment, then the run footer. Every `finalize` lifecycle comment ends
+/// through here so the list sits before the footer.
+fn lifecycle_footer(
+    body: &str,
+    public_url: Option<&str>,
+    run: crate::run_footer::CommentRun<'_>,
+    key: &str,
+    line: &str,
+) -> String {
+    let list = crate::progress_list::render_with_context(key, line);
+    crate::run_footer::append_job(&format!("{body}\n\n{list}"), public_url, run, key)
+}
+
 impl Finalized {
     fn as_str(&self) -> &'static str {
         match self {
@@ -4377,7 +4465,7 @@ fn final_push_failed(
         &cause,
         "Nothing was pushed; the commits are preserved on the runner host only.",
     );
-    let body = crate::run_footer::append_job(&body, public_url, run, &job.key);
+    let body = lifecycle_footer(&body, public_url, run, &job.key, "Failed");
     comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
     Ok(Finalized::Failed {
         cause: err.to_string(),
@@ -4407,7 +4495,7 @@ fn finish_delivery_blocked(
         .map(str::to_string)
         .or_else(|| pr.map(|p| p.url.clone()));
     let body = delivery_blocked_comment(reason, pr_url.as_deref());
-    let body = crate::run_footer::append_job(&body, public_url, run, &job.key);
+    let body = lifecycle_footer(&body, public_url, run, &job.key, "Needs Review");
     let label = src.states.delivery_blocked_label().to_string();
     comment_then_field(backend, src, &job.key, &body, &label)?;
     Ok(Finalized::DeliveryBlocked {
@@ -4515,7 +4603,7 @@ fn finalize(
         let reason = std::fs::read_to_string(&needs_review)?.trim().to_string();
         let reason = append_compaction_note(&reason, stream_log, &job.key);
         let reason = note_checkpoint_rejection(reason);
-        let reason = crate::run_footer::append_job(&reason, public_url.as_deref(), run, &job.key);
+        let reason = lifecycle_footer(&reason, public_url.as_deref(), run, &job.key, "Needs Review");
         if let Err(e) = backend.comment(&job.key, &reason) {
             warn!(key = %job.key, error = %e, "issue comment failed (continuing to tag / AI Agent write)");
         }
@@ -4554,7 +4642,7 @@ fn finalize(
         }
         let summary = std::fs::read_to_string(&no_code)?.trim().to_string();
         let summary = note_checkpoint_rejection(summary);
-        let summary = crate::run_footer::append_job(&summary, public_url.as_deref(), run, &job.key);
+        let summary = lifecycle_footer(&summary, public_url.as_deref(), run, &job.key, "No code change");
         let label = src.states.no_code_label().to_string();
         comment_then_field(backend, src, &job.key, &summary, &label)?;
         info!(key = %job.key, %label, "no-code-change marker present; skipping PR");
@@ -4635,7 +4723,7 @@ fn finalize(
                     let body = append_compaction_note(&body, stream_log, &job.key);
                     let body = note_checkpoint_rejection(body);
                     let body =
-                        crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+                        lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Failed");
                     comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
                     return Ok(Finalized::Failed {
                         cause: format!("SPEC-3.3.2 verification gate failed (`just {command}`)"),
@@ -4680,11 +4768,12 @@ fn finalize(
                         let body = push_comment_note(body);
                         let body = append_compaction_note(&body, stream_log, &job.key);
                         let body = note_checkpoint_rejection(body);
-                        let body = crate::run_footer::append_job(
+                        let body = lifecycle_footer(
                             &body,
                             public_url.as_deref(),
                             run,
                             &job.key,
+                            "PR ready",
                         );
                         comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
                         // Finalize never waits for CI (CLAUDE-278). It makes
@@ -4777,11 +4866,18 @@ fn finalize(
                         let body = push_comment_note(body);
                         let body = append_compaction_note(&body, stream_log, &job.key);
                         let body = note_checkpoint_rejection(body);
-                        let body = crate::run_footer::append_job(
+                        let body = lifecycle_footer(
                             &body,
                             public_url.as_deref(),
                             run,
                             &job.key,
+                            if no_verdict {
+                                "Review (no verdict)".to_string()
+                            } else if requeued {
+                                format!("Retry {}", run.attempt + 1)
+                            } else {
+                                "Needs Review".to_string()
+                            }.as_str(),
                         );
                         comment_then_field(backend, src, &job.key, &body, target)?;
                         Ok(Finalized::ReviewFailed {
@@ -4826,7 +4922,7 @@ fn finalize(
                 );
                 let body = note_checkpoint_rejection(body);
                 let body =
-                    crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+                    lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Conflict resolution");
                 if let Err(ce) = backend.comment(&job.key, &body) {
                     warn!(key = %job.key, error = %ce, "issue comment failed (continuing to AI Agent write)");
                 }
@@ -4901,11 +4997,12 @@ fn finalize(
                             pr_failure_comment(claude_result, &e, &location, pr_step, resume_pr_url)
                         };
                         let body = note_checkpoint_rejection(body);
-                        let body = crate::run_footer::append_job(
+                        let body = lifecycle_footer(
                             &body,
                             public_url.as_deref(),
                             run,
                             &job.key,
+                            if requeued { format!("Retry {}", run.attempt + 1) } else { "Failed".to_string() }.as_str(),
                         );
                         if let Err(ce) = backend.comment(&job.key, &body) {
                             warn!(key = %job.key, error = %ce, "issue comment failed (continuing to AI Agent write)");
@@ -4945,11 +5042,12 @@ fn finalize(
                             resume_pr_url,
                         );
                         let body = note_checkpoint_rejection(body);
-                        let body = crate::run_footer::append_job(
+                        let body = lifecycle_footer(
                             &body,
                             public_url.as_deref(),
                             run,
                             &job.key,
+                            "Failed",
                         );
                         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
                         Ok(Finalized::Failed {
@@ -4995,7 +5093,7 @@ fn finalize(
             let body =
                 delivery_blocked_comment(DeliveryBlockedReason::TimeoutNothingMergeable, None);
             let body = note_checkpoint_rejection(body);
-            let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+            let body = lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Needs Review");
             if let Err(e) = backend.comment(&job.key, &body) {
                 warn!(key = %job.key, error = %e, "delivery-blocked comment failed (continuing)");
             }
@@ -5056,7 +5154,7 @@ fn finalize(
                 let body = lines.join("\n");
                 let body = note_checkpoint_rejection(body);
                 let body =
-                    crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+                    lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "PR ready");
                 if let Err(e) = backend.comment(&job.key, &body) {
                     warn!(key = %job.key, error = %e, "timeout-completed comment failed (continuing)");
                 }
@@ -5075,7 +5173,7 @@ fn finalize(
         }
         let body = timeout_comment(claude_result, claude_timeout, &salvage);
         let body = note_checkpoint_rejection(body);
-        let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+        let body = lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Needs Review");
         if let Err(e) = backend.comment(&job.key, &body) {
             warn!(key = %job.key, error = %e, "timeout comment failed (continuing)");
         }
@@ -5111,7 +5209,7 @@ fn finalize(
         };
         let body = failure_comment(claude_result, &pushed);
         let body = note_checkpoint_rejection(body);
-        let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+        let body = lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Failed");
         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
         let (cause, pr_step) = match &push_result {
             Err(e) => (format!("final push failed: {e}"), Some("push")),
@@ -6995,6 +7093,91 @@ mod tests {
         );
         assert!(tracker.comments.lock().unwrap().is_empty());
         assert_eq!(state::attempts_get(&pool, "yt", "MK-16").await.unwrap(), 0);
+    }
+
+    /// CLAUDE-587 / SPEC-3.15 item 4: every `Finalized` variant maps to its
+    /// own step-list line, and a lifecycle comment ends its list with that
+    /// line marked, before the run footer.
+    #[test]
+    fn each_finalized_variant_ends_its_list_with_its_own_line() {
+        let cr = || Finalized::CodeReview {
+            pr_url: "u".into(),
+            pr_number: Some(1),
+            head_branch: Some("b".into()),
+            merged: false,
+        };
+        let table: Vec<(Finalized, &str)> = vec![
+            (Finalized::NeedsReview, "Needs Review"),
+            (Finalized::NoCodeChange, "No code change"),
+            (cr(), "PR ready"),
+            (
+                Finalized::Failed {
+                    cause: "c".into(),
+                    pr_step: None,
+                    requeued: false,
+                },
+                "Failed",
+            ),
+            (
+                Finalized::Failed {
+                    cause: "c".into(),
+                    pr_step: Some("push"),
+                    requeued: true,
+                },
+                "Retry 2",
+            ),
+            (
+                Finalized::TimedOut {
+                    pr_number: None,
+                    head_branch: None,
+                },
+                "Needs Review",
+            ),
+            (
+                Finalized::ReviewFailed {
+                    pr_url: "u".into(),
+                    pr_number: None,
+                    head_branch: None,
+                    requeued: true,
+                },
+                "Retry 2",
+            ),
+            (
+                Finalized::ReviewFailed {
+                    pr_url: "u".into(),
+                    pr_number: None,
+                    head_branch: None,
+                    requeued: false,
+                },
+                "Needs Review",
+            ),
+            (
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::NoCommitsAhead,
+                    pr_url: None,
+                    pr_number: None,
+                    head_branch: None,
+                },
+                "Needs Review",
+            ),
+        ];
+        let started = chrono::Utc::now();
+        let trigger = crate::run_footer::Trigger::AiAgentPickup;
+        for (finalized, expected_line) in table {
+            let line = finalized_line(&finalized, 1);
+            assert_eq!(line, expected_line, "{finalized:?}");
+            let run = crate::run_footer::CommentRun {
+                run_id: 7,
+                attempt: 1,
+                started,
+                source: "youtrack",
+                trigger: Some(&trigger),
+            };
+            let body = lifecycle_footer("outcome", None, run, "TBL-1", &line);
+            let marked = format!("1. {line}: <-- This comment");
+            let list_end = body.find(&marked).expect("the marked line is present");
+            assert!(body.find("Run: ").unwrap() > list_end, "list before footer: {body}");
+        }
     }
 
     /// CLAUDE-584 / SPEC-3.13: the pickup posts the start notice, naming the

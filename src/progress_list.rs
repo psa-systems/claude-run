@@ -246,6 +246,52 @@ pub async fn render_for(pool: &DbPool, action: &str, key: &str, current: &str) -
     }
 }
 
+/// The earlier steps a lifecycle comment for one job lists: stored rows of
+/// earlier attempts plus the current attempt's steps derived so far.
+#[derive(Debug, Clone, Default)]
+pub struct ListContext {
+    pub done: Vec<Milestone>,
+    /// The stored rows could not be read; every time renders `?:??`.
+    pub incomplete: bool,
+}
+
+type ContextRegistry = std::sync::Mutex<std::collections::HashMap<String, ListContext>>;
+
+fn context_registry() -> &'static ContextRegistry {
+    static R: std::sync::OnceLock<ContextRegistry> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// Hand the synchronous `finalize` (no pool, fixed signature) the steps its
+/// comments list, keyed by job key. Cleared by [`clear_context`] when
+/// `finalize` returns.
+pub fn stash_context(key: &str, ctx: ListContext) {
+    context_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.to_string(), ctx);
+}
+
+/// Drop the stashed context for `key`.
+pub fn clear_context(key: &str) {
+    context_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(key);
+}
+
+/// SPEC-3.15: the list for a comment whose own line is `current`, from the
+/// context stashed for `key` (earlier steps only when none was stashed).
+pub fn render_with_context(key: &str, current: &str) -> String {
+    let ctx = context_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(key)
+        .cloned()
+        .unwrap_or_default();
+    render(&ctx.done, current, ctx.incomplete)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +385,26 @@ mod tests {
     fn output_is_ascii_only() {
         let rows = [row(1, "checkpoint", 0, 60, true)];
         assert!(render_rows(&rows, "Checks 1", false).is_ascii());
+    }
+
+    #[test]
+    fn a_stashed_context_supplies_the_earlier_steps() {
+        let rows = [row(1, "check", 0, 90, true)];
+        stash_context(
+            "CTX-1",
+            ListContext {
+                done: milestones(&rows),
+                incomplete: false,
+            },
+        );
+        let list = render_with_context("CTX-1", "Failed");
+        clear_context("CTX-1");
+        assert_eq!(list, "1. Checks 1: 1:30 / 1:30\n2. Failed: <-- This comment");
+        assert_eq!(
+            render_with_context("CTX-1", "Failed"),
+            "1. Failed: <-- This comment",
+            "a cleared context lists only the current line"
+        );
     }
 
     #[tokio::test]
