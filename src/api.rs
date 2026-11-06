@@ -136,6 +136,7 @@ pub fn router(state: AppState) -> Router {
         .route("/report/weekly", get(report_weekly))
         .route("/report/by-weekday", get(report_by_weekday))
         .route("/report/by-hour", get(report_by_hour))
+        .route("/report/step-timing", get(report_step_timing))
         // On-demand access check. Same typed report the `/access`
         // page renders and `claude-run access check` prints, so the three
         // surfaces cannot drift.
@@ -720,6 +721,16 @@ async fn report_by_hour(
 ) -> Result<Json<Vec<crate::report::HourBucket>>, AppError> {
     Ok(Json(
         crate::report::by_hour(&s.pool, q.range(), q.action()).await?,
+    ))
+}
+
+/// SPEC-4.3.14: `GET /report/step-timing`.
+async fn report_step_timing(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<crate::report::StepTimingReport>, AppError> {
+    Ok(Json(
+        crate::report::step_timing(&s.pool, q.range(), q.action()).await?,
     ))
 }
 
