@@ -65,7 +65,7 @@ Each terminal variant in [`Finalized`](../src/native/youtrack.rs):
   - `PushRejected`: a rejected checkpoint push (CLAUDE-448) followed by a failing final push.
   - `ReviewModifiedWorkdir`: a `NoVerdict` whose cause names the "read-only by contract" invariant. By the time `finalize` sees this, the review has already been retried once (SPEC-3.12 item 9, `run_review_session_with_retry` in `src/native/youtrack.rs`, called before `finalize`): a first session that modifies the workdir has its changes discarded (`discard_review_changes`) and a fresh session runs; this reason fires only when that retry also gave no verdict (another modification, a timeout, or no marker), and the cause then names both sessions' findings.
   - `NoCommitsAhead`: `create_pr_with_draft` failed with `work_location == WorkLocation::None`.
-  - `CiFixCeiling`: driven by the CI-failure webhook path (`src/web/webhooks.rs`), not `finalize` itself. Included here for a complete inventory of the terminal states a run can reach, including the webhook-driven ones.
+  - `CiFixCeiling`: driven by the CI-failure webhook path (`src/web/webhooks.rs`), not `finalize` itself. Included here for a complete inventory of the terminal states a run can reach, including the webhook-driven ones. Its two `Needs Review` writes (the loop-breaker that stops a repeated failure, and the hard-cap park) both name the one action and write `mint.needs_info_tag` (default `Needs-Info`), matching the SPEC-3.12 item 3 "CI remediation ceiling reached" row (CLAUDE-582).
   AI Agent = `states.delivery_blocked_label()` (falls back to `states.needs_review` when `delivery_blocked` is unset).
 
 ## Guards threaded through `finalize`
