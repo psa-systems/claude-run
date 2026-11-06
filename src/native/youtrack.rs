@@ -1484,6 +1484,8 @@ async fn process_job(
                         already_resuming,
                         CHECKPOINT_PUSH_INTERVAL,
                         stop_rx,
+                        run_id,
+                        started_wall,
                     )
                 });
                 let invoke_result = claude.invoke(
@@ -2192,6 +2194,8 @@ fn run_checkpoint_watcher(
     already_resuming: bool,
     interval: Duration,
     stop_rx: std::sync::mpsc::Receiver<()>,
+    run_id: i64,
+    run_started: chrono::DateTime<chrono::Utc>,
 ) -> CheckpointOutcome {
     use std::sync::mpsc::RecvTimeoutError;
     let host = host_only(&job.repo_host);
@@ -2202,7 +2206,14 @@ fn run_checkpoint_watcher(
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
-        match forge.checkpoint_push(workdir, &host, Some(body.as_str())) {
+        match forge.checkpoint_push(
+            workdir,
+            &host,
+            Some(body.as_str()),
+            &job.key,
+            Some(run_id),
+            Some(run_started),
+        ) {
             Ok(Some(pr)) => {
                 if opened.is_none() && !already_resuming {
                     if let (Some(pr_number), Some(head_branch)) =
@@ -6279,6 +6290,9 @@ mod tests {
             _workdir: &Path,
             _host: &str,
             _body: Option<&str>,
+            _issue_key: &str,
+            _run_id: Option<i64>,
+            _run_started: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<Option<PullRequest>> {
             let mut calls = self.calls.lock().unwrap();
             let results = self.results.lock().unwrap();
@@ -6386,6 +6400,8 @@ mod tests {
                     false,
                     watcher_test_interval(),
                     stop_rx,
+                    1,
+                    chrono::Utc::now(),
                 )
             });
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -6444,6 +6460,8 @@ mod tests {
                     true,
                     watcher_test_interval(),
                     stop_rx,
+                    1,
+                    chrono::Utc::now(),
                 )
             });
             std::thread::sleep(Duration::from_millis(30));
@@ -6488,6 +6506,8 @@ mod tests {
                     false,
                     watcher_test_interval(),
                     stop_rx,
+                    1,
+                    chrono::Utc::now(),
                 )
             });
             // Wait for the rejecting tick (CLAUDE-462), then leave several more
