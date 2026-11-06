@@ -2913,6 +2913,15 @@ struct ReportsTpl {
     /// writes all failed); shown as its own figure, never folded into either
     /// series above as zero.
     attempts_with_no_step_data: i64,
+    /// SPEC-4.3.14 stages series, every stage in order.
+    stages: Vec<crate::report::StageStats>,
+    stages_no_step_data: i64,
+    /// SPEC-4.3.14 Postgres series.
+    postgres: crate::report::PostgresReport,
+    /// SPEC-4.3.14 funnel; `mismatch` renders as an error banner.
+    funnel: crate::report::FunnelReport,
+    /// SPEC-4.3.14 failure causes, every cause in order.
+    failure_causes: crate::report::FailureCauseReport,
 }
 
 /// Query params for `/reports`: `range` (default all-time) and an optional
@@ -3037,6 +3046,11 @@ async fn reports_page(
         .collect();
     checks.sort_by(|a, b| b.seconds.partial_cmp(&a.seconds).unwrap());
 
+    let stage_report = crate::report::stages(pool, range, action_filter).await?;
+    let postgres = crate::report::postgres(pool, range, action_filter).await?;
+    let funnel = crate::report::funnel(pool, range, action_filter).await?;
+    let failure_causes = crate::report::failure_causes(pool, range, action_filter).await?;
+
     let usage = crate::report::claude_usage(pool, range, action_filter).await?;
     let usage_chart = (!usage.points.is_empty()).then(|| build_usage_chart(&usage.points));
 
@@ -3109,6 +3123,11 @@ async fn reports_page(
         time_by_kind,
         checks,
         attempts_with_no_step_data: step_timing.attempts_with_no_step_data,
+        stages_no_step_data: stage_report.attempts_with_no_step_data,
+        stages: stage_report.stages,
+        postgres,
+        funnel,
+        failure_causes,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }

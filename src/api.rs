@@ -137,6 +137,10 @@ pub fn router(state: AppState) -> Router {
         .route("/report/by-weekday", get(report_by_weekday))
         .route("/report/by-hour", get(report_by_hour))
         .route("/report/step-timing", get(report_step_timing))
+        .route("/report/stages", get(report_stages))
+        .route("/report/postgres", get(report_postgres))
+        .route("/report/funnel", get(report_funnel))
+        .route("/report/failure-causes", get(report_failure_causes))
         // On-demand access check. Same typed report the `/access`
         // page renders and `claude-run access check` prints, so the three
         // surfaces cannot drift.
@@ -731,6 +735,46 @@ async fn report_step_timing(
 ) -> Result<Json<crate::report::StepTimingReport>, AppError> {
     Ok(Json(
         crate::report::step_timing(&s.pool, q.range(), q.action()).await?,
+    ))
+}
+
+/// SPEC-4.2 / SPEC-4.3.14: `GET /report/stages`.
+async fn report_stages(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<crate::report::StageReport>, AppError> {
+    Ok(Json(
+        crate::report::stages(&s.pool, q.range(), q.action()).await?,
+    ))
+}
+
+/// SPEC-4.2 / SPEC-4.3.14: `GET /report/postgres`.
+async fn report_postgres(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<crate::report::PostgresReport>, AppError> {
+    Ok(Json(
+        crate::report::postgres(&s.pool, q.range(), q.action()).await?,
+    ))
+}
+
+/// SPEC-4.2 / SPEC-4.3.14: `GET /report/funnel`.
+async fn report_funnel(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<crate::report::FunnelReport>, AppError> {
+    Ok(Json(
+        crate::report::funnel(&s.pool, q.range(), q.action()).await?,
+    ))
+}
+
+/// SPEC-4.2 / SPEC-4.3.14: `GET /report/failure-causes`.
+async fn report_failure_causes(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<crate::report::FailureCauseReport>, AppError> {
+    Ok(Json(
+        crate::report::failure_causes(&s.pool, q.range(), q.action()).await?,
     ))
 }
 
