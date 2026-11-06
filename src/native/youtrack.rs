@@ -4860,24 +4860,27 @@ fn post_gate_failure_on_pr(
 
 /// Issue comment for a [`Finalized::ReviewFailed`] outcome: the PR stays a
 /// draft, so the comment says so and names where the findings also landed.
+///
+/// SPEC-3.16.3/5: at most 2 bullets (the cause, then the draft PR to look
+/// at; the run link is the third bullet, appended by the caller's SPEC-3.9
+/// footer), the cause first. `findings` and the agent's summary move to a
+/// collapsed `<details>` block, which is not a bullet and so is not bound by
+/// the cap.
 fn review_findings_comment(
     r: &ClaudeResult,
     pr_url: &str,
     findings: &str,
     no_verdict: bool,
 ) -> String {
-    let headline = if no_verdict {
-        "Claude AI agent run completed, but the post-success review gave no usable verdict. \
-         The PR is left as a draft pending a human decision:"
+    let cause = if no_verdict {
+        "the post-success review gave no usable verdict"
     } else {
-        "Claude AI agent run completed, but the post-success review found problems. \
-         The PR is left as a draft until they are fixed:"
+        "the post-success review found problems"
     };
-    [
-        headline.to_string(),
-        String::new(),
-        format!("Draft PR: {pr_url}"),
-        String::new(),
+    let outcome = format!("The PR is left as a draft pending a human decision: {pr_url}");
+    let mut body =
+        format!("**Claude AI agent run completed; Needs Review.**\n\n- {cause}\n- {outcome}");
+    let detail = [
         "Review findings:".to_string(),
         String::new(),
         findings.to_string(),
@@ -4886,7 +4889,12 @@ fn review_findings_comment(
         String::new(),
         format!("Cost: ${} USD", r.cost),
     ]
-    .join("\n")
+    .join("\n");
+    body.push_str(&collapsed_details(
+        "Review findings and agent summary",
+        &detail,
+    ));
+    body
 }
 
 /// Post `findings` as a comment on PR `pr_number`, through a scratch file
@@ -4908,11 +4916,22 @@ fn post_review_findings_on_pr(
 }
 
 // CLAUDE-466: `pr_step` is `"push"` or `"pr_create"`, the step `finalize`
-// determined actually failed, so the headline never blames PR creation for a
-// push failure. `recorded_pr_url`, when set, is the PR `agent_pull_requests`
-// already has recorded for this issue (a prior resume target, or one a
-// checkpoint push opened mid-run): a `RemoteBranch` failure on a recorded PR
-// means a re-queue resumes that PR's branch rather than opening a fresh one.
+// determined actually failed, so the cause bullet never blames PR creation
+// for a push failure. `recorded_pr_url`, when set, is the PR
+// `agent_pull_requests` already has recorded for this issue (a prior resume
+// target, or one a checkpoint push opened mid-run): a `RemoteBranch` failure
+// on a recorded PR means a re-queue resumes that PR's branch rather than
+// opening a fresh one.
+//
+// SPEC-3.16.3/5: capped at the same 2-bullet shape as
+// `run_footer::failure_comment` (cause, then what was or was not pushed; the
+// run link is the third bullet, appended by the caller's SPEC-3.9 footer).
+// The cause is drawn from the closed `FailureCause` set: a push failure
+// classifies as `PushRejected` (mirrors `final_push_failed`), a PR-create
+// failure as `CommandFailed { command: "pr create" }`. `err`'s text and the
+// agent's summary move to a collapsed `<details>` block, which is not a
+// bullet and so is not bound by the cap; the raw terminal event is dropped
+// entirely rather than appended, since the run link already reaches it.
 fn pr_failure_comment(
     r: &ClaudeResult,
     err: &Error,
@@ -4943,23 +4962,25 @@ fn pr_failure_comment(
         },
         WorkLocation::None => "No local commits were found to preserve.".to_string(),
     };
-    let headline = match pr_step {
-        "push" => "Claude AI agent run completed but pushing the branch FAILED:",
-        _ => "Claude AI agent run completed but opening the PR FAILED:",
+    let cause = if pr_step == "push" {
+        crate::run_footer::FailureCause::PushRejected {
+            error: err.to_string(),
+        }
+    } else {
+        crate::run_footer::FailureCause::CommandFailed {
+            command: "pr create".to_string(),
+        }
     };
-    let mut body = [
-        headline.to_string(),
-        String::new(),
+    let mut body = crate::run_footer::failure_comment(&cause, &location_line);
+    let detail = [
         err.to_string(),
-        String::new(),
-        location_line,
         String::new(),
         r.summary.clone(),
         String::new(),
         format!("Cost: ${} USD", r.cost),
     ]
     .join("\n");
-    body.push_str(&raw_event_details(&r.raw));
+    body.push_str(&collapsed_details("Run detail and agent summary", &detail));
     body
 }
 
@@ -10242,13 +10263,14 @@ mod tests {
             None,
         );
 
+        let lead = body.split("\n\n<details>").next().unwrap_or(&body);
         assert!(
-            body.contains("pushing the branch FAILED"),
-            "a push failure must name pushing, not PR creation: {body}"
+            lead.starts_with("**Claude AI agent run FAILED.**\n\n- push rejected:"),
+            "a push failure must lead with the closed set's push-rejected cause: {body}"
         );
         assert!(
-            !body.contains("PR creation"),
-            "a push failure must never say \"PR creation\": {body}"
+            !lead.contains("`pr create` failed"),
+            "a push failure must never classify as a pr-create command failure: {body}"
         );
     }
 
@@ -10266,9 +10288,87 @@ mod tests {
         );
 
         assert!(
-            body.contains("opening the PR FAILED"),
-            "a pr_create failure must name opening the PR: {body}"
+            body.contains("`pr create` failed"),
+            "a pr_create failure must classify as the closed set's command-failed cause: {body}"
         );
+        assert!(
+            !body.contains("push rejected"),
+            "a pr_create failure must never name a push rejection: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_failure_comment_is_capped_at_three_bullets_and_leads_with_the_cause() {
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+
+        for pr_step in ["push", "pr_create"] {
+            let body = pr_failure_comment(
+                &ok_result(),
+                &pr_error(),
+                &work_location(&clone, None),
+                pr_step,
+                None,
+            );
+            let lead = body
+                .split("\n\n<details>")
+                .next()
+                .unwrap_or(&body)
+                .to_string();
+            let bullets: Vec<&str> = lead.lines().filter(|l| l.starts_with("- ")).collect();
+            assert!(
+                bullets.len() <= 3,
+                "{pr_step}: at most 3 bullets outside <details>, got {bullets:?}: {body}"
+            );
+            assert!(
+                bullets[0].starts_with("- push rejected")
+                    || bullets[0].starts_with("- `pr create` failed"),
+                "{pr_step}: the cause must lead: {bullets:?}"
+            );
+            assert!(
+                !lead.contains("claude exited") && !lead.contains(".jsonl"),
+                "{pr_step}: the raw stream-log path must never reach the comment body outside <details>: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_findings_comment_is_capped_at_three_bullets_and_leads_with_the_cause() {
+        for no_verdict in [false, true] {
+            let body = review_findings_comment(
+                &ok_result(),
+                "https://dev.a8n.run/contoso/claude-run/pulls/42",
+                "- some finding\n- another finding",
+                no_verdict,
+            );
+            let lead = body
+                .split("\n\n<details>")
+                .next()
+                .unwrap_or(&body)
+                .to_string();
+            let bullets: Vec<&str> = lead.lines().filter(|l| l.starts_with("- ")).collect();
+            assert!(
+                bullets.len() <= 3,
+                "no_verdict={no_verdict}: at most 3 bullets outside <details>, got {bullets:?}: {body}"
+            );
+            let expected_cause = if no_verdict {
+                "- the post-success review gave no usable verdict"
+            } else {
+                "- the post-success review found problems"
+            };
+            assert_eq!(
+                bullets[0], expected_cause,
+                "no_verdict={no_verdict}: the cause must lead: {bullets:?}"
+            );
+            assert!(
+                lead.contains("https://dev.a8n.run/contoso/claude-run/pulls/42"),
+                "the draft PR must still be named outside <details>: {body}"
+            );
+            assert!(
+                body.contains("some finding"),
+                "the findings must still be reachable, in the collapsed detail: {body}"
+            );
+        }
     }
 
     #[test]
