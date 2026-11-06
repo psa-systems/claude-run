@@ -206,18 +206,28 @@ pub fn render_rows(rows: &[StepRow], current: &str, incomplete: bool) -> String 
 /// Load every stored step of one job across its attempts, oldest first. A row
 /// whose timestamps do not parse is an error naming the row, never skipped.
 pub async fn load_rows(pool: &DbPool, action: &str, key: &str) -> Result<Vec<StepRow>> {
-    let raw: Vec<(i64, String, String, String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(
-        crate::db::q(
-            pool,
-            "SELECT attempt, kind, started_at, ended_at, ok FROM attempt_steps \
-             WHERE action_name = ? AND job_key = ? ORDER BY attempt, seq",
-        )
-        .into_owned(),
-    ))
-    .bind(action)
-    .bind(key)
-    .fetch_all(pool)
-    .await?;
+    load_rows_where(pool, Some(action), key).await
+}
+
+/// [`load_rows`] for a caller that knows the job key but not which action
+/// stored it (a webhook handler). `None` matches every action.
+async fn load_rows_where(pool: &DbPool, action: Option<&str>, key: &str) -> Result<Vec<StepRow>> {
+    // SPEC-3.14: step-end writes (a checkpoint, the clone) interleave with the
+    // attempt-end rows, so chronological order is `started_at`, not `seq`.
+    let sql = if action.is_some() {
+        "SELECT attempt, kind, started_at, ended_at, ok FROM attempt_steps \
+         WHERE action_name = ? AND job_key = ? ORDER BY attempt, started_at, seq"
+    } else {
+        "SELECT attempt, kind, started_at, ended_at, ok FROM attempt_steps \
+         WHERE job_key = ? ORDER BY attempt, started_at, seq"
+    };
+    let mut query = sqlx::query_as::<_, (i64, String, String, String, i64)>(sqlx::AssertSqlSafe(
+        crate::db::q(pool, sql).into_owned(),
+    ));
+    if let Some(action) = action {
+        query = query.bind(action);
+    }
+    let raw = query.bind(key).fetch_all(pool).await?;
     raw.into_iter()
         .map(|(attempt, kind, started, ended, ok)| {
             let parse = |what: &str, v: &str| {
@@ -251,6 +261,74 @@ pub async fn render_for(pool: &DbPool, action: &str, key: &str, current: &str) -
             render(&[], current, true)
         }
     }
+}
+
+/// SPEC-3.15 item 5: the stored rows of `key` as a [`ListContext`]. A failed
+/// read is logged at `error` with the key and marks the context incomplete, so
+/// every time renders `?:??` instead of a made-up one. `action` is `None` for
+/// a caller with no action name (a webhook handler).
+pub async fn context_for(pool: &DbPool, action: Option<&str>, key: &str) -> ListContext {
+    match load_rows_where(pool, action, key).await {
+        Ok(rows) => ListContext {
+            done: milestones(&rows),
+            incomplete: false,
+        },
+        Err(e) => {
+            tracing::error!(key = %key, error = %e, "reading attempt_steps for the push comment step list failed; rendering unknown times");
+            ListContext {
+                done: Vec::new(),
+                incomplete: true,
+            }
+        }
+    }
+}
+
+/// SPEC-3.15 + SPEC-8.8: the line a push comment of `event` reports, given the
+/// steps already listed. A checkpoint push is the next `Checkpoint N`.
+pub fn push_step_label(event: crate::push_comment::PushEvent, done: &[Milestone]) -> String {
+    use crate::push_comment::PushEvent;
+    match event {
+        PushEvent::CheckpointPush => {
+            let n = done
+                .iter()
+                .filter(|m| m.label.starts_with("Checkpoint "))
+                .count();
+            format!("Checkpoint {}", n + 1)
+        }
+        PushEvent::InitialPush
+        | PushEvent::ResumedRunPush
+        | PushEvent::MergedRemoteBranchBeforePush => "Final commit".to_string(),
+        PushEvent::TimeoutSalvagePush => "Timed Out".to_string(),
+        PushEvent::ConflictResolvePush => "Conflict resolution".to_string(),
+        PushEvent::CommentWebhookFixPush => "Fix push".to_string(),
+        PushEvent::BranchUpdatedFromBase => "Branch update".to_string(),
+    }
+}
+
+/// SPEC-3.15 item 5 + SPEC-8.8: the list for a push comment of `event`,
+/// rendered from the context stashed for `key` (see [`stash_context`]). No
+/// stashed context is logged at `info` with the key and renders the current
+/// line alone: a push outside any run has no earlier steps to list.
+pub fn render_push(key: &str, event: crate::push_comment::PushEvent) -> String {
+    let ctx = context_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(key)
+        .cloned();
+    let Some(ctx) = ctx else {
+        tracing::info!(key = %key, event = event.label(), "no stored steps for this push comment; listing its own line only");
+        return render(&[], &push_step_label(event, &[]), false);
+    };
+    render_push_with(&ctx, event)
+}
+
+/// [`render_push`] from a context the caller already holds.
+pub fn render_push_with(ctx: &ListContext, event: crate::push_comment::PushEvent) -> String {
+    render(
+        &ctx.done,
+        &push_step_label(event, &ctx.done),
+        ctx.incomplete,
+    )
 }
 
 /// The earlier steps a lifecycle comment for one job lists: stored rows of
@@ -341,6 +419,96 @@ mod tests {
              7. Final commit:\n\
              8. PR ready:"
         );
+    }
+
+    /// CLAUDE-603 / SPEC-3.15 item 5, SPEC-8.8: a push comment renders the
+    /// stashed rows with its own line marked, and the next checkpoint is
+    /// numbered after the stored ones.
+    #[test]
+    fn a_push_comment_lists_the_stashed_rows_and_marks_its_own_line() {
+        let rows = [
+            row(1, "clone", 0, 1, true),
+            row(1, "checkpoint", 2, 88, true),
+        ];
+        stash_context(
+            "PUSH-1",
+            ListContext {
+                done: milestones(&rows),
+                incomplete: false,
+            },
+        );
+        let list = render_push("PUSH-1", crate::push_comment::PushEvent::CheckpointPush);
+        clear_context("PUSH-1");
+        assert!(list.contains("1. Checkpoint 1: 1:26 / 1:28"), "{list}");
+        assert!(list.contains("2. Checkpoint 2: <-- This comment"), "{list}");
+    }
+
+    /// A push with no stashed steps still lists its own line, never a made-up time.
+    #[test]
+    fn a_push_comment_without_stored_steps_lists_its_own_line_only() {
+        let list = render_push(
+            "PUSH-NONE",
+            crate::push_comment::PushEvent::BranchUpdatedFromBase,
+        );
+        assert_eq!(list, "1. Branch update: <-- This comment");
+    }
+
+    /// `context_for` reads the key's stored rows from the database.
+    #[tokio::test]
+    async fn context_for_reads_the_stored_rows_in_time_order() {
+        let pool = crate::db::test_pool().await;
+        let run_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "INSERT INTO runs (action_name, started_at) VALUES ('act', '2026-01-01T00:00:00Z') RETURNING id",
+            )
+            .into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // seq order differs from time order: the checkpoint was written first.
+        for (seq, kind, start, end) in [
+            (
+                1,
+                "checkpoint",
+                "2026-01-01T00:00:10.000Z",
+                "2026-01-01T00:00:12.000Z",
+            ),
+            (
+                2,
+                "clone",
+                "2026-01-01T00:00:00.000Z",
+                "2026-01-01T00:00:03.000Z",
+            ),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    &pool,
+                    "INSERT INTO attempt_steps (run_id, action_name, job_key, attempt, seq, stage, kind, label, started_at, ended_at, ok) VALUES (?, 'act', 'CTX-1', 1, ?, 'initial', ?, ?, ?, ?, 1)",
+                )
+                .into_owned(),
+            ))
+            .bind(run_id)
+            .bind(seq as i64)
+            .bind(kind)
+            .bind(kind)
+            .bind(start)
+            .bind(end)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let ctx = context_for(&pool, Some("act"), "CTX-1").await;
+        assert!(!ctx.incomplete);
+        assert_eq!(ctx.done.len(), 1, "{:?}", ctx.done);
+        assert_eq!(ctx.done[0].label, "Checkpoint 1");
+        assert_eq!(
+            ctx.done[0].total_secs, 12,
+            "total runs from the clone start"
+        );
+        let any_action = context_for(&pool, None, "CTX-1").await;
+        assert_eq!(any_action.done.len(), 1);
     }
 
     #[test]

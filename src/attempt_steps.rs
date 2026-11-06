@@ -394,6 +394,38 @@ impl<'a> StepRecorder<'a> {
         }
     }
 
+    /// Delete every row stored for this recorder's attempt number. Called when
+    /// the attempt starts (rows left by an earlier attempt that never counted
+    /// and so reuses this number) and when it ends uncounted, because step-end
+    /// writes (CLAUDE-603) land before the attempt is known to count. A failure
+    /// is logged at `error` with the key and marks the attempt incomplete.
+    pub async fn clear_attempt(&mut self) {
+        let res = sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                self.pool,
+                "DELETE FROM attempt_steps WHERE action_name = ? AND job_key = ? AND attempt = ?",
+            )
+            .into_owned(),
+        ))
+        .bind(&self.action_name)
+        .bind(&self.job_key)
+        .bind(self.attempt)
+        .execute(self.pool)
+        .await;
+        self.seq = 0;
+        self.spans.clear();
+        if let Err(e) = res {
+            error!(
+                action = %self.action_name,
+                key = %self.job_key,
+                attempt = self.attempt,
+                error = %e,
+                "clearing the attempt's stale attempt_steps rows failed; attempt marked step data incomplete"
+            );
+            self.incomplete = true;
+        }
+    }
+
     /// SPEC-3.14 item 6: fills every gap between recorded spans (and before
     /// the first / after the last) with its own `other`/`unaccounted` row, so
     /// the attempt's steps plus this remainder always equal its wall time.
@@ -482,6 +514,45 @@ async fn insert_step(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// SPEC-3.14 item 6: remove `holes` (steps recorded while `claude` ran, such as
+/// a checkpoint push) from derived steps so no instant is counted twice. A
+/// step a hole splits keeps both pieces; a step a hole covers is dropped.
+pub fn carve_steps(
+    steps: Vec<ClaudeStep>,
+    holes: &[(DateTime<Utc>, DateTime<Utc>)],
+) -> Vec<ClaudeStep> {
+    let mut out = Vec::new();
+    for step in steps {
+        let mut pieces = vec![(step.start, step.end)];
+        for (hs, he) in holes {
+            pieces = pieces
+                .into_iter()
+                .flat_map(|(s, e)| {
+                    if *he <= s || *hs >= e {
+                        return vec![(s, e)];
+                    }
+                    let mut kept = Vec::new();
+                    if *hs > s {
+                        kept.push((s, *hs));
+                    }
+                    if *he < e {
+                        kept.push((*he, e));
+                    }
+                    kept
+                })
+                .collect();
+        }
+        for (start, end) in pieces {
+            out.push(ClaudeStep {
+                start,
+                end,
+                ..step.clone()
+            });
+        }
+    }
+    out
 }
 
 /// SPEC-3.14 item 4: classify a Bash tool call by its command text alone.
@@ -688,6 +759,40 @@ pub fn derive_claude_steps(
 
 #[cfg(test)]
 mod tests {
+    /// CLAUDE-603: a checkpoint span inside a derived step splits it, so no
+    /// instant is counted by both rows.
+    #[test]
+    fn carve_steps_removes_hole_spans_from_derived_steps() {
+        let at = |s: i64| {
+            DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+                + chrono::Duration::seconds(s)
+        };
+        let step = |kind, start, end| ClaudeStep {
+            kind,
+            label: "x",
+            start: at(start),
+            end: at(end),
+            detail: None,
+        };
+        let out = carve_steps(
+            vec![
+                step(StepKind::Coding, 0, 100),
+                step(StepKind::Check, 100, 120),
+            ],
+            &[(at(40), at(50)), (at(100), at(120))],
+        );
+        let spans: Vec<_> = out.iter().map(|s| (s.kind, s.start, s.end)).collect();
+        assert_eq!(
+            spans,
+            vec![
+                (StepKind::Coding, at(0), at(40)),
+                (StepKind::Coding, at(50), at(100)),
+            ]
+        );
+    }
+
     use super::*;
 
     #[test]

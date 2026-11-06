@@ -1106,6 +1106,8 @@ impl CliBackend {
                 return;
             }
         };
+        // SPEC-3.15 item 5, SPEC-8.8: the list is rendered from stored rows.
+        let progress = crate::progress_list::render_push(&issue_key, event);
         let ctx = crate::push_comment::PushCommentContext {
             event,
             issue_key: &issue_key,
@@ -1116,8 +1118,7 @@ impl CliBackend {
             public_url: public_url.as_deref(),
             run_id: None,
             started: None,
-            // TODO(CLAUDE-603): no stored step rows reach this provider-level site yet.
-            progress: None,
+            progress: Some(&progress),
         };
         pr.push_comment_failure =
             crate::push_comment::post(self, host, repo, pr_number, &scratch, &ctx);
@@ -2314,6 +2315,12 @@ impl Forge for CliBackend {
             let public_url = crate::run_footer::resolved_public_url();
             match self.git_dir_scratch(workdir) {
                 Ok(scratch) => {
+                    // SPEC-3.15 item 5, SPEC-8.8: the watcher stashed the stored
+                    // rows for this key just before the push.
+                    let progress = crate::progress_list::render_push(
+                        issue_key,
+                        crate::push_comment::PushEvent::CheckpointPush,
+                    );
                     let ctx = crate::push_comment::PushCommentContext {
                         event: crate::push_comment::PushEvent::CheckpointPush,
                         issue_key,
@@ -2324,8 +2331,7 @@ impl Forge for CliBackend {
                         public_url: public_url.as_deref(),
                         run_id,
                         started: run_started,
-                        // TODO(CLAUDE-603): no stored step rows reach this provider-level site yet.
-                        progress: None,
+                        progress: Some(&progress),
                     };
                     pr.push_comment_failure =
                         crate::push_comment::post(self, host, &repo, pr_number, &scratch, &ctx);

@@ -1719,8 +1719,19 @@ async fn process_job(
     let resume_branch = resume.as_ref().map(|r| r.branch.as_str());
     // SPEC-3.14: the `clone` runner-owned step, timed by `run_pre` around the
     // `clone_repo` call alone (not the field writes before it or the hook
-    // install after it, both of which fall into `unaccounted` honestly);
-    // recorded below once this attempt is known to count.
+    // install after it, both of which fall into `unaccounted` honestly).
+    // CLAUDE-603: runner-owned steps are written when they end, through this
+    // one recorder, so the rows exist when a push comment renders the SPEC-3.15
+    // list. Rows an earlier uncounted attempt left under this attempt number
+    // are dropped first, and an uncounted attempt drops its own at the end.
+    let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
+        pool,
+        run_id,
+        &action.name,
+        key,
+        attempts + 1,
+    ));
+    recorder.lock().await.clear_attempt().await;
     let mut clone_timing = None;
     let pre_result = crate::blocking::in_place(|| {
         run_pre(
@@ -1735,6 +1746,23 @@ async fn process_job(
         )
     });
 
+    // SPEC-3.14 / CLAUDE-603: the `clone` row, written the moment the clone ends.
+    if let Some((clone_start, clone_end, clone_ok)) = clone_timing {
+        recorder
+            .lock()
+            .await
+            .record(
+                stage,
+                crate::attempt_steps::StepKind::Clone,
+                "clone",
+                clone_start,
+                clone_end,
+                clone_ok,
+                None,
+            )
+            .await;
+    }
+
     // ---- prompt + claude (skipped on pre failure / cancel / global pause) ----
     // The gate is read once here (not in a match guard, which cannot
     // `await`) and reused below so a paused job's attempt is not counted.
@@ -1743,6 +1771,10 @@ async fn process_job(
     // watcher's own outcome; every other arm never checkpoints, so this
     // stays `None` for them, which `finalize` treats as "nothing rejected".
     let mut checkpoint_rejected: Option<String> = None;
+    // CLAUDE-603: the spans of the checkpoint pushes the watcher recorded
+    // during `claude.invoke`, carved out of the derived coding/check/build steps.
+    let mut checkpoint_spans: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
+        Vec::new();
     // SPEC-3.14: the stream-log path plus the `claude.invoke` call's own
     // start/end, set only in the claude-ran arm below. `coding`/`check`/
     // `build` steps are derived from this span's stream log once this
@@ -1855,6 +1887,8 @@ async fn process_job(
                         stop_rx,
                         run_id,
                         started_wall,
+                        &recorder,
+                        stage,
                     )
                 });
                 let invoke_result = claude.invoke(
@@ -1874,12 +1908,14 @@ async fn process_job(
                 let outcome = watcher.join().unwrap_or(CheckpointOutcome {
                     opened: None,
                     rejected: None,
+                    spans: Vec::new(),
                 });
                 (invoke_result, outcome)
             });
             let r = invoke_result?;
             claude_span = Some((stream_log.clone(), invoke_step_start, chrono::Utc::now()));
             checkpoint_rejected = checkpoint_outcome.rejected;
+            checkpoint_spans = checkpoint_outcome.spans;
             if resume.is_none() {
                 resume = checkpoint_outcome.opened;
             }
@@ -1996,13 +2032,6 @@ async fn process_job(
     // succeeded with no outstanding blocker/no-code marker (a blocker or a
     // deliberate no-code run never opens a PR, so there is nothing to
     // review). Billed exactly like the main invocation.
-    // SPEC-3.14: the `review` runner-owned step's start/end/ok, set only when
-    // this branch runs.
-    let mut review_span: Option<(
-        chrono::DateTime<chrono::Utc>,
-        chrono::DateTime<chrono::Utc>,
-        bool,
-    )> = None;
     let review = if claude_ran
         && claude_result.ok
         && !workdir_path.join(NEEDS_REVIEW_MARKER).exists()
@@ -2043,11 +2072,22 @@ async fn process_job(
         });
         // SPEC-3.14: the `review` runner-owned step, recorded below once this
         // attempt is known to count.
-        review_span = Some((
-            review_step_start,
-            chrono::Utc::now(),
-            matches!(outcome, ReviewOutcome::Pass(_)),
-        ));
+        let review_end = chrono::Utc::now();
+        let review_ok = matches!(outcome, ReviewOutcome::Pass(_));
+        // CLAUDE-603: the `review` row, written the moment the review ends.
+        recorder
+            .lock()
+            .await
+            .record(
+                "review",
+                crate::attempt_steps::StepKind::Review,
+                "review",
+                review_step_start,
+                review_end,
+                review_ok,
+                None,
+            )
+            .await;
         for review_result in &review_results {
             spend.record(review_result);
         }
@@ -2126,13 +2166,12 @@ async fn process_job(
                 ok,
             });
         };
-        if let Some((clone_start, clone_end, clone_ok)) = clone_timing {
-            push_row("clone", clone_start, clone_end, clone_ok);
-        }
+        // CLAUDE-603: the clone, checkpoint and review rows are already stored
+        // and loaded above; only the derived steps are still to add.
         if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
             match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
                 Ok(steps) => {
-                    for step in steps {
+                    for step in crate::attempt_steps::carve_steps(steps, &checkpoint_spans) {
                         push_row(step.kind.as_str(), step.start, step.end, true);
                     }
                 }
@@ -2142,6 +2181,7 @@ async fn process_job(
                 }
             }
         }
+        rows.sort_by_key(|r| (r.attempt, r.started_at));
         crate::progress_list::stash_context(
             key,
             crate::progress_list::ListContext {
@@ -2309,34 +2349,22 @@ async fn process_job(
         state::daily_count_increment(pool, &action.name).await?;
     }
 
-    // SPEC-3.14: record this attempt's steps (clone, the claude invocation's
-    // derived coding/check/build steps, and the post-success review), only
-    // for an attempt that counts. Scope: finalize's own PR-path steps (push,
-    // pr_create, gate, ci_wait, conflict_resolution) and hook_install /
-    // postgres_* are tracked in a follow-up issue, not here.
+    // SPEC-3.14: record the rest of this attempt's steps (the claude
+    // invocation's derived coding/check/build steps and the verification
+    // gates; the clone, checkpoint and review rows were written when each
+    // ended, CLAUDE-603), only for an attempt that counts. An uncounted
+    // attempt drops the rows it already wrote.
     // Drained whether or not the attempt counts, so a skipped attempt's gate
     // timing never leaks into the next attempt of the same key.
     let gate_timings = crate::attempt_steps::take_gate_timings(key);
-    if !skip_attempt {
-        let mut recorder =
-            crate::attempt_steps::StepRecorder::new(pool, run_id, &action.name, key, attempts + 1);
-        if let Some((clone_start, clone_end, clone_ok)) = clone_timing {
-            recorder
-                .record(
-                    stage,
-                    crate::attempt_steps::StepKind::Clone,
-                    "clone",
-                    clone_start,
-                    clone_end,
-                    clone_ok,
-                    None,
-                )
-                .await;
-        }
+    if skip_attempt {
+        recorder.lock().await.clear_attempt().await;
+    } else {
+        let mut recorder = recorder.lock().await;
         if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
             match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
                 Ok(steps) => {
-                    for step in steps {
+                    for step in crate::attempt_steps::carve_steps(steps, &checkpoint_spans) {
                         recorder
                             .record(
                                 stage,
@@ -2364,19 +2392,6 @@ async fn process_job(
         // with their recipe stages as check sub-steps when the output timed them.
         for gate in &gate_timings {
             recorder.record_gate(stage, gate).await;
-        }
-        if let Some((review_start, review_end, review_ok)) = review_span {
-            recorder
-                .record(
-                    "review",
-                    crate::attempt_steps::StepKind::Review,
-                    "review",
-                    review_start,
-                    review_end,
-                    review_ok,
-                    None,
-                )
-                .await;
         }
         let incomplete = recorder
             .finish(stage, started_wall, chrono::Utc::now())
@@ -2709,6 +2724,9 @@ async fn mark_merged_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: u6
 struct CheckpointOutcome {
     opened: Option<PrResume>,
     rejected: Option<String>,
+    /// CLAUDE-603: the span of every checkpoint push that landed, so the
+    /// caller can carve them out of the derived steps they fall inside.
+    spans: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
 }
 
 /// Tick `forge.checkpoint_push` on `interval` while `claude` is still running,
@@ -2754,25 +2772,61 @@ fn run_checkpoint_watcher(
     stop_rx: std::sync::mpsc::Receiver<()>,
     run_id: i64,
     run_started: chrono::DateTime<chrono::Utc>,
+    recorder: &tokio::sync::Mutex<crate::attempt_steps::StepRecorder<'_>>,
+    stage: &str,
 ) -> CheckpointOutcome {
     use std::sync::mpsc::RecvTimeoutError;
     let host = host_only(&job.repo_host);
     let body = checkpoint_pr_body(&job.key);
     let mut opened: Option<PrResume> = None;
+    let mut spans = Vec::new();
     loop {
         match stop_rx.recv_timeout(interval) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
-        match forge.checkpoint_push(
+        // SPEC-3.15 item 5, SPEC-8.8, CLAUDE-603: stash the stored rows of this
+        // job just before the push, so the push comment lists every step that
+        // ended before it and marks its own `Checkpoint N` line.
+        crate::progress_list::stash_context(
+            &job.key,
+            pool_handle.block_on(crate::progress_list::context_for(
+                pool,
+                Some(action_name),
+                &job.key,
+            )),
+        );
+        let push_start = chrono::Utc::now();
+        let pushed = forge.checkpoint_push(
             workdir,
             &host,
             Some(body.as_str()),
             &job.key,
             Some(run_id),
             Some(run_started),
-        ) {
+        );
+        crate::progress_list::clear_context(&job.key);
+        match pushed {
             Ok(Some(pr)) => {
+                // SPEC-3.14 / CLAUDE-603: the `checkpoint` row, written the
+                // moment the push ends, so the next checkpoint's comment lists it.
+                let push_end = chrono::Utc::now();
+                pool_handle.block_on(async {
+                    recorder
+                        .lock()
+                        .await
+                        .record(
+                            stage,
+                            crate::attempt_steps::StepKind::Checkpoint,
+                            "checkpoint",
+                            push_start,
+                            push_end,
+                            true,
+                            None,
+                        )
+                        .await;
+                });
+                spans.push((push_start, push_end));
                 if opened.is_none() && !already_resuming {
                     if let (Some(pr_number), Some(head_branch)) =
                         (pr.number, pr.head_branch.clone())
@@ -2810,13 +2864,18 @@ fn run_checkpoint_watcher(
                 error!(key = %job.key, error = %e, "CLAUDE-448: checkpoint push rejected; stopping checkpointing for the rest of this run");
                 let rejected = Some(e.to_string());
                 let _ = stop_rx.recv();
-                return CheckpointOutcome { opened, rejected };
+                return CheckpointOutcome {
+                    opened,
+                    rejected,
+                    spans,
+                };
             }
         }
     }
     CheckpointOutcome {
         opened,
         rejected: None,
+        spans,
     }
 }
 
@@ -7893,6 +7952,9 @@ mod tests {
     struct FakeCheckpointForge {
         results: Mutex<Vec<Result<Option<PullRequest>>>>,
         calls: Mutex<u32>,
+        /// The step list each push would carry (CLAUDE-603), rendered the way
+        /// the provider sites do.
+        lists: Mutex<Vec<String>>,
     }
 
     impl FakeCheckpointForge {
@@ -7900,6 +7962,7 @@ mod tests {
             Self {
                 results: Mutex::new(results),
                 calls: Mutex::new(0),
+                lists: Mutex::new(Vec::new()),
             }
         }
 
@@ -7923,10 +7986,19 @@ mod tests {
             _workdir: &Path,
             _host: &str,
             _body: Option<&str>,
-            _issue_key: &str,
+            issue_key: &str,
             _run_id: Option<i64>,
             _run_started: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<Option<PullRequest>> {
+            // Distinct, non-empty spans so each checkpoint row is stored.
+            std::thread::sleep(Duration::from_millis(2));
+            self.lists
+                .lock()
+                .unwrap()
+                .push(crate::progress_list::render_push(
+                    issue_key,
+                    crate::push_comment::PushEvent::CheckpointPush,
+                ));
             let mut calls = self.calls.lock().unwrap();
             let results = self.results.lock().unwrap();
             let idx = (*calls as usize).min(results.len() - 1);
@@ -8021,6 +8093,9 @@ mod tests {
         let wd = tempfile::tempdir().unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let pool_handle = tokio::runtime::Handle::current();
+        let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
+            &pool, 1, "act", "MK-16", 1,
+        ));
         let outcome = std::thread::scope(|scope| {
             let watcher = scope.spawn(|| {
                 run_checkpoint_watcher(
@@ -8035,6 +8110,8 @@ mod tests {
                     stop_rx,
                     1,
                     chrono::Utc::now(),
+                    &recorder,
+                    "initial",
                 )
             });
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -8070,14 +8147,41 @@ mod tests {
         );
     }
 
-    /// A run that is already resuming its own recorded PR must never let the
-    /// watcher record a second row for it: `already_resuming` suppresses the
-    /// DB write (and `opened`) entirely, even though the forge itself still
-    /// happily pushes and adopts the PR every tick.
+    /// CLAUDE-603 / SPEC-3.15 item 5, SPEC-8.8: each checkpoint push comment
+    /// is rendered from rows stored before that push. The clone row exists
+    /// first, the first checkpoint's own row is written when its push ends,
+    /// and the second comment lists it and marks `Checkpoint 2`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn run_checkpoint_watcher_skips_the_db_write_when_already_resuming() {
+    async fn checkpoint_push_comments_list_the_rows_stored_before_each_push() {
         let pool = mem_pool().await;
-        let forge = FakeCheckpointForge::new(vec![Ok(Some(checkpoint_pr(7, "fix/MK-16")))]);
+        let run_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "INSERT INTO runs (action_name, started_at) VALUES ('act', '2026-01-01T00:00:00Z') RETURNING id",
+            )
+            .into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
+            &pool, run_id, "act", "MK-16", 1,
+        ));
+        let t0 = chrono::Utc::now() - chrono::Duration::seconds(10);
+        recorder
+            .lock()
+            .await
+            .record(
+                "initial",
+                crate::attempt_steps::StepKind::Clone,
+                "clone",
+                t0,
+                t0 + chrono::Duration::seconds(2),
+                true,
+                None,
+            )
+            .await;
+        let forge = FakeCheckpointForge::new(vec![Ok(Some(checkpoint_pr(77, "fix/MK-16")))]);
         let wd = tempfile::tempdir().unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let pool_handle = tokio::runtime::Handle::current();
@@ -8093,8 +8197,87 @@ mod tests {
                     true,
                     watcher_test_interval(),
                     stop_rx,
+                    run_id,
+                    t0,
+                    &recorder,
+                    "initial",
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while forge.lists.lock().unwrap().len() < 2 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(stop_tx);
+            watcher.join().unwrap()
+        });
+        let lists = forge.lists.lock().unwrap().clone();
+        assert!(lists.len() >= 2, "{lists:?}");
+        assert!(
+            lists[0].contains("1. Checkpoint 1: <-- This comment"),
+            "{}",
+            lists[0]
+        );
+        assert!(
+            lists[1].contains("1. Checkpoint 1: ") && !lists[1].contains("1. Checkpoint 1: <--"),
+            "{}",
+            lists[1]
+        );
+        assert!(
+            lists[1].contains("2. Checkpoint 2: <-- This comment"),
+            "{}",
+            lists[1]
+        );
+        assert!(
+            outcome.spans.len() >= 2,
+            "every landed push reports its span: {:?}",
+            outcome.spans
+        );
+        let stored: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "SELECT COUNT(*) FROM attempt_steps WHERE job_key = 'MK-16' AND kind = 'checkpoint'",
+            )
+            .into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            stored >= 2,
+            "checkpoint rows are stored as pushes end: {stored}"
+        );
+    }
+
+    /// A run that is already resuming its own recorded PR must never let the
+    /// watcher record a second row for it: `already_resuming` suppresses the
+    /// DB write (and `opened`) entirely, even though the forge itself still
+    /// happily pushes and adopts the PR every tick.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_checkpoint_watcher_skips_the_db_write_when_already_resuming() {
+        let pool = mem_pool().await;
+        let forge = FakeCheckpointForge::new(vec![Ok(Some(checkpoint_pr(7, "fix/MK-16")))]);
+        let wd = tempfile::tempdir().unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let pool_handle = tokio::runtime::Handle::current();
+        let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
+            &pool, 1, "act", "MK-16", 1,
+        ));
+        let outcome = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                run_checkpoint_watcher(
+                    &forge,
+                    &job(),
+                    wd.path(),
+                    &pool,
+                    &pool_handle,
+                    "act",
+                    true,
+                    watcher_test_interval(),
+                    stop_rx,
                     1,
                     chrono::Utc::now(),
+                    &recorder,
+                    "initial",
                 )
             });
             std::thread::sleep(Duration::from_millis(30));
@@ -8127,6 +8310,9 @@ mod tests {
         let wd = tempfile::tempdir().unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let pool_handle = tokio::runtime::Handle::current();
+        let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
+            &pool, 1, "act", "MK-16", 1,
+        ));
         let outcome = std::thread::scope(|scope| {
             let watcher = scope.spawn(|| {
                 run_checkpoint_watcher(
@@ -8141,6 +8327,8 @@ mod tests {
                     stop_rx,
                     1,
                     chrono::Utc::now(),
+                    &recorder,
+                    "initial",
                 )
             });
             // Wait for the rejecting tick (CLAUDE-462), then leave several more
