@@ -546,10 +546,13 @@ All sweeps are DB-backed settings, enabled by default flags in each section, and
 
 #### 3.8.2 Stream-log, snippet and webhook-log age sweeps (`SPEC-3.8.2`)
 
-- Per-attempt stream logs under `logs/<action>/streams/*.jsonl` older than `retention_days` (30) are deleted. A log
-  whose `(action, job_key)` pair is still in flight (joined from `run_inflight_jobs` to runs that have not ended) is
-  kept regardless of age, because age alone is not evidence a run has finished. A file not shaped
-  `<key>-attempt-<n>.jsonl` is not a stream log and is swept on age alone without the in-flight check.
+- Per-attempt files under `logs/<action>/streams/` older than `retention_days` (30) are deleted: the main attempt log
+  (`<key>-attempt-<n>.jsonl`), the post-success review session's own log (`<key>-attempt-<n>-review.jsonl`), the
+  SPEC-3.16 item 2 evidence file (`<key>-attempt-<n>-review-evidence.md`), and each one's SPEC-3.12 item 9 `-retry`
+  sibling. A file whose `(action, job_key)` pair is still in flight (joined from `run_inflight_jobs` to runs that have
+  not ended) is kept regardless of age, because age alone is not evidence a run has finished. A file matching none of
+  those shapes is not a run's own file; it is swept on age alone without the in-flight check, and logged at `warn`
+  naming it so a new unswept kind is findable.
 - `snippets/<action>/<job_key>/` directories older than `snippet_retention_days` are deleted the same way, reusing the
   exact in-flight set the stream-log sweep reads; a failed read of that set skips both sweeps, since sweeping with an
   empty set would delete a live run's own stream log or snippet directory.
