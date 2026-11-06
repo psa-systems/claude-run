@@ -4796,6 +4796,10 @@ fn finalize(
         if let Err(e) = backend.comment(&job.key, &body) {
             warn!(key = %job.key, error = %e, "timeout comment failed (continuing)");
         }
+        // SPEC-3.12 item 5: a draft PR opened by the salvage above is never
+        // left standing in for a state; this write (or the deliberate
+        // human-override skip) always pairs it with a field from the closed
+        // set.
         if is_working {
             backend.set_field(&job.key, &src.custom_field, &src.states.needs_review)?;
         } else {
@@ -5633,6 +5637,13 @@ fn conflict_resolution_failed_comment(
         format!("Conflicting file(s): {files}"),
         String::new(),
         format!("Conflict-resolution pass failure: {detail}"),
+        String::new(),
+        // SPEC-3.12 item 6: name the single action a human takes next,
+        // rather than only describing the state.
+        format!(
+            "Resolve the conflict by hand (merge `origin/{branch}` into `{branch}`, fix {files}, \
+             and push), or re-queue the issue (set AI Agent = Queued) to retry from a fresh clone."
+        ),
         String::new(),
         r.summary.clone(),
         String::new(),
@@ -10755,6 +10766,13 @@ mod tests {
         assert!(
             comment_call.contains("remotesha"),
             "names the remote SHA: {comment_call}"
+        );
+        // SPEC-3.12 item 6: the comment must name the one action a human
+        // takes next, not just describe the aborted state.
+        assert!(
+            comment_call.contains("Resolve the conflict by hand")
+                && comment_call.contains("re-queue the issue"),
+            "names the single next action: {comment_call}"
         );
         assert!(
             calls
