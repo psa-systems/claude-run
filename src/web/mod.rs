@@ -1387,6 +1387,22 @@ struct DashboardTpl {
     /// Distinct `triggered_by` values present in `runs`, for the
     /// Triggered filter dropdown options.
     triggered_options: Vec<String>,
+    /// SPEC-4.3.15: the CI-failures table, newest first, under the
+    /// active bucket/repo filter.
+    ci_failures: Vec<CiFailureRow>,
+    /// Whitelisted active bucket filter (`open`/`resolved`/`pr_only`, or
+    /// empty for "all"), echoed into the filter dropdown.
+    ci_bucket: String,
+    /// Whitelisted active repo filter, or empty for "all".
+    ci_repo: String,
+    /// Distinct repos with at least one `ci_failures` row, for the
+    /// repository filter dropdown options.
+    ci_repo_options: Vec<String>,
+    /// SPEC-3.12 item 2 / SPEC-4.3.15: count of stuck-Working corrections
+    /// in the last 7 days.
+    stuck_count: i64,
+    /// The stuck-Working corrections themselves, newest first.
+    stuck_rows: Vec<StuckWorkRow>,
 }
 
 /// One stale dependency gate, with its ages pre-rendered for the
@@ -1479,6 +1495,110 @@ impl CappedKeyRow {
         self.link_template
             .as_deref()
             .map(|t| crate::action::render_link(t, &self.capped.job_key))
+    }
+}
+
+/// SPEC-4.3.15: one dashboard table cell that is either a resolved link,
+/// plain text, the "none" sentinel, or a failed lookup. Kept distinct from a
+/// plain `Option<String>` because a failed lookup must render visibly
+/// differently from "no PR"/"no issue": "A failure with no PR or no issue
+/// shows 'none', visibly different from a failed lookup, which shows an
+/// error cell naming the cause."
+enum DashboardCell {
+    /// No PR/issue exists for this failure.
+    None,
+    /// A resolved link, pre-rendered as an escaped `<a>` tag.
+    Link(String),
+    /// Plain text, escaped on render.
+    Text(String),
+    /// The lookup itself failed; carries the cause.
+    Error(String),
+}
+
+impl DashboardCell {
+    /// Pre-rendered HTML for this cell; the template marks it `|safe`.
+    fn render(&self) -> String {
+        match self {
+            DashboardCell::None => "none".to_string(),
+            DashboardCell::Link(html) => html.clone(),
+            DashboardCell::Text(s) => html_escape(s),
+            DashboardCell::Error(cause) => {
+                format!(
+                    r#"<span class="error">error: {}</span>"#,
+                    html_escape(cause)
+                )
+            }
+        }
+    }
+}
+
+/// SPEC-4.3.15: one row of the dashboard's CI-failures table.
+struct CiFailureRow {
+    failure: crate::ci_failure::store::Failure,
+    pr_cell: DashboardCell,
+    issue_cell: DashboardCell,
+    fix_attempts: i64,
+}
+
+impl CiFailureRow {
+    fn repo(&self) -> &str {
+        &self.failure.repo
+    }
+
+    fn workflow_id(&self) -> &str {
+        &self.failure.workflow_id
+    }
+
+    fn job_name(&self) -> &str {
+        &self.failure.job_name
+    }
+
+    /// The dashboard's "bucket" column. `ci_failures` persists no separate
+    /// triage-bucket value distinct from lifecycle state (`open`/`resolved`/
+    /// `pr_only` - see `src/triage.rs`'s `TriageBucket`, computed only at
+    /// webhook-mint time and never written back to the row), so the stored
+    /// `state` fills both roles here: it is what SPEC-4.3.15 calls the
+    /// "triage bucket" column and also the failure's own state.
+    fn bucket(&self) -> &str {
+        &self.failure.state
+    }
+
+    fn infra_kind(&self) -> &str {
+        self.failure.infra_kind.as_deref().unwrap_or("none")
+    }
+
+    fn pr_html(&self) -> String {
+        self.pr_cell.render()
+    }
+
+    fn issue_html(&self) -> String {
+        self.issue_cell.render()
+    }
+
+    fn fix_attempts(&self) -> i64 {
+        self.fix_attempts
+    }
+}
+
+/// SPEC-3.12 item 2 / SPEC-4.3.15: one issue the stuck-Working reconcile
+/// sweep corrected, as rendered in the dashboard's "Stuck work" list.
+struct StuckWorkRow {
+    ts: String,
+    action_name: String,
+    message: String,
+}
+
+impl StuckWorkRow {
+    fn ts(&self) -> &str {
+        &self.ts
+    }
+
+    fn action_name(&self) -> &str {
+        &self.action_name
+    }
+
+    fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -1699,11 +1819,26 @@ struct DashboardQuery {
     /// value is clamped to the valid range in the handler.
     #[serde(default)]
     page: Option<i64>,
+    /// SPEC-4.3.15: CI-failures bucket filter. `None` (the param absent, i.e.
+    /// first page load) defaults to "open" per "a table of every open CI
+    /// failure"; `Some(String::new())` is an explicit "all" from the filter
+    /// dropdown's empty option.
+    #[serde(default)]
+    ci_bucket: Option<String>,
+    /// SPEC-4.3.15: CI-failures repo filter, empty for all.
+    #[serde(default)]
+    ci_repo: String,
 }
 
 /// Rows per page on the dashboard Recent runs table. Matches the
 /// previous hardcoded `LIMIT 20` so page 1 shows exactly the rows it did before.
 const DASHBOARD_PAGE_SIZE: i64 = 20;
+
+/// SPEC-4.3.15: cap on the CI-failures table.
+const CI_FAILURES_LIMIT: i64 = 100;
+
+/// SPEC-3.12 item 2 / SPEC-4.3.15: cap on the dashboard's stuck-work list.
+const STUCK_WORK_LIMIT: i64 = 50;
 
 /// SPEC-4.3.1: the `/` dashboard handler.
 async fn dashboard(
@@ -1885,6 +2020,53 @@ async fn dashboard(
         })
         .collect();
 
+    // SPEC-4.3.15: CI failures table. The bucket filter defaults to "open"
+    // on first load (no `?ci_bucket=` at all); an explicit (possibly empty,
+    // i.e. "all") value from the filter dropdown is whitelisted against the
+    // fixed set of stored `state` values.
+    let ci_repo_options = crate::ci_failure::store::distinct_failure_repos(pool).await?;
+    let ci_bucket = match &q.ci_bucket {
+        None => "open".to_string(),
+        Some(v) => whitelisted(v, &["", "open", "resolved", "pr_only"]),
+    };
+    let ci_repo = whitelist_member(&q.ci_repo, &ci_repo_options);
+    let ci_bucket_filter = (!ci_bucket.is_empty()).then(|| ci_bucket.as_str());
+    let ci_repo_filter = (!ci_repo.is_empty()).then(|| ci_repo.as_str());
+    let failures_raw = crate::ci_failure::store::list_failures_for_dashboard(
+        pool,
+        ci_bucket_filter,
+        ci_repo_filter,
+        CI_FAILURES_LIMIT,
+    )
+    .await?;
+    // SPEC-4.3.15: "the tracker issue (linked through the action's
+    // link_template)". A `ci_failures` row carries no `action_name` of its
+    // own (unlike a run), so the native action that mints these issues
+    // ("youtrack") stands in for the usual per-action resolution.
+    let ci_issue_link_template =
+        action_link_template(pool, &actions_dir, "youtrack", base.as_deref()).await;
+    let mut ci_failures: Vec<CiFailureRow> = Vec::with_capacity(failures_raw.len());
+    for failure in failures_raw {
+        let (pr_cell, issue_cell, fix_attempts) = resolve_issue_cell(
+            pool,
+            failure.issue_key.as_deref(),
+            ci_issue_link_template.as_deref(),
+        )
+        .await;
+        ci_failures.push(CiFailureRow {
+            failure,
+            pr_cell,
+            issue_cell,
+            fix_attempts,
+        });
+    }
+
+    // SPEC-3.12 item 2 / SPEC-4.3.15: stuck-work count and list over the
+    // last 7 days.
+    let stuck_since = stuck_work_window_start();
+    let stuck_count = stuck_work_count(pool, &stuck_since).await?;
+    let stuck_rows = stuck_work_corrections(pool, &stuck_since, STUCK_WORK_LIMIT).await?;
+
     let tpl = DashboardTpl {
         version: s.api.version,
         global_pause,
@@ -1906,6 +2088,12 @@ async fn dashboard(
         view,
         action_options,
         triggered_options,
+        ci_failures,
+        ci_bucket,
+        ci_repo,
+        ci_repo_options,
+        stuck_count,
+        stuck_rows,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
@@ -2083,6 +2271,96 @@ const EVENTS_SUMMARY_LIMIT: i64 = 10;
 fn events_window_start() -> String {
     (chrono::Utc::now() - chrono::Duration::hours(24))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// SPEC-3.12 item 2 / SPEC-4.3.15: start of the 7-day window for the
+/// dashboard's "Stuck work" list ("a count and list of issues the reconcile
+/// sweep corrected ... in the last 7 days").
+fn stuck_work_window_start() -> String {
+    (chrono::Utc::now() - chrono::Duration::days(7))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// SPEC-3.12 item 2 / SPEC-4.3.15: count of stuck-Working sweep corrections
+/// (tagged `context = STUCK_WORKING_SWEEP_CONTEXT`) since `since`.
+async fn stuck_work_count(pool: &DbPool, since: &str) -> Result<i64, WebError> {
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT COUNT(*) FROM run_events WHERE context = ? AND ts >= ?",
+        )
+        .into_owned(),
+    ))
+    .bind(crate::native::youtrack::STUCK_WORKING_SWEEP_CONTEXT)
+    .bind(since)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// SPEC-3.12 item 2 / SPEC-4.3.15: the stuck-Working sweep corrections
+/// themselves since `since`, newest first, capped at `limit`.
+async fn stuck_work_corrections(
+    pool: &DbPool,
+    since: &str,
+    limit: i64,
+) -> Result<Vec<StuckWorkRow>, WebError> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT ts, action_name, message FROM run_events \
+             WHERE context = ? AND ts >= ? ORDER BY ts DESC LIMIT ?",
+        )
+        .into_owned(),
+    ))
+    .bind(crate::native::youtrack::STUCK_WORKING_SWEEP_CONTEXT)
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(ts, action_name, message)| StuckWorkRow {
+            ts,
+            action_name,
+            message,
+        })
+        .collect())
+}
+
+/// SPEC-4.3.15: resolve one CI failure's PR and Issue cells, and the
+/// remediation attempt count. A failure with no `issue_key` has resolved
+/// neither (no issue was ever minted, so there is no PR to find either): both
+/// cells render "none". A failure with an `issue_key` resolves the Issue
+/// cell through `issue_link_template` and looks up the PR by that key; a
+/// lookup failure renders as an error cell (never silently as "none") and is
+/// logged at `warn`, per "visibly different from a failed lookup, which
+/// shows an error cell naming the cause and is logged at `warn`."
+async fn resolve_issue_cell(
+    pool: &DbPool,
+    issue_key: Option<&str>,
+    issue_link_template: Option<&str>,
+) -> (DashboardCell, DashboardCell, i64) {
+    let Some(key) = issue_key else {
+        return (DashboardCell::None, DashboardCell::None, 0);
+    };
+    let issue_cell = match issue_link_template {
+        Some(t) => DashboardCell::Link(link_anchor(&crate::action::render_link(t, key), key)),
+        None => DashboardCell::Text(key.to_string()),
+    };
+    match crate::ci_failure::store::agent_pr_for_issue(pool, key).await {
+        Ok(Some(pr)) => {
+            let url = crate::provider::pr_web_url(&pr.host, &pr.repo, pr.pr_number, &[]);
+            let label = format!("{}#{}", pr.repo, pr.pr_number);
+            let pr_cell = DashboardCell::Link(link_anchor(&url, &label));
+            (pr_cell, issue_cell, pr.fix_attempts)
+        }
+        Ok(None) => (DashboardCell::None, issue_cell, 0),
+        Err(e) => {
+            tracing::warn!(issue_key = %key, error = %e, "dashboard: ci-failure PR lookup failed");
+            (DashboardCell::Error(e.to_string()), issue_cell, 0)
+        }
+    }
 }
 
 /// SPEC-4.3.5: distinct `level` values present in `run_events`,
@@ -7911,6 +8189,12 @@ mod tests {
             view,
             action_options: vec!["YouTrack".to_string(), "forgejo".to_string()],
             triggered_options: vec!["schedule".to_string(), "webhook".to_string()],
+            ci_failures: vec![],
+            ci_bucket: String::new(),
+            ci_repo: String::new(),
+            ci_repo_options: vec![],
+            stuck_count: 0,
+            stuck_rows: vec![],
         };
         let html = tpl.render().expect("render dashboard");
         // Poll URL carries the active sort/filter (askama escapes `&` to `&amp;`).
@@ -8016,6 +8300,12 @@ mod tests {
             view: RunsView::default(),
             action_options: vec![],
             triggered_options: vec![],
+            ci_failures: vec![],
+            ci_bucket: String::new(),
+            ci_repo: String::new(),
+            ci_repo_options: vec![],
+            stuck_count: 0,
+            stuck_rows: vec![],
         };
 
         let quiet = tpl(vec![]).render().expect("render dashboard");
@@ -8091,6 +8381,12 @@ mod tests {
             view: RunsView::default(),
             action_options: vec![],
             triggered_options: vec![],
+            ci_failures: vec![],
+            ci_bucket: String::new(),
+            ci_repo: String::new(),
+            ci_repo_options: vec![],
+            stuck_count: 0,
+            stuck_rows: vec![],
         };
 
         let quiet = tpl(vec![]).render().expect("render dashboard");
