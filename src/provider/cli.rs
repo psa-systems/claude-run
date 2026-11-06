@@ -527,6 +527,19 @@ struct ProjectShow {
     name: String,
 }
 
+/// `yt issue get-field <KEY> Estimation --json`. `raw` is `null` when the
+/// field is unset; only the whole-minute count is consumed.
+#[derive(Debug, Deserialize)]
+struct EstimationField {
+    #[serde(default)]
+    raw: Option<EstimationRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EstimationRaw {
+    minutes: i64,
+}
+
 /// One project as `yt project list --json` emits it. Only the short name and the
 /// archived flag are consumed; unknown fields are ignored.
 #[derive(Debug, Deserialize)]
@@ -1914,6 +1927,15 @@ impl IssueTracker for CliBackend {
         Ok(parsed.name)
     }
 
+    /// SPEC-3.12 item 7: the `Estimation` read backing the pickup-time
+    /// estimate-vs-session-timeout check.
+    fn get_estimation_minutes(&self, key: &str) -> Result<Option<i64>> {
+        let stdout = self.yt_ok(&["issue", "get-field", key, "Estimation", "--json"])?;
+        let parsed: EstimationField =
+            Self::parse_json(&self.yt, "yt issue get-field --json", &stdout)?;
+        Ok(parsed.raw.map(|r| r.minutes))
+    }
+
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo> {
         // `vcs` is a command group; `list` is the subcommand that takes the
         // project short-name positional. Omitting it makes the project land in
@@ -3250,6 +3272,26 @@ mod tests {
             "Queued\n",
         ));
         assert_eq!(b.get_field("MK-16", "AI Agent").unwrap(), "Queued");
+    }
+
+    #[test]
+    fn get_estimation_minutes_parses_raw_minutes() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &["issue", "get-field", "MK-16", "Estimation", "--json"],
+            r#"{"field":"Estimation","value":"2h","type":"PeriodValue","raw":{"presentation":"2h","minutes":120,"$type":"PeriodValue"}}"#,
+        ));
+        assert_eq!(b.get_estimation_minutes("MK-16").unwrap(), Some(120));
+    }
+
+    #[test]
+    fn get_estimation_minutes_is_none_when_unset() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &["issue", "get-field", "MK-16", "Estimation", "--json"],
+            r#"{"field":"Estimation","value":null,"type":"","raw":null}"#,
+        ));
+        assert_eq!(b.get_estimation_minutes("MK-16").unwrap(), None);
     }
 
     #[test]

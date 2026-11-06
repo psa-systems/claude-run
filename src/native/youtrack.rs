@@ -1513,6 +1513,39 @@ async fn process_job(
         }
     }
 
+    // ---- estimate vs session timeout (SPEC-3.12 item 7) ----
+    // "At pickup, if the issue's Estimation exceeds the action's session
+    // timeout, the runner does not start the attempt. It sets Needs Review
+    // with Needs-Info, and the comment names both numbers and asks for the
+    // issue to be split or the limit raised. An issue with no Estimation is
+    // picked up as before." Read-only and placed after the dependency gate,
+    // before the clone; like that gate, a read failure must not strand an
+    // otherwise-workable issue, so it falls back to proceeding with pickup.
+    match backend.get_estimation_minutes(key) {
+        Ok(Some(minutes)) if minutes * 60 > limits.claude_timeout.as_secs() as i64 => {
+            info!(
+                action = %action.name,
+                key = %key,
+                estimation_minutes = minutes,
+                timeout_secs = limits.claude_timeout.as_secs(),
+                "estimate exceeds the session timeout; parking Needs Review, no attempt consumed"
+            );
+            report_estimate_over_timeout(
+                backend,
+                src,
+                &action.name,
+                key,
+                minutes,
+                limits.claude_timeout,
+            );
+            return Ok(ProcessedJob::EstimateOverTimeout { key: key.clone() });
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(action = %action.name, key = %key, error = %e, "Estimation lookup failed; proceeding with pickup");
+        }
+    }
+
     // ---- CI in-flight cap (CLAUDE-535) ----
     // One slow CI runner serves every runner PR on a repo, so a pickup waits while
     // `max_ci_in_flight_per_repo` of the repo's other runner PRs still have CI
@@ -4994,6 +5027,47 @@ fn report_cap_reached(
     }
 }
 
+/// SPEC-3.12 item 7: comment naming both numbers (best-effort), then the
+/// `Needs-Info` tag (best-effort), then `AI Agent` = Needs Review as the
+/// authoritative write, mirroring [`report_cap_reached`]'s independent-writes
+/// shape: the issue is parked either way, so a write failure here is logged at
+/// `error` rather than aborting the caller, which must still return
+/// `ProcessedJob::EstimateOverTimeout` so the issue is not re-cloned this poll.
+fn report_estimate_over_timeout(
+    backend: &dyn IssueTracker,
+    src: &YoutrackSource,
+    action: &str,
+    key: &str,
+    estimation_minutes: i64,
+    session_timeout: Duration,
+) {
+    let body = estimate_over_timeout_comment(estimation_minutes, session_timeout);
+    if let Err(e) = backend.comment(key, &body) {
+        error!(action = %action, key = %key, error = %e, "estimate-over-timeout comment failed");
+    }
+    let needs_info_tag = src.tags.needs_info.trim();
+    if !needs_info_tag.is_empty() {
+        if let Err(e) = backend.add_tag(key, needs_info_tag) {
+            error!(action = %action, key = %key, tag = %needs_info_tag, error = %e, "estimate-over-timeout Needs-Info tag write failed");
+        }
+    }
+    if let Err(e) = backend.set_field(key, &src.custom_field, &src.states.needs_review) {
+        error!(action = %action, key = %key, error = %e, "estimate-over-timeout AI Agent write failed");
+    }
+}
+
+fn estimate_over_timeout_comment(estimation_minutes: i64, session_timeout: Duration) -> String {
+    let timeout_minutes = session_timeout.as_secs() / 60;
+    [
+        format!(
+            "This issue's Estimation ({estimation_minutes} minutes) exceeds this action's session timeout ({timeout_minutes} minutes), so it was not started."
+        ),
+        String::new(),
+        "Split this issue into pieces that each fit inside the timeout, or raise the action's `limits.claude_timeout_seconds`.".to_string(),
+    ]
+    .join("\n")
+}
+
 fn cap_reached_comment(attempts: u32, cap: u32) -> String {
     [
         format!(
@@ -6573,6 +6647,118 @@ mod tests {
         );
     }
 
+    /// SPEC-3.12 item 7 test harness: a pickup whose tracker reports
+    /// `estimation_minutes` for `Estimation`, under a `claude_timeout` session
+    /// limit. The cancel token is always set, so a pickup that is NOT parked
+    /// over the estimate instead stops at the next checkpoint (`Filtered`),
+    /// before any clone, the same way `run_gated_process_job` does for the CI
+    /// cap.
+    async fn run_estimation_gated_process_job(
+        pool: &DbPool,
+        estimation_minutes: Option<i64>,
+        claude_timeout: Duration,
+    ) -> (ProcessedJob, FakeTracker) {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = ClaudeInvoker::new(Some("/nonexistent/claude-stub-should-never-run.sh"));
+        let tracker = FakeTracker {
+            estimation_minutes: Mutex::new(estimation_minutes),
+            ..FakeTracker::new("Queued")
+        };
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let mut s = src();
+        s.dependencies.enabled = false;
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout,
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+            review_timeout: Duration::from_secs(1800),
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+        let pause = crate::pause::PauseGate::new(pool.clone()).for_action_run("yt");
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            pool,
+            &claude,
+            &tracker,
+            &forge,
+            &s,
+            &limits,
+            &cancel,
+            &pause,
+            &spend,
+            &job(),
+            PrStrategy::Branch,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+        (outcome, tracker)
+    }
+
+    /// SPEC-3.12 item 7: an issue whose `Estimation` exceeds the action's
+    /// session timeout is parked `Needs Review` with `Needs-Info`, a comment
+    /// naming both numbers, and no attempt consumed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_job_parks_needs_review_when_estimate_exceeds_timeout() {
+        let pool = mem_pool().await;
+        let (outcome, tracker) =
+            run_estimation_gated_process_job(&pool, Some(60), Duration::from_secs(1800)).await;
+        assert!(
+            matches!(&outcome, ProcessedJob::EstimateOverTimeout { key } if key == "MK-16"),
+            "got {outcome:?}"
+        );
+        assert_eq!(tracker.field(), "Needs Review");
+        let comments = tracker.comments.lock().unwrap().clone();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].contains("60 minutes"), "{comments:?}");
+        assert!(comments[0].contains("30 minutes"), "{comments:?}");
+        assert_eq!(tracker.tags.lock().unwrap().as_slice(), ["Needs-Info"]);
+        assert_eq!(
+            state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
+            0,
+            "no attempt is spent when the estimate parks the issue"
+        );
+    }
+
+    /// SPEC-3.12 item 7: an issue with no `Estimation`, and one at or below
+    /// the timeout, is picked up as before (here: proceeding past this gate to
+    /// the cancel checkpoint, never parked over the estimate).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_job_proceeds_with_no_estimation_or_at_the_timeout() {
+        let pool = mem_pool().await;
+
+        let (no_estimate, _) =
+            run_estimation_gated_process_job(&pool, None, Duration::from_secs(1800)).await;
+        assert!(
+            matches!(no_estimate, ProcessedJob::Filtered { .. }),
+            "got {no_estimate:?}"
+        );
+
+        let (at_timeout, _) =
+            run_estimation_gated_process_job(&pool, Some(30), Duration::from_secs(1800)).await;
+        assert!(
+            matches!(at_timeout, ProcessedJob::Filtered { .. }),
+            "got {at_timeout:?}"
+        );
+    }
+
     /// The Claude login needing renewal mid-run trips the readiness gate
     /// AFTER `run_pre` has already written AI Agent=Working and cloned, but
     /// BEFORE claude is invoked: the issue is reverted to Queued with a
@@ -7213,6 +7399,10 @@ mod tests {
         /// written, so a test can trip state deterministically from inside
         /// `run_pre` instead of racing a background sleep against it.
         on_set_field: Mutex<Option<Box<dyn FnMut() + Send>>>,
+        /// Canned `Estimation` reading, in minutes; `None` means the field is
+        /// unset, backing [`IssueTracker::get_estimation_minutes`].
+        estimation_minutes: Mutex<Option<i64>>,
+        tags: Mutex<Vec<String>>,
     }
 
     impl FakeTracker {
@@ -7302,6 +7492,15 @@ mod tests {
 
         fn attach_file(&self, _key: &str, _file: &Path) -> Result<()> {
             Ok(())
+        }
+
+        fn add_tag(&self, _key: &str, tag: &str) -> Result<()> {
+            self.tags.lock().unwrap().push(tag.to_string());
+            Ok(())
+        }
+
+        fn get_estimation_minutes(&self, _key: &str) -> Result<Option<i64>> {
+            Ok(*self.estimation_minutes.lock().unwrap())
         }
     }
 
