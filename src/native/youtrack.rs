@@ -15399,21 +15399,23 @@ mod tests {
 
         reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
 
-        let calls = runner.calls.lock().unwrap();
-        assert!(
-            calls
-                .iter()
-                .any(|c| c == "yt issue set-field MK-20 AI Agent Queued"),
-            "{calls:?}"
-        );
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|c| c.starts_with("yt issue comment MK-20"))
-                .count(),
-            1,
-            "exactly one correction comment; {calls:?}"
-        );
+        {
+            let calls = runner.calls.lock().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c == "yt issue set-field MK-20 AI Agent Queued"),
+                "{calls:?}"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.starts_with("yt issue comment MK-20"))
+                    .count(),
+                1,
+                "exactly one correction comment; {calls:?}"
+            );
+        }
         let events = state::run_events_for_action(&pool, "yt-action", 10)
             .await
             .unwrap();
@@ -15457,9 +15459,11 @@ mod tests {
 
         reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
 
-        let calls = runner.calls.lock().unwrap();
-        assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
-        assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+        {
+            let calls = runner.calls.lock().unwrap();
+            assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+        }
         let events = state::run_events_for_action(&pool, "yt-action", 10)
             .await
             .unwrap();
