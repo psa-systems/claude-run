@@ -472,24 +472,27 @@ pub async fn list_failures(pool: &DbPool, state: Option<&str>, limit: i64) -> Re
     rows.iter().map(failure_from_row).collect()
 }
 
-/// SPEC-4.3.15: the dashboard's CI-failures listing. `bucket` filters on the
+/// SPEC-4.3.15: the dashboard's CI-failures listing. `state` filters on the
 /// stored lifecycle `state` (`open`/`resolved`/`pr_only`) and `repo` narrows
-/// to one repository; either `None` is "no filter". Newest first. `state` is
-/// the only categorical field `ci_failures` persists per row (no separate
-/// triage-bucket value - `code_fix`/`human_action`/`transient`/`auto_fix`,
-/// `src/triage.rs` - is stored), so this doubles as the dashboard's "bucket"
-/// filter and column.
+/// to one repository; either `None` is "no filter". Newest first.
+/// `ci_failures` persists no separate triage-bucket value
+/// (`code_fix`/`human_action`/`transient`/`auto_fix`, `src/triage.rs`,
+/// computed only at webhook-mint time and never written back to the row),
+/// so the dashboard's "Bucket" column from SPEC-4.3.15's Background is not
+/// yet implemented; this filters and renders lifecycle `state` instead,
+/// labeled accordingly. Persisting the real triage bucket is tracked as
+/// CLAUDE-598.
 pub async fn list_failures_for_dashboard(
     pool: &DbPool,
-    bucket: Option<&str>,
+    state: Option<&str>,
     repo: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Failure>> {
     let mut conds: Vec<&str> = Vec::new();
     let mut binds: Vec<&str> = Vec::new();
-    if let Some(b) = bucket {
+    if let Some(s) = state {
         conds.push("state = ?");
-        binds.push(b);
+        binds.push(s);
     }
     if let Some(r) = repo {
         conds.push("repo = ?");
@@ -1347,7 +1350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_listing_filters_by_bucket_and_repo() {
+    async fn dashboard_listing_filters_by_state_and_repo() {
         let pool = test_pool().await;
         seed_failure(
             &pool,

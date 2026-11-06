@@ -216,21 +216,24 @@
 </div>
 
 {# SPEC-4.3.15: the CI-failures table, with its own filter form so the
-   bucket/repo selection round-trips through the 5s poll and every other
+   state/repo selection round-trips through the 5s poll and every other
    dashboard control the same way the search form does (hx-include widened
-   below to carry both). #}
+   below to carry both). The Background also calls for a separate "triage
+   bucket" column, but `ci_failures` persists no such value (see
+   `CiFailureRow::state()`), so this filters and renders lifecycle `state`
+   instead, labeled "State". #}
 <h2>CI failures</h2>
 <form id="ci-failures-form"
       style="margin: 4px 0 14px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
   <label style="font-size: 12px; text-transform: none; letter-spacing: 0; font-weight: normal;">
-    Bucket
-    <select name="ci_bucket" hx-trigger="change"
+    State
+    <select name="ci_state" hx-trigger="change"
             hx-get="/" hx-include="#ci-failures-form, #search-form"
             hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
-      <option value=""{% if ci_bucket.is_empty() %} selected{% endif %}>all</option>
-      <option value="open"{% if ci_bucket.as_str() == "open" %} selected{% endif %}>open</option>
-      <option value="resolved"{% if ci_bucket.as_str() == "resolved" %} selected{% endif %}>resolved</option>
-      <option value="pr_only"{% if ci_bucket.as_str() == "pr_only" %} selected{% endif %}>pr_only</option>
+      <option value=""{% if ci_state.is_empty() %} selected{% endif %}>all</option>
+      <option value="open"{% if ci_state.as_str() == "open" %} selected{% endif %}>open</option>
+      <option value="resolved"{% if ci_state.as_str() == "resolved" %} selected{% endif %}>resolved</option>
+      <option value="pr_only"{% if ci_state.as_str() == "pr_only" %} selected{% endif %}>pr_only</option>
     </select>
   </label>
   <label style="font-size: 12px; text-transform: none; letter-spacing: 0; font-weight: normal;">
@@ -249,14 +252,14 @@
   <div class="card"><span class="dim">No CI failures under the active filter.</span></div>
 {% else %}
   <table style="margin-bottom: 16px;">
-    <thead><tr><th>Repo</th><th>Workflow</th><th>Job</th><th>Bucket</th><th>Infra</th><th>PR</th><th>Issue</th><th>Remediations</th></tr></thead>
+    <thead><tr><th>Repo</th><th>Workflow</th><th>Job</th><th>State</th><th>Infra</th><th>PR</th><th>Issue</th><th>Remediations</th></tr></thead>
     <tbody>
       {% for f in ci_failures %}
       <tr>
         <td class="mono">{{ f.repo() }}</td>
         <td class="mono">{{ f.workflow_id() }}</td>
         <td class="mono">{{ f.job_name() }}</td>
-        <td><span class="badge neutral">{{ f.bucket() }}</span></td>
+        <td><span class="badge neutral">{{ f.state() }}</span></td>
         <td class="dim">{{ f.infra_kind() }}</td>
         <td class="mono">{{ f.pr_html()|safe }}</td>
         <td class="mono">{{ f.issue_html()|safe }}</td>

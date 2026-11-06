@@ -1388,11 +1388,13 @@ struct DashboardTpl {
     /// Triggered filter dropdown options.
     triggered_options: Vec<String>,
     /// SPEC-4.3.15: the CI-failures table, newest first, under the
-    /// active bucket/repo filter.
+    /// active state/repo filter.
     ci_failures: Vec<CiFailureRow>,
-    /// Whitelisted active bucket filter (`open`/`resolved`/`pr_only`, or
-    /// empty for "all"), echoed into the filter dropdown.
-    ci_bucket: String,
+    /// Whitelisted active state filter (`open`/`resolved`/`pr_only`, or
+    /// empty for "all"), echoed into the filter dropdown. This is the
+    /// lifecycle `state`, not a persisted triage bucket: see
+    /// `CiFailureRow::state()`.
+    ci_state: String,
     /// Whitelisted active repo filter, or empty for "all".
     ci_repo: String,
     /// Distinct repos with at least one `ci_failures` row, for the
@@ -1553,13 +1555,14 @@ impl CiFailureRow {
         &self.failure.job_name
     }
 
-    /// The dashboard's "bucket" column. `ci_failures` persists no separate
-    /// triage-bucket value distinct from lifecycle state (`open`/`resolved`/
-    /// `pr_only` - see `src/triage.rs`'s `TriageBucket`, computed only at
-    /// webhook-mint time and never written back to the row), so the stored
-    /// `state` fills both roles here: it is what SPEC-4.3.15 calls the
-    /// "triage bucket" column and also the failure's own state.
-    fn bucket(&self) -> &str {
+    /// The dashboard's "State" column: the failure's stored lifecycle
+    /// `state` (`open`/`resolved`/`pr_only`). SPEC-4.3.15's Background also
+    /// calls for a separate "triage bucket" column
+    /// (`code_fix`/`human_action`/`transient`/`auto_fix`, `src/triage.rs`'s
+    /// `TriageBucket`), but that value is computed only at webhook-mint
+    /// time and never persisted to `ci_failures`, so it cannot be rendered
+    /// here without a schema change; tracked as CLAUDE-598.
+    fn state(&self) -> &str {
         &self.failure.state
     }
 
@@ -1819,12 +1822,12 @@ struct DashboardQuery {
     /// value is clamped to the valid range in the handler.
     #[serde(default)]
     page: Option<i64>,
-    /// SPEC-4.3.15: CI-failures bucket filter. `None` (the param absent, i.e.
+    /// SPEC-4.3.15: CI-failures state filter. `None` (the param absent, i.e.
     /// first page load) defaults to "open" per "a table of every open CI
     /// failure"; `Some(String::new())` is an explicit "all" from the filter
     /// dropdown's empty option.
     #[serde(default)]
-    ci_bucket: Option<String>,
+    ci_state: Option<String>,
     /// SPEC-4.3.15: CI-failures repo filter, empty for all.
     #[serde(default)]
     ci_repo: String,
@@ -2020,21 +2023,21 @@ async fn dashboard(
         })
         .collect();
 
-    // SPEC-4.3.15: CI failures table. The bucket filter defaults to "open"
-    // on first load (no `?ci_bucket=` at all); an explicit (possibly empty,
+    // SPEC-4.3.15: CI failures table. The state filter defaults to "open"
+    // on first load (no `?ci_state=` at all); an explicit (possibly empty,
     // i.e. "all") value from the filter dropdown is whitelisted against the
     // fixed set of stored `state` values.
     let ci_repo_options = crate::ci_failure::store::distinct_failure_repos(pool).await?;
-    let ci_bucket = match &q.ci_bucket {
+    let ci_state = match &q.ci_state {
         None => "open".to_string(),
         Some(v) => whitelisted(v, &["", "open", "resolved", "pr_only"]),
     };
     let ci_repo = whitelist_member(&q.ci_repo, &ci_repo_options);
-    let ci_bucket_filter = (!ci_bucket.is_empty()).then_some(ci_bucket.as_str());
+    let ci_state_filter = (!ci_state.is_empty()).then_some(ci_state.as_str());
     let ci_repo_filter = (!ci_repo.is_empty()).then_some(ci_repo.as_str());
     let failures_raw = crate::ci_failure::store::list_failures_for_dashboard(
         pool,
-        ci_bucket_filter,
+        ci_state_filter,
         ci_repo_filter,
         CI_FAILURES_LIMIT,
     )
@@ -2089,7 +2092,7 @@ async fn dashboard(
         action_options,
         triggered_options,
         ci_failures,
-        ci_bucket,
+        ci_state,
         ci_repo,
         ci_repo_options,
         stuck_count,
@@ -8190,7 +8193,7 @@ mod tests {
             action_options: vec!["YouTrack".to_string(), "forgejo".to_string()],
             triggered_options: vec!["schedule".to_string(), "webhook".to_string()],
             ci_failures: vec![],
-            ci_bucket: String::new(),
+            ci_state: String::new(),
             ci_repo: String::new(),
             ci_repo_options: vec![],
             stuck_count: 0,
@@ -8301,7 +8304,7 @@ mod tests {
             action_options: vec![],
             triggered_options: vec![],
             ci_failures: vec![],
-            ci_bucket: String::new(),
+            ci_state: String::new(),
             ci_repo: String::new(),
             ci_repo_options: vec![],
             stuck_count: 0,
@@ -8382,7 +8385,7 @@ mod tests {
             action_options: vec![],
             triggered_options: vec![],
             ci_failures: vec![],
-            ci_bucket: String::new(),
+            ci_state: String::new(),
             ci_repo: String::new(),
             ci_repo_options: vec![],
             stuck_count: 0,
@@ -9435,7 +9438,7 @@ mod tests {
             );
         }
 
-        /// SPEC-4.3.15: the bucket/repo filters narrow the CI-failures
+        /// SPEC-4.3.15: the state/repo filters narrow the CI-failures
         /// rows, and SPEC-3.12 item 2's stuck-work list shows the sweep's
         /// own seeded corrections.
         #[tokio::test]
@@ -9468,7 +9471,7 @@ mod tests {
             .await
             .unwrap();
 
-            // Default load (no ?ci_bucket=) is "open"-only per SPEC-4.3.15.
+            // Default load (no ?ci_state=) is "open"-only per SPEC-4.3.15.
             let body = body_string(
                 dashboard(State(s.clone()), Query(DashboardQuery::default()))
                     .await
@@ -9484,10 +9487,10 @@ mod tests {
             assert!(body.contains(widgets_row), "{body}");
             assert!(!body.contains(gizmos_row), "{body}");
 
-            // Explicit "all" bucket shows both; the repo filter then narrows
+            // Explicit "all" state shows both; the repo filter then narrows
             // to just one.
             let all = DashboardQuery {
-                ci_bucket: Some(String::new()),
+                ci_state: Some(String::new()),
                 ..Default::default()
             };
             let body = body_string(
@@ -9503,7 +9506,7 @@ mod tests {
             );
 
             let repo_narrowed = DashboardQuery {
-                ci_bucket: Some(String::new()),
+                ci_state: Some(String::new()),
                 ci_repo: "acme/gizmos".to_string(),
                 ..Default::default()
             };
