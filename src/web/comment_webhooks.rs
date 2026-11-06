@@ -1690,7 +1690,7 @@ fn serve_run(
                 {
                     Ok(steps) => {
                         for (kind, label, start, end) in steps {
-                            recorder.record("comment", kind, label, start, end, true, None).await;
+                            recorder.record("initial", kind, label, start, end, true, None).await;
                         }
                     }
                     Err(e) => {
@@ -1702,7 +1702,7 @@ fn serve_run(
                 }
             }
             recorder
-                .finish("comment", served_start, chrono::Utc::now())
+                .finish("initial", served_start, chrono::Utc::now())
                 .await
         });
         if incomplete {
