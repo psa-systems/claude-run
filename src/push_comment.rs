@@ -261,7 +261,8 @@ mod tests {
     /// step, before the SPEC-3.9 footer.
     #[test]
     fn the_step_list_precedes_the_footer_with_the_marker_on_the_current_step() {
-        let list = "1. Initial commit: 0:02 / 0:02\n2. Checkpoint 1: <-- This comment\n3. Checks 1:";
+        let list =
+            "1. Initial commit: 0:02 / 0:02\n2. Checkpoint 1: <-- This comment\n3. Checks 1:";
         let mut c = ctx(
             PushEvent::CheckpointPush,
             CommitSubjects::Listed(vec!["Add thing".into()]),

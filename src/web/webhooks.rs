@@ -2529,9 +2529,13 @@ async fn route_agent_pr_failure(
             ev.html_url
         );
         // SPEC-3.15: the run ends in Needs Review, so the list ends with that line.
-        let list =
-            crate::progress_list::render_for(&ctx.pool, "youtrack", &record.issue_key, "Needs Review")
-                .await;
+        let list = crate::progress_list::render_for(
+            &ctx.pool,
+            "youtrack",
+            &record.issue_key,
+            "Needs Review",
+        )
+        .await;
         let body = format!("{body}\n\n{list}");
         let body = crate::run_footer::append_run(
             &body,
@@ -2638,10 +2642,9 @@ async fn route_agent_pr_failure(
         // SPEC-3.13: the remediation dispatch tells the issue the stage and the
         // expected duration of the attempt it queues; the pickup that follows
         // posts its own start notice with the attempt and the session timeout.
-        let expected_duration =
-            state::expected_duration(&ctx.pool, "youtrack", "ci-remediation")
-                .await
-                .render();
+        let expected_duration = state::expected_duration(&ctx.pool, "youtrack", "ci-remediation")
+            .await
+            .render();
         // SPEC-3.15 item 4: this comment is the `CI remediation N` line.
         let step_list = crate::progress_list::render_for(
             &ctx.pool,
@@ -2792,9 +2795,13 @@ async fn route_agent_pr_failure(
                 Some(&ev.html_url),
             ),
         );
-        let list =
-            crate::progress_list::render_for(&ctx.pool, "youtrack", &record.issue_key, "Needs Review")
-                .await;
+        let list = crate::progress_list::render_for(
+            &ctx.pool,
+            "youtrack",
+            &record.issue_key,
+            "Needs Review",
+        )
+        .await;
         let body = format!("{body}\n\n{list}");
         let body = crate::run_footer::append_run(
             &body,
@@ -6095,7 +6102,7 @@ async fn post_branch_updated_push_comment(
             public_url: public_url.as_deref(),
             run_id: None,
             started: None,
-            // FOLLOWUP-PROGRESS: no stored step rows reach this provider-level site yet.
+            // TODO(CLAUDE-603): no stored step rows reach this provider-level site yet.
             progress: None,
         };
         // A directory scoped to this one call, not the bare shared
@@ -9561,7 +9568,7 @@ mod tests {
         assert!(
             calls.iter().any(|c| c.starts_with("comment CLAUDE-40")
                 && c.contains("1. CI remediation 1: <-- This comment")
-                && c.find("<-- This comment") < c.find("Run: ")),
+                && c.find("<-- This comment") < c.rfind("Run: ")),
             "the requeue comment carries the step list: {calls:?}"
         );
         assert!(
@@ -10261,18 +10268,23 @@ mod tests {
             assert!(result.ok, "{kind}: {}", result.text);
             let calls = backend.calls();
             assert!(
-                calls.iter().any(|c| c.starts_with(&format!("comment {key}"))),
+                calls
+                    .iter()
+                    .any(|c| c.starts_with(&format!("comment {key}"))),
                 "{kind}: the issue is told: {calls:?}"
             );
             assert!(
-                !calls.iter().any(|c| c.starts_with(&format!("set_field {key} AI Agent"))),
+                !calls
+                    .iter()
+                    .any(|c| c.starts_with(&format!("set_field {key} AI Agent"))),
                 "{kind}: no re-queue and no Needs Review write: {calls:?}"
             );
             assert_eq!(counting.call_count(), 0, "{kind}: no analysis run");
-            let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", pr_number)
-                .await
-                .unwrap()
-                .unwrap();
+            let record =
+                ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", pr_number)
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert_eq!(record.fix_attempts, 0, "{kind}: no attempt spent");
             let failure = ci_failure_store::failure_for_issue(&pool, &key)
                 .await

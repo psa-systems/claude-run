@@ -302,7 +302,8 @@ impl<'a> StepRecorder<'a> {
             } else {
                 StepKind::Check
             };
-            self.record(stage, kind, label, start, end, g.ok, None).await;
+            self.record(stage, kind, label, start, end, g.ok, None)
+                .await;
         }
     }
 }
@@ -963,7 +964,11 @@ mod tests {
             ]
         );
         let total: chrono::Duration = rows.iter().map(|r| r.2 - r.1).sum();
-        assert_eq!(total, at(200) - at(0), "sub-steps sum to the check's duration");
+        assert_eq!(
+            total,
+            at(200) - at(0),
+            "sub-steps sum to the check's duration"
+        );
     }
 
     #[test]
@@ -984,9 +989,10 @@ mod tests {
         let log = dir.path().join("stream.jsonl");
         let line = |offset: i64, json: serde_json::Value| -> String {
             let mut v = json;
-            v.as_object_mut()
-                .unwrap()
-                .insert("ts".to_string(), serde_json::Value::String(fmt_ts(at(offset))));
+            v.as_object_mut().unwrap().insert(
+                "ts".to_string(),
+                serde_json::Value::String(fmt_ts(at(offset))),
+            );
             serde_json::to_string(&v).unwrap()
         };
         let bash = |cmd: &str| {

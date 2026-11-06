@@ -618,7 +618,12 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                     for step in steps {
                         recorder
                             .record(
-                                stage, step.kind, step.label, step.start, step.end, true,
+                                stage,
+                                step.kind,
+                                step.label,
+                                step.start,
+                                step.end,
+                                true,
                                 step.detail,
                             )
                             .await;

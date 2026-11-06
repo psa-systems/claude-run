@@ -1259,8 +1259,7 @@ async fn run_instruction(
         let trigger = crate::run_footer::Trigger::UserCommand {
             login: cmd.author.clone(),
         };
-        let expected =
-            state::expected_duration(&ctx.pool, WEBHOOK_COMMENT_ACTION, "initial").await;
+        let expected = state::expected_duration(&ctx.pool, WEBHOOK_COMMENT_ACTION, "initial").await;
         let body = started_comment(
             COMMENT_WEBHOOK_SOURCE,
             &trigger_word,
@@ -2419,7 +2418,7 @@ fn post_fix_push_comment(
         public_url: public_url.as_deref(),
         run_id: None,
         started: None,
-        // FOLLOWUP-PROGRESS: no stored step rows reach this provider-level site yet.
+        // TODO(CLAUDE-603): no stored step rows reach this provider-level site yet.
         progress: None,
     };
     let scratch = git_dir_scratch(workdir).unwrap_or_else(|_| std::env::temp_dir());

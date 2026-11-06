@@ -1344,13 +1344,12 @@ pub async fn recent_attempt_durations_ms(
         "SELECT duration_ms FROM job_outcomes WHERE action_name = ? AND stage = ? \
          AND attempt_counted = 1 AND duration_ms > 0 ORDER BY ts DESC, id DESC LIMIT {EXPECTED_WINDOW}"
     );
-    let rows: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(
-        crate::db::q(pool, &sql).into_owned(),
-    ))
-    .bind(action)
-    .bind(stage)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<i64> =
+        sqlx::query_scalar(sqlx::AssertSqlSafe(crate::db::q(pool, &sql).into_owned()))
+            .bind(action)
+            .bind(stage)
+            .fetch_all(pool)
+            .await?;
     Ok(rows)
 }
 

@@ -589,9 +589,8 @@ pub async fn attempts_by_outcome(
     action: Option<&str>,
 ) -> Result<Vec<StageOutcomeCount>> {
     let cutoff = ts_cutoff(range);
-    let mut sql = String::from(
-        "SELECT stage, outcome, COUNT(*) FROM job_outcomes WHERE attempt_counted = 1",
-    );
+    let mut sql =
+        String::from("SELECT stage, outcome, COUNT(*) FROM job_outcomes WHERE attempt_counted = 1");
     if cutoff.is_some() {
         sql.push_str(" AND ts >= ?");
     }
@@ -788,11 +787,7 @@ fn stats(mut values: Vec<f64>) -> Stats {
 /// Counted attempts in the window with no `attempt_steps` rows at all
 /// (SPEC-4.3.14 "no step data"): shown as its own figure on every series,
 /// never folded in as zero seconds.
-async fn attempts_without_steps(
-    pool: &DbPool,
-    range: Range,
-    action: Option<&str>,
-) -> Result<i64> {
+async fn attempts_without_steps(pool: &DbPool, range: Range, action: Option<&str>) -> Result<i64> {
     let cutoff = ts_cutoff(range);
     let mut total_sql = String::from("SELECT COUNT(*) FROM job_outcomes WHERE attempt_counted = 1");
     let mut with_sql = String::from(
@@ -947,7 +942,16 @@ pub async fn postgres(pool: &DbPool, range: Range, action: Option<&str>) -> Resu
     }
     sql.push_str(" ORDER BY started_at");
     let sql = crate::db::q(pool, &sql).into_owned();
-    type Row = (String, String, i64, String, String, String, i64, Option<String>);
+    type Row = (
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+    );
     let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()));
     if let Some(c) = &cutoff {
         q = q.bind(c);
@@ -1047,7 +1051,16 @@ async fn attempt_rows(
     }
     sql.push_str(" ORDER BY action_name, job_key, attempt");
     let sql = crate::db::q(pool, &sql).into_owned();
-    type Row = (i64, String, String, i64, String, Option<String>, i64, Option<String>);
+    type Row = (
+        i64,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        i64,
+        Option<String>,
+    );
     let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()));
     if let Some(c) = &cutoff {
         q = q.bind(c);
@@ -1230,9 +1243,19 @@ pub fn classify_failure_cause(timed_out: bool, summary: &str) -> &'static str {
         "hook"
     } else if has(&["rustfmt", "cargo fmt", "clippy", "lint"]) {
         "fmt-lint"
-    } else if has(&["could not compile", "compilation", "error[e", "failed to compile"]) {
+    } else if has(&[
+        "could not compile",
+        "compilation",
+        "error[e",
+        "failed to compile",
+    ]) {
         "compile"
-    } else if has(&["test result: failed", "tests failed", "failing test", "test failed"]) {
+    } else if has(&[
+        "test result: failed",
+        "tests failed",
+        "failing test",
+        "test failed",
+    ]) {
         "test"
     } else {
         "other"
@@ -1275,10 +1298,9 @@ pub async fn failure_causes(
     let rows = attempt_rows(pool, range, action).await?;
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut other_attempts = Vec::new();
-    for r in rows
-        .iter()
-        .filter(|r| r.timed_out || matches!(r.outcome.as_str(), "failed" | "queued" | "needs_review"))
-    {
+    for r in rows.iter().filter(|r| {
+        r.timed_out || matches!(r.outcome.as_str(), "failed" | "queued" | "needs_review")
+    }) {
         let cause = classify_failure_cause(r.timed_out, r.summary.as_deref().unwrap_or(""));
         *counts.entry(cause).or_default() += 1;
         if cause == "other" {
@@ -1366,7 +1388,7 @@ pub fn highlight(
 pub async fn inflight_jobs(
     pool: &DbPool,
     now: DateTime<Utc>,
-    timeout_for: &dyn Fn(&str) -> Option<u64>,
+    timeout_for: &(dyn Fn(&str) -> Option<u64> + Sync),
 ) -> Result<Vec<InflightJob>> {
     let sql = crate::db::q(
         pool,
@@ -1530,11 +1552,66 @@ mod tests {
     async fn funnel_buckets_sum_to_the_issue_count_and_a_mismatch_is_named() {
         let pool = mem_pool().await;
         let run = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
-        seed_attempt(&pool, run, "alpha", "F-1", 1, "initial", "code_review", false, None).await;
-        seed_attempt(&pool, run, "alpha", "F-2", 1, "initial", "queued", false, Some("x")).await;
-        seed_attempt(&pool, run, "alpha", "F-2", 2, "retry-2", "code_review", false, None).await;
-        seed_attempt(&pool, run, "alpha", "F-3", 1, "initial", "needs_review", false, None).await;
-        seed_attempt(&pool, run, "alpha", "F-4", 1, "initial", "failed", false, Some("boom")).await;
+        seed_attempt(
+            &pool,
+            run,
+            "alpha",
+            "F-1",
+            1,
+            "initial",
+            "code_review",
+            false,
+            None,
+        )
+        .await;
+        seed_attempt(
+            &pool,
+            run,
+            "alpha",
+            "F-2",
+            1,
+            "initial",
+            "queued",
+            false,
+            Some("x"),
+        )
+        .await;
+        seed_attempt(
+            &pool,
+            run,
+            "alpha",
+            "F-2",
+            2,
+            "retry-2",
+            "code_review",
+            false,
+            None,
+        )
+        .await;
+        seed_attempt(
+            &pool,
+            run,
+            "alpha",
+            "F-3",
+            1,
+            "initial",
+            "needs_review",
+            false,
+            None,
+        )
+        .await;
+        seed_attempt(
+            &pool,
+            run,
+            "alpha",
+            "F-4",
+            1,
+            "initial",
+            "failed",
+            false,
+            Some("boom"),
+        )
+        .await;
         let f = funnel(&pool, Range::All, None).await.unwrap();
         assert_eq!(f.counts.first_attempt, 1);
         assert_eq!(f.counts.second_attempt, 1);
@@ -1544,7 +1621,10 @@ mod tests {
         assert!(f.mismatch.is_none(), "{:?}", f.mismatch);
 
         // A row whose outcome is outside the closed set is bucketed nowhere.
-        seed_attempt(&pool, run, "alpha", "F-5", 1, "initial", "mystery", false, None).await;
+        seed_attempt(
+            &pool, run, "alpha", "F-5", 1, "initial", "mystery", false, None,
+        )
+        .await;
         let f = funnel(&pool, Range::All, None).await.unwrap();
         let banner = f.mismatch.expect("a seeded mismatch shows the banner");
         assert!(banner.contains("sum to 4 but 5 issues"), "{banner}");
@@ -1601,7 +1681,12 @@ mod tests {
         }
         let report = failure_causes(&pool, Range::All, None).await.unwrap();
         for (cause, _, _) in cases {
-            let n = report.causes.iter().find(|c| c.cause == cause).unwrap().count;
+            let n = report
+                .causes
+                .iter()
+                .find(|c| c.cause == cause)
+                .unwrap()
+                .count;
             assert_eq!(n, 1, "{cause}");
         }
         assert_eq!(report.causes.len(), FAILURE_CAUSES.len());
@@ -1619,24 +1704,84 @@ mod tests {
         let mut rec = crate::attempt_steps::StepRecorder::new(&pool, run, "alpha", "S-1", 1);
         let sec = |s: i64| t0 + Duration::seconds(s);
         use crate::attempt_steps::StepKind;
-        rec.record("initial", StepKind::PostgresStart, "postgres_start", sec(0), sec(2), true, None).await;
-        rec.record("initial", StepKind::PostgresHealthy, "postgres_healthy", sec(2), sec(12), true, None).await;
-        rec.record("initial", StepKind::Coding, "coding", sec(12), sec(100), true, None).await;
+        rec.record(
+            "initial",
+            StepKind::PostgresStart,
+            "postgres_start",
+            sec(0),
+            sec(2),
+            true,
+            None,
+        )
+        .await;
+        rec.record(
+            "initial",
+            StepKind::PostgresHealthy,
+            "postgres_healthy",
+            sec(2),
+            sec(12),
+            true,
+            None,
+        )
+        .await;
+        rec.record(
+            "initial",
+            StepKind::Coding,
+            "coding",
+            sec(12),
+            sec(100),
+            true,
+            None,
+        )
+        .await;
         let mut rec2 = crate::attempt_steps::StepRecorder::new(&pool, run, "alpha", "S-2", 1);
-        rec2.record("initial", StepKind::PostgresStart, "postgres_start", sec(200), sec(201), true, None).await;
-        rec2.record("initial", StepKind::PostgresHealthy, "postgres_healthy", sec(201), sec(231), false, Some("connection refused")).await;
+        rec2.record(
+            "initial",
+            StepKind::PostgresStart,
+            "postgres_start",
+            sec(200),
+            sec(201),
+            true,
+            None,
+        )
+        .await;
+        rec2.record(
+            "initial",
+            StepKind::PostgresHealthy,
+            "postgres_healthy",
+            sec(201),
+            sec(231),
+            false,
+            Some("connection refused"),
+        )
+        .await;
         let mut rec3 = crate::attempt_steps::StepRecorder::new(&pool, run, "alpha", "S-3", 2);
-        rec3.record("retry-2", StepKind::Coding, "coding", sec(300), sec(360), true, None).await;
+        rec3.record(
+            "retry-2",
+            StepKind::Coding,
+            "coding",
+            sec(300),
+            sec(360),
+            true,
+            None,
+        )
+        .await;
 
         let st = stages(&pool, Range::All, None).await.unwrap();
         let initial = st.stages.iter().find(|s| s.stage == "initial").unwrap();
-        assert_eq!(initial.stats.count, 2, "S-1 and S-2 each form one initial attempt");
+        assert_eq!(
+            initial.stats.count, 2,
+            "S-1 and S-2 each form one initial attempt"
+        );
         let retry = st.stages.iter().find(|s| s.stage == "retry-2").unwrap();
         assert_eq!(retry.stats.count, 1);
         assert_eq!(retry.stats.median_seconds, Some(60.0));
         let empty = st.stages.iter().find(|s| s.stage == "final").unwrap();
         assert_eq!(empty.stats.count, 0);
-        assert_eq!(empty.stats.median_seconds, None, "no data is absent, not zero");
+        assert_eq!(
+            empty.stats.median_seconds, None,
+            "no data is absent, not zero"
+        );
 
         let pg = postgres(&pool, Range::All, None).await.unwrap();
         assert_eq!((pg.starts, pg.healthy, pg.never_healthy), (2, 1, 1));
@@ -1650,13 +1795,30 @@ mod tests {
     async fn pre_instrumentation_attempts_show_in_the_no_step_data_figure() {
         let pool = mem_pool().await;
         let run = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
-        seed_attempt(&pool, run, "alpha", "N-1", 1, "initial", "code_review", false, None).await;
+        seed_attempt(
+            &pool,
+            run,
+            "alpha",
+            "N-1",
+            1,
+            "initial",
+            "code_review",
+            false,
+            None,
+        )
+        .await;
         assert_eq!(
-            stages(&pool, Range::All, None).await.unwrap().attempts_with_no_step_data,
+            stages(&pool, Range::All, None)
+                .await
+                .unwrap()
+                .attempts_with_no_step_data,
             1
         );
         assert_eq!(
-            postgres(&pool, Range::All, None).await.unwrap().attempts_with_no_step_data,
+            postgres(&pool, Range::All, None)
+                .await
+                .unwrap()
+                .attempts_with_no_step_data,
             1
         );
     }
@@ -1726,9 +1888,24 @@ mod tests {
         let pool = mem_pool().await;
         let run = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
         for (action, ms) in [("alpha", 10_000_i64), ("alpha", 30_000), ("beta", 5_000)] {
-            seed_attempt(&pool, run, action, &format!("M-{ms}"), 1, "initial", "success", false, None).await;
+            seed_attempt(
+                &pool,
+                run,
+                action,
+                &format!("M-{ms}"),
+                1,
+                "initial",
+                "success",
+                false,
+                None,
+            )
+            .await;
             sqlx::query(sqlx::AssertSqlSafe(
-                crate::db::q(&pool, "UPDATE job_outcomes SET duration_ms = ? WHERE job_key = ?").into_owned(),
+                crate::db::q(
+                    &pool,
+                    "UPDATE job_outcomes SET duration_ms = ? WHERE job_key = ?",
+                )
+                .into_owned(),
             ))
             .bind(ms)
             .bind(format!("M-{ms}"))
@@ -1736,12 +1913,22 @@ mod tests {
             .await
             .unwrap();
         }
-        let means = mean_attempt_duration_by_action(&pool, Range::Last7Days).await.unwrap();
+        let means = mean_attempt_duration_by_action(&pool, Range::Last7Days)
+            .await
+            .unwrap();
         assert_eq!(
             means,
             vec![
-                ActionMean { action: "alpha".into(), attempts: 2, mean_seconds: 20.0 },
-                ActionMean { action: "beta".into(), attempts: 1, mean_seconds: 5.0 },
+                ActionMean {
+                    action: "alpha".into(),
+                    attempts: 2,
+                    mean_seconds: 20.0
+                },
+                ActionMean {
+                    action: "beta".into(),
+                    attempts: 1,
+                    mean_seconds: 5.0
+                },
             ]
         );
     }

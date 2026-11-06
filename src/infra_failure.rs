@@ -81,7 +81,7 @@ pub fn detect(log: &str) -> Option<InfraFailure> {
         .or_else(|| detect_job_timeout(&lower))
         .or_else(|| detect_container_not_started(&lower))
         .or_else(|| detect_runner_deadline(&lower))
-        .or_else(|| detect_no_diagnostic(log, &filtered, &lower))
+        .or_else(|| detect_no_diagnostic(log, &filtered))
 }
 
 /// Drop lines that carry only a test name: a `test ... ... ok|FAILED|ignored`
@@ -246,8 +246,12 @@ fn detect_runner_deadline(lower: &str) -> Option<InfraFailure> {
 /// Deliberately conservative: any line naming an error, a failure, a panic, a
 /// diff or a traceback counts as a diagnostic, so a log that merely looks
 /// unusual stays with the classifier.
-fn detect_no_diagnostic(raw: &str, filtered: &str, lower: &str) -> Option<InfraFailure> {
-    if filtered.trim().is_empty() || !crate::ci_failure::fingerprint::failing_tests(raw).is_empty() {
+fn detect_no_diagnostic(raw: &str, filtered: &str) -> Option<InfraFailure> {
+    // Markers are read from the whole log, test-result lines included: a
+    // `FAILED` test line is a diagnostic even though detection ignores its name.
+    let lower = raw.to_ascii_lowercase();
+    if filtered.trim().is_empty() || !crate::ci_failure::fingerprint::failing_tests(raw).is_empty()
+    {
         return None;
     }
     const MARKERS: &[&str] = &[

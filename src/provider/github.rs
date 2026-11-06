@@ -882,7 +882,7 @@ impl GithubForge {
             public_url: public_url.as_deref(),
             run_id: None,
             started: None,
-            // FOLLOWUP-PROGRESS: no stored step rows reach this provider-level site yet.
+            // TODO(CLAUDE-603): no stored step rows reach this provider-level site yet.
             progress: None,
         };
         pr.push_comment_failure =

@@ -2100,14 +2100,19 @@ async fn process_job(
     // written to `attempt_steps` right after `finalize` returns). Handed over
     // through a keyed stash because `finalize` is synchronous with no pool.
     {
-        let (mut rows, mut incomplete) =
-            match crate::progress_list::load_rows(pool, &action.name, key).await {
-                Ok(rows) => (rows, false),
-                Err(e) => {
-                    error!(action = %action.name, key = %key, error = %e, "reading the stored steps for the step list failed; its times render as unknown");
-                    (Vec::new(), true)
-                }
-            };
+        let (mut rows, mut incomplete) = match crate::progress_list::load_rows(
+            pool,
+            &action.name,
+            key,
+        )
+        .await
+        {
+            Ok(rows) => (rows, false),
+            Err(e) => {
+                error!(action = %action.name, key = %key, error = %e, "reading the stored steps for the step list failed; its times render as unknown");
+                (Vec::new(), true)
+            }
+        };
         let attempt_no = i64::from(attempts + 1);
         let mut push_row = |kind: &str,
                             start: chrono::DateTime<chrono::Utc>,
@@ -2334,7 +2339,12 @@ async fn process_job(
                     for step in steps {
                         recorder
                             .record(
-                                stage, step.kind, step.label, step.start, step.end, true,
+                                stage,
+                                step.kind,
+                                step.label,
+                                step.start,
+                                step.end,
+                                true,
                                 step.detail,
                             )
                             .await;
@@ -4313,9 +4323,11 @@ impl DeliveryBlockedReason {
 }
 
 /// SPEC-3.15 item 4: the step-list line a lifecycle comment about `f` is
-/// marked with. One arm per [`Finalized`] variant, no wildcard. A re-queue
+/// marked with. Reference table for the literal labels `finalize` passes to
+/// [`lifecycle_footer`]; the test below pins one line per variant. One arm per [`Finalized`] variant, no wildcard. A re-queue
 /// announces the next attempt's `Retry N`; a run that ends in `Needs Review` or
 /// `Failed` ends its list with that line.
+#[cfg(test)]
 fn finalized_line(f: &Finalized, attempt: u32) -> String {
     let retry = || format!("Retry {}", attempt + 1);
     match f {
@@ -4603,7 +4615,13 @@ fn finalize(
         let reason = std::fs::read_to_string(&needs_review)?.trim().to_string();
         let reason = append_compaction_note(&reason, stream_log, &job.key);
         let reason = note_checkpoint_rejection(reason);
-        let reason = lifecycle_footer(&reason, public_url.as_deref(), run, &job.key, "Needs Review");
+        let reason = lifecycle_footer(
+            &reason,
+            public_url.as_deref(),
+            run,
+            &job.key,
+            "Needs Review",
+        );
         if let Err(e) = backend.comment(&job.key, &reason) {
             warn!(key = %job.key, error = %e, "issue comment failed (continuing to tag / AI Agent write)");
         }
@@ -4642,7 +4660,13 @@ fn finalize(
         }
         let summary = std::fs::read_to_string(&no_code)?.trim().to_string();
         let summary = note_checkpoint_rejection(summary);
-        let summary = lifecycle_footer(&summary, public_url.as_deref(), run, &job.key, "No code change");
+        let summary = lifecycle_footer(
+            &summary,
+            public_url.as_deref(),
+            run,
+            &job.key,
+            "No code change",
+        );
         let label = src.states.no_code_label().to_string();
         comment_then_field(backend, src, &job.key, &summary, &label)?;
         info!(key = %job.key, %label, "no-code-change marker present; skipping PR");
@@ -4877,7 +4901,8 @@ fn finalize(
                                 format!("Retry {}", run.attempt + 1)
                             } else {
                                 "Needs Review".to_string()
-                            }.as_str(),
+                            }
+                            .as_str(),
                         );
                         comment_then_field(backend, src, &job.key, &body, target)?;
                         Ok(Finalized::ReviewFailed {
@@ -4921,8 +4946,13 @@ fn finalize(
                     &detail,
                 );
                 let body = note_checkpoint_rejection(body);
-                let body =
-                    lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Conflict resolution");
+                let body = lifecycle_footer(
+                    &body,
+                    public_url.as_deref(),
+                    run,
+                    &job.key,
+                    "Conflict resolution",
+                );
                 if let Err(ce) = backend.comment(&job.key, &body) {
                     warn!(key = %job.key, error = %ce, "issue comment failed (continuing to AI Agent write)");
                 }
@@ -5002,7 +5032,12 @@ fn finalize(
                             public_url.as_deref(),
                             run,
                             &job.key,
-                            if requeued { format!("Retry {}", run.attempt + 1) } else { "Failed".to_string() }.as_str(),
+                            if requeued {
+                                format!("Retry {}", run.attempt + 1)
+                            } else {
+                                "Failed".to_string()
+                            }
+                            .as_str(),
                         );
                         if let Err(ce) = backend.comment(&job.key, &body) {
                             warn!(key = %job.key, error = %ce, "issue comment failed (continuing to AI Agent write)");
@@ -5042,13 +5077,8 @@ fn finalize(
                             resume_pr_url,
                         );
                         let body = note_checkpoint_rejection(body);
-                        let body = lifecycle_footer(
-                            &body,
-                            public_url.as_deref(),
-                            run,
-                            &job.key,
-                            "Failed",
-                        );
+                        let body =
+                            lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Failed");
                         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
                         Ok(Finalized::Failed {
                             cause: e.to_string(),
@@ -5093,7 +5123,8 @@ fn finalize(
             let body =
                 delivery_blocked_comment(DeliveryBlockedReason::TimeoutNothingMergeable, None);
             let body = note_checkpoint_rejection(body);
-            let body = lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Needs Review");
+            let body =
+                lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Needs Review");
             if let Err(e) = backend.comment(&job.key, &body) {
                 warn!(key = %job.key, error = %e, "delivery-blocked comment failed (continuing)");
             }
@@ -6926,9 +6957,15 @@ mod tests {
             "a transient auth failure must revert the issue off Working"
         );
         assert_eq!(
-            tracker.comments.lock().unwrap().len(),
+            tracker
+                .comments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| !c.contains("**Started.**"))
+                .count(),
             1,
-            "exactly one comment names the revert"
+            "exactly one comment (besides the start notice) names the revert"
         );
     }
 
@@ -7010,7 +7047,16 @@ mod tests {
             "no attempt is spent on a transient rate-limit result"
         );
         assert_eq!(tracker.field(), "Queued");
-        assert_eq!(tracker.comments.lock().unwrap().len(), 1);
+        assert_eq!(
+            tracker
+                .comments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| !c.contains("**Started.**"))
+                .count(),
+            1
+        );
     }
 
     /// A run already stopped (here: by the Claude login needing renewal) when
@@ -7176,7 +7222,10 @@ mod tests {
             let body = lifecycle_footer("outcome", None, run, "TBL-1", &line);
             let marked = format!("1. {line}: <-- This comment");
             let list_end = body.find(&marked).expect("the marked line is present");
-            assert!(body.find("Run: ").unwrap() > list_end, "list before footer: {body}");
+            assert!(
+                body.find("Run: ").unwrap() > list_end,
+                "list before footer: {body}"
+            );
         }
     }
 
@@ -7218,8 +7267,21 @@ mod tests {
         let gate = crate::pause::PauseGate::new(pool.clone());
         let pause = gate.for_action_run("yt");
         let _ = process_job(
-            &loaded, &paths, &pool, &claude, &tracker, &forge, &s, &limits, &cancel, &pause,
-            &spend, &j, PrStrategy::Branch, false, 1,
+            &loaded,
+            &paths,
+            &pool,
+            &claude,
+            &tracker,
+            &forge,
+            &s,
+            &limits,
+            &cancel,
+            &pause,
+            &spend,
+            &j,
+            PrStrategy::Branch,
+            false,
+            1,
         )
         .await;
         let comments = tracker.comments.lock().unwrap();
@@ -7228,7 +7290,10 @@ mod tests {
         assert!(first.contains("Attempt: 1 (stage: initial)"), "{first:?}");
         assert!(first.contains("Session timeout: 30s"), "{first:?}");
         assert!(first.contains("Expected duration: no history"), "{first:?}");
-        assert!(first.contains("1. Initial commit: <-- This comment"), "{first:?}");
+        assert!(
+            first.contains("1. Initial commit: <-- This comment"),
+            "{first:?}"
+        );
     }
 
     /// CLAUDE-535 fixture: a forge whose PRs report the CI state listed in
@@ -7606,7 +7671,16 @@ mod tests {
             "a login trip mid-run must requeue rather than fail, got {outcome:?}"
         );
         assert_eq!(tracker.field(), "Queued");
-        assert_eq!(tracker.comments.lock().unwrap().len(), 1);
+        assert_eq!(
+            tracker
+                .comments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| !c.contains("**Started.**"))
+                .count(),
+            1
+        );
         assert_eq!(
             state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
             0,

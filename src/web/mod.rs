@@ -1373,7 +1373,7 @@ struct MeanBar {
 /// SPEC-4.3.15: the dashboard's live panels. Each series carries its own
 /// error so one unreadable series renders an error panel naming the cause
 /// instead of an empty chart.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct LiveView {
     inflight: Vec<InflightRow>,
     inflight_error: Option<String>,
@@ -1421,7 +1421,11 @@ async fn live_view(pool: &crate::db::DbPool, actions_dir: &std::path::Path) -> L
     let defaults = crate::job::RunnerDefaults::default();
     let timeout_for = |name: &str| -> Option<u64> {
         match crate::action::load(name, actions_dir) {
-            Ok(l) => Some(crate::job::effective_limits(&defaults, &l).claude_timeout.as_secs()),
+            Ok(l) => Some(
+                crate::job::effective_limits(&defaults, &l)
+                    .claude_timeout
+                    .as_secs(),
+            ),
             Err(e) => {
                 tracing::warn!(action = %name, error = %e, "loading the action for its session timeout failed; no at-risk highlight");
                 None
@@ -8416,9 +8420,7 @@ mod tests {
     /// an error panel naming the cause.
     #[test]
     fn dashboard_renders_inflight_rows_highlights_and_error_panels() {
-        use super::{
-            inflight_row, DashboardTpl, LiveView, MeanBar, PageNav, RunsView,
-        };
+        use super::{inflight_row, DashboardTpl, LiveView, MeanBar, PageNav, RunsView};
         use crate::report::InflightJob;
         use askama::Template;
 
@@ -8490,15 +8492,24 @@ mod tests {
         .render()
         .unwrap();
         assert!(html.contains("4 job(s) in flight"), "{html}");
-        assert!(html.contains("SLOW-1") && html.contains("(over median)"), "{html}");
-        assert!(html.contains("RISK-1") && html.contains("(at risk)"), "{html}");
+        assert!(
+            html.contains("SLOW-1") && html.contains("(over median)"),
+            "{html}"
+        );
+        assert!(
+            html.contains("RISK-1") && html.contains("(at risk)"),
+            "{html}"
+        );
         assert!(html.contains("no history"), "{html}");
         assert!(
             html.contains("The time-by-kind series could not be read:")
                 && html.contains("db unreachable"),
             "{html}"
         );
-        assert!(!html.contains("No step data recorded in the last 7 days."), "{html}");
+        assert!(
+            !html.contains("No step data recorded in the last 7 days."),
+            "{html}"
+        );
     }
 
     /// `whitelist_member` keeps only values present in the data-derived list.
@@ -8574,7 +8585,7 @@ mod tests {
             ci_repo_options: vec![],
             stuck_count: 0,
             stuck_rows: vec![],
-            live: LiveView::default(),
+            live: super::LiveView::default(),
         };
         let html = tpl.render().expect("render dashboard");
         // Poll URL carries the active sort/filter (askama escapes `&` to `&amp;`).
@@ -8686,7 +8697,7 @@ mod tests {
             ci_repo_options: vec![],
             stuck_count: 0,
             stuck_rows: vec![],
-            live: LiveView::default(),
+            live: super::LiveView::default(),
         };
 
         let quiet = tpl(vec![]).render().expect("render dashboard");
@@ -8768,7 +8779,7 @@ mod tests {
             ci_repo_options: vec![],
             stuck_count: 0,
             stuck_rows: vec![],
-            live: LiveView::default(),
+            live: super::LiveView::default(),
         };
 
         let quiet = tpl(vec![]).render().expect("render dashboard");

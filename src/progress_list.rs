@@ -64,7 +64,11 @@ fn is_check_kind(kind: &str) -> bool {
 /// The label a stored kind lists under, or `None` for a kind that only adds
 /// to the elapsed time (clone, coding, build, Postgres, ...). `n` counts the
 /// earlier steps of the same family in this list.
-fn listed_label(kind: &str, seen_milestones_in_attempt: usize, counts: &mut Counts) -> Option<String> {
+fn listed_label(
+    kind: &str,
+    seen_milestones_in_attempt: usize,
+    counts: &mut Counts,
+) -> Option<String> {
     match kind {
         "checkpoint" => {
             counts.checkpoint += 1;
@@ -108,26 +112,25 @@ pub fn milestones(rows: &[StepRow]) -> Vec<Milestone> {
     let mut open_checks: Option<(DateTime<Utc>, DateTime<Utc>, bool)> = None;
     let secs = |a: DateTime<Utc>, b: DateTime<Utc>| (b - a).num_seconds().max(0);
 
-    let flush_checks =
-        |open: &mut Option<(DateTime<Utc>, DateTime<Utc>, bool)>,
-         counts: &mut Counts,
-         in_attempt: &mut usize,
-         out: &mut Vec<Milestone>| {
-            if let Some((start, end, ok)) = open.take() {
-                counts.checks += 1;
-                let label = if ok {
-                    format!("Checks {}", counts.checks)
-                } else {
-                    format!("Checks {} (failed)", counts.checks)
-                };
-                *in_attempt += 1;
-                out.push(Milestone {
-                    label,
-                    step_secs: secs(start, end),
-                    total_secs: secs(origin, end),
-                });
-            }
-        };
+    let flush_checks = |open: &mut Option<(DateTime<Utc>, DateTime<Utc>, bool)>,
+                        counts: &mut Counts,
+                        in_attempt: &mut usize,
+                        out: &mut Vec<Milestone>| {
+        if let Some((start, end, ok)) = open.take() {
+            counts.checks += 1;
+            let label = if ok {
+                format!("Checks {}", counts.checks)
+            } else {
+                format!("Checks {} (failed)", counts.checks)
+            };
+            *in_attempt += 1;
+            out.push(Milestone {
+                label,
+                step_secs: secs(start, end),
+                total_secs: secs(origin, end),
+            });
+        }
+    };
 
     for row in rows {
         if row.attempt != current_attempt {
@@ -178,7 +181,11 @@ pub fn render(done: &[Milestone], current: &str, incomplete: bool) -> String {
         let times = if incomplete {
             format!("{UNKNOWN_TIME} / {UNKNOWN_TIME}")
         } else {
-            format!("{} / {}", format_secs(m.step_secs), format_secs(m.total_secs))
+            format!(
+                "{} / {}",
+                format_secs(m.step_secs),
+                format_secs(m.total_secs)
+            )
         };
         lines.push(format!("{}. {}: {times}", i + 1, m.label));
     }
@@ -344,7 +351,10 @@ mod tests {
         assert_eq!(format_secs(3725), "1:02:05");
         let rows = [row(1, "checkpoint", 0, 3725, true)];
         let list = render_rows(&rows, "Checks 1", false);
-        assert!(list.contains("1. Checkpoint 1: 1:02:05 / 1:02:05"), "{list}");
+        assert!(
+            list.contains("1. Checkpoint 1: 1:02:05 / 1:02:05"),
+            "{list}"
+        );
     }
 
     #[test]
@@ -375,10 +385,19 @@ mod tests {
 
     #[test]
     fn a_review_without_a_pass_is_listed_as_no_verdict() {
-        let rows = [row(1, "check", 0, 10, true), row(1, "review", 10, 30, false)];
+        let rows = [
+            row(1, "check", 0, 10, true),
+            row(1, "review", 10, 30, false),
+        ];
         let list = render_rows(&rows, "Needs Review", false);
-        assert!(list.contains("2. Review (no verdict): 0:20 / 0:30"), "{list}");
-        assert!(list.ends_with("3. Needs Review: <-- This comment"), "{list}");
+        assert!(
+            list.contains("2. Review (no verdict): 0:20 / 0:30"),
+            "{list}"
+        );
+        assert!(
+            list.ends_with("3. Needs Review: <-- This comment"),
+            "{list}"
+        );
     }
 
     #[test]
@@ -399,7 +418,10 @@ mod tests {
         );
         let list = render_with_context("CTX-1", "Failed");
         clear_context("CTX-1");
-        assert_eq!(list, "1. Checks 1: 1:30 / 1:30\n2. Failed: <-- This comment");
+        assert_eq!(
+            list,
+            "1. Checks 1: 1:30 / 1:30\n2. Failed: <-- This comment"
+        );
         assert_eq!(
             render_with_context("CTX-1", "Failed"),
             "1. Failed: <-- This comment",

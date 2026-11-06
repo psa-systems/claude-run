@@ -1116,7 +1116,7 @@ impl CliBackend {
             public_url: public_url.as_deref(),
             run_id: None,
             started: None,
-            // FOLLOWUP-PROGRESS: no stored step rows reach this provider-level site yet.
+            // TODO(CLAUDE-603): no stored step rows reach this provider-level site yet.
             progress: None,
         };
         pr.push_comment_failure =
@@ -2324,7 +2324,7 @@ impl Forge for CliBackend {
                         public_url: public_url.as_deref(),
                         run_id,
                         started: run_started,
-                        // FOLLOWUP-PROGRESS: no stored step rows reach this provider-level site yet.
+                        // TODO(CLAUDE-603): no stored step rows reach this provider-level site yet.
                         progress: None,
                     };
                     pr.push_comment_failure =

@@ -276,11 +276,7 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
     if let Some(infra) = crate::infra_failure::detect(&input.log) {
         if matches!(
             infra.kind.as_str(),
-            "runner-unavailable"
-                | "job-timeout"
-                | "container-not-started"
-                | "runner-deadline"
-                | "no-diagnostic"
+            "runner-unavailable" | "job-timeout" | "container-not-started" | "runner-deadline"
         ) {
             return Some(Triage::rules(TriageBucket::HumanAction, infra.problem));
         }
@@ -295,6 +291,15 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
             TriageBucket::Transient,
             format!("log matched transient/infra signature {sig:?}"),
         ));
+    }
+
+    // SPEC-3.12 item 8: a log with no test id and no diagnostic is a runner
+    // problem. After the transient scan so a named transient signature keeps
+    // its bucket.
+    if let Some(infra) = crate::infra_failure::detect(&input.log) {
+        if infra.kind == "no-diagnostic" {
+            return Some(Triage::rules(TriageBucket::HumanAction, infra.problem));
+        }
     }
 
     None
