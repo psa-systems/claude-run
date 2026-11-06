@@ -1323,6 +1323,160 @@ pub async fn failure_causes(
     })
 }
 
+// ---- SPEC-4.3.15: in flight and recent averages --------------------------
+
+/// SPEC-4.3.15: the fraction of the session timeout past which an in-flight
+/// job is highlighted as at risk.
+pub const AT_RISK_FRACTION: f64 = 0.8;
+
+/// One job in flight (`run_inflight_jobs`).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct InflightJob {
+    pub run_id: i64,
+    pub action: String,
+    pub job_key: String,
+    pub stage: String,
+    /// The latest recorded step (`kind` / `label`), `None` while no step of
+    /// the attempt has been written yet.
+    pub current_step: Option<String>,
+    pub elapsed_secs: i64,
+    /// The median of the last 20 completed attempts of the same action and
+    /// stage; `None` reads "no history" (fewer than 3).
+    pub median_secs: Option<i64>,
+    pub timeout_secs: Option<u64>,
+    pub over_median: bool,
+    pub at_risk: bool,
+}
+
+/// SPEC-4.3.15: highlight flags for one job. Pure, so the rule is tested alone.
+pub fn highlight(
+    elapsed_secs: i64,
+    median_secs: Option<i64>,
+    timeout_secs: Option<u64>,
+) -> (bool, bool) {
+    let over_median = median_secs.is_some_and(|m| elapsed_secs > m);
+    let at_risk = timeout_secs.is_some_and(|t| elapsed_secs as f64 > AT_RISK_FRACTION * t as f64);
+    (over_median, at_risk)
+}
+
+/// SPEC-4.3.15: every job in flight with its stage, current step, elapsed time
+/// and the median of recent completed attempts. `timeout_for` gives an
+/// action's session timeout, `None` when it cannot be resolved (no at-risk
+/// highlight then; the caller logs why).
+pub async fn inflight_jobs(
+    pool: &DbPool,
+    now: DateTime<Utc>,
+    timeout_for: &dyn Fn(&str) -> Option<u64>,
+) -> Result<Vec<InflightJob>> {
+    let sql = crate::db::q(
+        pool,
+        "SELECT r.id, r.action_name, r.started_at, j.job_key FROM run_inflight_jobs j \
+         JOIN runs r ON r.id = j.run_id ORDER BY r.started_at",
+    )
+    .into_owned();
+    let rows: Vec<(i64, String, String, String)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_all(pool)
+            .await?;
+    let mut out = Vec::new();
+    for (run_id, action, run_started, job_key) in rows {
+        let attempts = crate::state::attempts_get(pool, &action, &job_key).await?;
+        let latest_sql = crate::db::q(
+            pool,
+            "SELECT stage, kind, label, started_at FROM attempt_steps \
+             WHERE action_name = ? AND job_key = ? AND attempt = ? ORDER BY seq DESC LIMIT 1",
+        )
+        .into_owned();
+        let latest: Option<(String, String, String, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(latest_sql.as_str()))
+                .bind(&action)
+                .bind(&job_key)
+                .bind(i64::from(attempts) + 1)
+                .fetch_optional(pool)
+                .await?;
+        let (stage, current_step) = match latest {
+            Some((stage, kind, label, _)) => (stage, Some(format!("{kind} / {label}"))),
+            None => (
+                crate::attempt_steps::stage_for_attempt(attempts + 1).to_string(),
+                None,
+            ),
+        };
+        let started = DateTime::parse_from_rfc3339(&run_started)
+            .map_err(|e| {
+                crate::error::Error::Other(anyhow::anyhow!(
+                    "run {run_id} has a bad started_at {run_started:?}: {e}"
+                ))
+            })?
+            .with_timezone(&Utc);
+        let elapsed_secs = (now - started).num_seconds().max(0);
+        let median_secs = match crate::state::recent_attempt_durations_ms(pool, &action, &stage)
+            .await
+            .map(|d| crate::state::median_duration(&d))?
+        {
+            crate::state::ExpectedDuration::Median(d) => Some(d.as_secs() as i64),
+            crate::state::ExpectedDuration::NoHistory
+            | crate::state::ExpectedDuration::Unavailable => None,
+        };
+        let timeout_secs = timeout_for(&action);
+        let (over_median, at_risk) = highlight(elapsed_secs, median_secs, timeout_secs);
+        out.push(InflightJob {
+            run_id,
+            action,
+            job_key,
+            stage,
+            current_step,
+            elapsed_secs,
+            median_secs,
+            timeout_secs,
+            over_median,
+            at_risk,
+        });
+    }
+    Ok(out)
+}
+
+/// SPEC-4.3.15: mean attempt duration for one action.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ActionMean {
+    pub action: String,
+    pub attempts: usize,
+    pub mean_seconds: f64,
+}
+
+/// SPEC-4.3.15: mean attempt duration by action over the window, from attempts
+/// that recorded a duration. Sorted by action name.
+pub async fn mean_attempt_duration_by_action(
+    pool: &DbPool,
+    range: Range,
+) -> Result<Vec<ActionMean>> {
+    let cutoff = ts_cutoff(range);
+    let mut sql = String::from(
+        "SELECT action_name, duration_ms FROM job_outcomes WHERE attempt_counted = 1 AND duration_ms > 0",
+    );
+    if cutoff.is_some() {
+        sql.push_str(" AND ts >= ?");
+    }
+    let sql = crate::db::q(pool, &sql).into_owned();
+    let mut q = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql.as_str()));
+    if let Some(c) = &cutoff {
+        q = q.bind(c);
+    }
+    let mut by_action: BTreeMap<String, (usize, i64)> = BTreeMap::new();
+    for (action, ms) in q.fetch_all(pool).await? {
+        let e = by_action.entry(action).or_default();
+        e.0 += 1;
+        e.1 += ms;
+    }
+    Ok(by_action
+        .into_iter()
+        .map(|(action, (n, total))| ActionMean {
+            action,
+            attempts: n,
+            mean_seconds: total as f64 / n as f64 / 1000.0,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1514,6 +1668,82 @@ mod tests {
         assert_eq!(s.p95_seconds, Some(19.0));
         assert_eq!(s.max_seconds, Some(20.0));
         assert_eq!(stats(vec![]).median_seconds, None);
+    }
+
+    #[test]
+    fn highlights_flag_over_median_and_over_eighty_percent_of_the_timeout() {
+        assert_eq!(highlight(100, Some(200), Some(1000)), (false, false));
+        assert_eq!(highlight(300, Some(200), Some(1000)), (true, false));
+        assert_eq!(highlight(801, Some(2000), Some(1000)), (false, true));
+        assert_eq!(highlight(900, Some(200), Some(1000)), (true, true));
+        // No history and no timeout flag nothing.
+        assert_eq!(highlight(9999, None, None), (false, false));
+    }
+
+    #[tokio::test]
+    async fn inflight_jobs_carry_stage_step_elapsed_and_the_recent_median() {
+        let pool = mem_pool().await;
+        let run = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
+        for (i, ms) in [100_000_i64, 200_000, 300_000].iter().enumerate() {
+            state::job_outcome_insert(
+                &pool,
+                &JobOutcome {
+                    run_id: run,
+                    action_name: "alpha",
+                    job_key: &format!("H-{i}"),
+                    attempt: 1,
+                    ok: true,
+                    claude_ran: true,
+                    claude_ok: true,
+                    claude_cost_usd: 0.0,
+                    attempt_counted: true,
+                    summary: None,
+                    stream_log_path: None,
+                    duration_ms: *ms,
+                    timed_out: false,
+                    stage: "initial",
+                    outcome: "success",
+                },
+            )
+            .await
+            .unwrap();
+        }
+        state::run_inflight_add(&pool, run, "LIVE-1", "LIVE-1")
+            .await
+            .unwrap();
+        let now = Utc::now() + Duration::seconds(250);
+        let jobs = inflight_jobs(&pool, now, &|_| Some(300)).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        let j = &jobs[0];
+        assert_eq!((j.stage.as_str(), j.median_secs), ("initial", Some(200)));
+        assert!(j.over_median, "{j:?}");
+        assert!(j.at_risk, "250s is over 80% of a 300s timeout: {j:?}");
+        assert_eq!(j.current_step, None, "no step written yet");
+    }
+
+    #[tokio::test]
+    async fn mean_attempt_duration_groups_by_action() {
+        let pool = mem_pool().await;
+        let run = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
+        for (action, ms) in [("alpha", 10_000_i64), ("alpha", 30_000), ("beta", 5_000)] {
+            seed_attempt(&pool, run, action, &format!("M-{ms}"), 1, "initial", "success", false, None).await;
+            sqlx::query(sqlx::AssertSqlSafe(
+                crate::db::q(&pool, "UPDATE job_outcomes SET duration_ms = ? WHERE job_key = ?").into_owned(),
+            ))
+            .bind(ms)
+            .bind(format!("M-{ms}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let means = mean_attempt_duration_by_action(&pool, Range::Last7Days).await.unwrap();
+        assert_eq!(
+            means,
+            vec![
+                ActionMean { action: "alpha".into(), attempts: 2, mean_seconds: 20.0 },
+                ActionMean { action: "beta".into(), attempts: 1, mean_seconds: 5.0 },
+            ]
+        );
     }
 
     /// CLAUDE-601: "succeeded on the first try" is a query on `job_outcomes`.
