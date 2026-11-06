@@ -449,6 +449,9 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                     cancel: job_cancel.clone(),
                     spend: job_spend.clone(),
                     key: job.key.clone(),
+                    pool: pool.clone(),
+                    run_id,
+                    action_name: action.name.clone(),
                 }));
             if let Err(e) = state::run_inflight_add(&pool, run_id, &job.key, &inflight_ckey).await {
                 warn!(error = %e, "run_inflight_add failed (non-fatal)");
@@ -3201,6 +3204,9 @@ struct FinalPushConflictResolver {
     cancel: CancellationToken,
     spend: crate::usage::RunSpend,
     key: String,
+    pool: crate::db::DbPool,
+    run_id: i64,
+    action_name: String,
 }
 
 impl ConflictResolver for FinalPushConflictResolver {
@@ -3236,6 +3242,18 @@ impl ConflictResolver for FinalPushConflictResolver {
             // that losing that cache here is not worth threading it through.
             None,
         )?;
+        self.spend.record(&result);
+        // SPEC-3.12 item 4: this pass is a `claude` invocation like any
+        // other, so it leaves a `claude_invocations` row the same way the
+        // job's main attempt and review session do.
+        tokio::runtime::Handle::current().block_on(crate::usage::record_invocation(
+            &self.pool,
+            &self.action_name,
+            Some(&self.key),
+            Some(self.run_id),
+            &stream_log,
+            &result,
+        ));
         if result.timed_out {
             return Err(Error::Other(anyhow::anyhow!(
                 "the conflict-resolution pass timed out"
