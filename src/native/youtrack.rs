@@ -5346,7 +5346,8 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
     let detail = [
         "The agent may have completed all, some, or none of the work before being killed. A backgrounded command can hold the process open past the limit even after the functional work is done, so this is not necessarily a failure. The runner did NOT mark this issue Failed.".to_string(),
         String::new(),
-        r.summary.clone(),
+        // SPEC-3.16.3: the collapsed block is still part of the posted comment, so it gets the same redaction.
+        redact_stream_log_path(&r.summary),
     ]
     .join("\n");
     body.push_str(&collapsed_details("Run detail and agent summary", &detail));
@@ -7248,6 +7249,21 @@ mod tests {
             body.contains("mid-write on src/foo.rs"),
             "agent summary must still appear in the collapsed block:\n{body}"
         );
+    }
+
+    /// SPEC-3.16.3: a killed run with no final message carries the raw stream-log
+    /// path in `summary`; the collapsed detail block must not repeat it.
+    #[test]
+    fn timeout_comment_detail_redacts_the_stream_log_path() {
+        let mut r = ClaudeResult::synthesized("claude exited 124", "");
+        r.summary = "The run produced no final message: no terminal result event and no assistant text were found in the stream log. 0 assistant turns were recorded. See /state/logs/act/streams/K-attempt-1.jsonl for the full stream log.".into();
+        let salvage = SalvageReport {
+            nothing_to_salvage: true,
+            ..Default::default()
+        };
+        let body = timeout_comment(&r, Duration::from_secs(60), &salvage);
+        assert!(!body.contains(".jsonl"), "{body}");
+        assert!(body.contains("The run produced no final message"), "{body}");
     }
 
     /// SPEC-3.16.3/5: the timeout Needs-Review comment is at most 3 bullets,
