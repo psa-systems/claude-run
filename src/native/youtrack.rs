@@ -5293,11 +5293,20 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
         timeout.as_secs()
     );
 
+    // SPEC-3.16.3's bullet contract is "what was or was not pushed" in full:
+    // `salvage_timeout_work` always attempts `create_pr_with_draft` after a
+    // failed WIP commit, so `commit_error` and `pr_url`/`open_error` can both
+    // be set on the same report. Reporting only one silently drops the other
+    // fact, so both pieces are collected into the single bullet when present.
     let salvage_line = if salvage.nothing_to_salvage {
         "No local work to salvage (clean working tree, no commits ahead of the remote default branch).".to_string()
-    } else if let Some(e) = &salvage.commit_error {
-        format!("Committing the uncommitted working tree failed: {e}")
     } else {
+        let mut parts = Vec::new();
+        if let Some(e) = &salvage.commit_error {
+            parts.push(format!(
+                "Committing the uncommitted working tree failed: {e}"
+            ));
+        }
         match (&salvage.pr_url, &salvage.open_error) {
             (Some(url), _) => {
                 let mut line = format!("Work in progress was salvaged as a draft PR: {url}");
@@ -5313,11 +5322,16 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
                 {
                     line.push_str(&format!(" {e}"));
                 }
-                line
+                parts.push(line);
             }
-            (None, Some(e)) => format!("Salvaging the work as a draft PR failed: {e}"),
-            (None, None) => "No local work to salvage.".to_string(),
+            (None, Some(e)) => parts.push(format!("Salvaging the work as a draft PR failed: {e}")),
+            (None, None) => {
+                if parts.is_empty() {
+                    parts.push("No local work to salvage.".to_string());
+                }
+            }
         }
+        parts.join(" ")
     };
 
     let action = format!(
@@ -5364,15 +5378,42 @@ fn failure_cause(r: &ClaudeResult) -> crate::run_footer::FailureCause {
         }
     } else {
         FailureCause::AgentError {
-            message: r
-                .summary
-                .lines()
-                .next()
-                .unwrap_or(&r.error)
+            message: redact_stream_log_path(r.summary.lines().next().unwrap_or(&r.error))
                 .trim()
                 .to_string(),
         }
     }
+}
+
+/// SPEC-3.16.3: strips the raw stream-log path that
+/// `claude::no_final_message_summary` / `claude::unreadable_log_summary`
+/// embed in an otherwise single-line `ClaudeResult.summary`, so it never
+/// reaches a FAILED comment via [`failure_cause`] or the webhook-comment
+/// `ClaudeFailed` path in `comment_webhooks.rs`. Any other summary (a
+/// `result` event's text, or the last assistant message) passes through
+/// unchanged, since neither names the stream log.
+pub(crate) fn redact_stream_log_path(message: &str) -> String {
+    const NO_FINAL_MARKER: &str = " See ";
+    const NO_FINAL_SUFFIX: &str = "for the full stream log.";
+    if let Some(start) = message.find(NO_FINAL_MARKER) {
+        if message[start..].ends_with(NO_FINAL_SUFFIX) {
+            return format!("{}.", message[..start].trim_end_matches('.'));
+        }
+    }
+
+    const UNREADABLE_MARKER: &str = "could not read this run's stream log (";
+    if let Some(start) = message.find(UNREADABLE_MARKER) {
+        if let Some(close) = message[start..].find(')') {
+            let close_idx = start + close;
+            return format!(
+                "{}could not read this run's stream log{}",
+                &message[..start],
+                &message[close_idx + 1..]
+            );
+        }
+    }
+
+    message.to_string()
 }
 
 /// Delivery-blocked issue comment (CLAUDE-545). One-line outcome naming
@@ -7092,6 +7133,46 @@ mod tests {
         assert!(!timeout_body.contains("secret reasoning"), "{timeout_body}");
     }
 
+    /// SPEC-3.16.3: `failure_cause`'s `AgentError` mapping must never let the
+    /// raw stream-log path embedded in `claude::no_final_message_summary` /
+    /// `claude::unreadable_log_summary` reach the FAILED comment, since those
+    /// summaries have no newline and `r.summary.lines().next()` would
+    /// otherwise return the whole path-bearing sentence verbatim.
+    #[test]
+    fn failure_comment_never_carries_the_stream_log_path_from_a_crash_summary() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // No final `result` event and no assistant text: `friendly_failure_summary`
+        // falls through to `no_final_message_summary`, which embeds the path.
+        let empty_log = dir.path().join("empty.jsonl");
+        std::fs::write(&empty_log, "").unwrap();
+        let summary = crate::claude::friendly_failure_summary(&serde_json::Value::Null, &empty_log);
+        assert!(summary.contains(".jsonl"), "precondition: {summary}");
+        let mut r = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
+        r.summary = summary;
+        let body = failure_comment(&r, "Nothing was pushed.");
+        assert!(
+            !body.contains(".jsonl") && !body.contains("empty.jsonl"),
+            "{body}"
+        );
+        assert!(body.contains("agent error"), "{body}");
+
+        // The stream log cannot be read at all: `unreadable_log_summary` also
+        // embeds the path.
+        let missing_log = dir.path().join("missing.jsonl");
+        let summary =
+            crate::claude::friendly_failure_summary(&serde_json::Value::Null, &missing_log);
+        assert!(summary.contains(".jsonl"), "precondition: {summary}");
+        let mut r = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
+        r.summary = summary;
+        let body = failure_comment(&r, "Nothing was pushed.");
+        assert!(
+            !body.contains(".jsonl") && !body.contains("missing.jsonl"),
+            "{body}"
+        );
+        assert!(body.contains("agent error"), "{body}");
+    }
+
     /// CLAUDE-447: a failed `timeout salvage push` comment post never fails
     /// the draft PR the timeout salvaged, but the YouTrack timeout comment
     /// names it, right alongside (and never confused with) a failed
@@ -7198,6 +7279,17 @@ mod tests {
                 open_error: Some("opening the draft PR failed".to_string()),
                 ..Default::default()
             },
+            SalvageReport {
+                commit_error: Some("working tree commit failed".to_string()),
+                pr_url: Some("https://dev.a8n.run/contoso/claude-run/pulls/9".to_string()),
+                pr: Some(PullRequest {
+                    number: Some(9),
+                    url: "https://dev.a8n.run/contoso/claude-run/pulls/9".into(),
+                    head_branch: Some("feat/x".into()),
+                    push_comment_failure: None,
+                }),
+                ..Default::default()
+            },
         ];
         for salvage in cases {
             let body = timeout_comment(&r, Duration::from_secs(1800), salvage);
@@ -7206,6 +7298,13 @@ mod tests {
                 bullets.len() <= 3,
                 "{salvage:?}: at most 3 bullets:\n{body}"
             );
+            if salvage.commit_error.is_some() && salvage.pr_url.is_some() {
+                assert!(
+                    body.contains("Committing the uncommitted working tree failed")
+                        && body.contains("salvaged as a draft PR"),
+                    "{salvage:?}: a commit failure followed by a draft PR must report BOTH facts, not just the first:\n{body}"
+                );
+            }
             assert_eq!(
                 bullets.first().copied(),
                 Some("- timed out after 1800s (the run hit its time limit and was killed)"),

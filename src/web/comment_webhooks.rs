@@ -2638,7 +2638,9 @@ pub fn outcome_comment(
         Decision::ClaudeFailed => {
             let message = crate::claude::failure_hint(claude.timed_out, claude.killed)
                 .map(str::to_string)
-                .unwrap_or_else(|| first_line(&claude.summary));
+                .unwrap_or_else(|| {
+                    crate::native::youtrack::redact_stream_log_path(&first_line(&claude.summary))
+                });
             crate::run_footer::failure_comment(
                 &crate::run_footer::FailureCause::AgentError { message },
                 "Nothing was pushed.",
@@ -4235,6 +4237,28 @@ mod tests {
         let body = outcome_comment(&Decision::ClaudeFailed, &killed, None, None, None);
         assert!(!body.contains("signature"), "{body}");
         assert!(!body.contains("secret reasoning"), "{body}");
+    }
+
+    /// SPEC-3.16.3: when no `result` event and no assistant text landed in
+    /// the stream log, `friendly_failure_summary` falls back to
+    /// `no_final_message_summary`, which embeds the stream-log path in an
+    /// otherwise single-line summary; the `ClaudeFailed` comment must still
+    /// never carry that path.
+    #[test]
+    fn claude_failed_comment_never_carries_the_stream_log_path_from_a_crash_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("empty.jsonl");
+        std::fs::write(&log, "").unwrap();
+        let summary = crate::claude::friendly_failure_summary(&serde_json::Value::Null, &log);
+        assert!(summary.contains(".jsonl"), "precondition: {summary}");
+
+        let mut r = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "");
+        r.summary = summary;
+        let body = outcome_comment(&Decision::ClaudeFailed, &r, None, None, None);
+        assert!(
+            !body.contains(".jsonl") && !body.contains("empty.jsonl"),
+            "{body}"
+        );
     }
 
     /// The plain-issue route's own reply bodies. Both outcomes name
