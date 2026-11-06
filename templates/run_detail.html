@@ -260,6 +260,9 @@
           <td>
             {% if o.claude_ran %}
               <a href="/runs/{{ run.id }}/jobs/{{ o.job_key }}/attempt/{{ o.attempt }}">view stream</a>
+              {% if o.has_evidence %}
+                <a href="/runs/{{ run.id }}/jobs/{{ o.job_key }}/attempt/{{ o.attempt }}/review-evidence">evidence</a>
+              {% endif %}
             {% else %}<span class="dim">-</span>{% endif %}
           </td>
           {# Clamp the summary to two lines in the cell; the full

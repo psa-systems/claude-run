@@ -12,6 +12,7 @@
 //! `Run:` line then says so explicitly rather than being omitted.
 
 use chrono::{DateTime, Utc};
+use std::time::Duration;
 
 /// SPEC-3.9: "a comment about one job's attempt" links the attempt page.
 ///
@@ -191,6 +192,57 @@ pub fn render(
         started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         finished.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         humanize(finished - started),
+    )
+}
+
+/// SPEC-3.16.3: "The cause is one line from a closed set." One variant per
+/// member of that set; an exhaustive match with no wildcard arm means a new
+/// variant fails to compile here until [`FailureCause::render`] names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FailureCause {
+    /// The run hit its wall-clock session limit. `turns` is the number of
+    /// agent turns completed before the kill.
+    TimedOut { limit: Duration, turns: u32 },
+    /// A push was rejected, typically by a pre-push hook; `error` is the
+    /// one-line git error.
+    PushRejected { error: String },
+    /// The verification gate or a hook command itself failed; `command`
+    /// names it.
+    CommandFailed { command: String },
+    /// The run was cancelled (an operator `claude-run cancel`, or a kill
+    /// delivered before any other terminal state).
+    Cancelled,
+    /// Any other agent-side failure; `message` is a one-line, already
+    /// redacted summary (never the raw stream-log path).
+    AgentError { message: String },
+}
+
+impl FailureCause {
+    /// SPEC-3.16.3: the one-line cause text, first bullet of
+    /// [`failure_comment`].
+    fn render(&self) -> String {
+        match self {
+            FailureCause::TimedOut { limit, turns } => {
+                format!("timed out (limit {}s, {turns} turn(s))", limit.as_secs())
+            }
+            FailureCause::PushRejected { error } => format!("push rejected: {error}"),
+            FailureCause::CommandFailed { command } => format!("`{command}` failed"),
+            FailureCause::Cancelled => "cancelled".to_string(),
+            FailureCause::AgentError { message } => format!("agent error: {message}"),
+        }
+    }
+}
+
+/// SPEC-3.16.3: a `FAILED` comment body, at most 3 bullets: the cause first,
+/// then what was or was not pushed, then the run link. The run link is the
+/// third bullet SPEC-3.16.3 names; every caller already appends the SPEC-3.9
+/// footer (which carries its own `Run:` line), so this body holds only the
+/// two bullets it owns and relies on that footer for the third. The raw
+/// stream-log path never appears here, since the run link reaches it.
+pub fn failure_comment(cause: &FailureCause, pushed: &str) -> String {
+    format!(
+        "**Claude AI agent run FAILED.**\n\n- {}\n- {pushed}",
+        cause.render()
     )
 }
 
@@ -468,6 +520,60 @@ mod tests {
             Some(&trigger),
         );
         assert!(body.contains("\nTrigger: scheduled poll"), "{body}");
+    }
+
+    /// SPEC-3.16.3: one case per [`FailureCause`] variant, asserting the
+    /// rendered body is at most 3 bullets (2 here plus the footer's run
+    /// link), the cause is the first bullet, and no stream-log path ever
+    /// appears.
+    #[test]
+    fn failure_comment_per_cause_is_capped_and_leads_with_the_cause() {
+        let cases: &[(FailureCause, &str)] = &[
+            (
+                FailureCause::TimedOut {
+                    limit: Duration::from_secs(1800),
+                    turns: 42,
+                },
+                "- timed out (limit 1800s, 42 turn(s))",
+            ),
+            (
+                FailureCause::PushRejected {
+                    error: "! [remote rejected] (pre-push hook declined)".to_string(),
+                },
+                "- push rejected: ! [remote rejected] (pre-push hook declined)",
+            ),
+            (
+                FailureCause::CommandFailed {
+                    command: "pre".to_string(),
+                },
+                "- `pre` failed",
+            ),
+            (FailureCause::Cancelled, "- cancelled"),
+            (
+                FailureCause::AgentError {
+                    message: "API Error: 529 Overloaded.".to_string(),
+                },
+                "- agent error: API Error: 529 Overloaded.",
+            ),
+        ];
+        for (cause, first_bullet) in cases {
+            let body = failure_comment(cause, "Nothing was pushed.");
+            let bullets: Vec<&str> = body.lines().filter(|l| l.starts_with("- ")).collect();
+            assert!(bullets.len() <= 3, "{cause:?}: at most 3 bullets:\n{body}");
+            assert_eq!(
+                bullets.first().copied(),
+                Some(*first_bullet),
+                "{cause:?}: the cause must be the first bullet:\n{body}"
+            );
+            assert!(
+                !body.contains(".jsonl") && !body.contains("/streams/"),
+                "{cause:?}: no raw stream-log path:\n{body}"
+            );
+            assert!(
+                body.starts_with("**Claude AI agent run FAILED.**"),
+                "{body}"
+            );
+        }
     }
 
     #[test]

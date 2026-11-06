@@ -472,6 +472,61 @@ pub async fn list_failures(pool: &DbPool, state: Option<&str>, limit: i64) -> Re
     rows.iter().map(failure_from_row).collect()
 }
 
+/// SPEC-4.3.15: the dashboard's CI-failures listing. `state` filters on the
+/// stored lifecycle `state` (`open`/`resolved`/`pr_only`) and `repo` narrows
+/// to one repository; either `None` is "no filter". Newest first.
+/// `ci_failures` persists no separate triage-bucket value
+/// (`code_fix`/`human_action`/`transient`/`auto_fix`, `src/triage.rs`,
+/// computed only at webhook-mint time and never written back to the row),
+/// so the dashboard's "Bucket" column from SPEC-4.3.15's Background is not
+/// yet implemented; this filters and renders lifecycle `state` instead,
+/// labeled accordingly. Persisting the real triage bucket is tracked as
+/// CLAUDE-598.
+pub async fn list_failures_for_dashboard(
+    pool: &DbPool,
+    state: Option<&str>,
+    repo: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Failure>> {
+    let mut conds: Vec<&str> = Vec::new();
+    let mut binds: Vec<&str> = Vec::new();
+    if let Some(s) = state {
+        conds.push("state = ?");
+        binds.push(s);
+    }
+    if let Some(r) = repo {
+        conds.push("repo = ?");
+        binds.push(r);
+    }
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    let sql = format!(
+        "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, \
+         created_at, updated_at FROM ci_failures{where_clause} ORDER BY updated_at DESC LIMIT ?"
+    );
+    let dialect_sql = db::q(pool, &sql).into_owned();
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(dialect_sql.as_str()));
+    for b in &binds {
+        query = query.bind(*b);
+    }
+    let rows = query.bind(limit).fetch_all(pool).await?;
+    rows.iter().map(failure_from_row).collect()
+}
+
+/// SPEC-4.3.15: distinct repos with at least one `ci_failures` row,
+/// alphabetically, for the dashboard's repository filter dropdown.
+pub async fn distinct_failure_repos(pool: &DbPool) -> Result<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        db::q(pool, "SELECT DISTINCT repo FROM ci_failures ORDER BY repo").into_owned(),
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// SPEC-3.5.2: record a PR the agent opened. `salvaged` is true for a timeout-salvage PR
 /// (`Finalized::TimedOut`), false otherwise (CLAUDE-429). Returns its
 /// `agent_pull_requests` id.
@@ -1292,5 +1347,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found, None);
+    }
+
+    #[tokio::test]
+    async fn dashboard_listing_filters_by_state_and_repo() {
+        let pool = test_pool().await;
+        seed_failure(
+            &pool,
+            "acme/widgets",
+            "checks.yml",
+            "test",
+            &["lib::a"],
+            "open",
+            "2026-09-01T00:00:00Z",
+        )
+        .await;
+        seed_failure(
+            &pool,
+            "acme/widgets",
+            "checks.yml",
+            "lint",
+            &["lib::b"],
+            "resolved",
+            "2026-09-02T00:00:00Z",
+        )
+        .await;
+        seed_failure(
+            &pool,
+            "acme/gizmos",
+            "checks.yml",
+            "test",
+            &["lib::c"],
+            "open",
+            "2026-09-03T00:00:00Z",
+        )
+        .await;
+
+        let all = list_failures_for_dashboard(&pool, None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        // newest updated_at first
+        assert_eq!(all[0].repo, "acme/gizmos");
+
+        let open_only = list_failures_for_dashboard(&pool, Some("open"), None, 100)
+            .await
+            .unwrap();
+        assert_eq!(open_only.len(), 2);
+        assert!(open_only.iter().all(|f| f.state == "open"));
+
+        let repo_only = list_failures_for_dashboard(&pool, None, Some("acme/widgets"), 100)
+            .await
+            .unwrap();
+        assert_eq!(repo_only.len(), 2);
+        assert!(repo_only.iter().all(|f| f.repo == "acme/widgets"));
+
+        let both = list_failures_for_dashboard(&pool, Some("open"), Some("acme/widgets"), 100)
+            .await
+            .unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].job_name, "test");
+    }
+
+    #[tokio::test]
+    async fn distinct_repos_are_alphabetical_and_deduped() {
+        let pool = test_pool().await;
+        seed_failure(
+            &pool,
+            "acme/widgets",
+            "checks.yml",
+            "test",
+            &["lib::a"],
+            "open",
+            "2026-09-01T00:00:00Z",
+        )
+        .await;
+        seed_failure(
+            &pool,
+            "acme/widgets",
+            "checks.yml",
+            "lint",
+            &["lib::b"],
+            "resolved",
+            "2026-09-02T00:00:00Z",
+        )
+        .await;
+        seed_failure(
+            &pool,
+            "acme/gizmos",
+            "checks.yml",
+            "test",
+            &["lib::c"],
+            "open",
+            "2026-09-03T00:00:00Z",
+        )
+        .await;
+
+        let repos = distinct_failure_repos(&pool).await.unwrap();
+        assert_eq!(
+            repos,
+            vec!["acme/gizmos".to_string(), "acme/widgets".to_string()]
+        );
     }
 }

@@ -73,8 +73,8 @@ use crate::config::Paths;
 use crate::error::{Error, Result};
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
 use crate::provider::{
-    self, AuditedTracker, CliBackend, CommandRunner, Forge, IssueTracker, IssueWriteAudit,
-    PullRequest,
+    self, AuditedTracker, CliBackend, CommandRunner, ConflictResolver, Forge, IssueTracker,
+    IssueWriteAudit, PullRequest,
 };
 use crate::secrets::{self, JobCredentials};
 use crate::state;
@@ -434,6 +434,25 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                     let backend = credentialed_backend(&runner, &guard);
                     (backend, Some(guard))
                 };
+            // SPEC-3.12 item 4: wire the bounded conflict-resolution pass
+            // in here, the one place this job's `CliBackend` is
+            // constructed, where `ClaudeInvoker`, this job's claude config,
+            // its timeout, cancellation and spend ledger are all already in
+            // scope. `finalize` (called at the end of `process_job`, below)
+            // is the only caller that can reach the diverged-push path that
+            // uses it.
+            let job_backend =
+                job_backend.with_conflict_resolver(Arc::new(FinalPushConflictResolver {
+                    claude: claude.clone(),
+                    claude_cfg: action.claude.clone(),
+                    timeout: limits.claude_timeout,
+                    cancel: job_cancel.clone(),
+                    spend: job_spend.clone(),
+                    key: job.key.clone(),
+                    pool: pool.clone(),
+                    run_id,
+                    action_name: action.name.clone(),
+                }));
             if let Err(e) = state::run_inflight_add(&pool, run_id, &job.key, &inflight_ckey).await {
                 warn!(error = %e, "run_inflight_add failed (non-fatal)");
             }
@@ -772,7 +791,7 @@ fn sanitize_key(key: &str) -> String {
 
 /// `run_events` context tag for every correction the stuck-Working sweep
 /// records, so the dashboard can list them as one group (SPEC-3.12 item 2).
-const STUCK_WORKING_SWEEP_CONTEXT: &str = "stuck-working-sweep";
+pub(crate) const STUCK_WORKING_SWEEP_CONTEXT: &str = "stuck-working-sweep";
 
 /// Comment posted when the sweep moves an issue off `Working` because no
 /// live run backs it. SPEC-3.12 item 2: "a comment naming the cause and the
@@ -1513,6 +1532,39 @@ async fn process_job(
         }
     }
 
+    // ---- estimate vs session timeout (SPEC-3.12 item 7) ----
+    // "At pickup, if the issue's Estimation exceeds the action's session
+    // timeout, the runner does not start the attempt. It sets Needs Review
+    // with Needs-Info, and the comment names both numbers and asks for the
+    // issue to be split or the limit raised. An issue with no Estimation is
+    // picked up as before." Read-only and placed after the dependency gate,
+    // before the clone; like that gate, a read failure must not strand an
+    // otherwise-workable issue, so it falls back to proceeding with pickup.
+    match backend.get_estimation_minutes(key) {
+        Ok(Some(minutes)) if minutes * 60 > limits.claude_timeout.as_secs() as i64 => {
+            info!(
+                action = %action.name,
+                key = %key,
+                estimation_minutes = minutes,
+                timeout_secs = limits.claude_timeout.as_secs(),
+                "estimate exceeds the session timeout; parking Needs Review, no attempt consumed"
+            );
+            report_estimate_over_timeout(
+                backend,
+                src,
+                &action.name,
+                key,
+                minutes,
+                limits.claude_timeout,
+            );
+            return Ok(ProcessedJob::EstimateOverTimeout { key: key.clone() });
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(action = %action.name, key = %key, error = %e, "Estimation lookup failed; proceeding with pickup");
+        }
+    }
+
     // ---- CI in-flight cap (CLAUDE-535) ----
     // One slow CI runner serves every runner PR on a repo, so a pickup waits while
     // `max_ci_in_flight_per_repo` of the repo's other runner PRs still have CI
@@ -1896,14 +1948,13 @@ async fn process_job(
         // SPEC-3.12 item 9: the one retry a workdir-modifying review gets
         // logs to its own file, alongside the first attempt's, rather than
         // overwriting it.
-        let review_retry_stream_log = {
-            let mut name = review_stream_log
-                .file_name()
-                .unwrap_or_default()
-                .to_os_string();
-            name.push("-retry");
-            review_stream_log.with_file_name(name)
-        };
+        let review_retry_stream_log = ClaudeInvoker::review_retry_sibling(&review_stream_log);
+        // SPEC-3.16 item 2: evidence file paths, named like the stream-log
+        // retry above, so a retried review's evidence does not overwrite the
+        // first attempt's.
+        let review_evidence =
+            ClaudeInvoker::review_evidence_path(&paths.logs_dir(), &action.name, key, attempts + 1);
+        let review_retry_evidence = ClaudeInvoker::review_retry_sibling(&review_evidence);
         let review_step_start = chrono::Utc::now();
         let (outcome, review_results) = crate::blocking::in_place(|| {
             run_review_session_with_retry(
@@ -1914,6 +1965,8 @@ async fn process_job(
                 limits.review_timeout,
                 &review_stream_log,
                 &review_retry_stream_log,
+                &review_evidence,
+                &review_retry_evidence,
                 cancel,
                 Some(spend.remaining_usd()),
                 Some(cargo_target_dir.as_path()),
@@ -1944,7 +1997,24 @@ async fn process_job(
             .await;
             state::daily_cost_add(pool, &action.name, result.cost).await?;
         }
-        Some(outcome)
+        // SPEC-3.16 items 1 and 2: cap the verdict to 5 bullets and link
+        // whichever evidence file is authoritative (the retry's, when a
+        // retry ran) before the outcome reaches `finalize` and is posted.
+        let evidence_link = ClaudeInvoker::review_evidence_authoritative(
+            &paths.logs_dir(),
+            &action.name,
+            key,
+            attempts + 1,
+        )
+        .map(|_| {
+            review_evidence_link_text(
+                crate::run_footer::resolved_public_url().as_deref(),
+                run_id,
+                key,
+                attempts + 1,
+            )
+        });
+        Some(cap_verdict_outcome(outcome, key, evidence_link.as_deref()))
     } else {
         None
     };
@@ -3317,20 +3387,27 @@ fn default_review_prompt() -> String {
         "4. State in one sentence the invariant the issue's Goal establishes, as a contract. Derive it from the Goal and the root cause in the Background, not from the criteria list: a named list of files or backends is a lower bound, never the full scope.",
         "5. Derive a search pattern for the SHAPE of code that invariant governs (every implementation of the same trait, every call site of the same kind, every consumer of the same config key), independent of the files the diff touched, and run it over the WHOLE repository with Glob/Grep, not just the changed files.",
         "6. Classify every hit the sweep finds as compliant, not-applicable (state the concrete reason it cannot be affected), or violating. For a fix to an `if`/success branch, also check its `else`/failure branch for the same gap.",
-        "7. If every criterion is satisfied AND the sweep finds no violating or uncovered hit, write a verdict to this file: what you checked, why it passes, and the classified table from steps 4-6 as its evidence.",
+        "7. Write your full working to this evidence file, in full, whether you pass or fail: what you checked per criterion from step 3, the invariant and search pattern from steps 4-5, and the classified table from step 6.",
+        "     {{review_evidence_file}}",
+        "8. If every criterion is satisfied AND the sweep finds no violating or uncovered hit, write the verdict to this file: a first line 'Review: PASS', then at most 4 more lines, one per criterion met, each as 'file:line - what you checked'. No headings, no tables, no restated invariant or search pattern: that detail lives only in the evidence file from step 7.",
         "     {{workdir}}/{{review_pass_marker}}",
-        "8. If any criterion is unmet, contradicted, or unverifiable, OR the sweep finds a hit that is violating, OR a hit the invariant governs but the issue's Goal or file set does not cover, write the findings to this file instead, even when every written criterion is satisfied: name the invariant, the search pattern, and each uncovered or violating hit with file:line.",
+        "9. If any criterion is unmet, contradicted, or unverifiable, OR the sweep finds a hit that is violating, OR a hit the invariant governs but the issue's Goal or file set does not cover, write the verdict to this file instead, even when every written criterion is satisfied: a first line 'Review: FAIL', then at most 4 more lines, one per uncovered or violating hit or unmet criterion, each as 'file:line - what is wrong'. No headings, no tables.",
         "     {{workdir}}/{{review_fail_marker}}",
-        "9. Write to EXACTLY ONE of those two files. Do not write YouTrack comments, do not set any field, do not touch the tracker at all: this session reports only through the marker file, which the runner posts verbatim.",
+        "10. Write to EXACTLY ONE of the two marker files above, after writing the evidence file from step 7. Do not write YouTrack comments, do not set any field, do not touch the tracker at all: this session reports only through the marker file, which the runner posts capped to 5 bullets with the evidence file linked.",
     ]
     .join("\n")
 }
 
 /// Build the review session's instruction text for `job`, substituting the
-/// same `{{...}}` placeholders [`build_prompt`] uses.
-fn build_review_prompt(job: &YoutrackJob, workdir: &Path) -> String {
+/// same `{{...}}` placeholders [`build_prompt`] uses, plus `evidence_path`
+/// (SPEC-3.16 item 2) as `{{review_evidence_file}}`.
+fn build_review_prompt(job: &YoutrackJob, workdir: &Path, evidence_path: &Path) -> String {
+    let template = default_review_prompt().replace(
+        "{{review_evidence_file}}",
+        &evidence_path.display().to_string(),
+    );
     render_prompt_template(
-        &default_review_prompt(),
+        &template,
         job,
         workdir,
         Duration::from_secs(0),
@@ -3397,6 +3474,10 @@ fn run_review_session(
     workdir: &Path,
     timeout: Duration,
     stream_log: &Path,
+    // SPEC-3.16 item 2: where the review session writes its full sweep
+    // (invariant, search pattern, classified table), kept out of the capped
+    // verdict marker and linked from the posted comment instead.
+    evidence_path: &Path,
     cancel: &CancellationToken,
     budget_usd: Option<f64>,
     // SPEC-3.10 item 3: the review session is a `claude` child spawned for
@@ -3411,7 +3492,7 @@ fn run_review_session(
     let before_sha = git_head_sha(workdir);
     let mut review_cfg = claude_cfg.clone();
     review_cfg.allowed_tools = Some("Read,Glob,Grep,Bash".to_string());
-    let prompt = build_review_prompt(job, workdir);
+    let prompt = build_review_prompt(job, workdir, evidence_path);
 
     let invoke_result = claude.invoke(
         &prompt,
@@ -3485,6 +3566,109 @@ fn run_review_session(
         }
     };
     (outcome, result)
+}
+
+/// SPEC-3.12 item 4: the instruction for the bounded conflict-resolution
+/// pass, modeled on CLAUDE-550's `CONFLICT_RESOLVE_INSTRUCTION`
+/// (`src/web/comment_webhooks.rs`) but for the opposite merge direction:
+/// here the local branch's own work is merging in a newer copy of itself
+/// that the remote already carries (typically the runner's own periodic
+/// checkpoint push), not a PR branch merging its base.
+const FINAL_PUSH_CONFLICT_RESOLVE_INSTRUCTION: &str =
+    "A `git merge` of the remote copy of this branch into the local work is in progress and has \
+     left conflict markers. Resolve every conflict, keeping the intent of both sides, change \
+     nothing that is not needed to resolve a conflict, then conclude the merge with a commit. Run \
+     the project's build and test gate once afterward and fix only what the merge broke. If a \
+     conflict cannot be resolved safely, leave it unresolved and say which files in your summary.";
+
+/// SPEC-3.12 item 4: the bounded, one-shot conflict-resolution pass run in
+/// the same clone when the final push finds the remote branch diverged and
+/// the local merge of it conflicts. Implements [`ConflictResolver`], the
+/// provider-layer seam `CliBackend::merge_remote_branch` calls through, so
+/// `src/provider/cli.rs` never has to depend on `ClaudeInvoker`, budget or
+/// cancellation.
+struct FinalPushConflictResolver {
+    claude: Arc<ClaudeInvoker>,
+    claude_cfg: action::ClaudeBlock,
+    timeout: Duration,
+    cancel: CancellationToken,
+    spend: crate::usage::RunSpend,
+    key: String,
+    pool: crate::db::DbPool,
+    run_id: i64,
+    action_name: String,
+}
+
+impl ConflictResolver for FinalPushConflictResolver {
+    fn resolve(
+        &self,
+        workdir: &Path,
+        branch: &str,
+        local_sha: &str,
+        remote_sha: &str,
+    ) -> Result<()> {
+        // A dedicated stream log local to the workdir: this pass is a
+        // one-off, bounded side effect of the final push rather than the
+        // job's main attempt, so it is not folded into the job's own
+        // rotated stream log.
+        let stream_log = workdir.join(".claude-run-conflict-resolve-stream.jsonl");
+        info!(
+            key = %self.key,
+            branch = %branch,
+            local_sha = %local_sha,
+            remote_sha = %remote_sha,
+            "running the bounded conflict-resolution pass (SPEC-3.12 item 4)"
+        );
+        let result = self.claude.invoke(
+            FINAL_PUSH_CONFLICT_RESOLVE_INSTRUCTION,
+            &self.claude_cfg,
+            self.timeout,
+            workdir,
+            &stream_log,
+            &self.cancel,
+            Some(self.spend.remaining_usd()),
+            // No shared cargo cache: this bounded pass is spawned too late
+            // to know the job's own `cargo_target_dir`, and is rare enough
+            // that losing that cache here is not worth threading it through.
+            None,
+        )?;
+        self.spend.record(&result);
+        // SPEC-3.12 item 4: this pass is a `claude` invocation like any
+        // other, so it leaves a `claude_invocations` row the same way the
+        // job's main attempt and review session do.
+        tokio::runtime::Handle::current().block_on(crate::usage::record_invocation(
+            &self.pool,
+            &self.action_name,
+            Some(&self.key),
+            Some(self.run_id),
+            &stream_log,
+            &result,
+        ));
+        if result.timed_out {
+            return Err(Error::Other(anyhow::anyhow!(
+                "the conflict-resolution pass timed out"
+            )));
+        }
+        if !result.ok {
+            return Err(Error::Other(anyhow::anyhow!(
+                "the conflict-resolution pass did not conclude successfully"
+            )));
+        }
+        // SPEC-3.3.2: re-run the repository's own pre-push gate in the
+        // clone, exactly as the normal (non-conflict) path does after its
+        // push, rather than trusting the agent's own report; here it runs
+        // before the push because a merge resolution that breaks the build
+        // must not land as a fast-forward.
+        let gate = run_verification_gate(workdir);
+        if let Some(output) = gate.failure {
+            let command = gate.command.unwrap_or("none");
+            return Err(Error::Other(anyhow::anyhow!(
+                "the conflict-resolution pass's merge commit failed the SPEC-3.3.2 verification \
+                 gate (`just {command}`): {output}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// The current branch `workdir` has checked out, or `None` when it is
@@ -3610,6 +3794,8 @@ fn run_review_session_with_retry(
     timeout: Duration,
     stream_log: &Path,
     retry_stream_log: &Path,
+    evidence_path: &Path,
+    retry_evidence_path: &Path,
     cancel: &CancellationToken,
     budget_usd: Option<f64>,
     cargo_target_dir: Option<&Path>,
@@ -3622,6 +3808,7 @@ fn run_review_session_with_retry(
         workdir,
         timeout,
         stream_log,
+        evidence_path,
         cancel,
         budget_usd,
         cargo_target_dir,
@@ -3644,6 +3831,7 @@ fn run_review_session_with_retry(
         workdir,
         timeout,
         retry_stream_log,
+        retry_evidence_path,
         cancel,
         budget_usd,
         cargo_target_dir,
@@ -3655,6 +3843,102 @@ fn run_review_session_with_retry(
         passed_or_failed => passed_or_failed,
     };
     (combined, vec![result, second_result])
+}
+
+/// SPEC-3.16 item 2: the evidence-file link text appended to a capped
+/// verdict, built with the same `public_url`-aware degradation
+/// [`crate::run_footer::render`] uses for its `Run:` line, so a reader
+/// without `CLAUDE_RUN_PUBLIC_URL` set still learns where to look.
+fn review_evidence_link_text(
+    public_url: Option<&str>,
+    run_id: i64,
+    key: &str,
+    attempt: u32,
+) -> String {
+    match public_url {
+        Some(base) => {
+            let base = base.trim_end_matches('/');
+            format!("{base}/runs/{run_id}/jobs/{key}/attempt/{attempt}/review-evidence")
+        }
+        None => format!(
+            "link unavailable (CLAUDE_RUN_PUBLIC_URL is not set); run {run_id}, attempt {attempt}, evidence file"
+        ),
+    }
+}
+
+/// SPEC-3.16 item 1: cap a verdict marker's bullets at 5 so a posted comment
+/// stays short. `text` is the raw marker content: a `Review: PASS`/`Review:
+/// FAIL` header line, then zero or more `file:line - ...` bullets. The
+/// evidence link (when `Some`) counts as one of the 5 bullets, so at most 4
+/// finding bullets are kept alongside it; when a bullet is dropped, the final
+/// bullet names how many and links the evidence, and the drop is logged at
+/// `warn` with the issue key so an operator can find the full sweep.
+fn cap_verdict_bullets(text: &str, key: &str, evidence_link: Option<&str>) -> String {
+    const MAX_BULLETS: usize = 5;
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let header = lines.next().unwrap_or_default().to_string();
+    let findings: Vec<&str> = lines.collect();
+
+    // One slot is reserved for the evidence-link bullet when there is one,
+    // whether or not the findings themselves overflow the cap.
+    let finding_budget = if evidence_link.is_some() {
+        MAX_BULLETS - 1
+    } else {
+        MAX_BULLETS
+    };
+
+    let bullets: Vec<String> = if findings.len() > finding_budget {
+        let dropped = findings.len() - (finding_budget - 1);
+        warn!(
+            key = %key,
+            dropped = dropped,
+            total = findings.len(),
+            "verdict marker exceeded the 5-bullet cap; truncating and linking the evidence file (SPEC-3.16)"
+        );
+        let mut kept: Vec<String> = findings[..finding_budget - 1]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        let link_suffix = evidence_link
+            .map(|link| format!("; see {link}"))
+            .unwrap_or_default();
+        kept.push(format!("{dropped} more finding(s) dropped{link_suffix}"));
+        kept
+    } else {
+        let mut kept: Vec<String> = findings.iter().map(|l| l.to_string()).collect();
+        if let Some(link) = evidence_link {
+            kept.push(format!("full sweep: {link}"));
+        }
+        kept
+    };
+
+    let mut out = header;
+    for bullet in bullets {
+        out.push('\n');
+        out.push_str(&bullet);
+    }
+    out
+}
+
+/// SPEC-3.16 items 1 and 2: apply [`cap_verdict_bullets`] to a review
+/// outcome's text before it reaches [`finalize`], so the posted comment is
+/// always capped regardless of what the review session wrote. `NoVerdict`
+/// passes through unchanged: it carries the runner's own short diagnostic
+/// message, not a session-written sweep.
+fn cap_verdict_outcome(
+    outcome: ReviewOutcome,
+    key: &str,
+    evidence_link: Option<&str>,
+) -> ReviewOutcome {
+    match outcome {
+        ReviewOutcome::Pass(text) => {
+            ReviewOutcome::Pass(cap_verdict_bullets(&text, key, evidence_link))
+        }
+        ReviewOutcome::Fail(text) => {
+            ReviewOutcome::Fail(cap_verdict_bullets(&text, key, evidence_link))
+        }
+        no_verdict => no_verdict,
+    }
 }
 
 /// Outcome of [`finalize`]: which AI Agent transition was applied. Carried into
@@ -3896,23 +4180,19 @@ fn final_push_failed(
     backend: &dyn IssueTracker,
     src: &YoutrackSource,
     job: &YoutrackJob,
-    claude_result: &ClaudeResult,
     err: &Error,
     public_url: Option<&str>,
     run: crate::run_footer::CommentRun<'_>,
 ) -> Result<Finalized> {
-    let body = [
-        "**The final push failed (SPEC-3.3.1).**".to_string(),
-        String::new(),
-        claude_result.summary.clone(),
-        String::new(),
-        format!("Error: {err}"),
-        String::new(),
-        "The commits are still only in the preserved workdir on the runner host; nothing \
-         reached the forge."
-            .to_string(),
-    ]
-    .join("\n");
+    // SPEC-3.16.3/5: the final-push failure maps directly onto the closed
+    // cause set's `push rejected` member.
+    let cause = crate::run_footer::FailureCause::PushRejected {
+        error: err.to_string(),
+    };
+    let body = crate::run_footer::failure_comment(
+        &cause,
+        "Nothing was pushed; the commits are preserved on the runner host only.",
+    );
     let body = crate::run_footer::append_job(&body, public_url, run, &job.key);
     comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
     Ok(Finalized::Failed {
@@ -4041,15 +4321,7 @@ fn finalize(
                     run,
                 );
             }
-            return final_push_failed(
-                backend,
-                src,
-                job,
-                claude_result,
-                &e,
-                public_url.as_deref(),
-                run,
-            );
+            return final_push_failed(backend, src, job, &e, public_url.as_deref(), run);
         }
         // Blocker: ensure the skip marker is present so this attempt is not
         // counted, surface the reason verbatim, AI Agent=Needs Review, no PR.
@@ -4094,15 +4366,7 @@ fn finalize(
                     run,
                 );
             }
-            return final_push_failed(
-                backend,
-                src,
-                job,
-                claude_result,
-                &e,
-                public_url.as_deref(),
-                run,
-            );
+            return final_push_failed(backend, src, job, &e, public_url.as_deref(), run);
         }
         let summary = std::fs::read_to_string(&no_code)?.trim().to_string();
         let summary = note_checkpoint_rejection(summary);
@@ -4336,6 +4600,46 @@ fn finalize(
                         })
                     }
                 }
+            }
+            Err(Error::ConflictResolutionFailed {
+                branch,
+                local_sha,
+                remote_sha,
+                files,
+                detail,
+            }) => {
+                // SPEC-3.12 item 4: distinct from the generic push/
+                // PR-create failure below. `merge_remote_branch` already
+                // aborted the merge before returning this, so the agent's
+                // local commits are exactly as they were; this is a human
+                // decision (how to land past the divergence), not a hard
+                // failure of the run's own work, so it goes to Needs
+                // Review rather than Failed or a requeue.
+                warn!(
+                    key = %job.key,
+                    branch = %branch,
+                    local_sha = %local_sha,
+                    remote_sha = %remote_sha,
+                    files = %files,
+                    error = %detail,
+                    "bounded conflict-resolution pass failed; parking Needs Review"
+                );
+                let body = conflict_resolution_failed_comment(
+                    claude_result,
+                    &branch,
+                    &local_sha,
+                    &remote_sha,
+                    &files,
+                    &detail,
+                );
+                let body = note_checkpoint_rejection(body);
+                let body =
+                    crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+                if let Err(ce) = backend.comment(&job.key, &body) {
+                    warn!(key = %job.key, error = %ce, "issue comment failed (continuing to AI Agent write)");
+                }
+                backend.set_field(&job.key, &src.custom_field, &src.states.needs_review)?;
+                Ok(Finalized::NeedsReview)
             }
             Err(e) => {
                 // The error reaches the journal here (the run loop only records
@@ -4600,14 +4904,16 @@ fn finalize(
         // into both the comment and `cause` rather than silently leaving the
         // commits unpushed.
         let push_result = final_push(forge, job, workdir);
-        let body = failure_comment(claude_result);
-        let body = match &push_result {
-            Ok(()) => body,
+        let pushed = match &push_result {
+            Ok(()) => {
+                "Any commits were pushed to the branch; no PR was opened for this run.".to_string()
+            }
             Err(e) => format!(
-                "{body}\n\n**The final push failed (SPEC-3.3.1): {e}.** The commits are still \
-                 only in the preserved workdir on the runner host."
+                "The final push also failed (SPEC-3.3.1): {e}; the commits are preserved on \
+                 the runner host only."
             ),
         };
+        let body = failure_comment(claude_result, &pushed);
         let body = note_checkpoint_rejection(body);
         let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
@@ -4979,6 +5285,47 @@ fn report_cap_reached(
     }
 }
 
+/// SPEC-3.12 item 7: comment naming both numbers (best-effort), then the
+/// `Needs-Info` tag (best-effort), then `AI Agent` = Needs Review as the
+/// authoritative write, mirroring [`report_cap_reached`]'s independent-writes
+/// shape: the issue is parked either way, so a write failure here is logged at
+/// `error` rather than aborting the caller, which must still return
+/// `ProcessedJob::EstimateOverTimeout` so the issue is not re-cloned this poll.
+fn report_estimate_over_timeout(
+    backend: &dyn IssueTracker,
+    src: &YoutrackSource,
+    action: &str,
+    key: &str,
+    estimation_minutes: i64,
+    session_timeout: Duration,
+) {
+    let body = estimate_over_timeout_comment(estimation_minutes, session_timeout);
+    if let Err(e) = backend.comment(key, &body) {
+        error!(action = %action, key = %key, error = %e, "estimate-over-timeout comment failed");
+    }
+    let needs_info_tag = src.tags.needs_info.trim();
+    if !needs_info_tag.is_empty() {
+        if let Err(e) = backend.add_tag(key, needs_info_tag) {
+            error!(action = %action, key = %key, tag = %needs_info_tag, error = %e, "estimate-over-timeout Needs-Info tag write failed");
+        }
+    }
+    if let Err(e) = backend.set_field(key, &src.custom_field, &src.states.needs_review) {
+        error!(action = %action, key = %key, error = %e, "estimate-over-timeout AI Agent write failed");
+    }
+}
+
+fn estimate_over_timeout_comment(estimation_minutes: i64, session_timeout: Duration) -> String {
+    let timeout_minutes = session_timeout.as_secs() / 60;
+    [
+        format!(
+            "This issue's Estimation ({estimation_minutes} minutes) exceeds this action's session timeout ({timeout_minutes} minutes), so it was not started."
+        ),
+        String::new(),
+        "Split this issue into pieces that each fit inside the timeout, or raise the action's `limits.claude_timeout_seconds`.".to_string(),
+    ]
+    .join("\n")
+}
+
 fn cap_reached_comment(attempts: u32, cap: u32) -> String {
     [
         format!(
@@ -5206,24 +5553,27 @@ fn post_gate_failure_on_pr(
 
 /// Issue comment for a [`Finalized::ReviewFailed`] outcome: the PR stays a
 /// draft, so the comment says so and names where the findings also landed.
+///
+/// SPEC-3.16.3/5: at most 2 bullets (the cause, then the draft PR to look
+/// at; the run link is the third bullet, appended by the caller's SPEC-3.9
+/// footer), the cause first. `findings` and the agent's summary move to a
+/// collapsed `<details>` block, which is not a bullet and so is not bound by
+/// the cap.
 fn review_findings_comment(
     r: &ClaudeResult,
     pr_url: &str,
     findings: &str,
     no_verdict: bool,
 ) -> String {
-    let headline = if no_verdict {
-        "Claude AI agent run completed, but the post-success review gave no usable verdict. \
-         The PR is left as a draft pending a human decision:"
+    let cause = if no_verdict {
+        "the post-success review gave no usable verdict"
     } else {
-        "Claude AI agent run completed, but the post-success review found problems. \
-         The PR is left as a draft until they are fixed:"
+        "the post-success review found problems"
     };
-    [
-        headline.to_string(),
-        String::new(),
-        format!("Draft PR: {pr_url}"),
-        String::new(),
+    let outcome = format!("The PR is left as a draft pending a human decision: {pr_url}");
+    let mut body =
+        format!("**Claude AI agent run completed; Needs Review.**\n\n- {cause}\n- {outcome}");
+    let detail = [
         "Review findings:".to_string(),
         String::new(),
         findings.to_string(),
@@ -5232,7 +5582,12 @@ fn review_findings_comment(
         String::new(),
         format!("Cost: ${} USD", r.cost),
     ]
-    .join("\n")
+    .join("\n");
+    body.push_str(&collapsed_details(
+        "Review findings and agent summary",
+        &detail,
+    ));
+    body
 }
 
 /// Post `findings` as a comment on PR `pr_number`, through a scratch file
@@ -5254,11 +5609,22 @@ fn post_review_findings_on_pr(
 }
 
 // CLAUDE-466: `pr_step` is `"push"` or `"pr_create"`, the step `finalize`
-// determined actually failed, so the headline never blames PR creation for a
-// push failure. `recorded_pr_url`, when set, is the PR `agent_pull_requests`
-// already has recorded for this issue (a prior resume target, or one a
-// checkpoint push opened mid-run): a `RemoteBranch` failure on a recorded PR
-// means a re-queue resumes that PR's branch rather than opening a fresh one.
+// determined actually failed, so the cause bullet never blames PR creation
+// for a push failure. `recorded_pr_url`, when set, is the PR
+// `agent_pull_requests` already has recorded for this issue (a prior resume
+// target, or one a checkpoint push opened mid-run): a `RemoteBranch` failure
+// on a recorded PR means a re-queue resumes that PR's branch rather than
+// opening a fresh one.
+//
+// SPEC-3.16.3/5: capped at the same 2-bullet shape as
+// `run_footer::failure_comment` (cause, then what was or was not pushed; the
+// run link is the third bullet, appended by the caller's SPEC-3.9 footer).
+// The cause is drawn from the closed `FailureCause` set: a push failure
+// classifies as `PushRejected` (mirrors `final_push_failed`), a PR-create
+// failure as `CommandFailed { command: "pr create" }`. `err`'s text and the
+// agent's summary move to a collapsed `<details>` block, which is not a
+// bullet and so is not bound by the cap; the raw terminal event is dropped
+// entirely rather than appended, since the run link already reaches it.
 fn pr_failure_comment(
     r: &ClaudeResult,
     err: &Error,
@@ -5289,16 +5655,55 @@ fn pr_failure_comment(
         },
         WorkLocation::None => "No local commits were found to preserve.".to_string(),
     };
-    let headline = match pr_step {
-        "push" => "Claude AI agent run completed but pushing the branch FAILED:",
-        _ => "Claude AI agent run completed but opening the PR FAILED:",
+    let cause = if pr_step == "push" {
+        crate::run_footer::FailureCause::PushRejected {
+            error: err.to_string(),
+        }
+    } else {
+        crate::run_footer::FailureCause::CommandFailed {
+            command: "pr create".to_string(),
+        }
     };
-    let mut body = [
-        headline.to_string(),
-        String::new(),
+    let mut body = crate::run_footer::failure_comment(&cause, &location_line);
+    let detail = [
         err.to_string(),
         String::new(),
-        location_line,
+        r.summary.clone(),
+        String::new(),
+        format!("Cost: ${} USD", r.cost),
+    ]
+    .join("\n");
+    body.push_str(&collapsed_details("Run detail and agent summary", &detail));
+    body
+}
+
+/// SPEC-3.12 item 4: the issue comment for a diverged final push whose
+/// bounded conflict-resolution pass failed (or found its cap already
+/// spent), distinct from the generic push/PR-create failure comment: names
+/// the conflicting files and both SHAs, since that is exactly what a human
+/// resolving this by hand needs, and says the merge was aborted so the
+/// agent's local work is unchanged.
+fn conflict_resolution_failed_comment(
+    r: &ClaudeResult,
+    branch: &str,
+    local_sha: &str,
+    remote_sha: &str,
+    files: &str,
+    detail: &str,
+) -> String {
+    let mut body = [
+        format!(
+            "Claude AI agent run completed, but the final push found branch `{branch}` had \
+             diverged from the remote and the runner's bounded conflict-resolution pass \
+             (SPEC-3.12 item 4) could not resolve it. The merge was aborted; nothing was \
+             force-pushed, and the agent's local commits are unchanged."
+        ),
+        String::new(),
+        format!("Local SHA: `{local_sha}`"),
+        format!("Remote SHA: `{remote_sha}`"),
+        format!("Conflicting file(s): {files}"),
+        String::new(),
+        format!("Conflict-resolution pass failure: {detail}"),
         String::new(),
         r.summary.clone(),
         String::new(),
@@ -5352,7 +5757,7 @@ fn push_failure_requeue_comment(
 /// recorded separately, never swallowed into one generic "salvage failed", so
 /// the issue's timeout comment can name exactly which step a human needs to
 /// redo by hand.
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct SalvageReport {
     /// Nothing local beyond the remote default branch and a clean working
     /// tree: no salvage was attempted.
@@ -5604,36 +6009,40 @@ fn timeout_salvage_pr_comment(
     .join("\n")
 }
 
-/// Timeout-specific issue comment. One-line outcome first, a short bullet
-/// list of the salvage result and the follow-up action, then the detail
-/// (the kill-time ambiguity paragraph, the agent's last summary, and the
-/// raw result event) under a collapsed `<details>` block. Points a human
-/// at the branch/PR and the run log (`r.error` carries the log path).
+/// SPEC-3.12 item 3, the "timeout or cancel with commits" row: the
+/// Needs-Review comment for a timed-out run. SPEC-3.16.3/5: capped at 3
+/// bullets (the cause, the salvage outcome, the follow-up action), the cause
+/// first; the run link comes from the SPEC-3.9 footer the caller appends.
+/// Neither the raw stream-log path (`r.error`) nor the raw terminal event
+/// reaches the comment: the kill-time ambiguity paragraph and the agent's
+/// last summary move to a collapsed `<details>` block instead, which is not
+/// a bullet and so is not bound by the cap.
 fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport) -> String {
-    let mut lines = vec![
-        format!(
-            "Claude AI agent run TIMED OUT after {}s (the run hit its time limit and was killed).",
-            timeout.as_secs()
-        ),
-        String::new(),
-    ];
+    let cause = format!(
+        "timed out after {}s (the run hit its time limit and was killed)",
+        timeout.as_secs()
+    );
 
-    if salvage.nothing_to_salvage {
-        lines.push("- No local work to salvage (clean working tree, no commits ahead of the remote default branch).".to_string());
+    // SPEC-3.16.3's bullet contract is "what was or was not pushed" in full:
+    // `salvage_timeout_work` always attempts `create_pr_with_draft` after a
+    // failed WIP commit, so `commit_error` and `pr_url`/`open_error` can both
+    // be set on the same report. Reporting only one silently drops the other
+    // fact, so both pieces are collected into the single bullet when present.
+    let salvage_line = if salvage.nothing_to_salvage {
+        "No local work to salvage (clean working tree, no commits ahead of the remote default branch).".to_string()
     } else {
+        let mut parts = Vec::new();
         if let Some(e) = &salvage.commit_error {
-            lines.push(format!(
-                "- Committing the uncommitted working tree failed: {e}"
+            parts.push(format!(
+                "Committing the uncommitted working tree failed: {e}"
             ));
         }
         match (&salvage.pr_url, &salvage.open_error) {
             (Some(url), _) => {
-                lines.push(format!(
-                    "- Work in progress was salvaged as a draft PR: {url}"
-                ));
+                let mut line = format!("Work in progress was salvaged as a draft PR: {url}");
                 if let Some(e) = &salvage.comment_error {
-                    lines.push(format!(
-                        "- Posting the explanation comment on that PR failed: {e}"
+                    line.push_str(&format!(
+                        " Posting the explanation comment on that PR failed: {e}"
                     ));
                 }
                 if let Some(e) = salvage
@@ -5641,48 +6050,101 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
                     .as_ref()
                     .and_then(|pr| pr.push_comment_failure.as_deref())
                 {
-                    lines.push(format!("- {e}"));
+                    line.push_str(&format!(" {e}"));
+                }
+                parts.push(line);
+            }
+            (None, Some(e)) => parts.push(format!("Salvaging the work as a draft PR failed: {e}")),
+            (None, None) => {
+                if parts.is_empty() {
+                    parts.push("No local work to salvage.".to_string());
                 }
             }
-            (None, Some(e)) => {
-                lines.push(format!("- Salvaging the work as a draft PR failed: {e}"));
-            }
-            (None, None) => {}
         }
-    }
-    lines.push("- A human should inspect the branch/PR and the run log, then resolve the issue manually or re-queue it (set AI Agent = Queued); a re-queue resumes on the salvaged branch.".to_string());
-    lines.push(format!("- {}", timeout_cost_line(r)));
+        parts.join(" ")
+    };
 
-    let mut body = lines.join("\n");
+    let action = format!(
+        "A human should inspect the branch/PR and the run log, then resolve the issue manually \
+         or re-queue it (set AI Agent = Queued); a re-queue resumes on the salvaged branch. {}.",
+        timeout_cost_line(r)
+    );
+
+    let mut body =
+        format!("**Claude AI agent run TIMED OUT.**\n\n- {cause}\n- {salvage_line}\n- {action}");
+
     let detail = [
-        format!("Details: {}", r.error),
-        String::new(),
         "The agent may have completed all, some, or none of the work before being killed. A backgrounded command can hold the process open past the limit even after the functional work is done, so this is not necessarily a failure. The runner did NOT mark this issue Failed.".to_string(),
         String::new(),
-        r.summary.clone(),
+        // SPEC-3.16.3: the collapsed block is still part of the posted comment, so it gets the same redaction.
+        redact_stream_log_path(&r.summary),
     ]
     .join("\n");
     body.push_str(&collapsed_details("Run detail and agent summary", &detail));
-    body.push_str(&raw_event_details(&r.raw));
     body
 }
 
-/// Failure issue comment. One-line outcome first, the agent's last
-/// summary inline, then a two-bullet action list (cost and what a human
-/// should do), and finally the raw terminal event in a collapsed block
-/// when one is present.
-fn failure_comment(r: &ClaudeResult) -> String {
-    let mut body = [
-        format!("Claude AI agent run FAILED ({}).", r.error),
-        String::new(),
-        r.summary.clone(),
-        String::new(),
-        format!("- Cost: ${} USD", r.cost),
-        "- A human should inspect the run log, then either resolve the issue manually or re-queue it (set AI Agent = Queued).".to_string(),
-    ]
-    .join("\n");
-    body.push_str(&raw_event_details(&r.raw));
-    body
+/// SPEC-3.16.3/5: the closed-cause FAILED comment for a crashed, empty
+/// prompt, pre-failed, or operator-cancelled run. `r.error` carries the raw
+/// "claude exited N, see stream.jsonl" text for a real crash, so it is
+/// classified into a [`crate::run_footer::FailureCause`] rather than quoted
+/// directly: the raw stream-log path never reaches the comment, since the
+/// run link (in the SPEC-3.9 footer the caller appends) reaches it instead.
+fn failure_comment(r: &ClaudeResult, pushed: &str) -> String {
+    crate::run_footer::failure_comment(&failure_cause(r), pushed)
+}
+
+/// Maps a crashed/cancelled/pre-failed [`ClaudeResult`] onto the closed
+/// [`crate::run_footer::FailureCause`] set. `r.error` carries sentinel
+/// strings for the two non-agent cases the caller synthesizes; anything else
+/// is a genuine agent-side failure, reported from the one-line summary
+/// rather than the raw `r.error` text.
+fn failure_cause(r: &ClaudeResult) -> crate::run_footer::FailureCause {
+    use crate::run_footer::FailureCause;
+    if r.error == "run cancelled by operator" {
+        FailureCause::Cancelled
+    } else if r.error == "pre step failed" {
+        FailureCause::CommandFailed {
+            command: "pre".to_string(),
+        }
+    } else {
+        FailureCause::AgentError {
+            message: redact_stream_log_path(r.summary.lines().next().unwrap_or(&r.error))
+                .trim()
+                .to_string(),
+        }
+    }
+}
+
+/// SPEC-3.16.3: strips the raw stream-log path that
+/// `claude::no_final_message_summary` / `claude::unreadable_log_summary`
+/// embed in an otherwise single-line `ClaudeResult.summary`, so it never
+/// reaches a FAILED comment via [`failure_cause`] or the webhook-comment
+/// `ClaudeFailed` path in `comment_webhooks.rs`. Any other summary (a
+/// `result` event's text, or the last assistant message) passes through
+/// unchanged, since neither names the stream log.
+pub(crate) fn redact_stream_log_path(message: &str) -> String {
+    const NO_FINAL_MARKER: &str = " See ";
+    const NO_FINAL_SUFFIX: &str = "for the full stream log.";
+    if let Some(start) = message.find(NO_FINAL_MARKER) {
+        if message[start..].ends_with(NO_FINAL_SUFFIX) {
+            return format!("{}.", message[..start].trim_end_matches('.'));
+        }
+    }
+
+    const UNREADABLE_MARKER: &str = "could not read this run's stream log (";
+    if let Some(start) = message.find(UNREADABLE_MARKER) {
+        if let Some(close) = message[start..].find(')') {
+            let close_idx = start + close;
+            return format!(
+                "{}could not read this run's stream log{}",
+                &message[..start],
+                &message[close_idx + 1..]
+            );
+        }
+    }
+
+    message.to_string()
 }
 
 /// Delivery-blocked issue comment (CLAUDE-545). One-line outcome naming
@@ -6480,6 +6942,118 @@ mod tests {
         );
     }
 
+    /// SPEC-3.12 item 7 test harness: a pickup whose tracker reports
+    /// `estimation_minutes` for `Estimation`, under a `claude_timeout` session
+    /// limit. The cancel token is always set, so a pickup that is NOT parked
+    /// over the estimate instead stops at the next checkpoint (`Filtered`),
+    /// before any clone, the same way `run_gated_process_job` does for the CI
+    /// cap.
+    async fn run_estimation_gated_process_job(
+        pool: &DbPool,
+        estimation_minutes: Option<i64>,
+        claude_timeout: Duration,
+    ) -> (ProcessedJob, FakeTracker) {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = ClaudeInvoker::new(Some("/nonexistent/claude-stub-should-never-run.sh"));
+        let tracker = FakeTracker {
+            estimation_minutes: Mutex::new(estimation_minutes),
+            ..FakeTracker::new("Queued")
+        };
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let mut s = src();
+        s.dependencies.enabled = false;
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout,
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+            review_timeout: Duration::from_secs(1800),
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+        let pause = crate::pause::PauseGate::new(pool.clone()).for_action_run("yt");
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            pool,
+            &claude,
+            &tracker,
+            &forge,
+            &s,
+            &limits,
+            &cancel,
+            &pause,
+            &spend,
+            &job(),
+            PrStrategy::Branch,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+        (outcome, tracker)
+    }
+
+    /// SPEC-3.12 item 7: an issue whose `Estimation` exceeds the action's
+    /// session timeout is parked `Needs Review` with `Needs-Info`, a comment
+    /// naming both numbers, and no attempt consumed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_job_parks_needs_review_when_estimate_exceeds_timeout() {
+        let pool = mem_pool().await;
+        let (outcome, tracker) =
+            run_estimation_gated_process_job(&pool, Some(60), Duration::from_secs(1800)).await;
+        assert!(
+            matches!(&outcome, ProcessedJob::EstimateOverTimeout { key } if key == "MK-16"),
+            "got {outcome:?}"
+        );
+        assert_eq!(tracker.field(), "Needs Review");
+        let comments = tracker.comments.lock().unwrap().clone();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].contains("60 minutes"), "{comments:?}");
+        assert!(comments[0].contains("30 minutes"), "{comments:?}");
+        assert_eq!(tracker.tags.lock().unwrap().as_slice(), ["Needs-Info"]);
+        assert_eq!(
+            state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
+            0,
+            "no attempt is spent when the estimate parks the issue"
+        );
+    }
+
+    /// SPEC-3.12 item 7: an issue with no `Estimation`, and one at or below
+    /// the timeout, is picked up as before (here: proceeding past this gate to
+    /// the cancel checkpoint, never parked over the estimate).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_job_proceeds_with_no_estimation_or_at_the_timeout() {
+        let pool = mem_pool().await;
+
+        let (no_estimate, _) =
+            run_estimation_gated_process_job(&pool, None, Duration::from_secs(1800)).await;
+        assert!(
+            matches!(no_estimate, ProcessedJob::Filtered { .. }),
+            "got {no_estimate:?}"
+        );
+
+        let (at_timeout, _) =
+            run_estimation_gated_process_job(&pool, Some(30), Duration::from_secs(1800)).await;
+        assert!(
+            matches!(at_timeout, ProcessedJob::Filtered { .. }),
+            "got {at_timeout:?}"
+        );
+    }
+
     /// The Claude login needing renewal mid-run trips the readiness gate
     /// AFTER `run_pre` has already written AI Agent=Working and cloned, but
     /// BEFORE claude is invoked: the issue is reverted to Queued with a
@@ -7120,6 +7694,10 @@ mod tests {
         /// written, so a test can trip state deterministically from inside
         /// `run_pre` instead of racing a background sleep against it.
         on_set_field: Mutex<Option<Box<dyn FnMut() + Send>>>,
+        /// Canned `Estimation` reading, in minutes; `None` means the field is
+        /// unset, backing [`IssueTracker::get_estimation_minutes`].
+        estimation_minutes: Mutex<Option<i64>>,
+        tags: Mutex<Vec<String>>,
     }
 
     impl FakeTracker {
@@ -7210,6 +7788,15 @@ mod tests {
         fn attach_file(&self, _key: &str, _file: &Path) -> Result<()> {
             Ok(())
         }
+
+        fn add_tag(&self, _key: &str, tag: &str) -> Result<()> {
+            self.tags.lock().unwrap().push(tag.to_string());
+            Ok(())
+        }
+
+        fn get_estimation_minutes(&self, _key: &str) -> Result<Option<i64>> {
+            Ok(*self.estimation_minutes.lock().unwrap())
+        }
     }
 
     /// Still on Working (as a transient claude result or a mid-run pause/login
@@ -7288,11 +7875,11 @@ mod tests {
         assert_eq!(tracker.field(), "Working");
     }
 
-    /// A failure with a populated `raw` event leads with the friendly
-    /// summary, preserves the first-line error and Cost line, and appends the
-    /// pretty-printed event in a collapsed `<details>` block.
+    /// SPEC-3.16.3/5: a crash classifies as `agent error`, reported from the
+    /// friendly one-line summary; the raw `r.error` stream-log text never
+    /// surfaces in the comment.
     #[test]
-    fn failure_comment_friendly_summary_and_collapsed_raw() {
+    fn failure_comment_classifies_agent_error_from_summary() {
         let r = ClaudeResult {
             ok: false,
             summary: "API Error: 529 Overloaded.".into(),
@@ -7306,14 +7893,17 @@ mod tests {
             killed: false,
             exit_code: Some(1),
         };
-        let body = failure_comment(&r);
-        assert!(body.starts_with("Claude AI agent run FAILED (claude exited 1, see stream.jsonl)."));
-        assert!(body.contains("API Error: 529 Overloaded."));
-        assert!(body.contains("- Cost: $0.01 USD"));
-        assert!(body.contains("- A human should inspect the run log"));
-        assert!(body.contains("<details>\n<summary>Raw result event</summary>"));
-        assert!(body.contains("```json"));
-        assert!(body.contains("\"api_error_status\": \"529\""));
+        let body = failure_comment(&r, "Nothing was pushed.");
+        assert!(
+            body.starts_with("**Claude AI agent run FAILED.**"),
+            "{body}"
+        );
+        assert!(
+            body.contains("- agent error: API Error: 529 Overloaded."),
+            "{body}"
+        );
+        assert!(!body.contains("claude exited 1"), "{body}");
+        assert!(!body.contains(".jsonl"), "{body}");
     }
 
     /// A killed run has no terminal `result` event, so `r.cost` defaults to
@@ -7358,14 +7948,16 @@ mod tests {
         assert!(!body.contains("unknown"), "{body}");
     }
 
-    /// A synthesized failure (empty `raw`) omits the `<details>` block.
+    /// SPEC-3.16.3: the pre-step sentinel `r.error` classifies as
+    /// `` `pre` failed ``, never quoted verbatim or paired with a raw details
+    /// block.
     #[test]
-    fn failure_comment_omits_details_for_synthesized_raw() {
-        let r = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "pre step failed");
-        let body = failure_comment(&r);
-        assert!(body.contains("pre step failed"));
-        assert!(body.contains("Cost: $0 USD"));
-        assert!(!body.contains("<details>"));
+    fn failure_comment_classifies_pre_step_failure() {
+        let r =
+            ClaudeResult::synthesized("pre step failed", "pre step: cargo fmt --check exited 1");
+        let body = failure_comment(&r, "Nothing was pushed.");
+        assert!(body.contains("- `pre` failed"), "{body}");
+        assert!(!body.contains("<details>"), "{body}");
     }
 
     /// CLAUDE-372: a killed run's stream tail holds a `thinking` block with a
@@ -7384,7 +7976,7 @@ mod tests {
         let mut r = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
         r.summary = summary;
 
-        let failure_body = failure_comment(&r);
+        let failure_body = failure_comment(&r, "Nothing was pushed.");
         assert!(!failure_body.contains("signature"), "{failure_body}");
         assert!(!failure_body.contains("secret reasoning"), "{failure_body}");
 
@@ -7395,6 +7987,46 @@ mod tests {
         let timeout_body = timeout_comment(&r, Duration::from_secs(60), &salvage);
         assert!(!timeout_body.contains("signature"), "{timeout_body}");
         assert!(!timeout_body.contains("secret reasoning"), "{timeout_body}");
+    }
+
+    /// SPEC-3.16.3: `failure_cause`'s `AgentError` mapping must never let the
+    /// raw stream-log path embedded in `claude::no_final_message_summary` /
+    /// `claude::unreadable_log_summary` reach the FAILED comment, since those
+    /// summaries have no newline and `r.summary.lines().next()` would
+    /// otherwise return the whole path-bearing sentence verbatim.
+    #[test]
+    fn failure_comment_never_carries_the_stream_log_path_from_a_crash_summary() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // No final `result` event and no assistant text: `friendly_failure_summary`
+        // falls through to `no_final_message_summary`, which embeds the path.
+        let empty_log = dir.path().join("empty.jsonl");
+        std::fs::write(&empty_log, "").unwrap();
+        let summary = crate::claude::friendly_failure_summary(&serde_json::Value::Null, &empty_log);
+        assert!(summary.contains(".jsonl"), "precondition: {summary}");
+        let mut r = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
+        r.summary = summary;
+        let body = failure_comment(&r, "Nothing was pushed.");
+        assert!(
+            !body.contains(".jsonl") && !body.contains("empty.jsonl"),
+            "{body}"
+        );
+        assert!(body.contains("agent error"), "{body}");
+
+        // The stream log cannot be read at all: `unreadable_log_summary` also
+        // embeds the path.
+        let missing_log = dir.path().join("missing.jsonl");
+        let summary =
+            crate::claude::friendly_failure_summary(&serde_json::Value::Null, &missing_log);
+        assert!(summary.contains(".jsonl"), "precondition: {summary}");
+        let mut r = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
+        r.summary = summary;
+        let body = failure_comment(&r, "Nothing was pushed.");
+        assert!(
+            !body.contains(".jsonl") && !body.contains("missing.jsonl"),
+            "{body}"
+        );
+        assert!(body.contains("agent error"), "{body}");
     }
 
     /// CLAUDE-447: a failed `timeout salvage push` comment post never fails
@@ -7428,10 +8060,10 @@ mod tests {
         );
     }
 
-    /// CLAUDE-546: the timeout comment leads with a one-line outcome that
-    /// names the timeout, lists the salvage and follow-up as bullets, and
-    /// moves the kill-time ambiguity paragraph and agent summary under a
-    /// collapsed `<details>` block so a reviewer sees the outcome first.
+    /// CLAUDE-546: the timeout comment leads with a one-line outcome, lists
+    /// the cause, salvage and follow-up as bullets, and moves the kill-time
+    /// ambiguity paragraph and agent summary under a collapsed `<details>`
+    /// block so a reviewer sees the outcome first.
     #[test]
     fn timeout_comment_leads_with_outcome_and_collapses_detail() {
         let mut r = ClaudeResult::synthesized("claude exited 124, see stream.jsonl", "");
@@ -7442,9 +8074,10 @@ mod tests {
         };
         let body = timeout_comment(&r, Duration::from_secs(120), &salvage);
         assert!(
-            body.starts_with("Claude AI agent run TIMED OUT after 120s"),
+            body.starts_with("**Claude AI agent run TIMED OUT.**"),
             "{body}"
         );
+        assert!(body.contains("- timed out after 120s"), "{body}");
         assert!(body.contains("- No local work to salvage"), "{body}");
         assert!(body.contains("- A human should inspect"), "{body}");
         assert!(
@@ -7473,9 +8106,99 @@ mod tests {
         );
     }
 
+    /// SPEC-3.16.3: a killed run with no final message carries the raw stream-log
+    /// path in `summary`; the collapsed detail block must not repeat it.
+    #[test]
+    fn timeout_comment_detail_redacts_the_stream_log_path() {
+        let mut r = ClaudeResult::synthesized("claude exited 124", "");
+        r.summary = "The run produced no final message: no terminal result event and no assistant text were found in the stream log. 0 assistant turns were recorded. See /state/logs/act/streams/K-attempt-1.jsonl for the full stream log.".into();
+        let salvage = SalvageReport {
+            nothing_to_salvage: true,
+            ..Default::default()
+        };
+        let body = timeout_comment(&r, Duration::from_secs(60), &salvage);
+        assert!(!body.contains(".jsonl"), "{body}");
+        assert!(body.contains("The run produced no final message"), "{body}");
+    }
+
+    /// SPEC-3.16.3/5: the timeout Needs-Review comment is at most 3 bullets,
+    /// the cause first, and never carries the raw stream-log path or the raw
+    /// terminal result event, across every salvage outcome.
+    #[test]
+    fn timeout_comment_per_salvage_outcome_is_capped_and_leads_with_the_cause() {
+        let r = ClaudeResult::synthesized("claude exited 124, see stream.jsonl", "summary");
+        let cases: &[SalvageReport] = &[
+            SalvageReport {
+                nothing_to_salvage: true,
+                ..Default::default()
+            },
+            SalvageReport {
+                commit_error: Some("working tree commit failed".to_string()),
+                ..Default::default()
+            },
+            SalvageReport {
+                pr_url: Some("https://dev.a8n.run/contoso/claude-run/pulls/9".to_string()),
+                pr: Some(PullRequest {
+                    number: Some(9),
+                    url: "https://dev.a8n.run/contoso/claude-run/pulls/9".into(),
+                    head_branch: Some("feat/x".into()),
+                    push_comment_failure: None,
+                }),
+                ..Default::default()
+            },
+            SalvageReport {
+                open_error: Some("opening the draft PR failed".to_string()),
+                ..Default::default()
+            },
+            SalvageReport {
+                commit_error: Some("working tree commit failed".to_string()),
+                pr_url: Some("https://dev.a8n.run/contoso/claude-run/pulls/9".to_string()),
+                pr: Some(PullRequest {
+                    number: Some(9),
+                    url: "https://dev.a8n.run/contoso/claude-run/pulls/9".into(),
+                    head_branch: Some("feat/x".into()),
+                    push_comment_failure: None,
+                }),
+                ..Default::default()
+            },
+        ];
+        for salvage in cases {
+            let body = timeout_comment(&r, Duration::from_secs(1800), salvage);
+            let bullets: Vec<&str> = body.lines().filter(|l| l.starts_with("- ")).collect();
+            assert!(
+                bullets.len() <= 3,
+                "{salvage:?}: at most 3 bullets:\n{body}"
+            );
+            if salvage.commit_error.is_some() && salvage.pr_url.is_some() {
+                assert!(
+                    body.contains("Committing the uncommitted working tree failed")
+                        && body.contains("salvaged as a draft PR"),
+                    "{salvage:?}: a commit failure followed by a draft PR must report BOTH facts, not just the first:\n{body}"
+                );
+            }
+            assert_eq!(
+                bullets.first().copied(),
+                Some("- timed out after 1800s (the run hit its time limit and was killed)"),
+                "{salvage:?}: the cause must be the first bullet:\n{body}"
+            );
+            assert!(
+                !body.contains(".jsonl") && !body.contains("/streams/"),
+                "{salvage:?}: no raw stream-log path:\n{body}"
+            );
+            assert!(
+                !body.contains("claude exited 124"),
+                "{salvage:?}: the raw `r.error` text must not appear:\n{body}"
+            );
+            assert!(
+                body.starts_with("**Claude AI agent run TIMED OUT.**"),
+                "{body}"
+            );
+        }
+    }
+
     /// CLAUDE-546: the failure comment leads with a one-line outcome and
-    /// renders the cost and follow-up action as bullets rather than loose
-    /// trailing lines.
+    /// SPEC-3.16.3: the pre-step failure body is capped at 2 bullets here
+    /// (cause, pushed), leading with the cause.
     #[test]
     fn failure_comment_leads_with_outcome_and_renders_bullets() {
         let r = ClaudeResult {
@@ -7491,13 +8214,17 @@ mod tests {
             killed: false,
             exit_code: Some(1),
         };
-        let body = failure_comment(&r);
+        let body = failure_comment(&r, "Nothing was pushed.");
         assert!(
-            body.starts_with("Claude AI agent run FAILED (pre step failed)."),
+            body.starts_with("**Claude AI agent run FAILED.**"),
             "{body}"
         );
-        assert!(body.contains("- Cost: $0 USD"), "{body}");
-        assert!(body.contains("- A human should inspect"), "{body}");
+        let bullets: Vec<&str> = body.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(
+            bullets,
+            vec!["- `pre` failed", "- Nothing was pushed."],
+            "{body}"
+        );
     }
 
     /// CLAUDE-545: the delivery-blocked comment leads with the reason's
@@ -9940,6 +10667,174 @@ mod tests {
         );
     }
 
+    /// A [`ConflictResolver`] that always refuses, so `finalize` falls
+    /// through to the abort path exactly as it would with no resolver
+    /// configured, but with `Error::ConflictResolutionFailed` naming the
+    /// pass's own failure instead of the generic divergence message.
+    struct AlwaysFailsResolver;
+
+    impl ConflictResolver for AlwaysFailsResolver {
+        fn resolve(
+            &self,
+            _workdir: &Path,
+            _branch: &str,
+            _local_sha: &str,
+            _remote_sha: &str,
+        ) -> Result<()> {
+            Err(Error::Other(anyhow::anyhow!(
+                "stub: the pass could not resolve this safely"
+            )))
+        }
+    }
+
+    /// SPEC-3.12 item 4, acceptance criterion 2: the final push finds the
+    /// remote branch diverged, the local merge conflicts, and the bounded
+    /// conflict-resolution pass fails. `finalize` must abort the merge
+    /// (preserving the agent's local commits), park the issue at Needs
+    /// Review rather than Failed or a requeue, and name the conflicting
+    /// file and both SHAs in the posted comment.
+    #[test]
+    fn finalize_conflict_resolution_pass_failure_parks_needs_review_naming_files_and_shas() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "localsha\n")
+                .ok(
+                    "git",
+                    &["ls-remote", "--heads", "origin", "feat/x"],
+                    "remotesha\trefs/heads/feat/x\n",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &[
+                        "fetch",
+                        "origin",
+                        "refs/heads/feat/x:refs/remotes/origin/feat/x",
+                    ],
+                    "",
+                )
+                .fail(
+                    "git",
+                    &["merge-base", "--is-ancestor", "remotesha", "localsha"],
+                    1,
+                    "",
+                )
+                .fail(
+                    "git",
+                    &["merge", "--no-edit", "origin/feat/x"],
+                    1,
+                    "CONFLICT (content): Merge conflict in src/lib.rs",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+                    "",
+                )
+                .ok(
+                    "git",
+                    &["diff", "--name-only", "--diff-filter=U"],
+                    "src/lib.rs\n",
+                )
+                .ok("git", &["merge", "--abort"], "")
+                .ok_prefix("yt issue comment MK-16", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone())
+            .with_git_retry_waits([Duration::ZERO; 3])
+            .with_conflict_resolver(Arc::new(AlwaysFailsResolver));
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::NeedsReview);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c == "git merge --abort"),
+            "a failed pass must still abort the merge: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "a diverged conflict must never push: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("--force")),
+            "no force anywhere: {calls:?}"
+        );
+        let comment_call = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .unwrap_or_else(|| panic!("no issue comment call found: {calls:?}"));
+        assert!(
+            comment_call.contains("src/lib.rs"),
+            "names the conflicting file: {comment_call}"
+        );
+        assert!(
+            comment_call.contains("localsha"),
+            "names the local SHA: {comment_call}"
+        );
+        assert!(
+            comment_call.contains("remotesha"),
+            "names the remote SHA: {comment_call}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+    }
+
     /// CLAUDE-447: a failed push-comment post never fails the PR create or
     /// the Code Review outcome it reports on, but the YouTrack success
     /// comment names it.
@@ -10506,13 +11401,14 @@ mod tests {
             None,
         );
 
+        let lead = body.split("\n\n<details>").next().unwrap_or(&body);
         assert!(
-            body.contains("pushing the branch FAILED"),
-            "a push failure must name pushing, not PR creation: {body}"
+            lead.starts_with("**Claude AI agent run FAILED.**\n\n- push rejected:"),
+            "a push failure must lead with the closed set's push-rejected cause: {body}"
         );
         assert!(
-            !body.contains("PR creation"),
-            "a push failure must never say \"PR creation\": {body}"
+            !lead.contains("`pr create` failed"),
+            "a push failure must never classify as a pr-create command failure: {body}"
         );
     }
 
@@ -10530,9 +11426,87 @@ mod tests {
         );
 
         assert!(
-            body.contains("opening the PR FAILED"),
-            "a pr_create failure must name opening the PR: {body}"
+            body.contains("`pr create` failed"),
+            "a pr_create failure must classify as the closed set's command-failed cause: {body}"
         );
+        assert!(
+            !body.contains("push rejected"),
+            "a pr_create failure must never name a push rejection: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_failure_comment_is_capped_at_three_bullets_and_leads_with_the_cause() {
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+
+        for pr_step in ["push", "pr_create"] {
+            let body = pr_failure_comment(
+                &ok_result(),
+                &pr_error(),
+                &work_location(&clone, None),
+                pr_step,
+                None,
+            );
+            let lead = body
+                .split("\n\n<details>")
+                .next()
+                .unwrap_or(&body)
+                .to_string();
+            let bullets: Vec<&str> = lead.lines().filter(|l| l.starts_with("- ")).collect();
+            assert!(
+                bullets.len() <= 3,
+                "{pr_step}: at most 3 bullets outside <details>, got {bullets:?}: {body}"
+            );
+            assert!(
+                bullets[0].starts_with("- push rejected")
+                    || bullets[0].starts_with("- `pr create` failed"),
+                "{pr_step}: the cause must lead: {bullets:?}"
+            );
+            assert!(
+                !lead.contains("claude exited") && !lead.contains(".jsonl"),
+                "{pr_step}: the raw stream-log path must never reach the comment body outside <details>: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_findings_comment_is_capped_at_three_bullets_and_leads_with_the_cause() {
+        for no_verdict in [false, true] {
+            let body = review_findings_comment(
+                &ok_result(),
+                "https://dev.a8n.run/contoso/claude-run/pulls/42",
+                "- some finding\n- another finding",
+                no_verdict,
+            );
+            let lead = body
+                .split("\n\n<details>")
+                .next()
+                .unwrap_or(&body)
+                .to_string();
+            let bullets: Vec<&str> = lead.lines().filter(|l| l.starts_with("- ")).collect();
+            assert!(
+                bullets.len() <= 3,
+                "no_verdict={no_verdict}: at most 3 bullets outside <details>, got {bullets:?}: {body}"
+            );
+            let expected_cause = if no_verdict {
+                "- the post-success review gave no usable verdict"
+            } else {
+                "- the post-success review found problems"
+            };
+            assert_eq!(
+                bullets[0], expected_cause,
+                "no_verdict={no_verdict}: the cause must lead: {bullets:?}"
+            );
+            assert!(
+                lead.contains("https://dev.a8n.run/contoso/claude-run/pulls/42"),
+                "the draft PR must still be named outside <details>: {body}"
+            );
+            assert!(
+                body.contains("some finding"),
+                "the findings must still be reachable, in the collapsed detail: {body}"
+            );
+        }
     }
 
     #[test]
@@ -15710,6 +16684,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15742,6 +16717,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15771,6 +16747,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15801,6 +16778,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15829,6 +16807,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(1),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15863,6 +16842,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15893,6 +16873,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15931,6 +16912,8 @@ mod tests {
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
             &scratch.path().join("stream-retry.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &scratch.path().join("evidence-retry.md"),
             &cancel,
             None,
             None,
@@ -15977,6 +16960,8 @@ mod tests {
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
             &scratch.path().join("stream-retry.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &scratch.path().join("evidence-retry.md"),
             &cancel,
             None,
             None,
@@ -16016,6 +17001,8 @@ mod tests {
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
             &scratch.path().join("stream-retry.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &scratch.path().join("evidence-retry.md"),
             &cancel,
             None,
             None,
@@ -16064,6 +17051,8 @@ mod tests {
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
             &scratch.path().join("stream-retry.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &scratch.path().join("evidence-retry.md"),
             &cancel,
             None,
             None,
@@ -16104,6 +17093,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &stream_log,
+            &scratch.path().join("evidence.md"),
             &cancel,
             Some(2.5),
             None,
@@ -16132,7 +17122,9 @@ mod tests {
     #[test]
     fn build_review_prompt_resolves_placeholders_and_keeps_markers_and_read_only_constraint() {
         let dir = tempfile::tempdir().unwrap();
-        let prompt = build_review_prompt(&job(), dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let evidence_path = scratch.path().join("evidence.md");
+        let prompt = build_review_prompt(&job(), dir.path(), &evidence_path);
         assert!(
             !prompt.contains("{{") && !prompt.contains("}}"),
             "every placeholder must resolve, got:\n{prompt}"
@@ -16142,6 +17134,106 @@ mod tests {
         assert!(prompt.contains(REVIEW_PASS_MARKER));
         assert!(prompt.contains(REVIEW_FAIL_MARKER));
         assert!(prompt.contains("no Edit, no Write"));
+    }
+
+    /// SPEC-3.16 item 2: the prompt tells the session to write its full
+    /// sweep to the evidence file and keep the marker itself to bullets.
+    #[test]
+    fn build_review_prompt_names_the_evidence_file_and_caps_the_marker_to_bullets() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let evidence_path = scratch.path().join("evidence.md");
+        let prompt = build_review_prompt(&job(), dir.path(), &evidence_path);
+        assert!(
+            prompt.contains(&evidence_path.display().to_string()),
+            "the prompt must name the evidence file path, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Review: PASS") && prompt.contains("Review: FAIL"),
+            "the marker format must be a short PASS/FAIL header, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("No headings, no tables"),
+            "the marker must be told to stay to bullets, not a restated sweep, got:\n{prompt}"
+        );
+    }
+
+    /// SPEC-3.16 item 1: a marker with more findings than the cap allows is
+    /// truncated to 5 total bullets, the final bullet names the dropped
+    /// count and links the evidence file, and the drop is logged at `warn`
+    /// with the issue key.
+    #[test]
+    fn cap_verdict_bullets_truncates_over_cap_marker_and_warns() {
+        let text = "Review: FAIL\n\
+            a.rs:1 - finding one\n\
+            a.rs:2 - finding two\n\
+            a.rs:3 - finding three\n\
+            a.rs:4 - finding four\n\
+            a.rs:5 - finding five\n\
+            a.rs:6 - finding six";
+        let link = "https://example.test/runs/1/jobs/mk-16/attempt/1/review-evidence";
+        let logs = capture_logs(|| {
+            let capped = cap_verdict_bullets(text, "MK-16", Some(link));
+            let lines: Vec<&str> = capped.lines().collect();
+            assert_eq!(lines[0], "Review: FAIL");
+            assert_eq!(
+                lines.len(),
+                5,
+                "capped marker must have at most 5 bullets total, got:\n{capped}"
+            );
+            assert!(
+                lines.last().unwrap().contains("3 more finding(s) dropped"),
+                "final bullet must name the dropped count, got:\n{capped}"
+            );
+            assert!(
+                lines.last().unwrap().contains(link),
+                "final bullet must link the evidence file, got:\n{capped}"
+            );
+        });
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("MK-16"), "{logs}");
+    }
+
+    /// SPEC-3.16 items 1 and 2: `cap_verdict_outcome` applies the cap to
+    /// both `Pass` and `Fail` text, leaves `NoVerdict` untouched, and the
+    /// non-overflow case appends a single evidence-link bullet rather than
+    /// truncating anything.
+    #[test]
+    fn cap_verdict_outcome_caps_pass_and_fail_and_passes_through_no_verdict() {
+        let link = "https://example.test/runs/1/jobs/mk-16/attempt/1/review-evidence";
+
+        let capped = cap_verdict_outcome(
+            ReviewOutcome::Pass("Review: PASS\na.rs:1 - ok".to_string()),
+            "MK-16",
+            Some(link),
+        );
+        match capped {
+            ReviewOutcome::Pass(text) => {
+                assert!(text.contains("Review: PASS"));
+                assert!(text.contains(&format!("full sweep: {link}")));
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+
+        let capped = cap_verdict_outcome(
+            ReviewOutcome::Fail("Review: FAIL\na.rs:1 - bad".to_string()),
+            "MK-16",
+            Some(link),
+        );
+        match capped {
+            ReviewOutcome::Fail(text) => {
+                assert!(text.contains("Review: FAIL"));
+                assert!(text.contains(&format!("full sweep: {link}")));
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+
+        let no_verdict = cap_verdict_outcome(
+            ReviewOutcome::NoVerdict("no marker written".to_string()),
+            "MK-16",
+            Some(link),
+        );
+        assert!(matches!(no_verdict, ReviewOutcome::NoVerdict(ref t) if t == "no marker written"));
     }
 
     /// CLAUDE-471 criterion: a fail marker written alongside all-satisfied
@@ -16169,6 +17261,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
