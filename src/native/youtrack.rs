@@ -922,6 +922,34 @@ pub async fn reconcile_stuck_working(
                 continue;
             }
 
+            // A run adds its in-flight row BEFORE it sets Working and drops it
+            // AFTER it moves the field off Working. Checking the row, then the
+            // live field, then the row again therefore closes both windows: a
+            // run that finalized after the list read has already left Working,
+            // and a run that started after it has already re-added its row.
+            match backend.get_field(key, &src.custom_field) {
+                Ok(v) if v.trim() == src.states.working => {}
+                Ok(v) => {
+                    info!(action = %action_name, key = %key, current = %v, "stuck-working sweep: already advanced off Working; left alone");
+                    continue;
+                }
+                Err(e) => {
+                    error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: re-reading the AI Agent field failed; key left on Working until the next tick");
+                    continue;
+                }
+            }
+            match state::action_inflight_keys(pool, action_name).await {
+                Ok(keys) if keys.iter().any(|k| k == key) => {
+                    info!(action = %action_name, key = %key, "stuck-working sweep: a run picked the issue up during the sweep; left alone");
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: re-reading in-flight keys failed; key left on Working until the next tick");
+                    continue;
+                }
+            }
+
             let attempts = match state::attempts_get(pool, action_name, key).await {
                 Ok(a) => a,
                 Err(e) => {
@@ -935,9 +963,15 @@ pub async fn reconcile_stuck_working(
                 &src.states.needs_review
             };
 
-            let last_step = state::last_job_outcome_summary(pool, key)
-                .await
-                .unwrap_or(None);
+            // The correction must still post when the lookup fails, so the
+            // comment says the step is unreadable instead of "no recorded step".
+            let last_step = match state::last_job_outcome_summary(pool, key).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: reading the last recorded step failed; correcting without it");
+                    Some("unreadable (the lookup failed; see the daemon log)".to_string())
+                }
+            };
             let comment = stuck_working_comment(last_step.as_deref());
             let comment = crate::run_footer::append_run(
                 &comment,
@@ -15349,6 +15383,11 @@ mod tests {
                     &["list", "--query=AI Agent: Working", "--json"],
                     r#"[{"idReadable":"MK-20"}]"#,
                 )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-20", "AI Agent"],
+                    "Working\n",
+                )
                 .ok_prefix("yt issue comment MK-20", "")
                 .ok(
                     "yt",
@@ -15375,6 +15414,56 @@ mod tests {
             1,
             "exactly one correction comment; {calls:?}"
         );
+        let events = state::run_events_for_action(&pool, "yt-action", 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            events[0].context.as_deref(),
+            Some(STUCK_WORKING_SWEEP_CONTEXT),
+            "{events:?}"
+        );
+        assert_eq!(events[0].level, "warn", "{events:?}");
+        assert!(events[0].message.starts_with("MK-20:"), "{events:?}");
+    }
+
+    /// An issue the list read saw on `Working` but whose live field has since
+    /// moved on (a run finalized mid-sweep) is left alone: no write, no
+    /// `run_events` row.
+    #[tokio::test]
+    async fn reconcile_stuck_working_leaves_an_already_advanced_issue_alone() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-23"}]"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-23", "AI Agent"],
+                    "Code Review\n",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+        let events = state::run_events_for_action(&pool, "yt-action", 10)
+            .await
+            .unwrap();
+        assert!(events.is_empty(), "{events:?}");
     }
 
     /// An issue at its action's `max_attempts_per_key` is parked at `Needs
@@ -15402,6 +15491,11 @@ mod tests {
                     "yt",
                     &["list", "--query=AI Agent: Working", "--json"],
                     r#"[{"idReadable":"MK-22"}]"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-22", "AI Agent"],
+                    "Working\n",
                 )
                 .ok_prefix("yt issue comment MK-22", "")
                 .ok(

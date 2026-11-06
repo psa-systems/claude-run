@@ -88,6 +88,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - Switching backends carries the data over with `claude-run import` ([CLAUDE-251](docs/conventions/state.md#backend-import-claude-251))
 - `config.toml` holds only bootstrap keys; runtime settings are DB-backed and edited in the UI ([CLAUDE-101](docs/conventions/state.md#bootstrap-vs-runtime-config-claude-101))
 - Global pause is one DB flag honored at EVERY entry point ([CLAUDE-223](docs/conventions/state.md#global-pause-claude-223))
+- A periodic sweep corrects any `Working` issue with no live run ([CLAUDE-577](docs/conventions/state.md#stuck-working-sweep-claude-577))
 
 ### CI failures and webhooks
 
@@ -133,7 +134,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 
 ## Phases
 
-The Rust port is complete: all six phases below are merged. This table is the historical record of that rollout, kept because code comments across the tree still cite these phase numbers.
+The Rust port is complete: all six phases are merged. The table is kept because code comments still cite these phase numbers.
 
 | Phase | Scope                                                                | Status                          |
 |-------|----------------------------------------------------------------------|---------------------------------|
@@ -145,9 +146,9 @@ The Rust port is complete: all six phases below are merged. This table is the hi
 | 6     | Retention policy enforcement on the unbounded history tables, polish | merged (CLAUDE-172, CLAUDE-175) |
 
 Two unrelated numbering schemes both say "Phase N", and a bare `grep 'Phase 3'` returns hits from both. The roadmap phases in this table are one (e.g. `src/web/mod.rs` "Phase 3" = Web UI, `src/auth.rs` "Phase 5" = token auth). The separate native-actions epic (CLAUDE-30..CLAUDE-34, tracked under CLAUDE-25) is the other;
-its comments carry the "native-action" qualifier (e.g. `src/native/youtrack.rs` "Phase 3 of the native-action epic" = CLAUDE-32, which is NOT roadmap Phase 3). Tell them apart by that qualifier and the CLAUDE-30..34 / CLAUDE-25 issue range; a bare "Phase N" with no "native-action" wording refers to this table.
+its comments carry the "native-action" qualifier (e.g. `src/native/youtrack.rs` "Phase 3 of the native-action epic" = CLAUDE-32, which is NOT roadmap Phase 3). Tell them apart by that qualifier and the CLAUDE-30..34 / CLAUDE-25 range; a bare "Phase N" refers to this table.
 
-Cross-cutting (not a numbered phase): a container runtime (CLAUDE-37, made self-contained in CLAUDE-247) runs the daemon and its spawned `claude` children in an isolated `$HOME` with a slim bot CLAUDE.md and its own logins, decoupled from the host's operator config. See `oci-build/Dockerfile` (`runtime` target), `oci-build/entrypoint.sh`, `compose.yml`, and `deploy/bot-CLAUDE.md`.
+Cross-cutting (not a numbered phase): a container runtime (CLAUDE-37, made self-contained in CLAUDE-247) runs the daemon and its spawned `claude` children in an isolated `$HOME` with a slim bot CLAUDE.md and its own logins. See `oci-build/Dockerfile` (`runtime` target), `oci-build/entrypoint.sh`, `compose.yml`, and `deploy/bot-CLAUDE.md`.
 
 ## Working on this repo
 
