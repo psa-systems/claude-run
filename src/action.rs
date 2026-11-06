@@ -444,8 +444,11 @@ fn default_block_on() -> Vec<String> {
 pub struct Tags {
     /// Tag added when the agent parks an issue via
     /// `.claude-run-needs-review`, alongside the `Needs Review` AI Agent
-    /// value. An empty value disables the tag write; the attempt-cap and
-    /// timeout parks (which also set `Needs Review`) never write this tag.
+    /// value. An empty value disables the tag write; the attempt-cap park and
+    /// the in-run claude timeout/cancel park (which also set `Needs Review`)
+    /// never write this tag. The pre-pickup estimate-over-timeout park
+    /// (`SPEC-3.12` item 7) does write it: that park names a decision (split
+    /// the issue or raise the limit), same as the marker path.
     pub needs_info: String,
 }
 
