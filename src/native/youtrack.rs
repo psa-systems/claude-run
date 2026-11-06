@@ -6536,7 +6536,7 @@ mod tests {
             "got {outcome:?}"
         );
         assert_eq!(tracker.field(), "Needs Review");
-        let comments = tracker.comments.lock().unwrap();
+        let comments = tracker.comments.lock().unwrap().clone();
         assert_eq!(comments.len(), 1);
         assert!(comments[0].contains("60 minutes"), "{comments:?}");
         assert!(comments[0].contains("30 minutes"), "{comments:?}");
