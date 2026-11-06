@@ -3379,23 +3379,19 @@ fn final_push_failed(
     backend: &dyn IssueTracker,
     src: &YoutrackSource,
     job: &YoutrackJob,
-    claude_result: &ClaudeResult,
     err: &Error,
     public_url: Option<&str>,
     run: crate::run_footer::CommentRun<'_>,
 ) -> Result<Finalized> {
-    let body = [
-        "**The final push failed (SPEC-3.3.1).**".to_string(),
-        String::new(),
-        claude_result.summary.clone(),
-        String::new(),
-        format!("Error: {err}"),
-        String::new(),
-        "The commits are still only in the preserved workdir on the runner host; nothing \
-         reached the forge."
-            .to_string(),
-    ]
-    .join("\n");
+    // SPEC-3.16.3/5: the final-push failure maps directly onto the closed
+    // cause set's `push rejected` member.
+    let cause = crate::run_footer::FailureCause::PushRejected {
+        error: err.to_string(),
+    };
+    let body = crate::run_footer::failure_comment(
+        &cause,
+        "Nothing was pushed; the commits are preserved on the runner host only.",
+    );
     let body = crate::run_footer::append_job(&body, public_url, run, &job.key);
     comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
     Ok(Finalized::Failed {
@@ -3524,15 +3520,7 @@ fn finalize(
                     run,
                 );
             }
-            return final_push_failed(
-                backend,
-                src,
-                job,
-                claude_result,
-                &e,
-                public_url.as_deref(),
-                run,
-            );
+            return final_push_failed(backend, src, job, &e, public_url.as_deref(), run);
         }
         // Blocker: ensure the skip marker is present so this attempt is not
         // counted, surface the reason verbatim, AI Agent=Needs Review, no PR.
@@ -3577,15 +3565,7 @@ fn finalize(
                     run,
                 );
             }
-            return final_push_failed(
-                backend,
-                src,
-                job,
-                claude_result,
-                &e,
-                public_url.as_deref(),
-                run,
-            );
+            return final_push_failed(backend, src, job, &e, public_url.as_deref(), run);
         }
         let summary = std::fs::read_to_string(&no_code)?.trim().to_string();
         let summary = note_checkpoint_rejection(summary);
@@ -4083,14 +4063,16 @@ fn finalize(
         // into both the comment and `cause` rather than silently leaving the
         // commits unpushed.
         let push_result = final_push(forge, job, workdir);
-        let body = failure_comment(claude_result);
-        let body = match &push_result {
-            Ok(()) => body,
+        let pushed = match &push_result {
+            Ok(()) => {
+                "Any commits were pushed to the branch; no PR was opened for this run.".to_string()
+            }
             Err(e) => format!(
-                "{body}\n\n**The final push failed (SPEC-3.3.1): {e}.** The commits are still \
-                 only in the preserved workdir on the runner host."
+                "The final push also failed (SPEC-3.3.1): {e}; the commits are preserved on \
+                 the runner host only."
             ),
         };
+        let body = failure_comment(claude_result, &pushed);
         let body = note_checkpoint_rejection(body);
         let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
@@ -5150,22 +5132,40 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
     body
 }
 
-/// Failure issue comment. One-line outcome first, the agent's last
-/// summary inline, then a two-bullet action list (cost and what a human
-/// should do), and finally the raw terminal event in a collapsed block
-/// when one is present.
-fn failure_comment(r: &ClaudeResult) -> String {
-    let mut body = [
-        format!("Claude AI agent run FAILED ({}).", r.error),
-        String::new(),
-        r.summary.clone(),
-        String::new(),
-        format!("- Cost: ${} USD", r.cost),
-        "- A human should inspect the run log, then either resolve the issue manually or re-queue it (set AI Agent = Queued).".to_string(),
-    ]
-    .join("\n");
-    body.push_str(&raw_event_details(&r.raw));
-    body
+/// SPEC-3.16.3/5: the closed-cause FAILED comment for a crashed, empty
+/// prompt, pre-failed, or operator-cancelled run. `r.error` carries the raw
+/// "claude exited N, see stream.jsonl" text for a real crash, so it is
+/// classified into a [`crate::run_footer::FailureCause`] rather than quoted
+/// directly: the raw stream-log path never reaches the comment, since the
+/// run link (in the SPEC-3.9 footer the caller appends) reaches it instead.
+fn failure_comment(r: &ClaudeResult, pushed: &str) -> String {
+    crate::run_footer::failure_comment(&failure_cause(r), pushed)
+}
+
+/// Maps a crashed/cancelled/pre-failed [`ClaudeResult`] onto the closed
+/// [`crate::run_footer::FailureCause`] set. `r.error` carries sentinel
+/// strings for the two non-agent cases the caller synthesizes; anything else
+/// is a genuine agent-side failure, reported from the one-line summary
+/// rather than the raw `r.error` text.
+fn failure_cause(r: &ClaudeResult) -> crate::run_footer::FailureCause {
+    use crate::run_footer::FailureCause;
+    if r.error == "run cancelled by operator" {
+        FailureCause::Cancelled
+    } else if r.error == "pre step failed" {
+        FailureCause::CommandFailed {
+            command: "pre".to_string(),
+        }
+    } else {
+        FailureCause::AgentError {
+            message: r
+                .summary
+                .lines()
+                .next()
+                .unwrap_or(&r.error)
+                .trim()
+                .to_string(),
+        }
+    }
 }
 
 /// Delivery-blocked issue comment (CLAUDE-545). One-line outcome naming
@@ -6771,11 +6771,11 @@ mod tests {
         assert_eq!(tracker.field(), "Working");
     }
 
-    /// A failure with a populated `raw` event leads with the friendly
-    /// summary, preserves the first-line error and Cost line, and appends the
-    /// pretty-printed event in a collapsed `<details>` block.
+    /// SPEC-3.16.3/5: a crash classifies as `agent error`, reported from the
+    /// friendly one-line summary; the raw `r.error` stream-log text never
+    /// surfaces in the comment.
     #[test]
-    fn failure_comment_friendly_summary_and_collapsed_raw() {
+    fn failure_comment_classifies_agent_error_from_summary() {
         let r = ClaudeResult {
             ok: false,
             summary: "API Error: 529 Overloaded.".into(),
@@ -6789,14 +6789,17 @@ mod tests {
             killed: false,
             exit_code: Some(1),
         };
-        let body = failure_comment(&r);
-        assert!(body.starts_with("Claude AI agent run FAILED (claude exited 1, see stream.jsonl)."));
-        assert!(body.contains("API Error: 529 Overloaded."));
-        assert!(body.contains("- Cost: $0.01 USD"));
-        assert!(body.contains("- A human should inspect the run log"));
-        assert!(body.contains("<details>\n<summary>Raw result event</summary>"));
-        assert!(body.contains("```json"));
-        assert!(body.contains("\"api_error_status\": \"529\""));
+        let body = failure_comment(&r, "Nothing was pushed.");
+        assert!(
+            body.starts_with("**Claude AI agent run FAILED.**"),
+            "{body}"
+        );
+        assert!(
+            body.contains("- agent error: API Error: 529 Overloaded."),
+            "{body}"
+        );
+        assert!(!body.contains("claude exited 1"), "{body}");
+        assert!(!body.contains(".jsonl"), "{body}");
     }
 
     /// A killed run has no terminal `result` event, so `r.cost` defaults to
@@ -6841,14 +6844,16 @@ mod tests {
         assert!(!body.contains("unknown"), "{body}");
     }
 
-    /// A synthesized failure (empty `raw`) omits the `<details>` block.
+    /// SPEC-3.16.3: the pre-step sentinel `r.error` classifies as
+    /// `` `pre` failed ``, never quoted verbatim or paired with a raw details
+    /// block.
     #[test]
-    fn failure_comment_omits_details_for_synthesized_raw() {
-        let r = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "pre step failed");
-        let body = failure_comment(&r);
-        assert!(body.contains("pre step failed"));
-        assert!(body.contains("Cost: $0 USD"));
-        assert!(!body.contains("<details>"));
+    fn failure_comment_classifies_pre_step_failure() {
+        let r =
+            ClaudeResult::synthesized("pre step failed", "pre step: cargo fmt --check exited 1");
+        let body = failure_comment(&r, "Nothing was pushed.");
+        assert!(body.contains("- `pre` failed"), "{body}");
+        assert!(!body.contains("<details>"), "{body}");
     }
 
     /// CLAUDE-372: a killed run's stream tail holds a `thinking` block with a
@@ -6867,7 +6872,7 @@ mod tests {
         let mut r = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
         r.summary = summary;
 
-        let failure_body = failure_comment(&r);
+        let failure_body = failure_comment(&r, "Nothing was pushed.");
         assert!(!failure_body.contains("signature"), "{failure_body}");
         assert!(!failure_body.contains("secret reasoning"), "{failure_body}");
 
@@ -6957,8 +6962,8 @@ mod tests {
     }
 
     /// CLAUDE-546: the failure comment leads with a one-line outcome and
-    /// renders the cost and follow-up action as bullets rather than loose
-    /// trailing lines.
+    /// SPEC-3.16.3: the pre-step failure body is capped at 2 bullets here
+    /// (cause, pushed), leading with the cause.
     #[test]
     fn failure_comment_leads_with_outcome_and_renders_bullets() {
         let r = ClaudeResult {
@@ -6974,13 +6979,17 @@ mod tests {
             killed: false,
             exit_code: Some(1),
         };
-        let body = failure_comment(&r);
+        let body = failure_comment(&r, "Nothing was pushed.");
         assert!(
-            body.starts_with("Claude AI agent run FAILED (pre step failed)."),
+            body.starts_with("**Claude AI agent run FAILED.**"),
             "{body}"
         );
-        assert!(body.contains("- Cost: $0 USD"), "{body}");
-        assert!(body.contains("- A human should inspect"), "{body}");
+        let bullets: Vec<&str> = body.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(
+            bullets,
+            vec!["- `pre` failed", "- Nothing was pushed."],
+            "{body}"
+        );
     }
 
     /// CLAUDE-545: the delivery-blocked comment leads with the reason's
