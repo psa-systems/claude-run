@@ -299,6 +299,11 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     // before the attempt-cap check; only the `Done` path carries it into the
     // outcome record, so capped / filtered jobs (no outcome) never read it.
     let started = Instant::now();
+    // SPEC-3.14 item 4: wall-clock start for this attempt, so the
+    // scripted-action `coding`/`check`/`build` steps derived below (and the
+    // `unaccounted` remainder around them) can be anchored the same way the
+    // `youtrack` native action anchors its own attempt.
+    let started_wall = chrono::Utc::now();
     let action = &ctx.action.action;
     let key = job_key(ctx.action, job, idx);
     let attempts = state::attempts_get(ctx.pool, &action.name, &key).await?;
@@ -363,6 +368,15 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     // so its attempt is not counted (the job is re-gathered on the first run
     // after Resume).
     let mut paused_before_claude = false;
+    // SPEC-3.14 item 4: the claude invocation's own stream log path plus the
+    // wall-clock span it ran in, set only on the one branch below that
+    // actually calls `ctx.claude.invoke`, so `derive_claude_steps` below has
+    // something to classify.
+    let mut claude_span: Option<(
+        std::path::PathBuf,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    )> = None;
     let (claude_result, claude_ran) = if let Some((step_idx, exit_code, stderr)) = pre_failed {
         (
             ClaudeResult::synthesized(format!("pre step {step_idx} exited {exit_code}"), stderr),
@@ -444,6 +458,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                     attempts + 1,
                 );
                 info!(action = %action.name, key = %key, stream_log = %stream_log.display(), "invoking claude");
+                let invoke_start = chrono::Utc::now();
                 let r = ctx.claude.invoke(
                     &prompt,
                     &action.claude,
@@ -462,6 +477,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                     // `CARGO_TARGET_DIR` themselves if they need it.
                     None,
                 )?;
+                claude_span = Some((stream_log.clone(), invoke_start, chrono::Utc::now()));
                 // Bill the run before any branch discards `r`, so a cancelled
                 // invocation still reports what it spent.
                 // SPEC-3.2.2: "billing happens before any branch discards the
@@ -576,6 +592,51 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
 
     workdir::cleanup_or_preserve(&workdir_path, &action.name, &key);
 
+    let mut summary = claude_result.summary;
+
+    // SPEC-3.14 item 4: derive this attempt's `coding`/`check`/`build` steps
+    // from the stream log the same way the `youtrack` native action does, so
+    // a scripted action's attempts carry step data too rather than falling
+    // permanently into `/reports`' "no step data" bucket. Only for an
+    // attempt that counts.
+    if !skip_attempt {
+        let stage = match attempts + 1 {
+            1 => "initial",
+            2 => "retry-2",
+            _ => "retry-3",
+        };
+        let mut recorder = crate::attempt_steps::StepRecorder::new(
+            ctx.pool,
+            ctx.run_id,
+            &action.name,
+            &key,
+            attempts + 1,
+        );
+        if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
+            match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
+                Ok(steps) => {
+                    for (kind, label, start, end) in steps {
+                        recorder
+                            .record(stage, kind, label, start, end, true, None)
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        action = %action.name, key = %key, error = %e,
+                        "deriving claude steps from the stream log failed; coding/check/build steps for this attempt fall into unaccounted"
+                    );
+                }
+            }
+        }
+        let incomplete = recorder
+            .finish(stage, started_wall, chrono::Utc::now())
+            .await;
+        if incomplete {
+            summary.push_str(" (step data incomplete)");
+        }
+    }
+
     Ok(ProcessedJob::Done {
         key,
         attempt: attempts + 1,
@@ -584,7 +645,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
         claude_ok: claude_result.ok,
         claude_cost: claude_result.cost,
         attempt_counted: !skip_attempt,
-        summary: claude_result.summary,
+        summary,
         stream_log_path,
         duration_ms: started.elapsed().as_millis() as i64,
         timed_out: claude_result.timed_out,
