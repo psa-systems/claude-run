@@ -2131,6 +2131,9 @@ impl Forge for CliBackend {
         workdir: &Path,
         host: &str,
         body: Option<&str>,
+        issue_key: &str,
+        run_id: Option<i64>,
+        run_started: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Option<PullRequest>> {
         let branch = match self.resolve_feature_branch(workdir) {
             Ok(b) => b,
@@ -2147,21 +2150,20 @@ impl Forge for CliBackend {
         self.push_branch(workdir, &branch, token_url)?;
         let mut pr = self.find_or_create_pr(workdir, host, &repo, &branch, true, body)?;
         if let Some(pr_number) = pr.number {
-            let issue_key = self.tip_issue_key(workdir, &branch);
             let subjects = self.commit_subjects_since(workdir, remote_sha.as_deref(), &local_sha);
             let public_url = crate::run_footer::resolved_public_url();
             match self.git_dir_scratch(workdir) {
                 Ok(scratch) => {
                     let ctx = crate::push_comment::PushCommentContext {
                         event: crate::push_comment::PushEvent::CheckpointPush,
-                        issue_key: &issue_key,
+                        issue_key,
                         draft: true,
                         old_sha: remote_sha.as_deref(),
                         new_sha: Some(&local_sha),
                         subjects,
                         public_url: public_url.as_deref(),
-                        run_id: None,
-                        started: None,
+                        run_id,
+                        started: run_started,
                     };
                     pr.push_comment_failure =
                         crate::push_comment::post(self, host, &repo, pr_number, &scratch, &ctx);
@@ -4281,7 +4283,14 @@ mod tests {
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         let result = b
-            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"))
+            .checkpoint_push(
+                wd.path(),
+                "dev.a8n.run",
+                Some("## Summary\n\n#MK-16"),
+                "MK-16",
+                None,
+                None,
+            )
             .unwrap();
         assert!(result.is_none());
         let calls = runner.calls.lock().unwrap();
@@ -4307,7 +4316,14 @@ mod tests {
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         let result = b
-            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"))
+            .checkpoint_push(
+                wd.path(),
+                "dev.a8n.run",
+                Some("## Summary\n\n#MK-16"),
+                "MK-16",
+                None,
+                None,
+            )
             .unwrap();
         assert!(result.is_none());
         let calls = runner.calls.lock().unwrap();
@@ -4394,7 +4410,14 @@ mod tests {
         let b = CliBackend::new(runner.clone());
 
         let first = b
-            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"))
+            .checkpoint_push(
+                wd.path(),
+                "dev.a8n.run",
+                Some("## Summary\n\n#MK-16"),
+                "MK-16",
+                None,
+                None,
+            )
             .unwrap()
             .expect("first tick landed new commits and must push");
         assert_eq!(first.number, Some(77));
@@ -4443,7 +4466,14 @@ mod tests {
         let runner2 = Arc::new(runner2);
         let b2 = CliBackend::new(runner2.clone());
         let second = b2
-            .checkpoint_push(wd.path(), "dev.a8n.run", Some("## Summary\n\n#MK-16"))
+            .checkpoint_push(
+                wd.path(),
+                "dev.a8n.run",
+                Some("## Summary\n\n#MK-16"),
+                "MK-16",
+                None,
+                None,
+            )
             .unwrap()
             .expect("second tick landed further new commits and must push");
         assert_eq!(

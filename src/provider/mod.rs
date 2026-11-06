@@ -530,8 +530,11 @@ pub trait Forge: Send + Sync {
         workdir: &std::path::Path,
         host: &str,
         body: Option<&str>,
+        issue_key: &str,
+        run_id: Option<i64>,
+        run_started: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Option<PullRequest>> {
-        let _ = (workdir, host, body);
+        let _ = (workdir, host, body, issue_key, run_id, run_started);
         Err(Error::Other(anyhow::anyhow!(
             "checkpoint_push not supported by this forge backend"
         )))

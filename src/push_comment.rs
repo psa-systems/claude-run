@@ -143,10 +143,13 @@ fn outcome_headline(ctx: &PushCommentContext<'_>) -> String {
 /// range, capped commit subjects, and the SPEC-3.9 run footer.
 pub fn build_body(ctx: &PushCommentContext<'_>) -> String {
     let state = if ctx.draft { "draft" } else { "ready" };
-    let old = ctx.old_sha.map(short).unwrap_or("none");
     let new = ctx.new_sha.map(short).unwrap_or("unknown");
+    let range = match ctx.old_sha {
+        Some(old) => format!("{}..{new}", short(old)),
+        None => format!("(new branch) {new}"),
+    };
     let body = format!(
-        "{}\n\nIssue: {}\nPR state: {state}\nRange: {old}..{new}\n\n{}",
+        "{}\n\nIssue: {}\nPR state: {state}\nRange: {range}\n\n{}",
         outcome_headline(ctx),
         ctx.issue_key,
         format_subjects(&ctx.subjects),
@@ -335,12 +338,31 @@ mod tests {
         assert!(body.contains("PR state: draft"));
     }
 
+    /// Issue: names the caller's own issue key verbatim. Locks in the "no
+    /// derivation from the tip commit body" guarantee: a commit that
+    /// references another ticket (fixing in-flight work that closes
+    /// #OTHER-999) must not have that ticket appear in Issue:.
+    #[test]
+    fn issue_key_is_passed_through_verbatim_regardless_of_commit_body() {
+        let mut c = ctx(
+            PushEvent::CheckpointPush,
+            CommitSubjects::Listed(vec!["fix something that also closes #OTHER-999".into()]),
+        );
+        c.issue_key = "DMARC-165";
+        let body = build_body(&c);
+        assert!(body.contains("Issue: DMARC-165"), "{body}");
+        assert!(
+            !body.contains("Issue: OTHER-999"),
+            "the Issue: line must not derive from commit subjects: {body}"
+        );
+    }
+
     #[test]
     fn new_branch_has_no_old_sha() {
         let mut c = ctx(PushEvent::InitialPush, CommitSubjects::Listed(vec![]));
         c.old_sha = None;
         let body = build_body(&c);
-        assert!(body.contains("Range: none..fedcba987654"));
+        assert!(body.contains("Range: (new branch) fedcba987654"));
     }
 
     #[test]
