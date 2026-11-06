@@ -24,6 +24,20 @@
 //! worse than leaving a host condition ungrouped, so each detector requires an
 //! unambiguous phrase and an undetected condition is the preferred failure mode.
 
+/// SPEC-3.5.1 / SPEC-3.12 item 8: every `kind` [`detect`] can return. Each is a
+/// runner condition rather than a defect in the commit, so a CI failure that
+/// carries one spends no `webhook.agent_pr_fix_attempts` attempt and starts no
+/// remediation run ([`InfraFailure::spends_no_attempt`]).
+pub const KINDS: &[&str] = &[
+    "disk-full",
+    "out-of-memory",
+    "runner-unavailable",
+    "job-timeout",
+    "container-not-started",
+    "runner-deadline",
+    "no-diagnostic",
+];
+
 /// SPEC-3.5.1 / SPEC-3.5.2: an infrastructure / runner condition recognized in
 /// a job log. Same shape as
 /// [`crate::autofix::AutoFix`]: a stable `kind` id (what the dedupe key is built
@@ -31,12 +45,21 @@
 /// plus a human-readable statement of the problem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InfraFailure {
-    /// Stable detector id: `disk-full`, `out-of-memory`, `runner-unavailable`.
-    /// This, not the matched line, is what [`crate::mint`] hashes.
+    /// Stable detector id: one of [`KINDS`]. This, not the matched line, is what [`crate::mint`] hashes.
     pub kind: String,
     /// Human-readable statement of the host condition, for the log line and the
     /// operator reading it.
     pub problem: String,
+}
+
+impl InfraFailure {
+    /// SPEC-3.12 item 8: an infrastructure failure never counts toward
+    /// `webhook.agent_pr_fix_attempts` and starts no remediation run. True for
+    /// every kind in [`KINDS`]; a string outside the closed set is not an
+    /// infrastructure kind and still spends an attempt.
+    pub fn spends_no_attempt(kind: &str) -> bool {
+        KINDS.contains(&kind)
+    }
 }
 
 /// SPEC-3.5.1: run the infrastructure detectors against a full redacted job
@@ -55,6 +78,10 @@ pub fn detect(log: &str) -> Option<InfraFailure> {
     detect_disk_full(&lower)
         .or_else(|| detect_out_of_memory(&lower))
         .or_else(|| detect_runner_unavailable(&lower))
+        .or_else(|| detect_job_timeout(&lower))
+        .or_else(|| detect_container_not_started(&lower))
+        .or_else(|| detect_runner_deadline(&lower))
+        .or_else(|| detect_no_diagnostic(log, &filtered, &lower))
 }
 
 /// Drop lines that carry only a test name: a `test ... ... ok|FAILED|ignored`
@@ -167,6 +194,79 @@ fn detect_runner_unavailable(lower: &str) -> Option<InfraFailure> {
     matched.then(|| InfraFailure {
         kind: "runner-unavailable".to_string(),
         problem: "the runner could not reach the network it depends on: the job log reports a DNS failure or a reset connection to a package or container registry. This is a runner-connectivity problem, not a problem with the commit.".to_string(),
+    })
+}
+
+/// `job-timeout`: the job was killed by its own `timeout-minutes` (SPEC-3.12
+/// item 8). The runner prints the exceeded-limit wording, not the test suite.
+fn detect_job_timeout(lower: &str) -> Option<InfraFailure> {
+    const PHRASES: &[&str] = &[
+        "exceeded the maximum execution time",
+        "job execution time exceeded",
+        "job timed out after",
+        "exceeded timeout-minutes",
+    ];
+    PHRASES.iter().any(|p| lower.contains(p)).then(|| InfraFailure {
+        kind: "job-timeout".to_string(),
+        problem: "the job was killed by its own timeout-minutes limit: the job log reports the maximum execution time was exceeded. This is a runner-capacity or workflow-limit problem, not a defect the agent can fix in the commit.".to_string(),
+    })
+}
+
+/// `container-not-started`: the job container never came up, so no step of the
+/// workflow ran (SPEC-3.12 item 8).
+fn detect_container_not_started(lower: &str) -> Option<InfraFailure> {
+    const PHRASES: &[&str] = &[
+        "failed to start container",
+        "failed to create container",
+        "cannot start container",
+        "failed to create task for container",
+        "container failed to start",
+    ];
+    PHRASES.iter().any(|p| lower.contains(p)).then(|| InfraFailure {
+        kind: "container-not-started".to_string(),
+        problem: "the job container never started: the job log reports the container runtime could not create or start it. This is a runner problem, not a problem with the commit.".to_string(),
+    })
+}
+
+/// `runner-deadline`: the runner's own API call to the forge or the container
+/// runtime timed out (SPEC-3.12 item 8).
+fn detect_runner_deadline(lower: &str) -> Option<InfraFailure> {
+    lower
+        .contains("context deadline exceeded")
+        .then(|| InfraFailure {
+            kind: "runner-deadline".to_string(),
+            problem: "a runner API call timed out: the job log reports context deadline exceeded. This is a runner-connectivity or load problem, not a problem with the commit.".to_string(),
+        })
+}
+
+/// `no-diagnostic` (SPEC-3.12 item 8): a non-empty log with no parsed failing
+/// test id and no compiler, test or lint diagnostic of any kind. Nothing in it
+/// points at the commit, so a fix attempt has nothing to act on. The runner's
+/// own `Process completed with exit code` line is not a diagnostic.
+/// Deliberately conservative: any line naming an error, a failure, a panic, a
+/// diff or a traceback counts as a diagnostic, so a log that merely looks
+/// unusual stays with the classifier.
+fn detect_no_diagnostic(raw: &str, filtered: &str, lower: &str) -> Option<InfraFailure> {
+    if filtered.trim().is_empty() || !crate::ci_failure::fingerprint::failing_tests(raw).is_empty() {
+        return None;
+    }
+    const MARKERS: &[&str] = &[
+        "error",
+        "fail",
+        "panick",
+        "assert",
+        "traceback",
+        "exception",
+        "diff in ",
+        "warning",
+    ];
+    let has_diagnostic = lower.lines().any(|l| {
+        let l = l.trim();
+        !l.contains("process completed with exit code") && MARKERS.iter().any(|m| l.contains(m))
+    });
+    (!has_diagnostic).then(|| InfraFailure {
+        kind: "no-diagnostic".to_string(),
+        problem: "the job failed with no parsed failing test and no compiler, test or lint diagnostic in its log. Nothing points at the commit, so this is treated as a runner problem.".to_string(),
     })
 }
 
@@ -357,5 +457,72 @@ mod tests {
             kind_of("no space left on device\ncould not resolve host: proxy\n").as_deref(),
             Some("disk-full")
         );
+    }
+
+    #[test]
+    fn job_timeout_is_detected() {
+        assert_eq!(
+            kind_of(
+                "Running tests\n##[error]The job running on runner r1 has exceeded the maximum execution time of 60 minutes.\n"
+            )
+            .as_deref(),
+            Some("job-timeout")
+        );
+    }
+
+    #[test]
+    fn container_not_started_is_detected() {
+        assert_eq!(
+            kind_of(
+                "Error response from daemon: failed to create task for container: OCI runtime create failed\n"
+            )
+            .as_deref(),
+            Some("container-not-started")
+        );
+    }
+
+    #[test]
+    fn runner_deadline_is_detected() {
+        assert_eq!(
+            kind_of("Post \"https://forge.example.org/api/actions\": context deadline exceeded\n")
+                .as_deref(),
+            Some("runner-deadline")
+        );
+    }
+
+    #[test]
+    fn no_diagnostic_is_detected_for_a_log_with_nothing_to_act_on() {
+        assert_eq!(
+            kind_of(
+                "Set up job\nCheckout\nRun step\n##[error]Process completed with exit code 1\n"
+            )
+            .as_deref(),
+            Some("no-diagnostic")
+        );
+    }
+
+    #[test]
+    fn no_diagnostic_does_not_match_a_log_with_a_diagnostic_or_no_log() {
+        assert!(detect("Set up job\nerror: expected `;`\n").is_none());
+        assert!(detect("Set up job\nDiff in src/main.rs:1:\n").is_none());
+        assert!(detect("   \n").is_none());
+    }
+
+    #[test]
+    fn the_new_phrases_inside_a_test_name_do_not_match() {
+        assert!(detect(
+            "test runner::tests::context_deadline_exceeded_is_detected ... ok\n\
+             test job::tests::failed_to_start_container_is_detected ... ok\n\
+             test job::tests::exceeded_the_maximum_execution_time ... FAILED\n"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn every_kind_spends_no_attempt_and_an_unknown_kind_does_not() {
+        for k in KINDS {
+            assert!(InfraFailure::spends_no_attempt(k), "{k}");
+        }
+        assert!(!InfraFailure::spends_no_attempt("compile-error"));
     }
 }

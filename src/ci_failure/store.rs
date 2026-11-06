@@ -377,6 +377,25 @@ pub async fn set_failure_state(
     Ok(())
 }
 
+/// SPEC-3.12 item 8: store the infrastructure `kind` on an existing failure
+/// row, so a failure first recorded before the condition was recognised still
+/// shows its category on the dashboard and in the Reports failure causes.
+pub async fn set_infra_kind(pool: &DbPool, failure_id: i64, kind: &str, now: &str) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "UPDATE ci_failures SET infra_kind = ?, updated_at = ? WHERE id = ?",
+        )
+        .into_owned(),
+    ))
+    .bind(kind)
+    .bind(now)
+    .bind(failure_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// SPEC-3.5.2: every distinct branch `failure_id` has been seen on, sorted.
 pub async fn distinct_branches(pool: &DbPool, failure_id: i64) -> Result<Vec<String>> {
     let branches: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
