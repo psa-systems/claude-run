@@ -1342,7 +1342,7 @@ pub async fn recent_attempt_durations_ms(
 ) -> Result<Vec<i64>> {
     let sql = format!(
         "SELECT duration_ms FROM job_outcomes WHERE action_name = ? AND stage = ? \
-         AND attempt_counted = 1 AND duration_ms > 0 ORDER BY ts DESC LIMIT {EXPECTED_WINDOW}"
+         AND attempt_counted = 1 AND duration_ms > 0 ORDER BY ts DESC, id DESC LIMIT {EXPECTED_WINDOW}"
     );
     let rows: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(
         crate::db::q(pool, &sql).into_owned(),
@@ -3378,8 +3378,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                // `ts` orders the window; keep rows strictly increasing.
-                tokio::time::sleep(std::time::Duration::from_millis(3)).await;
             }
         };
         let secs = |s: u64| ExpectedDuration::Median(std::time::Duration::from_secs(s));
