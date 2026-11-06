@@ -64,8 +64,8 @@ catches the CLAUDE-170/CLAUDE-206/CLAUDE-469 shape of gap, where criteria named 
 the same invariant and a diff-only review passed anyway.
 
 The verdict is read from the workdir, not from the invocation's own exit code: the review session is told to write
-`.claude-run-review-pass` with its notes and the classified table as evidence if the work looks done and the sweep
-found no violating or uncovered hit, or `.claude-run-review-fail` with its findings otherwise, even when every
+`.claude-run-review-pass` with the verdict bullets (at most 5, SPEC-3.16 item 1; a longer marker is truncated, the drop logged at `warn`) if the work looks done and the sweep
+found no violating or uncovered hit, or `.claude-run-review-fail` with its findings otherwise, and to write the full sweep to an evidence file beside the attempt's stream log (`ClaudeInvoker::review_evidence_path`; a retried review writes a `-retry` sibling). `ClaudeInvoker::review_evidence_authoritative` picks the file that backs the posted verdict, and the comment link, the run page and the `/runs/{id}/jobs/{key}/attempt/{n}/review-evidence` route all resolve through it, even when every
 written criterion is satisfied: a violating or uncovered hit the sweep finds fails the review on its own.
 `run_review_session` removes any stale marker before invoking, then after a clean, non-timed-out return
 compares `git rev-parse HEAD` before and after and re-reads `workdir::uncommitted_or_stashed`, filtering out the two

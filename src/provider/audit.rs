@@ -270,6 +270,10 @@ impl IssueTracker for AuditedTracker<'_> {
     fn project_show(&self, project_key: &str) -> Result<String> {
         self.inner.project_show(project_key)
     }
+
+    fn get_estimation_minutes(&self, key: &str) -> Result<Option<i64>> {
+        self.inner.get_estimation_minutes(key)
+    }
 }
 
 #[cfg(test)]

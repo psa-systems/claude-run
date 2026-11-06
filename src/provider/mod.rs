@@ -37,7 +37,9 @@ use tracing::{info, warn};
 use crate::error::{Error, Result};
 
 pub use audit::{AuditedTracker, IssueWriteAudit, DEFAULT_MAX_ISSUES_PER_RUN};
-pub use cli::{CliBackend, CmdOutput, CommandRunner, FjForgeReads, ProcessRunner};
+pub use cli::{
+    CliBackend, CmdOutput, CommandRunner, ConflictResolver, FjForgeReads, ProcessRunner,
+};
 pub use github::{
     is_github_host, pr_web_url, GhForgeReads, GithubForge, HttpMcpTransport, McpTransport,
 };
@@ -293,6 +295,17 @@ pub trait IssueTracker: Send + Sync {
         Err(Error::Other(anyhow::anyhow!(
             "link_issue not supported by this tracker backend"
         )))
+    }
+
+    /// Read the issue's `Estimation` custom field as whole minutes
+    /// (`yt issue get-field <key> Estimation --json`'s `raw.minutes`), or
+    /// `None` when the field is unset. Backs the pickup-time estimate-vs-
+    /// session-timeout check (SPEC-3.12 item 7). The default returns
+    /// `Ok(None)`, so a backend with no `Estimation` support never blocks
+    /// pickup.
+    fn get_estimation_minutes(&self, key: &str) -> Result<Option<i64>> {
+        let _ = key;
+        Ok(None)
     }
 
     /// Attach an existing tag to an issue, creating the instance-wide tag when

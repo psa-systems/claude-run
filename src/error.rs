@@ -133,6 +133,25 @@ pub enum Error {
     #[error("forge `{op}` did not answer within {timeout:?}")]
     ForgeTimeout { op: String, timeout: Duration },
 
+    /// SPEC-3.12 item 4: the final push found `branch` diverged, and the
+    /// configured bounded conflict-resolution pass either failed or left the
+    /// merge unresolved, so the merge was aborted exactly as it would have
+    /// been with no resolver configured. Distinct from the generic push/
+    /// PR-create failure so `finalize` can route it to `Needs Review` naming
+    /// the conflicting files and both SHAs, per the SPEC-3.12 outcome table.
+    #[error(
+        "remote branch `{branch}` has diverged from the local work (local {local_sha}, remote \
+         {remote_sha}) and the bounded conflict-resolution pass could not resolve it ({detail}); \
+         the merge was aborted. Refusing to force-push over it. Conflicting files: {files}."
+    )]
+    ConflictResolutionFailed {
+        branch: String,
+        local_sha: String,
+        remote_sha: String,
+        files: String,
+        detail: String,
+    },
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

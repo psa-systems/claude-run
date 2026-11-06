@@ -31,7 +31,8 @@ flowchart TD
     QReview -- NoVerdict names<br/>read-only contract --> DB_ReviewWD([DeliveryBlocked<br/>ReviewModifiedWorkdir])
     QReview -- Fail or other<br/>NoVerdict --> ReviewFailed([ReviewFailed])
 
-    QCreatePR -- no --> QLoc{work_location?}
+    QCreatePR -- no, diverged final push:<br/>conflict pass failed<br/>(SPEC-3.12 item 4) --> NeedsReview
+    QCreatePR -- no, other --> QLoc{work_location?}
     QLoc -- None<br/>clean + no commits --> DB_NoCommits([DeliveryBlocked<br/>NoCommitsAhead])
     QLoc -- RemoteBranch --> Failed_PrCreate([Failed pr_step=pr_create])
     QLoc -- Preserved or<br/>UncommittedChanges --> Failed_Push
@@ -53,7 +54,7 @@ flowchart TD
 
 Each terminal variant in [`Finalized`](../src/native/youtrack.rs):
 
-- `NeedsReview`: the agent parked the job (left `.claude-run-needs-review`). No PR. AI Agent = `states.needs_review`.
+- `NeedsReview`: the agent parked the job (left `.claude-run-needs-review`), OR the final push found the remote branch diverged, the local merge conflicted, and the bounded conflict-resolution pass (SPEC-3.12 item 4, `CliBackend::with_conflict_resolver`) either failed or left the merge unresolved, so the merge was aborted and the issue is parked for a human decision rather than routed through the generic push/PR-create failure path. The comment names the conflicting files and both SHAs. No PR in the conflict case. AI Agent = `states.needs_review`.
 - `NoCodeChange`: a successful run deliberately produced no commits and left `.claude-run-no-code-change`. No PR. AI Agent = `states.no_code_label()`.
 - `CodeReview { pr_url, pr_number, head_branch, merged }`: success. PR opened and promoted to ready. AI Agent = `states.code_review`. `merged` is `true` (outcome `Merged`) when automerge is enabled and the one bounded status read after promotion found the PR green, current and mergeable, so finalize merged it in the same tick (CLAUDE-549); `process_job` then marks its `agent_pull_requests` row `merged`.
 - `Failed { cause, pr_step, requeued }`: a hard failure in the agent's own run or in finalize's post-agent push/PR-create/verify path. AI Agent = `states.failed` (or `states.queued` when `requeued`).
@@ -73,6 +74,7 @@ Each terminal variant in [`Finalized`](../src/native/youtrack.rs):
 - `resume_pr_url`: CLAUDE-275 drives a resume onto an open PR. In the `create_pr_with_draft` error arm, a push/PR-create failure with a resume URL below the attempt cap re-queues to `states.queued` instead of parking at `states.failed`.
 - Human-override preservation: the timeout path reads AI Agent before writing and leaves it untouched when a human has advanced it off Working (set Done, Code Review, ...). The delivery-blocked path on the same branch preserves this guard.
 - `review`: not computed by `finalize` itself. Its caller runs `run_review_session_with_retry` (SPEC-3.12 item 9) before calling `finalize`, so a single workdir-modifying review never reaches this state machine as-is; `finalize` only ever sees the retry's own final verdict.
+- Bounded conflict-resolution pass (SPEC-3.12 item 4): when the final push's local merge of a diverged `origin/<branch>` conflicts, `CliBackend::merge_remote_branch` dispatches one `claude` pass (`FinalPushConflictResolver` in `src/native/youtrack.rs`) in the same clone before falling back to aborting the merge. The pass is capped at one attempt per `create_pr_with_draft` call (`CliBackend::conflict_resolve_spent`); a second divergence in the same call, or a failed pass, aborts the merge exactly as it would with no resolver configured. On a claimed success, the resolver's own SPEC-3.3.2 verification gate run and the caller's independent re-check that no conflict markers remain gate whether the push proceeds; a failure surfaces as `Error::ConflictResolutionFailed` rather than the generic divergence error, which `finalize` routes to `NeedsReview` above instead of the `QLoc` branch.
 
 ## See also
 
