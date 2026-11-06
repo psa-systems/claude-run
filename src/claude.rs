@@ -322,6 +322,18 @@ impl ClaudeInvoker {
             .join(format!("{key}-attempt-{attempt}-review.jsonl"))
     }
 
+    /// SPEC-3.16 item 2: evidence file for the post-success review session,
+    /// stored beside the attempt's stream log rather than pasted into the
+    /// capped verdict comment. The review session writes its full working
+    /// (the invariant, the search pattern and the classified sweep) directly
+    /// to this path; the runner only checks whether it exists and links it.
+    pub fn review_evidence_path(logs_dir: &Path, action: &str, key: &str, attempt: u32) -> PathBuf {
+        logs_dir
+            .join(action)
+            .join("streams")
+            .join(format!("{key}-attempt-{attempt}-review-evidence.md"))
+    }
+
     /// Spawn claude, relay its stdout to `stream_log` stamping each JSON event
     /// line with an arrival-time `ts` (stderr is a direct, unstamped redirect to
     /// the same file), wait, then scan the stream for the terminal `result`

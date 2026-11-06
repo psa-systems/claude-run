@@ -1648,6 +1648,19 @@ async fn process_job(
             name.push("-retry");
             review_stream_log.with_file_name(name)
         };
+        // SPEC-3.16 item 2: evidence file paths, mirroring the stream-log
+        // retry naming above, so a retried review's evidence does not
+        // overwrite the first attempt's.
+        let review_evidence =
+            ClaudeInvoker::review_evidence_path(&paths.logs_dir(), &action.name, key, attempts + 1);
+        let review_retry_evidence = {
+            let mut name = review_evidence
+                .file_name()
+                .unwrap_or_default()
+                .to_os_string();
+            name.push("-retry");
+            review_evidence.with_file_name(name)
+        };
         let (outcome, review_results) = crate::blocking::in_place(|| {
             run_review_session_with_retry(
                 claude,
@@ -1657,6 +1670,8 @@ async fn process_job(
                 limits.review_timeout,
                 &review_stream_log,
                 &review_retry_stream_log,
+                &review_evidence,
+                &review_retry_evidence,
                 cancel,
                 Some(spend.remaining_usd()),
                 Some(cargo_target_dir.as_path()),
@@ -1680,7 +1695,23 @@ async fn process_job(
             .await;
             state::daily_cost_add(pool, &action.name, result.cost).await?;
         }
-        Some(outcome)
+        // SPEC-3.16 items 1 and 2: cap the verdict to 5 bullets and link
+        // whichever evidence file is authoritative (the retry's, when a
+        // retry ran) before the outcome reaches `finalize` and is posted.
+        let evidence_path = if review_results.len() == 2 {
+            &review_retry_evidence
+        } else {
+            &review_evidence
+        };
+        let evidence_link = evidence_path.exists().then(|| {
+            review_evidence_link_text(
+                crate::run_footer::resolved_public_url().as_deref(),
+                run_id,
+                key,
+                attempts + 1,
+            )
+        });
+        Some(cap_verdict_outcome(outcome, key, evidence_link.as_deref()))
     } else {
         None
     };
@@ -2989,20 +3020,27 @@ fn default_review_prompt() -> String {
         "4. State in one sentence the invariant the issue's Goal establishes, as a contract. Derive it from the Goal and the root cause in the Background, not from the criteria list: a named list of files or backends is a lower bound, never the full scope.",
         "5. Derive a search pattern for the SHAPE of code that invariant governs (every implementation of the same trait, every call site of the same kind, every consumer of the same config key), independent of the files the diff touched, and run it over the WHOLE repository with Glob/Grep, not just the changed files.",
         "6. Classify every hit the sweep finds as compliant, not-applicable (state the concrete reason it cannot be affected), or violating. For a fix to an `if`/success branch, also check its `else`/failure branch for the same gap.",
-        "7. If every criterion is satisfied AND the sweep finds no violating or uncovered hit, write a verdict to this file: what you checked, why it passes, and the classified table from steps 4-6 as its evidence.",
+        "7. Write your full working to this evidence file, in full, whether you pass or fail: what you checked per criterion from step 3, the invariant and search pattern from steps 4-5, and the classified table from step 6.",
+        "     {{review_evidence_file}}",
+        "8. If every criterion is satisfied AND the sweep finds no violating or uncovered hit, write the verdict to this file: a first line 'Review: PASS', then at most 4 more lines, one per criterion met, each as 'file:line - what you checked'. No headings, no tables, no restated invariant or search pattern: that detail lives only in the evidence file from step 7.",
         "     {{workdir}}/{{review_pass_marker}}",
-        "8. If any criterion is unmet, contradicted, or unverifiable, OR the sweep finds a hit that is violating, OR a hit the invariant governs but the issue's Goal or file set does not cover, write the findings to this file instead, even when every written criterion is satisfied: name the invariant, the search pattern, and each uncovered or violating hit with file:line.",
+        "9. If any criterion is unmet, contradicted, or unverifiable, OR the sweep finds a hit that is violating, OR a hit the invariant governs but the issue's Goal or file set does not cover, write the verdict to this file instead, even when every written criterion is satisfied: a first line 'Review: FAIL', then at most 4 more lines, one per uncovered or violating hit or unmet criterion, each as 'file:line - what is wrong'. No headings, no tables.",
         "     {{workdir}}/{{review_fail_marker}}",
-        "9. Write to EXACTLY ONE of those two files. Do not write YouTrack comments, do not set any field, do not touch the tracker at all: this session reports only through the marker file, which the runner posts verbatim.",
+        "10. Write to EXACTLY ONE of the two marker files above, after writing the evidence file from step 7. Do not write YouTrack comments, do not set any field, do not touch the tracker at all: this session reports only through the marker file, which the runner posts capped to 5 bullets with the evidence file linked.",
     ]
     .join("\n")
 }
 
 /// Build the review session's instruction text for `job`, substituting the
-/// same `{{...}}` placeholders [`build_prompt`] uses.
-fn build_review_prompt(job: &YoutrackJob, workdir: &Path) -> String {
+/// same `{{...}}` placeholders [`build_prompt`] uses, plus `evidence_path`
+/// (SPEC-3.16 item 2) as `{{review_evidence_file}}`.
+fn build_review_prompt(job: &YoutrackJob, workdir: &Path, evidence_path: &Path) -> String {
+    let template = default_review_prompt().replace(
+        "{{review_evidence_file}}",
+        &evidence_path.display().to_string(),
+    );
     render_prompt_template(
-        &default_review_prompt(),
+        &template,
         job,
         workdir,
         Duration::from_secs(0),
@@ -3069,6 +3107,10 @@ fn run_review_session(
     workdir: &Path,
     timeout: Duration,
     stream_log: &Path,
+    // SPEC-3.16 item 2: where the review session writes its full sweep
+    // (invariant, search pattern, classified table), kept out of the capped
+    // verdict marker and linked from the posted comment instead.
+    evidence_path: &Path,
     cancel: &CancellationToken,
     budget_usd: Option<f64>,
     // SPEC-3.10 item 3: the review session is a `claude` child spawned for
@@ -3083,7 +3125,7 @@ fn run_review_session(
     let before_sha = git_head_sha(workdir);
     let mut review_cfg = claude_cfg.clone();
     review_cfg.allowed_tools = Some("Read,Glob,Grep,Bash".to_string());
-    let prompt = build_review_prompt(job, workdir);
+    let prompt = build_review_prompt(job, workdir, evidence_path);
 
     let invoke_result = claude.invoke(
         &prompt,
@@ -3282,6 +3324,8 @@ fn run_review_session_with_retry(
     timeout: Duration,
     stream_log: &Path,
     retry_stream_log: &Path,
+    evidence_path: &Path,
+    retry_evidence_path: &Path,
     cancel: &CancellationToken,
     budget_usd: Option<f64>,
     cargo_target_dir: Option<&Path>,
@@ -3294,6 +3338,7 @@ fn run_review_session_with_retry(
         workdir,
         timeout,
         stream_log,
+        evidence_path,
         cancel,
         budget_usd,
         cargo_target_dir,
@@ -3316,6 +3361,7 @@ fn run_review_session_with_retry(
         workdir,
         timeout,
         retry_stream_log,
+        retry_evidence_path,
         cancel,
         budget_usd,
         cargo_target_dir,
@@ -3327,6 +3373,102 @@ fn run_review_session_with_retry(
         passed_or_failed => passed_or_failed,
     };
     (combined, vec![result, second_result])
+}
+
+/// SPEC-3.16 item 2: the evidence-file link text appended to a capped
+/// verdict, built with the same `public_url`-aware degradation
+/// [`crate::run_footer::render`] uses for its `Run:` line, so a reader
+/// without `CLAUDE_RUN_PUBLIC_URL` set still learns where to look.
+fn review_evidence_link_text(
+    public_url: Option<&str>,
+    run_id: i64,
+    key: &str,
+    attempt: u32,
+) -> String {
+    match public_url {
+        Some(base) => {
+            let base = base.trim_end_matches('/');
+            format!("{base}/runs/{run_id}/jobs/{key}/attempt/{attempt}/review-evidence")
+        }
+        None => format!(
+            "link unavailable (CLAUDE_RUN_PUBLIC_URL is not set); run {run_id}, attempt {attempt}, evidence file"
+        ),
+    }
+}
+
+/// SPEC-3.16 item 1: cap a verdict marker's bullets at 5 so a posted comment
+/// stays short. `text` is the raw marker content: a `Review: PASS`/`Review:
+/// FAIL` header line, then zero or more `file:line - ...` bullets. The
+/// evidence link (when `Some`) counts as one of the 5 bullets, so at most 4
+/// finding bullets are kept alongside it; when a bullet is dropped, the final
+/// bullet names how many and links the evidence, and the drop is logged at
+/// `warn` with the issue key so an operator can find the full sweep.
+fn cap_verdict_bullets(text: &str, key: &str, evidence_link: Option<&str>) -> String {
+    const MAX_BULLETS: usize = 5;
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let header = lines.next().unwrap_or_default().to_string();
+    let findings: Vec<&str> = lines.collect();
+
+    // One slot is reserved for the evidence-link bullet when there is one,
+    // whether or not the findings themselves overflow the cap.
+    let finding_budget = if evidence_link.is_some() {
+        MAX_BULLETS - 1
+    } else {
+        MAX_BULLETS
+    };
+
+    let bullets: Vec<String> = if findings.len() > finding_budget {
+        let dropped = findings.len() - (finding_budget - 1);
+        warn!(
+            key = %key,
+            dropped = dropped,
+            total = findings.len(),
+            "verdict marker exceeded the 5-bullet cap; truncating and linking the evidence file (SPEC-3.16)"
+        );
+        let mut kept: Vec<String> = findings[..finding_budget - 1]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        let link_suffix = evidence_link
+            .map(|link| format!("; see {link}"))
+            .unwrap_or_default();
+        kept.push(format!("{dropped} more finding(s) dropped{link_suffix}"));
+        kept
+    } else {
+        let mut kept: Vec<String> = findings.iter().map(|l| l.to_string()).collect();
+        if let Some(link) = evidence_link {
+            kept.push(format!("full sweep: {link}"));
+        }
+        kept
+    };
+
+    let mut out = header;
+    for bullet in bullets {
+        out.push('\n');
+        out.push_str(&bullet);
+    }
+    out
+}
+
+/// SPEC-3.16 items 1 and 2: apply [`cap_verdict_bullets`] to a review
+/// outcome's text before it reaches [`finalize`], so the posted comment is
+/// always capped regardless of what the review session wrote. `NoVerdict`
+/// passes through unchanged: it carries the runner's own short diagnostic
+/// message, not a session-written sweep.
+fn cap_verdict_outcome(
+    outcome: ReviewOutcome,
+    key: &str,
+    evidence_link: Option<&str>,
+) -> ReviewOutcome {
+    match outcome {
+        ReviewOutcome::Pass(text) => {
+            ReviewOutcome::Pass(cap_verdict_bullets(&text, key, evidence_link))
+        }
+        ReviewOutcome::Fail(text) => {
+            ReviewOutcome::Fail(cap_verdict_bullets(&text, key, evidence_link))
+        }
+        no_verdict => no_verdict,
+    }
 }
 
 /// Outcome of [`finalize`]: which AI Agent transition was applied. Carried into
@@ -15160,6 +15302,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15192,6 +15335,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15221,6 +15365,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15251,6 +15396,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15279,6 +15425,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(1),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15313,6 +15460,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15343,6 +15491,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
@@ -15381,6 +15530,8 @@ mod tests {
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
             &scratch.path().join("stream-retry.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &scratch.path().join("evidence-retry.md"),
             &cancel,
             None,
             None,
@@ -15427,6 +15578,8 @@ mod tests {
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
             &scratch.path().join("stream-retry.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &scratch.path().join("evidence-retry.md"),
             &cancel,
             None,
             None,
@@ -15466,6 +15619,8 @@ mod tests {
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
             &scratch.path().join("stream-retry.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &scratch.path().join("evidence-retry.md"),
             &cancel,
             None,
             None,
@@ -15514,6 +15669,8 @@ mod tests {
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
             &scratch.path().join("stream-retry.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &scratch.path().join("evidence-retry.md"),
             &cancel,
             None,
             None,
@@ -15554,6 +15711,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &stream_log,
+            &scratch.path().join("evidence.md"),
             &cancel,
             Some(2.5),
             None,
@@ -15582,7 +15740,9 @@ mod tests {
     #[test]
     fn build_review_prompt_resolves_placeholders_and_keeps_markers_and_read_only_constraint() {
         let dir = tempfile::tempdir().unwrap();
-        let prompt = build_review_prompt(&job(), dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let evidence_path = scratch.path().join("evidence.md");
+        let prompt = build_review_prompt(&job(), dir.path(), &evidence_path);
         assert!(
             !prompt.contains("{{") && !prompt.contains("}}"),
             "every placeholder must resolve, got:\n{prompt}"
@@ -15592,6 +15752,28 @@ mod tests {
         assert!(prompt.contains(REVIEW_PASS_MARKER));
         assert!(prompt.contains(REVIEW_FAIL_MARKER));
         assert!(prompt.contains("no Edit, no Write"));
+    }
+
+    /// SPEC-3.16 item 2: the prompt tells the session to write its full
+    /// sweep to the evidence file and keep the marker itself to bullets.
+    #[test]
+    fn build_review_prompt_names_the_evidence_file_and_caps_the_marker_to_bullets() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let evidence_path = scratch.path().join("evidence.md");
+        let prompt = build_review_prompt(&job(), dir.path(), &evidence_path);
+        assert!(
+            prompt.contains(&evidence_path.display().to_string()),
+            "the prompt must name the evidence file path, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Review: PASS") && prompt.contains("Review: FAIL"),
+            "the marker format must be a short PASS/FAIL header, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("No headings, no tables"),
+            "the marker must be told to stay to bullets, not a restated sweep, got:\n{prompt}"
+        );
     }
 
     /// CLAUDE-471 criterion: a fail marker written alongside all-satisfied
@@ -15619,6 +15801,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
             &cancel,
             None,
             None,
