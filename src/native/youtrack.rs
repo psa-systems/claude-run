@@ -3244,6 +3244,11 @@ pub(crate) enum DeliveryBlockedReason {
     /// A successful agent run reached the PR-open step with no commits
     /// ahead of the base branch, so there is nothing to open a PR from.
     NoCommitsAhead,
+    /// CLAUDE-550: the PR has a real merge conflict with its base and the
+    /// automerge conflict auto-resolve (CLAUDE-380) used every one of its
+    /// `agent_conflict_resolve_attempts` without clearing it; the webhook
+    /// path drives this outcome rather than `finalize`.
+    UnresolvedConflicts,
 }
 
 impl DeliveryBlockedReason {
@@ -3254,6 +3259,7 @@ impl DeliveryBlockedReason {
             DeliveryBlockedReason::CiFixCeiling => "ci-fix-ceiling",
             DeliveryBlockedReason::ReviewModifiedWorkdir => "review-modified-workdir",
             DeliveryBlockedReason::NoCommitsAhead => "no-commits-ahead",
+            DeliveryBlockedReason::UnresolvedConflicts => "unresolved-conflicts",
         }
     }
 
@@ -3274,6 +3280,9 @@ impl DeliveryBlockedReason {
             }
             DeliveryBlockedReason::NoCommitsAhead => {
                 "Claude AI agent run DELIVERY BLOCKED: the agent's run ended with no commits ahead of the base, so no PR could be opened."
+            }
+            DeliveryBlockedReason::UnresolvedConflicts => {
+                "Claude AI agent run DELIVERY BLOCKED: the PR has merge conflicts with its base that the runner's conflict auto-resolve attempts could not clear."
             }
         }
     }
@@ -4308,13 +4317,15 @@ pub(crate) fn automerge_update_failed_comment(pr_url: &str, error: &str) -> Stri
 /// commit; a second failure for the SAME head commit falls back to that
 /// comment instead, since the auto-resolve attempt already ran and did not
 /// resolve it.
-pub(crate) fn automerge_conflict_resolving_comment(pr_url: &str) -> String {
+pub(crate) fn automerge_conflict_resolving_comment(pr_url: &str, attempt: i64, cap: u32) -> String {
     [
         "This PR's branch is behind its base, and updating it hit a merge conflict.".to_string(),
         String::new(),
         format!("PR: {pr_url}"),
         String::new(),
-        "The runner is attempting to resolve the conflict automatically.".to_string(),
+        format!(
+            "The runner is attempting to resolve the conflict automatically (attempt {attempt} of {cap})."
+        ),
     ]
     .join("\n")
 }
@@ -5174,6 +5185,9 @@ pub(crate) fn delivery_blocked_comment(
         }
         DeliveryBlockedReason::NoCommitsAhead => {
             "- The agent reached its stop condition with no code change; close the issue if intentional, otherwise re-queue it (set AI Agent = Queued) with clearer intent."
+        }
+        DeliveryBlockedReason::UnresolvedConflicts => {
+            "- Merge the base branch into the PR branch and resolve the conflicts by hand, or close the PR and re-queue the issue (set AI Agent = Queued) to redo the work on the current base."
         }
     };
     lines.push(follow_up.to_string());
@@ -6961,6 +6975,7 @@ mod tests {
             DeliveryBlockedReason::CiFixCeiling,
             DeliveryBlockedReason::ReviewModifiedWorkdir,
             DeliveryBlockedReason::NoCommitsAhead,
+            DeliveryBlockedReason::UnresolvedConflicts,
         ] {
             let body = delivery_blocked_comment(reason, None);
             assert!(

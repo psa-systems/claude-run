@@ -351,15 +351,18 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
 - Automerge separates a behind-base PR (its branch is simply behind its base, `behind_base: true`) from a real
   conflict: a green, behind-base PR is updated through the forge's update-branch endpoint, which retriggers CI, and a
   later success event re-evaluates and merges once that run goes green; a PR whose checks are green but the forge
-  still reports it not mergeable (`mergeable: false`) gets the same one `/claude` conflict-resolution run per PR head
-  commit on its first attempt, as does a non-WIP runner PR whose checks failed and that reports `mergeable: false`;
-  a second pass for the same head commit leaves a green PR at Code Review for a human, as is a merge call that
-  fails after the mergeable check passed. A Forgejo WIP PR reports `mergeable: false` whether or not it conflicts,
+  still reports it not mergeable (`mergeable: false`) gets a `/claude` conflict-resolution run, as does a non-WIP
+  runner PR whose checks failed and that reports `mergeable: false`; a PR with no run to send is left at Code Review
+  for a human, as is a merge call that fails after the mergeable check passed. A Forgejo WIP PR reports `mergeable: false` whether or not it conflicts,
   so it is not routed until `fj` reports a conflict field (FJ-124, CLAUDE-572). The conflict run clones the head
   branch with the base branch's full history, so the merge base is present. When the behind-base update
-  itself fails because of a merge conflict, the runner dispatches one `/claude` conflict-resolution run instead of
-  leaving it to a human on the first attempt per PR head commit; a second failure for the same head commit falls
-  back to leaving it at Code Review. When the forge reports no `behind_base` at all, automerge takes no merge action:
+  itself fails because of a merge conflict, the runner dispatches the same `/claude` conflict-resolution run instead
+  of leaving it to a human. Conflict-resolution runs are bounded per PR, not per head commit (CLAUDE-550): at most
+  `webhook_comment.agent_conflict_resolve_attempts` (default 2) across the PR's life, one at a time (a dispatched run
+  blocks the next until it finishes or its stamp is older than the listener's timeout plus 900 seconds). A resolve
+  run never pushes a file the merge left unmerged or that still carries a conflict marker. Once every attempt is
+  spent and the PR still conflicts, the issue gets one delivery-blocked comment (reason `unresolved-conflicts`)
+  naming the files the last attempt could not resolve, and AI Agent moves to the action's delivery-blocked label. When the forge reports no `behind_base` at all, automerge takes no merge action:
   on Forgejo this means the runtime's `fj` predates FJ-99 and a human must act; on GitHub, `mergeStateStatus` is
   still `UNKNOWN` (computed lazily after a push) and the reconciler re-checks on its next pass. Each of these
   outcomes posts one comment naming the reason. The behind-base update runs only when the repo is below the
@@ -494,7 +497,8 @@ Hybrid: a cheap deterministic pass runs first and only the residue it cannot lab
 - Start notice: the run posts the `SPEC-3.13` start comment on the PR or issue before it clones, mentioning the
   commenter, and every rejection is posted as a comment naming the reason.
 - Throttling: synthetic action `webhook-comment` with `max_runs_per_day` (20); session timeout
-  `claude_timeout_seconds` (600).
+  `claude_timeout_seconds` (600); automerge conflict-resolution runs per agent PR
+  `agent_conflict_resolve_attempts` (2, CLAUDE-550).
 
 ### 3.7 Pause, cancel and readiness
 

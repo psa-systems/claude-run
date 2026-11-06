@@ -493,6 +493,15 @@ pub struct CommentWebhookConfig {
     /// `RunnerDefaults::claude_timeout_seconds`. Must be at least 1 (validated
     /// in `src/settings.rs`); default 600 matches the prior hard-coded value.
     pub claude_timeout_seconds: u32,
+    /// CLAUDE-550: how many automerge conflict auto-resolve runs (CLAUDE-380)
+    /// one agent PR gets, across head commits, before the runner stops
+    /// dispatching and parks its issue as delivery-blocked
+    /// (`UnresolvedConflicts`), naming the files the last attempt could not
+    /// resolve. Matched against `agent_pull_requests.conflict_resolve_attempts`.
+    /// Lives here because the resolve run is served by this listener and only
+    /// exists when it is configured. Must be at least 1 (validated in
+    /// `src/settings.rs`); default 2.
+    pub agent_conflict_resolve_attempts: u32,
 }
 
 impl Default for CommentWebhookConfig {
@@ -504,6 +513,7 @@ impl Default for CommentWebhookConfig {
             sources: BTreeMap::new(),
             max_runs_per_day: 20,
             claude_timeout_seconds: 600,
+            agent_conflict_resolve_attempts: 2,
         }
     }
 }

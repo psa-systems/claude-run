@@ -4574,7 +4574,8 @@ fn resolve_forge(
 /// when `outcome` differs from that previous message: an unchanged outcome
 /// across reconciler ticks is recorded every pass but commented once, while
 /// a changed outcome (a different error text, or a different outcome
-/// entirely) posts again.
+/// entirely) posts again. Returns whether this call posted, i.e. whether the
+/// outcome changed.
 /// The PR and issue a [`record_automerge_outcome_and_comment_once`] call
 /// concerns; bundled to keep that function's argument count down.
 struct AutomergePr<'a> {
@@ -4592,7 +4593,7 @@ async fn record_automerge_outcome_and_comment_once(
     outcome: String,
     body: String,
     comment_context: &str,
-) {
+) -> bool {
     let prefix = format!("PR {}#{}: ", pr.repo, pr.pr_number);
     let msg = format!("{prefix}{outcome}");
     let previous = state::run_events_last_message_containing(pool, WEBHOOK_MINT_ACTION, &prefix)
@@ -4602,7 +4603,8 @@ async fn record_automerge_outcome_and_comment_once(
             None
         });
     record_run_event(pool, None, WEBHOOK_MINT_ACTION, level, msg.clone()).await;
-    if previous.as_deref() != Some(msg.as_str()) {
+    let changed = previous.as_deref() != Some(msg.as_str());
+    if changed {
         post_issue_comment(
             mint,
             pr.issue_key,
@@ -4613,16 +4615,20 @@ async fn record_automerge_outcome_and_comment_once(
         )
         .await;
     }
+    changed
 }
 
 /// SPEC-4.4.3: deterministic synthetic comment id for a conflict auto-resolve dispatch, used to dedupe the dispatch itself.
-/// `hash(repo, pr_number, head_sha)`, forced negative so it never collides
-/// with a real (positive) Forgejo comment id in the dedupe / attempt key
-/// [`crate::web::comment_webhooks::command_key`] both routes share. Clearing
-/// the digest's top bit before negating keeps the result in `i64`'s range
+/// `hash(repo, pr_number, head_sha, attempt)`, forced negative so it never
+/// collides with a real (positive) Forgejo comment id in the dedupe / attempt
+/// key [`crate::web::comment_webhooks::command_key`] both routes share.
+/// `attempt` (CLAUDE-550) is the PR's 1-based resolve attempt, so a second
+/// attempt on an unchanged head commit (the first one pushed nothing) gets
+/// its own key instead of being refused as a redelivery. Clearing the
+/// digest's top bit before negating keeps the result in `i64`'s range
 /// without risking the `i64::MIN` overflow a naive negation of an arbitrary
 /// `u64` could hit.
-fn synthetic_conflict_comment_id(repo: &str, pr_number: u64, head_sha: &str) -> i64 {
+fn synthetic_conflict_comment_id(repo: &str, pr_number: u64, head_sha: &str, attempt: i64) -> i64 {
     let mut h = Sha256::new();
     h.update(b"automerge-conflict-resolve\0");
     h.update(repo.as_bytes());
@@ -4630,6 +4636,8 @@ fn synthetic_conflict_comment_id(repo: &str, pr_number: u64, head_sha: &str) -> 
     h.update(pr_number.to_string().as_bytes());
     h.update(b"\0");
     h.update(head_sha.as_bytes());
+    h.update(b"\0");
+    h.update(attempt.to_string().as_bytes());
     let digest = h.finalize();
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);
@@ -4640,14 +4648,10 @@ fn synthetic_conflict_comment_id(repo: &str, pr_number: u64, head_sha: &str) -> 
 /// SPEC-4.4.3: on an automerge conflict (`update_pr_branch` failure), dispatches a synthetic `/claude`-equivalent command to the comment listener instead of leaving a "needs a human" comment, when a [`MintContext::comment_dispatch`] handle is configured.
 /// On a conflict `update_pr_branch` failure, dispatch the same
 /// conflict-resolution run a human's `/claude merge from main and resolve any
-/// merge conflicts` PR comment would start (CLAUDE-380), at most once per
-/// `(repo, pr_number, head_sha)`. Returns `true` when a synthetic command was
-/// just sent (the caller posts the "resolving" comment instead of "a human
-/// needs to resolve this"); `false` for every case that keeps today's
-/// behavior: a non-conflict error, an unknown `head_sha`, no sender wired, no
-/// comment-webhook source covering `repo`, an attempt already made for this
-/// head commit, or a failed send (logged at `error` with a `run_events` row,
-/// never swallowed).
+/// merge conflicts` PR comment would start (CLAUDE-380), when the forge error
+/// says it is a conflict. See [`dispatch_conflict_auto_resolve`] for the
+/// per-PR bound (CLAUDE-550); a non-conflict error is
+/// [`ConflictDispatch::Skipped`] and keeps the human comment.
 #[allow(clippy::too_many_arguments)]
 async fn try_dispatch_conflict_auto_resolve(
     mint: &MintContext,
@@ -4656,34 +4660,64 @@ async fn try_dispatch_conflict_auto_resolve(
     repo: &str,
     pr_number: u64,
     pr_url: &str,
-    issue_key: &str,
+    row: &ci_failure_store::AgentPullRequest,
     error_msg: &str,
     head_sha: Option<&str>,
-) -> bool {
+) -> ConflictDispatch {
     if !error_msg.to_ascii_lowercase().contains("conflict") {
-        return false;
+        return ConflictDispatch::Skipped;
     }
-    matches!(
-        dispatch_conflict_auto_resolve(
-            mint, pool, host, repo, pr_number, pr_url, issue_key, head_sha
-        )
-        .await,
-        ConflictDispatch::Dispatched
-    )
+    dispatch_conflict_auto_resolve(mint, pool, host, repo, pr_number, pr_url, row, head_sha).await
 }
 
-/// What [`dispatch_conflict_auto_resolve`] did, so a caller can tell "a run
-/// was just sent" from "this head commit already had its one attempt" (CLAUDE-547).
+/// What [`dispatch_conflict_auto_resolve`] did (CLAUDE-547, bounded per PR by
+/// CLAUDE-550).
 #[derive(Debug, PartialEq, Eq)]
 enum ConflictDispatch {
-    Dispatched,
+    /// A resolve run was sent: attempt `attempt` of `cap` for this PR.
+    Dispatched { attempt: i64, cap: u32 },
+    /// This exact attempt's command key was already used.
     AlreadyAttempted,
+    /// An earlier resolve run for this PR is still within its time window;
+    /// nothing was sent and nothing should be commented.
+    InFlight,
+    /// The PR used every attempt and still conflicts: park it
+    /// delivery-blocked (`UnresolvedConflicts`).
+    CapReached { attempts: i64, cap: u32 },
+    /// A precondition failed (unknown head commit, no comment listener or
+    /// source for the repo, or the send failed), already logged.
     Skipped,
 }
 
+/// CLAUDE-550: how long past the comment listener's own `claude` timeout a
+/// dispatched conflict auto-resolve run still counts as in flight. Covers the
+/// clone, the decision gate and the push around the session; a stamp older
+/// than timeout plus this margin belongs to a run that was dropped (busy
+/// thread, daily cap, a daemon restart) and no longer blocks the next attempt.
+const CONFLICT_RESOLVE_IN_FLIGHT_MARGIN_SECS: i64 = 900;
+
+/// CLAUDE-550: whether `started_at` (an RFC 3339 `now_iso` stamp) is still
+/// within `window_secs` of now. An unparseable stamp is treated as stale so a
+/// bad value can never block auto-resolve forever.
+fn conflict_resolve_in_flight(started_at: Option<&str>, window_secs: i64) -> bool {
+    let Some(raw) = started_at else {
+        return false;
+    };
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(at) => (chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds() < window_secs,
+        Err(_) => false,
+    }
+}
+
 /// The dispatch half of [`try_dispatch_conflict_auto_resolve`], for a caller
-/// that already knows the PR conflicts. At most one run per
-/// `(repo, pr_number, head_sha)`.
+/// that already knows the PR conflicts. CLAUDE-550 bounds it per PR rather
+/// than per head commit: at most
+/// `webhook_comment.agent_conflict_resolve_attempts` runs across the PR's
+/// life (counted on `row.conflict_resolve_attempts`), never two at once (an
+/// unfinished run's `conflict_resolve_started_at` stamp reads
+/// [`ConflictDispatch::InFlight`] until the comment run clears it or it goes
+/// stale), and once the attempts are spent a still-conflicting PR reads
+/// [`ConflictDispatch::CapReached`] instead of dispatching again.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_conflict_auto_resolve(
     mint: &MintContext,
@@ -4692,21 +4726,28 @@ async fn dispatch_conflict_auto_resolve(
     repo: &str,
     pr_number: u64,
     pr_url: &str,
-    issue_key: &str,
+    row: &ci_failure_store::AgentPullRequest,
     head_sha: Option<&str>,
 ) -> ConflictDispatch {
+    let issue_key = row.issue_key.as_str();
     let Some(head_sha) = head_sha else {
         return ConflictDispatch::Skipped;
     };
     let Some(dispatch) = &mint.comment_dispatch else {
         return ConflictDispatch::Skipped;
     };
-    let source = {
+    let (source, cap, timeout_secs) = {
         let cfg = dispatch.cfg.read().await;
-        cfg.sources
+        let source = cfg
+            .sources
             .iter()
             .find(|(_, src)| repo_allowed(&src.allowed_repos, repo))
-            .map(|(name, _)| name.clone())
+            .map(|(name, _)| name.clone());
+        (
+            source,
+            cfg.agent_conflict_resolve_attempts.max(1),
+            i64::from(cfg.claude_timeout_seconds),
+        )
     };
     let Some(source) = source else {
         error!(repo = %repo, pr = pr_number, "automerge conflict auto-resolve: no comment webhook source covers this repo; falling back to the human comment");
@@ -4720,17 +4761,30 @@ async fn dispatch_conflict_auto_resolve(
         .await;
         return ConflictDispatch::Skipped;
     };
-    let comment_id = synthetic_conflict_comment_id(repo, pr_number, head_sha);
+    if conflict_resolve_in_flight(
+        row.conflict_resolve_started_at.as_deref(),
+        timeout_secs + CONFLICT_RESOLVE_IN_FLIGHT_MARGIN_SECS,
+    ) {
+        info!(repo = %repo, pr = pr_number, issue = %issue_key, "automerge conflict auto-resolve: an earlier attempt is still in flight; waiting for it");
+        return ConflictDispatch::InFlight;
+    }
+    let attempts = row.conflict_resolve_attempts;
+    if attempts >= i64::from(cap) {
+        warn!(repo = %repo, pr = pr_number, issue = %issue_key, attempts, cap, "automerge conflict auto-resolve: attempt cap reached; parking the PR delivery-blocked");
+        return ConflictDispatch::CapReached { attempts, cap };
+    }
+    let attempt = attempts + 1;
+    let comment_id = synthetic_conflict_comment_id(repo, pr_number, head_sha, attempt);
     let key = crate::web::comment_webhooks::command_key(repo, pr_number, comment_id);
-    let attempts = state::attempts_get(
+    let already = state::attempts_get(
         pool,
         crate::web::comment_webhooks::WEBHOOK_COMMENT_ACTION,
         &key,
     )
     .await
     .unwrap_or(0);
-    if attempts > 0 {
-        info!(repo = %repo, pr = pr_number, head_sha, "automerge conflict auto-resolve: already attempted for this head commit; falling back to the human comment");
+    if already > 0 {
+        info!(repo = %repo, pr = pr_number, head_sha, attempt, "automerge conflict auto-resolve: this attempt was already sent; falling back to the human comment");
         return ConflictDispatch::AlreadyAttempted;
     }
     let author = mint
@@ -4750,9 +4804,7 @@ async fn dispatch_conflict_auto_resolve(
         comment_id,
         author,
         kind: crate::web::comment_webhooks::CommandKind::Run {
-            instruction:
-                "merge the base branch into this PR's branch and resolve any merge conflicts"
-                    .to_string(),
+            instruction: crate::web::comment_webhooks::CONFLICT_RESOLVE_INSTRUCTION.to_string(),
         },
         html_url: pr_url.to_string(),
         title: String::new(),
@@ -4760,16 +4812,24 @@ async fn dispatch_conflict_auto_resolve(
     };
     match dispatch.tx.send(cmd).await {
         Ok(()) => {
-            info!(repo = %repo, pr = pr_number, issue = %issue_key, head_sha, "automerge conflict auto-resolve: dispatched");
+            // Recorded after the send: a failed send must not spend an attempt.
+            if let Err(e) =
+                ci_failure_store::begin_conflict_resolve(pool, row.id, &state::now_iso()).await
+            {
+                error!(repo = %repo, pr = pr_number, issue = %issue_key, error = %e, "automerge conflict auto-resolve: recording the attempt failed; the cap cannot count it");
+            }
+            info!(repo = %repo, pr = pr_number, issue = %issue_key, head_sha, attempt, cap, "automerge conflict auto-resolve: dispatched");
             record_run_event(
                 pool,
                 None,
                 WEBHOOK_MINT_ACTION,
                 "info",
-                format!("PR {repo}#{pr_number}: conflict auto-resolve dispatched"),
+                format!(
+                    "PR {repo}#{pr_number}: conflict auto-resolve dispatched (attempt {attempt} of {cap})"
+                ),
             )
             .await;
-            ConflictDispatch::Dispatched
+            ConflictDispatch::Dispatched { attempt, cap }
         }
         Err(e) => {
             error!(repo = %repo, pr = pr_number, issue = %issue_key, error = %e, "automerge conflict auto-resolve: dispatch send failed; falling back to the human comment");
@@ -4789,10 +4849,14 @@ async fn dispatch_conflict_auto_resolve(
 /// How [`route_conflicting_pr`] handled a PR that reports `mergeable: false`.
 #[derive(Debug, PartialEq, Eq)]
 enum ConflictRoute {
-    /// A resolution run was just dispatched.
-    Dispatched,
-    /// The head commit already had its one attempt.
+    /// A resolution run was just dispatched: attempt `attempt` of `cap`.
+    Dispatched { attempt: i64, cap: u32 },
+    /// This attempt's command key was already used.
     AlreadyAttempted,
+    /// CLAUDE-550: an earlier resolution run is still in flight.
+    InFlight,
+    /// CLAUDE-550: every attempt is spent; park the PR delivery-blocked.
+    CapReached { attempts: i64, cap: u32 },
     /// The CLAUDE-535 per-repo cap defers the push; the next pass asks again.
     Deferred(String),
     /// Not a PR this routes: no conflict verdict, or a WIP/draft Forgejo PR.
@@ -4880,16 +4944,20 @@ async fn route_conflicting_pr(
         repo,
         pr_number,
         pr_url,
-        &row.issue_key,
+        row,
         status.head_sha.as_deref(),
     )
     .await;
     Ok(match result {
-        ConflictDispatch::Dispatched => {
+        ConflictDispatch::Dispatched { attempt, cap } => {
             mint.ci_update_holders.set(host, repo, pr_number as i64);
-            ConflictRoute::Dispatched
+            ConflictRoute::Dispatched { attempt, cap }
         }
         ConflictDispatch::AlreadyAttempted => ConflictRoute::AlreadyAttempted,
+        ConflictDispatch::InFlight => ConflictRoute::InFlight,
+        ConflictDispatch::CapReached { attempts, cap } => {
+            ConflictRoute::CapReached { attempts, cap }
+        }
         ConflictDispatch::Skipped => ConflictRoute::Skipped,
     })
 }
@@ -5189,39 +5257,58 @@ async fn apply_automerge_decision(
                     }
                     Err(e) => {
                         let msg = format!("update_pr_branch failed: {e}");
-                        let dispatched = try_dispatch_conflict_auto_resolve(
+                        let resolve = try_dispatch_conflict_auto_resolve(
                             mint,
                             pool,
                             host,
                             repo,
                             pr_number,
                             pr_url,
-                            &row.issue_key,
+                            row,
                             &msg,
                             status.head_sha.as_deref(),
                         )
                         .await;
                         // The dedupe key below is the comment-once guard's
-                        // identity for "this outcome"; folding `dispatched`
-                        // into it (rather than just `msg`) means the fallback
-                        // comment still posts the first time the conflict
-                        // auto-resolve attempt has already run and failed,
-                        // even though the underlying forge error text is
-                        // unchanged from the first, dispatching, failure.
-                        let (body, outcome) = if dispatched {
-                            (
-                                crate::native::youtrack::automerge_conflict_resolving_comment(
+                        // identity for "this outcome"; folding the dispatch
+                        // result (and its attempt number) into it rather
+                        // than just `msg` means each attempt, the fallback
+                        // and the cap each comment once, even though the
+                        // underlying forge error text never changes.
+                        let (body, outcome) = match resolve {
+                            ConflictDispatch::InFlight => {
+                                return Ok(AutomergeOutcome::NoAction(format!(
+                                    "PR #{pr_number} has merge conflicts; a conflict auto-resolve run is already in flight"
+                                )));
+                            }
+                            ConflictDispatch::CapReached { attempts, cap } => {
+                                return park_unresolved_conflicts(
+                                    mint,
+                                    pool,
+                                    row,
+                                    repo,
+                                    pr_number,
                                     pr_url,
+                                    &youtrack_cfg,
+                                    attempts,
+                                    cap,
+                                )
+                                .await;
+                            }
+                            ConflictDispatch::Dispatched { attempt, cap } => (
+                                crate::native::youtrack::automerge_conflict_resolving_comment(
+                                    pr_url, attempt, cap,
                                 ),
-                                format!("{msg} (conflict auto-resolve dispatched)"),
-                            )
-                        } else {
-                            (
+                                format!(
+                                    "{msg} (conflict auto-resolve dispatched, attempt {attempt} of {cap})"
+                                ),
+                            ),
+                            ConflictDispatch::AlreadyAttempted | ConflictDispatch::Skipped => (
                                 crate::native::youtrack::automerge_update_failed_comment(
                                     pr_url, &msg,
                                 ),
                                 msg.clone(),
-                            )
+                            ),
                         };
                         record_automerge_outcome_and_comment_once(
                             mint,
@@ -5257,9 +5344,10 @@ async fn apply_automerge_decision(
                 )
                 .await?;
                 match route {
-                    ConflictRoute::Dispatched => {
-                        let body =
-                            crate::native::youtrack::automerge_conflict_resolving_comment(pr_url);
+                    ConflictRoute::Dispatched { attempt, cap } => {
+                        let body = crate::native::youtrack::automerge_conflict_resolving_comment(
+                            pr_url, attempt, cap,
+                        );
                         record_automerge_outcome_and_comment_once(
                             mint,
                             pool,
@@ -5269,7 +5357,9 @@ async fn apply_automerge_decision(
                                 issue_key: &row.issue_key,
                             },
                             "info",
-                            "not mergeable (conflict auto-resolve dispatched)".to_string(),
+                            format!(
+                                "not mergeable (conflict auto-resolve dispatched, attempt {attempt} of {cap})"
+                            ),
                             body,
                             "action-run success: conflict-resolving comment failed",
                         )
@@ -5282,6 +5372,25 @@ async fn apply_automerge_decision(
                         return Ok(AutomergeOutcome::NoAction(format!(
                             "PR #{pr_number} not mergeable; conflict resolution deferred: {reason}"
                         )));
+                    }
+                    ConflictRoute::InFlight => {
+                        return Ok(AutomergeOutcome::NoAction(format!(
+                            "PR #{pr_number} not mergeable; a conflict auto-resolve run is already in flight"
+                        )));
+                    }
+                    ConflictRoute::CapReached { attempts, cap } => {
+                        return park_unresolved_conflicts(
+                            mint,
+                            pool,
+                            row,
+                            repo,
+                            pr_number,
+                            pr_url,
+                            &youtrack_cfg,
+                            attempts,
+                            cap,
+                        )
+                        .await;
                     }
                     ConflictRoute::AlreadyAttempted
                     | ConflictRoute::NotApplicable
@@ -5383,7 +5492,24 @@ async fn apply_automerge_decision(
             )
             .await?;
             match route {
-                ConflictRoute::Dispatched => {
+                ConflictRoute::InFlight => Ok(AutomergeOutcome::NoAction(format!(
+                    "PR #{pr_number} checks failed and it conflicts with base; a conflict auto-resolve run is already in flight"
+                ))),
+                ConflictRoute::CapReached { attempts, cap } => {
+                    park_unresolved_conflicts(
+                        mint,
+                        pool,
+                        row,
+                        repo,
+                        pr_number,
+                        pr_url,
+                        &youtrack_cfg,
+                        attempts,
+                        cap,
+                    )
+                    .await
+                }
+                ConflictRoute::Dispatched { .. } => {
                     info!(repo = %repo, pr = pr_number, "action-run success: red PR conflicts with base; conflict auto-resolve dispatched");
                     Ok(AutomergeOutcome::Acted(format!(
                         "PR #{pr_number} checks failed and it conflicts with base; conflict auto-resolve dispatched"
@@ -5409,6 +5535,89 @@ async fn apply_automerge_decision(
             )))
         }
     }
+}
+
+/// CLAUDE-550: the conflict auto-resolve cap is spent and the PR still
+/// conflicts with its base. Posts the CLAUDE-545 delivery-blocked comment
+/// (`UnresolvedConflicts`), naming the files the last attempt could not
+/// resolve, and moves AI Agent to the action's `delivery_blocked` label
+/// (Needs Review when none is set), both once per unchanged outcome through
+/// [`record_automerge_outcome_and_comment_once`]. Later passes over the same
+/// state are a quiet [`AutomergeOutcome::NoAction`].
+#[allow(clippy::too_many_arguments)]
+async fn park_unresolved_conflicts(
+    mint: &MintContext,
+    pool: &DbPool,
+    row: &ci_failure_store::AgentPullRequest,
+    repo: &str,
+    pr_number: u64,
+    pr_url: &str,
+    youtrack_cfg: &crate::action::YoutrackSource,
+    attempts: i64,
+    cap: u32,
+) -> Result<AutomergeOutcome, String> {
+    let body = unresolved_conflicts_comment(pr_url, &row.conflict_files, attempts, cap);
+    let outcome = format!(
+        "conflict auto-resolve cap reached ({attempts} of {cap} attempts); delivery blocked (unresolved-conflicts)"
+    );
+    let posted = record_automerge_outcome_and_comment_once(
+        mint,
+        pool,
+        AutomergePr {
+            repo,
+            pr_number,
+            issue_key: &row.issue_key,
+        },
+        "warn",
+        outcome.clone(),
+        body,
+        "action-run success: unresolved-conflicts comment failed",
+    )
+    .await;
+    if !posted {
+        return Ok(AutomergeOutcome::NoAction(format!(
+            "PR #{pr_number}: {outcome}; already parked"
+        )));
+    }
+    let backend = mint.backend.clone();
+    let key = row.issue_key.clone();
+    let field = youtrack_cfg.custom_field.clone();
+    let label = youtrack_cfg.states.delivery_blocked_label().to_string();
+    let set = tokio::task::spawn_blocking(move || backend.set_field(&key, &field, &label))
+        .await
+        .map_err(|e| format!("delivery-blocked field write task panicked: {e}"))?;
+    if let Err(e) = set {
+        let msg = format!("PR #{pr_number}: {outcome}; setting the AI Agent field failed: {e}");
+        error!(repo = %repo, pr = pr_number, issue = %row.issue_key, error = %e, "{msg}");
+        return Err(msg);
+    }
+    info!(repo = %repo, pr = pr_number, issue = %row.issue_key, attempts, cap, "conflict auto-resolve cap reached; issue parked delivery-blocked");
+    Ok(AutomergeOutcome::Acted(format!(
+        "PR #{pr_number}: {outcome}"
+    )))
+}
+
+/// CLAUDE-550: the delivery-blocked comment for a PR whose conflicts the
+/// auto-resolve attempts could not clear: the CLAUDE-545 shape, then the
+/// attempt count and the unresolved files (or a note that the last attempt
+/// reported none).
+fn unresolved_conflicts_comment(pr_url: &str, files: &[String], attempts: i64, cap: u32) -> String {
+    let mut body = crate::native::youtrack::delivery_blocked_comment(
+        crate::native::youtrack::DeliveryBlockedReason::UnresolvedConflicts,
+        Some(pr_url),
+    );
+    body.push_str(&format!(
+        "\n- Conflict auto-resolve attempts: {attempts} of {cap} (configured `agent_conflict_resolve_attempts`)"
+    ));
+    if files.is_empty() {
+        body.push_str("\n- The last attempt did not report which files still conflict.");
+    } else {
+        body.push_str("\n- Files the last attempt could not resolve:");
+        for f in files {
+            body.push_str(&format!("\n  - `{f}`"));
+        }
+    }
+    body
 }
 
 /// SPEC-4.4.3: marks an agent PR merged in the `agent_pull_requests` store once automerge lands it.
@@ -14821,8 +15030,27 @@ mod tests {
             .unwrap();
         }
 
+        fn mk16_comments(backend: &StoreBackend) -> Vec<String> {
+            backend
+                .calls()
+                .into_iter()
+                .filter(|c| c.starts_with("comment MK-16"))
+                .collect()
+        }
+
+        async fn row7(pool: &DbPool) -> ci_failure_store::AgentPullRequest {
+            ci_failure_store::agent_pr(pool, "dev.a8n.run", "contoso/claude-run", 7)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        /// CLAUDE-550: one attempt is dispatched, a tick while it is in
+        /// flight sends nothing and says nothing, and once it finishes a
+        /// second attempt goes out even on the same head commit (the first
+        /// one pushed nothing).
         #[tokio::test]
-        async fn conflict_with_a_wired_dispatch_sends_once_per_head_sha_and_allows_a_new_head() {
+        async fn conflict_dispatches_one_attempt_at_a_time_up_to_the_cap() {
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
@@ -14842,252 +15070,142 @@ mod tests {
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path(), Some(dispatch));
             let gate = crate::concurrency::KeyGate::new();
 
-            // Acceptance 1: one reconciler tick for a conflict with a known
-            // head_sha sends exactly one synthetic command, and the issue
-            // comment says the runner is attempting the resolve itself.
             reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
-            let sent = rx.try_recv().expect("expected one dispatched command");
-            assert!(sent.synthetic);
-            assert_eq!(sent.repo, "contoso/claude-run");
-            assert_eq!(sent.number, 7);
+            let first = rx.try_recv().expect("expected one dispatched command");
+            assert!(first.synthetic);
+            assert_eq!(first.repo, "contoso/claude-run");
+            assert_eq!(first.number, 7);
             assert!(
-                sent.comment_id < 0,
+                first.comment_id < 0,
                 "dispatch id must not collide with a real (positive) comment id"
             );
+            match &first.kind {
+                crate::web::comment_webhooks::CommandKind::Run { instruction } => assert_eq!(
+                    instruction,
+                    crate::web::comment_webhooks::CONFLICT_RESOLVE_INSTRUCTION
+                ),
+                other => panic!("expected a Run command, got {other:?}"),
+            }
             assert!(
                 rx.try_recv().is_err(),
                 "only one command should have been sent"
             );
-            let comments = backend
-                .calls()
-                .into_iter()
-                .filter(|c| c.starts_with("comment MK-16"))
-                .collect::<Vec<_>>();
+            let comments = mk16_comments(&backend);
             assert_eq!(comments.len(), 1, "{comments:?}");
-            assert!(
-                comments[0].contains("attempting to resolve the conflict automatically"),
-                "{comments:?}"
-            );
+            assert!(comments[0].contains("(attempt 1 of 2)"), "{comments:?}");
+            let row = row7(&pool).await;
+            assert_eq!(row.conflict_resolve_attempts, 1);
+            assert!(row.conflict_resolve_started_at.is_some());
 
-            // The dispatched command shares the same (repo, pr, comment_id)
-            // attempt counter `serve_command` records once it actually runs
-            // the command; simulate that completed run here rather than
-            // draining the channel through the full comment-webhook pipeline.
-            let key =
-                crate::web::comment_webhooks::command_key("contoso/claude-run", 7, sent.comment_id);
-            state::attempts_increment(
-                &pool,
-                crate::web::comment_webhooks::WEBHOOK_COMMENT_ACTION,
-                &key,
-            )
-            .await
-            .unwrap();
-
-            // Acceptance 1 (continued): a second tick for the SAME head_sha,
-            // once an attempt is recorded for it, sends no further command and
-            // falls back to the human comment.
+            // In flight: no second dispatch, no comment.
             reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
             assert!(
                 rx.try_recv().is_err(),
-                "a second tick for the same head must not dispatch again"
+                "an in-flight attempt must not be doubled"
             );
-            let comments = backend
-                .calls()
-                .into_iter()
-                .filter(|c| c.starts_with("comment MK-16"))
-                .collect::<Vec<_>>();
+            assert_eq!(mk16_comments(&backend).len(), 1);
+
+            // The comment run finished without resolving: the same head
+            // commit gets attempt 2, under its own command key.
+            ci_failure_store::finish_conflict_resolve(
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                &["src/lib.rs".to_string()],
+                &state::now_iso(),
+            )
+            .await
+            .unwrap();
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            let second = rx.try_recv().expect("attempt 2 must be dispatched");
+            assert_ne!(second.comment_id, first.comment_id);
+            let comments = mk16_comments(&backend);
             assert_eq!(comments.len(), 2, "{comments:?}");
-            assert!(
-                comments[1].contains("A human needs to resolve this"),
-                "second failure for the same head must fall back to the human comment: {comments:?}"
-            );
-
-            // Acceptance 2: a new head_sha (after a push) allows one new attempt.
-            *backend.pr_status.lock().unwrap() = Some(crate::provider::PrStatus {
-                state: "success".to_string(),
-                mergeable: Some(false),
-                behind_base: Some(true),
-                head_sha: Some("sha-2".to_string()),
-            });
-            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
-            assert!(
-                rx.try_recv().is_ok(),
-                "a new head commit must get its own dispatch attempt"
-            );
+            assert!(comments[1].contains("(attempt 2 of 2)"), "{comments:?}");
+            assert_eq!(row7(&pool).await.conflict_resolve_attempts, 2);
         }
 
-        fn wired_dispatch() -> (
-            CommentDispatch,
-            mpsc::Receiver<crate::web::comment_webhooks::VerifiedCommentCommand>,
-        ) {
-            let (tx, rx) = mpsc::channel(8);
-            (
-                CommentDispatch {
-                    tx,
-                    cfg: Arc::new(RwLock::new(dispatch_cfg())),
-                },
-                rx,
-            )
-        }
-
-        fn wip_pr(number: u64) -> ForgePullRequest {
-            ForgePullRequest {
-                title: "WIP: feat: x".to_string(),
-                ..pr(number, "")
-            }
-        }
-
-        /// CLAUDE-547: a red, non-draft PR that conflicts with base gets one
-        /// resolution run per head commit; a second tick for the same head
-        /// sends nothing.
+        /// CLAUDE-550: with every attempt spent and the conflict still there,
+        /// the PR is parked delivery-blocked once, naming the stuck files, and
+        /// later passes neither dispatch, comment nor write the field again.
         #[tokio::test]
-        async fn red_conflicting_pr_dispatches_once_per_head_commit() {
+        async fn spent_attempts_park_the_issue_delivery_blocked_naming_the_files() {
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
             seed_open_row(&pool).await;
-            let (dispatch, mut rx) = wired_dispatch();
-            let backend = Arc::new(
-                StoreBackend::new()
-                    .with_open_prs(vec![pr(7, "")])
-                    .with_pr_status_full("failure", Some(false), Some(false), Some("sha-1")),
-            );
-            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path(), Some(dispatch));
-            let gate = crate::concurrency::KeyGate::new();
-
-            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
-            let sent = rx.try_recv().expect("a red conflicting PR dispatches");
-            assert!(sent.synthetic);
-            assert_eq!(sent.number, 7);
-            assert!(rx.try_recv().is_err(), "exactly one command");
-
-            // The run recording its attempt is what dedupes the next tick.
-            let key =
-                crate::web::comment_webhooks::command_key("contoso/claude-run", 7, sent.comment_id);
-            state::attempts_increment(
+            let row = row7(&pool).await;
+            for _ in 0..2 {
+                ci_failure_store::begin_conflict_resolve(&pool, row.id, &state::now_iso())
+                    .await
+                    .unwrap();
+            }
+            ci_failure_store::finish_conflict_resolve(
                 &pool,
-                crate::web::comment_webhooks::WEBHOOK_COMMENT_ACTION,
-                &key,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                &["src/lib.rs".to_string(), "README.md".to_string()],
+                &state::now_iso(),
             )
             .await
             .unwrap();
-            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
-            assert!(
-                rx.try_recv().is_err(),
-                "a second tick for the same head sends nothing"
-            );
-        }
-
-        /// CLAUDE-547: a green PR Forgejo reports as not mergeable gets a
-        /// resolution run on its first attempt instead of the human comment.
-        #[tokio::test]
-        async fn green_not_mergeable_pr_dispatches_instead_of_the_human_comment() {
-            let pool = crate::db::test_pool().await;
-            let dir = tempfile::tempdir().unwrap();
-            write_youtrack_action(dir.path(), "yt", true);
-            seed_open_row(&pool).await;
-            let (dispatch, mut rx) = wired_dispatch();
+            let (tx, mut rx) =
+                mpsc::channel::<crate::web::comment_webhooks::VerifiedCommentCommand>(8);
+            let dispatch = CommentDispatch {
+                tx,
+                cfg: Arc::new(RwLock::new(dispatch_cfg())),
+            };
             let backend = Arc::new(
                 StoreBackend::new()
                     .with_open_prs(vec![pr(7, "")])
-                    .with_pr_status_full("success", Some(false), Some(false), Some("sha-1")),
+                    .with_pr_status_full("success", Some(false), Some(true), Some("sha-3"))
+                    .with_update_pr_branch_error("merge conflict in src/lib.rs"),
             );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path(), Some(dispatch));
             let gate = crate::concurrency::KeyGate::new();
 
-            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
-
-            assert!(rx.try_recv().is_ok(), "the first attempt dispatches");
-            let comments = backend
-                .calls()
-                .into_iter()
-                .filter(|c| c.starts_with("comment MK-16"))
-                .collect::<Vec<_>>();
-            assert_eq!(comments.len(), 1, "{comments:?}");
+            for _ in 0..2 {
+                reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new())
+                    .await;
+            }
+            assert!(rx.try_recv().is_err(), "a spent cap must never dispatch");
+            let comments = mk16_comments(&backend);
+            assert_eq!(comments.len(), 1, "parked exactly once: {comments:?}");
+            assert!(comments[0].contains("DELIVERY BLOCKED"), "{comments:?}");
             assert!(
-                comments[0].contains("attempting to resolve the conflict automatically"),
+                comments[0].contains("`unresolved-conflicts`"),
                 "{comments:?}"
             );
-        }
-
-        /// CLAUDE-547: with no resolution run to send (here, no wired sender)
-        /// the green not-mergeable PR keeps the human comment.
-        #[tokio::test]
-        async fn green_not_mergeable_pr_without_a_sender_keeps_the_human_comment() {
-            let pool = crate::db::test_pool().await;
-            let dir = tempfile::tempdir().unwrap();
-            write_youtrack_action(dir.path(), "yt", true);
-            seed_open_row(&pool).await;
-            let backend = Arc::new(
-                StoreBackend::new()
-                    .with_open_prs(vec![pr(7, "")])
-                    .with_pr_status_full("success", Some(false), Some(false), Some("sha-1")),
-            );
-            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path(), None);
-            let gate = crate::concurrency::KeyGate::new();
-
-            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
-
-            let comments = backend
+            assert!(comments[0].contains("2 of 2"), "{comments:?}");
+            assert!(comments[0].contains("`src/lib.rs`"), "{comments:?}");
+            assert!(comments[0].contains("`README.md`"), "{comments:?}");
+            let field_writes = backend
                 .calls()
                 .into_iter()
-                .filter(|c| c.starts_with("comment MK-16"))
+                .filter(|c| c.starts_with("set_field MK-16"))
                 .collect::<Vec<_>>();
-            assert_eq!(comments.len(), 1, "{comments:?}");
-            assert!(
-                comments[0].contains("A human needs to resolve this"),
-                "{comments:?}"
+            assert_eq!(
+                field_writes,
+                vec!["set_field MK-16 AI Agent Needs Review".to_string()],
+                "AI Agent moves to the delivery-blocked label (Needs Review by default) once"
             );
         }
 
-        /// CLAUDE-547: a Forgejo WIP PR reports `mergeable: false` without a
-        /// conflict verdict, so it is never dispatched (CLAUDE-572 covers it).
-        #[tokio::test]
-        async fn wip_pr_is_not_dispatched() {
-            let pool = crate::db::test_pool().await;
-            let dir = tempfile::tempdir().unwrap();
-            write_youtrack_action(dir.path(), "yt", true);
-            seed_open_row(&pool).await;
-            let (dispatch, mut rx) = wired_dispatch();
-            let backend = Arc::new(
-                StoreBackend::new()
-                    .with_open_prs(vec![wip_pr(7)])
-                    .with_pr_status_full("failure", Some(false), Some(false), Some("sha-1")),
-            );
-            let ctx = ctx_for(pool.clone(), backend, dir.path(), Some(dispatch));
-            let gate = crate::concurrency::KeyGate::new();
-
-            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
-
-            assert!(rx.try_recv().is_err(), "a WIP PR must not dispatch");
-        }
-
-        /// CLAUDE-547 / CLAUDE-535: a dispatch waits while another runner PR's
-        /// CI-triggering push is still pending on the repo.
-        #[tokio::test]
-        async fn dispatch_respects_the_per_repo_ci_cap() {
-            let pool = crate::db::test_pool().await;
-            let dir = tempfile::tempdir().unwrap();
-            write_youtrack_action(dir.path(), "yt", true);
-            seed_open_row(&pool).await;
-            let (dispatch, mut rx) = wired_dispatch();
-            let backend = Arc::new(
-                StoreBackend::new()
-                    .with_open_prs(vec![pr(7, "")])
-                    .with_pr_status_full("failure", Some(false), Some(false), Some("sha-1")),
-            );
-            backend.set_pr_status_for(99, "pending", Some(false));
-            let ctx = ctx_for(pool.clone(), backend, dir.path(), Some(dispatch));
-            ctx.ci_update_holders
-                .set("dev.a8n.run", "contoso/claude-run", 99);
-            let gate = crate::concurrency::KeyGate::new();
-
-            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
-
-            assert!(
-                rx.try_recv().is_err(),
-                "a pending holder on the repo defers the dispatch"
-            );
+        /// CLAUDE-550: a stamp from a run that never finished (dropped, or
+        /// the daemon restarted) stops blocking once it is older than the
+        /// listener's timeout plus the margin.
+        #[test]
+        fn a_stale_in_flight_stamp_no_longer_blocks() {
+            let now = state::now_iso();
+            assert!(conflict_resolve_in_flight(Some(&now), 600));
+            assert!(!conflict_resolve_in_flight(
+                Some("2020-01-01T00:00:00Z"),
+                600
+            ));
+            assert!(!conflict_resolve_in_flight(None, 600));
+            assert!(!conflict_resolve_in_flight(Some("not a time"), 600));
         }
 
         #[tokio::test]
@@ -15228,6 +15346,11 @@ mod tests {
                 comments[0].contains("A human needs to resolve this"),
                 "{comments:?}"
             );
+            // CLAUDE-550: a send that never reached the listener spends no
+            // attempt and leaves no in-flight stamp.
+            let row = row7(&pool).await;
+            assert_eq!(row.conflict_resolve_attempts, 0);
+            assert!(row.conflict_resolve_started_at.is_none());
         }
 
         #[tokio::test]
