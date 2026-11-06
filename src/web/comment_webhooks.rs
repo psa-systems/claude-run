@@ -1750,8 +1750,13 @@ fn serve_run(
                 match crate::attempt_steps::derive_claude_steps(stream_log, invoke_start, invoke_end)
                 {
                     Ok(steps) => {
-                        for (kind, label, start, end) in steps {
-                            recorder.record("initial", kind, label, start, end, true, None).await;
+                        for step in steps {
+                            recorder
+                                .record(
+                                    "initial", step.kind, step.label, step.start, step.end, true,
+                                    step.detail,
+                                )
+                                .await;
                         }
                     }
                     Err(e) => {

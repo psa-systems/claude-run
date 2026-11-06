@@ -2206,12 +2206,11 @@ async fn process_job(
     // for an attempt that counts. Scope: finalize's own PR-path steps (push,
     // pr_create, gate, ci_wait, conflict_resolution) and hook_install /
     // postgres_* are tracked in a follow-up issue, not here.
+    // Drained whether or not the attempt counts, so a skipped attempt's gate
+    // timing never leaks into the next attempt of the same key.
+    let gate_timings = crate::attempt_steps::take_gate_timings(key);
     if !skip_attempt {
-        let stage = match attempts + 1 {
-            1 => "initial",
-            2 => "retry-2",
-            _ => "retry-3",
-        };
+        let stage = crate::attempt_steps::stage_for_attempt(attempts + 1);
         let mut recorder =
             crate::attempt_steps::StepRecorder::new(pool, run_id, &action.name, key, attempts + 1);
         if let Some((clone_start, clone_end, clone_ok)) = clone_timing {
@@ -2230,9 +2229,12 @@ async fn process_job(
         if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
             match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
                 Ok(steps) => {
-                    for (kind, label, start, end) in steps {
+                    for step in steps {
                         recorder
-                            .record(stage, kind, label, start, end, true, None)
+                            .record(
+                                stage, step.kind, step.label, step.start, step.end, true,
+                                step.detail,
+                            )
                             .await;
                     }
                 }
@@ -2245,6 +2247,11 @@ async fn process_job(
                     );
                 }
             }
+        }
+        // SPEC-3.14 items 3 and 5: the verification gate(s) `finalize` ran,
+        // with their recipe stages as check sub-steps when the output timed them.
+        for gate in &gate_timings {
+            recorder.record_gate(stage, gate).await;
         }
         if let Some((review_start, review_end, review_ok)) = review_span {
             recorder
@@ -3035,6 +3042,65 @@ fn install_hooks(workdir: &Path) {
 struct GateResult {
     command: Option<&'static str>,
     failure: Option<String>,
+    /// SPEC-3.14: when the recipe ran, its timing and timed stage spans, for
+    /// the caller to stash for the attempt's step recorder.
+    timing: Option<crate::attempt_steps::GateTiming>,
+}
+
+/// Run `just <recipe>` in `workdir`, stamping each stdout line with its
+/// arrival time so the recipe's stage banners can be timed (SPEC-3.14 item 5).
+/// Returns the exit status, the full stdout and stderr, and the timed stdout
+/// lines. A reader thread that fails is an error, never a silently short log.
+fn run_recipe_timed(
+    workdir: &Path,
+    recipe: &str,
+) -> std::io::Result<(
+    std::process::ExitStatus,
+    String,
+    String,
+    Vec<crate::attempt_steps::TimedLine>,
+)> {
+    use std::io::Read;
+    let mut child = Command::new("just")
+        .current_dir(workdir)
+        .arg(recipe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let out_thread = std::thread::spawn(move || -> std::io::Result<_> {
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut text = String::new();
+        let mut timed = Vec::new();
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            if reader.read_until(b'\n', &mut buf)? == 0 {
+                break;
+            }
+            let ts = chrono::Utc::now();
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            text.push_str(&line);
+            timed.push((Some(ts), line.trim_end_matches('\n').to_string()));
+        }
+        Ok((text, timed))
+    });
+    let err_thread = std::thread::spawn(move || -> std::io::Result<String> {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    });
+    let status = child.wait()?;
+    let (out_text, timed) = out_thread
+        .join()
+        .map_err(|_| std::io::Error::other("the gate stdout reader thread panicked"))??;
+    let err_text = err_thread
+        .join()
+        .map_err(|_| std::io::Error::other("the gate stderr reader thread panicked"))??;
+    Ok((status, out_text, err_text, timed))
 }
 
 /// SPEC-3.3.2 "Verification gate": re-run the repository's own pre-push
@@ -3057,32 +3123,36 @@ fn run_verification_gate(workdir: &Path) -> GateResult {
         if !matches!(probe, Ok(s) if s.success()) {
             continue;
         }
-        return match Command::new("just")
-            .current_dir(workdir)
-            .arg(recipe)
-            .output()
-        {
-            Ok(out) if out.status.success() => GateResult {
-                command: Some(recipe),
-                failure: None,
-            },
-            Ok(out) => GateResult {
-                command: Some(recipe),
-                failure: Some(provider::append_stdout_tail(
-                    &String::from_utf8_lossy(&out.stderr),
-                    &String::from_utf8_lossy(&out.stdout),
-                    &[],
-                )),
-            },
+        let start = chrono::Utc::now();
+        let ran = run_recipe_timed(workdir, recipe);
+        let end = chrono::Utc::now();
+        return match ran {
+            Ok((status, stdout, stderr, timed)) => {
+                let timing = crate::attempt_steps::GateTiming {
+                    command: recipe,
+                    start,
+                    end,
+                    ok: status.success(),
+                    stages: crate::attempt_steps::stage_spans(&timed, end),
+                };
+                GateResult {
+                    command: Some(recipe),
+                    failure: (!status.success())
+                        .then(|| provider::append_stdout_tail(&stderr, &stdout, &[])),
+                    timing: Some(timing),
+                }
+            }
             Err(e) => GateResult {
                 command: Some(recipe),
-                failure: Some(format!("running `just {recipe}` failed to start: {e}")),
+                failure: Some(format!("running `just {recipe}` failed: {e}")),
+                timing: None,
             },
         };
     }
     GateResult {
         command: None,
         failure: None,
+        timing: None,
     }
 }
 
@@ -3697,6 +3767,9 @@ impl ConflictResolver for FinalPushConflictResolver {
         // before the push because a merge resolution that breaks the build
         // must not land as a fast-forward.
         let gate = run_verification_gate(workdir);
+        if let Some(t) = gate.timing.clone() {
+            crate::attempt_steps::stash_gate_timing(&self.key, t);
+        }
         if let Some(output) = gate.failure {
             let command = gate.command.unwrap_or("none");
             return Err(Error::Other(anyhow::anyhow!(
@@ -4487,6 +4560,9 @@ fn finalize(
                 // post-success review session below: there is no point
                 // reviewing a diff whose own checks do not pass.
                 let gate = run_verification_gate(workdir);
+                if let Some(t) = gate.timing.clone() {
+                    crate::attempt_steps::stash_gate_timing(&job.key, t);
+                }
                 if let Some(output) = &gate.failure {
                     let command = gate.command.unwrap_or("none");
                     if let Some(pr_number) = pr.number {

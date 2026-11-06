@@ -615,9 +615,12 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
         if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
             match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
                 Ok(steps) => {
-                    for (kind, label, start, end) in steps {
+                    for step in steps {
                         recorder
-                            .record(stage, kind, label, start, end, true, None)
+                            .record(
+                                stage, step.kind, step.label, step.start, step.end, true,
+                                step.detail,
+                            )
                             .await;
                     }
                 }

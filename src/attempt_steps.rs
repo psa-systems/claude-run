@@ -112,8 +112,200 @@ impl Outcome {
     }
 }
 
-/// One derived step from [`derive_claude_steps`]: kind, label, start, end.
-pub type ClaudeStep = (StepKind, &'static str, DateTime<Utc>, DateTime<Utc>);
+/// One derived step from [`derive_claude_steps`]. `detail` is `Some` when the
+/// step carries a note for its `attempt_steps.detail` column, e.g.
+/// [`SUBSTEPS_UNKNOWN`] on a check whose output printed no timed stage boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeStep {
+    pub kind: StepKind,
+    pub label: &'static str,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub detail: Option<&'static str>,
+}
+
+/// SPEC-3.14 item 5: the `detail` of a check row whose recipe printed no
+/// observable, timed stage boundary, so Reports lists its sub-steps as unknown.
+pub const SUBSTEPS_UNKNOWN: &str = "sub-steps unknown";
+
+/// SPEC-3.14 item 5: classify one output line as a recipe stage banner. The
+/// shared recipes print `[<recipe>] <command>` before each stage (for example
+/// `[pre-commit] cargo clippy --all-targets`); the stage is named by the
+/// cargo subcommand. `Some(None)` is a banner that is not a timed stage (such
+/// as `[pre-commit] check-tree-ownership`), which still ends the previous
+/// stage. `None` is not a banner.
+pub fn classify_banner(line: &str) -> Option<Option<&'static str>> {
+    let rest = line.trim_start().strip_prefix('[')?;
+    let (_, command) = rest.split_once(']')?;
+    let command = command.trim().to_lowercase();
+    let has = |needle: &str| command.contains(needle);
+    let stage = if has("cargo fmt") {
+        Some("fmt")
+    } else if has("cargo clippy") {
+        Some("clippy")
+    } else if has("cargo test") || has("cargo nextest") {
+        Some("test")
+    } else if has("cargo build") || has("cargo check") {
+        Some("build")
+    } else {
+        None
+    };
+    Some(stage)
+}
+
+/// One timed output line: its arrival time when the output carries one, and
+/// its text.
+pub type TimedLine = (Option<DateTime<Utc>>, String);
+
+/// Split a tool result's text into [`TimedLine`]s. A line that starts with an
+/// RFC 3339 timestamp token (the forge log format, or a `ts`-prefixed recipe)
+/// is timed; any other line is untimed.
+pub fn timed_lines(text: &str) -> Vec<TimedLine> {
+    text.lines()
+        .map(|l| {
+            let t = l.trim_start();
+            match t.split_once(' ') {
+                Some((first, rest)) => match DateTime::parse_from_rfc3339(first) {
+                    Ok(ts) => (Some(ts.with_timezone(&Utc)), rest.to_string()),
+                    Err(_) => (None, l.to_string()),
+                },
+                None => (None, l.to_string()),
+            }
+        })
+        .collect()
+}
+
+/// A timed recipe stage: the stage label and its span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageSpan {
+    pub label: &'static str,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+/// SPEC-3.14 item 5: the timed stage spans in `lines`. A stage runs from its
+/// banner to the next banner (stage or not), or to `end` for the last one.
+/// Only a banner with an arrival time is a boundary: an untimed banner proves
+/// the stage exists but not how long it took, so it yields no span.
+pub fn stage_spans(lines: &[TimedLine], end: DateTime<Utc>) -> Vec<StageSpan> {
+    let banners: Vec<(DateTime<Utc>, Option<&'static str>)> = lines
+        .iter()
+        .filter_map(|(ts, line)| Some(((*ts)?, classify_banner(line)?)))
+        .collect();
+    let mut out = Vec::new();
+    for (i, (start, stage)) in banners.iter().enumerate() {
+        let Some(label) = stage else { continue };
+        let stop = banners.get(i + 1).map(|b| b.0).unwrap_or(end).min(end);
+        if stop > *start {
+            out.push(StageSpan {
+                label,
+                start: *start,
+                end: stop,
+            });
+        }
+    }
+    out
+}
+
+/// SPEC-3.14 items 5 and 6: tile the check span `[start, end]` with its stage
+/// spans, filling every gap (the prologue, a non-stage banner, the tail) with a
+/// row labelled `parent`, so the rows still sum to the check's own duration.
+/// With no stage spans the result is the single `parent` row, which the caller
+/// flags [`SUBSTEPS_UNKNOWN`].
+pub fn tile_check(
+    parent: &'static str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    stages: &[StageSpan],
+) -> Vec<(&'static str, DateTime<Utc>, DateTime<Utc>)> {
+    let mut rows = Vec::new();
+    let mut cursor = start;
+    for st in stages {
+        let s = st.start.clamp(start, end);
+        let e = st.end.clamp(start, end);
+        if s > cursor {
+            rows.push((parent, cursor, s));
+        }
+        if e > s.max(cursor) {
+            rows.push((st.label, s.max(cursor), e));
+            cursor = e;
+        }
+    }
+    if end > cursor {
+        rows.push((parent, cursor, end));
+    }
+    rows
+}
+
+/// A verification-gate run's timing (SPEC-3.3.2, SPEC-3.14), stashed by the
+/// synchronous `finalize` for the async caller that owns the recorder.
+#[derive(Debug, Clone)]
+pub struct GateTiming {
+    pub command: &'static str,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub ok: bool,
+    pub stages: Vec<StageSpan>,
+}
+
+type GateRegistry = std::sync::Mutex<std::collections::HashMap<String, Vec<GateTiming>>>;
+
+fn gate_registry() -> &'static GateRegistry {
+    static R: std::sync::OnceLock<GateRegistry> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// Stash one gate run's timing under the job key. `finalize` is synchronous
+/// with no recorder or pool (its signature and ~40 test call sites are fixed),
+/// so the timing is handed to the async caller through this keyed registry
+/// and drained by [`take_gate_timings`] once `finalize` returns.
+pub fn stash_gate_timing(key: &str, timing: GateTiming) {
+    gate_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(key.to_string())
+        .or_default()
+        .push(timing);
+}
+
+/// Drain the gate timings stashed for `key`.
+pub fn take_gate_timings(key: &str) -> Vec<GateTiming> {
+    gate_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(key)
+        .unwrap_or_default()
+}
+
+impl<'a> StepRecorder<'a> {
+    /// Record one verification-gate run (SPEC-3.14 items 3 and 5): the whole
+    /// span as a `gate` row when no stage boundary was timed (flagged
+    /// [`SUBSTEPS_UNKNOWN`]), else `check` rows per stage with `gate` rows for
+    /// the gaps.
+    pub async fn record_gate(&mut self, stage: &str, g: &GateTiming) {
+        if g.stages.is_empty() {
+            self.record(
+                stage,
+                StepKind::Gate,
+                g.command,
+                g.start,
+                g.end,
+                g.ok,
+                Some(SUBSTEPS_UNKNOWN),
+            )
+            .await;
+            return;
+        }
+        for (label, start, end) in tile_check(g.command, g.start, g.end, &g.stages) {
+            let kind = if label == g.command {
+                StepKind::Gate
+            } else {
+                StepKind::Check
+            };
+            self.record(stage, kind, label, start, end, g.ok, None).await;
+        }
+    }
+}
 
 fn fmt_ts(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -347,6 +539,7 @@ pub fn derive_claude_steps(
     struct Event {
         ts: DateTime<Utc>,
         bash_cmd: Option<String>,
+        result_text: Option<String>,
     }
     let mut events = Vec::new();
     for line in raw.lines() {
@@ -386,7 +579,44 @@ pub fn derive_claude_steps(
                 }
             }
         }
-        events.push(Event { ts, bash_cmd });
+        let mut result_text = None;
+        if v.get("type").and_then(|t| t.as_str()) == Some("user") {
+            if let Some(blocks) = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
+                let mut text = String::new();
+                for b in blocks {
+                    if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                        continue;
+                    }
+                    match b.get("content") {
+                        Some(serde_json::Value::String(s)) => {
+                            text.push_str(s);
+                            text.push('\n');
+                        }
+                        Some(serde_json::Value::Array(parts)) => {
+                            for p in parts {
+                                if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                                    text.push_str(t);
+                                    text.push('\n');
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !text.is_empty() {
+                    result_text = Some(text);
+                }
+            }
+        }
+        events.push(Event {
+            ts,
+            bash_cmd,
+            result_text,
+        });
     }
 
     let mut steps: Vec<ClaudeStep> = Vec::new();
@@ -397,7 +627,13 @@ pub fn derive_claude_steps(
         };
         let start = events[i].ts.clamp(invoke_start, invoke_end);
         if start > cursor {
-            steps.push((StepKind::Coding, "coding", cursor, start));
+            steps.push(ClaudeStep {
+                kind: StepKind::Coding,
+                label: "coding",
+                start: cursor,
+                end: start,
+                detail: None,
+            });
         }
         let end = events
             .get(i + 1)
@@ -406,12 +642,45 @@ pub fn derive_claude_steps(
             .clamp(start, invoke_end);
         let (kind, label) = classify_bash_command(cmd);
         if end > start {
-            steps.push((kind, label, start, end));
+            if kind == StepKind::Check {
+                // SPEC-3.14 item 5: the result arrives on the next line; its
+                // text names the recipe's stages and, when timed, their spans.
+                let lines = events
+                    .get(i + 1)
+                    .and_then(|n| n.result_text.as_deref())
+                    .map(timed_lines)
+                    .unwrap_or_default();
+                let spans = stage_spans(&lines, end);
+                let unknown = spans.is_empty();
+                for (row_label, s, e) in tile_check(label, start, end, &spans) {
+                    steps.push(ClaudeStep {
+                        kind,
+                        label: row_label,
+                        start: s,
+                        end: e,
+                        detail: unknown.then_some(SUBSTEPS_UNKNOWN),
+                    });
+                }
+            } else {
+                steps.push(ClaudeStep {
+                    kind,
+                    label,
+                    start,
+                    end,
+                    detail: None,
+                });
+            }
         }
         cursor = end;
     }
     if invoke_end > cursor {
-        steps.push((StepKind::Coding, "coding", cursor, invoke_end));
+        steps.push(ClaudeStep {
+            kind: StepKind::Coding,
+            label: "coding",
+            start: cursor,
+            end: invoke_end,
+            detail: None,
+        });
     }
     Ok(steps)
 }
@@ -531,21 +800,22 @@ mod tests {
 
         // coding(0..5), check/pre-push(5..65), coding(65..70), other(70..71), coding(71..90)
         assert_eq!(steps.len(), 5, "{steps:?}");
-        assert_eq!(steps[0].0, StepKind::Coding);
+        assert_eq!(steps[0].kind, StepKind::Coding);
         assert_eq!(
             steps[1],
-            (
-                StepKind::Check,
-                "pre-push",
-                base + chrono::Duration::seconds(5),
-                base + chrono::Duration::seconds(65)
-            )
+            ClaudeStep {
+                kind: StepKind::Check,
+                label: "pre-push",
+                start: base + chrono::Duration::seconds(5),
+                end: base + chrono::Duration::seconds(65),
+                detail: Some(SUBSTEPS_UNKNOWN),
+            }
         );
-        assert_eq!(steps[2].0, StepKind::Coding);
-        assert_eq!(steps[3].0, StepKind::Other);
-        assert_eq!(steps[4].0, StepKind::Coding);
+        assert_eq!(steps[2].kind, StepKind::Coding);
+        assert_eq!(steps[3].kind, StepKind::Other);
+        assert_eq!(steps[4].kind, StepKind::Coding);
 
-        let total: chrono::Duration = steps.iter().map(|s| s.3 - s.2).sum();
+        let total: chrono::Duration = steps.iter().map(|s| s.end - s.start).sum();
         assert_eq!(
             total,
             invoke_end - invoke_start,
@@ -633,5 +903,184 @@ mod tests {
             })
             .sum();
         assert_eq!(total, attempt_end - attempt_start, "rows: {rows:?}");
+    }
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+            + chrono::Duration::seconds(secs)
+    }
+
+    #[test]
+    fn banners_name_the_recipe_stage() {
+        assert_eq!(
+            classify_banner("[pre-commit] cargo fmt --check"),
+            Some(Some("fmt"))
+        );
+        assert_eq!(
+            classify_banner("[pre-commit] cargo clippy --all-targets -- -D warnings"),
+            Some(Some("clippy"))
+        );
+        assert_eq!(
+            classify_banner("[pre-commit] cargo build --all-targets"),
+            Some(Some("build"))
+        );
+        assert_eq!(
+            classify_banner("[pre-commit] cargo test --lib"),
+            Some(Some("test"))
+        );
+        // A banner that is not a timed stage still ends the previous one.
+        assert_eq!(
+            classify_banner("[pre-commit] check-tree-ownership"),
+            Some(None)
+        );
+        assert_eq!(classify_banner("Compiling foo v0.1.0"), None);
+    }
+
+    /// A recorded-shaped gate output: each line stamped on arrival.
+    #[test]
+    fn stage_rows_tile_a_timed_check_with_no_gap() {
+        let lines = timed_lines(
+            "2026-01-01T00:00:02Z [pre-push] cargo fmt --check\n\
+             2026-01-01T00:00:12Z [pre-push] cargo clippy --all-targets\n\
+             2026-01-01T00:01:12Z [pre-push] cargo test\n\
+             2026-01-01T00:03:12Z [pre-push] check-tree-ownership\n\
+             2026-01-01T00:03:15Z all checks passed\n",
+        );
+        let spans = stage_spans(&lines, at(200));
+        let labels: Vec<_> = spans.iter().map(|s| s.label).collect();
+        assert_eq!(labels, ["fmt", "clippy", "test"]);
+        let rows = tile_check("pre-push", at(0), at(200), &spans);
+        assert_eq!(
+            rows,
+            vec![
+                ("pre-push", at(0), at(2)),
+                ("fmt", at(2), at(12)),
+                ("clippy", at(12), at(72)),
+                ("test", at(72), at(192)),
+                ("pre-push", at(192), at(200)),
+            ]
+        );
+        let total: chrono::Duration = rows.iter().map(|r| r.2 - r.1).sum();
+        assert_eq!(total, at(200) - at(0), "sub-steps sum to the check's duration");
+    }
+
+    #[test]
+    fn untimed_banners_yield_no_stage_rows() {
+        let lines = timed_lines("[pre-push] cargo fmt --check\n[pre-push] cargo test\n");
+        assert!(stage_spans(&lines, at(100)).is_empty());
+        assert_eq!(
+            tile_check("pre-push", at(0), at(100), &[]),
+            vec![("pre-push", at(0), at(100))],
+            "no boundary: one row, never zero-length sub-steps"
+        );
+    }
+
+    /// An agent-run check whose tool result carries timed stage banners.
+    #[test]
+    fn agent_check_log_yields_stage_rows_and_a_no_boundary_check_stays_one_flagged_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        let line = |offset: i64, json: serde_json::Value| -> String {
+            let mut v = json;
+            v.as_object_mut()
+                .unwrap()
+                .insert("ts".to_string(), serde_json::Value::String(fmt_ts(at(offset))));
+            serde_json::to_string(&v).unwrap()
+        };
+        let bash = |cmd: &str| {
+            serde_json::json!({"type":"assistant","message":{"content":[
+                {"type":"tool_use","name":"Bash","input":{"command":cmd}}]}})
+        };
+        let result = |text: &str| {
+            serde_json::json!({"type":"user","message":{"content":[
+                {"type":"tool_result","content":text}]}})
+        };
+        let lines = [
+            line(0, serde_json::json!({"type":"system","subtype":"init"})),
+            line(10, bash("just pre-push")),
+            line(
+                100,
+                result(
+                    "2026-01-01T00:00:10Z [pre-push] cargo fmt --check\n\
+                     2026-01-01T00:00:20Z [pre-push] cargo test\n",
+                ),
+            ),
+            line(110, bash("just check")),
+            line(150, result("everything passed")),
+        ];
+        std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+        let steps = derive_claude_steps(&log, at(0), at(160)).unwrap();
+        let checks: Vec<_> = steps
+            .iter()
+            .filter(|s| s.kind == StepKind::Check)
+            .map(|s| (s.label, (s.end - s.start).num_seconds(), s.detail))
+            .collect();
+        assert_eq!(
+            checks,
+            vec![
+                ("fmt", 10, None),
+                ("test", 80, None),
+                ("check", 40, Some(SUBSTEPS_UNKNOWN)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_with_stage_spans_records_check_rows_and_without_records_one_flagged_gate_row() {
+        let pool = crate::db::test_pool().await;
+        let run_id = crate::state::run_begin(&pool, "youtrack", "cli")
+            .await
+            .unwrap();
+        let mut recorder = StepRecorder::new(&pool, run_id, "youtrack", "T-1", 1);
+        recorder
+            .record_gate(
+                "initial",
+                &GateTiming {
+                    command: "pre-push",
+                    start: at(0),
+                    end: at(100),
+                    ok: true,
+                    stages: vec![StageSpan {
+                        label: "test",
+                        start: at(20),
+                        end: at(90),
+                    }],
+                },
+            )
+            .await;
+        recorder
+            .record_gate(
+                "initial",
+                &GateTiming {
+                    command: "check",
+                    start: at(100),
+                    end: at(130),
+                    ok: true,
+                    stages: vec![],
+                },
+            )
+            .await;
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "SELECT kind, label, detail FROM attempt_steps WHERE run_id = ? ORDER BY seq",
+            )
+            .into_owned(),
+        ))
+        .bind(run_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("gate".into(), "pre-push".into(), None),
+                ("check".into(), "test".into(), None),
+                ("gate".into(), "pre-push".into(), None),
+                ("gate".into(), "check".into(), Some(SUBSTEPS_UNKNOWN.into())),
+            ]
+        );
     }
 }
