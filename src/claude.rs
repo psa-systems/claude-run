@@ -334,6 +334,37 @@ impl ClaudeInvoker {
             .join(format!("{key}-attempt-{attempt}-review-evidence.md"))
     }
 
+    /// SPEC-3.12 item 9: the sibling path the one retried review session
+    /// writes to (`<name>-retry`), so a retry never overwrites the first
+    /// session's stream log or evidence file. The single source of that naming.
+    pub fn review_retry_sibling(path: &Path) -> PathBuf {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push("-retry");
+        path.with_file_name(name)
+    }
+
+    /// SPEC-3.16 item 2: the evidence file that backs the posted verdict for
+    /// one attempt, or `None` when none was written. A retried review (its
+    /// `-retry` stream log exists) is authoritative with its own evidence
+    /// file only; the discarded first session's file is never returned for
+    /// it. The finalize link, the run page and the evidence route all
+    /// resolve through here so they cannot disagree.
+    pub fn review_evidence_authoritative(
+        logs_dir: &Path,
+        action: &str,
+        key: &str,
+        attempt: u32,
+    ) -> Option<PathBuf> {
+        let stream = Self::review_stream_log_path(logs_dir, action, key, attempt);
+        let evidence = Self::review_evidence_path(logs_dir, action, key, attempt);
+        let chosen = if Self::review_retry_sibling(&stream).exists() {
+            Self::review_retry_sibling(&evidence)
+        } else {
+            evidence
+        };
+        chosen.exists().then_some(chosen)
+    }
+
     /// Spawn claude, relay its stdout to `stream_log` stamping each JSON event
     /// line with an arrival-time `ts` (stderr is a direct, unstamped redirect to
     /// the same file), wait, then scan the stream for the terminal `result`

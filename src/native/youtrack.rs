@@ -1872,27 +1872,13 @@ async fn process_job(
         // SPEC-3.12 item 9: the one retry a workdir-modifying review gets
         // logs to its own file, alongside the first attempt's, rather than
         // overwriting it.
-        let review_retry_stream_log = {
-            let mut name = review_stream_log
-                .file_name()
-                .unwrap_or_default()
-                .to_os_string();
-            name.push("-retry");
-            review_stream_log.with_file_name(name)
-        };
-        // SPEC-3.16 item 2: evidence file paths, mirroring the stream-log
-        // retry naming above, so a retried review's evidence does not
-        // overwrite the first attempt's.
+        let review_retry_stream_log = ClaudeInvoker::review_retry_sibling(&review_stream_log);
+        // SPEC-3.16 item 2: evidence file paths, named like the stream-log
+        // retry above, so a retried review's evidence does not overwrite the
+        // first attempt's.
         let review_evidence =
             ClaudeInvoker::review_evidence_path(&paths.logs_dir(), &action.name, key, attempts + 1);
-        let review_retry_evidence = {
-            let mut name = review_evidence
-                .file_name()
-                .unwrap_or_default()
-                .to_os_string();
-            name.push("-retry");
-            review_evidence.with_file_name(name)
-        };
+        let review_retry_evidence = ClaudeInvoker::review_retry_sibling(&review_evidence);
         let (outcome, review_results) = crate::blocking::in_place(|| {
             run_review_session_with_retry(
                 claude,
@@ -1930,12 +1916,13 @@ async fn process_job(
         // SPEC-3.16 items 1 and 2: cap the verdict to 5 bullets and link
         // whichever evidence file is authoritative (the retry's, when a
         // retry ran) before the outcome reaches `finalize` and is posted.
-        let evidence_path = if review_results.len() == 2 {
-            &review_retry_evidence
-        } else {
-            &review_evidence
-        };
-        let evidence_link = evidence_path.exists().then(|| {
+        let evidence_link = ClaudeInvoker::review_evidence_authoritative(
+            &paths.logs_dir(),
+            &action.name,
+            key,
+            attempts + 1,
+        )
+        .map(|_| {
             review_evidence_link_text(
                 crate::run_footer::resolved_public_url().as_deref(),
                 run_id,

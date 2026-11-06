@@ -6745,13 +6745,13 @@ async fn run_detail(
     // never reached that step, has none).
     let logs_dir = s.paths.logs_dir();
     for o in &mut outcomes {
-        o.has_evidence = ClaudeInvoker::review_evidence_path(
+        o.has_evidence = ClaudeInvoker::review_evidence_authoritative(
             &logs_dir,
             &run.action_name,
             &o.job_key,
             o.attempt as u32,
         )
-        .exists();
+        .is_some();
     }
 
     // Look up the action's link_template once and reuse for both planned
@@ -6982,12 +6982,23 @@ async fn job_review_evidence(
     .fetch_optional(&s.api.pool)
     .await?;
     let action_name = action_name.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
-    let path =
-        ClaudeInvoker::review_evidence_path(&s.paths.logs_dir(), &action_name, &key, attempt);
-    let content = std::fs::read_to_string(&path).map_err(|_| {
+    // Resolves to the retry's file when a review retry ran, so the served
+    // sweep is the one that backs the posted verdict.
+    let not_found = || {
         WebError::not_found(format!(
             "no review evidence file for run #{id}, job {key}, attempt {attempt}"
         ))
+    };
+    let path = ClaudeInvoker::review_evidence_authoritative(
+        &s.paths.logs_dir(),
+        &action_name,
+        &key,
+        attempt,
+    )
+    .ok_or_else(not_found)?;
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        tracing::error!(path = %path.display(), error = %e, "review evidence file unreadable");
+        not_found()
     })?;
     let mut resp = Response::new(Body::from(content));
     resp.headers_mut().insert(
@@ -13425,6 +13436,57 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(&body[..], b"the full sweep goes here");
+        }
+
+        /// A retried review serves the retry's evidence, never the discarded
+        /// first session's file.
+        #[tokio::test]
+        async fn serves_the_retry_evidence_when_a_review_retry_ran() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_run(&s.api.pool, 1).await;
+            let logs = s.paths.logs_dir();
+            let primary = ClaudeInvoker::review_evidence_path(&logs, "act", "CLAUDE-1", 1);
+            std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+            std::fs::write(&primary, "first session sweep").unwrap();
+            let stream = ClaudeInvoker::review_stream_log_path(&logs, "act", "CLAUDE-1", 1);
+            std::fs::write(ClaudeInvoker::review_retry_sibling(&stream), "").unwrap();
+            std::fs::write(
+                ClaudeInvoker::review_retry_sibling(&primary),
+                "retry session sweep",
+            )
+            .unwrap();
+
+            let resp = job_review_evidence(State(s), AxumPath((1, "CLAUDE-1".to_string(), 1)))
+                .await
+                .unwrap()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"retry session sweep");
+        }
+
+        /// A retry that wrote no evidence is a 404, not the first session's
+        /// file, since that sweep does not back the posted verdict.
+        #[tokio::test]
+        async fn retry_without_evidence_does_not_fall_back_to_the_first_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_run(&s.api.pool, 1).await;
+            let logs = s.paths.logs_dir();
+            let primary = ClaudeInvoker::review_evidence_path(&logs, "act", "CLAUDE-1", 1);
+            std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+            std::fs::write(&primary, "first session sweep").unwrap();
+            let stream = ClaudeInvoker::review_stream_log_path(&logs, "act", "CLAUDE-1", 1);
+            std::fs::write(ClaudeInvoker::review_retry_sibling(&stream), "").unwrap();
+
+            let resp = job_review_evidence(State(s), AxumPath((1, "CLAUDE-1".to_string(), 1)))
+                .await
+                .unwrap_err()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         }
 
         #[tokio::test]
