@@ -5033,6 +5033,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 badge: "next event",
                 note: "branch prefixes (e.g. renovate/) owned by another bot; a failing check there routes to human_action, never code_fix/auto_fix.",
             },
+            FieldDoc {
+                name: "needs_info_tag",
+                badge: "next event",
+                note: "tag added alongside Needs Review at the CI fix-attempt ceiling (SPEC-3.12 item 3); empty disables the tag write.",
+            },
         ],
         Webhook => vec![
             FieldDoc {
