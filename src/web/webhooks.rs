@@ -2435,8 +2435,13 @@ async fn route_agent_pr_failure(
             None => format!("run #{previous_index}"),
         };
         let tests_display = test_ids.join(", ");
+        // SPEC-3.12 item 6: the comment names the one decision a human must
+        // make (fix the recurring failure by hand, or re-queue once it no
+        // longer reproduces), and this is the "CI remediation ceiling
+        // reached" table row (item 3, folded in by SPEC-4.4.3), which
+        // requires the `Needs-Info` tag.
         let body = format!(
-            "CI failed the same way as the previous attempt on this PR (branch `{branch}`); stopping the fix-attempt loop instead of re-queueing.\n- Repeated failing tests: {tests_display}\n- This run: {}\n- Previous run: {previous_link}",
+            "CI failed the same way as the previous attempt on this PR (branch `{branch}`); stopping the fix-attempt loop instead of re-queueing.\n- Repeated failing tests: {tests_display}\n- This run: {}\n- Previous run: {previous_link}\n- Decision needed: fix the recurring failure by hand, or re-queue the issue once it no longer reproduces.",
             ev.html_url
         );
         let body = crate::run_footer::append_run(
@@ -2452,6 +2457,12 @@ async fn route_agent_pr_failure(
         let key = record.issue_key.clone();
         let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
             backend.comment(&key, &body)?;
+            let needs_info_tag = mint_cfg.needs_info_tag.trim();
+            if !needs_info_tag.is_empty() {
+                if let Err(e) = backend.add_tag(&key, needs_info_tag) {
+                    warn!(key = %key, tag = %needs_info_tag, error = %e, "CI loop-breaker Needs-Info tag write failed (continuing to AI Agent write)");
+                }
+            }
             backend.set_field(&key, &mint_cfg.ai_agent_field, NEEDS_REVIEW_VALUE)?;
             Ok(())
         })
@@ -2684,8 +2695,17 @@ async fn route_agent_pr_failure(
         let backend = ctx.backend.clone();
         let mint_cfg = ctx.mint_cfg.read().await.clone();
         let key = record.issue_key.clone();
+        // SPEC-3.12 item 3: the "CI remediation ceiling reached" row requires
+        // `Needs Review` with `Needs-Info`; `delivery_blocked_comment` already
+        // names the one follow-up action.
         let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
             backend.comment(&key, &body)?;
+            let needs_info_tag = mint_cfg.needs_info_tag.trim();
+            if !needs_info_tag.is_empty() {
+                if let Err(e) = backend.add_tag(&key, needs_info_tag) {
+                    warn!(key = %key, tag = %needs_info_tag, error = %e, "CI fix-attempt ceiling Needs-Info tag write failed (continuing to AI Agent write)");
+                }
+            }
             backend.set_field(&key, &mint_cfg.ai_agent_field, NEEDS_REVIEW_VALUE)?;
             Ok(())
         })
@@ -6707,6 +6727,13 @@ mod tests {
                 .push(format!("set_state {key} {state}"));
             Ok(())
         }
+        fn add_tag(&self, key: &str, tag: &str) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("add_tag {key} {tag}"));
+            Ok(())
+        }
         fn set_assignee(&self, key: &str, login: &str) -> crate::error::Result<()> {
             self.calls
                 .lock()
@@ -9495,6 +9522,10 @@ mod tests {
                 .any(|c| c.starts_with("comment CLAUDE-41") && c.contains("Run: ")),
             "the ceiling comment carries the run footer: {calls:?}"
         );
+        assert!(
+            calls.iter().any(|c| c == "add_tag CLAUDE-41 Needs-Info"),
+            "SPEC-3.12 item 3: the CI remediation ceiling row requires Needs-Info: {calls:?}"
+        );
 
         let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 18)
             .await
@@ -9631,6 +9662,10 @@ mod tests {
         for test in ["test_one", "test_two", "test_three", "test_four"] {
             assert!(comment.contains(test), "{test} named: {comment}");
         }
+        assert!(
+            calls.iter().any(|c| c == "add_tag CLAUDE-551 Needs-Info"),
+            "SPEC-3.12 item 3: the CI remediation ceiling row requires Needs-Info: {calls:?}"
+        );
         let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 30)
             .await
             .unwrap()
@@ -9766,6 +9801,14 @@ mod tests {
         assert!(
             repeat_comment.contains("Run: "),
             "the repeated-failure comment carries the run footer: {repeat_comment}"
+        );
+        assert!(
+            repeat_comment.contains("Decision needed:"),
+            "SPEC-3.12 item 6: the comment names the one action a human must take: {repeat_comment}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "add_tag CLAUDE-50 Needs-Info"),
+            "SPEC-3.12 item 3: the CI remediation ceiling row requires Needs-Info: {calls:?}"
         );
 
         let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 20)

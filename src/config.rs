@@ -669,6 +669,12 @@ pub struct MintConfig {
     /// routes to `human_action` instead, naming the base branch as the place to
     /// fix. Default `["renovate/"]`.
     pub bot_branch_prefixes: Vec<String>,
+    /// Tag added alongside `Needs Review` when a CI failure on the agent's own
+    /// open PR reaches the fix-attempt ceiling (loop-breaker or hard cap): the
+    /// "CI remediation ceiling reached" row of the `SPEC-3.12` item 3 table,
+    /// which requires `Needs-Info`. Mirrors `Tags::needs_info`'s default; an
+    /// empty value disables the tag write.
+    pub needs_info_tag: String,
 }
 
 impl Default for MintConfig {
@@ -684,6 +690,7 @@ impl Default for MintConfig {
             queued_value: "Queued".to_string(),
             auto_fix: AutoFixConfig::default(),
             bot_branch_prefixes: vec!["renovate/".to_string()],
+            needs_info_tag: "Needs-Info".to_string(),
         }
     }
 }
