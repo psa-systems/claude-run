@@ -1513,6 +1513,39 @@ async fn process_job(
         }
     }
 
+    // ---- estimate vs session timeout (SPEC-3.12 item 7) ----
+    // "At pickup, if the issue's Estimation exceeds the action's session
+    // timeout, the runner does not start the attempt. It sets Needs Review
+    // with Needs-Info, and the comment names both numbers and asks for the
+    // issue to be split or the limit raised. An issue with no Estimation is
+    // picked up as before." Read-only and placed after the dependency gate,
+    // before the clone; like that gate, a read failure must not strand an
+    // otherwise-workable issue, so it falls back to proceeding with pickup.
+    match backend.get_estimation_minutes(key) {
+        Ok(Some(minutes)) if minutes * 60 > limits.claude_timeout.as_secs() as i64 => {
+            info!(
+                action = %action.name,
+                key = %key,
+                estimation_minutes = minutes,
+                timeout_secs = limits.claude_timeout.as_secs(),
+                "estimate exceeds the session timeout; parking Needs Review, no attempt consumed"
+            );
+            report_estimate_over_timeout(
+                backend,
+                src,
+                &action.name,
+                key,
+                minutes,
+                limits.claude_timeout,
+            );
+            return Ok(ProcessedJob::EstimateOverTimeout { key: key.clone() });
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(action = %action.name, key = %key, error = %e, "Estimation lookup failed; proceeding with pickup");
+        }
+    }
+
     // ---- CI in-flight cap (CLAUDE-535) ----
     // One slow CI runner serves every runner PR on a repo, so a pickup waits while
     // `max_ci_in_flight_per_repo` of the repo's other runner PRs still have CI
@@ -4881,6 +4914,47 @@ fn report_cap_reached(
     if let Err(e) = backend.set_field(key, &src.custom_field, &src.states.needs_review) {
         error!(action = %action, key = %key, error = %e, "attempt-cap AI Agent write failed");
     }
+}
+
+/// SPEC-3.12 item 7: comment naming both numbers (best-effort), then the
+/// `Needs-Info` tag (best-effort), then `AI Agent` = Needs Review as the
+/// authoritative write, mirroring [`report_cap_reached`]'s independent-writes
+/// shape: the issue is parked either way, so a write failure here is logged at
+/// `error` rather than aborting the caller, which must still return
+/// `ProcessedJob::EstimateOverTimeout` so the issue is not re-cloned this poll.
+fn report_estimate_over_timeout(
+    backend: &dyn IssueTracker,
+    src: &YoutrackSource,
+    action: &str,
+    key: &str,
+    estimation_minutes: i64,
+    session_timeout: Duration,
+) {
+    let body = estimate_over_timeout_comment(estimation_minutes, session_timeout);
+    if let Err(e) = backend.comment(key, &body) {
+        error!(action = %action, key = %key, error = %e, "estimate-over-timeout comment failed");
+    }
+    let needs_info_tag = src.tags.needs_info.trim();
+    if !needs_info_tag.is_empty() {
+        if let Err(e) = backend.add_tag(key, needs_info_tag) {
+            error!(action = %action, key = %key, tag = %needs_info_tag, error = %e, "estimate-over-timeout Needs-Info tag write failed");
+        }
+    }
+    if let Err(e) = backend.set_field(key, &src.custom_field, &src.states.needs_review) {
+        error!(action = %action, key = %key, error = %e, "estimate-over-timeout AI Agent write failed");
+    }
+}
+
+fn estimate_over_timeout_comment(estimation_minutes: i64, session_timeout: Duration) -> String {
+    let timeout_minutes = session_timeout.as_secs() / 60;
+    [
+        format!(
+            "This issue's Estimation ({estimation_minutes} minutes) exceeds this action's session timeout ({timeout_minutes} minutes), so it was not started."
+        ),
+        String::new(),
+        "Split this issue into pieces that each fit inside the timeout, or raise the action's `limits.claude_timeout_seconds`.".to_string(),
+    ]
+    .join("\n")
 }
 
 fn cap_reached_comment(attempts: u32, cap: u32) -> String {

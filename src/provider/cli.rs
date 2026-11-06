@@ -527,6 +527,19 @@ struct ProjectShow {
     name: String,
 }
 
+/// `yt issue get-field <KEY> Estimation --json`. `raw` is `null` when the
+/// field is unset; only the whole-minute count is consumed.
+#[derive(Debug, Deserialize)]
+struct EstimationField {
+    #[serde(default)]
+    raw: Option<EstimationRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EstimationRaw {
+    minutes: i64,
+}
+
 /// One project as `yt project list --json` emits it. Only the short name and the
 /// archived flag are consumed; unknown fields are ignored.
 #[derive(Debug, Deserialize)]
@@ -1912,6 +1925,15 @@ impl IssueTracker for CliBackend {
         let stdout = self.yt_ok(&["project", "show", project_key, "--json"])?;
         let parsed: ProjectShow = Self::parse_json(&self.yt, "yt project show --json", &stdout)?;
         Ok(parsed.name)
+    }
+
+    /// SPEC-3.12 item 7: the `Estimation` read backing the pickup-time
+    /// estimate-vs-session-timeout check.
+    fn get_estimation_minutes(&self, key: &str) -> Result<Option<i64>> {
+        let stdout = self.yt_ok(&["issue", "get-field", key, "Estimation", "--json"])?;
+        let parsed: EstimationField =
+            Self::parse_json(&self.yt, "yt issue get-field --json", &stdout)?;
+        Ok(parsed.raw.map(|r| r.minutes))
     }
 
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo> {

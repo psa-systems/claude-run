@@ -295,6 +295,17 @@ pub trait IssueTracker: Send + Sync {
         )))
     }
 
+    /// Read the issue's `Estimation` custom field as whole minutes
+    /// (`yt issue get-field <key> Estimation --json`'s `raw.minutes`), or
+    /// `None` when the field is unset. Backs the pickup-time estimate-vs-
+    /// session-timeout check (SPEC-3.12 item 7). The default returns
+    /// `Ok(None)`, so a backend with no `Estimation` support never blocks
+    /// pickup.
+    fn get_estimation_minutes(&self, key: &str) -> Result<Option<i64>> {
+        let _ = key;
+        Ok(None)
+    }
+
     /// Attach an existing tag to an issue, creating the instance-wide tag when
     /// missing (`yt issue tag add <key> <tag> --create`). Backs the
     /// `Needs-Info` tag written alongside the `Needs Review` AI Agent value
