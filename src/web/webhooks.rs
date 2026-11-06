@@ -2477,7 +2477,61 @@ async fn route_agent_pr_failure(
         };
     }
 
-    if (record.fix_attempts as u32) < webhook_cfg.agent_pr_fix_attempts {
+    // CLAUDE-551: at the normal cap, a failure whose tests overlap none of
+    // the earlier attempts' on this PR (the agent fixed what it was asked to
+    // and a different test tripped) gets one more attempt, up to the hard
+    // cap. With no earlier fingerprint to compare against, or no test ids
+    // parsed now, nothing shows the failure is new, so it parks as before.
+    let prior = match ci_failure_store::prior_run_test_ids(
+        &ctx.pool,
+        failure_id,
+        record.pr_number,
+        run_id,
+    )
+    .await
+    {
+        Ok(prior) => prior,
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "reading the earlier attempts' fingerprints failed");
+            return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+        }
+    };
+    let new_signature = !test_ids.is_empty()
+        && !prior.is_empty()
+        && prior
+            .iter()
+            .all(|(_, ids)| !ids.iter().any(|t| test_ids.contains(t)));
+    let attempts = record.fix_attempts as u32;
+    let extended = attempts >= webhook_cfg.agent_pr_fix_attempts
+        && new_signature
+        && attempts < webhook_cfg.agent_pr_fix_attempts_hard_cap;
+
+    if attempts < webhook_cfg.agent_pr_fix_attempts || extended {
+        record_run_event(
+            &ctx.pool,
+            webhook_run_id,
+            WEBHOOK_MINT_ACTION,
+            "info",
+            if extended {
+                format!(
+                    "{}: extended fix attempt {} (a failure not seen before on PR #{}; normal cap {}, hard cap {})",
+                    record.issue_key,
+                    attempts + 1,
+                    record.pr_number,
+                    webhook_cfg.agent_pr_fix_attempts,
+                    webhook_cfg.agent_pr_fix_attempts_hard_cap
+                )
+            } else {
+                format!(
+                    "{}: normal fix attempt {} of {} on PR #{}",
+                    record.issue_key,
+                    attempts + 1,
+                    webhook_cfg.agent_pr_fix_attempts,
+                    record.pr_number
+                )
+            },
+        )
+        .await;
         let backend = ctx.backend.clone();
         let classifier = ctx.classifier.clone();
         let mint_cfg = ctx.mint_cfg.read().await.clone();
@@ -2511,8 +2565,13 @@ async fn route_agent_pr_failure(
             } else {
                 tests.join(", ")
             };
+            let extra = if extended {
+                "\n- An extra attempt: these tests failed on none of this PR's earlier attempts, so the attempt ceiling is extended (up to `agent_pr_fix_attempts_hard_cap`)."
+            } else {
+                ""
+            };
             let body = format!(
-                "CI failed again on this PR (run #{}, branch `{branch_owned}`).\n- Run: {}\n- Failing tests: {tests_display}\n\n{}",
+                "CI failed again on this PR (run #{}, branch `{branch_owned}`).\n- Run: {}\n- Failing tests: {tests_display}{extra}\n\n{}",
                 event.index_in_repo, event.html_url, verdict.analysis
             );
             let body = crate::run_footer::append_run(
@@ -2542,9 +2601,16 @@ async fn route_agent_pr_failure(
         if let Err(e) = ci_failure_store::bump_fix_attempts(&ctx.pool, record.id, &now).await {
             warn!(error = %e, "bumping the agent PR's fix-attempt counter failed (continuing)");
         }
-        info!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, "CI failure on the agent's own open PR; re-queued its issue");
+        info!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, extended, "CI failure on the agent's own open PR; re-queued its issue");
         WebhookRunSummary {
-            text: format!("re-queued {} (agent PR fix attempt)", record.issue_key),
+            text: if extended {
+                format!(
+                    "re-queued {} (extended agent PR fix attempt)",
+                    record.issue_key
+                )
+            } else {
+                format!("re-queued {} (agent PR fix attempt)", record.issue_key)
+            },
             ok: true,
         }
     } else {
@@ -2567,13 +2633,45 @@ async fn route_agent_pr_failure(
         // delivery-blocked label to route to from this path), but the
         // comment follows the delivery-blocked shape so the issue reads
         // the same way as the finalize-path blockers.
+        // CLAUDE-551: every distinct failing-test set seen on this PR, so the
+        // reader sees whether the agent kept tripping the same thing or a
+        // new one each time.
+        let mut signatures: Vec<String> = Vec::new();
+        for ids in prior
+            .iter()
+            .map(|(_, ids)| ids.as_slice())
+            .chain(std::iter::once(test_ids))
+            .filter(|ids| !ids.is_empty())
+        {
+            let mut sorted = ids.to_vec();
+            sorted.sort();
+            let line = format!("- {}", sorted.join(", "));
+            if !signatures.contains(&line) {
+                signatures.push(line);
+            }
+        }
+        let signatures = if signatures.is_empty() {
+            "- (no test ids parsed)".to_string()
+        } else {
+            signatures.join("\n")
+        };
+        let ceiling = if attempts >= webhook_cfg.agent_pr_fix_attempts_hard_cap {
+            format!(
+                "{} (configured `agent_pr_fix_attempts_hard_cap`; the normal cap `agent_pr_fix_attempts` is {})",
+                webhook_cfg.agent_pr_fix_attempts_hard_cap, webhook_cfg.agent_pr_fix_attempts
+            )
+        } else {
+            format!(
+                "{} (configured `agent_pr_fix_attempts`; this failure overlaps an earlier one, so no extra attempt)",
+                webhook_cfg.agent_pr_fix_attempts
+            )
+        };
         let body = format!(
-            "{}\n\n- Attempt ceiling: {} (configured `agent_pr_fix_attempts`)\n- Attempts:\n{links}",
+            "{}\n\n- Attempt ceiling: {ceiling}\n- Attempts:\n{links}\n- Failing-test sets seen on this PR:\n{signatures}",
             crate::native::youtrack::delivery_blocked_comment(
                 crate::native::youtrack::DeliveryBlockedReason::CiFixCeiling,
                 Some(&ev.html_url),
             ),
-            webhook_cfg.agent_pr_fix_attempts,
         );
         let body = crate::run_footer::append_run(
             &body,
@@ -9312,6 +9410,170 @@ mod tests {
         );
     }
 
+    /// CLAUDE-551: one CI failure on the agent's PR #30 (issue CLAUDE-551),
+    /// failing `tests`, through the real dispatch; returns the summary and
+    /// the tracker calls it made.
+    async fn agent_attempt(
+        pool: &DbPool,
+        index: i64,
+        tests: &[&str],
+        cfg: &WebhookConfig,
+    ) -> (WebhookRunSummary, Vec<String>) {
+        let backend =
+            Arc::new(StoreBackend::new().with_open_prs(vec![pr(30, &format!("commit-{index}"))]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &store_event(index),
+            failing_tests_log("mod_a", tests, "fix/CLAUDE-551"),
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            cfg,
+            &test_spend(),
+        )
+        .await;
+        (result, backend.calls())
+    }
+
+    async fn agent_pr_551(pool: &DbPool) {
+        ci_failure_store::record_agent_pr(
+            pool,
+            "youtrack",
+            "CLAUDE-551",
+            "dev.a8n.run",
+            "acme/widgets",
+            30,
+            "fix/CLAUDE-551",
+            "open",
+            false,
+            "2026-11-05T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    }
+
+    fn fix_caps(normal: u32, hard: u32) -> WebhookConfig {
+        WebhookConfig {
+            agent_pr_fix_attempts: normal,
+            agent_pr_fix_attempts_hard_cap: hard,
+            ..WebhookConfig::default()
+        }
+    }
+
+    async fn events_matching(pool: &DbPool, needle: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(pool, "SELECT COUNT(*) FROM run_events WHERE message LIKE ?").into_owned(),
+        ))
+        .bind(format!("%{needle}%"))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn requeued(calls: &[String]) -> bool {
+        calls
+            .iter()
+            .any(|c| c == "set_field CLAUDE-551 AI Agent Queued")
+    }
+
+    fn parked(calls: &[String]) -> bool {
+        calls
+            .iter()
+            .any(|c| c == "set_field CLAUDE-551 AI Agent Needs Review")
+    }
+
+    #[tokio::test]
+    async fn a_new_failure_at_the_cap_gets_extra_attempts_up_to_the_hard_cap() {
+        // CLAUDE-551: normal cap 1, hard cap 3. Each attempt trips a test no
+        // earlier attempt failed, so attempts 2 and 3 are extended; the
+        // fourth hits the hard cap and parks, naming every failing-test set.
+        let pool = crate::db::test_pool().await;
+        agent_pr_551(&pool).await;
+        let cfg = fix_caps(1, 3);
+
+        let (r, calls) = agent_attempt(&pool, 8001, &["test_one"], &cfg).await;
+        assert!(r.ok && requeued(&calls), "{} {calls:?}", r.text);
+        assert_eq!(events_matching(&pool, "normal fix attempt 1 of 1").await, 1);
+
+        for (index, test, attempt) in [(8002, "test_two", 2), (8003, "test_three", 3)] {
+            let (r, calls) = agent_attempt(&pool, index, &[test], &cfg).await;
+            assert!(r.ok && requeued(&calls), "{} {calls:?}", r.text);
+            assert!(r.text.contains("extended"), "{}", r.text);
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with("comment CLAUDE-551") && c.contains("An extra attempt")),
+                "{calls:?}"
+            );
+            assert_eq!(
+                events_matching(&pool, &format!("extended fix attempt {attempt}")).await,
+                1
+            );
+        }
+
+        let (r, calls) = agent_attempt(&pool, 8004, &["test_four"], &cfg).await;
+        assert!(
+            r.ok && parked(&calls) && !requeued(&calls),
+            "{} {calls:?}",
+            r.text
+        );
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("comment CLAUDE-551"))
+            .unwrap();
+        assert!(
+            comment.contains("agent_pr_fix_attempts_hard_cap"),
+            "{comment}"
+        );
+        for test in ["test_one", "test_two", "test_three", "test_four"] {
+            assert!(comment.contains(test), "{test} named: {comment}");
+        }
+        let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 30)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.fix_attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn an_overlapping_failure_at_the_cap_parks_as_before() {
+        // CLAUDE-551: a failure sharing a test with an earlier attempt (not
+        // identical, so not CLAUDE-371's repeat) is the same root: it parks at
+        // the normal cap with no extra attempt.
+        let pool = crate::db::test_pool().await;
+        agent_pr_551(&pool).await;
+        let cfg = fix_caps(1, 6);
+        let (r, calls) = agent_attempt(&pool, 8101, &["test_one", "test_two"], &cfg).await;
+        assert!(r.ok && requeued(&calls), "{} {calls:?}", r.text);
+
+        let (r, calls) = agent_attempt(&pool, 8102, &["test_two", "test_three"], &cfg).await;
+        assert!(
+            r.ok && parked(&calls) && !requeued(&calls),
+            "{} {calls:?}",
+            r.text
+        );
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("comment CLAUDE-551"))
+            .unwrap();
+        assert!(comment.contains("overlaps an earlier one"), "{comment}");
+        assert_eq!(events_matching(&pool, "extended fix attempt").await, 0);
+    }
+
+    #[test]
+    fn the_hard_cap_cannot_be_below_the_normal_cap() {
+        let err = crate::settings::validate_webhook(&fix_caps(4, 3)).unwrap_err();
+        assert!(err.contains("agent_pr_fix_attempts_hard_cap"), "{err}");
+        assert!(crate::settings::validate_webhook(&fix_caps(3, 3)).is_ok());
+    }
+
     #[tokio::test]
     async fn agent_pr_repeated_failure_stops_the_loop_without_requeue() {
         // CLAUDE-371: two consecutive attempts failing the exact same test
@@ -10408,6 +10670,7 @@ mod tests {
                 analysis_concurrency: 2,
                 max_runs_per_day: 20,
                 agent_pr_fix_attempts: 3,
+                agent_pr_fix_attempts_hard_cap: 6,
             }
         }
 
@@ -11011,6 +11274,7 @@ mod tests {
                 analysis_concurrency: 2,
                 max_runs_per_day: 20,
                 agent_pr_fix_attempts: 3,
+                agent_pr_fix_attempts_hard_cap: 6,
             };
             let (tx, _rx) = mpsc::channel(8);
             let st = WebhookState::new(pool, config, tx);

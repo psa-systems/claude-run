@@ -310,6 +310,13 @@ pub struct WebhookConfig {
     /// flagged `Needs Review` instead. Matched against
     /// `agent_pull_requests.fix_attempts`. Default 3.
     pub agent_pr_fix_attempts: u32,
+    /// CLAUDE-551: at `agent_pr_fix_attempts`, a failure whose failing tests
+    /// overlap none of the earlier attempts' on the same PR (the agent fixed
+    /// what it was asked to and a different test tripped) gets one more
+    /// attempt, up to this many in all. A failure overlapping an earlier one
+    /// parks at the normal cap as before. Must be at least
+    /// `agent_pr_fix_attempts`; default 6.
+    pub agent_pr_fix_attempts_hard_cap: u32,
     /// Daily run cap of the synthetic `webhook-forgejo` action's
     /// ledger, read per event so a Settings save applies to the next one.
     /// Must be at least 1 (validated in `src/settings.rs`); default 20.
@@ -326,6 +333,7 @@ impl Default for WebhookConfig {
             analysis_concurrency: 2,
             auto_fix: false,
             agent_pr_fix_attempts: 3,
+            agent_pr_fix_attempts_hard_cap: 6,
             max_runs_per_day: 20,
         }
     }

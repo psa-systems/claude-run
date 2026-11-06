@@ -1039,6 +1039,9 @@ pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> 
     if cfg.agent_pr_fix_attempts < 1 {
         return Err("agent_pr_fix_attempts must be >= 1".to_string());
     }
+    if cfg.agent_pr_fix_attempts_hard_cap < cfg.agent_pr_fix_attempts {
+        return Err("agent_pr_fix_attempts_hard_cap must be >= agent_pr_fix_attempts".to_string());
+    }
     if cfg.max_runs_per_day < 1 {
         return Err("max_runs_per_day must be >= 1".to_string());
     }

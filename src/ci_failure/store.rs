@@ -301,6 +301,38 @@ pub async fn previous_run_test_ids(
     }))
 }
 
+/// CLAUDE-551: every earlier attempt's fingerprint on `pr_number` for
+/// `failure_id`, oldest first, as `(run_index, test_ids)`; attempts with no
+/// parsed test ids are left out.
+pub async fn prior_run_test_ids(
+    pool: &DbPool,
+    failure_id: i64,
+    pr_number: i64,
+    before_run_id: i64,
+) -> Result<Vec<(i64, Vec<String>)>> {
+    let rows: Vec<(i64, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "SELECT run_index, test_ids FROM ci_failure_runs \
+         WHERE failure_id = ? AND pr_number = ? AND id < ? \
+         ORDER BY id",
+        )
+        .into_owned(),
+    ))
+    .bind(failure_id)
+    .bind(pr_number)
+    .bind(before_run_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(run_index, ids)| {
+            ids.filter(|s| !s.is_empty())
+                .map(|s| (run_index, s.split('\n').map(str::to_string).collect()))
+        })
+        .collect())
+}
+
 /// SPEC-3.5.2: point `failure_id` at `issue_key` (or clear it with `None`).
 pub async fn set_issue(
     pool: &DbPool,

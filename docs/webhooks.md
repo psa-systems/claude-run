@@ -113,7 +113,11 @@ whether `agent_pull_requests` has an `open` row for `(host, repo, pr.number)`:
   3), the run comments the recorded issue with the run link, the failing tests, and the analysis, bumps
   `fix_attempts`, and sets `AI Agent = Queued` so the runner picks the SAME issue back up on the SAME branch (CLAUDE-275)
   instead of a second issue ever being filed for it. At the ceiling, the issue is flagged `AI Agent = Needs Review`
-  instead, with a comment listing every fix attempt's run. Either way: no PR comment, no new issue - the failure
+  instead, with a comment listing every fix attempt's run and every distinct failing-test set seen on the PR. One
+  exception (CLAUDE-551): when this failure's tests overlap none of the earlier attempts' on the PR (the agent fixed
+  what it was asked to and a different test tripped), it gets one more attempt, up to
+  `config.webhook.agent_pr_fix_attempts_hard_cap` (default 6). Each re-queue logs a `run_events` row on
+  `webhook-triage` saying whether it was a normal or an extended attempt. Either way: no PR comment, no new issue - the failure
   belongs to an issue that already exists. This replaces matching `trigger_user` against `bot_logins`, which is what
   silently dropped a real incident (run 5874 on PR 766, opened by the bot as `Claude-Run`, never matched the
   lowercase-only `claude-run` in `bot_logins`).
@@ -155,7 +159,7 @@ wrong destination is diagnosable.
 The webhook sources and the mint routing are edited on the **Settings** page (the `Webhook sources` and `Issue minting`
 sections, formerly `[webhook]` and `[mint]` in `config.toml`; CLAUDE-101), or over the API. Adding / editing a source (
 allow-list, rate limit, `secret_ref`, `log_token_ref`, `write_token_ref`) and the webhook `auto_fix` toggle (CLAUDE-153)
-take effect live, as does `agent_pr_fix_attempts` (CLAUDE-276, default 3, applies to the next event); `replay_window_secs`
+take effect live, as do `agent_pr_fix_attempts` (CLAUDE-276, default 3) and `agent_pr_fix_attempts_hard_cap` (CLAUDE-551, default 6), applying to the next event; `replay_window_secs`
 applies on restart. A mint edit is honored by the next event.
 
 ### Resolving a CI-failure issue on merge (CLAUDE-277, CLAUDE-327)

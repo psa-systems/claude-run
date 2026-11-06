@@ -412,7 +412,11 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
 - `mint.bot_logins` is not a mint-time loop guard: loop safety is the open-PR routing below, decided from the
   `agent_pull_requests` store (3.5.2) before a failure on the agent's own PR ever reaches the mint. `bot_logins` is
   read only by the comment-command webhook (3.6). Open-PR routing: a failure on the agent's own open PR requeues its
-  issue until `webhook.agent_pr_fix_attempts` (default 3) is reached, then the issue is set to needs-review; a
+  issue until `webhook.agent_pr_fix_attempts` (default 3) is reached, then the issue is set to needs-review, except
+  that a failure whose failing tests overlap none of the earlier attempts' on that PR gets one more attempt, up to
+  `webhook.agent_pr_fix_attempts_hard_cap` (default 6, at least the normal cap; CLAUDE-551); with no earlier fingerprint
+  or no parsed test ids it parks as before. Each re-queue writes a `run_events` row saying normal or extended, and the
+  needs-review comment lists every distinct failing-test set seen on the PR; a
   failure on a human's PR is commented on that PR; a resolved match reopens as a regression, comments the run and
   its failing tests, and is re-triaged so `AI Agent` is set exactly as a freshly minted issue of that bucket would.
 - Issues are created in the project whose VCS integration claims the repository, with `mint.repo_project_map` consulted
@@ -1220,6 +1224,10 @@ delivery that is not `issue_comment` (except `ping`) is acked and dropped before
   (`SPEC-4.4.4`-adjacent, `CLAUDE-447`).
 - A plain-issue command clones nothing and runs no agent: it mints a YouTrack issue carrying the instruction verbatim,
   sets `State` then the `AI Agent` field to the queued value last, and replies naming the minted key.
+- Every reply opens with `@<commenter>` and a one-word verdict line (CLAUDE-552): `**Done.**` (a commit reached the
+  PR, or the request was filed), `**No.**` (refused, no change, or too large to push unattended), `**Blocked.**`
+  (anything that stopped it), and `**Started.**` for the acknowledgement posted once an instruction is admitted,
+  before any work. The usage reply has no verdict; a synthetic command mentions no one and posts no acknowledgement.
 - Every outcome replies on the originating thread; a served command records one `job_outcomes` row and finalizes
   through the run guard.
 
@@ -1525,7 +1533,9 @@ non-durable PostgreSQL container in the Docker-in-Docker sidecar, runs `<command
 `CLAUDE_RUN_TEST_DATABASE_URL` and `CLAUDE_RUN_TEST_POSTGRES_CONTAINER` set, and tears the container down however
 the command ends (normal exit, command failure, `SIGINT`/`SIGTERM`, or a setup error), propagating the command's
 exit code (128 + signal if it was killed by one) and failing the run if teardown itself fails even when the command
-succeeded. It sweeps orphaned containers from earlier runs whose owning pid is no longer alive first, starts the
+succeeded. It sweeps orphaned containers from earlier runs first: one labelled with this process's own pid namespace
+is an orphan when its owning pid is dead; any other (another CI job's container on the same Docker daemon, or one
+from before the namespace label) only when older than 6 hours, since its pid means nothing here (CLAUDE-573). It starts the
 container with a loopback-only ephemeral published port (or, with the optional `--network`, on that Docker network
 with nothing published, reached by container name on port 5432, for a caller that is itself a container on that
 network), `--rm`, no volume (the writable layer and data directory are both discarded on teardown) and a raised
