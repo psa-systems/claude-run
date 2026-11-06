@@ -1014,6 +1014,7 @@ mod tests {
         assert!(report.recent.is_empty());
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_attempt_step(
         pool: &DbPool,
         run_id: i64,

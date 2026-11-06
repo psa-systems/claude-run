@@ -58,6 +58,9 @@ impl StepKind {
     }
 }
 
+/// One derived step from [`derive_claude_steps`]: kind, label, start, end.
+pub type ClaudeStep = (StepKind, &'static str, DateTime<Utc>, DateTime<Utc>);
+
 fn fmt_ts(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -99,6 +102,7 @@ impl<'a> StepRecorder<'a> {
     /// Records one step. A write failure is logged at `error` with the issue
     /// key and the step, and marks the attempt "step data incomplete"
     /// (SPEC-3.14 item 8) rather than aborting the attempt.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record(
         &mut self,
         stage: &str,
@@ -284,7 +288,7 @@ pub fn derive_claude_steps(
     stream_log: &std::path::Path,
     invoke_start: DateTime<Utc>,
     invoke_end: DateTime<Utc>,
-) -> std::io::Result<Vec<(StepKind, &'static str, DateTime<Utc>, DateTime<Utc>)>> {
+) -> std::io::Result<Vec<ClaudeStep>> {
     let raw = std::fs::read_to_string(stream_log)?;
     struct Event {
         ts: DateTime<Utc>,
@@ -331,7 +335,7 @@ pub fn derive_claude_steps(
         events.push(Event { ts, bash_cmd });
     }
 
-    let mut steps: Vec<(StepKind, &'static str, DateTime<Utc>, DateTime<Utc>)> = Vec::new();
+    let mut steps: Vec<ClaudeStep> = Vec::new();
     let mut cursor = invoke_start;
     for i in 0..events.len() {
         let Some(cmd) = events[i].bash_cmd.as_ref() else {
@@ -448,22 +452,23 @@ mod tests {
                 .insert("ts".to_string(), serde_json::Value::String(fmt_ts(ts)));
             serde_json::to_string(&v).unwrap()
         };
-        let mut lines = Vec::new();
-        lines.push(line(0, r#"{"type":"system","subtype":"init"}"#));
-        lines.push(line(
-            5,
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"just pre-push"}}]}}"#,
-        ));
-        lines.push(line(65, r#"{"type":"user","message":{"content":[]}}"#));
-        lines.push(line(
-            70,
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la"}}]}}"#,
-        ));
-        lines.push(line(71, r#"{"type":"user","message":{"content":[]}}"#));
-        lines.push(line(
-            80,
-            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
-        ));
+        let lines = [
+            line(0, r#"{"type":"system","subtype":"init"}"#),
+            line(
+                5,
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"just pre-push"}}]}}"#,
+            ),
+            line(65, r#"{"type":"user","message":{"content":[]}}"#),
+            line(
+                70,
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la"}}]}}"#,
+            ),
+            line(71, r#"{"type":"user","message":{"content":[]}}"#),
+            line(
+                80,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+            ),
+        ];
         std::fs::write(&log, lines.join("\n") + "\n").unwrap();
 
         let invoke_start = base;
