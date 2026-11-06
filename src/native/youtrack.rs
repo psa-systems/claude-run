@@ -1835,30 +1835,49 @@ async fn process_job(
             key,
             attempts + 1,
         );
-        let (outcome, review_result) = crate::blocking::in_place(|| {
-            run_review_session(
+        // SPEC-3.12 item 9: the one retry a workdir-modifying review gets
+        // logs to its own file, alongside the first attempt's, rather than
+        // overwriting it.
+        let review_retry_stream_log = {
+            let mut name = review_stream_log
+                .file_name()
+                .unwrap_or_default()
+                .to_os_string();
+            name.push("-retry");
+            review_stream_log.with_file_name(name)
+        };
+        let (outcome, review_results) = crate::blocking::in_place(|| {
+            run_review_session_with_retry(
                 claude,
                 &action.claude,
                 job,
                 &workdir_path,
                 limits.review_timeout,
                 &review_stream_log,
+                &review_retry_stream_log,
                 cancel,
                 Some(spend.remaining_usd()),
                 Some(cargo_target_dir.as_path()),
             )
         });
-        spend.record(&review_result);
-        crate::usage::record_invocation(
-            pool,
-            &action.name,
-            Some(key),
-            Some(run_id),
-            &review_stream_log,
-            &review_result,
-        )
-        .await;
-        state::daily_cost_add(pool, &action.name, review_result.cost).await?;
+        for review_result in &review_results {
+            spend.record(review_result);
+        }
+        for (log, result) in [&review_stream_log, &review_retry_stream_log]
+            .into_iter()
+            .zip(review_results.iter())
+        {
+            crate::usage::record_invocation(
+                pool,
+                &action.name,
+                Some(key),
+                Some(run_id),
+                log,
+                result,
+            )
+            .await;
+            state::daily_cost_add(pool, &action.name, result.cost).await?;
+        }
         Some(outcome)
     } else {
         None
@@ -3336,6 +3355,176 @@ fn run_review_session(
         }
     };
     (outcome, result)
+}
+
+/// The current branch `workdir` has checked out, or `None` when it is
+/// detached (or `git` fails). Used only to roll a stray review-session commit
+/// back to `pre_review_sha` in [`discard_review_changes`].
+fn git_current_branch(workdir: &Path) -> Option<String> {
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
+    let out = Command::new("git")
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Whether `path` exists in the tree of commit `sha`, used to tell a tracked
+/// path (checked out back to `sha`) from one that only exists because the
+/// review session added it (removed by explicit path instead).
+fn path_exists_at(workdir: &Path, sha: &str, path: &str) -> bool {
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
+    Command::new("git")
+        .args(["cat-file", "-e", &format!("{sha}:{path}")])
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn run_git(workdir: &Path, args: &[&str]) -> bool {
+    #[cfg(test)]
+    let _path_guard = crate::testutil::path_env_lock();
+    Command::new("git")
+        .args(args)
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn remove_path_explicit(workdir: &Path, path: &str) {
+    let full = workdir.join(path);
+    if full.is_dir() {
+        let _ = std::fs::remove_dir_all(&full);
+    } else {
+        let _ = std::fs::remove_file(&full);
+    }
+}
+
+/// SPEC-3.12 item 9: discard a review session's changes, restoring `workdir`
+/// to `pre_review_sha`, and log the changed paths at `warn`. A tracked path
+/// is checked out back from `pre_review_sha` (`git checkout <sha> -- <path>`);
+/// a path that does not exist there (an untracked file the session wrote, or
+/// one it `git add`ed itself) is unstaged with `git reset <sha> -- <path>`
+/// and then removed by explicit path. Neither uses a force flag. If the
+/// session also committed (moved HEAD), the branch is rolled back first:
+/// `git commit` never itself changes the working tree, so whatever it staged
+/// lands back on disk as an ordinary dirty path for the loop below to handle
+/// the same way.
+fn discard_review_changes(workdir: &Path, key: &str, pre_review_sha: &str) {
+    if let Some(branch) = git_current_branch(workdir) {
+        let _ = run_git(
+            workdir,
+            &[
+                "update-ref",
+                &format!("refs/heads/{branch}"),
+                pre_review_sha,
+            ],
+        );
+    }
+
+    let dirty = match workdir::uncommitted_or_stashed(workdir) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let mut changed = Vec::new();
+    for entry in &dirty.paths {
+        let status = entry.get(..2).unwrap_or("");
+        let path = entry.get(3..).unwrap_or(entry).trim();
+        if path == REVIEW_PASS_MARKER || path == REVIEW_FAIL_MARKER {
+            continue;
+        }
+        changed.push(path.to_string());
+        if status == "??" {
+            remove_path_explicit(workdir, path);
+        } else if path_exists_at(workdir, pre_review_sha, path) {
+            let _ = run_git(workdir, &["checkout", pre_review_sha, "--", path]);
+        } else {
+            let _ = run_git(workdir, &["reset", pre_review_sha, "--", path]);
+            remove_path_explicit(workdir, path);
+        }
+    }
+    warn!(
+        key = %key,
+        changed = ?changed,
+        "post-success review session modified the read-only workdir; discarding its changes and re-running the review once (SPEC-3.12 item 9)"
+    );
+}
+
+/// SPEC-3.12 item 9: run the post-success review session, retrying it once
+/// when it modifies the read-only workdir. The first attempt's changes are
+/// discarded ([`discard_review_changes`]) and a fresh session runs in the
+/// restored workdir; only a second no-verdict (any cause, including another
+/// modification) is reported upward, its message naming both causes so the
+/// caller's existing "modified the workdir" routing still recognizes it (the
+/// first cause's "read-only by contract" phrase is folded in verbatim).
+/// Returns one [`ClaudeResult`] per session actually run (one, or two when
+/// retried), so the caller bills and logs both.
+#[allow(clippy::too_many_arguments)]
+fn run_review_session_with_retry(
+    claude: &ClaudeInvoker,
+    claude_cfg: &action::ClaudeBlock,
+    job: &YoutrackJob,
+    workdir: &Path,
+    timeout: Duration,
+    stream_log: &Path,
+    retry_stream_log: &Path,
+    cancel: &CancellationToken,
+    budget_usd: Option<f64>,
+    cargo_target_dir: Option<&Path>,
+) -> (ReviewOutcome, Vec<ClaudeResult>) {
+    let pre_review_sha = git_head_sha(workdir);
+    let (outcome, result) = run_review_session(
+        claude,
+        claude_cfg,
+        job,
+        workdir,
+        timeout,
+        stream_log,
+        cancel,
+        budget_usd,
+        cargo_target_dir,
+    );
+    let first_cause = match &outcome {
+        ReviewOutcome::NoVerdict(cause) if cause.contains("read-only by contract") => cause.clone(),
+        _ => return (outcome, vec![result]),
+    };
+
+    if let Some(sha) = &pre_review_sha {
+        discard_review_changes(workdir, &job.key, sha);
+    } else {
+        warn!(key = %job.key, "post-success review session modified the workdir, but the pre-review HEAD could not be read; re-running the review without a restore");
+    }
+
+    let (second_outcome, second_result) = run_review_session(
+        claude,
+        claude_cfg,
+        job,
+        workdir,
+        timeout,
+        retry_stream_log,
+        cancel,
+        budget_usd,
+        cargo_target_dir,
+    );
+    let combined = match second_outcome {
+        ReviewOutcome::NoVerdict(second_cause) => ReviewOutcome::NoVerdict(format!(
+            "first review session: {first_cause}; second review session (after discarding the first's changes): {second_cause}"
+        )),
+        passed_or_failed => passed_or_failed,
+    };
+    (combined, vec![result, second_result])
 }
 
 /// Outcome of [`finalize`]: which AI Agent transition was applied. Carried into
@@ -15516,6 +15705,178 @@ mod tests {
         );
         assert!(
             matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("read-only by contract"))
+        );
+    }
+
+    // --- CLAUDE-580 / SPEC-3.12 item 9: discard-and-retry-once ---
+
+    #[test]
+    fn run_review_session_with_retry_discards_a_modified_tracked_file_then_promotes_on_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let attempted_marker = scratch.path().join(".attempted");
+        // First invocation touches the already-tracked f.txt (read-only
+        // violation) and would otherwise pass; the second, run only after
+        // the first's change is discarded, is clean and passes for real.
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\nif [ ! -f {attempted} ]; then\n  touch {attempted}\n  echo changed > f.txt\nfi\necho ok > {pass}\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                attempted = attempted_marker.to_str().unwrap(),
+                pass = REVIEW_PASS_MARKER,
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, results) = run_review_session_with_retry(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("stream-retry.jsonl"),
+            &cancel,
+            None,
+            None,
+        );
+        assert_eq!(
+            results.len(),
+            2,
+            "a discarded first attempt runs a second session"
+        );
+        assert!(
+            matches!(outcome, ReviewOutcome::Pass(_)),
+            "the retried, clean session's pass verdict must win: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt"))
+                .unwrap()
+                .trim(),
+            "x",
+            "the first session's edit must be discarded; workdir must equal the pre-review state"
+        );
+    }
+
+    #[test]
+    fn run_review_session_with_retry_discards_an_untracked_file_then_promotes_on_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let attempted_marker = scratch.path().join(".attempted");
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\nif [ ! -f {attempted} ]; then\n  touch {attempted}\n  echo sneaky > untracked.txt\nfi\necho ok > {pass}\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                attempted = attempted_marker.to_str().unwrap(),
+                pass = REVIEW_PASS_MARKER,
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, results) = run_review_session_with_retry(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("stream-retry.jsonl"),
+            &cancel,
+            None,
+            None,
+        );
+        assert_eq!(results.len(), 2);
+        assert!(matches!(outcome, ReviewOutcome::Pass(_)));
+        assert!(
+            !dir.path().join("untracked.txt").exists(),
+            "an untracked file the first session wrote must be removed by explicit path"
+        );
+    }
+
+    #[test]
+    fn run_review_session_with_retry_two_consecutive_no_verdicts_names_both_causes() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let attempted_marker = scratch.path().join(".attempted");
+        // First invocation modifies the workdir (triggering the retry);
+        // the second, in the restored workdir, writes no verdict marker at
+        // all, so the whole retry still ends in a no-verdict.
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\nif [ ! -f {attempted} ]; then\n  touch {attempted}\n  echo changed > f.txt\n  echo ok > {pass}\nfi\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                attempted = attempted_marker.to_str().unwrap(),
+                pass = REVIEW_PASS_MARKER,
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, results) = run_review_session_with_retry(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("stream-retry.jsonl"),
+            &cancel,
+            None,
+            None,
+        );
+        assert_eq!(results.len(), 2);
+        match &outcome {
+            ReviewOutcome::NoVerdict(cause) => {
+                assert!(
+                    cause.contains("read-only by contract"),
+                    "first cause (the workdir violation) must still be named, so finalize's existing routing still sees it: {cause}"
+                );
+                assert!(
+                    cause.contains("wrote no verdict marker"),
+                    "second cause must also be named: {cause}"
+                );
+            }
+            other => panic!("expected a combined NoVerdict, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt"))
+                .unwrap()
+                .trim(),
+            "x",
+            "the first session's edit is still discarded even when the retry also fails"
+        );
+    }
+
+    #[test]
+    fn run_review_session_with_retry_does_not_retry_a_non_workdir_no_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        // Writes neither marker but never touches the workdir: an ordinary
+        // no-verdict that SPEC-3.12 item 9 does not single out for a retry.
+        let stub = review_stub(
+            scratch.path(),
+            &format!("#!/bin/sh\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n"),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, results) = run_review_session_with_retry(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("stream-retry.jsonl"),
+            &cancel,
+            None,
+            None,
+        );
+        assert_eq!(results.len(), 1, "no workdir violation means no retry");
+        assert!(
+            matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("wrote no verdict marker"))
         );
     }
 

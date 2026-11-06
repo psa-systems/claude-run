@@ -5056,18 +5056,11 @@ async fn apply_automerge_decision(
             )));
         }
     };
-    if !youtrack_cfg.automerge.enabled {
-        info!(repo = %repo, pr = pr_number, action = %row.action_name, "action-run success: automerge disabled for this action; no action");
-        return Ok(AutomergeOutcome::NoAction(
-            "automerge disabled for this action; no action".to_string(),
-        ));
-    }
     // A PR the runner opened before its run finished (a timeout salvage or
-    // a checkpoint push, CLAUDE-379 / CLAUDE-448) is never automerged
-    // however its draft status changes, until a resumed run clears the
-    // flag by finishing successfully (CLAUDE-429). Checked before any
-    // forge call (`pr_status` included), so a salvaged PR's automerge
-    // decision never depends on live CI state.
+    // a checkpoint push) is never automerged however its draft status
+    // changes, until a resumed run clears the flag by finishing
+    // successfully. A salvaged PR also skips the stale-PR conflict sweep:
+    // dispatching a resolve run on top of an unfinished run would race.
     if row.salvaged {
         info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR was opened by the runner before its run finished; automerge blocked");
         let body = format!(
@@ -5140,6 +5133,94 @@ async fn apply_automerge_decision(
             return Err(msg);
         }
     };
+
+    // CLAUDE-595: the automerge state match below only routes a conflict when
+    // CI is already success or failure. A stale PR whose CI is still pending,
+    // or a PR on an action with automerge disabled, never reaches that branch
+    // and the conflict sits forever. When `conflicted: true`, run the same
+    // `route_conflicting_pr` the automerge path uses, bounded by the same
+    // `agent_conflict_resolve_attempts` cap and per-head-commit dedupe. Gated
+    // on "the automerge match below would not have handled it anyway" so the
+    // automerge-enabled success/failure cases keep their existing path.
+    let automerge_will_route_conflict = youtrack_cfg.automerge.enabled
+        && matches!(status.state.trim(), "success" | "failure")
+        && status.mergeable == Some(false);
+    if status.conflicted == Some(true) && !automerge_will_route_conflict {
+        let route = route_conflicting_pr(
+            mint,
+            pool,
+            &forge,
+            host,
+            repo,
+            pr_number,
+            pr_url,
+            row,
+            &status,
+            ci_cap,
+            is_github_host(host, &github_cfg.hosts),
+        )
+        .await?;
+        match route {
+            ConflictRoute::Dispatched { attempt, cap } => {
+                let body = crate::native::youtrack::automerge_conflict_resolving_comment(
+                    pr_url, attempt, cap,
+                );
+                record_automerge_outcome_and_comment_once(
+                    mint,
+                    pool,
+                    AutomergePr {
+                        repo,
+                        pr_number,
+                        issue_key: &row.issue_key,
+                    },
+                    "info",
+                    format!(
+                        "stale PR conflict auto-resolve dispatched (attempt {attempt} of {cap})"
+                    ),
+                    body,
+                    "stale-PR conflict-resolving comment failed",
+                )
+                .await;
+                return Ok(AutomergeOutcome::Acted(format!(
+                    "PR #{pr_number} conflicts with base; conflict auto-resolve dispatched"
+                )));
+            }
+            ConflictRoute::CapReached { attempts, cap } => {
+                return park_unresolved_conflicts(
+                    mint,
+                    pool,
+                    row,
+                    repo,
+                    pr_number,
+                    pr_url,
+                    &youtrack_cfg,
+                    attempts,
+                    cap,
+                )
+                .await;
+            }
+            ConflictRoute::InFlight => {
+                return Ok(AutomergeOutcome::NoAction(format!(
+                    "PR #{pr_number} conflicts with base; conflict auto-resolve already in flight"
+                )));
+            }
+            ConflictRoute::Deferred(reason) => {
+                return Ok(AutomergeOutcome::NoAction(format!(
+                    "PR #{pr_number} conflicts with base; resolution deferred: {reason}"
+                )));
+            }
+            ConflictRoute::AlreadyAttempted
+            | ConflictRoute::NotApplicable
+            | ConflictRoute::Skipped => {}
+        }
+    }
+
+    if !youtrack_cfg.automerge.enabled {
+        info!(repo = %repo, pr = pr_number, action = %row.action_name, "action-run success: automerge disabled for this action; no action");
+        return Ok(AutomergeOutcome::NoAction(
+            "automerge disabled for this action; no action".to_string(),
+        ));
+    }
 
     match status.state.trim() {
         "success" => match status.behind_base {
@@ -12111,8 +12192,12 @@ mod tests {
 
         #[tokio::test]
         async fn automerge_disabled_action_changes_nothing() {
-            // Acceptance criterion 3 (part 2): a recorded agent PR whose action
-            // has automerge disabled changes nothing.
+            // Acceptance criterion 3 (part 2): a recorded agent PR whose
+            // action has automerge disabled posts no issue comment and makes
+            // no forge write. After CLAUDE-595 the stale-PR sweep runs even
+            // when automerge is disabled, so `pr_status` IS read (one call),
+            // but no dispatch, comment, merge or branch update happens as
+            // long as the PR is not conflicted.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", false);
@@ -12145,7 +12230,11 @@ mod tests {
             .await
             .unwrap();
             assert!(result.contains("automerge disabled"), "{result}");
-            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+            let calls = backend.calls();
+            assert!(
+                calls.iter().all(|c| c == "pr_status 7"),
+                "only pr_status should be called when automerge is off and the PR is not conflicted: {calls:?}"
+            );
         }
 
         #[tokio::test]
@@ -13031,11 +13120,16 @@ mod tests {
             )
             .await;
 
-            // The reconciler still lists open PRs for the (host, repo)
-            // group before checking any row's own action config.
+            // The reconciler lists open PRs for the (host, repo) group and,
+            // after CLAUDE-595, reads this PR's `pr_status` so the stale-PR
+            // conflict sweep can see whether it is conflicted. It is not,
+            // so no further forge call is made.
             assert_eq!(
                 backend.calls(),
-                vec!["list_open_prs dev.a8n.run contoso/claude-run"],
+                vec![
+                    "list_open_prs dev.a8n.run contoso/claude-run".to_string(),
+                    "pr_status 7".to_string(),
+                ],
                 "{:?}",
                 backend.calls()
             );
@@ -15628,6 +15722,128 @@ mod tests {
                 comments[0].contains("A human needs to resolve this"),
                 "{comments:?}"
             );
+        }
+
+        /// CLAUDE-595: a conflicted PR on an action with automerge disabled
+        /// still gets one resolve run per head commit. Without this sweep,
+        /// `apply_automerge_decision` early-returned on
+        /// `!automerge.enabled` and nothing noticed the stale PR.
+        #[tokio::test]
+        async fn automerge_disabled_still_dispatches_on_conflict() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", false);
+            seed_open_row(&pool).await;
+            let (dispatch, mut rx) = wired_dispatch();
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_full("success", Some(true), Some(false), Some("sha-1"))
+                    .with_conflicted(Some(true)),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path(), Some(dispatch));
+            let gate = crate::concurrency::KeyGate::new();
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            let sent = rx.try_recv().expect("expected one dispatched command");
+            assert!(sent.synthetic);
+            assert_eq!(sent.number, 7);
+            assert_eq!(row7(&pool).await.conflict_resolve_attempts, 1);
+        }
+
+        /// CLAUDE-595: a conflicted PR whose CI is still pending (neither
+        /// `success` nor `failure`) gets one resolve run. The existing
+        /// automerge state match only routes on `success` / `failure`, so
+        /// `pending` would otherwise fall through to `NoAction`.
+        #[tokio::test]
+        async fn ci_pending_conflicted_pr_dispatches() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let (dispatch, mut rx) = wired_dispatch();
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_full("pending", Some(false), Some(false), Some("sha-1"))
+                    .with_conflicted(Some(true)),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path(), Some(dispatch));
+            let gate = crate::concurrency::KeyGate::new();
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            let sent = rx.try_recv().expect("expected one dispatched command");
+            assert!(sent.synthetic);
+            assert_eq!(row7(&pool).await.conflict_resolve_attempts, 1);
+        }
+
+        /// CLAUDE-595: with automerge enabled AND CI already success AND
+        /// mergeable false, the existing state-match path handles the
+        /// conflict. The new sweep must NOT also dispatch, so the PR
+        /// receives exactly one resolve run per head commit, not two.
+        #[tokio::test]
+        async fn automerge_success_path_is_not_double_dispatched() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let (dispatch, mut rx) = wired_dispatch();
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_full("success", Some(false), Some(false), Some("sha-1"))
+                    .with_conflicted(Some(true)),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path(), Some(dispatch));
+            let gate = crate::concurrency::KeyGate::new();
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            let _first = rx.try_recv().expect("the existing path dispatches once");
+            assert!(
+                rx.try_recv().is_err(),
+                "the new sweep must not also dispatch in the existing path's cases"
+            );
+            assert_eq!(row7(&pool).await.conflict_resolve_attempts, 1);
+        }
+
+        /// CLAUDE-595: a salvaged PR (opened before its run finished) is
+        /// never swept, because dispatching a resolve run on top of an
+        /// unfinished run would race.
+        #[tokio::test]
+        async fn salvaged_conflicted_pr_is_never_dispatched() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", false);
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                true,
+                "2026-09-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            let (dispatch, mut rx) = wired_dispatch();
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_full("success", Some(true), Some(false), Some("sha-1"))
+                    .with_conflicted(Some(true)),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path(), Some(dispatch));
+            let gate = crate::concurrency::KeyGate::new();
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "a salvaged PR must never dispatch a resolve run"
+            );
+            assert_eq!(row7(&pool).await.conflict_resolve_attempts, 0);
         }
     }
 }
