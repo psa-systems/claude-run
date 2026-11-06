@@ -15138,6 +15138,164 @@ mod tests {
         assert!(runner.calls.lock().unwrap().is_empty());
     }
 
+    // ---- SPEC-3.12 item 2: periodic sweep of stuck Working issues ----
+
+    /// A `Working` issue with no `run_inflight_jobs` row for its action's
+    /// open runs is moved to `Queued` (attempts below the cap) and gets
+    /// exactly one comment.
+    #[tokio::test]
+    async fn reconcile_stuck_working_requeues_an_unbacked_working_issue() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-20"}]"#,
+                )
+                .ok_prefix("yt issue comment MK-20", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-20", "AI Agent", "Queued"],
+                    "",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-20 AI Agent Queued"),
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("yt issue comment MK-20"))
+                .count(),
+            1,
+            "exactly one correction comment; {calls:?}"
+        );
+    }
+
+    /// An issue at its action's `max_attempts_per_key` is parked at `Needs
+    /// Review` instead of requeued.
+    #[tokio::test]
+    async fn reconcile_stuck_working_at_the_attempt_cap_parks_needs_review() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        // Default `max_attempts_per_key` is 3 (`RunnerDefaults::default`).
+        for _ in 0..3 {
+            state::attempts_increment(&pool, "yt-action", "MK-22")
+                .await
+                .unwrap();
+        }
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-22"}]"#,
+                )
+                .ok_prefix("yt issue comment MK-22", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-22", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-22 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+    }
+
+    /// A `Working` issue with a live `run_inflight_jobs` row for its
+    /// action's open run is backed by a real run and is left untouched: no
+    /// `set-field`, no comment.
+    #[tokio::test]
+    async fn reconcile_stuck_working_leaves_an_inflight_backed_issue_alone() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let run_id = state::run_begin(&pool, "yt-action", "scheduler")
+            .await
+            .unwrap();
+        state::run_inflight_add(&pool, run_id, "MK-21", "MK")
+            .await
+            .unwrap();
+
+        let runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["list", "--query=AI Agent: Working", "--json"],
+            r#"[{"idReadable":"MK-21"}]"#,
+        ));
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+    }
+
+    /// A tracker read failure (`yt list` erroring) is logged and changes
+    /// nothing: no `set-field`, no comment, and the next tick still gets a
+    /// chance (SPEC-3.12 item 2: never treated as "nothing stuck").
+    #[tokio::test]
+    async fn reconcile_stuck_working_tracker_read_failure_changes_nothing() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let runner = Arc::new(StubRunner::new().fail(
+            "yt",
+            &["list", "--query=AI Agent: Working", "--json"],
+            1,
+            "boom",
+        ));
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+    }
+
     // --- CLAUDE-449: the post-success review session ---
 
     const REVIEW_RESULT_OK: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.1}"#;
