@@ -355,7 +355,7 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   commit on its first attempt, as does a non-WIP runner PR whose checks failed and that reports `mergeable: false`;
   a second pass for the same head commit leaves a green PR at Code Review for a human, as is a merge call that
   fails after the mergeable check passed. A Forgejo WIP PR reports `mergeable: false` whether or not it conflicts,
-  so it is not routed until `fj` reports a conflict field (FJ-124, CLAUDE-572). The conflict run clones the head
+  so it is routed only when `fj` reports `conflicted: true` (FJ-124, CLAUDE-572), once per head commit like any other PR. The conflict run clones the head
   branch with the base branch's full history, so the merge base is present. When the behind-base update
   itself fails because of a merge conflict, the runner dispatches one `/claude` conflict-resolution run instead of
   leaving it to a human on the first attempt per PR head commit; a second failure for the same head commit falls

@@ -4795,7 +4795,8 @@ enum ConflictRoute {
     AlreadyAttempted,
     /// The CLAUDE-535 per-repo cap defers the push; the next pass asks again.
     Deferred(String),
-    /// Not a PR this routes: no conflict verdict, or a WIP/draft Forgejo PR.
+    /// Not a PR this routes: no conflict verdict, or a WIP/draft Forgejo PR
+    /// that `fj` does not report as conflicted.
     NotApplicable,
     /// A dispatch precondition failed (already logged by the dispatcher).
     Skipped,
@@ -4804,7 +4805,8 @@ enum ConflictRoute {
 /// CLAUDE-547: send one conflict-resolution run for a runner PR that reports
 /// `mergeable: false`, whatever its CI state, through the CLAUDE-535 per-repo
 /// push cap. A Forgejo WIP/draft PR reports `mergeable: false` without
-/// conflicting, so it is not routed until `fj` reports a conflict field.
+/// conflicting, so it is routed only when `fj` reports `conflicted: true`
+/// (CLAUDE-572).
 #[allow(clippy::too_many_arguments)]
 async fn route_conflicting_pr(
     mint: &MintContext,
@@ -4819,7 +4821,8 @@ async fn route_conflicting_pr(
     ci_cap: u32,
     github: bool,
 ) -> Result<ConflictRoute, String> {
-    if status.mergeable != Some(false) {
+    let conflicted = status.conflicted == Some(true);
+    if status.mergeable != Some(false) && !conflicted {
         return Ok(ConflictRoute::NotApplicable);
     }
     if !github {
@@ -4835,13 +4838,13 @@ async fn route_conflicting_pr(
             error!(repo = %repo, pr = pr_number, error = %e, "{msg}");
             msg
         })?;
-        // TODO(FJ-124): replace the WIP title check with fj's `conflicted` field, tracked in CLAUDE-572.
         let draft = prs
             .iter()
             .find(|p| p.number == pr_number)
             .is_some_and(|p| p.title.starts_with("WIP: "));
-        if draft {
-            info!(repo = %repo, pr = pr_number, "conflict routing: WIP PR reports mergeable false without a conflict verdict; not dispatched");
+        // A draft reports `mergeable: false` conflict or not, so only fj's `conflicted` verdict routes it.
+        if draft && !conflicted {
+            info!(repo = %repo, pr = pr_number, conflicted = ?status.conflicted, "conflict routing: WIP PR without a conflict verdict; not dispatched");
             return Ok(ConflictRoute::NotApplicable);
         }
     }
@@ -6317,11 +6320,22 @@ mod tests {
                 state: state.to_string(),
                 mergeable,
                 behind_base,
+                conflicted: None,
                 head_sha: head_sha.map(str::to_string),
             });
             self
         }
         /// Make `pr_status` for `pr_number` alone report `state`, behind base or not.
+        /// Set the `conflicted` verdict on the already-configured PR status.
+        fn with_conflicted(self, conflicted: Option<bool>) -> Self {
+            self.pr_status
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("a PR status must be set first")
+                .conflicted = conflicted;
+            self
+        }
         fn set_pr_status_for(&self, pr_number: u64, state: &str, behind_base: Option<bool>) {
             self.pr_status_by_pr.lock().unwrap().insert(
                 pr_number,
@@ -6329,6 +6343,7 @@ mod tests {
                     state: state.to_string(),
                     mergeable: Some(true),
                     behind_base,
+                    conflicted: None,
                     head_sha: None,
                 },
             );
@@ -11844,6 +11859,7 @@ mod tests {
                 state: "success".to_string(),
                 mergeable: Some(true),
                 behind_base: Some(false),
+                conflicted: None,
                 head_sha: None,
             });
             let result2 = handle_action_success_for_pr(
@@ -11948,6 +11964,7 @@ mod tests {
                 state: "merged".to_string(),
                 mergeable: None,
                 behind_base: None,
+                conflicted: None,
                 head_sha: None,
             });
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
@@ -13595,6 +13612,7 @@ mod tests {
                 state: "success".to_string(),
                 mergeable: Some(false),
                 behind_base: Some(true),
+                conflicted: None,
                 head_sha: None,
             });
             *backend.update_pr_branch_error.lock().unwrap() = Some("boom".to_string());
@@ -14907,6 +14925,7 @@ mod tests {
                 state: "success".to_string(),
                 mergeable: Some(false),
                 behind_base: Some(true),
+                conflicted: None,
                 head_sha: Some("sha-2".to_string()),
             });
             reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
@@ -15040,10 +15059,39 @@ mod tests {
             );
         }
 
-        /// CLAUDE-547: a Forgejo WIP PR reports `mergeable: false` without a
-        /// conflict verdict, so it is never dispatched (CLAUDE-572 covers it).
+        /// CLAUDE-572: a Forgejo WIP PR whose `conflicted` is `false` or
+        /// unknown is never dispatched: `mergeable: false` alone is WIP.
         #[tokio::test]
-        async fn wip_pr_is_not_dispatched() {
+        async fn clean_or_unknown_wip_pr_is_not_dispatched() {
+            for conflicted in [Some(false), None] {
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
+                seed_open_row(&pool).await;
+                let (dispatch, mut rx) = wired_dispatch();
+                let backend = Arc::new(
+                    StoreBackend::new()
+                        .with_open_prs(vec![wip_pr(7)])
+                        .with_pr_status_full("failure", Some(false), Some(false), Some("sha-1"))
+                        .with_conflicted(conflicted),
+                );
+                let ctx = ctx_for(pool.clone(), backend, dir.path(), Some(dispatch));
+                let gate = crate::concurrency::KeyGate::new();
+
+                reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new())
+                    .await;
+
+                assert!(
+                    rx.try_recv().is_err(),
+                    "a WIP PR with conflicted {conflicted:?} must not dispatch"
+                );
+            }
+        }
+
+        /// CLAUDE-572: a Forgejo WIP PR that `fj` reports as conflicted gets
+        /// exactly one resolution run per head commit.
+        #[tokio::test]
+        async fn conflicted_wip_pr_dispatches_once_per_head_commit() {
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
@@ -15052,14 +15100,32 @@ mod tests {
             let backend = Arc::new(
                 StoreBackend::new()
                     .with_open_prs(vec![wip_pr(7)])
-                    .with_pr_status_full("failure", Some(false), Some(false), Some("sha-1")),
+                    .with_pr_status_full("failure", Some(false), Some(false), Some("sha-1"))
+                    .with_conflicted(Some(true)),
             );
             let ctx = ctx_for(pool.clone(), backend, dir.path(), Some(dispatch));
             let gate = crate::concurrency::KeyGate::new();
 
             reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            let sent = rx.try_recv().expect("a conflicted WIP PR dispatches");
+            assert!(sent.synthetic);
+            assert_eq!(sent.number, 7);
+            assert!(rx.try_recv().is_err(), "exactly one command");
 
-            assert!(rx.try_recv().is_err(), "a WIP PR must not dispatch");
+            let key =
+                crate::web::comment_webhooks::command_key("contoso/claude-run", 7, sent.comment_id);
+            state::attempts_increment(
+                &pool,
+                crate::web::comment_webhooks::WEBHOOK_COMMENT_ACTION,
+                &key,
+            )
+            .await
+            .unwrap();
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "a second tick for the same head sends nothing"
+            );
         }
 
         /// CLAUDE-547 / CLAUDE-535: a dispatch waits while another runner PR's
