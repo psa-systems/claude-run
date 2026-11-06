@@ -1406,6 +1406,9 @@ async fn finish_webhook_run(
         stream_log_path: None,
         duration_ms: 0,
         timed_out: false,
+        // SPEC-3.14: the triage run belongs to the CI-failure remediation stage.
+        stage: "ci-remediation",
+        outcome: crate::attempt_steps::Outcome::from_ok(ok).as_str(),
     };
     if let Err(e) = state::job_outcome_insert(pool, &outcome).await {
         warn!(error = %e, "recording webhook run outcome failed");
@@ -2320,6 +2323,71 @@ async fn analyze_and_comment_pr(
 /// spelled directly rather than threaded through another config section.
 const NEEDS_REVIEW_VALUE: &str = "Needs Review";
 
+/// SPEC-3.12 item 8: a CI failure on an agent PR that [`crate::infra_failure`]
+/// recognised as a runner problem. Stores the kind on the failure row, comments
+/// the issue with the one action a person takes (re-run the job), and returns
+/// without bumping `fix_attempts` or touching the `AI Agent` field, so no
+/// remediation run starts. A write that fails is an error summary, never a
+/// silent success.
+async fn report_infra_failure_on_agent_pr(
+    ctx: &MintContext,
+    webhook_run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    record: &ci_failure_store::AgentPullRequest,
+    failure_id: i64,
+    branch: &str,
+    kind: &str,
+) -> WebhookRunSummary {
+    let now = state::now_iso();
+    if let Err(e) = ci_failure_store::set_infra_kind(&ctx.pool, failure_id, kind, &now).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, kind = %kind, error = %e, "storing the infrastructure kind on the ci-failure row failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, kind = %kind, "CI failure on the agent's PR is an infrastructure failure; no fix attempt spent");
+    record_run_event(
+        &ctx.pool,
+        webhook_run_id,
+        WEBHOOK_MINT_ACTION,
+        "warn",
+        format!(
+            "{}: infrastructure failure `{kind}` on PR #{}; no fix attempt spent",
+            record.issue_key, record.pr_number
+        ),
+    )
+    .await;
+    let body = format!(
+        "CI failed on this PR (run #{}, branch `{branch}`) because of the runner, not the commit.\n- Category: `{kind}`\n- Run: {}\n- No fix attempt was spent and no remediation run was started.\n- Re-run the failed CI job; if it keeps failing the same way, a person needs to look at the runner.",
+        ev.index_in_repo, ev.html_url
+    );
+    let body = crate::run_footer::append_run(
+        &body,
+        crate::run_footer::resolved_public_url().as_deref(),
+        webhook_run_id,
+        None,
+        "ci-failure-webhook",
+        Some(&ci_failure_trigger(ev.index_in_repo)),
+    );
+    let backend = ctx.backend.clone();
+    let key = record.issue_key.clone();
+    match tokio::task::spawn_blocking(move || backend.comment(&key, &body)).await {
+        Ok(Ok(())) => WebhookRunSummary {
+            text: format!(
+                "{} infrastructure failure `{kind}` (no fix attempt spent)",
+                record.issue_key
+            ),
+            ok: true,
+        },
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, error = %e, "commenting the infrastructure failure failed");
+            WebhookRunSummary::error(e.to_string())
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, error = %e, "infrastructure comment task panicked");
+            WebhookRunSummary::error(format!("task panicked: {e}"))
+        }
+    }
+}
+
 /// `ev` failed on an open PR the agent itself opened (an `open`
 /// `agent_pull_requests` row). Below `webhook_cfg.agent_pr_fix_attempts`,
 /// comment the recorded issue with the run, the failing tests and the
@@ -2418,6 +2486,23 @@ async fn route_agent_pr_failure(
         error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording this attempt's fingerprint failed");
         return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
     }
+    // SPEC-3.12 item 8: a runner problem is not the agent's to fix. It spends
+    // no `fix_attempts`, starts no remediation run, and is stored on the
+    // failure row with its kind.
+    if let Some(kind) =
+        infra_kind.filter(|k| crate::infra_failure::InfraFailure::spends_no_attempt(k))
+    {
+        return report_infra_failure_on_agent_pr(
+            ctx,
+            webhook_run_id,
+            ev,
+            &record,
+            failure_id,
+            branch,
+            kind,
+        )
+        .await;
+    }
     let repeats_previous = !test_ids.is_empty()
         && previous.as_ref().is_some_and(|(_, prev_ids)| {
             let prev_set: std::collections::BTreeSet<&str> =
@@ -2443,6 +2528,15 @@ async fn route_agent_pr_failure(
             "CI failed the same way as the previous attempt on this PR (branch `{branch}`); stopping the fix-attempt loop instead of re-queueing.\n- Repeated failing tests: {tests_display}\n- This run: {}\n- Previous run: {previous_link}\n- Inspect the repeated failure and fix it by hand, then re-queue the issue (set AI Agent = Queued) once it is resolved.",
             ev.html_url
         );
+        // SPEC-3.15: the run ends in Needs Review, so the list ends with that line.
+        let list = crate::progress_list::render_for(
+            &ctx.pool,
+            "youtrack",
+            &record.issue_key,
+            "Needs Review",
+        )
+        .await;
+        let body = format!("{body}\n\n{list}");
         let body = crate::run_footer::append_run(
             &body,
             crate::run_footer::resolved_public_url().as_deref(),
@@ -2545,6 +2639,20 @@ async fn route_agent_pr_failure(
             },
         )
         .await;
+        // SPEC-3.13: the remediation dispatch tells the issue the stage and the
+        // expected duration of the attempt it queues; the pickup that follows
+        // posts its own start notice with the attempt and the session timeout.
+        let expected_duration = state::expected_duration(&ctx.pool, "youtrack", "ci-remediation")
+            .await
+            .render();
+        // SPEC-3.15 item 4: this comment is the `CI remediation N` line.
+        let step_list = crate::progress_list::render_for(
+            &ctx.pool,
+            "youtrack",
+            &record.issue_key,
+            &format!("CI remediation {}", attempts + 1),
+        )
+        .await;
         let backend = ctx.backend.clone();
         let classifier = ctx.classifier.clone();
         let mint_cfg = ctx.mint_cfg.read().await.clone();
@@ -2584,9 +2692,10 @@ async fn route_agent_pr_failure(
                 ""
             };
             let body = format!(
-                "CI failed again on this PR (run #{}, branch `{branch_owned}`).\n- Run: {}\n- Failing tests: {tests_display}{extra}\n\n{}",
+                "CI failed again on this PR (run #{}, branch `{branch_owned}`).\n- Run: {}\n- Failing tests: {tests_display}{extra}\n- Stage: ci-remediation, expected duration: {expected_duration}\n\n{}",
                 event.index_in_repo, event.html_url, verdict.analysis
             );
+            let body = format!("{body}\n\n{step_list}");
             let body = crate::run_footer::append_run(
                 &body,
                 crate::run_footer::resolved_public_url().as_deref(),
@@ -2686,6 +2795,14 @@ async fn route_agent_pr_failure(
                 Some(&ev.html_url),
             ),
         );
+        let list = crate::progress_list::render_for(
+            &ctx.pool,
+            "youtrack",
+            &record.issue_key,
+            "Needs Review",
+        )
+        .await;
+        let body = format!("{body}\n\n{list}");
         let body = crate::run_footer::append_run(
             &body,
             crate::run_footer::resolved_public_url().as_deref(),
@@ -5985,6 +6102,8 @@ async fn post_branch_updated_push_comment(
             public_url: public_url.as_deref(),
             run_id: None,
             started: None,
+            // TODO(CLAUDE-603): no stored step rows reach this provider-level site yet.
+            progress: None,
         };
         // A directory scoped to this one call, not the bare shared
         // `std::env::temp_dir()` (CLAUDE-519): `push_comment::post` names its
@@ -6958,11 +7077,13 @@ mod tests {
         log
     }
 
-    /// A log on `branch` with no diagnostic line at all, so
+    /// A log on `branch` whose only line is a formatter diff, so
     /// [`fingerprint::fingerprint`] parses an empty id set from it
-    /// (CLAUDE-371: the empty/unparseable-fingerprint fallback case).
+    /// (CLAUDE-371: the empty/unparseable-fingerprint fallback case). It is
+    /// still a code diagnostic, so it is not a SPEC-3.12 item 8
+    /// `no-diagnostic` infrastructure failure.
     fn unparseable_log(branch: &str) -> String {
-        format!("GITHUB_HEAD_REF={branch}\nnothing recognizable here\n")
+        format!("GITHUB_HEAD_REF={branch}\nDiff in src/lib.rs:1:\n")
     }
 
     fn store_mint_cfg() -> MintConfig {
@@ -9442,6 +9563,14 @@ mod tests {
                 .any(|c| c.starts_with("comment CLAUDE-40") && c.contains("Run: ")),
             "the requeue comment carries the run footer: {calls:?}"
         );
+        // CLAUDE-587 / SPEC-3.15 item 4: the remediation comment carries the
+        // step list with its own `CI remediation N` line marked, before the footer.
+        assert!(
+            calls.iter().any(|c| c.starts_with("comment CLAUDE-40")
+                && c.contains("1. CI remediation 1: <-- This comment")
+                && c.find("<-- This comment") < c.rfind("Run: ")),
+            "the requeue comment carries the step list: {calls:?}"
+        );
         assert!(
             calls
                 .iter()
@@ -10068,6 +10197,101 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.fix_attempts, 2);
+    }
+
+    /// CLAUDE-579 / SPEC-3.12 item 8: one log per infrastructure signature on
+    /// an agent PR spends no fix attempt, starts no remediation run and stores
+    /// the kind on the failure row.
+    #[tokio::test]
+    async fn agent_pr_infrastructure_failure_spends_no_attempt_and_starts_no_run() {
+        let cases = [
+            (
+                "job-timeout",
+                "##[error]The job running on runner r1 has exceeded the maximum execution time of 60 minutes.",
+            ),
+            (
+                "container-not-started",
+                "Error response from daemon: failed to create task for container: OCI runtime create failed",
+            ),
+            (
+                "runner-deadline",
+                "Post \"https://forge.example.org/api/actions\": context deadline exceeded",
+            ),
+            (
+                "no-diagnostic",
+                "Set up job\n##[error]Process completed with exit code 1",
+            ),
+        ];
+        for (i, (kind, body)) in cases.iter().enumerate() {
+            let pool = crate::db::test_pool().await;
+            let now = "2026-09-01T00:00:00Z";
+            let pr_number = 60 + i as i64;
+            let key = format!("CLAUDE-{}", 600 + i);
+            let branch = format!("fix/{key}");
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                &key,
+                "dev.a8n.run",
+                "acme/widgets",
+                pr_number,
+                &branch,
+                "open",
+                false,
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(
+                StoreBackend::new().with_open_prs(vec![pr(pr_number as u64, "commit-7600")]),
+            );
+            let counting = Arc::new(CountingClassifier::new());
+            let classifier: Arc<dyn FailureClassifier> = counting.clone();
+            let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+            let log = format!("GITHUB_HEAD_REF={branch}\n{body}\n");
+            let result = triage_and_mint(
+                &ctx,
+                None,
+                &store_event(7600),
+                log,
+                true,
+                None,
+                None,
+                true,
+                "test".to_string(),
+                None,
+                &crate::concurrency::KeyGate::new(),
+                &WebhookConfig::default(),
+                &test_spend(),
+            )
+            .await;
+            assert!(result.ok, "{kind}: {}", result.text);
+            let calls = backend.calls();
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with(&format!("comment {key}"))),
+                "{kind}: the issue is told: {calls:?}"
+            );
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.starts_with(&format!("set_field {key} AI Agent"))),
+                "{kind}: no re-queue and no Needs Review write: {calls:?}"
+            );
+            assert_eq!(counting.call_count(), 0, "{kind}: no analysis run");
+            let record =
+                ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", pr_number)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(record.fix_attempts, 0, "{kind}: no attempt spent");
+            let failure = ci_failure_store::failure_for_issue(&pool, &key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(failure.infra_kind.as_deref(), Some(*kind));
+        }
     }
 
     #[tokio::test]

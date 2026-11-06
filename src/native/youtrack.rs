@@ -1436,6 +1436,18 @@ async fn process_job(
     let action = &loaded.action;
     let key = &job.key;
     let attempts = state::attempts_get(pool, &action.name, key).await?;
+    // SPEC-3.14 item 1: an attempt that continues a PR whose CI failed (the
+    // recorded PR has spent a fix attempt) is the `ci-remediation` stage; any
+    // other attempt is `initial`, `retry-2` or `retry-3` by its number. A store
+    // read failure is logged and falls back to the numbered stage.
+    let stage: &'static str = match crate::ci_failure::store::agent_pr_for_issue(pool, key).await {
+        Ok(Some(rec)) if rec.state == "open" && rec.fix_attempts > 0 => "ci-remediation",
+        Ok(_) => crate::attempt_steps::stage_for_attempt(attempts + 1),
+        Err(e) => {
+            error!(action = %action.name, key = %key, error = %e, "reading the agent PR record for the attempt stage failed; using the numbered stage");
+            crate::attempt_steps::stage_for_attempt(attempts + 1)
+        }
+    };
     // CLAUDE-556: a scheduler pickup is the AI Agent = Queued pickup; any
     // other origin (`bypass_backoff`) is an operator-initiated run.
     let trigger = if bypass_backoff {
@@ -1654,6 +1666,46 @@ async fn process_job(
         };
         info!(action = %action.name, key = %key, reason, "run stopped before Working; left Queued, no attempt consumed");
         return Ok(ProcessedJob::Filtered { key: key.clone() });
+    }
+
+    // SPEC-3.13: the start notice is the first runner write for this attempt,
+    // posted before the `Working` field write and the clone. A failed post is
+    // logged at `error` with the issue key, the run proceeds, and the first
+    // progress comment states the notice is missing.
+    {
+        let expected = state::expected_duration(pool, &action.name, stage).await;
+        let current = if stage == "ci-remediation" {
+            "CI remediation".to_string()
+        } else if attempts == 0 {
+            crate::progress_list::HAPPY_PATH[0].to_string()
+        } else {
+            format!("Retry {}", attempts + 1)
+        };
+        let progress = crate::progress_list::render_for(pool, &action.name, key, &current).await;
+        let body = crate::run_footer::start_notice(
+            &action.name,
+            attempts + 1,
+            stage,
+            limits.claude_timeout,
+            &expected,
+            Some(&progress),
+        );
+        let body = crate::run_footer::append_job(
+            &body,
+            crate::run_footer::resolved_public_url().as_deref(),
+            crate::run_footer::CommentRun {
+                run_id,
+                attempt: attempts + 1,
+                started: started_wall,
+                source: "youtrack",
+                trigger: Some(&trigger),
+            },
+            key,
+        );
+        if let Err(e) = crate::blocking::in_place(|| backend.comment(key, &body)) {
+            error!(action = %action.name, key = %key, error = %e, "SPEC-3.13: posting the start notice failed; the run proceeds");
+            crate::run_footer::mark_start_notice_missing(key);
+        }
     }
 
     // A preserved workdir from a failed finalize (unpushed commits)
@@ -2043,6 +2095,61 @@ async fn process_job(
     // this issue, whether from a re-queue or a checkpoint push opened one
     // mid-run, so a PR-step failure comment can say truthfully whether a
     // re-queue resumes that PR's branch.
+    // SPEC-3.15 item 5: the steps `finalize`'s comments list: the stored rows
+    // of earlier attempts plus this attempt's steps derived so far (they are
+    // written to `attempt_steps` right after `finalize` returns). Handed over
+    // through a keyed stash because `finalize` is synchronous with no pool.
+    {
+        let (mut rows, mut incomplete) = match crate::progress_list::load_rows(
+            pool,
+            &action.name,
+            key,
+        )
+        .await
+        {
+            Ok(rows) => (rows, false),
+            Err(e) => {
+                error!(action = %action.name, key = %key, error = %e, "reading the stored steps for the step list failed; its times render as unknown");
+                (Vec::new(), true)
+            }
+        };
+        let attempt_no = i64::from(attempts + 1);
+        let mut push_row = |kind: &str,
+                            start: chrono::DateTime<chrono::Utc>,
+                            end: chrono::DateTime<chrono::Utc>,
+                            ok: bool| {
+            rows.push(crate::progress_list::StepRow {
+                attempt: attempt_no,
+                kind: kind.to_string(),
+                started_at: start,
+                ended_at: end,
+                ok,
+            });
+        };
+        if let Some((clone_start, clone_end, clone_ok)) = clone_timing {
+            push_row("clone", clone_start, clone_end, clone_ok);
+        }
+        if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
+            match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
+                Ok(steps) => {
+                    for step in steps {
+                        push_row(step.kind.as_str(), step.start, step.end, true);
+                    }
+                }
+                Err(e) => {
+                    error!(action = %action.name, key = %key, error = %e, "deriving claude steps for the step list failed; its times render as unknown");
+                    incomplete = true;
+                }
+            }
+        }
+        crate::progress_list::stash_context(
+            key,
+            crate::progress_list::ListContext {
+                done: crate::progress_list::milestones(&rows),
+                incomplete,
+            },
+        );
+    }
     let finalize_res = crate::blocking::in_place(|| {
         finalize(
             backend,
@@ -2069,6 +2176,7 @@ async fn process_job(
             limits.max_attempts_per_key,
         )
     });
+    crate::progress_list::clear_context(key);
     // ---- record a newly opened PR against its issue ----
     // Only for a fresh PR (`resume` is `None`): a resumed job's PR is already
     // recorded, and re-inserting it would collide with the store's
@@ -2191,6 +2299,7 @@ async fn process_job(
     }
 
     let (ok, mut summary) = record_finalize_outcome(&claude_result, &finalize_res, post_failed);
+    let attempt_outcome = attempt_outcome_of(&finalize_res);
     let stream_log_path = stream_log.as_deref().map(|p| p.display().to_string());
 
     if !skip_attempt {
@@ -2205,12 +2314,10 @@ async fn process_job(
     // for an attempt that counts. Scope: finalize's own PR-path steps (push,
     // pr_create, gate, ci_wait, conflict_resolution) and hook_install /
     // postgres_* are tracked in a follow-up issue, not here.
+    // Drained whether or not the attempt counts, so a skipped attempt's gate
+    // timing never leaks into the next attempt of the same key.
+    let gate_timings = crate::attempt_steps::take_gate_timings(key);
     if !skip_attempt {
-        let stage = match attempts + 1 {
-            1 => "initial",
-            2 => "retry-2",
-            _ => "retry-3",
-        };
         let mut recorder =
             crate::attempt_steps::StepRecorder::new(pool, run_id, &action.name, key, attempts + 1);
         if let Some((clone_start, clone_end, clone_ok)) = clone_timing {
@@ -2229,9 +2336,17 @@ async fn process_job(
         if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
             match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
                 Ok(steps) => {
-                    for (kind, label, start, end) in steps {
+                    for step in steps {
                         recorder
-                            .record(stage, kind, label, start, end, true, None)
+                            .record(
+                                stage,
+                                step.kind,
+                                step.label,
+                                step.start,
+                                step.end,
+                                true,
+                                step.detail,
+                            )
                             .await;
                     }
                 }
@@ -2244,6 +2359,11 @@ async fn process_job(
                     );
                 }
             }
+        }
+        // SPEC-3.14 items 3 and 5: the verification gate(s) `finalize` ran,
+        // with their recipe stages as check sub-steps when the output timed them.
+        for gate in &gate_timings {
+            recorder.record_gate(stage, gate).await;
         }
         if let Some((review_start, review_end, review_ok)) = review_span {
             recorder
@@ -2324,6 +2444,8 @@ async fn process_job(
         stream_log_path,
         duration_ms: started.elapsed().as_millis() as i64,
         timed_out: claude_result.timed_out,
+        stage,
+        outcome: attempt_outcome,
     })
 }
 
@@ -3032,6 +3154,65 @@ fn install_hooks(workdir: &Path) {
 struct GateResult {
     command: Option<&'static str>,
     failure: Option<String>,
+    /// SPEC-3.14: when the recipe ran, its timing and timed stage spans, for
+    /// the caller to stash for the attempt's step recorder.
+    timing: Option<crate::attempt_steps::GateTiming>,
+}
+
+/// Run `just <recipe>` in `workdir`, stamping each stdout line with its
+/// arrival time so the recipe's stage banners can be timed (SPEC-3.14 item 5).
+/// Returns the exit status, the full stdout and stderr, and the timed stdout
+/// lines. A reader thread that fails is an error, never a silently short log.
+fn run_recipe_timed(
+    workdir: &Path,
+    recipe: &str,
+) -> std::io::Result<(
+    std::process::ExitStatus,
+    String,
+    String,
+    Vec<crate::attempt_steps::TimedLine>,
+)> {
+    use std::io::Read;
+    let mut child = Command::new("just")
+        .current_dir(workdir)
+        .arg(recipe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let out_thread = std::thread::spawn(move || -> std::io::Result<_> {
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut text = String::new();
+        let mut timed = Vec::new();
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            if reader.read_until(b'\n', &mut buf)? == 0 {
+                break;
+            }
+            let ts = chrono::Utc::now();
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            text.push_str(&line);
+            timed.push((Some(ts), line.trim_end_matches('\n').to_string()));
+        }
+        Ok((text, timed))
+    });
+    let err_thread = std::thread::spawn(move || -> std::io::Result<String> {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    });
+    let status = child.wait()?;
+    let (out_text, timed) = out_thread
+        .join()
+        .map_err(|_| std::io::Error::other("the gate stdout reader thread panicked"))??;
+    let err_text = err_thread
+        .join()
+        .map_err(|_| std::io::Error::other("the gate stderr reader thread panicked"))??;
+    Ok((status, out_text, err_text, timed))
 }
 
 /// SPEC-3.3.2 "Verification gate": re-run the repository's own pre-push
@@ -3054,32 +3235,36 @@ fn run_verification_gate(workdir: &Path) -> GateResult {
         if !matches!(probe, Ok(s) if s.success()) {
             continue;
         }
-        return match Command::new("just")
-            .current_dir(workdir)
-            .arg(recipe)
-            .output()
-        {
-            Ok(out) if out.status.success() => GateResult {
-                command: Some(recipe),
-                failure: None,
-            },
-            Ok(out) => GateResult {
-                command: Some(recipe),
-                failure: Some(provider::append_stdout_tail(
-                    &String::from_utf8_lossy(&out.stderr),
-                    &String::from_utf8_lossy(&out.stdout),
-                    &[],
-                )),
-            },
+        let start = chrono::Utc::now();
+        let ran = run_recipe_timed(workdir, recipe);
+        let end = chrono::Utc::now();
+        return match ran {
+            Ok((status, stdout, stderr, timed)) => {
+                let timing = crate::attempt_steps::GateTiming {
+                    command: recipe,
+                    start,
+                    end,
+                    ok: status.success(),
+                    stages: crate::attempt_steps::stage_spans(&timed, end),
+                };
+                GateResult {
+                    command: Some(recipe),
+                    failure: (!status.success())
+                        .then(|| provider::append_stdout_tail(&stderr, &stdout, &[])),
+                    timing: Some(timing),
+                }
+            }
             Err(e) => GateResult {
                 command: Some(recipe),
-                failure: Some(format!("running `just {recipe}` failed to start: {e}")),
+                failure: Some(format!("running `just {recipe}` failed: {e}")),
+                timing: None,
             },
         };
     }
     GateResult {
         command: None,
         failure: None,
+        timing: None,
     }
 }
 
@@ -3694,6 +3879,9 @@ impl ConflictResolver for FinalPushConflictResolver {
         // before the push because a merge resolution that breaks the build
         // must not land as a fast-forward.
         let gate = run_verification_gate(workdir);
+        if let Some(t) = gate.timing.clone() {
+            crate::attempt_steps::stash_gate_timing(&self.key, t);
+        }
         if let Some(output) = gate.failure {
             let command = gate.command.unwrap_or("none");
             return Err(Error::Other(anyhow::anyhow!(
@@ -4134,6 +4322,45 @@ impl DeliveryBlockedReason {
     }
 }
 
+/// SPEC-3.15 item 4: the step-list line a lifecycle comment about `f` is
+/// marked with. Reference table for the literal labels `finalize` passes to
+/// [`lifecycle_footer`]; the test below pins one line per variant. One arm per [`Finalized`] variant, no wildcard. A re-queue
+/// announces the next attempt's `Retry N`; a run that ends in `Needs Review` or
+/// `Failed` ends its list with that line.
+#[cfg(test)]
+fn finalized_line(f: &Finalized, attempt: u32) -> String {
+    let retry = || format!("Retry {}", attempt + 1);
+    match f {
+        Finalized::NeedsReview => "Needs Review".to_string(),
+        Finalized::NoCodeChange => "No code change".to_string(),
+        Finalized::CodeReview { .. } => "PR ready".to_string(),
+        Finalized::Failed { requeued: true, .. } => retry(),
+        Finalized::Failed {
+            requeued: false, ..
+        } => "Failed".to_string(),
+        Finalized::TimedOut { .. } => "Needs Review".to_string(),
+        Finalized::ReviewFailed { requeued: true, .. } => retry(),
+        Finalized::ReviewFailed {
+            requeued: false, ..
+        } => "Needs Review".to_string(),
+        Finalized::DeliveryBlocked { .. } => "Needs Review".to_string(),
+    }
+}
+
+/// SPEC-3.15 + SPEC-3.9: `body`, the numbered step list with `line` marked as
+/// this comment, then the run footer. Every `finalize` lifecycle comment ends
+/// through here so the list sits before the footer.
+fn lifecycle_footer(
+    body: &str,
+    public_url: Option<&str>,
+    run: crate::run_footer::CommentRun<'_>,
+    key: &str,
+    line: &str,
+) -> String {
+    let list = crate::progress_list::render_with_context(key, line);
+    crate::run_footer::append_job(&format!("{body}\n\n{list}"), public_url, run, key)
+}
+
 impl Finalized {
     fn as_str(&self) -> &'static str {
         match self {
@@ -4152,6 +4379,29 @@ impl Finalized {
             } => "Needs Review (review)",
             Finalized::DeliveryBlocked { .. } => "Delivery Blocked",
         }
+    }
+}
+
+/// SPEC-3.14 item 7 / SPEC-3.12 item 3: the stored outcome of an attempt, one
+/// arm per [`Finalized`] variant with no wildcard. A `finalize` that returned
+/// `Err` is a hard failure.
+fn attempt_outcome_of(finalize_res: &Result<Finalized>) -> crate::attempt_steps::Outcome {
+    use crate::attempt_steps::Outcome;
+    match finalize_res {
+        Err(_) => Outcome::Failed,
+        Ok(Finalized::NeedsReview) => Outcome::NeedsReview,
+        Ok(Finalized::NoCodeChange) => Outcome::NoCodeChange,
+        Ok(Finalized::CodeReview { .. }) => Outcome::CodeReview,
+        Ok(Finalized::Failed { requeued: true, .. }) => Outcome::Queued,
+        Ok(Finalized::Failed {
+            requeued: false, ..
+        }) => Outcome::Failed,
+        Ok(Finalized::TimedOut { .. }) => Outcome::NeedsReview,
+        Ok(Finalized::ReviewFailed { requeued: true, .. }) => Outcome::Queued,
+        Ok(Finalized::ReviewFailed {
+            requeued: false, ..
+        }) => Outcome::NeedsReview,
+        Ok(Finalized::DeliveryBlocked { .. }) => Outcome::NeedsReview,
     }
 }
 
@@ -4227,7 +4477,7 @@ fn final_push_failed(
         &cause,
         "Nothing was pushed; the commits are preserved on the runner host only.",
     );
-    let body = crate::run_footer::append_job(&body, public_url, run, &job.key);
+    let body = lifecycle_footer(&body, public_url, run, &job.key, "Failed");
     comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
     Ok(Finalized::Failed {
         cause: err.to_string(),
@@ -4257,7 +4507,7 @@ fn finish_delivery_blocked(
         .map(str::to_string)
         .or_else(|| pr.map(|p| p.url.clone()));
     let body = delivery_blocked_comment(reason, pr_url.as_deref());
-    let body = crate::run_footer::append_job(&body, public_url, run, &job.key);
+    let body = lifecycle_footer(&body, public_url, run, &job.key, "Needs Review");
     let label = src.states.delivery_blocked_label().to_string();
     comment_then_field(backend, src, &job.key, &body, &label)?;
     Ok(Finalized::DeliveryBlocked {
@@ -4365,7 +4615,13 @@ fn finalize(
         let reason = std::fs::read_to_string(&needs_review)?.trim().to_string();
         let reason = append_compaction_note(&reason, stream_log, &job.key);
         let reason = note_checkpoint_rejection(reason);
-        let reason = crate::run_footer::append_job(&reason, public_url.as_deref(), run, &job.key);
+        let reason = lifecycle_footer(
+            &reason,
+            public_url.as_deref(),
+            run,
+            &job.key,
+            "Needs Review",
+        );
         if let Err(e) = backend.comment(&job.key, &reason) {
             warn!(key = %job.key, error = %e, "issue comment failed (continuing to tag / AI Agent write)");
         }
@@ -4404,7 +4660,13 @@ fn finalize(
         }
         let summary = std::fs::read_to_string(&no_code)?.trim().to_string();
         let summary = note_checkpoint_rejection(summary);
-        let summary = crate::run_footer::append_job(&summary, public_url.as_deref(), run, &job.key);
+        let summary = lifecycle_footer(
+            &summary,
+            public_url.as_deref(),
+            run,
+            &job.key,
+            "No code change",
+        );
         let label = src.states.no_code_label().to_string();
         comment_then_field(backend, src, &job.key, &summary, &label)?;
         info!(key = %job.key, %label, "no-code-change marker present; skipping PR");
@@ -4461,6 +4723,9 @@ fn finalize(
                 // post-success review session below: there is no point
                 // reviewing a diff whose own checks do not pass.
                 let gate = run_verification_gate(workdir);
+                if let Some(t) = gate.timing.clone() {
+                    crate::attempt_steps::stash_gate_timing(&job.key, t);
+                }
                 if let Some(output) = &gate.failure {
                     let command = gate.command.unwrap_or("none");
                     if let Some(pr_number) = pr.number {
@@ -4482,7 +4747,7 @@ fn finalize(
                     let body = append_compaction_note(&body, stream_log, &job.key);
                     let body = note_checkpoint_rejection(body);
                     let body =
-                        crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+                        lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Failed");
                     comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
                     return Ok(Finalized::Failed {
                         cause: format!("SPEC-3.3.2 verification gate failed (`just {command}`)"),
@@ -4527,11 +4792,12 @@ fn finalize(
                         let body = push_comment_note(body);
                         let body = append_compaction_note(&body, stream_log, &job.key);
                         let body = note_checkpoint_rejection(body);
-                        let body = crate::run_footer::append_job(
+                        let body = lifecycle_footer(
                             &body,
                             public_url.as_deref(),
                             run,
                             &job.key,
+                            "PR ready",
                         );
                         comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
                         // Finalize never waits for CI (CLAUDE-278). It makes
@@ -4624,11 +4890,19 @@ fn finalize(
                         let body = push_comment_note(body);
                         let body = append_compaction_note(&body, stream_log, &job.key);
                         let body = note_checkpoint_rejection(body);
-                        let body = crate::run_footer::append_job(
+                        let body = lifecycle_footer(
                             &body,
                             public_url.as_deref(),
                             run,
                             &job.key,
+                            if no_verdict {
+                                "Review (no verdict)".to_string()
+                            } else if requeued {
+                                format!("Retry {}", run.attempt + 1)
+                            } else {
+                                "Needs Review".to_string()
+                            }
+                            .as_str(),
                         );
                         comment_then_field(backend, src, &job.key, &body, target)?;
                         Ok(Finalized::ReviewFailed {
@@ -4672,8 +4946,13 @@ fn finalize(
                     &detail,
                 );
                 let body = note_checkpoint_rejection(body);
-                let body =
-                    crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+                let body = lifecycle_footer(
+                    &body,
+                    public_url.as_deref(),
+                    run,
+                    &job.key,
+                    "Conflict resolution",
+                );
                 if let Err(ce) = backend.comment(&job.key, &body) {
                     warn!(key = %job.key, error = %ce, "issue comment failed (continuing to AI Agent write)");
                 }
@@ -4748,11 +5027,17 @@ fn finalize(
                             pr_failure_comment(claude_result, &e, &location, pr_step, resume_pr_url)
                         };
                         let body = note_checkpoint_rejection(body);
-                        let body = crate::run_footer::append_job(
+                        let body = lifecycle_footer(
                             &body,
                             public_url.as_deref(),
                             run,
                             &job.key,
+                            if requeued {
+                                format!("Retry {}", run.attempt + 1)
+                            } else {
+                                "Failed".to_string()
+                            }
+                            .as_str(),
                         );
                         if let Err(ce) = backend.comment(&job.key, &body) {
                             warn!(key = %job.key, error = %ce, "issue comment failed (continuing to AI Agent write)");
@@ -4792,12 +5077,8 @@ fn finalize(
                             resume_pr_url,
                         );
                         let body = note_checkpoint_rejection(body);
-                        let body = crate::run_footer::append_job(
-                            &body,
-                            public_url.as_deref(),
-                            run,
-                            &job.key,
-                        );
+                        let body =
+                            lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Failed");
                         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
                         Ok(Finalized::Failed {
                             cause: e.to_string(),
@@ -4842,7 +5123,8 @@ fn finalize(
             let body =
                 delivery_blocked_comment(DeliveryBlockedReason::TimeoutNothingMergeable, None);
             let body = note_checkpoint_rejection(body);
-            let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+            let body =
+                lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Needs Review");
             if let Err(e) = backend.comment(&job.key, &body) {
                 warn!(key = %job.key, error = %e, "delivery-blocked comment failed (continuing)");
             }
@@ -4903,7 +5185,7 @@ fn finalize(
                 let body = lines.join("\n");
                 let body = note_checkpoint_rejection(body);
                 let body =
-                    crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+                    lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "PR ready");
                 if let Err(e) = backend.comment(&job.key, &body) {
                     warn!(key = %job.key, error = %e, "timeout-completed comment failed (continuing)");
                 }
@@ -4922,7 +5204,7 @@ fn finalize(
         }
         let body = timeout_comment(claude_result, claude_timeout, &salvage);
         let body = note_checkpoint_rejection(body);
-        let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+        let body = lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Needs Review");
         if let Err(e) = backend.comment(&job.key, &body) {
             warn!(key = %job.key, error = %e, "timeout comment failed (continuing)");
         }
@@ -4958,7 +5240,7 @@ fn finalize(
         };
         let body = failure_comment(claude_result, &pushed);
         let body = note_checkpoint_rejection(body);
-        let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
+        let body = lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Failed");
         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
         let (cause, pr_step) = match &push_result {
             Err(e) => (format!("final push failed: {e}"), Some("push")),
@@ -6287,6 +6569,8 @@ async fn record_outcome(
         stream_log_path,
         duration_ms,
         timed_out,
+        stage,
+        outcome: attempt_outcome,
     } = outcome
     {
         state::job_outcome_insert(
@@ -6305,6 +6589,8 @@ async fn record_outcome(
                 stream_log_path: stream_log_path.as_deref(),
                 duration_ms: *duration_ms,
                 timed_out: *timed_out,
+                stage,
+                outcome: attempt_outcome.as_str(),
             },
         )
         .await?;
@@ -6671,9 +6957,15 @@ mod tests {
             "a transient auth failure must revert the issue off Working"
         );
         assert_eq!(
-            tracker.comments.lock().unwrap().len(),
+            tracker
+                .comments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| !c.contains("**Started.**"))
+                .count(),
             1,
-            "exactly one comment names the revert"
+            "exactly one comment (besides the start notice) names the revert"
         );
     }
 
@@ -6755,7 +7047,16 @@ mod tests {
             "no attempt is spent on a transient rate-limit result"
         );
         assert_eq!(tracker.field(), "Queued");
-        assert_eq!(tracker.comments.lock().unwrap().len(), 1);
+        assert_eq!(
+            tracker
+                .comments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| !c.contains("**Started.**"))
+                .count(),
+            1
+        );
     }
 
     /// A run already stopped (here: by the Claude login needing renewal) when
@@ -6838,6 +7139,161 @@ mod tests {
         );
         assert!(tracker.comments.lock().unwrap().is_empty());
         assert_eq!(state::attempts_get(&pool, "yt", "MK-16").await.unwrap(), 0);
+    }
+
+    /// CLAUDE-587 / SPEC-3.15 item 4: every `Finalized` variant maps to its
+    /// own step-list line, and a lifecycle comment ends its list with that
+    /// line marked, before the run footer.
+    #[test]
+    fn each_finalized_variant_ends_its_list_with_its_own_line() {
+        let cr = || Finalized::CodeReview {
+            pr_url: "u".into(),
+            pr_number: Some(1),
+            head_branch: Some("b".into()),
+            merged: false,
+        };
+        let table: Vec<(Finalized, &str)> = vec![
+            (Finalized::NeedsReview, "Needs Review"),
+            (Finalized::NoCodeChange, "No code change"),
+            (cr(), "PR ready"),
+            (
+                Finalized::Failed {
+                    cause: "c".into(),
+                    pr_step: None,
+                    requeued: false,
+                },
+                "Failed",
+            ),
+            (
+                Finalized::Failed {
+                    cause: "c".into(),
+                    pr_step: Some("push"),
+                    requeued: true,
+                },
+                "Retry 2",
+            ),
+            (
+                Finalized::TimedOut {
+                    pr_number: None,
+                    head_branch: None,
+                },
+                "Needs Review",
+            ),
+            (
+                Finalized::ReviewFailed {
+                    pr_url: "u".into(),
+                    pr_number: None,
+                    head_branch: None,
+                    requeued: true,
+                },
+                "Retry 2",
+            ),
+            (
+                Finalized::ReviewFailed {
+                    pr_url: "u".into(),
+                    pr_number: None,
+                    head_branch: None,
+                    requeued: false,
+                },
+                "Needs Review",
+            ),
+            (
+                Finalized::DeliveryBlocked {
+                    reason: DeliveryBlockedReason::NoCommitsAhead,
+                    pr_url: None,
+                    pr_number: None,
+                    head_branch: None,
+                },
+                "Needs Review",
+            ),
+        ];
+        let started = chrono::Utc::now();
+        let trigger = crate::run_footer::Trigger::AiAgentPickup;
+        for (finalized, expected_line) in table {
+            let line = finalized_line(&finalized, 1);
+            assert_eq!(line, expected_line, "{finalized:?}");
+            let run = crate::run_footer::CommentRun {
+                run_id: 7,
+                attempt: 1,
+                started,
+                source: "youtrack",
+                trigger: Some(&trigger),
+            };
+            let body = lifecycle_footer("outcome", None, run, "TBL-1", &line);
+            let marked = format!("1. {line}: <-- This comment");
+            let list_end = body.find(&marked).expect("the marked line is present");
+            assert!(
+                body.find("Run: ").unwrap() > list_end,
+                "list before footer: {body}"
+            );
+        }
+    }
+
+    /// CLAUDE-584 / SPEC-3.13: the pickup posts the start notice, naming the
+    /// attempt, stage, timeout and expected duration, before it clones: the
+    /// clone fails here, and the notice is still the first comment.
+    #[tokio::test]
+    async fn process_job_posts_the_start_notice_before_it_clones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = ClaudeInvoker::new(Some("/nonexistent/claude-stub-should-never-run.sh"));
+        let tracker = FakeTracker::new("Queued");
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let mut j = job();
+        j.clone_url = "/nonexistent/claude-run-584.git".into();
+        let mut s = src();
+        s.dependencies.enabled = false;
+        let pool = mem_pool().await;
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout: Duration::from_secs(30),
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+            review_timeout: Duration::from_secs(1800),
+        };
+        let cancel = CancellationToken::new();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+        let gate = crate::pause::PauseGate::new(pool.clone());
+        let pause = gate.for_action_run("yt");
+        let _ = process_job(
+            &loaded,
+            &paths,
+            &pool,
+            &claude,
+            &tracker,
+            &forge,
+            &s,
+            &limits,
+            &cancel,
+            &pause,
+            &spend,
+            &j,
+            PrStrategy::Branch,
+            false,
+            1,
+        )
+        .await;
+        let comments = tracker.comments.lock().unwrap();
+        let first = comments.first().expect("the start notice was posted");
+        assert!(first.contains("**Started.**"), "{first:?}");
+        assert!(first.contains("Attempt: 1 (stage: initial)"), "{first:?}");
+        assert!(first.contains("Session timeout: 30s"), "{first:?}");
+        assert!(first.contains("Expected duration: no history"), "{first:?}");
+        assert!(
+            first.contains("1. Initial commit: <-- This comment"),
+            "{first:?}"
+        );
     }
 
     /// CLAUDE-535 fixture: a forge whose PRs report the CI state listed in
@@ -7215,7 +7671,16 @@ mod tests {
             "a login trip mid-run must requeue rather than fail, got {outcome:?}"
         );
         assert_eq!(tracker.field(), "Queued");
-        assert_eq!(tracker.comments.lock().unwrap().len(), 1);
+        assert_eq!(
+            tracker
+                .comments
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| !c.contains("**Started.**"))
+                .count(),
+            1
+        );
         assert_eq!(
             state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
             0,

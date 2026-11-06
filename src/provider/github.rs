@@ -882,6 +882,8 @@ impl GithubForge {
             public_url: public_url.as_deref(),
             run_id: None,
             started: None,
+            // TODO(CLAUDE-603): no stored step rows reach this provider-level site yet.
+            progress: None,
         };
         pr.push_comment_failure =
             crate::push_comment::post(self, host, repo, pr_number, &std::env::temp_dir(), &ctx);

@@ -615,9 +615,17 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
         if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
             match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
                 Ok(steps) => {
-                    for (kind, label, start, end) in steps {
+                    for step in steps {
                         recorder
-                            .record(stage, kind, label, start, end, true, None)
+                            .record(
+                                stage,
+                                step.kind,
+                                step.label,
+                                step.start,
+                                step.end,
+                                true,
+                                step.detail,
+                            )
                             .await;
                     }
                 }
@@ -649,6 +657,8 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
         stream_log_path,
         duration_ms: started.elapsed().as_millis() as i64,
         timed_out: claude_result.timed_out,
+        stage: crate::attempt_steps::stage_for_attempt(attempts + 1),
+        outcome: crate::attempt_steps::Outcome::from_ok(ok),
     })
 }
 
@@ -696,6 +706,10 @@ pub enum ProcessedJob {
         /// Claude hit the wall-clock limit (exit 124). Carried into the
         /// persisted outcome so a timeout renders distinctly from a failure.
         timed_out: bool,
+        /// SPEC-3.14 item 1: the attempt's stage.
+        stage: &'static str,
+        /// SPEC-3.14 item 7: the attempt's [`crate::attempt_steps::Outcome`].
+        outcome: crate::attempt_steps::Outcome,
     },
 }
 

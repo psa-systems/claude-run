@@ -30,6 +30,7 @@ use crate::error::Result;
 /// SPEC-4.3.13: selectable reporting window. Bounds every query by date / `ts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Range {
+    Last7Days,
     Last30Days,
     Last90Days,
     All,
@@ -41,6 +42,7 @@ impl Range {
     /// defaults to all-time.
     pub fn from_param(s: &str) -> Range {
         match s {
+            "7d" => Range::Last7Days,
             "30d" => Range::Last30Days,
             "90d" => Range::Last90Days,
             _ => Range::All,
@@ -50,6 +52,7 @@ impl Range {
     /// The canonical query-param spelling, for round-tripping into links / forms.
     pub fn as_param(self) -> &'static str {
         match self {
+            Range::Last7Days => "7d",
             Range::Last30Days => "30d",
             Range::Last90Days => "90d",
             Range::All => "all",
@@ -59,6 +62,7 @@ impl Range {
     /// Window length in days, or `None` for all-time (no lower bound).
     fn days(self) -> Option<i64> {
         match self {
+            Range::Last7Days => Some(7),
             Range::Last30Days => Some(30),
             Range::Last90Days => Some(90),
             Range::All => None,
@@ -566,6 +570,53 @@ pub async fn claude_usage(
     })
 }
 
+/// CLAUDE-601 / SPEC-3.14 items 1 and 7: attempts counted by `(stage,
+/// outcome)` straight from `job_outcomes`, so "succeeded on the first try" is
+/// a query and not a re-derivation from `attempt_steps`.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct StageOutcomeCount {
+    pub stage: String,
+    pub outcome: String,
+    pub count: i64,
+}
+
+/// SPEC-3.14 item 7: attempt counts by stage and outcome over the window.
+/// A row with a NULL stage or outcome (it cannot exist after the backfill
+/// migration) is an error, never silently bucketed.
+pub async fn attempts_by_outcome(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+) -> Result<Vec<StageOutcomeCount>> {
+    let cutoff = ts_cutoff(range);
+    let mut sql =
+        String::from("SELECT stage, outcome, COUNT(*) FROM job_outcomes WHERE attempt_counted = 1");
+    if cutoff.is_some() {
+        sql.push_str(" AND ts >= ?");
+    }
+    if action.is_some() {
+        sql.push_str(" AND action_name = ?");
+    }
+    sql.push_str(" GROUP BY stage, outcome ORDER BY stage, outcome");
+    let sql = crate::db::q(pool, &sql).into_owned();
+    let mut q = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql.as_str()));
+    if let Some(c) = &cutoff {
+        q = q.bind(c);
+    }
+    if let Some(a) = action {
+        q = q.bind(a);
+    }
+    Ok(q.fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|(stage, outcome, count)| StageOutcomeCount {
+            stage,
+            outcome,
+            count,
+        })
+        .collect())
+}
+
 /// SPEC-4.3.14: one `kind`'s total duration over the window.
 #[derive(Debug, Serialize)]
 pub struct KindDuration {
@@ -701,6 +752,753 @@ pub async fn step_timing(
     })
 }
 
+// ---- SPEC-4.3.14: stages, Postgres, funnel, failure causes ---------------
+
+/// Nearest-rank percentile of `sorted` (ascending), `p` in `0..=100`.
+/// `None` for an empty slice: no data is not a zero.
+fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil().max(1.0) as usize;
+    sorted.get(rank - 1).copied()
+}
+
+/// The shared statistics helper SPEC-4.3.14 names: count, median, 95th
+/// percentile and maximum of `values` (seconds).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Stats {
+    pub count: usize,
+    pub median_seconds: Option<f64>,
+    pub p95_seconds: Option<f64>,
+    pub max_seconds: Option<f64>,
+}
+
+fn stats(mut values: Vec<f64>) -> Stats {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Stats {
+        count: values.len(),
+        median_seconds: percentile(&values, 50.0),
+        p95_seconds: percentile(&values, 95.0),
+        max_seconds: values.last().copied(),
+    }
+}
+
+/// Counted attempts in the window with no `attempt_steps` rows at all
+/// (SPEC-4.3.14 "no step data"): shown as its own figure on every series,
+/// never folded in as zero seconds.
+async fn attempts_without_steps(pool: &DbPool, range: Range, action: Option<&str>) -> Result<i64> {
+    let cutoff = ts_cutoff(range);
+    let mut total_sql = String::from("SELECT COUNT(*) FROM job_outcomes WHERE attempt_counted = 1");
+    let mut with_sql = String::from(
+        "SELECT COUNT(DISTINCT action_name || '|' || job_key || '|' || attempt) \
+         FROM attempt_steps WHERE 1 = 1",
+    );
+    if cutoff.is_some() {
+        total_sql.push_str(" AND ts >= ?");
+        with_sql.push_str(" AND started_at >= ?");
+    }
+    if action.is_some() {
+        total_sql.push_str(" AND action_name = ?");
+        with_sql.push_str(" AND action_name = ?");
+    }
+    let mut counts = [0_i64; 2];
+    for (i, sql) in [total_sql, with_sql].iter().enumerate() {
+        let sql = crate::db::q(pool, sql).into_owned();
+        let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
+        if let Some(c) = &cutoff {
+            q = q.bind(c);
+        }
+        if let Some(a) = action {
+            q = q.bind(a);
+        }
+        counts[i] = q.fetch_one(pool).await?;
+    }
+    Ok((counts[0] - counts[1]).max(0))
+}
+
+/// SPEC-3.14 item 1: the closed stage set, in report order.
+pub const STAGES: &[&str] = &[
+    "initial",
+    "retry-2",
+    "retry-3",
+    "ci-remediation",
+    "conflict-resolution",
+    "review",
+    "final",
+];
+
+/// SPEC-4.3.14 stages series: one row per stage.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct StageStats {
+    pub stage: String,
+    #[serde(flatten)]
+    pub stats: Stats,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct StageReport {
+    pub stages: Vec<StageStats>,
+    pub attempts_with_no_step_data: i64,
+}
+
+/// `(action_name, job_key, attempt, stage, started_at, ended_at)` step rows.
+async fn stage_step_rows(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+) -> Result<Vec<(String, String, i64, String, String, String)>> {
+    let cutoff = ts_cutoff(range);
+    let mut sql = String::from(
+        "SELECT action_name, job_key, attempt, stage, started_at, ended_at FROM attempt_steps WHERE 1 = 1",
+    );
+    if cutoff.is_some() {
+        sql.push_str(" AND started_at >= ?");
+    }
+    if action.is_some() {
+        sql.push_str(" AND action_name = ?");
+    }
+    let sql = crate::db::q(pool, &sql).into_owned();
+    let mut q = sqlx::query_as::<_, (String, String, i64, String, String, String)>(
+        sqlx::AssertSqlSafe(sql.as_str()),
+    );
+    if let Some(c) = &cutoff {
+        q = q.bind(c);
+    }
+    if let Some(a) = action {
+        q = q.bind(a);
+    }
+    Ok(q.fetch_all(pool).await?)
+}
+
+/// SPEC-4.3.14: duration per stage (count, median, 95th percentile), one
+/// duration per `(action, job, attempt, stage)` summed from its steps. Always
+/// returns every stage of [`STAGES`], a stage with no attempts having a zero
+/// count and no statistics (absent, not zero seconds).
+pub async fn stages(pool: &DbPool, range: Range, action: Option<&str>) -> Result<StageReport> {
+    let mut per_attempt: BTreeMap<(String, String, i64, String), f64> = BTreeMap::new();
+    for (a, k, attempt, stage, started, ended) in stage_step_rows(pool, range, action).await? {
+        let Some(minutes) = span_minutes(&started, &ended) else {
+            return Err(crate::error::Error::Other(anyhow::anyhow!(
+                "attempt_steps row for {a}/{k} attempt {attempt} has an unparseable timestamp ({started:?} / {ended:?})"
+            )));
+        };
+        *per_attempt.entry((a, k, attempt, stage)).or_default() += minutes * 60.0;
+    }
+    let mut by_stage: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for ((_, _, _, stage), secs) in per_attempt {
+        by_stage.entry(stage).or_default().push(secs);
+    }
+    // A stage outside the closed set is a data defect: surface it.
+    if let Some(unknown) = by_stage.keys().find(|k| !STAGES.contains(&k.as_str())) {
+        return Err(crate::error::Error::Other(anyhow::anyhow!(
+            "attempt_steps holds a stage outside the SPEC-3.14 closed set: {unknown:?}"
+        )));
+    }
+    let stages = STAGES
+        .iter()
+        .map(|st| StageStats {
+            stage: (*st).to_string(),
+            stats: stats(by_stage.remove(*st).unwrap_or_default()),
+        })
+        .collect();
+    Ok(StageReport {
+        stages,
+        attempts_with_no_step_data: attempts_without_steps(pool, range, action).await?,
+    })
+}
+
+/// SPEC-4.3.14 Postgres series.
+#[derive(Debug, Default, Serialize)]
+pub struct PostgresReport {
+    /// Attempts that started a Postgres container.
+    pub starts: usize,
+    /// Starts that became healthy.
+    pub healthy: usize,
+    /// Starts that never became healthy.
+    pub never_healthy: usize,
+    /// Time from start to healthy, over the healthy starts.
+    pub time_to_healthy: Option<Stats>,
+    /// The probe's last error from the most recent start that never became
+    /// healthy; `None` when there was no such start.
+    pub last_failure_cause: Option<String>,
+    pub attempts_with_no_step_data: i64,
+}
+
+/// SPEC-4.3.14: time from Postgres start to healthy (median, 95th percentile,
+/// maximum), the count of starts that never became healthy and the cause of
+/// the last such failure.
+pub async fn postgres(pool: &DbPool, range: Range, action: Option<&str>) -> Result<PostgresReport> {
+    let cutoff = ts_cutoff(range);
+    let mut sql = String::from(
+        "SELECT action_name, job_key, attempt, kind, started_at, ended_at, ok, detail \
+         FROM attempt_steps WHERE kind IN ('postgres_start', 'postgres_healthy')",
+    );
+    if cutoff.is_some() {
+        sql.push_str(" AND started_at >= ?");
+    }
+    if action.is_some() {
+        sql.push_str(" AND action_name = ?");
+    }
+    sql.push_str(" ORDER BY started_at");
+    let sql = crate::db::q(pool, &sql).into_owned();
+    type Row = (
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+    );
+    let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()));
+    if let Some(c) = &cutoff {
+        q = q.bind(c);
+    }
+    if let Some(a) = action {
+        q = q.bind(a);
+    }
+    let rows = q.fetch_all(pool).await?;
+
+    struct Start {
+        started: String,
+        healthy_end: Option<String>,
+        failure: Option<Option<String>>,
+    }
+    let mut by_attempt: BTreeMap<(String, String, i64), Start> = BTreeMap::new();
+    for (a, k, attempt, kind, started, ended, ok, detail) in rows {
+        let e = by_attempt.entry((a, k, attempt)).or_insert(Start {
+            started: started.clone(),
+            healthy_end: None,
+            failure: None,
+        });
+        if kind == "postgres_start" {
+            e.started = started;
+        } else if ok != 0 {
+            e.healthy_end = Some(ended);
+        } else {
+            e.failure = Some(detail);
+        }
+    }
+    let mut times = Vec::new();
+    let mut never = 0usize;
+    let mut last_failure_cause = None;
+    let starts = by_attempt.len();
+    for (_, st) in by_attempt {
+        match st.healthy_end {
+            Some(end) => {
+                let m = span_minutes(&st.started, &end).ok_or_else(|| {
+                    crate::error::Error::Other(anyhow::anyhow!(
+                        "postgres step timestamps do not parse ({:?} / {end:?})",
+                        st.started
+                    ))
+                })?;
+                times.push(m * 60.0);
+            }
+            None => {
+                never += 1;
+                last_failure_cause = Some(
+                    st.failure
+                        .flatten()
+                        .unwrap_or_else(|| "no cause recorded".to_string()),
+                );
+            }
+        }
+    }
+    Ok(PostgresReport {
+        starts,
+        healthy: times.len(),
+        never_healthy: never,
+        time_to_healthy: (!times.is_empty()).then(|| stats(times)),
+        last_failure_cause,
+        attempts_with_no_step_data: attempts_without_steps(pool, range, action).await?,
+    })
+}
+
+/// SPEC-3.14 item 7: seconds after an issue's last attempt before a
+/// non-terminal outcome counts as "never finished".
+pub const NEVER_FINISHED_AFTER_SECS: i64 = 300;
+
+/// One attempt, as the funnel and failure causes read it.
+#[derive(Debug, Clone)]
+pub struct AttemptRow {
+    pub run_id: i64,
+    pub action_name: String,
+    pub job_key: String,
+    pub attempt: i64,
+    pub ts: DateTime<Utc>,
+    pub outcome: String,
+    pub timed_out: bool,
+    pub summary: Option<String>,
+}
+
+async fn attempt_rows(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+) -> Result<Vec<AttemptRow>> {
+    let cutoff = ts_cutoff(range);
+    let mut sql = String::from(
+        "SELECT run_id, action_name, job_key, attempt, ts, outcome, timed_out, summary \
+         FROM job_outcomes WHERE attempt_counted = 1",
+    );
+    if cutoff.is_some() {
+        sql.push_str(" AND ts >= ?");
+    }
+    if action.is_some() {
+        sql.push_str(" AND action_name = ?");
+    }
+    sql.push_str(" ORDER BY action_name, job_key, attempt");
+    let sql = crate::db::q(pool, &sql).into_owned();
+    type Row = (
+        i64,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        i64,
+        Option<String>,
+    );
+    let mut q = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(sql.as_str()));
+    if let Some(c) = &cutoff {
+        q = q.bind(c);
+    }
+    if let Some(a) = action {
+        q = q.bind(a);
+    }
+    q.fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|(run_id, action_name, job_key, attempt, ts, outcome, timed_out, summary)| {
+            let parsed = DateTime::parse_from_rfc3339(&ts)
+                .map_err(|e| {
+                    crate::error::Error::Other(anyhow::anyhow!(
+                        "job_outcomes row for {action_name}/{job_key} attempt {attempt} has a bad ts {ts:?}: {e}"
+                    ))
+                })?
+                .with_timezone(&Utc);
+            Ok(AttemptRow {
+                run_id,
+                action_name,
+                job_key,
+                attempt,
+                ts: parsed,
+                // A NULL outcome (cannot exist after the backfill) is kept
+                // as an unrecognised value so it shows up as a funnel mismatch.
+                outcome: outcome.unwrap_or_else(|| "(null)".to_string()),
+                timed_out: timed_out != 0,
+                summary,
+            })
+        })
+        .collect()
+}
+
+/// SPEC-4.3.14 funnel: where the issues in range ended up.
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
+pub struct FunnelCounts {
+    pub first_attempt: usize,
+    pub second_attempt: usize,
+    pub third_attempt: usize,
+    pub needs_review: usize,
+    pub failed: usize,
+    pub never_finished: usize,
+    /// Issues whose last attempt re-queued less than
+    /// [`NEVER_FINISHED_AFTER_SECS`] ago: still in flight, neither finished nor
+    /// "never finished" yet.
+    pub in_progress: usize,
+    /// Issues whose last outcome is not in the closed set: counted nowhere, so
+    /// they surface as a mismatch.
+    pub unclassified: usize,
+}
+
+impl FunnelCounts {
+    fn classified(&self) -> usize {
+        self.first_attempt
+            + self.second_attempt
+            + self.third_attempt
+            + self.needs_review
+            + self.failed
+            + self.never_finished
+            + self.in_progress
+    }
+}
+
+/// Fold attempts (ordered by action, job, attempt) into the funnel. An issue's
+/// terminal outcome is its last attempt's, unless that is `queued`.
+pub fn fold_funnel(rows: &[AttemptRow], now: DateTime<Utc>) -> FunnelCounts {
+    let mut c = FunnelCounts::default();
+    let mut i = 0;
+    while i < rows.len() {
+        let mut j = i;
+        while j < rows.len()
+            && rows[j].action_name == rows[i].action_name
+            && rows[j].job_key == rows[i].job_key
+        {
+            j += 1;
+        }
+        let last = &rows[j - 1];
+        match last.outcome.as_str() {
+            "success" | "code_review" | "no_code_change" => match last.attempt {
+                ..=1 => c.first_attempt += 1,
+                2 => c.second_attempt += 1,
+                _ => c.third_attempt += 1,
+            },
+            "needs_review" => c.needs_review += 1,
+            "failed" => c.failed += 1,
+            "queued" => {
+                if (now - last.ts).num_seconds() > NEVER_FINISHED_AFTER_SECS {
+                    c.never_finished += 1;
+                } else {
+                    c.in_progress += 1;
+                }
+            }
+            _ => c.unclassified += 1,
+        }
+        i = j;
+    }
+    c
+}
+
+#[derive(Debug, Serialize)]
+pub struct FunnelReport {
+    #[serde(flatten)]
+    pub counts: FunnelCounts,
+    /// Distinct issues with a counted attempt in the window, counted by SQL
+    /// independently of the fold above.
+    pub issues_in_range: i64,
+    /// `Some` when the buckets do not sum to `issues_in_range`; names the
+    /// difference. Rendered as an error banner.
+    pub mismatch: Option<String>,
+    pub attempts_with_no_step_data: i64,
+}
+
+/// SPEC-4.3.14 funnel series.
+pub async fn funnel(pool: &DbPool, range: Range, action: Option<&str>) -> Result<FunnelReport> {
+    let rows = attempt_rows(pool, range, action).await?;
+    let counts = fold_funnel(&rows, Utc::now());
+
+    let cutoff = ts_cutoff(range);
+    let mut sql = String::from(
+        "SELECT COUNT(DISTINCT action_name || '|' || job_key) FROM job_outcomes WHERE attempt_counted = 1",
+    );
+    if cutoff.is_some() {
+        sql.push_str(" AND ts >= ?");
+    }
+    if action.is_some() {
+        sql.push_str(" AND action_name = ?");
+    }
+    let sql = crate::db::q(pool, &sql).into_owned();
+    let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
+    if let Some(c) = &cutoff {
+        q = q.bind(c);
+    }
+    if let Some(a) = action {
+        q = q.bind(a);
+    }
+    let issues_in_range = q.fetch_one(pool).await?;
+    let sum = counts.classified() as i64;
+    let mismatch = (sum != issues_in_range).then(|| {
+        format!(
+            "the funnel buckets sum to {sum} but {issues_in_range} issues are in range (difference {}; {} with an unrecognised outcome)",
+            issues_in_range - sum,
+            counts.unclassified
+        )
+    });
+    Ok(FunnelReport {
+        counts,
+        issues_in_range,
+        mismatch,
+        attempts_with_no_step_data: attempts_without_steps(pool, range, action).await?,
+    })
+}
+
+/// SPEC-4.3.14: the closed failure-cause set.
+pub const FAILURE_CAUSES: &[&str] = &[
+    "test",
+    "compile",
+    "fmt-lint",
+    "timeout",
+    "push-diverged",
+    "hook",
+    "ci-infrastructure",
+    "review-no-verdict",
+    "other",
+];
+
+/// SPEC-4.3.14: classify one failed attempt into [`FAILURE_CAUSES`] from its
+/// timeout flag and recorded summary. `other` is the explicit bucket for
+/// everything that matches no rule; it is shown, never merged elsewhere.
+pub fn classify_failure_cause(timed_out: bool, summary: &str) -> &'static str {
+    let s = summary.to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| s.contains(n));
+    if timed_out {
+        "timeout"
+    } else if has(&["diverged", "non-fast-forward"]) {
+        "push-diverged"
+    } else if has(&["no verdict", "gave no verdict"]) {
+        "review-no-verdict"
+    } else if has(&["hook"]) {
+        "hook"
+    } else if has(&["rustfmt", "cargo fmt", "clippy", "lint"]) {
+        "fmt-lint"
+    } else if has(&[
+        "could not compile",
+        "compilation",
+        "error[e",
+        "failed to compile",
+    ]) {
+        "compile"
+    } else if has(&[
+        "test result: failed",
+        "tests failed",
+        "failing test",
+        "test failed",
+    ]) {
+        "test"
+    } else {
+        "other"
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct CauseCount {
+    pub cause: &'static str,
+    pub count: usize,
+}
+
+/// A failed attempt, linkable to its run page.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct AttemptRef {
+    pub run_id: i64,
+    pub job_key: String,
+    pub attempt: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FailureCauseReport {
+    /// Every cause of [`FAILURE_CAUSES`], in order, zero counts included.
+    pub causes: Vec<CauseCount>,
+    /// The attempts behind a non-zero `other` count (newest 50).
+    pub other_attempts: Vec<AttemptRef>,
+    /// `Some` when the `ci-infrastructure` count could not honour the `action`
+    /// filter (CI failures belong to no action).
+    pub ci_infrastructure_note: Option<String>,
+    pub attempts_with_no_step_data: i64,
+}
+
+/// SPEC-4.3.14 failure-causes series: failed attempts by closed category, plus
+/// the infrastructure CI failures `triage` stored with a kind (SPEC-3.12 item 8).
+pub async fn failure_causes(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+) -> Result<FailureCauseReport> {
+    let rows = attempt_rows(pool, range, action).await?;
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut other_attempts = Vec::new();
+    for r in rows.iter().filter(|r| {
+        r.timed_out || matches!(r.outcome.as_str(), "failed" | "queued" | "needs_review")
+    }) {
+        let cause = classify_failure_cause(r.timed_out, r.summary.as_deref().unwrap_or(""));
+        *counts.entry(cause).or_default() += 1;
+        if cause == "other" {
+            other_attempts.push(AttemptRef {
+                run_id: r.run_id,
+                job_key: r.job_key.clone(),
+                attempt: r.attempt,
+            });
+        }
+    }
+    other_attempts.reverse();
+    other_attempts.truncate(50);
+
+    let cutoff = ts_cutoff(range);
+    let mut sql = String::from("SELECT COUNT(*) FROM ci_failures WHERE infra_kind IS NOT NULL");
+    if cutoff.is_some() {
+        sql.push_str(" AND created_at >= ?");
+    }
+    let sql = crate::db::q(pool, &sql).into_owned();
+    let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
+    if let Some(c) = &cutoff {
+        q = q.bind(c);
+    }
+    let ci_infra = q.fetch_one(pool).await? as usize;
+    let ci_infrastructure_note = action.map(|_| {
+        "CI infrastructure failures belong to no action, so this count ignores the action filter"
+            .to_string()
+    });
+    *counts.entry("ci-infrastructure").or_default() += ci_infra;
+
+    Ok(FailureCauseReport {
+        causes: FAILURE_CAUSES
+            .iter()
+            .map(|c| CauseCount {
+                cause: c,
+                count: counts.get(c).copied().unwrap_or(0),
+            })
+            .collect(),
+        other_attempts,
+        ci_infrastructure_note,
+        attempts_with_no_step_data: attempts_without_steps(pool, range, action).await?,
+    })
+}
+
+// ---- SPEC-4.3.15: in flight and recent averages --------------------------
+
+/// SPEC-4.3.15: the fraction of the session timeout past which an in-flight
+/// job is highlighted as at risk.
+pub const AT_RISK_FRACTION: f64 = 0.8;
+
+/// One job in flight (`run_inflight_jobs`).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct InflightJob {
+    pub run_id: i64,
+    pub action: String,
+    pub job_key: String,
+    pub stage: String,
+    /// The latest recorded step (`kind` / `label`), `None` while no step of
+    /// the attempt has been written yet.
+    pub current_step: Option<String>,
+    pub elapsed_secs: i64,
+    /// The median of the last 20 completed attempts of the same action and
+    /// stage; `None` reads "no history" (fewer than 3).
+    pub median_secs: Option<i64>,
+    pub timeout_secs: Option<u64>,
+    pub over_median: bool,
+    pub at_risk: bool,
+}
+
+/// SPEC-4.3.15: highlight flags for one job. Pure, so the rule is tested alone.
+pub fn highlight(
+    elapsed_secs: i64,
+    median_secs: Option<i64>,
+    timeout_secs: Option<u64>,
+) -> (bool, bool) {
+    let over_median = median_secs.is_some_and(|m| elapsed_secs > m);
+    let at_risk = timeout_secs.is_some_and(|t| elapsed_secs as f64 > AT_RISK_FRACTION * t as f64);
+    (over_median, at_risk)
+}
+
+/// SPEC-4.3.15: every job in flight with its stage, current step, elapsed time
+/// and the median of recent completed attempts. `timeout_for` gives an
+/// action's session timeout, `None` when it cannot be resolved (no at-risk
+/// highlight then; the caller logs why).
+pub async fn inflight_jobs(
+    pool: &DbPool,
+    now: DateTime<Utc>,
+    timeout_for: &(dyn Fn(&str) -> Option<u64> + Sync),
+) -> Result<Vec<InflightJob>> {
+    let sql = crate::db::q(
+        pool,
+        "SELECT r.id, r.action_name, r.started_at, j.job_key FROM run_inflight_jobs j \
+         JOIN runs r ON r.id = j.run_id ORDER BY r.started_at",
+    )
+    .into_owned();
+    let rows: Vec<(i64, String, String, String)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_all(pool)
+            .await?;
+    let mut out = Vec::new();
+    for (run_id, action, run_started, job_key) in rows {
+        let attempts = crate::state::attempts_get(pool, &action, &job_key).await?;
+        let latest_sql = crate::db::q(
+            pool,
+            "SELECT stage, kind, label, started_at FROM attempt_steps \
+             WHERE action_name = ? AND job_key = ? AND attempt = ? ORDER BY seq DESC LIMIT 1",
+        )
+        .into_owned();
+        let latest: Option<(String, String, String, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(latest_sql.as_str()))
+                .bind(&action)
+                .bind(&job_key)
+                .bind(i64::from(attempts) + 1)
+                .fetch_optional(pool)
+                .await?;
+        let (stage, current_step) = match latest {
+            Some((stage, kind, label, _)) => (stage, Some(format!("{kind} / {label}"))),
+            None => (
+                crate::attempt_steps::stage_for_attempt(attempts + 1).to_string(),
+                None,
+            ),
+        };
+        let started = DateTime::parse_from_rfc3339(&run_started)
+            .map_err(|e| {
+                crate::error::Error::Other(anyhow::anyhow!(
+                    "run {run_id} has a bad started_at {run_started:?}: {e}"
+                ))
+            })?
+            .with_timezone(&Utc);
+        let elapsed_secs = (now - started).num_seconds().max(0);
+        let median_secs = match crate::state::recent_attempt_durations_ms(pool, &action, &stage)
+            .await
+            .map(|d| crate::state::median_duration(&d))?
+        {
+            crate::state::ExpectedDuration::Median(d) => Some(d.as_secs() as i64),
+            crate::state::ExpectedDuration::NoHistory
+            | crate::state::ExpectedDuration::Unavailable => None,
+        };
+        let timeout_secs = timeout_for(&action);
+        let (over_median, at_risk) = highlight(elapsed_secs, median_secs, timeout_secs);
+        out.push(InflightJob {
+            run_id,
+            action,
+            job_key,
+            stage,
+            current_step,
+            elapsed_secs,
+            median_secs,
+            timeout_secs,
+            over_median,
+            at_risk,
+        });
+    }
+    Ok(out)
+}
+
+/// SPEC-4.3.15: mean attempt duration for one action.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ActionMean {
+    pub action: String,
+    pub attempts: usize,
+    pub mean_seconds: f64,
+}
+
+/// SPEC-4.3.15: mean attempt duration by action over the window, from attempts
+/// that recorded a duration. Sorted by action name.
+pub async fn mean_attempt_duration_by_action(
+    pool: &DbPool,
+    range: Range,
+) -> Result<Vec<ActionMean>> {
+    let cutoff = ts_cutoff(range);
+    let mut sql = String::from(
+        "SELECT action_name, duration_ms FROM job_outcomes WHERE attempt_counted = 1 AND duration_ms > 0",
+    );
+    if cutoff.is_some() {
+        sql.push_str(" AND ts >= ?");
+    }
+    let sql = crate::db::q(pool, &sql).into_owned();
+    let mut q = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql.as_str()));
+    if let Some(c) = &cutoff {
+        q = q.bind(c);
+    }
+    let mut by_action: BTreeMap<String, (usize, i64)> = BTreeMap::new();
+    for (action, ms) in q.fetch_all(pool).await? {
+        let e = by_action.entry(action).or_default();
+        e.0 += 1;
+        e.1 += ms;
+    }
+    Ok(by_action
+        .into_iter()
+        .map(|(action, (n, total))| ActionMean {
+            action,
+            attempts: n,
+            mean_seconds: total as f64 / n as f64 / 1000.0,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,6 +1507,479 @@ mod tests {
 
     async fn mem_pool() -> DbPool {
         crate::db::test_pool().await
+    }
+
+    /// Insert one `job_outcomes` row for the funnel and failure-cause tests.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_attempt(
+        pool: &DbPool,
+        run_id: i64,
+        action: &str,
+        key: &str,
+        attempt: u32,
+        stage: &str,
+        outcome: &str,
+        timed_out: bool,
+        summary: Option<&str>,
+    ) {
+        state::job_outcome_insert(
+            pool,
+            &JobOutcome {
+                run_id,
+                action_name: action,
+                job_key: key,
+                attempt,
+                ok: matches!(outcome, "success" | "code_review"),
+                claude_ran: true,
+                claude_ok: true,
+                claude_cost_usd: 0.0,
+                attempt_counted: true,
+                summary,
+                stream_log_path: None,
+                duration_ms: 1000,
+                timed_out,
+                stage,
+                outcome,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// CLAUDE-590: the funnel buckets sum to the issue count, and a seeded
+    /// unrecognised outcome shows the mismatch banner text.
+    #[tokio::test]
+    async fn funnel_buckets_sum_to_the_issue_count_and_a_mismatch_is_named() {
+        let pool = mem_pool().await;
+        let run = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
+        seed_attempt(
+            &pool,
+            run,
+            "alpha",
+            "F-1",
+            1,
+            "initial",
+            "code_review",
+            false,
+            None,
+        )
+        .await;
+        seed_attempt(
+            &pool,
+            run,
+            "alpha",
+            "F-2",
+            1,
+            "initial",
+            "queued",
+            false,
+            Some("x"),
+        )
+        .await;
+        seed_attempt(
+            &pool,
+            run,
+            "alpha",
+            "F-2",
+            2,
+            "retry-2",
+            "code_review",
+            false,
+            None,
+        )
+        .await;
+        seed_attempt(
+            &pool,
+            run,
+            "alpha",
+            "F-3",
+            1,
+            "initial",
+            "needs_review",
+            false,
+            None,
+        )
+        .await;
+        seed_attempt(
+            &pool,
+            run,
+            "alpha",
+            "F-4",
+            1,
+            "initial",
+            "failed",
+            false,
+            Some("boom"),
+        )
+        .await;
+        let f = funnel(&pool, Range::All, None).await.unwrap();
+        assert_eq!(f.counts.first_attempt, 1);
+        assert_eq!(f.counts.second_attempt, 1);
+        assert_eq!(f.counts.needs_review, 1);
+        assert_eq!(f.counts.failed, 1);
+        assert_eq!(f.issues_in_range, 4);
+        assert!(f.mismatch.is_none(), "{:?}", f.mismatch);
+
+        // A row whose outcome is outside the closed set is bucketed nowhere.
+        seed_attempt(
+            &pool, run, "alpha", "F-5", 1, "initial", "mystery", false, None,
+        )
+        .await;
+        let f = funnel(&pool, Range::All, None).await.unwrap();
+        let banner = f.mismatch.expect("a seeded mismatch shows the banner");
+        assert!(banner.contains("sum to 4 but 5 issues"), "{banner}");
+        assert!(banner.contains("difference 1"), "{banner}");
+    }
+
+    #[test]
+    fn a_requeued_issue_is_never_finished_only_after_300_seconds() {
+        let at = |secs: i64| Utc::now() - Duration::seconds(secs);
+        let row = |ts: DateTime<Utc>| AttemptRow {
+            run_id: 1,
+            action_name: "alpha".into(),
+            job_key: "K-1".into(),
+            attempt: 1,
+            ts,
+            outcome: "queued".into(),
+            timed_out: false,
+            summary: None,
+        };
+        let fresh = fold_funnel(&[row(at(10))], Utc::now());
+        assert_eq!((fresh.in_progress, fresh.never_finished), (1, 0));
+        let stale = fold_funnel(&[row(at(400))], Utc::now());
+        assert_eq!((stale.in_progress, stale.never_finished), (0, 1));
+    }
+
+    /// CLAUDE-590: each cause lands in its bucket and `other` stays its own.
+    #[tokio::test]
+    async fn each_failure_cause_lands_in_its_own_bucket() {
+        let pool = mem_pool().await;
+        let run = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
+        let cases: [(&str, bool, &str); 8] = [
+            ("test", false, "test result: FAILED. 1 failed"),
+            ("compile", false, "error: could not compile `x`"),
+            ("fmt-lint", false, "cargo clippy reported warnings"),
+            ("timeout", true, "run hit its limit"),
+            ("push-diverged", false, "remote branch diverged"),
+            ("hook", false, "the pre-push hook rejected the push"),
+            ("review-no-verdict", false, "review gave no verdict"),
+            ("other", false, "something nobody classified"),
+        ];
+        for (i, (_, timed_out, summary)) in cases.iter().enumerate() {
+            seed_attempt(
+                &pool,
+                run,
+                "alpha",
+                &format!("C-{i}"),
+                1,
+                "initial",
+                "failed",
+                *timed_out,
+                Some(summary),
+            )
+            .await;
+        }
+        let report = failure_causes(&pool, Range::All, None).await.unwrap();
+        for (cause, _, _) in cases {
+            let n = report
+                .causes
+                .iter()
+                .find(|c| c.cause == cause)
+                .unwrap()
+                .count;
+            assert_eq!(n, 1, "{cause}");
+        }
+        assert_eq!(report.causes.len(), FAILURE_CAUSES.len());
+        assert_eq!(report.other_attempts.len(), 1);
+        assert_eq!(report.other_attempts[0].job_key, "C-7");
+    }
+
+    /// CLAUDE-591: stage statistics and the Postgres series, including a
+    /// never-healthy start with its cause, from seeded steps.
+    #[tokio::test]
+    async fn stage_and_postgres_statistics_come_from_seeded_steps() {
+        let pool = mem_pool().await;
+        let run = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
+        let t0 = Utc::now() - Duration::minutes(30);
+        let mut rec = crate::attempt_steps::StepRecorder::new(&pool, run, "alpha", "S-1", 1);
+        let sec = |s: i64| t0 + Duration::seconds(s);
+        use crate::attempt_steps::StepKind;
+        rec.record(
+            "initial",
+            StepKind::PostgresStart,
+            "postgres_start",
+            sec(0),
+            sec(2),
+            true,
+            None,
+        )
+        .await;
+        rec.record(
+            "initial",
+            StepKind::PostgresHealthy,
+            "postgres_healthy",
+            sec(2),
+            sec(12),
+            true,
+            None,
+        )
+        .await;
+        rec.record(
+            "initial",
+            StepKind::Coding,
+            "coding",
+            sec(12),
+            sec(100),
+            true,
+            None,
+        )
+        .await;
+        let mut rec2 = crate::attempt_steps::StepRecorder::new(&pool, run, "alpha", "S-2", 1);
+        rec2.record(
+            "initial",
+            StepKind::PostgresStart,
+            "postgres_start",
+            sec(200),
+            sec(201),
+            true,
+            None,
+        )
+        .await;
+        rec2.record(
+            "initial",
+            StepKind::PostgresHealthy,
+            "postgres_healthy",
+            sec(201),
+            sec(231),
+            false,
+            Some("connection refused"),
+        )
+        .await;
+        let mut rec3 = crate::attempt_steps::StepRecorder::new(&pool, run, "alpha", "S-3", 2);
+        rec3.record(
+            "retry-2",
+            StepKind::Coding,
+            "coding",
+            sec(300),
+            sec(360),
+            true,
+            None,
+        )
+        .await;
+
+        let st = stages(&pool, Range::All, None).await.unwrap();
+        let initial = st.stages.iter().find(|s| s.stage == "initial").unwrap();
+        assert_eq!(
+            initial.stats.count, 2,
+            "S-1 and S-2 each form one initial attempt"
+        );
+        let retry = st.stages.iter().find(|s| s.stage == "retry-2").unwrap();
+        assert_eq!(retry.stats.count, 1);
+        assert_eq!(retry.stats.median_seconds, Some(60.0));
+        let empty = st.stages.iter().find(|s| s.stage == "final").unwrap();
+        assert_eq!(empty.stats.count, 0);
+        assert_eq!(
+            empty.stats.median_seconds, None,
+            "no data is absent, not zero"
+        );
+
+        let pg = postgres(&pool, Range::All, None).await.unwrap();
+        assert_eq!((pg.starts, pg.healthy, pg.never_healthy), (2, 1, 1));
+        assert_eq!(pg.time_to_healthy.as_ref().unwrap().max_seconds, Some(12.0));
+        assert_eq!(pg.last_failure_cause.as_deref(), Some("connection refused"));
+    }
+
+    /// CLAUDE-591: an attempt recorded before step data existed is counted in
+    /// the visible "no step data" figure on both series.
+    #[tokio::test]
+    async fn pre_instrumentation_attempts_show_in_the_no_step_data_figure() {
+        let pool = mem_pool().await;
+        let run = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
+        seed_attempt(
+            &pool,
+            run,
+            "alpha",
+            "N-1",
+            1,
+            "initial",
+            "code_review",
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(
+            stages(&pool, Range::All, None)
+                .await
+                .unwrap()
+                .attempts_with_no_step_data,
+            1
+        );
+        assert_eq!(
+            postgres(&pool, Range::All, None)
+                .await
+                .unwrap()
+                .attempts_with_no_step_data,
+            1
+        );
+    }
+
+    #[test]
+    fn percentiles_use_nearest_rank() {
+        let s = stats((1..=20).map(f64::from).collect());
+        assert_eq!(s.median_seconds, Some(10.0));
+        assert_eq!(s.p95_seconds, Some(19.0));
+        assert_eq!(s.max_seconds, Some(20.0));
+        assert_eq!(stats(vec![]).median_seconds, None);
+    }
+
+    #[test]
+    fn highlights_flag_over_median_and_over_eighty_percent_of_the_timeout() {
+        assert_eq!(highlight(100, Some(200), Some(1000)), (false, false));
+        assert_eq!(highlight(300, Some(200), Some(1000)), (true, false));
+        assert_eq!(highlight(801, Some(2000), Some(1000)), (false, true));
+        assert_eq!(highlight(900, Some(200), Some(1000)), (true, true));
+        // No history and no timeout flag nothing.
+        assert_eq!(highlight(9999, None, None), (false, false));
+    }
+
+    #[tokio::test]
+    async fn inflight_jobs_carry_stage_step_elapsed_and_the_recent_median() {
+        let pool = mem_pool().await;
+        let run = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
+        for (i, ms) in [100_000_i64, 200_000, 300_000].iter().enumerate() {
+            state::job_outcome_insert(
+                &pool,
+                &JobOutcome {
+                    run_id: run,
+                    action_name: "alpha",
+                    job_key: &format!("H-{i}"),
+                    attempt: 1,
+                    ok: true,
+                    claude_ran: true,
+                    claude_ok: true,
+                    claude_cost_usd: 0.0,
+                    attempt_counted: true,
+                    summary: None,
+                    stream_log_path: None,
+                    duration_ms: *ms,
+                    timed_out: false,
+                    stage: "initial",
+                    outcome: "success",
+                },
+            )
+            .await
+            .unwrap();
+        }
+        state::run_inflight_add(&pool, run, "LIVE-1", "LIVE-1")
+            .await
+            .unwrap();
+        let now = Utc::now() + Duration::seconds(250);
+        let jobs = inflight_jobs(&pool, now, &|_| Some(300)).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        let j = &jobs[0];
+        assert_eq!((j.stage.as_str(), j.median_secs), ("initial", Some(200)));
+        assert!(j.over_median, "{j:?}");
+        assert!(j.at_risk, "250s is over 80% of a 300s timeout: {j:?}");
+        assert_eq!(j.current_step, None, "no step written yet");
+    }
+
+    #[tokio::test]
+    async fn mean_attempt_duration_groups_by_action() {
+        let pool = mem_pool().await;
+        let run = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
+        for (action, ms) in [("alpha", 10_000_i64), ("alpha", 30_000), ("beta", 5_000)] {
+            seed_attempt(
+                &pool,
+                run,
+                action,
+                &format!("M-{ms}"),
+                1,
+                "initial",
+                "success",
+                false,
+                None,
+            )
+            .await;
+            sqlx::query(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    &pool,
+                    "UPDATE job_outcomes SET duration_ms = ? WHERE job_key = ?",
+                )
+                .into_owned(),
+            ))
+            .bind(ms)
+            .bind(format!("M-{ms}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let means = mean_attempt_duration_by_action(&pool, Range::Last7Days)
+            .await
+            .unwrap();
+        assert_eq!(
+            means,
+            vec![
+                ActionMean {
+                    action: "alpha".into(),
+                    attempts: 2,
+                    mean_seconds: 20.0
+                },
+                ActionMean {
+                    action: "beta".into(),
+                    attempts: 1,
+                    mean_seconds: 5.0
+                },
+            ]
+        );
+    }
+
+    /// CLAUDE-601: "succeeded on the first try" is a query on `job_outcomes`.
+    #[tokio::test]
+    async fn attempts_by_outcome_counts_first_try_successes() {
+        let pool = mem_pool().await;
+        let run_id = state::run_begin(&pool, "alpha", "schedule").await.unwrap();
+        let seed = |key: &'static str, attempt: u32, stage: &'static str, outcome: &'static str| {
+            let pool = pool.clone();
+            async move {
+                state::job_outcome_insert(
+                    &pool,
+                    &JobOutcome {
+                        run_id,
+                        action_name: "alpha",
+                        job_key: key,
+                        attempt,
+                        ok: outcome == "code_review",
+                        claude_ran: true,
+                        claude_ok: true,
+                        claude_cost_usd: 0.0,
+                        attempt_counted: true,
+                        summary: None,
+                        stream_log_path: None,
+                        duration_ms: 1000,
+                        timed_out: false,
+                        stage,
+                        outcome,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+        seed("A-1", 1, "initial", "code_review").await;
+        seed("A-2", 1, "initial", "queued").await;
+        seed("A-2", 2, "retry-2", "code_review").await;
+        seed("A-3", 1, "initial", "code_review").await;
+        let rows = attempts_by_outcome(&pool, Range::All, None).await.unwrap();
+        let first_try = rows
+            .iter()
+            .find(|r| r.stage == "initial" && r.outcome == "code_review")
+            .map(|r| r.count);
+        assert_eq!(first_try, Some(2));
+        let second_try = rows
+            .iter()
+            .find(|r| r.stage == "retry-2" && r.outcome == "code_review")
+            .map(|r| r.count);
+        assert_eq!(second_try, Some(1));
     }
 
     /// The core AC. A timestamp at 02:30 UTC on a Sunday lands on
@@ -822,6 +2093,8 @@ mod tests {
                 stream_log_path: None,
                 duration_ms: 1000,
                 timed_out: false,
+                stage: "initial",
+                outcome: "success",
             },
         )
         .await
@@ -1107,6 +2380,8 @@ mod tests {
                 stream_log_path: None,
                 duration_ms: 35_000,
                 timed_out: false,
+                stage: "initial",
+                outcome: "success",
             },
         )
         .await
@@ -1129,6 +2404,8 @@ mod tests {
                 stream_log_path: None,
                 duration_ms: 1000,
                 timed_out: false,
+                stage: "initial",
+                outcome: "success",
             },
         )
         .await

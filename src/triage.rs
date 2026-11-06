@@ -270,8 +270,14 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
     // no corrective PR can fix. It mints one grouped, branch-agnostic issue
     // (keyed on the infra kind) for a human instead of vanishing as transient.
     // This runs BEFORE the transient scan so the detector owns its phrases.
+    // SPEC-3.12 item 8: a job killed by its timeout, a container that never
+    // started, a runner API deadline and a log with no diagnostic are the same
+    // kind of runner problem, routed to a human (not an LLM fix attempt).
     if let Some(infra) = crate::infra_failure::detect(&input.log) {
-        if infra.kind == "runner-unavailable" {
+        if matches!(
+            infra.kind.as_str(),
+            "runner-unavailable" | "job-timeout" | "container-not-started" | "runner-deadline"
+        ) {
             return Some(Triage::rules(TriageBucket::HumanAction, infra.problem));
         }
     }
@@ -285,6 +291,15 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
             TriageBucket::Transient,
             format!("log matched transient/infra signature {sig:?}"),
         ));
+    }
+
+    // SPEC-3.12 item 8: a log with no test id and no diagnostic is a runner
+    // problem. After the transient scan so a named transient signature keeps
+    // its bucket.
+    if let Some(infra) = crate::infra_failure::detect(&input.log) {
+        if infra.kind == "no-diagnostic" {
+            return Some(Triage::rules(TriageBucket::HumanAction, infra.problem));
+        }
     }
 
     None

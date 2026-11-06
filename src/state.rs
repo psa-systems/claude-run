@@ -1233,6 +1233,11 @@ pub struct JobOutcome<'a> {
     /// was SIGKILLed. Distinct from a hard failure (`ok = 0`, `timed_out = 0`):
     /// the UI badges it separately and the failed-job count excludes it.
     pub timed_out: bool,
+    /// SPEC-3.14 item 1: the attempt's stage (`initial`, `retry-2`, ...).
+    pub stage: &'a str,
+    /// SPEC-3.14 item 7: the attempt's outcome, an
+    /// [`crate::attempt_steps::Outcome`] string.
+    pub outcome: &'a str,
 }
 
 /// SPEC-5.2.
@@ -1245,8 +1250,8 @@ pub async fn job_outcome_insert(pool: &DbPool, r: &JobOutcome<'_>) -> Result<()>
         INSERT INTO job_outcomes (
             run_id, action_name, job_key, attempt, ts, ok,
             claude_ran, claude_ok, claude_cost_usd, attempt_counted,
-            summary, stream_log_path, duration_ms, timed_out
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            summary, stream_log_path, duration_ms, timed_out, stage, outcome
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         )
         .into_owned(),
@@ -1265,9 +1270,100 @@ pub async fn job_outcome_insert(pool: &DbPool, r: &JobOutcome<'_>) -> Result<()>
     .bind(r.stream_log_path)
     .bind(r.duration_ms)
     .bind(r.timed_out as i64)
+    .bind(r.stage)
+    .bind(r.outcome)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// SPEC-3.13: the number of completed attempts the expected duration is the
+/// median of.
+pub const EXPECTED_WINDOW: usize = 20;
+/// SPEC-3.13: fewer completed attempts than this say "no history".
+pub const EXPECTED_MIN_ATTEMPTS: usize = 3;
+
+/// SPEC-3.13: what a start notice says about how long the work should take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedDuration {
+    /// Fewer than [`EXPECTED_MIN_ATTEMPTS`] completed attempts of the action and stage.
+    NoHistory,
+    /// The median of the last [`EXPECTED_WINDOW`] completed attempts.
+    Median(std::time::Duration),
+    /// The history could not be read; the failure is logged where it happened.
+    Unavailable,
+}
+
+impl ExpectedDuration {
+    /// SPEC-3.13 / SPEC-4.3.15: the text after `Expected duration: `.
+    pub fn render(&self) -> String {
+        match self {
+            ExpectedDuration::NoHistory => "no history".to_string(),
+            ExpectedDuration::Median(d) => {
+                let secs = d.as_secs();
+                if secs >= 60 {
+                    format!("{}m {}s", secs / 60, secs % 60)
+                } else {
+                    format!("{secs}s")
+                }
+            }
+            ExpectedDuration::Unavailable => {
+                "unavailable (the attempt history could not be read)".to_string()
+            }
+        }
+    }
+}
+
+/// SPEC-3.13: the median of `durations_ms`, or [`ExpectedDuration::NoHistory`]
+/// under [`EXPECTED_MIN_ATTEMPTS`] values. An even count averages the two
+/// middle values. The median, not the mean, so one timeout does not skew it.
+pub fn median_duration(durations_ms: &[i64]) -> ExpectedDuration {
+    if durations_ms.len() < EXPECTED_MIN_ATTEMPTS {
+        return ExpectedDuration::NoHistory;
+    }
+    let mut sorted = durations_ms.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    let ms = if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2
+    };
+    ExpectedDuration::Median(std::time::Duration::from_millis(ms.max(0) as u64))
+}
+
+/// SPEC-3.13: the durations of the last [`EXPECTED_WINDOW`] completed attempts
+/// of `action` at `stage`, newest first. A row with no measured duration
+/// (`duration_ms = 0`, as the webhook runs record) is not a completed measurement.
+pub async fn recent_attempt_durations_ms(
+    pool: &DbPool,
+    action: &str,
+    stage: &str,
+) -> Result<Vec<i64>> {
+    let sql = format!(
+        "SELECT duration_ms FROM job_outcomes WHERE action_name = ? AND stage = ? \
+         AND attempt_counted = 1 AND duration_ms > 0 ORDER BY ts DESC, id DESC LIMIT {EXPECTED_WINDOW}"
+    );
+    let rows: Vec<i64> =
+        sqlx::query_scalar(sqlx::AssertSqlSafe(crate::db::q(pool, &sql).into_owned()))
+            .bind(action)
+            .bind(stage)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows)
+}
+
+/// SPEC-3.13: the expected duration for `action` at `stage`. A read failure is
+/// logged at `error` with the action and stage and returned as
+/// [`ExpectedDuration::Unavailable`], never as "no history".
+pub async fn expected_duration(pool: &DbPool, action: &str, stage: &str) -> ExpectedDuration {
+    match recent_attempt_durations_ms(pool, action, stage).await {
+        Ok(rows) => median_duration(&rows),
+        Err(e) => {
+            tracing::error!(action = %action, stage = %stage, error = %e, "reading the attempt history for the expected duration failed");
+            ExpectedDuration::Unavailable
+        }
+    }
 }
 
 // ---- Phase 2: pause + action index --------------------------------------
@@ -2491,6 +2587,8 @@ mod tests {
             stream_log_path: None,
             duration_ms: 10,
             timed_out: false,
+            stage: "initial",
+            outcome: "success",
         };
         // A hard failure and a timeout in the same run.
         job_outcome_insert(
@@ -2507,6 +2605,8 @@ mod tests {
             &JobOutcome {
                 job_key: "TIMEOUT-1",
                 timed_out: true,
+                stage: "initial",
+                outcome: "success",
                 ..base
             },
         )
@@ -3244,5 +3344,85 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].job_key, "deadbeef");
+    }
+
+    /// CLAUDE-584 / SPEC-3.13: the expected duration is the median of the last
+    /// 20 completed attempts of the action and stage, "no history" under 3.
+    #[tokio::test]
+    async fn expected_duration_is_the_median_of_the_last_twenty_attempts() {
+        let pool = crate::db::test_pool().await;
+        let run_id = run_begin(&pool, "yt", "cli").await.unwrap();
+        let seed = |key: String, stage: &'static str, ms: i64| {
+            let pool = pool.clone();
+            async move {
+                job_outcome_insert(
+                    &pool,
+                    &JobOutcome {
+                        run_id,
+                        action_name: "yt",
+                        job_key: &key,
+                        attempt: 1,
+                        ok: true,
+                        claude_ran: true,
+                        claude_ok: true,
+                        claude_cost_usd: 0.0,
+                        attempt_counted: true,
+                        summary: None,
+                        stream_log_path: None,
+                        duration_ms: ms,
+                        timed_out: false,
+                        stage,
+                        outcome: "success",
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+        let secs = |s: u64| ExpectedDuration::Median(std::time::Duration::from_secs(s));
+
+        // Zero attempts.
+        assert_eq!(
+            expected_duration(&pool, "yt", "initial").await,
+            ExpectedDuration::NoHistory
+        );
+        // Two attempts: still no history.
+        seed("A-1".into(), "initial", 10_000).await;
+        seed("A-2".into(), "initial", 30_000).await;
+        assert_eq!(
+            expected_duration(&pool, "yt", "initial").await,
+            ExpectedDuration::NoHistory
+        );
+        // Three: the median.
+        seed("A-3".into(), "initial", 20_000).await;
+        assert_eq!(expected_duration(&pool, "yt", "initial").await, secs(20));
+        // Another stage is its own history.
+        assert_eq!(
+            expected_duration(&pool, "yt", "retry-2").await,
+            ExpectedDuration::NoHistory
+        );
+        // More than twenty: only the newest twenty count. 3 old slow rows are
+        // pushed out by 20 newer 5s rows.
+        for i in 0..20 {
+            seed(format!("B-{i}"), "initial", 5_000).await;
+        }
+        assert_eq!(expected_duration(&pool, "yt", "initial").await, secs(5));
+        assert_eq!(
+            recent_attempt_durations_ms(&pool, "yt", "initial")
+                .await
+                .unwrap()
+                .len(),
+            EXPECTED_WINDOW
+        );
+    }
+
+    #[test]
+    fn median_of_an_even_count_averages_the_middle_pair() {
+        assert_eq!(
+            median_duration(&[1000, 2000, 3000, 5000]),
+            ExpectedDuration::Median(std::time::Duration::from_millis(2500))
+        );
+        assert_eq!(median_duration(&[]), ExpectedDuration::NoHistory);
+        assert_eq!(median_duration(&[1, 2]), ExpectedDuration::NoHistory);
     }
 }

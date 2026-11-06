@@ -1132,7 +1132,7 @@ async fn reply(
         return;
     }
     let path = dir.join(PR_COMMENT_FILE);
-    if let Err(e) = std::fs::write(&path, addressed(cmd, body)) {
+    if let Err(e) = std::fs::write(&path, addressed(cmd, with_run_footer(cmd, body))) {
         warn!(error = %e, "writing the reply body failed; skipping the reply");
     } else {
         let backend = &env.backend;
@@ -1259,11 +1259,13 @@ async fn run_instruction(
         let trigger = crate::run_footer::Trigger::UserCommand {
             login: cmd.author.clone(),
         };
+        let expected = state::expected_duration(&ctx.pool, WEBHOOK_COMMENT_ACTION, "initial").await;
         let body = started_comment(
             COMMENT_WEBHOOK_SOURCE,
             &trigger_word,
             &instruction,
             Duration::from_secs(u64::from(claude_timeout_seconds)),
+            &expected,
             cmd.is_pull_request,
         );
         let body = crate::run_footer::append_run(
@@ -1750,8 +1752,13 @@ fn serve_run(
                 match crate::attempt_steps::derive_claude_steps(stream_log, invoke_start, invoke_end)
                 {
                     Ok(steps) => {
-                        for (kind, label, start, end) in steps {
-                            recorder.record("initial", kind, label, start, end, true, None).await;
+                        for step in steps {
+                            recorder
+                                .record(
+                                    "initial", step.kind, step.label, step.start, step.end, true,
+                                    step.detail,
+                                )
+                                .await;
                         }
                     }
                     Err(e) => {
@@ -2411,6 +2418,8 @@ fn post_fix_push_comment(
         public_url: public_url.as_deref(),
         run_id: None,
         started: None,
+        // TODO(CLAUDE-603): no stored step rows reach this provider-level site yet.
+        progress: None,
     };
     let scratch = git_dir_scratch(workdir).unwrap_or_else(|_| std::env::temp_dir());
     crate::push_comment::post(backend, &cmd.host, &cmd.repo, cmd.number, &scratch, &ctx)
@@ -2523,7 +2532,7 @@ fn post_reply(backend: &dyn Backend, cmd: &VerifiedCommentCommand, dir: &FsPath,
         return;
     }
     let path = dir.join(PR_COMMENT_FILE);
-    match std::fs::write(&path, addressed(cmd, body)) {
+    match std::fs::write(&path, addressed(cmd, with_run_footer(cmd, body))) {
         Ok(()) => {
             if let Err(e) = post_on_thread(backend, cmd, &path) {
                 warn!(repo = %cmd.repo, number = cmd.number, error = %e, "posting the reply failed (continuing)");
@@ -2544,6 +2553,31 @@ fn with_verdict(verdict: &str, body: String) -> String {
     format!("**{verdict}**\n\n{body}")
 }
 
+/// SPEC-3.9: "Every runner-posted comment ... webhook replies ... appends a
+/// footer." The rejection, help and outcome replies post before (or beside) a
+/// run row and have no run id to hand, so the footer says so explicitly
+/// ("no run id is available") instead of omitting the line. The trigger is the
+/// asker's `/claude` command, or the runner's own dispatch for a synthetic one.
+fn with_run_footer(cmd: &VerifiedCommentCommand, body: String) -> String {
+    let trigger = if cmd.synthetic {
+        crate::run_footer::Trigger::WebhookEvent {
+            source: "runner-dispatched comment command".to_string(),
+        }
+    } else {
+        crate::run_footer::Trigger::UserCommand {
+            login: cmd.author.clone(),
+        }
+    };
+    crate::run_footer::append_run(
+        &body,
+        crate::run_footer::resolved_public_url().as_deref(),
+        None,
+        None,
+        COMMENT_WEBHOOK_SOURCE,
+        Some(&trigger),
+    )
+}
+
 /// CLAUDE-552: `body` addressed to the commenter, so they are notified and
 /// see whom it answers. A synthetic command (the runner's own dispatch) has
 /// no human to mention and is left as it is.
@@ -2561,14 +2595,14 @@ pub fn addressed(cmd: &VerifiedCommentCommand, body: String) -> String {
 /// (`/claude`) and the instruction length." The commenter mention is left to
 /// [`addressed`], applied by the caller; this builds the rest of the body:
 /// the action, the trigger word, the instruction length, the session
-/// timeout, and an expected duration. `expected_duration` says "no history"
-/// here: the median-of-last-20-attempts case belongs to the youtrack
-/// start-notice issue in this epic, not this one.
+/// timeout, and an expected duration (the median of the last 20 completed
+/// attempts of the action and stage, [`crate::state::expected_duration`]).
 pub fn started_comment(
     action: &str,
     trigger: &str,
     instruction: &str,
     timeout: Duration,
+    expected: &crate::state::ExpectedDuration,
     is_pull_request: bool,
 ) -> String {
     let what = first_line(instruction);
@@ -2587,12 +2621,14 @@ pub fn started_comment(
         format!(
             "Working on: {what}\n\n\
              Action: {action}\n\
+             Attempt: 1 (stage: initial)\n\
              Command: {trigger}\n\
              Instruction length: {len} characters\n\
              Session timeout: {timeout_s}s\n\
-             Expected duration: no history\n\n{next}",
+             Expected duration: {expected_s}\n\n{next}",
             len = instruction.chars().count(),
             timeout_s = timeout.as_secs(),
+            expected_s = expected.render(),
         ),
     )
 }
@@ -2927,6 +2963,8 @@ async fn finish_comment_run(
         stream_log_path: stream.as_deref(),
         duration_ms: 0,
         timed_out: outcome.timed_out,
+        stage: "initial",
+        outcome: crate::attempt_steps::Outcome::from_ok(outcome.ok).as_str(),
     };
     if let Err(e) = state::job_outcome_insert(pool, &record).await {
         warn!(error = %e, "recording the comment run outcome failed");
@@ -4085,6 +4123,7 @@ mod tests {
                     "/claude",
                     "fix it",
                     Duration::from_secs(600),
+                    &crate::state::ExpectedDuration::NoHistory,
                     true,
                 ),
                 "**Started.**",
@@ -4184,6 +4223,38 @@ mod tests {
         assert_eq!(addressed(&cmd, cap_comment()), cap_comment());
     }
 
+    /// CLAUDE-602 / SPEC-3.9: a rejection reply carries the run footer, with
+    /// the explicit no-run-id line, and still opens with the asker's mention.
+    #[test]
+    fn rejection_replies_carry_the_run_footer() {
+        let cmd = command_of(&payload_json(
+            "created",
+            REPO,
+            "/claude fix it",
+            "alice",
+            true,
+        ))
+        .unwrap();
+        for body in [
+            busy_comment(true),
+            denied_comment(&PermissionVerdict::Denied("read".to_string()), &[]),
+            too_long_comment(9000, 4000),
+            cap_comment(),
+            login_required_comment("Claude login required"),
+        ] {
+            let posted = addressed(&cmd, with_run_footer(&cmd, body));
+            assert!(posted.starts_with("@alice "), "{posted}");
+            assert!(
+                posted.contains("Run: ") && posted.contains("Source: comment-webhook"),
+                "{posted}"
+            );
+            assert!(
+                posted.contains("Trigger: /claude command from alice"),
+                "{posted}"
+            );
+        }
+    }
+
     #[test]
     fn the_acknowledgement_names_the_request_and_what_comes_next() {
         let pr = started_comment(
@@ -4191,6 +4262,7 @@ mod tests {
             "/claude",
             "fix the flaky test\nmore detail",
             Duration::from_secs(600),
+            &crate::state::ExpectedDuration::NoHistory,
             true,
         );
         assert!(pr.contains("Working on: fix the flaky test"), "{pr}");
@@ -4201,6 +4273,7 @@ mod tests {
             "/claude",
             "x",
             Duration::from_secs(600),
+            &crate::state::ExpectedDuration::NoHistory,
             false
         )
         .contains("YouTrack issue"));
@@ -4209,6 +4282,7 @@ mod tests {
             "/claude",
             &"y".repeat(300),
             Duration::from_secs(600),
+            &crate::state::ExpectedDuration::NoHistory,
             true,
         );
         assert!(long.contains(&format!("{}...", "y".repeat(200))), "{long}");
@@ -4224,6 +4298,7 @@ mod tests {
             "/claude",
             "fix it",
             Duration::from_secs(900),
+            &crate::state::ExpectedDuration::NoHistory,
             true,
         );
         assert!(body.contains("Action: comment-webhook"), "{body}");
