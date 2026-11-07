@@ -581,6 +581,22 @@ impl GithubForge {
         draft: bool,
         body_override: Option<&str>,
     ) -> Result<PullRequest> {
+        let pushed_at = std::cell::Cell::new(None);
+        let mut pr = self.create_pr_inner(workdir, host, draft, body_override, &pushed_at)?;
+        pr.push_ended_at = pushed_at.get();
+        Ok(pr)
+    }
+
+    /// The push-then-open flow; `pushed_at` is set when the push ends so the
+    /// caller can time `push` and `pr_create` apart (SPEC-3.14 item 3).
+    fn create_pr_inner(
+        &self,
+        workdir: &Path,
+        host: &str,
+        draft: bool,
+        body_override: Option<&str>,
+        pushed_at: &std::cell::Cell<Option<chrono::DateTime<chrono::Utc>>>,
+    ) -> Result<PullRequest> {
         // GitHub has no AGit equivalent: PRs are always branch-backed, so the
         // branch-strategy selector does not apply here and is ignored.
         // Push the branch before opening the PR.
@@ -620,6 +636,7 @@ impl GithubForge {
             .filter(|s| !s.is_empty());
 
         self.push(workdir, host, &repo, &branch)?;
+        pushed_at.set(Some(chrono::Utc::now()));
 
         let event = if draft {
             crate::push_comment::PushEvent::TimeoutSalvagePush
@@ -776,6 +793,7 @@ impl GithubForge {
                 url: p.html_url,
                 head_branch: Some(branch.to_string()),
                 push_comment_failure: None,
+                push_ended_at: None,
             }))
     }
 
@@ -1647,6 +1665,7 @@ fn parse_pr_from_mcp(result: &Value) -> Result<PullRequest> {
                 // pushed; the MCP result carries no head-branch field of its own.
                 head_branch: None,
                 push_comment_failure: None,
+                push_ended_at: None,
             });
         }
     }
@@ -1696,6 +1715,7 @@ fn parse_pr_from_gh(stdout: &str) -> PullRequest {
         // Filled in by the caller, which knows the branch it pushed.
         head_branch: None,
         push_comment_failure: None,
+        push_ended_at: None,
     }
 }
 

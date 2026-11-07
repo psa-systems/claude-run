@@ -237,8 +237,7 @@ pub fn tile_check(
     rows
 }
 
-/// A verification-gate run's timing (SPEC-3.3.2, SPEC-3.14), stashed by the
-/// synchronous `finalize` for the async caller that owns the recorder.
+/// A verification-gate run's timing (SPEC-3.3.2, SPEC-3.14).
 #[derive(Debug, Clone)]
 pub struct GateTiming {
     pub command: &'static str,
@@ -248,6 +247,52 @@ pub struct GateTiming {
     pub stages: Vec<StageSpan>,
 }
 
+/// One finished runner-owned step, handed from the synchronous `finalize` to
+/// the attempt's recorder the moment it ends (SPEC-3.14 item 3, CLAUDE-604).
+#[derive(Debug, Clone)]
+pub struct StepSpan {
+    pub kind: StepKind,
+    pub label: &'static str,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub ok: bool,
+    pub detail: Option<&'static str>,
+}
+
+/// Where `finalize` reports each runner-owned step as it ends.
+pub type StepSink<'a> = &'a dyn Fn(Vec<StepSpan>);
+
+/// SPEC-3.14 items 3 and 5: the rows one gate run stores. The whole span is one
+/// `gate` row when no stage boundary was timed (flagged [`SUBSTEPS_UNKNOWN`]),
+/// else `check` rows per stage with `gate` rows for the gaps.
+pub fn gate_spans(g: &GateTiming) -> Vec<StepSpan> {
+    if g.stages.is_empty() {
+        return vec![StepSpan {
+            kind: StepKind::Gate,
+            label: g.command,
+            start: g.start,
+            end: g.end,
+            ok: g.ok,
+            detail: Some(SUBSTEPS_UNKNOWN),
+        }];
+    }
+    tile_check(g.command, g.start, g.end, &g.stages)
+        .into_iter()
+        .map(|(label, start, end)| StepSpan {
+            kind: if label == g.command {
+                StepKind::Gate
+            } else {
+                StepKind::Check
+            },
+            label,
+            start,
+            end,
+            ok: g.ok,
+            detail: None,
+        })
+        .collect()
+}
+
 type GateRegistry = std::sync::Mutex<std::collections::HashMap<String, Vec<GateTiming>>>;
 
 fn gate_registry() -> &'static GateRegistry {
@@ -255,10 +300,10 @@ fn gate_registry() -> &'static GateRegistry {
     R.get_or_init(Default::default)
 }
 
-/// Stash one gate run's timing under the job key. `finalize` is synchronous
-/// with no recorder or pool (its signature and ~40 test call sites are fixed),
-/// so the timing is handed to the async caller through this keyed registry
-/// and drained by [`take_gate_timings`] once `finalize` returns.
+/// Stash a gate run's timing under the job key. Only the final-push conflict
+/// resolver uses this: it runs inside a provider call with no `finalize` sink
+/// or recorder in reach, so the caller of that call drains it with
+/// [`take_gate_timings`] as soon as the call returns (CLAUDE-604).
 pub fn stash_gate_timing(key: &str, timing: GateTiming) {
     gate_registry()
         .lock()
@@ -278,33 +323,17 @@ pub fn take_gate_timings(key: &str) -> Vec<GateTiming> {
 }
 
 impl<'a> StepRecorder<'a> {
-    /// Record one verification-gate run (SPEC-3.14 items 3 and 5): the whole
-    /// span as a `gate` row when no stage boundary was timed (flagged
-    /// [`SUBSTEPS_UNKNOWN`]), else `check` rows per stage with `gate` rows for
-    /// the gaps.
-    pub async fn record_gate(&mut self, stage: &str, g: &GateTiming) {
-        if g.stages.is_empty() {
-            self.record(
-                stage,
-                StepKind::Gate,
-                g.command,
-                g.start,
-                g.end,
-                g.ok,
-                Some(SUBSTEPS_UNKNOWN),
-            )
-            .await;
-            return;
-        }
-        for (label, start, end) in tile_check(g.command, g.start, g.end, &g.stages) {
-            let kind = if label == g.command {
-                StepKind::Gate
-            } else {
-                StepKind::Check
-            };
-            self.record(stage, kind, label, start, end, g.ok, None)
+    /// Record a batch of finished steps (SPEC-3.14 item 3).
+    pub async fn record_spans(&mut self, stage: &str, spans: &[StepSpan]) {
+        for s in spans {
+            self.record(stage, s.kind, s.label, s.start, s.end, s.ok, s.detail)
                 .await;
         }
+    }
+
+    /// Record one verification-gate run (SPEC-3.14 items 3 and 5).
+    pub async fn record_gate(&mut self, stage: &str, g: &GateTiming) {
+        self.record_spans(stage, &gate_spans(g)).await;
     }
 }
 
@@ -1136,6 +1165,63 @@ mod tests {
                 ("check", 40, Some(SUBSTEPS_UNKNOWN)),
             ]
         );
+    }
+
+    /// SPEC-3.14 item 3, CLAUDE-604: `push`, `pr_create` and `gate` spans are
+    /// stored as they end, so the SPEC-3.15 list built for the next comment
+    /// of the same attempt already includes them.
+    #[tokio::test]
+    async fn push_pr_create_and_gate_spans_are_stored_for_the_next_comments_list() {
+        let pool = crate::db::test_pool().await;
+        let run_id = crate::state::run_begin(&pool, "youtrack", "cli")
+            .await
+            .unwrap();
+        let mut recorder = StepRecorder::new(&pool, run_id, "youtrack", "T-1", 1);
+        let span = |kind, label, start, end| StepSpan {
+            kind,
+            label,
+            start: at(start),
+            end: at(end),
+            ok: true,
+            detail: None,
+        };
+        recorder
+            .record_spans(
+                "initial",
+                &[
+                    span(StepKind::Push, "push", 0, 5),
+                    span(StepKind::PrCreate, "pr_create", 5, 8),
+                ],
+            )
+            .await;
+        recorder
+            .record_gate(
+                "initial",
+                &GateTiming {
+                    command: "pre-push",
+                    start: at(8),
+                    end: at(20),
+                    ok: true,
+                    stages: vec![],
+                },
+            )
+            .await;
+        let kinds: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(
+                &pool,
+                "SELECT kind FROM attempt_steps WHERE run_id = ? ORDER BY seq",
+            )
+            .into_owned(),
+        ))
+        .bind(run_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kinds, ["push", "pr_create", "gate"]);
+        let ctx = crate::progress_list::context_for(&pool, Some("youtrack"), "T-1").await;
+        let labels: Vec<&str> = ctx.done.iter().map(|m| m.label.as_str()).collect();
+        assert!(labels.contains(&"Initial commit"), "{labels:?}");
+        assert!(labels.contains(&"PR ready"), "{labels:?}");
     }
 
     #[tokio::test]
