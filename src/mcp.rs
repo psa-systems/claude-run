@@ -14,7 +14,7 @@
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -35,7 +35,7 @@ const MAX_TAIL_LINES: u32 = 2000;
 const STREAM_LOG_RESPONSE_CAP_BYTES: usize = 256 * 1024;
 
 fn json_result(value: serde_json::Value) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(value.to_string())])
+    CallToolResult::success(vec![ContentBlock::text(value.to_string())])
 }
 
 /// SPEC-4.5: every tool error logs instead of printing to stdout.
@@ -44,7 +44,7 @@ fn json_result(value: serde_json::Value) -> CallToolResult {
 /// itself is the problem), reported to the caller with the cause.
 fn tool_error(cause: impl std::fmt::Display) -> CallToolResult {
     tracing::warn!(error = %cause, "mcp: tool call failed");
-    CallToolResult::error(vec![Content::text(cause.to_string())])
+    CallToolResult::error(vec![ContentBlock::text(cause.to_string())])
 }
 
 /// SPEC-4.5: every tool error logs instead of printing to stdout.
@@ -53,7 +53,7 @@ fn tool_error(cause: impl std::fmt::Display) -> CallToolResult {
 /// thing" rather than a failure), reported to the caller with the cause.
 fn tool_not_found(cause: impl std::fmt::Display) -> CallToolResult {
     tracing::info!(message = %cause, "mcp: tool call found no match");
-    CallToolResult::error(vec![Content::text(cause.to_string())])
+    CallToolResult::error(vec![ContentBlock::text(cause.to_string())])
 }
 
 /// SPEC-4.5: limits above the maximum are rejected, not clamped.
