@@ -9862,9 +9862,10 @@ mod tests {
             );
         }
 
-        /// SPEC-4.3.15: the state/repo filters narrow the CI-failures
-        /// rows, and SPEC-3.12 item 2's stuck-work list shows the sweep's
-        /// own seeded corrections.
+        /// SPEC-4.3.15 / CLAUDE-598: the state/bucket/repo filters narrow
+        /// the CI-failures rows (the bucket filter independently of the
+        /// state filter), and SPEC-3.12 item 2's stuck-work list shows the
+        /// sweep's own seeded corrections.
         #[tokio::test]
         async fn dashboard_ci_filters_narrow_rows_and_stuck_work_lists_corrections() {
             let tmp = tempfile::tempdir().unwrap();
@@ -9878,7 +9879,7 @@ mod tests {
                 None,
                 None,
                 "open",
-                None,
+                Some("human_action"),
                 "2999-01-01T00:00:00Z",
             )
             .await
@@ -9891,7 +9892,7 @@ mod tests {
                 None,
                 None,
                 "resolved",
-                None,
+                Some("code_fix"),
                 "2999-01-01T00:00:01Z",
             )
             .await
@@ -9945,6 +9946,30 @@ mod tests {
             .await;
             assert!(!body.contains(widgets_row), "{body}");
             assert!(body.contains(gizmos_row), "{body}");
+
+            // SPEC-4.3.15 / CLAUDE-598: the bucket filter narrows
+            // independently of the state filter. "all" state + "code_fix"
+            // bucket keeps only the resolved acme/gizmos row, even though
+            // its state differs from the open acme/widgets row (which is
+            // "human_action").
+            let bucket_narrowed = DashboardQuery {
+                ci_state: Some(String::new()),
+                ci_bucket: "code_fix".to_string(),
+                ..Default::default()
+            };
+            let body = body_string(
+                dashboard(State(s.clone()), Query(bucket_narrowed))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(!body.contains(widgets_row), "{body}");
+            assert!(body.contains(gizmos_row), "{body}");
+            assert!(
+                body.contains(r#"<span class="badge neutral">code_fix</span>"#),
+                "{body}"
+            );
 
             // Stuck-work list: the sweep's own run_events tag, seeded
             // directly (not via the sweep itself, which this file set does

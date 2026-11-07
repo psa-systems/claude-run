@@ -277,13 +277,13 @@
   {% endif %}
 </div>
 
-{# SPEC-4.3.15: the CI-failures table, with its own filter form so the
-   state/repo selection round-trips through the 5s poll and every other
-   dashboard control the same way the search form does (hx-include widened
-   below to carry both). The Background also calls for a separate "triage
-   bucket" column, but `ci_failures` persists no such value (see
-   `CiFailureRow::state()`), so this filters and renders lifecycle `state`
-   instead, labeled "State". #}
+{# SPEC-4.3.15 / CLAUDE-598: the CI-failures table, with its own filter form
+   so the state/bucket/repo selection round-trips through the 5s poll and
+   every other dashboard control the same way the search form does
+   (hx-include widened below to carry both). "State" is the lifecycle state
+   (`open`/`resolved`/`pr_only`); "Bucket" is the persisted triage bucket
+   (`code_fix`/`human_action`/`transient`/`auto_fix`), a separate column with
+   its own filter that narrows independently of state. #}
 <h2>CI failures</h2>
 <form id="ci-failures-form"
       style="margin: 4px 0 14px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
@@ -296,6 +296,18 @@
       <option value="open"{% if ci_state.as_str() == "open" %} selected{% endif %}>open</option>
       <option value="resolved"{% if ci_state.as_str() == "resolved" %} selected{% endif %}>resolved</option>
       <option value="pr_only"{% if ci_state.as_str() == "pr_only" %} selected{% endif %}>pr_only</option>
+    </select>
+  </label>
+  <label style="font-size: 12px; text-transform: none; letter-spacing: 0; font-weight: normal;">
+    Bucket
+    <select name="ci_bucket" hx-trigger="change"
+            hx-get="/" hx-include="#ci-failures-form, #search-form"
+            hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
+      <option value=""{% if ci_bucket.is_empty() %} selected{% endif %}>all</option>
+      <option value="code_fix"{% if ci_bucket.as_str() == "code_fix" %} selected{% endif %}>code_fix</option>
+      <option value="human_action"{% if ci_bucket.as_str() == "human_action" %} selected{% endif %}>human_action</option>
+      <option value="transient"{% if ci_bucket.as_str() == "transient" %} selected{% endif %}>transient</option>
+      <option value="auto_fix"{% if ci_bucket.as_str() == "auto_fix" %} selected{% endif %}>auto_fix</option>
     </select>
   </label>
   <label style="font-size: 12px; text-transform: none; letter-spacing: 0; font-weight: normal;">
@@ -314,7 +326,7 @@
   <div class="card"><span class="dim">No CI failures under the active filter.</span></div>
 {% else %}
   <table style="margin-bottom: 16px;">
-    <thead><tr><th>Repo</th><th>Workflow</th><th>Job</th><th>State</th><th>Infra</th><th>PR</th><th>Issue</th><th>Remediations</th></tr></thead>
+    <thead><tr><th>Repo</th><th>Workflow</th><th>Job</th><th>State</th><th>Bucket</th><th>Infra</th><th>PR</th><th>Issue</th><th>Remediations</th></tr></thead>
     <tbody>
       {% for f in ci_failures %}
       <tr>
@@ -322,6 +334,7 @@
         <td class="mono">{{ f.workflow_id() }}</td>
         <td class="mono">{{ f.job_name() }}</td>
         <td><span class="badge neutral">{{ f.state() }}</span></td>
+        <td><span class="badge neutral">{{ f.bucket() }}</span></td>
         <td class="dim">{{ f.infra_kind() }}</td>
         <td class="mono">{{ f.pr_html()|safe }}</td>
         <td class="mono">{{ f.issue_html()|safe }}</td>

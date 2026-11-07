@@ -454,7 +454,7 @@ pub async fn distinct_branches(pool: &DbPool, failure_id: i64) -> Result<Vec<Str
 pub async fn failure_for_issue(pool: &DbPool, issue_key: &str) -> Result<Option<Failure>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, created_at, updated_at \
+        "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, triage_bucket, created_at, updated_at \
          FROM ci_failures WHERE issue_key = ?",
     ).into_owned()))
     .bind(issue_key)
