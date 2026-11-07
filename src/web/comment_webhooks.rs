@@ -96,6 +96,10 @@ use super::webhooks::{
 /// route and name stopped being Forgejo-specific).
 pub const WEBHOOK_COMMENT_ACTION: &str = "webhook-comment";
 
+/// SPEC-3.9's `Source:` line for every comment this listener posts, distinct
+/// from [`WEBHOOK_COMMENT_ACTION`] (the state/cap bookkeeping name).
+const COMMENT_WEBHOOK_SOURCE: &str = "comment-webhook";
+
 /// File the reply body is written to before `fj pr|issue comment`. For the
 /// clone-and-push route this lives in the checkout's git-directory scratch
 /// space ([`git_dir_scratch`]), never its work tree; the plain-issue mint
@@ -908,6 +912,7 @@ async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
 
     // At most one comment job per thread. A second command while one is running
     // is told so and dropped rather than queued behind it.
+    // SPEC-3.6: "every rejection is posted as a comment naming the reason."
     let Some(_gate) = ctx.keygate.try_acquire(&cmd.pr_gate_key()) else {
         info!(repo = %cmd.repo, number = cmd.number, "a comment job is already running for this thread; replying and dropping");
         reply(&ctx, &env, &cmd, &key, busy_comment(cmd.is_pull_request)).await;
@@ -930,6 +935,7 @@ async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
             })
         };
         if !verdict.is_allowed() {
+            // SPEC-3.6: "every rejection is posted as a comment naming the reason."
             let body = denied_comment(&verdict, &src.allowed_permissions);
             match &verdict {
                 PermissionVerdict::Denied(p) => {
@@ -964,6 +970,7 @@ async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
             reply(&ctx, &env, &cmd, &key, body).await;
         }
         CommandKind::TooLong { chars, limit } => {
+            // SPEC-3.6: "every rejection is posted as a comment naming the reason."
             info!(repo = %cmd.repo, number = cmd.number, chars, limit, "instruction over the configured limit; refusing");
             reply(&ctx, &env, &cmd, &key, too_long_comment(*chars, *limit)).await;
         }
@@ -1125,7 +1132,7 @@ async fn reply(
         return;
     }
     let path = dir.join(PR_COMMENT_FILE);
-    if let Err(e) = std::fs::write(&path, addressed(cmd, body)) {
+    if let Err(e) = std::fs::write(&path, addressed(cmd, with_run_footer(cmd, body))) {
         warn!(error = %e, "writing the reply body failed; skipping the reply");
     } else {
         let backend = &env.backend;
@@ -1136,6 +1143,41 @@ async fn reply(
     }
     if let Err(e) = std::fs::remove_dir_all(&dir) {
         warn!(error = %e, "reply workdir cleanup failed (continuing)");
+    }
+}
+
+/// SPEC-3.13: "A start comment that fails to post is logged at `error` with
+/// the issue key and the cause; the run proceeds." Separate from [`reply`]'s
+/// ordinary `warn` on a failed post, because the start notice is this
+/// action's one mandatory write, not a best-effort follow-up.
+async fn reply_start_notice(
+    ctx: &CommentContext,
+    env: &ServeEnv,
+    cmd: &VerifiedCommentCommand,
+    key: &str,
+    body: String,
+) {
+    let dir = crate::workdir::job_workdir(
+        &crate::workdir::resolve_workdir_base(None, &ctx.paths),
+        WEBHOOK_COMMENT_ACTION,
+        &format!("start-{key}"),
+    );
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        error!(key = %key, error = %e, "SPEC-3.13: creating the start-notice workdir failed; the run proceeds");
+        return;
+    }
+    let path = dir.join(PR_COMMENT_FILE);
+    if let Err(e) = std::fs::write(&path, addressed(cmd, body)) {
+        error!(key = %key, error = %e, "SPEC-3.13: writing the start-notice body failed; the run proceeds");
+    } else {
+        let backend = &env.backend;
+        let r = tokio::task::block_in_place(|| post_on_thread(backend.as_ref(), cmd, &path));
+        if let Err(e) = r {
+            error!(key = %key, repo = %cmd.repo, number = cmd.number, error = %e, "SPEC-3.13: posting the start notice failed; the run proceeds");
+        }
+    }
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        warn!(error = %e, "start-notice workdir cleanup failed (continuing)");
     }
 }
 
@@ -1157,6 +1199,7 @@ async fn run_instruction(
     src: &CommentWebhookSource,
     instruction: String,
 ) {
+    // SPEC-3.6: "every rejection is posted as a comment naming the reason."
     // Right after the pause check (already taken before this
     // command was accepted), refuse before admission so no attempt counter is
     // advanced and no `claude` runs. Unlike the CI-triage webhook's silent
@@ -1184,9 +1227,13 @@ async fn run_instruction(
     let daily = state::daily_count_get(&ctx.pool, WEBHOOK_COMMENT_ACTION)
         .await
         .unwrap_or(0);
-    let (max_runs_per_day, claude_timeout_seconds) = {
+    let (max_runs_per_day, claude_timeout_seconds, trigger_word) = {
         let cfg = ctx.config.read().await;
-        (cfg.max_runs_per_day, cfg.claude_timeout_seconds)
+        (
+            cfg.max_runs_per_day,
+            cfg.claude_timeout_seconds,
+            cfg.trigger.clone(),
+        )
     };
     match admit(attempts, daily, &ctx.defaults, max_runs_per_day) {
         Admission::Run => {}
@@ -1195,6 +1242,7 @@ async fn run_instruction(
             return;
         }
         Admission::DailyCapReached => {
+            // SPEC-3.6: "every rejection is posted as a comment naming the reason."
             warn!(repo = %cmd.repo, number = cmd.number, daily, "daily run cap reached; replying and running nothing");
             reply(ctx, env, cmd, key, cap_comment()).await;
             return;
@@ -1203,17 +1251,32 @@ async fn run_instruction(
     if let Err(e) = state::attempts_increment(&ctx.pool, WEBHOOK_COMMENT_ACTION, key).await {
         warn!(error = %e, "advancing the comment attempt counter failed");
     }
-    // CLAUDE-552: admitted, so tell the asker the runner is on it before any
-    // work starts. A synthetic command has no asker to tell.
+    // SPEC-3.13: admitted, so post the start notice before any clone or
+    // mint work starts (`begin_webhook_run` below, which is the earliest
+    // this attempt opens a run row). A synthetic command has no asker to
+    // tell and is left with CLAUDE-552's pre-existing no-op.
     if !cmd.synthetic {
-        reply(
-            ctx,
-            env,
-            cmd,
-            key,
-            started_comment(&instruction, cmd.is_pull_request),
-        )
-        .await;
+        let trigger = crate::run_footer::Trigger::UserCommand {
+            login: cmd.author.clone(),
+        };
+        let expected = state::expected_duration(&ctx.pool, WEBHOOK_COMMENT_ACTION, "initial").await;
+        let body = started_comment(
+            COMMENT_WEBHOOK_SOURCE,
+            &trigger_word,
+            &instruction,
+            Duration::from_secs(u64::from(claude_timeout_seconds)),
+            &expected,
+            cmd.is_pull_request,
+        );
+        let body = crate::run_footer::append_run(
+            &body,
+            crate::run_footer::resolved_public_url().as_deref(),
+            None,
+            None,
+            COMMENT_WEBHOOK_SOURCE,
+            Some(&trigger),
+        );
+        reply_start_notice(ctx, env, cmd, key, body).await;
     }
 
     // `run` carries the `RunGuard` through to `finish_comment_run` below, so a
@@ -1427,6 +1490,11 @@ fn serve_run(
     paths: &Paths,
 ) -> RunOutcome {
     let cancel = CancellationToken::new();
+    // SPEC-3.14 item 4: wall-clock start for this delivery, so the
+    // `coding`/`check`/`build` steps derived below (and the `unaccounted`
+    // remainder around them) can be anchored the same way a native-action
+    // attempt anchors its own.
+    let served_start = chrono::Utc::now();
 
     let (branch, base) = match pr_branches(backend, cmd) {
         Ok(b) => b,
@@ -1473,6 +1541,11 @@ fn serve_run(
 
     let mut claude_ran = false;
     let mut cloned_head = None;
+    // SPEC-3.14 item 4: set only on the branch below that actually calls
+    // `claude.invoke`, so the step derivation at the end of this function has
+    // a span to classify.
+    let mut claude_span: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
+        None;
     let claude_result = match clone {
         Err(reason) => {
             warn!(repo = %cmd.repo, pr = cmd.number, %reason, "clone or setup failed (the PR reply still runs)");
@@ -1527,6 +1600,7 @@ fn serve_run(
                             ci_failure_path.as_deref(),
                         );
                         info!(repo = %cmd.repo, pr = cmd.number, stream_log = %stream_log.display(), cargo_target_dir = %cargo_target_dir.display(), "invoking claude for a comment command");
+                        let invoke_start = chrono::Utc::now();
                         let result = match claude.invoke(
                             &prompt,
                             &crate::action::ClaudeBlock::default(),
@@ -1542,6 +1616,7 @@ fn serve_run(
                         ) {
                             Ok(r) => {
                                 claude_ran = true;
+                                claude_span = Some((invoke_start, chrono::Utc::now()));
                                 // Bill the run with what the session spent.
                                 spend.record(&r);
                                 r
@@ -1652,11 +1727,57 @@ fn serve_run(
         ),
     );
 
-    let summary = format!(
+    let mut summary = format!(
         "{}: {}",
         decision.as_str(),
         first_line(&claude_result.summary)
     );
+
+    // SPEC-3.14 item 4: derive this delivery's `coding`/`check`/`build` steps
+    // from the stream log, same as the `youtrack` native action and the
+    // scripted-action pipeline, so a comment-command run carries step data
+    // too instead of falling permanently into `/reports`' "no step data"
+    // bucket. No `run_id` (the run-begin failed) means nothing to attribute
+    // the rows to, so this is skipped rather than attributed to a fake run.
+    if let Some(run_id) = run_id {
+        let incomplete = tokio::runtime::Handle::current().block_on(async {
+            let mut recorder = crate::attempt_steps::StepRecorder::new(
+                pool,
+                run_id,
+                WEBHOOK_COMMENT_ACTION,
+                key,
+                1,
+            );
+            if let Some((invoke_start, invoke_end)) = claude_span {
+                match crate::attempt_steps::derive_claude_steps(stream_log, invoke_start, invoke_end)
+                {
+                    Ok(steps) => {
+                        for step in steps {
+                            recorder
+                                .record(
+                                    "initial", step.kind, step.label, step.start, step.end, true,
+                                    step.detail,
+                                )
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            repo = %cmd.repo, pr = cmd.number, error = %e,
+                            "deriving claude steps from the stream log failed; coding/check/build steps for this delivery fall into unaccounted"
+                        );
+                    }
+                }
+            }
+            recorder
+                .finish("initial", served_start, chrono::Utc::now())
+                .await
+        });
+        if incomplete {
+            summary.push_str(" (step data incomplete)");
+        }
+    }
+
     RunOutcome {
         summary,
         ok: claude_result.ok
@@ -2281,14 +2402,18 @@ fn post_fix_push_comment(
         Err(_) => crate::push_comment::CommitSubjects::Unavailable,
     };
     let public_url = crate::run_footer::resolved_public_url();
+    // CLAUDE-550: a synthetic command is the automerge conflict
+    // auto-resolve, the only runner-dispatched command today.
+    let event = if cmd.synthetic {
+        crate::push_comment::PushEvent::ConflictResolvePush
+    } else {
+        crate::push_comment::PushEvent::CommentWebhookFixPush
+    };
+    // SPEC-3.15 item 5, SPEC-8.8: a comment-driven run stores no steps, so the
+    // list is this comment's own line unless a context was stashed for the key.
+    let progress = crate::progress_list::render_push(&issue_key, event);
     let ctx = crate::push_comment::PushCommentContext {
-        // CLAUDE-550: a synthetic command is the automerge conflict
-        // auto-resolve, the only runner-dispatched command today.
-        event: if cmd.synthetic {
-            crate::push_comment::PushEvent::ConflictResolvePush
-        } else {
-            crate::push_comment::PushEvent::CommentWebhookFixPush
-        },
+        event,
         issue_key: &issue_key,
         draft: false,
         old_sha: Some(cloned_head),
@@ -2297,6 +2422,7 @@ fn post_fix_push_comment(
         public_url: public_url.as_deref(),
         run_id: None,
         started: None,
+        progress: Some(&progress),
     };
     let scratch = git_dir_scratch(workdir).unwrap_or_else(|_| std::env::temp_dir());
     crate::push_comment::post(backend, &cmd.host, &cmd.repo, cmd.number, &scratch, &ctx)
@@ -2409,7 +2535,7 @@ fn post_reply(backend: &dyn Backend, cmd: &VerifiedCommentCommand, dir: &FsPath,
         return;
     }
     let path = dir.join(PR_COMMENT_FILE);
-    match std::fs::write(&path, addressed(cmd, body)) {
+    match std::fs::write(&path, addressed(cmd, with_run_footer(cmd, body))) {
         Ok(()) => {
             if let Err(e) = post_on_thread(backend, cmd, &path) {
                 warn!(repo = %cmd.repo, number = cmd.number, error = %e, "posting the reply failed (continuing)");
@@ -2430,6 +2556,31 @@ fn with_verdict(verdict: &str, body: String) -> String {
     format!("**{verdict}**\n\n{body}")
 }
 
+/// SPEC-3.9: "Every runner-posted comment ... webhook replies ... appends a
+/// footer." The rejection, help and outcome replies post before (or beside) a
+/// run row and have no run id to hand, so the footer says so explicitly
+/// ("no run id is available") instead of omitting the line. The trigger is the
+/// asker's `/claude` command, or the runner's own dispatch for a synthetic one.
+fn with_run_footer(cmd: &VerifiedCommentCommand, body: String) -> String {
+    let trigger = if cmd.synthetic {
+        crate::run_footer::Trigger::WebhookEvent {
+            source: "runner-dispatched comment command".to_string(),
+        }
+    } else {
+        crate::run_footer::Trigger::UserCommand {
+            login: cmd.author.clone(),
+        }
+    };
+    crate::run_footer::append_run(
+        &body,
+        crate::run_footer::resolved_public_url().as_deref(),
+        None,
+        None,
+        COMMENT_WEBHOOK_SOURCE,
+        Some(&trigger),
+    )
+}
+
 /// CLAUDE-552: `body` addressed to the commenter, so they are notified and
 /// see whom it answers. A synthetic command (the runner's own dispatch) has
 /// no human to mention and is left as it is.
@@ -2441,9 +2592,22 @@ pub fn addressed(cmd: &VerifiedCommentCommand, body: String) -> String {
     }
 }
 
-/// CLAUDE-552: the acknowledgement posted once a command is admitted, before
-/// any work, so the asker knows the runner is on it.
-pub fn started_comment(instruction: &str, is_pull_request: bool) -> String {
+/// SPEC-3.13: "Every action that starts work posts a start comment before it
+/// clones, as the first runner write for that attempt ... A comment-command
+/// start comment mentions the commenter by login and names the trigger
+/// (`/claude`) and the instruction length." The commenter mention is left to
+/// [`addressed`], applied by the caller; this builds the rest of the body:
+/// the action, the trigger word, the instruction length, the session
+/// timeout, and an expected duration (the median of the last 20 completed
+/// attempts of the action and stage, [`crate::state::expected_duration`]).
+pub fn started_comment(
+    action: &str,
+    trigger: &str,
+    instruction: &str,
+    timeout: Duration,
+    expected: &crate::state::ExpectedDuration,
+    is_pull_request: bool,
+) -> String {
     let what = first_line(instruction);
     let what = if what.chars().count() > 200 {
         format!("{}...", what.chars().take(200).collect::<String>())
@@ -2455,7 +2619,21 @@ pub fn started_comment(instruction: &str, is_pull_request: bool) -> String {
     } else {
         "A reply follows here naming the YouTrack issue it is filed as."
     };
-    with_verdict("Started.", format!("Working on: {what}\n\n{next}"))
+    with_verdict(
+        "Started.",
+        format!(
+            "Working on: {what}\n\n\
+             Action: {action}\n\
+             Attempt: 1 (stage: initial)\n\
+             Command: {trigger}\n\
+             Instruction length: {len} characters\n\
+             Session timeout: {timeout_s}s\n\
+             Expected duration: {expected_s}\n\n{next}",
+            len = instruction.chars().count(),
+            timeout_s = timeout.as_secs(),
+            expected_s = expected.render(),
+        ),
+    )
 }
 
 /// SPEC-4.4.5: "Every outcome of a comment command (help, refused as too
@@ -2788,6 +2966,8 @@ async fn finish_comment_run(
         stream_log_path: stream.as_deref(),
         duration_ms: 0,
         timed_out: outcome.timed_out,
+        stage: "initial",
+        outcome: crate::attempt_steps::Outcome::from_ok(outcome.ok).as_str(),
     };
     if let Err(e) = state::job_outcome_insert(pool, &record).await {
         warn!(error = %e, "recording the comment run outcome failed");
@@ -3940,7 +4120,17 @@ mod tests {
             (login_required_comment("expired."), "**Blocked.**"),
             (cap_comment(), "**Blocked.**"),
             (error_comment("boom"), "**Blocked.**"),
-            (started_comment("fix it", true), "**Started.**"),
+            (
+                started_comment(
+                    "comment-webhook",
+                    "/claude",
+                    "fix it",
+                    Duration::from_secs(600),
+                    &crate::state::ExpectedDuration::NoHistory,
+                    true,
+                ),
+                "**Started.**",
+            ),
             (
                 outcome_comment(
                     &Decision::Push { files: 1, lines: 2 },
@@ -4036,15 +4226,89 @@ mod tests {
         assert_eq!(addressed(&cmd, cap_comment()), cap_comment());
     }
 
+    /// CLAUDE-602 / SPEC-3.9: a rejection reply carries the run footer, with
+    /// the explicit no-run-id line, and still opens with the asker's mention.
+    #[test]
+    fn rejection_replies_carry_the_run_footer() {
+        let cmd = command_of(&payload_json(
+            "created",
+            REPO,
+            "/claude fix it",
+            "alice",
+            true,
+        ))
+        .unwrap();
+        for body in [
+            busy_comment(true),
+            denied_comment(&PermissionVerdict::Denied("read".to_string()), &[]),
+            too_long_comment(9000, 4000),
+            cap_comment(),
+            login_required_comment("Claude login required"),
+        ] {
+            let posted = addressed(&cmd, with_run_footer(&cmd, body));
+            assert!(posted.starts_with("@alice "), "{posted}");
+            assert!(
+                posted.contains("Run: ") && posted.contains("Source: comment-webhook"),
+                "{posted}"
+            );
+            assert!(
+                posted.contains("Trigger: /claude command from alice"),
+                "{posted}"
+            );
+        }
+    }
+
     #[test]
     fn the_acknowledgement_names_the_request_and_what_comes_next() {
-        let pr = started_comment("fix the flaky test\nmore detail", true);
+        let pr = started_comment(
+            "comment-webhook",
+            "/claude",
+            "fix the flaky test\nmore detail",
+            Duration::from_secs(600),
+            &crate::state::ExpectedDuration::NoHistory,
+            true,
+        );
         assert!(pr.contains("Working on: fix the flaky test"), "{pr}");
         assert!(!pr.contains("more detail"), "first line only: {pr}");
         assert!(pr.contains("a pushed commit"), "{pr}");
-        assert!(started_comment("x", false).contains("YouTrack issue"));
-        let long = started_comment(&"y".repeat(300), true);
+        assert!(started_comment(
+            "comment-webhook",
+            "/claude",
+            "x",
+            Duration::from_secs(600),
+            &crate::state::ExpectedDuration::NoHistory,
+            false
+        )
+        .contains("YouTrack issue"));
+        let long = started_comment(
+            "comment-webhook",
+            "/claude",
+            &"y".repeat(300),
+            Duration::from_secs(600),
+            &crate::state::ExpectedDuration::NoHistory,
+            true,
+        );
         assert!(long.contains(&format!("{}...", "y".repeat(200))), "{long}");
+    }
+
+    #[test]
+    fn the_acknowledgement_names_the_action_trigger_length_and_timeout() {
+        // SPEC-3.13: "names the trigger (`/claude`) and the instruction
+        // length"; the action and session timeout are the general start
+        // comment fields the same requirement describes.
+        let body = started_comment(
+            "comment-webhook",
+            "/claude",
+            "fix it",
+            Duration::from_secs(900),
+            &crate::state::ExpectedDuration::NoHistory,
+            true,
+        );
+        assert!(body.contains("Action: comment-webhook"), "{body}");
+        assert!(body.contains("Command: /claude"), "{body}");
+        assert!(body.contains("Instruction length: 6 characters"), "{body}");
+        assert!(body.contains("Session timeout: 900s"), "{body}");
+        assert!(body.contains("Expected duration: no history"), "{body}");
     }
 
     #[test]
@@ -4874,6 +5138,255 @@ mod tests {
         let dir = PathBuf::from(&xdg);
         drop(env);
         assert!(!dir.exists(), "the temp credential dir is removed on drop");
+    }
+
+    /// A [`ServeEnv`] built directly, bypassing [`build_env`]'s real
+    /// `fj`/credential materialization, so a test can run the real
+    /// [`run_instruction`] pipeline against a [`StubRunner`]-backed
+    /// [`CliBackend`].
+    fn stub_serve_env(
+        runner: Arc<dyn crate::provider::cli::CommandRunner>,
+        creds_dir: &FsPath,
+    ) -> ServeEnv {
+        ServeEnv {
+            backend: Box::new(
+                CliBackend::new(runner).with_fj_read_retry_waits([Duration::ZERO; 3]),
+            ),
+            fj: Arc::new(crate::provider::FjForgeReads::new(Arc::new(
+                StubRunner::new(),
+            ))),
+            log_token: None,
+            _creds: secrets::JobCredentials::materialize(
+                creds_dir,
+                &secrets::ResolvedCredentials::default(),
+                None,
+            )
+            .unwrap(),
+        }
+    }
+
+    /// Wraps a [`StubRunner`] to capture the `--body-file` content of any
+    /// call whose `binary args...` starts with `prefix`, read WHILE the file
+    /// still exists: the real caller (`reply_start_notice` / `reply`) removes
+    /// its workdir, body file included, right after the call returns.
+    struct CapturingRunner {
+        inner: Arc<StubRunner>,
+        prefix: String,
+        captured: std::sync::Mutex<Option<String>>,
+    }
+
+    impl crate::provider::cli::CommandRunner for CapturingRunner {
+        fn run_in_env(
+            &self,
+            dir: Option<&FsPath>,
+            binary: &str,
+            args: &[&str],
+            envs: &[(&str, &str)],
+        ) -> crate::error::Result<crate::provider::cli::CmdOutput> {
+            let joined = format!("{binary} {}", args.join(" "));
+            if joined.starts_with(&self.prefix) {
+                let mut captured = self.captured.lock().unwrap();
+                if captured.is_none() {
+                    if let Some(pos) = args.iter().position(|a| *a == "--body-file") {
+                        if let Some(path) = args.get(pos + 1) {
+                            if let Ok(content) = std::fs::read_to_string(path) {
+                                *captured = Some(content);
+                            }
+                        }
+                    }
+                }
+            }
+            self.inner.run_in_env(dir, binary, args, envs)
+        }
+    }
+
+    fn stub_ctx(pool: DbPool, tmp: &FsPath) -> CommentContext {
+        let paths = Paths {
+            config_dir: tmp.to_path_buf(),
+            data_dir: tmp.to_path_buf(),
+            state_dir: tmp.to_path_buf(),
+            runtime_dir: tmp.to_path_buf(),
+        };
+        CommentContext {
+            pool,
+            paths,
+            claude: Arc::new(ClaudeInvoker::new(None)),
+            config: Arc::new(RwLock::new(config())),
+            mint_cfg: Arc::new(RwLock::new(MintConfig::default())),
+            route_cache: Arc::new(crate::mint::VcsRouteCache::new(
+                crate::mint::DEFAULT_VCS_MAP_TTL,
+            )),
+            defaults: RunnerDefaults::default(),
+            keygate: KeyGate::new(),
+            denials: Arc::new(DenialReplyLimiter::new()),
+            readiness: None,
+        }
+    }
+
+    /// SPEC-3.13: "Every action that starts work posts a start comment
+    /// before it clones, as the first runner write for that attempt ... A
+    /// comment-command start comment mentions the commenter by login." The
+    /// clone itself is a real `git clone` subprocess the test cannot stub,
+    /// so the PR's head/base lookup (`pr_branches`, the call immediately
+    /// before the clone) is made to fail instead: a `StubRunner` call log
+    /// that records the start-notice post BEFORE that lookup is proof the
+    /// notice posts before the clone, since the clone can only run after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_valid_command_posts_the_start_comment_before_the_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = memory_pool().await;
+        let ctx = Arc::new(stub_ctx(pool, tmp.path()));
+        let cmd = gate_cmd();
+        let stub = Arc::new(
+            StubRunner::new()
+                .ok_prefix("fj --host dev.a8n.run pr comment contoso/claude-run#7", "")
+                .fail(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    1,
+                    "boom",
+                ),
+        );
+        let runner = Arc::new(CapturingRunner {
+            inner: stub.clone(),
+            prefix: "fj --host dev.a8n.run pr comment contoso/claude-run#7".to_string(),
+            captured: std::sync::Mutex::new(None),
+        });
+        let env = stub_serve_env(runner.clone(), &tmp.path().join("creds"));
+        let src = config().sources[SOURCE].clone();
+
+        run_instruction(&ctx, &env, &cmd, &cmd.key(), &src, "fix it".to_string()).await;
+
+        let calls = stub.calls.lock().unwrap().clone();
+        let start_notice = calls
+            .iter()
+            .position(|c| c.starts_with("fj --host dev.a8n.run pr comment contoso/claude-run#7"))
+            .unwrap_or_else(|| panic!("the start notice must be posted: {calls:?}"));
+        let pr_search = calls
+            .iter()
+            .position(|c| c.contains("pr search --repo contoso/claude-run"))
+            .unwrap_or_else(|| panic!("pr_branches must run (preceding the clone): {calls:?}"));
+        assert!(
+            start_notice < pr_search,
+            "the start notice must post before the PR lookup that precedes the clone: {calls:?}"
+        );
+
+        // The start notice carries the fields SPEC-3.13 names, and mentions
+        // the commenter by login via `addressed`.
+        let posted = runner
+            .captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the start notice body must have been captured");
+        assert!(posted.starts_with("@alice "), "{posted}");
+        assert!(posted.contains("Action: comment-webhook"), "{posted}");
+        assert!(posted.contains("Command: /claude"), "{posted}");
+        assert!(
+            posted.contains("Instruction length: 6 characters"),
+            "{posted}"
+        );
+        assert!(
+            posted.contains("Trigger: /claude command from alice"),
+            "{posted}"
+        );
+    }
+
+    /// SPEC-3.13: "A start comment that fails to post is logged at `error`
+    /// with the issue key and the cause; the run proceeds." Distinct from
+    /// [`reply`]'s ordinary `warn` on a failed post.
+    #[test]
+    fn a_failed_start_notice_post_is_logged_at_error_and_the_run_proceeds() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (_, logs) = crate::testutil::capture_logs(|| {
+            rt.block_on(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let pool = memory_pool().await;
+                let ctx = stub_ctx(pool, tmp.path());
+                let cmd = gate_cmd();
+                let key = cmd.key();
+                let runner = Arc::new(StubRunner::new().fail_prefix(
+                    "fj --host dev.a8n.run pr comment contoso/claude-run#7",
+                    1,
+                    "network error",
+                ));
+                let env = stub_serve_env(runner, &tmp.path().join("creds"));
+                reply_start_notice(&ctx, &env, &cmd, &key, "a start notice".to_string()).await;
+                // The run proceeds: nothing here panics or stops short, and a
+                // second call (as the real caller continues into
+                // `begin_webhook_run`) still runs cleanly.
+                state::attempts_increment(&ctx.pool, WEBHOOK_COMMENT_ACTION, &key)
+                    .await
+                    .unwrap();
+            })
+        });
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains(&cmd_key_placeholder()), "{logs}");
+        assert!(logs.contains("SPEC-3.13"), "{logs}");
+        assert!(logs.contains("network error"), "{logs}");
+    }
+
+    /// `gate_cmd()`'s dedupe key, kept as its own function so the log
+    /// assertion above does not depend on the hash's exact shape.
+    fn cmd_key_placeholder() -> String {
+        gate_cmd().key()
+    }
+
+    /// SPEC-3.6: "Post a comment naming the reason for each rejection path
+    /// instead of only logging it." Each reason's comment body already names
+    /// the reason (see `denied_comment`, `too_long_comment`, `busy_comment`,
+    /// `cap_comment`, `login_required_comment`'s own tests); this proves
+    /// `reply`, the shared function every rejection path calls, actually
+    /// posts that body through the backend rather than only logging it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_rejection_reason_is_actually_posted_as_a_comment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = memory_pool().await;
+        let ctx = stub_ctx(pool, tmp.path());
+        let cmd = gate_cmd();
+        let key = cmd.key();
+
+        let reasons: Vec<(&str, String)> = vec![
+            ("busy", busy_comment(cmd.is_pull_request)),
+            (
+                "denied",
+                denied_comment(
+                    &PermissionVerdict::Denied("read".to_string()),
+                    &["write".to_string()],
+                ),
+            ),
+            ("too_long", too_long_comment(50, 10)),
+            ("cap", cap_comment()),
+            ("login_required", login_required_comment("expired.")),
+        ];
+
+        for (reason, body) in reasons {
+            let runner = Arc::new(
+                StubRunner::new()
+                    .ok_prefix("fj --host dev.a8n.run pr comment contoso/claude-run#7", ""),
+            );
+            let env = stub_serve_env(runner.clone(), &tmp.path().join(format!("creds-{reason}")));
+
+            reply(&ctx, &env, &cmd, &key, body).await;
+
+            let calls = runner.calls.lock().unwrap().clone();
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with("fj --host dev.a8n.run pr comment contoso/claude-run#7")),
+                "{reason}: the rejection must be posted as a comment, not only logged: {calls:?}"
+            );
+        }
     }
 
     /// A `Github`-provider source routes push/comment operations through

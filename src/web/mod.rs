@@ -1348,6 +1348,140 @@ async fn search_jobs(
 /// warn/error event banner that separately names access-failure events, a
 /// stale dependency-gate banner, and an attempt-cap banner." Render state for
 /// the dashboard page.
+/// SPEC-4.3.15: one row of the dashboard's in-flight panel, pre-formatted.
+#[derive(Debug, Clone, PartialEq)]
+struct InflightRow {
+    action: String,
+    job_key: String,
+    stage: String,
+    step: String,
+    elapsed: String,
+    median: String,
+    /// `at-risk`, `over-median` or empty: the row's highlight class.
+    highlight: &'static str,
+}
+
+/// SPEC-4.3.15: one bar of the 7-day mean attempt duration graph.
+#[derive(Debug, Clone, PartialEq)]
+struct MeanBar {
+    action: String,
+    attempts: usize,
+    seconds: f64,
+    pct: u32,
+}
+
+/// SPEC-4.3.15: the dashboard's live panels. Each series carries its own
+/// error so one unreadable series renders an error panel naming the cause
+/// instead of an empty chart.
+#[derive(Default)]
+struct LiveView {
+    inflight: Vec<InflightRow>,
+    inflight_error: Option<String>,
+    means: Vec<MeanBar>,
+    means_error: Option<String>,
+    kinds: Vec<KindBar>,
+    kinds_error: Option<String>,
+}
+
+/// `m:ss`, or `h:mm:ss` from one hour (the SPEC-3.15 time format).
+fn clock(secs: i64) -> String {
+    crate::progress_list::format_secs(secs)
+}
+
+fn inflight_row(j: &crate::report::InflightJob) -> InflightRow {
+    InflightRow {
+        action: j.action.clone(),
+        job_key: j.job_key.clone(),
+        stage: j.stage.clone(),
+        step: j
+            .current_step
+            .clone()
+            .unwrap_or_else(|| "none recorded yet".to_string()),
+        elapsed: clock(j.elapsed_secs),
+        median: j
+            .median_secs
+            .map(clock)
+            .unwrap_or_else(|| "no history".to_string()),
+        highlight: if j.at_risk {
+            "at-risk"
+        } else if j.over_median {
+            "over-median"
+        } else {
+            ""
+        },
+    }
+}
+
+/// SPEC-4.3.15: build the in-flight panel and the two 7-day graphs. Every
+/// failure is logged at `error` and kept on its own series.
+async fn live_view(pool: &crate::db::DbPool, actions_dir: &std::path::Path) -> LiveView {
+    let mut v = LiveView::default();
+    // The page already resolves limits against the built-in defaults; an
+    // action that cannot be loaded has no known timeout and no at-risk flag.
+    let defaults = crate::job::RunnerDefaults::default();
+    let timeout_for = |name: &str| -> Option<u64> {
+        match crate::action::load(name, actions_dir) {
+            Ok(l) => Some(
+                crate::job::effective_limits(&defaults, &l)
+                    .claude_timeout
+                    .as_secs(),
+            ),
+            Err(e) => {
+                tracing::warn!(action = %name, error = %e, "loading the action for its session timeout failed; no at-risk highlight");
+                None
+            }
+        }
+    };
+    match crate::report::inflight_jobs(pool, chrono::Utc::now(), &timeout_for).await {
+        Ok(jobs) => v.inflight = jobs.iter().map(inflight_row).collect(),
+        Err(e) => {
+            tracing::error!(error = %e, "reading the in-flight jobs for the dashboard failed");
+            v.inflight_error = Some(e.to_string());
+        }
+    }
+    match crate::report::mean_attempt_duration_by_action(pool, crate::report::Range::Last7Days)
+        .await
+    {
+        Ok(means) => {
+            let max = means.iter().map(|m| m.mean_seconds).fold(0.0, f64::max);
+            v.means = means
+                .into_iter()
+                .map(|m| MeanBar {
+                    pct: bar_pct(m.mean_seconds, max),
+                    action: m.action,
+                    attempts: m.attempts,
+                    seconds: m.mean_seconds,
+                })
+                .collect();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "reading the mean attempt durations for the dashboard failed");
+            v.means_error = Some(e.to_string());
+        }
+    }
+    match crate::report::step_timing(pool, crate::report::Range::Last7Days, None).await {
+        Ok(t) => {
+            let max = t.time_by_kind.iter().map(|k| k.seconds).fold(0.0, f64::max);
+            let mut kinds: Vec<KindBar> = t
+                .time_by_kind
+                .iter()
+                .map(|k| KindBar {
+                    kind: k.kind.clone(),
+                    seconds: k.seconds,
+                    pct: bar_pct(k.seconds, max),
+                })
+                .collect();
+            kinds.sort_by(|a, b| b.seconds.partial_cmp(&a.seconds).unwrap());
+            v.kinds = kinds;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "reading the time-by-kind series for the dashboard failed");
+            v.kinds_error = Some(e.to_string());
+        }
+    }
+    v
+}
+
 #[derive(Template)]
 #[template(path = "dashboard.html")]
 struct DashboardTpl {
@@ -1418,6 +1552,8 @@ struct DashboardTpl {
     stuck_count: i64,
     /// The stuck-Working corrections themselves, newest first.
     stuck_rows: Vec<StuckWorkRow>,
+    /// SPEC-4.3.15: the in-flight panel and the 7-day graphs.
+    live: LiveView,
 }
 
 /// One stale dependency gate, with its ages pre-rendered for the
@@ -2110,6 +2246,7 @@ async fn dashboard(
         ci_repo_options,
         stuck_count,
         stuck_rows,
+        live: live_view(pool, &s.paths.actions_dir()).await,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
@@ -2842,6 +2979,25 @@ struct WeekdayBar {
     pct: u32,
 }
 
+/// SPEC-4.3.14: one `kind`'s total duration, with a precomputed bar width
+/// relative to the window's busiest kind.
+#[derive(Serialize)]
+struct KindBar {
+    kind: String,
+    seconds: f64,
+    pct: u32,
+}
+
+/// SPEC-4.3.14: one `check` sub-step `label`'s total duration + occurrence
+/// count, with a precomputed bar width relative to the window's busiest label.
+#[derive(Serialize)]
+struct CheckBar {
+    label: String,
+    seconds: f64,
+    count: i64,
+    pct: u32,
+}
+
 /// One row of the "recent invocations" table, with the fields the template
 /// prints already formatted (the DB stores fractions; the table shows
 /// percentages, and a missing reading prints as an em-dash string rather than
@@ -2884,6 +3040,25 @@ struct ReportsTpl {
     /// Count of charted invocations with no rate-limit data at all.
     usage_missing_count: usize,
     usage_recent: Vec<RecentInvocationRow>,
+    /// SPEC-4.3.14: total duration per step `kind`, oldest-feature-first
+    /// ordering not required, so by descending seconds.
+    time_by_kind: Vec<KindBar>,
+    /// SPEC-4.3.14: the `check` step breakdown by `label`.
+    checks: Vec<CheckBar>,
+    /// SPEC-4.3.14: counted attempts in the window with no `attempt_steps`
+    /// rows at all (an attempt that predates this feature, or whose step
+    /// writes all failed); shown as its own figure, never folded into either
+    /// series above as zero.
+    attempts_with_no_step_data: i64,
+    /// SPEC-4.3.14 stages series, every stage in order.
+    stages: Vec<crate::report::StageStats>,
+    stages_no_step_data: i64,
+    /// SPEC-4.3.14 Postgres series.
+    postgres: crate::report::PostgresReport,
+    /// SPEC-4.3.14 funnel; `mismatch` renders as an error banner.
+    funnel: crate::report::FunnelReport,
+    /// SPEC-4.3.14 failure causes, every cause in order.
+    failure_causes: crate::report::FailureCauseReport,
 }
 
 /// Query params for `/reports`: `range` (default all-time) and an optional
@@ -2974,6 +3149,45 @@ async fn reports_page(
         .map(|a| a.name)
         .collect();
 
+    let step_timing = crate::report::step_timing(pool, range, action_filter).await?;
+    let kind_max = step_timing
+        .time_by_kind
+        .iter()
+        .map(|k| k.seconds)
+        .fold(0.0, f64::max);
+    let mut time_by_kind: Vec<KindBar> = step_timing
+        .time_by_kind
+        .iter()
+        .map(|k| KindBar {
+            kind: k.kind.clone(),
+            seconds: k.seconds,
+            pct: bar_pct(k.seconds, kind_max),
+        })
+        .collect();
+    time_by_kind.sort_by(|a, b| b.seconds.partial_cmp(&a.seconds).unwrap());
+
+    let check_max = step_timing
+        .checks
+        .iter()
+        .map(|c| c.seconds)
+        .fold(0.0, f64::max);
+    let mut checks: Vec<CheckBar> = step_timing
+        .checks
+        .iter()
+        .map(|c| CheckBar {
+            label: c.label.clone(),
+            seconds: c.seconds,
+            count: c.count,
+            pct: bar_pct(c.seconds, check_max),
+        })
+        .collect();
+    checks.sort_by(|a, b| b.seconds.partial_cmp(&a.seconds).unwrap());
+
+    let stage_report = crate::report::stages(pool, range, action_filter).await?;
+    let postgres = crate::report::postgres(pool, range, action_filter).await?;
+    let funnel = crate::report::funnel(pool, range, action_filter).await?;
+    let failure_causes = crate::report::failure_causes(pool, range, action_filter).await?;
+
     let usage = crate::report::claude_usage(pool, range, action_filter).await?;
     let usage_chart = (!usage.points.is_empty()).then(|| build_usage_chart(&usage.points));
 
@@ -3043,6 +3257,14 @@ async fn reports_page(
         usage_chart,
         usage_missing_count: usage.missing_data_count,
         usage_recent,
+        time_by_kind,
+        checks,
+        attempts_with_no_step_data: step_timing.attempts_with_no_step_data,
+        stages_no_step_data: stage_report.attempts_with_no_step_data,
+        stages: stage_report.stages,
+        postgres,
+        funnel,
+        failure_causes,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
@@ -8198,6 +8420,103 @@ mod tests {
         assert!(v.query_without("triggered").contains("outcome=timedout"));
     }
 
+    /// CLAUDE-592 / SPEC-4.3.15: rows, the over-median and at-risk highlights,
+    /// and "no history" render on the dashboard; an unreadable series renders
+    /// an error panel naming the cause.
+    #[test]
+    fn dashboard_renders_inflight_rows_highlights_and_error_panels() {
+        use super::{inflight_row, DashboardTpl, LiveView, MeanBar, PageNav, RunsView};
+        use crate::report::InflightJob;
+        use askama::Template;
+
+        let job = |key: &str, elapsed, median: Option<i64>, over, risk| InflightJob {
+            run_id: 1,
+            action: "youtrack".into(),
+            job_key: key.into(),
+            stage: "initial".into(),
+            current_step: Some("coding / coding".into()),
+            elapsed_secs: elapsed,
+            median_secs: median,
+            timeout_secs: Some(1000),
+            over_median: over,
+            at_risk: risk,
+        };
+        let live = LiveView {
+            inflight: vec![
+                inflight_row(&job("OK-1", 60, Some(120), false, false)),
+                inflight_row(&job("SLOW-1", 300, Some(120), true, false)),
+                inflight_row(&job("RISK-1", 900, Some(120), true, true)),
+                inflight_row(&job("NEW-1", 30, None, false, false)),
+            ],
+            means: vec![MeanBar {
+                action: "youtrack".into(),
+                attempts: 3,
+                seconds: 12.5,
+                pct: 100,
+            }],
+            kinds_error: Some("db unreachable".into()),
+            ..LiveView::default()
+        };
+        let html = DashboardTpl {
+            version: "test",
+            global_pause: None,
+            today_runs: 0,
+            today_actions: 0,
+            today_cost: 0.0,
+            actions: vec![],
+            recent_runs: vec![],
+            show_empty: false,
+            search_q: String::new(),
+            in_stream: false,
+            search: None,
+            page: PageNav {
+                page: 1,
+                total_pages: 1,
+                total: 0,
+                start: 0,
+                end: 0,
+                has_prev: false,
+                has_next: false,
+            },
+            events_24h: 0,
+            access_failure_events: 0,
+            access_failure_groups: 0,
+            stale_gates: vec![],
+            attempt_cap_hits: vec![],
+            view: RunsView::default(),
+            action_options: vec![],
+            triggered_options: vec![],
+            ci_failures: vec![],
+            ci_state: String::new(),
+            ci_repo: String::new(),
+            ci_repo_options: vec![],
+            stuck_count: 0,
+            stuck_rows: vec![],
+            live,
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains("4 job(s) in flight"), "{html}");
+        assert!(
+            html.contains("SLOW-1") && html.contains("(over median)"),
+            "{html}"
+        );
+        assert!(
+            html.contains("RISK-1") && html.contains("(at risk)"),
+            "{html}"
+        );
+        assert!(html.contains("no history"), "{html}");
+        assert!(
+            html.contains("The time-by-kind series could not be read:")
+                && html.contains("db unreachable"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("No step data recorded in the last 7 days."),
+            "{html}"
+        );
+    }
+
     /// `whitelist_member` keeps only values present in the data-derived list.
     #[test]
     fn whitelist_member_rejects_unknown_values() {
@@ -8271,6 +8590,7 @@ mod tests {
             ci_repo_options: vec![],
             stuck_count: 0,
             stuck_rows: vec![],
+            live: super::LiveView::default(),
         };
         let html = tpl.render().expect("render dashboard");
         // Poll URL carries the active sort/filter (askama escapes `&` to `&amp;`).
@@ -8382,6 +8702,7 @@ mod tests {
             ci_repo_options: vec![],
             stuck_count: 0,
             stuck_rows: vec![],
+            live: super::LiveView::default(),
         };
 
         let quiet = tpl(vec![]).render().expect("render dashboard");
@@ -8463,6 +8784,7 @@ mod tests {
             ci_repo_options: vec![],
             stuck_count: 0,
             stuck_rows: vec![],
+            live: super::LiveView::default(),
         };
 
         let quiet = tpl(vec![]).render().expect("render dashboard");
@@ -8546,6 +8868,8 @@ mod tests {
                         stream_log_path: None,
                         duration_ms: 1,
                         timed_out: *timed_out,
+                        stage: "initial",
+                        outcome: "success",
                     },
                 )
                 .await

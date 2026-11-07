@@ -16,6 +16,7 @@
 # Each line is a `cargo test` name filter: a substring of a test's full module
 # path, so a trailing `::` pins it to that module and its children.
 api::
+attempt_steps::
 auth::
 ci_failure::store::
 concurrency::
@@ -26,6 +27,7 @@ mcp::
 mcp_http::
 native::youtrack::
 pause::
+progress_list::
 report::
 retention::
 secrets::

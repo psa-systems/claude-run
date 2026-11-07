@@ -597,6 +597,8 @@ mod tests {
                 stream_log_path: None,
                 duration_ms: 1000,
                 timed_out: false,
+                stage: "initial",
+                outcome: "success",
             },
         )
         .await
@@ -679,6 +681,8 @@ mod tests {
                 stream_log_path: None,
                 duration_ms: 1,
                 timed_out: false,
+                stage: "initial",
+                outcome: "success",
             },
         )
         .await
@@ -718,6 +722,8 @@ mod tests {
                 stream_log_path: Some(missing.to_str().unwrap()),
                 duration_ms: 1,
                 timed_out: false,
+                stage: "initial",
+                outcome: "success",
             },
         )
         .await
@@ -765,6 +771,8 @@ mod tests {
                 stream_log_path: Some(link.to_str().unwrap()),
                 duration_ms: 1,
                 timed_out: false,
+                stage: "initial",
+                outcome: "success",
             },
         )
         .await
@@ -810,6 +818,8 @@ mod tests {
                 stream_log_path: Some(log_path.to_str().unwrap()),
                 duration_ms: 1,
                 timed_out: false,
+                stage: "initial",
+                outcome: "success",
             },
         )
         .await

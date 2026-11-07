@@ -151,6 +151,68 @@
   </div>
 </div>
 
+<h2>In flight</h2>
+{% if let Some(err) = live.inflight_error %}
+  <div class="card" role="alert" style="border-left: 4px solid var(--error, #c0392b);"><strong>The in-flight jobs could not be read:</strong> {{ err }}</div>
+{% else if live.inflight.is_empty() %}
+  <div class="card"><span class="dim">No jobs in flight.</span></div>
+{% else %}
+  <div class="meta">{{ live.inflight.len() }} job(s) in flight</div>
+  <table>
+    <thead><tr><th>Action</th><th>Issue</th><th>Stage</th><th>Current step</th><th>Elapsed</th><th>Median of last 20</th></tr></thead>
+    <tbody>
+      {% for j in live.inflight %}
+        <tr class="{{ j.highlight }}"{% if j.highlight == "at-risk" %} style="background: rgba(192, 57, 43, 0.15);"{% else if j.highlight == "over-median" %} style="background: rgba(230, 126, 34, 0.15);"{% endif %}>
+          <td class="mono dim">{{ j.action }}</td>
+          <td class="mono">{{ j.job_key }}</td>
+          <td class="mono">{{ j.stage }}</td>
+          <td class="mono">{{ j.step }}</td>
+          <td class="mono">{{ j.elapsed }}{% if j.highlight == "at-risk" %} (at risk){% else if j.highlight == "over-median" %} (over median){% endif %}</td>
+          <td class="mono">{{ j.median }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+<h2>Last 7 days</h2>
+<h3>Mean attempt duration by action</h3>
+{% if let Some(err) = live.means_error %}
+  <div class="card" role="alert" style="border-left: 4px solid var(--error, #c0392b);"><strong>The mean attempt durations could not be read:</strong> {{ err }}</div>
+{% else if live.means.is_empty() %}
+  <div class="card"><span class="dim">No completed attempts in the last 7 days.</span></div>
+{% else %}
+  <table>
+    <tbody>
+      {% for m in live.means %}
+        <tr>
+          <td class="mono dim">{{ m.action }}</td>
+          <td class="mono">{{ "{:.1}"|format(m.seconds) }}s ({{ m.attempts }})</td>
+          <td style="width: 50%;"><div style="background: var(--accent); height: 8px; border-radius: 2px; width: {{ m.pct }}%;"></div></td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+<h3>Time by kind</h3>
+{% if let Some(err) = live.kinds_error %}
+  <div class="card" role="alert" style="border-left: 4px solid var(--error, #c0392b);"><strong>The time-by-kind series could not be read:</strong> {{ err }}</div>
+{% else if live.kinds.is_empty() %}
+  <div class="card"><span class="dim">No step data recorded in the last 7 days.</span></div>
+{% else %}
+  <table>
+    <tbody>
+      {% for k in live.kinds %}
+        <tr>
+          <td class="mono dim">{{ k.kind }}</td>
+          <td class="mono">{{ "{:.1}"|format(k.seconds) }}s</td>
+          <td style="width: 50%;"><div style="background: var(--accent); height: 8px; border-radius: 2px; width: {{ k.pct }}%;"></div></td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
 <h2>Actions <a href="/actions/new" style="float: right; font-size: 11px; text-transform: none; letter-spacing: 0;">+ New action</a></h2>
 <div class="grid">
   {% for a in actions %}

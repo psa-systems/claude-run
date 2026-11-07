@@ -207,9 +207,17 @@ test foo ... FAILED
 
     #[test]
     fn fingerprint_is_empty_when_nothing_parses_at_all() {
+        // A diagnostic-bearing log that yields no test id and no signature.
+        assert_eq!(fingerprint("Diff in src/lib.rs:1:\n"), Vec::<String>::new());
+    }
+
+    /// SPEC-3.12 item 8: a log with no diagnostic at all is the infrastructure
+    /// `no-diagnostic` kind, keyed branch-agnostically.
+    #[test]
+    fn a_log_with_no_diagnostic_fingerprints_as_infrastructure() {
         assert_eq!(
             fingerprint("nothing interesting here\n"),
-            Vec::<String>::new()
+            vec!["infra:no-diagnostic".to_string()]
         );
     }
 }

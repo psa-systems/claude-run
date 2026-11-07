@@ -196,4 +196,127 @@
   </tbody>
 </table>
 
+<h2>Where the time goes</h2>
+{% if attempts_with_no_step_data > 0 %}
+  <div class="card"><span class="dim">{{ attempts_with_no_step_data }} attempt(s) in this window have no step data (recorded before step timing shipped, or a step write failed) and are excluded from the series below.</span></div>
+{% endif %}
+{% if time_by_kind.is_empty() %}
+  <div class="card"><span class="dim">No step data recorded in this window.</span></div>
+{% else %}
+  <table>
+    <thead><tr><th>Kind</th><th>Time</th><th style="width: 40%;"></th></tr></thead>
+    <tbody>
+      {% for k in time_by_kind %}
+        <tr>
+          <td class="mono dim">{{ k.kind }}</td>
+          <td class="mono">{{ "{:.1}"|format(k.seconds) }}s</td>
+          <td><div style="background: var(--accent); height: 8px; border-radius: 2px; width: {{ k.pct }}%;"></div></td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+<h3>Checks</h3>
+{% if checks.is_empty() %}
+  <div class="card"><span class="dim">No check steps recorded in this window.</span></div>
+{% else %}
+  <table>
+    <thead><tr><th>Label</th><th>Time</th><th style="width: 40%;"></th><th>Count</th></tr></thead>
+    <tbody>
+      {% for c in checks %}
+        <tr>
+          <td class="mono dim">{{ c.label }}</td>
+          <td class="mono">{{ "{:.1}"|format(c.seconds) }}s</td>
+          <td><div style="background: var(--accent); height: 8px; border-radius: 2px; width: {{ c.pct }}%;"></div></td>
+          <td class="mono">{{ c.count }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+<h3>Stages</h3>
+{% if stages_no_step_data > 0 %}
+  <div class="card"><span class="dim">No step data: {{ stages_no_step_data }} attempt(s) are excluded from the stage statistics.</span></div>
+{% endif %}
+<table>
+  <thead><tr><th>Stage</th><th>Attempts</th><th>Median</th><th>95th percentile</th></tr></thead>
+  <tbody>
+    {% for st in stages %}
+      <tr>
+        <td class="mono dim">{{ st.stage }}</td>
+        <td class="mono">{{ st.stats.count }}</td>
+        {% if let Some(m) = st.stats.median_seconds %}<td class="mono">{{ "{:.1}"|format(m) }}s</td>{% else %}<td class="dim">-</td>{% endif %}
+        {% if let Some(m) = st.stats.p95_seconds %}<td class="mono">{{ "{:.1}"|format(m) }}s</td>{% else %}<td class="dim">-</td>{% endif %}
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h3>Postgres</h3>
+{% if postgres.attempts_with_no_step_data > 0 %}
+  <div class="card"><span class="dim">No step data: {{ postgres.attempts_with_no_step_data }} attempt(s) are excluded from the Postgres statistics.</span></div>
+{% endif %}
+{% if postgres.starts == 0 %}
+  <div class="card"><span class="dim">No Postgres starts recorded in this window.</span></div>
+{% else %}
+  <table>
+    <tbody>
+      <tr><td class="dim">Starts</td><td class="mono">{{ postgres.starts }}</td></tr>
+      <tr><td class="dim">Became healthy</td><td class="mono">{{ postgres.healthy }}</td></tr>
+      <tr><td class="dim">Never became healthy</td><td class="mono">{{ postgres.never_healthy }}</td></tr>
+      {% if let Some(t) = postgres.time_to_healthy %}
+          <tr><td class="dim">Start to healthy (median / 95th / max)</td>
+              <td class="mono">{% if let Some(v) = t.median_seconds %}{{ "{:.1}"|format(v) }}s{% else %}-{% endif %} / {% if let Some(v) = t.p95_seconds %}{{ "{:.1}"|format(v) }}s{% else %}-{% endif %} / {% if let Some(v) = t.max_seconds %}{{ "{:.1}"|format(v) }}s{% else %}-{% endif %}</td></tr>
+        {% else %}
+          <tr><td class="dim">Start to healthy</td><td class="dim">no start became healthy</td></tr>
+      {% endif %}
+      {% if let Some(c) = postgres.last_failure_cause %}<tr><td class="dim">Last failure cause</td><td class="mono">{{ c }}</td></tr>
+        {% endif %}
+    </tbody>
+  </table>
+{% endif %}
+
+<h3>Funnel</h3>
+{% if let Some(m) = funnel.mismatch %}<div class="card" role="alert" style="border-left: 4px solid var(--error, #c0392b);"><strong>Funnel mismatch:</strong> {{ m }}</div>
+  {% endif %}
+{% if funnel.attempts_with_no_step_data > 0 %}
+  <div class="card"><span class="dim">No step data: {{ funnel.attempts_with_no_step_data }} attempt(s) have no recorded steps; they are counted in the funnel by outcome.</span></div>
+{% endif %}
+<table>
+  <tbody>
+    <tr><td class="dim">Succeeded on the first attempt</td><td class="mono">{{ funnel.counts.first_attempt }}</td></tr>
+    <tr><td class="dim">Succeeded on the second attempt</td><td class="mono">{{ funnel.counts.second_attempt }}</td></tr>
+    <tr><td class="dim">Succeeded on the third attempt</td><td class="mono">{{ funnel.counts.third_attempt }}</td></tr>
+    <tr><td class="dim">Ended in Needs Review</td><td class="mono">{{ funnel.counts.needs_review }}</td></tr>
+    <tr><td class="dim">Ended in Failed</td><td class="mono">{{ funnel.counts.failed }}</td></tr>
+    <tr><td class="dim">Never finished</td><td class="mono">{{ funnel.counts.never_finished }}</td></tr>
+    <tr><td class="dim">Still in flight</td><td class="mono">{{ funnel.counts.in_progress }}</td></tr>
+    <tr><td class="dim">Issues in range</td><td class="mono">{{ funnel.issues_in_range }}</td></tr>
+  </tbody>
+</table>
+
+<h3>Failure causes</h3>
+{% if failure_causes.attempts_with_no_step_data > 0 %}
+  <div class="card"><span class="dim">No step data: {{ failure_causes.attempts_with_no_step_data }} attempt(s) have no recorded steps; failed ones are classified from their recorded outcome.</span></div>
+{% endif %}
+{% if let Some(n) = failure_causes.ci_infrastructure_note %}<div class="card"><span class="dim">{{ n }}</span></div>
+  {% endif %}
+<table>
+  <thead><tr><th>Cause</th><th>Failed attempts</th></tr></thead>
+  <tbody>
+    {% for c in failure_causes.causes %}
+      <tr><td class="mono dim">{{ c.cause }}</td><td class="mono">{{ c.count }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% if !failure_causes.other_attempts.is_empty() %}
+  <p class="dim">Attempts in <code>other</code>:
+    {% for a in failure_causes.other_attempts %}
+      <a href="/runs/{{ a.run_id }}/jobs/{{ a.job_key }}/attempt/{{ a.attempt }}">{{ a.job_key }}#{{ a.attempt }}</a>{% if !loop.last %}, {% endif %}
+    {% endfor %}
+  </p>
+{% endif %}
+
 {% endblock %}
