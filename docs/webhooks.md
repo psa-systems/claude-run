@@ -113,9 +113,13 @@ whether `agent_pull_requests` has an `open` row for `(host, repo, pr.number)`:
   3), the run comments the recorded issue with the run link, the failing tests, and the analysis, bumps
   `fix_attempts`, and sets `AI Agent = Queued` so the runner picks the SAME issue back up on the SAME branch (CLAUDE-275)
   instead of a second issue ever being filed for it. At the ceiling, the issue is flagged `AI Agent = Needs Review`
-  instead, with a comment listing every fix attempt's run and every distinct failing-test set seen on the PR. One
-  exception (CLAUDE-551): when this failure's tests overlap none of the earlier attempts' on the PR (the agent fixed
-  what it was asked to and a different test tripped), it gets one more attempt, up to
+  instead, with a comment listing every fix attempt's run and every distinct failing-test set seen on the PR. A
+  failure whose fingerprint repeats the immediately preceding attempt's unchanged (CLAUDE-371, the loop-breaker) also
+  flags `Needs Review` instead of re-queueing, naming the decision needed (fix the recurring failure by hand, or
+  re-queue once it no longer reproduces). Both of these `Needs Review` writes are the `SPEC-3.12` item 3 "CI
+  remediation ceiling reached" table row, so both also tag `Needs-Info` (`mint.needs_info_tag`, default
+  `Needs-Info`). One exception (CLAUDE-551): when this failure's tests overlap none of the earlier attempts' on the
+  PR (the agent fixed what it was asked to and a different test tripped), it gets one more attempt, up to
   `config.webhook.agent_pr_fix_attempts_hard_cap` (default 6). Each re-queue logs a `run_events` row on
   `webhook-triage` saying whether it was a normal or an extended attempt. Either way: no PR comment, no new issue - the failure
   belongs to an issue that already exists. This replaces matching `trigger_user` against `bot_logins`, which is what
