@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
+use crate::ci_failure::fingerprint::strip_buildkit_prefix;
 use crate::config::MintConfig;
 use crate::error::Result;
 use crate::provider::{IssueTracker, VcsMapEntry};
@@ -469,6 +470,7 @@ pub(crate) fn legacy_collapse_key(
 /// cause across commits yields the same signature.
 pub fn failure_signature(log: &str) -> Option<String> {
     log.lines()
+        .map(strip_buildkit_prefix)
         .find(|l| is_diagnostic_line(l))
         .map(normalize_signature)
 }
@@ -490,11 +492,14 @@ fn is_diagnostic_line(line: &str) -> bool {
 }
 
 /// Normalize a diagnostic line so the same root cause yields the same signature:
-/// lowercase, replace each path-like token with its basename (drop `/…`
-/// prefixes), replace runs of digits with `#` (strip line/column numbers,
-/// timestamps, hashes), and collapse whitespace.
+/// drop a `thread '<name>' (<id>)` prefix (SPEC-3.5.2: which test thread
+/// panicked first is random, so it must not vary the signature), lowercase,
+/// replace each path-like token with its basename (drop `/…` prefixes),
+/// replace runs of digits with `#` (strip line/column numbers, timestamps,
+/// hashes), and collapse whitespace.
 fn normalize_signature(line: &str) -> String {
-    let debased: Vec<String> = line
+    let without_thread_name = strip_thread_name(line);
+    let debased: Vec<String> = without_thread_name
         .to_ascii_lowercase()
         .split_whitespace()
         .map(|tok| {
@@ -506,6 +511,30 @@ fn normalize_signature(line: &str) -> String {
         })
         .collect();
     mask_digit_runs(&debased.join(" "))
+}
+
+/// SPEC-3.5.2: drop the quoted thread name and, if present, the parenthesized
+/// thread id from a `thread '<name>' (<id>) panicked at ...` line, e.g.
+/// `thread 'needs_host_tools::foo' (380) panicked at a.rs:1:2:` ->
+/// `thread panicked at a.rs:1:2:`. Which test thread panics first is random,
+/// so without this the fallback signature differs between runs of the same
+/// failure. A line that is not this shape is returned unchanged.
+fn strip_thread_name(line: &str) -> String {
+    let Some(rest) = line.trim_start().strip_prefix("thread '") else {
+        return line.to_string();
+    };
+    let Some(name_end) = rest.find('\'') else {
+        return line.to_string();
+    };
+    let after_name = rest[name_end + 1..].trim_start();
+    let after_id = match after_name.strip_prefix('(') {
+        Some(rest) => match rest.find(')') {
+            Some(id_end) => rest[id_end + 1..].trim_start(),
+            None => after_name,
+        },
+        None => after_name,
+    };
+    format!("thread {after_id}")
 }
 
 /// Replace every maximal run of ASCII digits with a single `#`.
@@ -1598,6 +1627,39 @@ mod tests {
         assert!(!s.contains("/home/ci"), "path prefix dropped: {s}");
         assert!(!s.chars().any(|c| c.is_ascii_digit()), "digits masked: {s}");
         assert_eq!(s, s.to_ascii_lowercase(), "lowercased: {s}");
+    }
+
+    /// CLAUDE-608 acceptance criterion: two logs whose first diagnostic line
+    /// differs only in the panicking thread's name and id yield the same
+    /// signature, so which test thread panics first (random) never splits
+    /// one root cause across issues.
+    #[test]
+    fn signature_is_independent_of_the_panicking_thread_name_and_id() {
+        let a = failure_signature(
+            "thread 'needs_host_tools::failing_docker_leaves_no_temp_dir' (380) panicked at tests/build_recipe_args.rs:69:18:\n",
+        )
+        .unwrap();
+        let b = failure_signature(
+            "thread 'needs_host_tools::failing_git_ls_remote_leaves_no_temp_dir' (445) panicked at tests/build_recipe_args.rs:69:18:\n",
+        )
+        .unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// CLAUDE-608: the BuildKit progress prefix on a `thread '...' panicked`
+    /// line is stripped before the signature is derived, so a buildx-built
+    /// log signs identically to the same log outside a buildx build.
+    #[test]
+    fn signature_strips_the_buildkit_prefix_before_signing() {
+        let prefixed = failure_signature(
+            "#16 69.17 thread 'needs_host_tools::failing_docker_leaves_no_temp_dir' (380) panicked at tests/build_recipe_args.rs:69:18:\n",
+        )
+        .unwrap();
+        let plain = failure_signature(
+            "thread 'needs_host_tools::failing_docker_leaves_no_temp_dir' (380) panicked at tests/build_recipe_args.rs:69:18:\n",
+        )
+        .unwrap();
+        assert_eq!(prefixed, plain);
     }
 
     #[test]

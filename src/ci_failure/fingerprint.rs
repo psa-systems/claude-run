@@ -30,6 +30,46 @@ const TARGETS_FAILED_MARKER: &str = "target failed:";
 const TARGETS_FAILED_MARKER_PLURAL: &str = "targets failed:";
 const TARGET_LINE_MARKER: &str = "--test ";
 
+/// SPEC-3.5.2: a BuildKit progress-line prefix (`#<step> <seconds> `) that
+/// `docker buildx build` interleaves onto every line of a `RUN` step's
+/// output, e.g. `#16 63.58 test needs_host_tools::foo ... FAILED`. Strips it,
+/// if present, so a cargo log is fingerprinted identically whether or not it
+/// went through a buildx build. Every matcher below runs on the result of
+/// this, never on the raw line, so no path sees the prefixed form.
+pub(crate) fn strip_buildkit_prefix(line: &str) -> &str {
+    let after_leading_space = line.trim_start();
+    let Some(after_hash) = after_leading_space.strip_prefix('#') else {
+        return line;
+    };
+    let Some(space_idx) = after_hash.find(' ') else {
+        return line;
+    };
+    let (step, rest) = after_hash.split_at(space_idx);
+    if step.is_empty() || !step.bytes().all(|b| b.is_ascii_digit()) {
+        return line;
+    }
+    let rest = rest.trim_start();
+    let Some(space_idx) = rest.find(' ') else {
+        return line;
+    };
+    let (seconds, after_seconds) = rest.split_at(space_idx);
+    if !is_buildkit_seconds_token(seconds) {
+        return line;
+    }
+    after_seconds
+}
+
+/// `63.58` -> true: two nonempty ASCII-digit runs separated by one `.`.
+fn is_buildkit_seconds_token(tok: &str) -> bool {
+    let Some((whole, frac)) = tok.split_once('.') else {
+        return false;
+    };
+    !whole.is_empty()
+        && !frac.is_empty()
+        && whole.bytes().all(|b| b.is_ascii_digit())
+        && frac.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// SPEC-3.5.2: parse cargo test output into sorted, deduplicated
 /// `<target>::<test>` ids.
 ///
@@ -46,7 +86,7 @@ pub fn failing_tests(log: &str) -> Vec<String> {
     let mut in_targets_failed = false;
 
     for line in log.lines() {
-        let trimmed = line.trim();
+        let trimmed = strip_buildkit_prefix(line).trim();
 
         if let Some(rest) = trimmed.strip_prefix(RUNNING_PREFIX) {
             if let Some(target) = parse_running_target(rest) {
@@ -89,11 +129,20 @@ pub fn failing_tests(log: &str) -> Vec<String> {
 /// [`infra_failure::detect`] recognises a host condition, else
 /// [`failing_tests`], falling back to the normalized
 /// [`mint::failure_signature`] as a single id when neither parses anything.
+///
+/// Exception: a `docker buildx build` bootstrap warning (BuildKit polling its
+/// own API before the build starts) can read as the `runner-deadline` infra
+/// kind on a log that also carries parsed failing tests; that warning has
+/// nothing to do with the tests, so a log with any parsed `<target>::<test>`
+/// id is fingerprinted by those ids, never by a `runner-deadline` match.
+/// Every other infra kind still wins over `failing_tests` unchanged.
 pub fn fingerprint(log: &str) -> Vec<String> {
-    if let Some(infra) = infra_failure::detect(log) {
-        return vec![format!("infra:{}", infra.kind)];
-    }
     let tests = failing_tests(log);
+    if let Some(infra) = infra_failure::detect(log) {
+        if infra.kind != "runner-deadline" || tests.is_empty() {
+            return vec![format!("infra:{}", infra.kind)];
+        }
+    }
     if !tests.is_empty() {
         return tests;
     }
@@ -219,5 +268,85 @@ test foo ... FAILED
             fingerprint("nothing interesting here\n"),
             vec!["infra:no-diagnostic".to_string()]
         );
+    }
+
+    /// CLAUDE-608 acceptance criterion: a `docker buildx build` log, where
+    /// BuildKit prefixes every line of the `RUN cargo test` step with
+    /// `#<step> <seconds> `, must parse to the same ids as the unprefixed log.
+    #[test]
+    fn failing_tests_strips_the_buildkit_progress_prefix() {
+        let log = "\
+#16 63.58      Running tests/build_recipe_args.rs (target/release/deps/build_recipe_args-c1a58e8075edfcec)
+#16 63.58 test needs_host_tools::failing_docker_leaves_no_temp_dir ... FAILED
+#16 63.58 test needs_host_tools::failing_git_ls_remote_leaves_no_temp_dir ... FAILED
+#16 63.58 test needs_host_tools::missing_out_is_rejected_before_any_build_command ... FAILED
+#16 63.58 test needs_host_tools::missing_version_is_rejected_before_any_build_command ... FAILED
+";
+        assert_eq!(
+            failing_tests(log),
+            vec![
+                "build_recipe_args::needs_host_tools::failing_docker_leaves_no_temp_dir"
+                    .to_string(),
+                "build_recipe_args::needs_host_tools::failing_git_ls_remote_leaves_no_temp_dir"
+                    .to_string(),
+                "build_recipe_args::needs_host_tools::missing_out_is_rejected_before_any_build_command"
+                    .to_string(),
+                "build_recipe_args::needs_host_tools::missing_version_is_rejected_before_any_build_command"
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// CLAUDE-608: the same log, unprefixed, yields identical ids, so the
+    /// store attaches a buildx-built run to the same issue as a plain one.
+    #[test]
+    fn failing_tests_matches_with_or_without_the_buildkit_prefix() {
+        let prefixed = "\
+#16 63.58      Running tests/build_recipe_args.rs (target/release/deps/build_recipe_args-c1a58e8075edfcec)
+#16 63.58 test needs_host_tools::failing_docker_leaves_no_temp_dir ... FAILED
+";
+        let plain = "\
+     Running tests/build_recipe_args.rs (target/release/deps/build_recipe_args-c1a58e8075edfcec)
+test needs_host_tools::failing_docker_leaves_no_temp_dir ... FAILED
+";
+        assert_eq!(failing_tests(prefixed), failing_tests(plain));
+    }
+
+    /// CLAUDE-608 acceptance criterion: the BuildKit bootstrap warning
+    /// ahead of the prefixed cargo failure fingerprints to the four test
+    /// ids, not to the warning line (which otherwise reads as the
+    /// `runner-deadline` infra kind).
+    #[test]
+    fn fingerprint_prefers_parsed_failing_tests_over_a_buildx_bootstrap_warning() {
+        let log = "\
+Error:    Get \"http://host:2375/v1.54/containers/buildx_buildkit_builder0/json\": context deadline exceeded
+#16 63.58      Running tests/build_recipe_args.rs (target/release/deps/build_recipe_args-c1a58e8075edfcec)
+#16 63.58 test needs_host_tools::failing_docker_leaves_no_temp_dir ... FAILED
+#16 63.58 test needs_host_tools::failing_git_ls_remote_leaves_no_temp_dir ... FAILED
+#16 63.58 test needs_host_tools::missing_out_is_rejected_before_any_build_command ... FAILED
+#16 63.58 test needs_host_tools::missing_version_is_rejected_before_any_build_command ... FAILED
+";
+        assert_eq!(
+            fingerprint(log),
+            vec![
+                "build_recipe_args::needs_host_tools::failing_docker_leaves_no_temp_dir"
+                    .to_string(),
+                "build_recipe_args::needs_host_tools::failing_git_ls_remote_leaves_no_temp_dir"
+                    .to_string(),
+                "build_recipe_args::needs_host_tools::missing_out_is_rejected_before_any_build_command"
+                    .to_string(),
+                "build_recipe_args::needs_host_tools::missing_version_is_rejected_before_any_build_command"
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// A `runner-deadline` log with NO parsed failing tests is still the
+    /// infra kind: the narrowing in `fingerprint` only defers to parsed test
+    /// ids when there are any.
+    #[test]
+    fn fingerprint_still_prefers_runner_deadline_when_no_tests_parse() {
+        let log = "Get \"http://host:2375/v1.54/...\": context deadline exceeded\n";
+        assert_eq!(fingerprint(log), vec!["infra:runner-deadline".to_string()]);
     }
 }
