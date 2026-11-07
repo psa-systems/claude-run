@@ -2139,7 +2139,9 @@ async fn process_job(
     // of earlier attempts plus this attempt's steps derived so far (they are
     // written to `attempt_steps` right after `finalize` returns). Handed over
     // through a keyed stash because `finalize` is synchronous with no pool.
-    {
+    // CLAUDE-604: `finalize` then reports each `push`, `pr_create` and `gate`
+    // span as it ends; the sink below stores it and extends the stashed list.
+    let (list_rows, list_incomplete) = {
         let (mut rows, mut incomplete) = match crate::progress_list::load_rows(
             pool,
             &action.name,
@@ -2189,9 +2191,35 @@ async fn process_job(
                 incomplete,
             },
         );
-    }
+        (rows, incomplete)
+    };
+    let list_rows = std::sync::Mutex::new(list_rows);
+    let runtime = tokio::runtime::Handle::current();
+    let step_sink = |spans: Vec<crate::attempt_steps::StepSpan>| {
+        runtime.block_on(async {
+            recorder.lock().await.record_spans(stage, &spans).await;
+        });
+        let mut rows = list_rows.lock().unwrap_or_else(|p| p.into_inner());
+        for s in &spans {
+            rows.push(crate::progress_list::StepRow {
+                attempt: i64::from(attempts + 1),
+                kind: s.kind.as_str().to_string(),
+                started_at: s.start,
+                ended_at: s.end,
+                ok: s.ok,
+            });
+        }
+        rows.sort_by_key(|r| (r.attempt, r.started_at));
+        crate::progress_list::stash_context(
+            key,
+            crate::progress_list::ListContext {
+                done: crate::progress_list::milestones(&rows),
+                incomplete: list_incomplete,
+            },
+        );
+    };
     let finalize_res = crate::blocking::in_place(|| {
-        finalize(
+        finalize_with_steps(
             backend,
             forge,
             src,
@@ -2214,6 +2242,7 @@ async fn process_job(
             review.as_ref(),
             attempts + 1,
             limits.max_attempts_per_key,
+            &step_sink,
         )
     });
     crate::progress_list::clear_context(key);
@@ -2352,11 +2381,9 @@ async fn process_job(
     // SPEC-3.14: record the rest of this attempt's steps (the claude
     // invocation's derived coding/check/build steps and the verification
     // gates; the clone, checkpoint and review rows were written when each
-    // ended, CLAUDE-603), only for an attempt that counts. An uncounted
+    // ended, CLAUDE-603; the push, pr_create and gate rows likewise,
+    // CLAUDE-604), only for an attempt that counts. An uncounted
     // attempt drops the rows it already wrote.
-    // Drained whether or not the attempt counts, so a skipped attempt's gate
-    // timing never leaks into the next attempt of the same key.
-    let gate_timings = crate::attempt_steps::take_gate_timings(key);
     if skip_attempt {
         recorder.lock().await.clear_attempt().await;
     } else {
@@ -2387,11 +2414,6 @@ async fn process_job(
                     );
                 }
             }
-        }
-        // SPEC-3.14 items 3 and 5: the verification gate(s) `finalize` ran,
-        // with their recipe stages as check sub-steps when the output timed them.
-        for gate in &gate_timings {
-            recorder.record_gate(stage, gate).await;
         }
         let incomplete = recorder
             .finish(stage, started_wall, chrono::Utc::now())
@@ -3214,7 +3236,7 @@ struct GateResult {
     command: Option<&'static str>,
     failure: Option<String>,
     /// SPEC-3.14: when the recipe ran, its timing and timed stage spans, for
-    /// the caller to stash for the attempt's step recorder.
+    /// the caller to hand to the step sink (CLAUDE-604).
     timing: Option<crate::attempt_steps::GateTiming>,
 }
 
@@ -4508,10 +4530,64 @@ fn record_finalize_outcome(
 /// failed push is itself an error: per SPEC-3.3.1 ("a failed final push is a
 /// failure ... never reported as success"), the caller must turn whichever
 /// outcome it was about to report into a failure instead.
-fn final_push(forge: &dyn Forge, job: &YoutrackJob, workdir: &Path) -> Result<()> {
+/// SPEC-3.14 item 3: the `push` and `pr_create` spans of one PR open that took
+/// `[start, end]`, split where the provider reported the push ended.
+fn pr_open_spans(
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+    pr: &PullRequest,
+) -> Vec<crate::attempt_steps::StepSpan> {
+    use crate::attempt_steps::{StepKind, StepSpan};
+    let span = |kind, label, start, end| StepSpan {
+        kind,
+        label,
+        start,
+        end,
+        ok: true,
+        detail: None,
+    };
+    match pr.push_ended_at {
+        Some(pushed) => {
+            let pushed = pushed.clamp(start, end);
+            vec![
+                span(StepKind::Push, "push", start, pushed),
+                span(StepKind::PrCreate, "pr_create", pushed, end),
+            ]
+        }
+        None => vec![span(StepKind::PrCreate, "pr_create", start, end)],
+    }
+}
+
+fn final_push(
+    forge: &dyn Forge,
+    job: &YoutrackJob,
+    workdir: &Path,
+    steps: crate::attempt_steps::StepSink<'_>,
+) -> Result<()> {
     let host = host_only(&job.repo_host);
-    forge
-        .final_push(workdir, &host)
+    let start = chrono::Utc::now();
+    let pushed = forge.final_push(workdir, &host);
+    let end = chrono::Utc::now();
+    // SPEC-3.14 item 3, CLAUDE-604: a conflict-resolution gate that ran inside
+    // the push is stored first and the `push` row starts after it, so the rows
+    // never overlap.
+    let mut push_start = start;
+    for gate in crate::attempt_steps::take_gate_timings(&job.key) {
+        push_start = push_start.max(gate.end);
+        steps(crate::attempt_steps::gate_spans(&gate));
+    }
+    // Nothing to push (`Ok(None)`) is no step; a failed push is an `ok = false` one.
+    if !matches!(pushed, Ok(None)) {
+        steps(vec![crate::attempt_steps::StepSpan {
+            kind: crate::attempt_steps::StepKind::Push,
+            label: "push",
+            start: push_start,
+            end,
+            ok: pushed.is_ok(),
+            detail: None,
+        }]);
+    }
+    pushed
         .map(|_| ())
         .map_err(|e| Error::Other(anyhow::anyhow!("final push failed (SPEC-3.3.1): {e}")))
 }
@@ -4577,6 +4653,49 @@ fn finish_delivery_blocked(
     })
 }
 
+/// [`finalize_with_steps`] with the step hand-off discarded, for the unit tests
+/// that do not assert on stored steps.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn finalize(
+    backend: &dyn IssueTracker,
+    forge: &dyn Forge,
+    src: &YoutrackSource,
+    job: &YoutrackJob,
+    workdir: &Path,
+    claude_result: &ClaudeResult,
+    pr_strategy: crate::action::PrStrategy,
+    stream_log: Option<&Path>,
+    claude_timeout: Duration,
+    resumed: bool,
+    resume_pr_url: Option<&str>,
+    run: crate::run_footer::CommentRun<'_>,
+    checkpoint_push_rejected: Option<&str>,
+    review: Option<&ReviewOutcome>,
+    attempts_after: u32,
+    max_attempts_per_key: u32,
+) -> Result<Finalized> {
+    finalize_with_steps(
+        backend,
+        forge,
+        src,
+        job,
+        workdir,
+        claude_result,
+        pr_strategy,
+        stream_log,
+        claude_timeout,
+        resumed,
+        resume_pr_url,
+        run,
+        checkpoint_push_rejected,
+        review,
+        attempts_after,
+        max_attempts_per_key,
+        &|_| {},
+    )
+}
+
 /// SPEC-3.3: "Finalize runs on every path and is the only place external
 /// mutations happen." Implements the whole "Finalize runs on every path ..."
 /// bullet list and, via [`complete_automerge`], SPEC-3.3.1's automerge bullet.
@@ -4590,7 +4709,7 @@ fn finish_delivery_blocked(
 /// later, driven by a `success`/`recover` Action-run webhook event calling
 /// [`complete_automerge`] on this PR.
 #[allow(clippy::too_many_arguments)]
-fn finalize(
+fn finalize_with_steps(
     backend: &dyn IssueTracker,
     forge: &dyn Forge,
     src: &YoutrackSource,
@@ -4623,6 +4742,9 @@ fn finalize(
     // does for the ordinary attempt cap.
     attempts_after: u32,
     max_attempts_per_key: u32,
+    // SPEC-3.14 item 3, CLAUDE-604: receives each `push`, `pr_create` and
+    // `gate` span the moment it ends, so it is stored before the next comment.
+    steps: crate::attempt_steps::StepSink<'_>,
 ) -> Result<Finalized> {
     let public_url = crate::run_footer::resolved_public_url();
     // CLAUDE-448: appended to whichever outcome body this call produces, right
@@ -4645,7 +4767,7 @@ fn finalize(
         // A failed push overrides this outcome with Failed, never Needs
         // Review: SPEC-3.3.1 forbids reporting a failed push as anything
         // else.
-        if let Err(e) = final_push(forge, job, workdir) {
+        if let Err(e) = final_push(forge, job, workdir, steps) {
             // CLAUDE-545: when the checkpoint watcher's own push was
             // already rejected earlier AND this final push now also
             // fails, the pattern is a repo-level rejection the runner
@@ -4701,7 +4823,7 @@ fn finalize(
         // text verbatim, and finish on the no-code label. State is left
         // alone, so the issue stays In Progress until a human closes it. A
         // failed push overrides this outcome with Failed, per SPEC-3.3.1.
-        if let Err(e) = final_push(forge, job, workdir) {
+        if let Err(e) = final_push(forge, job, workdir, steps) {
             // CLAUDE-545: see the equivalent branch above.
             if checkpoint_push_rejected.is_some() {
                 return finish_delivery_blocked(
@@ -4741,8 +4863,21 @@ fn finalize(
         // PR or a resumed run reclaiming a checkpoint-opened one, so a
         // review session has a draft to inspect either way; the two cases
         // converge below on whether it gets promoted to ready.
-        match forge.create_pr_with_draft(workdir, &host, pr_strategy, true, None) {
+        let open_start = chrono::Utc::now();
+        let opened = forge.create_pr_with_draft(workdir, &host, pr_strategy, true, None);
+        let open_end = chrono::Utc::now();
+        // A conflict-resolution gate that ran inside the push is stored before it.
+        let mut open_start = open_start;
+        for gate in crate::attempt_steps::take_gate_timings(&job.key) {
+            open_start = open_start.max(gate.end);
+            steps(crate::attempt_steps::gate_spans(&gate));
+        }
+        match opened {
             Ok(pr) => {
+                // SPEC-3.14 item 3, CLAUDE-604: `push` ended where the provider
+                // says; with no push time (nothing pushed, or AGit's single call)
+                // the whole call is the `pr_create` step.
+                steps(pr_open_spans(open_start, open_end, &pr));
                 let url = pr_url(job, &pr);
                 // A resumed run (CLAUDE-275) may be adopting a draft PR a
                 // prior timed-out run salvaged (CLAUDE-379); now that the run
@@ -4782,8 +4917,9 @@ fn finalize(
                 // post-success review session below: there is no point
                 // reviewing a diff whose own checks do not pass.
                 let gate = run_verification_gate(workdir);
-                if let Some(t) = gate.timing.clone() {
-                    crate::attempt_steps::stash_gate_timing(&job.key, t);
+                // SPEC-3.14 item 3, CLAUDE-604: stored the moment the gate ends.
+                if let Some(t) = &gate.timing {
+                    steps(crate::attempt_steps::gate_spans(t));
                 }
                 if let Some(output) = &gate.failure {
                     let command = gate.command.unwrap_or("none");
@@ -5052,6 +5188,20 @@ fn finalize(
                     WorkLocation::RemoteBranch { .. } => "pr_create",
                     _ => "push",
                 };
+                // SPEC-3.14 item 3, CLAUDE-604: the failed step is stored with
+                // `ok = false` over the whole call.
+                steps(vec![crate::attempt_steps::StepSpan {
+                    kind: if pr_step == "push" {
+                        crate::attempt_steps::StepKind::Push
+                    } else {
+                        crate::attempt_steps::StepKind::PrCreate
+                    },
+                    label: pr_step,
+                    start: open_start,
+                    end: open_end,
+                    ok: false,
+                    detail: None,
+                }]);
                 // CLAUDE-467: a push or PR-create failure after the work is
                 // already safe (or recorded against an open PR) is not a
                 // hard failure of the work itself, so re-queue below the
@@ -5287,7 +5437,7 @@ fn finalize(
         // since this path opens no PR of its own; a failed push is folded
         // into both the comment and `cause` rather than silently leaving the
         // commits unpushed.
-        let push_result = final_push(forge, job, workdir);
+        let push_result = final_push(forge, job, workdir, steps);
         let pushed = match &push_result {
             Ok(()) => {
                 "Any commits were pushed to the branch; no PR was opened for this run.".to_string()
@@ -8056,6 +8206,7 @@ mod tests {
             url: format!("https://dev.a8n.run/contoso/claude-run/pulls/{number}"),
             head_branch: Some(branch.to_string()),
             push_comment_failure: None,
+            push_ended_at: None,
         }
     }
 
@@ -8773,6 +8924,7 @@ mod tests {
             push_comment_failure: Some(
                 "PR comment for timeout salvage push failed: network error".into(),
             ),
+            push_ended_at: None,
         };
         let salvage = SalvageReport {
             pr_url: Some(pr.url.clone()),
@@ -8873,6 +9025,7 @@ mod tests {
                     url: "https://dev.a8n.run/contoso/claude-run/pulls/9".into(),
                     head_branch: Some("feat/x".into()),
                     push_comment_failure: None,
+                    push_ended_at: None,
                 }),
                 ..Default::default()
             },
@@ -8888,6 +9041,7 @@ mod tests {
                     url: "https://dev.a8n.run/contoso/claude-run/pulls/9".into(),
                     head_branch: Some("feat/x".into()),
                     push_comment_failure: None,
+                    push_ended_at: None,
                 }),
                 ..Default::default()
             },
@@ -9679,6 +9833,7 @@ mod tests {
             url: "raw line".into(),
             head_branch: Some("fix/x".into()),
             push_comment_failure: None,
+            push_ended_at: None,
         };
         assert_eq!(
             pr_url(&j, &with_num),
@@ -9689,6 +9844,7 @@ mod tests {
             url: "fallback line".into(),
             head_branch: None,
             push_comment_failure: None,
+            push_ended_at: None,
         };
         assert_eq!(pr_url(&j, &no_num), "fallback line");
         // A real HTTP URL (the GitHub backend's html_url) is used
@@ -9698,6 +9854,7 @@ mod tests {
             url: "https://github.com/octo/widget/pull/11".into(),
             head_branch: Some("fix/x".into()),
             push_comment_failure: None,
+            push_ended_at: None,
         };
         assert_eq!(pr_url(&j, &gh), "https://github.com/octo/widget/pull/11");
     }
@@ -11281,6 +11438,150 @@ mod tests {
                 .iter()
                 .any(|c| c == "yt issue set-field MK-16 AI Agent Code Review"),
             "{calls:?}"
+        );
+    }
+
+    /// SPEC-3.14 item 3, CLAUDE-604: the success path hands its `push`,
+    /// `pr_create` and `gate` spans to the step sink in order, each before the
+    /// outcome comment is posted.
+    #[test]
+    fn finalize_hands_push_pr_create_and_gate_spans_to_the_sink_before_the_comment() {
+        if !just_available() {
+            eprintln!("skipping: `just` not available in this environment");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("justfile"), "pre-push:\n    @true\n").unwrap();
+        let git_dir = dir.path().join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &[
+                        "push",
+                        "--no-verify",
+                        "--set-upstream",
+                        "origin",
+                        "feat/x:feat/x",
+                    ],
+                    "",
+                )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: feat: x",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
+                )
+                .ok_prefix("yt issue comment MK-16", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
+        let seen: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+        let sink = |spans: Vec<crate::attempt_steps::StepSpan>| {
+            let commented = runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("yt issue comment MK-16"));
+            let mut seen = seen.lock().unwrap();
+            for s in spans {
+                assert!(s.end >= s.start, "{s:?}");
+                seen.push((s.kind.as_str().to_string(), commented));
+            }
+        };
+        let res = finalize_with_steps(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+            &sink,
+        )
+        .unwrap();
+        assert!(matches!(res, Finalized::CodeReview { .. }), "{res:?}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![
+                ("push".to_string(), false),
+                ("pr_create".to_string(), false),
+                ("gate".to_string(), false),
+            ]
         );
     }
 

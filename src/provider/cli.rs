@@ -810,6 +810,7 @@ impl CliBackend {
             // `head_branch` when it has one; AGit has none.
             head_branch: None,
             push_comment_failure: None,
+            push_ended_at: None,
         })
     }
 
@@ -972,7 +973,9 @@ impl CliBackend {
             // PR with `--head <branch>`).
             None => {
                 self.push_branch(workdir, branch, token_url)?;
+                let pushed_at = chrono::Utc::now();
                 let mut pr = self.find_or_create_pr(workdir, host, &repo, branch, draft, body)?;
+                pr.push_ended_at = Some(pushed_at);
                 self.post_branch_push_comment(
                     workdir,
                     host,
@@ -1004,8 +1007,10 @@ impl CliBackend {
                     // A fast-forward push is legal when the remote tip is an
                     // ancestor of the local tip.
                     self.push_branch(workdir, branch, token_url)?;
+                    let pushed_at = chrono::Utc::now();
                     let mut pr =
                         self.find_or_create_pr(workdir, host, &repo, branch, draft, body)?;
+                    pr.push_ended_at = Some(pushed_at);
                     self.post_branch_push_comment(
                         workdir,
                         host,
@@ -1027,9 +1032,11 @@ impl CliBackend {
                     // then find-or-create the PR as usual.
                     self.merge_remote_branch(workdir, branch, &local_sha, &remote_sha)?;
                     self.push_branch(workdir, branch, token_url)?;
+                    let pushed_at = chrono::Utc::now();
                     let merged_sha = self.rev_parse(workdir, branch)?;
                     let mut pr =
                         self.find_or_create_pr(workdir, host, &repo, branch, draft, body)?;
+                    pr.push_ended_at = Some(pushed_at);
                     self.post_branch_push_comment(
                         workdir,
                         host,
@@ -1557,6 +1564,7 @@ impl CliBackend {
                 url: p.html_url,
                 head_branch: Some(branch.to_string()),
                 push_comment_failure: None,
+                push_ended_at: None,
             }))
     }
 

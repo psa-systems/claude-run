@@ -166,6 +166,12 @@ pub struct PullRequest {
     /// same way it already folds a [`Forge::refresh_pr_text`] failure in.
     #[serde(default)]
     pub push_comment_failure: Option<String>,
+    /// When the branch push that preceded this PR's open finished, so the
+    /// caller can time `push` and `pr_create` as separate steps (SPEC-3.14
+    /// item 3). `None` when nothing was pushed or the push is part of one
+    /// opaque call (AGit).
+    #[serde(default)]
+    pub push_ended_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Direction of an issue link, mirroring the YouTrack REST `IssueLink.direction`
