@@ -1733,6 +1733,7 @@ async fn process_job(
     ));
     recorder.lock().await.clear_attempt().await;
     let mut clone_timing = None;
+    let mut hook_timing = None;
     let pre_result = crate::blocking::in_place(|| {
         run_pre(
             backend,
@@ -1743,6 +1744,7 @@ async fn process_job(
             resume_branch,
             &action.name,
             &mut clone_timing,
+            &mut hook_timing,
         )
     });
 
@@ -1758,6 +1760,23 @@ async fn process_job(
                 clone_start,
                 clone_end,
                 clone_ok,
+                None,
+            )
+            .await;
+    }
+
+    // SPEC-3.14 item 3: the `hook_install` row, written the moment the install ends.
+    if let Some((hook_start, hook_end, hook_ok)) = hook_timing {
+        recorder
+            .lock()
+            .await
+            .record(
+                stage,
+                crate::attempt_steps::StepKind::HookInstall,
+                "hook_install",
+                hook_start,
+                hook_end,
+                hook_ok,
                 None,
             )
             .await;
@@ -3141,6 +3160,13 @@ fn run_pre(
         chrono::DateTime<chrono::Utc>,
         bool,
     )>,
+    // SPEC-3.14: the `hook_install` step, set only when `just install-hooks`
+    // actually ran (no recipe, no `just`, or `install_hooks: false` is no step).
+    hook_timing: &mut Option<(
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        bool,
+    )>,
 ) -> std::result::Result<(), String> {
     backend
         .set_field(&job.key, &src.custom_field, &src.states.working)
@@ -3162,7 +3188,10 @@ fn run_pre(
     *clone_timing = Some((clone_start, clone_end, clone_result.is_ok()));
     clone_result.map_err(|e| format!("git clone: {e}"))?;
     if src.install_hooks {
-        install_hooks(workdir);
+        let hook_start = chrono::Utc::now();
+        if let Some(ok) = install_hooks(workdir) {
+            *hook_timing = Some((hook_start, chrono::Utc::now(), ok));
+        }
     } else {
         info!(
             action = action_name,
@@ -3190,7 +3219,11 @@ fn run_pre(
 /// gate. A repo with no `install-hooks` recipe, or a host without `just`, is
 /// left unchanged and the bootstrap continues - failing the job here would be
 /// strictly worse than the CI-only status quo.
-fn install_hooks(workdir: &Path) {
+///
+/// Returns `Some(ok)` when `just install-hooks` was run (`ok` is its success)
+/// and `None` when there was nothing to run, so the caller times only a real
+/// install (SPEC-3.14 item 3).
+fn install_hooks(workdir: &Path) -> Option<bool> {
     // `just --show <recipe>` exits non-zero when the recipe (or the justfile
     // itself) is absent, so it doubles as the presence probe with no output
     // parsing. A spawn error means `just` is not installed: nothing to do.
@@ -3203,10 +3236,10 @@ fn install_hooks(workdir: &Path) {
         .status()
     {
         Ok(s) if s.success() => {}
-        Ok(_) => return, // no install-hooks recipe; leave the clone unchanged
+        Ok(_) => return None, // no install-hooks recipe; leave the clone unchanged
         Err(e) => {
             info!(error = %e, "just not available; skipping pre-commit hook install");
-            return;
+            return None;
         }
     }
     match Command::new("just")
@@ -3214,15 +3247,24 @@ fn install_hooks(workdir: &Path) {
         .arg("install-hooks")
         .status()
     {
-        Ok(s) if s.success() => info!("installed repo pre-commit hook on fresh clone"),
-        Ok(s) => warn!(
-            code = s.code(),
-            "just install-hooks failed; continuing without local pre-commit hook"
-        ),
-        Err(e) => warn!(
-            error = %e,
-            "running just install-hooks failed; continuing without local pre-commit hook"
-        ),
+        Ok(s) if s.success() => {
+            info!("installed repo pre-commit hook on fresh clone");
+            Some(true)
+        }
+        Ok(s) => {
+            warn!(
+                code = s.code(),
+                "just install-hooks failed; continuing without local pre-commit hook"
+            );
+            Some(false)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "running just install-hooks failed; continuing without local pre-commit hook"
+            );
+            Some(false)
+        }
     }
 }
 
@@ -3919,7 +3961,8 @@ impl ConflictResolver for FinalPushConflictResolver {
             remote_sha = %remote_sha,
             "running the bounded conflict-resolution pass (SPEC-3.12 item 4)"
         );
-        let result = self.claude.invoke(
+        let pass_start = chrono::Utc::now();
+        let invoked = self.claude.invoke(
             FINAL_PUSH_CONFLICT_RESOLVE_INSTRUCTION,
             &self.claude_cfg,
             self.timeout,
@@ -3931,7 +3974,22 @@ impl ConflictResolver for FinalPushConflictResolver {
             // to know the job's own `cargo_target_dir`, and is rare enough
             // that losing that cache here is not worth threading it through.
             None,
-        )?;
+        );
+        // SPEC-3.14 item 3: the `conflict_resolution` step is the `claude` pass
+        // itself; an invoke error or a timeout closes it `ok = false` (item 6).
+        // The gate below is its own `gate` step.
+        crate::attempt_steps::stash_step_spans(
+            &self.key,
+            vec![crate::attempt_steps::StepSpan {
+                kind: crate::attempt_steps::StepKind::ConflictResolution,
+                label: "conflict_resolution",
+                start: pass_start,
+                end: chrono::Utc::now(),
+                ok: matches!(&invoked, Ok(r) if r.ok && !r.timed_out),
+                detail: None,
+            }],
+        );
+        let result = invoked?;
         self.spend.record(&result);
         // SPEC-3.12 item 4: this pass is a `claude` invocation like any
         // other, so it leaves a `claude_invocations` row the same way the
@@ -3960,8 +4018,8 @@ impl ConflictResolver for FinalPushConflictResolver {
         // before the push because a merge resolution that breaks the build
         // must not land as a fast-forward.
         let gate = run_verification_gate(workdir);
-        if let Some(t) = gate.timing.clone() {
-            crate::attempt_steps::stash_gate_timing(&self.key, t);
+        if let Some(t) = gate.timing.as_ref() {
+            crate::attempt_steps::stash_step_spans(&self.key, crate::attempt_steps::gate_spans(t));
         }
         if let Some(output) = gate.failure {
             let command = gate.command.unwrap_or("none");
@@ -4568,13 +4626,12 @@ fn final_push(
     let start = chrono::Utc::now();
     let pushed = forge.final_push(workdir, &host);
     let end = chrono::Utc::now();
-    // SPEC-3.14 item 3, CLAUDE-604: a conflict-resolution gate that ran inside
+    // SPEC-3.14 item 3, CLAUDE-604: a conflict-resolution pass and gate that ran inside
     // the push is stored first and the `push` row starts after it, so the rows
     // never overlap.
     let mut push_start = start;
-    for gate in crate::attempt_steps::take_gate_timings(&job.key) {
-        push_start = push_start.max(gate.end);
-        steps(crate::attempt_steps::gate_spans(&gate));
+    if let Some(latest) = crate::attempt_steps::drain_stashed_spans(&job.key, steps) {
+        push_start = push_start.max(latest);
     }
     // Nothing to push (`Ok(None)`) is no step; a failed push is an `ok = false` one.
     if !matches!(pushed, Ok(None)) {
@@ -4866,11 +4923,10 @@ fn finalize_with_steps(
         let open_start = chrono::Utc::now();
         let opened = forge.create_pr_with_draft(workdir, &host, pr_strategy, true, None);
         let open_end = chrono::Utc::now();
-        // A conflict-resolution gate that ran inside the push is stored before it.
+        // A conflict-resolution pass and gate that ran inside the push are stored before it.
         let mut open_start = open_start;
-        for gate in crate::attempt_steps::take_gate_timings(&job.key) {
-            open_start = open_start.max(gate.end);
-            steps(crate::attempt_steps::gate_spans(&gate));
+        if let Some(latest) = crate::attempt_steps::drain_stashed_spans(&job.key, steps) {
+            open_start = open_start.max(latest);
         }
         match opened {
             Ok(pr) => {
@@ -10260,6 +10316,7 @@ mod tests {
             None,
             "test-action",
             &mut clone_timing,
+            &mut None,
         );
         let calls = runner.calls.lock().unwrap();
         assert!(
@@ -10304,6 +10361,7 @@ mod tests {
             None,
             "test-action",
             &mut clone_timing,
+            &mut None,
         );
         let calls = runner.calls.lock().unwrap();
         assert!(!calls.iter().any(|c| c.contains("--assignee")), "{calls:?}");
@@ -10349,6 +10407,7 @@ mod tests {
             None,
             "test-action",
             &mut clone_timing,
+            &mut None,
         )
         .unwrap_err();
         assert!(err.starts_with("set Assignee=octocat:"), "{err}");
@@ -10407,6 +10466,7 @@ mod tests {
             Some("fix/existing"),
             "test-action",
             &mut clone_timing,
+            &mut None,
         )
         .unwrap();
 
@@ -10478,6 +10538,7 @@ mod tests {
             None,
             "test-action",
             &mut clone_timing,
+            &mut None,
         )
         .unwrap();
 
@@ -12333,7 +12394,8 @@ mod tests {
         )
         .unwrap();
 
-        install_hooks(dir.path());
+        // SPEC-3.14 item 3: a recipe that ran reports `Some(ok)` so `run_pre` times it.
+        assert_eq!(install_hooks(dir.path()), Some(true));
 
         let hook = dir.path().join(".git/hooks/pre-commit");
         assert!(hook.exists(), "hook must be written");
@@ -12352,7 +12414,8 @@ mod tests {
         // whether or not `just` is installed.
         let dir = tempfile::tempdir().unwrap();
         git_in(dir.path(), &["init"]);
-        install_hooks(dir.path());
+        // SPEC-3.14 item 3: nothing ran, so there is no `hook_install` step.
+        assert_eq!(install_hooks(dir.path()), None);
         assert!(
             !dir.path().join(".git/hooks/pre-commit").exists(),
             "no recipe means no hook"

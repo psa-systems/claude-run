@@ -293,33 +293,40 @@ pub fn gate_spans(g: &GateTiming) -> Vec<StepSpan> {
         .collect()
 }
 
-type GateRegistry = std::sync::Mutex<std::collections::HashMap<String, Vec<GateTiming>>>;
+type SpanRegistry = std::sync::Mutex<std::collections::HashMap<String, Vec<StepSpan>>>;
 
-fn gate_registry() -> &'static GateRegistry {
-    static R: std::sync::OnceLock<GateRegistry> = std::sync::OnceLock::new();
+fn span_registry() -> &'static SpanRegistry {
+    static R: std::sync::OnceLock<SpanRegistry> = std::sync::OnceLock::new();
     R.get_or_init(Default::default)
 }
 
-/// Stash a gate run's timing under the job key. Only the final-push conflict
+/// Stash finished steps under the job key. Only the final-push conflict
 /// resolver uses this: it runs inside a provider call with no `finalize` sink
 /// or recorder in reach, so the caller of that call drains it with
-/// [`take_gate_timings`] as soon as the call returns (CLAUDE-604).
-pub fn stash_gate_timing(key: &str, timing: GateTiming) {
-    gate_registry()
+/// [`drain_stashed_spans`] as soon as the call returns (CLAUDE-604, CLAUDE-597).
+pub fn stash_step_spans(key: &str, spans: Vec<StepSpan>) {
+    span_registry()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .entry(key.to_string())
         .or_default()
-        .push(timing);
+        .extend(spans);
 }
 
-/// Drain the gate timings stashed for `key`.
-pub fn take_gate_timings(key: &str) -> Vec<GateTiming> {
-    gate_registry()
+/// Hand the steps stashed for `key` to `steps` and return the latest end among
+/// them, so the caller can start its own step after them and no rows overlap.
+/// `None` when nothing was stashed.
+pub fn drain_stashed_spans(key: &str, steps: StepSink<'_>) -> Option<DateTime<Utc>> {
+    let spans = span_registry()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(key)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let latest = spans.iter().map(|s| s.end).max();
+    if !spans.is_empty() {
+        steps(spans);
+    }
+    latest
 }
 
 impl<'a> StepRecorder<'a> {
@@ -1279,5 +1286,48 @@ mod tests {
                 ("gate".into(), "check".into(), Some(SUBSTEPS_UNKNOWN.into())),
             ]
         );
+    }
+
+    /// SPEC-3.14 item 3, CLAUDE-597: a `conflict_resolution` span stashed by the
+    /// resolver and the gate span after it reach the sink in order, and the
+    /// latest end is returned so the caller's next step starts after them.
+    #[test]
+    fn stashed_conflict_resolution_and_gate_spans_drain_in_order() {
+        let span = |kind, label, start, end| StepSpan {
+            kind,
+            label,
+            start: at(start),
+            end: at(end),
+            ok: true,
+            detail: None,
+        };
+        stash_step_spans(
+            "T-DRAIN",
+            vec![span(
+                StepKind::ConflictResolution,
+                "conflict_resolution",
+                0,
+                30,
+            )],
+        );
+        stash_step_spans(
+            "T-DRAIN",
+            gate_spans(&GateTiming {
+                command: "pre-push",
+                start: at(30),
+                end: at(45),
+                ok: true,
+                stages: vec![],
+            }),
+        );
+        let seen = std::cell::RefCell::new(Vec::new());
+        let sink =
+            |spans: Vec<StepSpan>| seen.borrow_mut().extend(spans.into_iter().map(|s| s.kind));
+        assert_eq!(drain_stashed_spans("T-DRAIN", &sink), Some(at(45)));
+        assert_eq!(
+            *seen.borrow(),
+            vec![StepKind::ConflictResolution, StepKind::Gate]
+        );
+        assert_eq!(drain_stashed_spans("T-DRAIN", &sink), None);
     }
 }
