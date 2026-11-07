@@ -28,6 +28,8 @@ pub const HAPPY_PATH: &[&str] = &[
 pub struct StepRow {
     pub attempt: i64,
     pub kind: String,
+    /// The SPEC-3.14 item 1 stage the row was stored under.
+    pub stage: String,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     pub ok: bool,
@@ -66,6 +68,7 @@ fn is_check_kind(kind: &str) -> bool {
 /// earlier steps of the same family in this list.
 fn listed_label(
     kind: &str,
+    stage: &str,
     seen_milestones_in_attempt: usize,
     counts: &mut Counts,
 ) -> Option<String> {
@@ -79,7 +82,9 @@ fn listed_label(
         "review" => Some("Verdict".to_string()),
         "pr_create" => Some("PR ready".to_string()),
         "conflict_resolution" => Some("Conflict resolution".to_string()),
-        "ci_wait" => {
+        // A `ci_wait` outside the `ci-remediation` stage is the finalize-time
+        // status read (CLAUDE-549), not a remediation step: it only adds time.
+        "ci_wait" if stage == "ci-remediation" => {
             counts.ci_remediation += 1;
             Some(format!("CI remediation {}", counts.ci_remediation))
         }
@@ -151,7 +156,7 @@ pub fn milestones(rows: &[StepRow]) -> Vec<Milestone> {
             continue;
         }
         flush_checks(&mut open_checks, &mut counts, &mut in_attempt, &mut out);
-        let Some(mut label) = listed_label(&row.kind, in_attempt, &mut counts) else {
+        let Some(mut label) = listed_label(&row.kind, &row.stage, in_attempt, &mut counts) else {
             // Unlisted time also breaks adjacency between two check groups.
             continue;
         };
@@ -215,21 +220,21 @@ async fn load_rows_where(pool: &DbPool, action: Option<&str>, key: &str) -> Resu
     // SPEC-3.14: step-end writes (a checkpoint, the clone) interleave with the
     // attempt-end rows, so chronological order is `started_at`, not `seq`.
     let sql = if action.is_some() {
-        "SELECT attempt, kind, started_at, ended_at, ok FROM attempt_steps \
+        "SELECT attempt, kind, stage, started_at, ended_at, ok FROM attempt_steps \
          WHERE action_name = ? AND job_key = ? ORDER BY attempt, started_at, seq"
     } else {
-        "SELECT attempt, kind, started_at, ended_at, ok FROM attempt_steps \
+        "SELECT attempt, kind, stage, started_at, ended_at, ok FROM attempt_steps \
          WHERE job_key = ? ORDER BY attempt, started_at, seq"
     };
-    let mut query = sqlx::query_as::<_, (i64, String, String, String, i64)>(sqlx::AssertSqlSafe(
-        crate::db::q(pool, sql).into_owned(),
-    ));
+    let mut query = sqlx::query_as::<_, (i64, String, String, String, String, i64)>(
+        sqlx::AssertSqlSafe(crate::db::q(pool, sql).into_owned()),
+    );
     if let Some(action) = action {
         query = query.bind(action);
     }
     let raw = query.bind(key).fetch_all(pool).await?;
     raw.into_iter()
-        .map(|(attempt, kind, started, ended, ok)| {
+        .map(|(attempt, kind, stage, started, ended, ok)| {
             let parse = |what: &str, v: &str| {
                 DateTime::parse_from_rfc3339(v)
                     .map(|t| t.with_timezone(&Utc))
@@ -242,6 +247,7 @@ async fn load_rows_where(pool: &DbPool, action: Option<&str>, key: &str) -> Resu
             Ok(StepRow {
                 attempt,
                 kind,
+                stage,
                 started_at: parse("started_at", &started)?,
                 ended_at: parse("ended_at", &ended)?,
                 ok: ok != 0,
@@ -392,6 +398,7 @@ mod tests {
         StepRow {
             attempt,
             kind: kind.to_string(),
+            stage: "initial".to_string(),
             started_at: at(start),
             ended_at: at(end),
             ok,
@@ -618,5 +625,17 @@ mod tests {
         assert!(list.contains("1. Checks 1: 1:30 / 1:30"), "{list}");
         assert!(list.contains("2. Verdict: <-- This comment"), "{list}");
         assert!(list.contains("3. Final commit:"), "{list}");
+    }
+
+    /// CLAUDE-597: a `ci_wait` row lists as `CI remediation N` only in the
+    /// `ci-remediation` stage; the finalize-time status read adds time only.
+    #[test]
+    fn ci_wait_lists_only_in_the_ci_remediation_stage() {
+        let mut finalize_read = row(1, "ci_wait", 0, 5, true);
+        assert!(milestones(&[finalize_read.clone()]).is_empty());
+        finalize_read.stage = "ci-remediation".to_string();
+        let done = milestones(&[finalize_read]);
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].label, "CI remediation 1");
     }
 }

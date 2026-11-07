@@ -2182,6 +2182,7 @@ async fn process_job(
             rows.push(crate::progress_list::StepRow {
                 attempt: attempt_no,
                 kind: kind.to_string(),
+                stage: stage.to_string(),
                 started_at: start,
                 ended_at: end,
                 ok,
@@ -2223,6 +2224,7 @@ async fn process_job(
             rows.push(crate::progress_list::StepRow {
                 attempt: i64::from(attempts + 1),
                 kind: s.kind.as_str().to_string(),
+                stage: stage.to_string(),
                 started_at: s.start,
                 ended_at: s.end,
                 ok: s.ok,
@@ -5069,6 +5071,7 @@ fn finalize_with_steps(
                                 pr_number,
                                 &url,
                                 run.run_id,
+                                steps,
                             ),
                             // A PR still a draft, or one whose number is
                             // unknown, is not merged here.
@@ -5574,12 +5577,25 @@ fn automerge_at_finalize(
     pr_number: u64,
     pr_url: &str,
     run_id: i64,
+    steps: crate::attempt_steps::StepSink<'_>,
 ) -> bool {
     if !automerge.enabled || automerge.finalize_status_timeout_secs == 0 {
         return false;
     }
     let timeout = Duration::from_secs(automerge.finalize_status_timeout_secs);
-    let status = match forge.pr_status_within(host, repo, pr_number, timeout) {
+    let read_start = chrono::Utc::now();
+    let read = forge.pr_status_within(host, repo, pr_number, timeout);
+    // SPEC-3.14 item 3: the one bounded CI status read (CLAUDE-549) is the
+    // attempt's `ci_wait` step; a failed or timed-out read closes it `ok = false`.
+    steps(vec![crate::attempt_steps::StepSpan {
+        kind: crate::attempt_steps::StepKind::CiWait,
+        label: "ci_wait",
+        start: read_start,
+        end: chrono::Utc::now(),
+        ok: read.is_ok(),
+        detail: None,
+    }]);
+    let status = match read {
         Ok(status) => status,
         Err(e) => {
             warn!(key = %issue_key, pr_number, error = %e, "finalize-time automerge: PR status read failed or timed out; leaving the PR at Code Review for the webhook and reconciler");
@@ -15326,6 +15342,52 @@ mod tests {
                 .iter()
                 .any(|c| c.starts_with("yt issue comment MK-16 ") && c.contains("merged this PR")),
             "the merge must be announced on the issue: {calls:?}"
+        );
+    }
+
+    /// SPEC-3.14 item 3, CLAUDE-597: the finalize-time bounded status read is
+    /// stored as a `ci_wait` step, `ok` when the read answered.
+    #[test]
+    fn finalize_time_status_read_is_a_ci_wait_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+            "fj",
+            &FINALIZE_PR_STATUS_ARGS,
+            r#"{"pr":7,"head_sha":"abc","state":"pending","mergeable":true,"behind_base":false}"#,
+        ));
+        let forge = CliBackend::new(runner).with_git_retry_waits([Duration::ZERO; 3]);
+        let seen: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+        let sink = |spans: Vec<crate::attempt_steps::StepSpan>| {
+            seen.lock()
+                .unwrap()
+                .extend(spans.iter().map(|s| (s.kind.as_str().to_string(), s.ok)));
+        };
+        finalize_with_steps(
+            &forge,
+            &forge,
+            &automerge_src(10),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+            &sink,
+        )
+        .unwrap();
+        assert!(
+            seen.lock()
+                .unwrap()
+                .contains(&("ci_wait".to_string(), true)),
+            "{:?}",
+            seen.lock().unwrap()
         );
     }
 
