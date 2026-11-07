@@ -465,7 +465,14 @@ Hybrid: a cheap deterministic pass runs first and only the residue it cannot lab
 - The fingerprint is the sorted, deduplicated `<target>::<test>` ids parsed from cargo test output (a target that
   failed to build or run at all, with no parsed test, contributes a bare `<target>` id), or `infra:<kind>` when the
   infrastructure detector (3.5.1) matches, or a single normalized first-diagnostic-line signature when neither
-  parses anything.
+  parses anything. A `docker buildx build` log interleaves a `#<step> <seconds> ` progress prefix onto every line of
+  a `RUN` step's output; every matcher strips this prefix before it runs, so a cargo log parses to the same ids and
+  the same signature whether or not it went through a buildx build. A log with any parsed `<target>::<test>` id is
+  always fingerprinted by those ids even when the `runner-deadline` infrastructure condition (a harmless BuildKit
+  bootstrap warning polling its own API before the build starts) also matches somewhere in the log; every other
+  infrastructure kind still wins over parsed test ids unchanged. The fallback signature drops the quoted thread name
+  and parenthesized thread id from a `thread '<name>' (<id>) panicked at ...` line before normalizing it, since which
+  test thread panics first is random and must not change the signature.
 - A failure matches an existing `ci_failures` row by failing-test id overlap within the same `(repo, workflow_id,
   job_name)`, preferring `open` over `resolved` over `pr_only` and the newest on a tie.
 - A hidden `Dedupe-Key:` marker in the issue body (searched only by the legacy-adoption lookup, for an issue minted
