@@ -1987,6 +1987,11 @@ async fn reopen_resolved_failure(
             return WebhookRunSummary::error(format!("task panicked: {e}"));
         }
     };
+    if let Err(e) =
+        ci_failure_store::set_failure_triage_bucket(&ctx.pool, m.id, bucket.as_str(), &now).await
+    {
+        warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "persisting triage bucket failed (continuing)");
+    }
     info!(repo = %ev.repo, run = ev.index_in_repo, %key, bucket = %bucket, "regression reopened a resolved ci-failure issue");
     WebhookRunSummary::store_decided(&StoreOutcome::Reopened { key })
 }
@@ -1994,7 +1999,10 @@ async fn reopen_resolved_failure(
 /// SPEC-4.4.2: record a brand-new `ci_failures` row (fresh mint or legacy adoption) plus its tests and run.
 /// Record a brand-new `ci_failures` row for `issue_key` (either
 /// freshly minted, or a legacy issue this delivery adopted), and the tests /
-/// run this delivery already carries.
+/// run this delivery already carries. `triage_bucket` is `Some` for a fresh
+/// mint (the bucket [`triage::triage`] already computed), `None` for a
+/// legacy adoption, where no triage ever ran.
+#[allow(clippy::too_many_arguments)]
 async fn record_new_store_row(
     pool: &DbPool,
     ev: &VerifiedFailureEvent,
@@ -2003,6 +2011,7 @@ async fn record_new_store_row(
     issue_key: &str,
     branch: &str,
     test_ids: &[String],
+    triage_bucket: Option<&str>,
 ) -> crate::error::Result<()> {
     let now = state::now_iso();
     let id = ci_failure_store::record_failure(
@@ -2013,6 +2022,7 @@ async fn record_new_store_row(
         infra_kind,
         Some(issue_key),
         "open",
+        triage_bucket,
         &now,
     )
     .await?;
@@ -2255,8 +2265,11 @@ fn write_and_post_pr_comment(
     backend.pr_comment(host, repo, pr_number, body_file)
 }
 
-/// Run triage (for its analysis text) and post that text as a PR comment
-/// through `env`'s write-scoped backend. Returns the analysis text.
+/// Run triage (for its analysis text and bucket) and post the analysis as a
+/// PR comment through `env`'s write-scoped backend. Returns the analysis
+/// text and the triage bucket (SPEC-4.3.15 / CLAUDE-598), so a `pr_only` row
+/// (no issue minted, hence no [`DecideOutcome::Mint`]) can still persist the
+/// bucket this triage computed.
 #[allow(clippy::too_many_arguments)]
 async fn analyze_and_comment_pr(
     ctx: &MintContext,
@@ -2270,7 +2283,7 @@ async fn analyze_and_comment_pr(
     host: &str,
     env: PrCommentEnv,
     spend: &crate::usage::RunSpend,
-) -> crate::error::Result<String> {
+) -> crate::error::Result<(String, triage::TriageBucket)> {
     let classifier = ctx.classifier.clone();
     let mint_cfg = ctx.mint_cfg.read().await.clone();
     let event = ev.clone();
@@ -2278,36 +2291,38 @@ async fn analyze_and_comment_pr(
     let body_file = pr_comment_body_path(&ctx.paths, &ev.repo, pr_number);
     let spend = spend.clone();
     let branch_owned = branch.to_string();
-    let result = tokio::task::spawn_blocking(move || -> crate::error::Result<String> {
-        let input = TriageInput {
-            repo: event.repo.clone(),
-            workflow_id: event.workflow_id.clone(),
-            commit_sha: event.commit_sha.clone(),
-            html_url: event.html_url.clone(),
-            log: log_text,
-            log_available,
-            log_unavailable_reason,
-            has_open_pr: true,
-            branch: branch_owned,
-            log_token,
-        };
-        let verdict = triage::triage(
-            &input,
-            classifier.as_ref(),
-            &mint_cfg.auto_fix,
-            &mint_cfg.bot_branch_prefixes,
-            &spend,
-        );
-        write_and_post_pr_comment(
-            env.backend.as_ref(),
-            &host_owned,
-            &event.repo,
-            pr_number,
-            &body_file,
-            &verdict.analysis,
-        )?;
-        Ok(verdict.analysis)
-    })
+    let result = tokio::task::spawn_blocking(
+        move || -> crate::error::Result<(String, triage::TriageBucket)> {
+            let input = TriageInput {
+                repo: event.repo.clone(),
+                workflow_id: event.workflow_id.clone(),
+                commit_sha: event.commit_sha.clone(),
+                html_url: event.html_url.clone(),
+                log: log_text,
+                log_available,
+                log_unavailable_reason,
+                has_open_pr: true,
+                branch: branch_owned,
+                log_token,
+            };
+            let verdict = triage::triage(
+                &input,
+                classifier.as_ref(),
+                &mint_cfg.auto_fix,
+                &mint_cfg.bot_branch_prefixes,
+                &spend,
+            );
+            write_and_post_pr_comment(
+                env.backend.as_ref(),
+                &host_owned,
+                &event.repo,
+                pr_number,
+                &body_file,
+                &verdict.analysis,
+            )?;
+            Ok((verdict.analysis, verdict.bucket))
+        },
+    )
     .await;
     match result {
         Ok(inner) => inner,
@@ -2424,6 +2439,7 @@ async fn route_agent_pr_failure(
                 infra_kind,
                 Some(&record.issue_key),
                 "open",
+                None,
                 &now,
             )
             .await
@@ -3159,13 +3175,21 @@ async fn route_pr_matches_pr_only_failure(
     )
     .await
     {
-        Ok(_) => WebhookRunSummary {
-            text: format!(
-                "commented analysis on PR #{} (pr_only, still one branch)",
-                pr.number
-            ),
-            ok: true,
-        },
+        Ok((_, bucket)) => {
+            if let Err(e) =
+                ci_failure_store::set_failure_triage_bucket(&ctx.pool, m.id, bucket.as_str(), &now)
+                    .await
+            {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "persisting triage bucket failed (continuing)");
+            }
+            WebhookRunSummary {
+                text: format!(
+                    "commented analysis on PR #{} (pr_only, still one branch)",
+                    pr.number
+                ),
+                ok: true,
+            }
+        }
         Err(e) => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "PR analysis/comment failed");
             WebhookRunSummary::error(e.to_string())
@@ -3378,7 +3402,7 @@ async fn route_new_pr_only_failure(
         Ok(env) => env,
         Err(summary) => return summary,
     };
-    if let Err(e) = analyze_and_comment_pr(
+    let bucket = match analyze_and_comment_pr(
         ctx,
         ev,
         log_text,
@@ -3393,9 +3417,12 @@ async fn route_new_pr_only_failure(
     )
     .await
     {
-        warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "PR analysis/comment failed");
-        return WebhookRunSummary::error(e.to_string());
-    }
+        Ok((_, bucket)) => bucket,
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "PR analysis/comment failed");
+            return WebhookRunSummary::error(e.to_string());
+        }
+    };
 
     let now = state::now_iso();
     let id = match ci_failure_store::record_failure(
@@ -3406,6 +3433,7 @@ async fn route_new_pr_only_failure(
         infra_kind,
         None,
         "pr_only",
+        Some(bucket.as_str()),
         &now,
     )
     .await
@@ -3580,6 +3608,7 @@ async fn classify_and_mint(
                 &key,
                 &branch,
                 &test_ids,
+                None,
             )
             .await
             {
@@ -3612,6 +3641,7 @@ async fn classify_and_mint(
                     key,
                     &branch,
                     &test_ids,
+                    Some(bucket.as_str()),
                 )
                 .await
                 {
@@ -7684,6 +7714,7 @@ mod tests {
             None,
             Some("CLAUDE-40"),
             "resolved",
+            None,
             now,
         )
         .await
@@ -7774,6 +7805,7 @@ mod tests {
             None,
             Some("CLAUDE-41"),
             "open",
+            None,
             now,
         )
         .await
@@ -7847,6 +7879,7 @@ mod tests {
             None,
             Some("CLAUDE-42"),
             "open",
+            None,
             now,
         )
         .await
@@ -7914,6 +7947,7 @@ mod tests {
             None,
             Some("CLAUDE-43"),
             "open",
+            None,
             now,
         )
         .await
@@ -7978,6 +8012,7 @@ mod tests {
             None,
             Some("CLAUDE-50"),
             "open",
+            None,
             now,
         )
         .await
@@ -10405,6 +10440,7 @@ mod tests {
             None,
             Some("CLAUDE-42"),
             "open",
+            None,
             now,
         )
         .await
@@ -10493,6 +10529,7 @@ mod tests {
             None,
             Some("CLAUDE-44"),
             "open",
+            None,
             now,
         )
         .await
@@ -10566,6 +10603,7 @@ mod tests {
             None,
             Some("CLAUDE-45"),
             "open",
+            None,
             now,
         )
         .await

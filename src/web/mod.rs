@@ -1542,6 +1542,11 @@ struct DashboardTpl {
     /// lifecycle `state`, not a persisted triage bucket: see
     /// `CiFailureRow::state()`.
     ci_state: String,
+    /// SPEC-4.3.15 / CLAUDE-598: whitelisted active triage-bucket filter
+    /// (`code_fix`/`human_action`/`transient`/`auto_fix`, or empty for
+    /// "all"), echoed into its own filter dropdown. Narrows independently
+    /// of `ci_state`.
+    ci_bucket: String,
     /// Whitelisted active repo filter, or empty for "all".
     ci_repo: String,
     /// Distinct repos with at least one `ci_failures` row, for the
@@ -1705,14 +1710,18 @@ impl CiFailureRow {
     }
 
     /// The dashboard's "State" column: the failure's stored lifecycle
-    /// `state` (`open`/`resolved`/`pr_only`). SPEC-4.3.15's Background also
-    /// calls for a separate "triage bucket" column
-    /// (`code_fix`/`human_action`/`transient`/`auto_fix`, `src/triage.rs`'s
-    /// `TriageBucket`), but that value is computed only at webhook-mint
-    /// time and never persisted to `ci_failures`, so it cannot be rendered
-    /// here without a schema change; tracked as CLAUDE-598.
+    /// `state` (`open`/`resolved`/`pr_only`).
     fn state(&self) -> &str {
         &self.failure.state
+    }
+
+    /// SPEC-4.3.15 / CLAUDE-598: the dashboard's "Bucket" column: the
+    /// persisted triage bucket (`code_fix`/`human_action`/`transient`/
+    /// `auto_fix`, `src/triage.rs`'s `TriageBucket`), distinct from
+    /// lifecycle `state`. `"none"` when no triage ran for this row (a
+    /// legacy-adopted issue, or a row minted before this column existed).
+    fn bucket(&self) -> &str {
+        self.failure.triage_bucket.as_deref().unwrap_or("none")
     }
 
     fn infra_kind(&self) -> &str {
@@ -1980,6 +1989,11 @@ struct DashboardQuery {
     /// SPEC-4.3.15: CI-failures repo filter, empty for all.
     #[serde(default)]
     ci_repo: String,
+    /// SPEC-4.3.15 / CLAUDE-598: CI-failures triage-bucket filter
+    /// (`code_fix`/`human_action`/`transient`/`auto_fix`), empty for all.
+    /// Narrows independently of `ci_state`.
+    #[serde(default)]
+    ci_bucket: String,
 }
 
 /// Rows per page on the dashboard Recent runs table. Matches the
@@ -2182,11 +2196,17 @@ async fn dashboard(
         Some(v) => whitelisted(v, &["", "open", "resolved", "pr_only"]),
     };
     let ci_repo = whitelist_member(&q.ci_repo, &ci_repo_options);
+    let ci_bucket = whitelisted(
+        &q.ci_bucket,
+        &["", "code_fix", "human_action", "transient", "auto_fix"],
+    );
     let ci_state_filter = (!ci_state.is_empty()).then_some(ci_state.as_str());
+    let ci_bucket_filter = (!ci_bucket.is_empty()).then_some(ci_bucket.as_str());
     let ci_repo_filter = (!ci_repo.is_empty()).then_some(ci_repo.as_str());
     let failures_raw = crate::ci_failure::store::list_failures_for_dashboard(
         pool,
         ci_state_filter,
+        ci_bucket_filter,
         ci_repo_filter,
         CI_FAILURES_LIMIT,
     )
@@ -2242,6 +2262,7 @@ async fn dashboard(
         triggered_options,
         ci_failures,
         ci_state,
+        ci_bucket,
         ci_repo,
         ci_repo_options,
         stuck_count,
@@ -8488,6 +8509,7 @@ mod tests {
             triggered_options: vec![],
             ci_failures: vec![],
             ci_state: String::new(),
+            ci_bucket: String::new(),
             ci_repo: String::new(),
             ci_repo_options: vec![],
             stuck_count: 0,
@@ -8586,6 +8608,7 @@ mod tests {
             triggered_options: vec!["schedule".to_string(), "webhook".to_string()],
             ci_failures: vec![],
             ci_state: String::new(),
+            ci_bucket: String::new(),
             ci_repo: String::new(),
             ci_repo_options: vec![],
             stuck_count: 0,
@@ -8698,6 +8721,7 @@ mod tests {
             triggered_options: vec![],
             ci_failures: vec![],
             ci_state: String::new(),
+            ci_bucket: String::new(),
             ci_repo: String::new(),
             ci_repo_options: vec![],
             stuck_count: 0,
@@ -8780,6 +8804,7 @@ mod tests {
             triggered_options: vec![],
             ci_failures: vec![],
             ci_state: String::new(),
+            ci_bucket: String::new(),
             ci_repo: String::new(),
             ci_repo_options: vec![],
             stuck_count: 0,
@@ -9757,6 +9782,7 @@ mod tests {
                 None,
                 Some("CLAUDE-901"),
                 "open",
+                None,
                 "2999-01-01T00:00:00Z",
             )
             .await
@@ -9785,6 +9811,7 @@ mod tests {
                 None,
                 None,
                 "open",
+                None,
                 "2999-01-01T00:00:01Z",
             )
             .await
@@ -9851,6 +9878,7 @@ mod tests {
                 None,
                 None,
                 "open",
+                None,
                 "2999-01-01T00:00:00Z",
             )
             .await
@@ -9863,6 +9891,7 @@ mod tests {
                 None,
                 None,
                 "resolved",
+                None,
                 "2999-01-01T00:00:01Z",
             )
             .await

@@ -29,6 +29,12 @@ pub struct Failure {
     pub infra_kind: Option<String>,
     pub issue_key: Option<String>,
     pub state: String,
+    /// SPEC-4.3.15 / CLAUDE-598: the triage bucket
+    /// (`code_fix`/`human_action`/`transient`/`auto_fix`, `src/triage.rs`)
+    /// computed at webhook-mint time. `None` for a row minted before this
+    /// column existed, or adopted through the legacy YouTrack search (no
+    /// triage ever ran for it).
+    pub triage_bucket: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -73,6 +79,7 @@ fn failure_from_row(row: &sqlx::any::AnyRow) -> Result<Failure> {
         infra_kind: row.try_get("infra_kind")?,
         issue_key: row.try_get("issue_key")?,
         state: row.try_get("state")?,
+        triage_bucket: row.try_get("triage_bucket")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -160,7 +167,7 @@ pub async fn find_match(
 pub async fn get_failure(pool: &DbPool, id: i64) -> Result<Option<Failure>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, created_at, updated_at \
+        "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, triage_bucket, created_at, updated_at \
          FROM ci_failures WHERE id = ?",
     ).into_owned()))
     .bind(id)
@@ -170,6 +177,10 @@ pub async fn get_failure(pool: &DbPool, id: i64) -> Result<Option<Failure>> {
 }
 
 /// SPEC-3.5.2: insert a new `ci_failures` row. Returns its id.
+/// `triage_bucket` is the already-computed [`crate::triage::TriageBucket`]
+/// wire value (SPEC-4.3.15 / CLAUDE-598) when the caller minted this row from
+/// a triage verdict, `None` when no triage ran for it (a `pr_only` sighting,
+/// or a legacy-adopted issue).
 #[allow(clippy::too_many_arguments)]
 pub async fn record_failure(
     pool: &DbPool,
@@ -179,12 +190,13 @@ pub async fn record_failure(
     infra_kind: Option<&str>,
     issue_key: Option<&str>,
     state: &str,
+    triage_bucket: Option<&str>,
     now: &str,
 ) -> Result<i64> {
     let id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(db::q(
         pool,
-        "INSERT INTO ci_failures (repo, workflow_id, job_name, infra_kind, issue_key, state, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO ci_failures (repo, workflow_id, job_name, infra_kind, issue_key, state, triage_bucket, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     ).into_owned()))
     .bind(repo)
     .bind(workflow_id)
@@ -192,6 +204,7 @@ pub async fn record_failure(
     .bind(infra_kind)
     .bind(issue_key)
     .bind(state)
+    .bind(triage_bucket)
     .bind(now)
     .bind(now)
     .fetch_one(pool)
@@ -377,6 +390,30 @@ pub async fn set_failure_state(
     Ok(())
 }
 
+/// SPEC-4.3.15 / CLAUDE-598: persist the triage bucket onto an existing row,
+/// for the reopen path, which re-triages a resolved failure exactly as a
+/// fresh mint would.
+pub async fn set_failure_triage_bucket(
+    pool: &DbPool,
+    failure_id: i64,
+    triage_bucket: &str,
+    now: &str,
+) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "UPDATE ci_failures SET triage_bucket = ?, updated_at = ? WHERE id = ?",
+        )
+        .into_owned(),
+    ))
+    .bind(triage_bucket)
+    .bind(now)
+    .bind(failure_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// SPEC-3.12 item 8: store the infrastructure `kind` on an existing failure
 /// row, so a failure first recorded before the condition was recognised still
 /// shows its category on the dashboard and in the Reports failure causes.
@@ -473,12 +510,12 @@ pub async fn run_indexes_for_failure_pr(
 pub async fn list_failures(pool: &DbPool, state: Option<&str>, limit: i64) -> Result<Vec<Failure>> {
     let sql = match state {
         Some(_) => {
-            "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, \
+            "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, triage_bucket, \
              created_at, updated_at FROM ci_failures WHERE state = ? \
              ORDER BY updated_at DESC LIMIT ?"
         }
         None => {
-            "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, \
+            "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, triage_bucket, \
              created_at, updated_at FROM ci_failures ORDER BY updated_at DESC LIMIT ?"
         }
     };
@@ -491,19 +528,16 @@ pub async fn list_failures(pool: &DbPool, state: Option<&str>, limit: i64) -> Re
     rows.iter().map(failure_from_row).collect()
 }
 
-/// SPEC-4.3.15: the dashboard's CI-failures listing. `state` filters on the
-/// stored lifecycle `state` (`open`/`resolved`/`pr_only`) and `repo` narrows
-/// to one repository; either `None` is "no filter". Newest first.
-/// `ci_failures` persists no separate triage-bucket value
-/// (`code_fix`/`human_action`/`transient`/`auto_fix`, `src/triage.rs`,
-/// computed only at webhook-mint time and never written back to the row),
-/// so the dashboard's "Bucket" column from SPEC-4.3.15's Background is not
-/// yet implemented; this filters and renders lifecycle `state` instead,
-/// labeled accordingly. Persisting the real triage bucket is tracked as
-/// CLAUDE-598.
+/// SPEC-4.3.15 / CLAUDE-598: the dashboard's CI-failures listing. `state`
+/// filters on the stored lifecycle `state` (`open`/`resolved`/`pr_only`),
+/// `bucket` filters on the persisted triage bucket
+/// (`code_fix`/`human_action`/`transient`/`auto_fix`), and `repo` narrows to
+/// one repository; each `None` is "no filter" and the three narrow
+/// independently of one another. Newest first.
 pub async fn list_failures_for_dashboard(
     pool: &DbPool,
     state: Option<&str>,
+    bucket: Option<&str>,
     repo: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Failure>> {
@@ -512,6 +546,10 @@ pub async fn list_failures_for_dashboard(
     if let Some(s) = state {
         conds.push("state = ?");
         binds.push(s);
+    }
+    if let Some(b) = bucket {
+        conds.push("triage_bucket = ?");
+        binds.push(b);
     }
     if let Some(r) = repo {
         conds.push("repo = ?");
@@ -523,7 +561,7 @@ pub async fn list_failures_for_dashboard(
         format!(" WHERE {}", conds.join(" AND "))
     };
     let sql = format!(
-        "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, \
+        "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, triage_bucket, \
          created_at, updated_at FROM ci_failures{where_clause} ORDER BY updated_at DESC LIMIT ?"
     );
     let dialect_sql = db::q(pool, &sql).into_owned();
@@ -764,6 +802,7 @@ mod tests {
             None,
             None,
             state,
+            None,
             updated_at,
         )
         .await
@@ -780,6 +819,35 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+        id
+    }
+
+    /// [`seed_failure`] plus a persisted triage bucket, for tests of the
+    /// SPEC-4.3.15 / CLAUDE-598 bucket filter.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_failure_with_bucket(
+        pool: &DbPool,
+        repo: &str,
+        workflow_id: &str,
+        job_name: &str,
+        test_ids: &[&str],
+        state: &str,
+        bucket: &str,
+        updated_at: &str,
+    ) -> i64 {
+        let id = seed_failure(
+            pool,
+            repo,
+            workflow_id,
+            job_name,
+            test_ids,
+            state,
+            updated_at,
+        )
+        .await;
+        set_failure_triage_bucket(pool, id, bucket, updated_at)
+            .await
+            .unwrap();
         id
     }
 
@@ -951,6 +1019,7 @@ mod tests {
             None,
             None,
             "open",
+            None,
             "2026-09-01T00:00:00Z",
         )
         .await
@@ -988,6 +1057,7 @@ mod tests {
             None,
             None,
             "open",
+            None,
             "2026-09-01T00:00:00Z",
         )
         .await
@@ -1073,6 +1143,7 @@ mod tests {
             None,
             None,
             "open",
+            None,
             "2026-09-01T00:00:00Z",
         )
         .await
@@ -1280,6 +1351,7 @@ mod tests {
             None,
             Some("CLAUDE-42"),
             "open",
+            None,
             "2026-09-01T00:00:00Z",
         )
         .await
@@ -1304,6 +1376,7 @@ mod tests {
             None,
             Some("CLAUDE-42"),
             "open",
+            None,
             "2026-09-01T00:00:00Z",
         )
         .await
@@ -1402,30 +1475,93 @@ mod tests {
         )
         .await;
 
-        let all = list_failures_for_dashboard(&pool, None, None, 100)
+        let all = list_failures_for_dashboard(&pool, None, None, None, 100)
             .await
             .unwrap();
         assert_eq!(all.len(), 3);
         // newest updated_at first
         assert_eq!(all[0].repo, "acme/gizmos");
 
-        let open_only = list_failures_for_dashboard(&pool, Some("open"), None, 100)
+        let open_only = list_failures_for_dashboard(&pool, Some("open"), None, None, 100)
             .await
             .unwrap();
         assert_eq!(open_only.len(), 2);
         assert!(open_only.iter().all(|f| f.state == "open"));
 
-        let repo_only = list_failures_for_dashboard(&pool, None, Some("acme/widgets"), 100)
+        let repo_only = list_failures_for_dashboard(&pool, None, None, Some("acme/widgets"), 100)
             .await
             .unwrap();
         assert_eq!(repo_only.len(), 2);
         assert!(repo_only.iter().all(|f| f.repo == "acme/widgets"));
 
-        let both = list_failures_for_dashboard(&pool, Some("open"), Some("acme/widgets"), 100)
-            .await
-            .unwrap();
+        let both =
+            list_failures_for_dashboard(&pool, Some("open"), None, Some("acme/widgets"), 100)
+                .await
+                .unwrap();
         assert_eq!(both.len(), 1);
         assert_eq!(both[0].job_name, "test");
+    }
+
+    #[tokio::test]
+    async fn dashboard_listing_filters_by_bucket_independently_of_state() {
+        let pool = test_pool().await;
+        seed_failure_with_bucket(
+            &pool,
+            "acme/widgets",
+            "checks.yml",
+            "test",
+            &["lib::a"],
+            "open",
+            "code_fix",
+            "2026-09-01T00:00:00Z",
+        )
+        .await;
+        seed_failure_with_bucket(
+            &pool,
+            "acme/widgets",
+            "checks.yml",
+            "lint",
+            &["lib::b"],
+            "open",
+            "human_action",
+            "2026-09-02T00:00:00Z",
+        )
+        .await;
+        seed_failure_with_bucket(
+            &pool,
+            "acme/widgets",
+            "checks.yml",
+            "build",
+            &["lib::c"],
+            "resolved",
+            "code_fix",
+            "2026-09-03T00:00:00Z",
+        )
+        .await;
+
+        let code_fix_only = list_failures_for_dashboard(&pool, None, Some("code_fix"), None, 100)
+            .await
+            .unwrap();
+        assert_eq!(code_fix_only.len(), 2);
+        assert!(code_fix_only
+            .iter()
+            .all(|f| f.triage_bucket.as_deref() == Some("code_fix")));
+
+        // The bucket filter narrows independently of the state filter: combining
+        // both narrows further than either alone.
+        let code_fix_open =
+            list_failures_for_dashboard(&pool, Some("open"), Some("code_fix"), None, 100)
+                .await
+                .unwrap();
+        assert_eq!(code_fix_open.len(), 1);
+        assert_eq!(code_fix_open[0].job_name, "test");
+
+        let human_action_only =
+            list_failures_for_dashboard(&pool, None, Some("human_action"), None, 100)
+                .await
+                .unwrap();
+        assert_eq!(human_action_only.len(), 1);
+        assert_eq!(human_action_only[0].job_name, "lint");
     }
 
     #[tokio::test]
