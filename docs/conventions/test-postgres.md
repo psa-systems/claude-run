@@ -10,6 +10,8 @@
 4. Runs `<command>` with `DATABASE_URL` and `CLAUDE_RUN_TEST_DATABASE_URL` set to the throwaway Postgres and `CLAUDE_RUN_TEST_POSTGRES_CONTAINER` set to the container name, inheriting stdio, and propagates its exit code (128 + signal if it was killed by one).
 5. Stops the container on normal exit, on command failure, on SIGINT/SIGTERM, and on any error in steps 2-3. A teardown failure is reported and makes the exit code non-zero even when the command itself succeeded.
 
+When the runner started the calling `claude` it sets `CLAUDE_RUN_STEP_SPANS_FILE`; `test-postgres` then appends its `postgres_start` (container create call) and `postgres_healthy` (to the first successful readiness and reachability check, or `ok = false` with the error) timings to it, and the runner stores them as `attempt_steps` rows (SPEC-3.14). A failed append is printed and never fails the run.
+
 The password never appears in a log line or an error message.
 
 ## Using it

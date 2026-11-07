@@ -778,6 +778,12 @@ never summarized by one duration.
    `pr_create`, `gate`, `review`, `ci_wait`, `conflict_resolution`) are timed directly by the runner around the call.
    `postgres_start` runs from the container create call to its return, and `postgres_healthy` from there to the first
    successful health probe; a probe that never succeeds is recorded with `ok = false` and the probe's last error.
+   The `test-postgres` process (`SPEC-6.6`) times these two itself and appends them to the file named by
+   `CLAUDE_RUN_STEP_SPANS_FILE`, which the runner sets on every `claude` invocation; the runner reads that file after
+   the invocation and stores the rows, carved out of the derived steps. `hook_install` is recorded only when
+   `just install-hooks` ran. `conflict_resolution` is the `claude` pass of the bounded final-push conflict resolution
+   (`SPEC-3.12` item 4), and `ci_wait` is the one bounded CI status read `finalize` makes (`SPEC-3.3.1`); a
+   `ci_wait` lists as `CI remediation N` (`SPEC-3.15`) only in the `ci-remediation` stage.
 4. **Agent-run steps** (`coding`, `check`, `build`) are derived from the stream log (`SPEC-3.2`): a Bash tool call
    whose command is the repo's pre-commit, pre-push, check or verification recipe is a `check`, with `label`
    `pre-commit`, `pre-push`, `check`, `verify` or `ad-hoc` (any other test or lint command the agent chose to run); a
@@ -1557,7 +1563,9 @@ fast naming `--network` when it cannot (a caller in a container of its own canno
 then disables `fsync`, `synchronous_commit` and
 `full_page_writes` and verifies the change by reading `SHOW fsync` back, retrying for up to 20s against a
 restart-shaped connection failure. Each `--init-sql` file then runs in order with `ON_ERROR_STOP`, through the same
-retry. The generated password never appears in a log line or an error message. CI runs its Postgres leg through it
+retry. When `CLAUDE_RUN_STEP_SPANS_FILE` is set it appends the `postgres_start` and `postgres_healthy` steps it timed
+to that file (`SPEC-3.14` item 3); a failed append is printed and never fails the run. The generated password never
+appears in a log line or an error message. CI runs its Postgres leg through it
 (`SPEC-11.1`).
 
 ## 7. Security

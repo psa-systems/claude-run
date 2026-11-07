@@ -630,22 +630,63 @@ pub fn run(opts: &Opts, command: &[String]) -> Result<i32> {
     let password = random_hex(16)?;
     let image = opts.image().to_string();
 
+    // SPEC-3.14 item 3: when the runner set a span file, report the two steps
+    // only this process can time. A failed report is printed (the runner's
+    // stream log shows it) and never fails the test run.
+    let spans_file = std::env::var_os(crate::attempt_steps::STEP_SPANS_FILE_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let report = |kind, start, end, ok, detail: Option<String>| {
+        let Some(path) = &spans_file else { return };
+        let step = crate::attempt_steps::FileStep {
+            kind,
+            start,
+            end,
+            ok,
+            detail,
+        };
+        if let Err(e) = crate::attempt_steps::append_file_step(path, &step) {
+            eprintln!(
+                "test-postgres: writing the {} step to {} failed: {e}",
+                step.kind.as_str(),
+                path.display()
+            );
+        }
+    };
+
     let run_args = docker_run_args(&name, pid, &image, &password, opts.network.as_deref());
     let run_args_ref: Vec<&str> = run_args.iter().map(String::as_str).collect();
-    let out = docker(&run_args_ref, &[&password])?;
-    if !out.status.success() {
-        return Err(docker_error(
-            "docker run",
-            &run_args_ref,
-            &String::from_utf8_lossy(&out.stderr),
-            &[&password],
-        ));
-    }
+    // `postgres_start`: from the container create call to its return.
+    let create_start = chrono::Utc::now();
+    let created = docker(&run_args_ref, &[&password]).and_then(|out| {
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(docker_error(
+                "docker run",
+                &run_args_ref,
+                &String::from_utf8_lossy(&out.stderr),
+                &[&password],
+            ))
+        }
+    });
+    let create_end = chrono::Utc::now();
+    report(
+        crate::attempt_steps::StepKind::PostgresStart,
+        create_start,
+        create_end,
+        created.is_ok(),
+        created.as_ref().err().map(|e| e.to_string()),
+    );
+    created?;
 
     // From here on the container exists and MUST be torn down, whatever
     // happens next; `result` captures the outcome and teardown always runs
     // before we return it.
-    let result = (|| -> Result<i32> {
+    // `postgres_healthy`: from the create call's return to the first
+    // successful probe; a probe that never succeeds is `ok = false` with the
+    // last error.
+    let ready = (|| -> Result<(String, u16)> {
         // On a shared network the container is reached by name on its own
         // port; otherwise through the port published on the loopback.
         let (host, port) = match opts.network {
@@ -654,6 +695,17 @@ pub fn run(opts: &Opts, command: &[String]) -> Result<i32> {
         };
         wait_pg_ready(&name)?;
         wait_reachable(&host, port)?;
+        Ok((host, port))
+    })();
+    report(
+        crate::attempt_steps::StepKind::PostgresHealthy,
+        create_end,
+        chrono::Utc::now(),
+        ready.is_ok(),
+        ready.as_ref().err().map(|e| e.to_string()),
+    );
+    let result = (|| -> Result<i32> {
+        let (host, port) = ready?;
         disable_durability(&name)?;
         apply_init_files(&name, &opts.init_sql)?;
 
@@ -940,6 +992,37 @@ exit 0
             std::env::set_var("PATH", old_path);
         }
         let _ = std::fs::read_to_string(&log_path);
+    }
+
+    /// SPEC-3.14 item 3, CLAUDE-597: with the runner's span file set, a run
+    /// reports `postgres_start` then `postgres_healthy`, back to back and ok.
+    #[test]
+    fn run_reports_postgres_start_and_healthy_spans_to_the_runners_file() {
+        with_stub_on_path(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("spans.jsonl");
+            unsafe {
+                std::env::set_var(crate::attempt_steps::STEP_SPANS_FILE_ENV, &file);
+            }
+            let code = run(
+                &Opts::default(),
+                &["sh".into(), "-c".into(), "exit 0".into()],
+            );
+            unsafe {
+                std::env::remove_var(crate::attempt_steps::STEP_SPANS_FILE_ENV);
+            }
+            assert_eq!(code.unwrap(), 0);
+            let steps = crate::attempt_steps::read_file_steps(&file).unwrap();
+            let kinds: Vec<_> = steps.iter().map(|s| (s.kind, s.ok)).collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    (crate::attempt_steps::StepKind::PostgresStart, true),
+                    (crate::attempt_steps::StepKind::PostgresHealthy, true),
+                ]
+            );
+            assert_eq!(steps[0].end, steps[1].start);
+        });
     }
 
     #[test]

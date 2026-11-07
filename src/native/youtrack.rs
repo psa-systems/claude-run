@@ -1718,8 +1718,8 @@ async fn process_job(
     // all synchronous; keep them off the async worker thread.
     let resume_branch = resume.as_ref().map(|r| r.branch.as_str());
     // SPEC-3.14: the `clone` runner-owned step, timed by `run_pre` around the
-    // `clone_repo` call alone (not the field writes before it or the hook
-    // install after it, both of which fall into `unaccounted` honestly).
+    // `clone_repo` call alone (not the field writes before it, which fall into
+    // `unaccounted` honestly); the hook install after it is its own step.
     // CLAUDE-603: runner-owned steps are written when they end, through this
     // one recorder, so the rows exist when a push comment renders the SPEC-3.15
     // list. Rows an earlier uncounted attempt left under this attempt number
@@ -2193,8 +2193,13 @@ async fn process_job(
         if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
             match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
                 Ok(steps) => {
-                    for step in crate::attempt_steps::carve_steps(steps, &checkpoint_spans) {
+                    let (pg_steps, holes) =
+                        child_postgres_steps(log_path, &checkpoint_spans, &action.name, key);
+                    for step in crate::attempt_steps::carve_steps(steps, &holes) {
                         push_row(step.kind.as_str(), step.start, step.end, true);
+                    }
+                    for pg in &pg_steps {
+                        push_row(pg.kind.as_str(), pg.start, pg.end, pg.ok);
                     }
                 }
                 Err(e) => {
@@ -2412,7 +2417,11 @@ async fn process_job(
         if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
             match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
                 Ok(steps) => {
-                    for step in crate::attempt_steps::carve_steps(steps, &checkpoint_spans) {
+                    // SPEC-3.14 item 3: the Postgres steps `test-postgres` timed
+                    // itself, carved out of the derived steps.
+                    let (pg_steps, holes) =
+                        child_postgres_steps(log_path, &checkpoint_spans, &action.name, key);
+                    for step in crate::attempt_steps::carve_steps(steps, &holes) {
                         recorder
                             .record(
                                 stage,
@@ -2422,6 +2431,19 @@ async fn process_job(
                                 step.end,
                                 true,
                                 step.detail,
+                            )
+                            .await;
+                    }
+                    for pg in &pg_steps {
+                        recorder
+                            .record(
+                                stage,
+                                pg.kind,
+                                pg.kind.as_str(),
+                                pg.start,
+                                pg.end,
+                                pg.ok,
+                                pg.detail.as_deref(),
                             )
                             .await;
                     }
@@ -3133,6 +3155,33 @@ fn log_held(action: &str, key: &str, signature: &str, blocked_since_ms: i64, now
     }
 }
 
+type TimeSpan = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>);
+
+/// SPEC-3.14 item 3: the `postgres_start` / `postgres_healthy` steps the
+/// `test-postgres` processes of one `claude` invocation reported through its
+/// span file, trimmed so no instant is counted twice, plus the holes to carve
+/// out of the derived steps (the checkpoint spans and these steps). An
+/// unreadable span file is logged at `error` with the key and yields no steps,
+/// so the time falls into the derived steps rather than being invented.
+fn child_postgres_steps(
+    stream_log: &Path,
+    checkpoint_spans: &[TimeSpan],
+    action_name: &str,
+    key: &str,
+) -> (Vec<crate::attempt_steps::FileStep>, Vec<TimeSpan>) {
+    let file = crate::attempt_steps::spans_file_for(stream_log);
+    let steps = match crate::attempt_steps::read_file_steps(&file) {
+        Ok(steps) => crate::attempt_steps::disjoint_file_steps(steps, checkpoint_spans),
+        Err(e) => {
+            error!(action = %action_name, key = %key, error = %e, "reading the test-postgres step spans failed; the Postgres steps of this attempt are not recorded");
+            Vec::new()
+        }
+    };
+    let mut holes = checkpoint_spans.to_vec();
+    holes.extend(steps.iter().map(|s| (s.start, s.end)));
+    (steps, holes)
+}
+
 /// SPEC-3.3: "Pre: set the field to working and `State` to the in-progress
 /// value, optionally set `Assignee`, then `git clone --depth 50` and install
 /// the repo's own git hooks."
@@ -3153,10 +3202,9 @@ fn run_pre(
     action_name: &str,
     // SPEC-3.14: filled with the `clone_repo` call's own start/end/ok,
     // timed around that call alone so the `clone` step never blends in the
-    // field writes above it or the hook install below it (both of which are
-    // left to fall into `unaccounted` honestly until they get their own
-    // runner-owned steps). Left `None` when a field write fails before
-    // `clone_repo` is ever reached.
+    // field writes above it (left to fall into `unaccounted` honestly) or the
+    // hook install below it (its own step, `hook_timing`). Left `None` when a
+    // field write fails before `clone_repo` is ever reached.
     clone_timing: &mut Option<(
         chrono::DateTime<chrono::Utc>,
         chrono::DateTime<chrono::Utc>,
@@ -15343,6 +15391,44 @@ mod tests {
                 .any(|c| c.starts_with("yt issue comment MK-16 ") && c.contains("merged this PR")),
             "the merge must be announced on the issue: {calls:?}"
         );
+    }
+
+    /// SPEC-3.14 item 3, CLAUDE-597: the Postgres steps a `test-postgres`
+    /// process reported are read back, and become holes in the derived steps.
+    #[test]
+    fn child_postgres_steps_reads_the_span_file_and_returns_holes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("k-attempt-1.jsonl");
+        // Whole milliseconds: the span file stores millisecond timestamps.
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        let file = crate::attempt_steps::spans_file_for(&log);
+        for (kind, a, b, ok) in [
+            (crate::attempt_steps::StepKind::PostgresStart, 0, 3, true),
+            (crate::attempt_steps::StepKind::PostgresHealthy, 3, 8, false),
+        ] {
+            crate::attempt_steps::append_file_step(
+                &file,
+                &crate::attempt_steps::FileStep {
+                    kind,
+                    start: at(a),
+                    end: at(b),
+                    ok,
+                    detail: (!ok).then(|| "unreachable".to_string()),
+                },
+            )
+            .unwrap();
+        }
+        let (steps, holes) = child_postgres_steps(&log, &[], "youtrack", "MK-16");
+        let seen: Vec<_> = steps.iter().map(|s| (s.kind.as_str(), s.ok)).collect();
+        assert_eq!(
+            seen,
+            vec![("postgres_start", true), ("postgres_healthy", false)]
+        );
+        assert_eq!(steps[1].detail.as_deref(), Some("unreachable"));
+        assert_eq!(holes, vec![(at(0), at(3)), (at(3), at(8))]);
     }
 
     /// SPEC-3.14 item 3, CLAUDE-597: the finalize-time bounded status read is
