@@ -1718,8 +1718,8 @@ async fn process_job(
     // all synchronous; keep them off the async worker thread.
     let resume_branch = resume.as_ref().map(|r| r.branch.as_str());
     // SPEC-3.14: the `clone` runner-owned step, timed by `run_pre` around the
-    // `clone_repo` call alone (not the field writes before it or the hook
-    // install after it, both of which fall into `unaccounted` honestly).
+    // `clone_repo` call alone (not the field writes before it, which fall into
+    // `unaccounted` honestly); the hook install after it is its own step.
     // CLAUDE-603: runner-owned steps are written when they end, through this
     // one recorder, so the rows exist when a push comment renders the SPEC-3.15
     // list. Rows an earlier uncounted attempt left under this attempt number
@@ -1733,6 +1733,7 @@ async fn process_job(
     ));
     recorder.lock().await.clear_attempt().await;
     let mut clone_timing = None;
+    let mut hook_timing = None;
     let pre_result = crate::blocking::in_place(|| {
         run_pre(
             backend,
@@ -1743,6 +1744,7 @@ async fn process_job(
             resume_branch,
             &action.name,
             &mut clone_timing,
+            &mut hook_timing,
         )
     });
 
@@ -1758,6 +1760,23 @@ async fn process_job(
                 clone_start,
                 clone_end,
                 clone_ok,
+                None,
+            )
+            .await;
+    }
+
+    // SPEC-3.14 item 3: the `hook_install` row, written the moment the install ends.
+    if let Some((hook_start, hook_end, hook_ok)) = hook_timing {
+        recorder
+            .lock()
+            .await
+            .record(
+                stage,
+                crate::attempt_steps::StepKind::HookInstall,
+                "hook_install",
+                hook_start,
+                hook_end,
+                hook_ok,
                 None,
             )
             .await;
@@ -2163,6 +2182,7 @@ async fn process_job(
             rows.push(crate::progress_list::StepRow {
                 attempt: attempt_no,
                 kind: kind.to_string(),
+                stage: stage.to_string(),
                 started_at: start,
                 ended_at: end,
                 ok,
@@ -2173,8 +2193,13 @@ async fn process_job(
         if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
             match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
                 Ok(steps) => {
-                    for step in crate::attempt_steps::carve_steps(steps, &checkpoint_spans) {
+                    let (pg_steps, holes) =
+                        child_postgres_steps(log_path, &checkpoint_spans, &action.name, key);
+                    for step in crate::attempt_steps::carve_steps(steps, &holes) {
                         push_row(step.kind.as_str(), step.start, step.end, true);
+                    }
+                    for pg in &pg_steps {
+                        push_row(pg.kind.as_str(), pg.start, pg.end, pg.ok);
                     }
                 }
                 Err(e) => {
@@ -2204,6 +2229,7 @@ async fn process_job(
             rows.push(crate::progress_list::StepRow {
                 attempt: i64::from(attempts + 1),
                 kind: s.kind.as_str().to_string(),
+                stage: stage.to_string(),
                 started_at: s.start,
                 ended_at: s.end,
                 ok: s.ok,
@@ -2391,7 +2417,11 @@ async fn process_job(
         if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
             match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
                 Ok(steps) => {
-                    for step in crate::attempt_steps::carve_steps(steps, &checkpoint_spans) {
+                    // SPEC-3.14 item 3: the Postgres steps `test-postgres` timed
+                    // itself, carved out of the derived steps.
+                    let (pg_steps, holes) =
+                        child_postgres_steps(log_path, &checkpoint_spans, &action.name, key);
+                    for step in crate::attempt_steps::carve_steps(steps, &holes) {
                         recorder
                             .record(
                                 stage,
@@ -2401,6 +2431,19 @@ async fn process_job(
                                 step.end,
                                 true,
                                 step.detail,
+                            )
+                            .await;
+                    }
+                    for pg in &pg_steps {
+                        recorder
+                            .record(
+                                stage,
+                                pg.kind,
+                                pg.kind.as_str(),
+                                pg.start,
+                                pg.end,
+                                pg.ok,
+                                pg.detail.as_deref(),
                             )
                             .await;
                     }
@@ -3112,6 +3155,33 @@ fn log_held(action: &str, key: &str, signature: &str, blocked_since_ms: i64, now
     }
 }
 
+type TimeSpan = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>);
+
+/// SPEC-3.14 item 3: the `postgres_start` / `postgres_healthy` steps the
+/// `test-postgres` processes of one `claude` invocation reported through its
+/// span file, trimmed so no instant is counted twice, plus the holes to carve
+/// out of the derived steps (the checkpoint spans and these steps). An
+/// unreadable span file is logged at `error` with the key and yields no steps,
+/// so the time falls into the derived steps rather than being invented.
+fn child_postgres_steps(
+    stream_log: &Path,
+    checkpoint_spans: &[TimeSpan],
+    action_name: &str,
+    key: &str,
+) -> (Vec<crate::attempt_steps::FileStep>, Vec<TimeSpan>) {
+    let file = crate::attempt_steps::spans_file_for(stream_log);
+    let steps = match crate::attempt_steps::read_file_steps(&file) {
+        Ok(steps) => crate::attempt_steps::disjoint_file_steps(steps, checkpoint_spans),
+        Err(e) => {
+            error!(action = %action_name, key = %key, error = %e, "reading the test-postgres step spans failed; the Postgres steps of this attempt are not recorded");
+            Vec::new()
+        }
+    };
+    let mut holes = checkpoint_spans.to_vec();
+    holes.extend(steps.iter().map(|s| (s.start, s.end)));
+    (steps, holes)
+}
+
 /// SPEC-3.3: "Pre: set the field to working and `State` to the in-progress
 /// value, optionally set `Assignee`, then `git clone --depth 50` and install
 /// the repo's own git hooks."
@@ -3132,11 +3202,17 @@ fn run_pre(
     action_name: &str,
     // SPEC-3.14: filled with the `clone_repo` call's own start/end/ok,
     // timed around that call alone so the `clone` step never blends in the
-    // field writes above it or the hook install below it (both of which are
-    // left to fall into `unaccounted` honestly until they get their own
-    // runner-owned steps). Left `None` when a field write fails before
-    // `clone_repo` is ever reached.
+    // field writes above it (left to fall into `unaccounted` honestly) or the
+    // hook install below it (its own step, `hook_timing`). Left `None` when a
+    // field write fails before `clone_repo` is ever reached.
     clone_timing: &mut Option<(
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        bool,
+    )>,
+    // SPEC-3.14: the `hook_install` step, set only when `just install-hooks`
+    // actually ran (no recipe, no `just`, or `install_hooks: false` is no step).
+    hook_timing: &mut Option<(
         chrono::DateTime<chrono::Utc>,
         chrono::DateTime<chrono::Utc>,
         bool,
@@ -3162,7 +3238,10 @@ fn run_pre(
     *clone_timing = Some((clone_start, clone_end, clone_result.is_ok()));
     clone_result.map_err(|e| format!("git clone: {e}"))?;
     if src.install_hooks {
-        install_hooks(workdir);
+        let hook_start = chrono::Utc::now();
+        if let Some(ok) = install_hooks(workdir) {
+            *hook_timing = Some((hook_start, chrono::Utc::now(), ok));
+        }
     } else {
         info!(
             action = action_name,
@@ -3190,7 +3269,11 @@ fn run_pre(
 /// gate. A repo with no `install-hooks` recipe, or a host without `just`, is
 /// left unchanged and the bootstrap continues - failing the job here would be
 /// strictly worse than the CI-only status quo.
-fn install_hooks(workdir: &Path) {
+///
+/// Returns `Some(ok)` when `just install-hooks` was run (`ok` is its success)
+/// and `None` when there was nothing to run, so the caller times only a real
+/// install (SPEC-3.14 item 3).
+fn install_hooks(workdir: &Path) -> Option<bool> {
     // `just --show <recipe>` exits non-zero when the recipe (or the justfile
     // itself) is absent, so it doubles as the presence probe with no output
     // parsing. A spawn error means `just` is not installed: nothing to do.
@@ -3203,10 +3286,10 @@ fn install_hooks(workdir: &Path) {
         .status()
     {
         Ok(s) if s.success() => {}
-        Ok(_) => return, // no install-hooks recipe; leave the clone unchanged
+        Ok(_) => return None, // no install-hooks recipe; leave the clone unchanged
         Err(e) => {
             info!(error = %e, "just not available; skipping pre-commit hook install");
-            return;
+            return None;
         }
     }
     match Command::new("just")
@@ -3214,15 +3297,24 @@ fn install_hooks(workdir: &Path) {
         .arg("install-hooks")
         .status()
     {
-        Ok(s) if s.success() => info!("installed repo pre-commit hook on fresh clone"),
-        Ok(s) => warn!(
-            code = s.code(),
-            "just install-hooks failed; continuing without local pre-commit hook"
-        ),
-        Err(e) => warn!(
-            error = %e,
-            "running just install-hooks failed; continuing without local pre-commit hook"
-        ),
+        Ok(s) if s.success() => {
+            info!("installed repo pre-commit hook on fresh clone");
+            Some(true)
+        }
+        Ok(s) => {
+            warn!(
+                code = s.code(),
+                "just install-hooks failed; continuing without local pre-commit hook"
+            );
+            Some(false)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "running just install-hooks failed; continuing without local pre-commit hook"
+            );
+            Some(false)
+        }
     }
 }
 
@@ -3919,7 +4011,8 @@ impl ConflictResolver for FinalPushConflictResolver {
             remote_sha = %remote_sha,
             "running the bounded conflict-resolution pass (SPEC-3.12 item 4)"
         );
-        let result = self.claude.invoke(
+        let pass_start = chrono::Utc::now();
+        let invoked = self.claude.invoke(
             FINAL_PUSH_CONFLICT_RESOLVE_INSTRUCTION,
             &self.claude_cfg,
             self.timeout,
@@ -3931,7 +4024,22 @@ impl ConflictResolver for FinalPushConflictResolver {
             // to know the job's own `cargo_target_dir`, and is rare enough
             // that losing that cache here is not worth threading it through.
             None,
-        )?;
+        );
+        // SPEC-3.14 item 3: the `conflict_resolution` step is the `claude` pass
+        // itself; an invoke error or a timeout closes it `ok = false` (item 6).
+        // The gate below is its own `gate` step.
+        crate::attempt_steps::stash_step_spans(
+            &self.key,
+            vec![crate::attempt_steps::StepSpan {
+                kind: crate::attempt_steps::StepKind::ConflictResolution,
+                label: "conflict_resolution",
+                start: pass_start,
+                end: chrono::Utc::now(),
+                ok: matches!(&invoked, Ok(r) if r.ok && !r.timed_out),
+                detail: None,
+            }],
+        );
+        let result = invoked?;
         self.spend.record(&result);
         // SPEC-3.12 item 4: this pass is a `claude` invocation like any
         // other, so it leaves a `claude_invocations` row the same way the
@@ -3960,8 +4068,8 @@ impl ConflictResolver for FinalPushConflictResolver {
         // before the push because a merge resolution that breaks the build
         // must not land as a fast-forward.
         let gate = run_verification_gate(workdir);
-        if let Some(t) = gate.timing.clone() {
-            crate::attempt_steps::stash_gate_timing(&self.key, t);
+        if let Some(t) = gate.timing.as_ref() {
+            crate::attempt_steps::stash_step_spans(&self.key, crate::attempt_steps::gate_spans(t));
         }
         if let Some(output) = gate.failure {
             let command = gate.command.unwrap_or("none");
@@ -4568,13 +4676,12 @@ fn final_push(
     let start = chrono::Utc::now();
     let pushed = forge.final_push(workdir, &host);
     let end = chrono::Utc::now();
-    // SPEC-3.14 item 3, CLAUDE-604: a conflict-resolution gate that ran inside
+    // SPEC-3.14 item 3, CLAUDE-604: a conflict-resolution pass and gate that ran inside
     // the push is stored first and the `push` row starts after it, so the rows
     // never overlap.
     let mut push_start = start;
-    for gate in crate::attempt_steps::take_gate_timings(&job.key) {
-        push_start = push_start.max(gate.end);
-        steps(crate::attempt_steps::gate_spans(&gate));
+    if let Some(latest) = crate::attempt_steps::drain_stashed_spans(&job.key, steps) {
+        push_start = push_start.max(latest);
     }
     // Nothing to push (`Ok(None)`) is no step; a failed push is an `ok = false` one.
     if !matches!(pushed, Ok(None)) {
@@ -4866,11 +4973,10 @@ fn finalize_with_steps(
         let open_start = chrono::Utc::now();
         let opened = forge.create_pr_with_draft(workdir, &host, pr_strategy, true, None);
         let open_end = chrono::Utc::now();
-        // A conflict-resolution gate that ran inside the push is stored before it.
+        // A conflict-resolution pass and gate that ran inside the push are stored before it.
         let mut open_start = open_start;
-        for gate in crate::attempt_steps::take_gate_timings(&job.key) {
-            open_start = open_start.max(gate.end);
-            steps(crate::attempt_steps::gate_spans(&gate));
+        if let Some(latest) = crate::attempt_steps::drain_stashed_spans(&job.key, steps) {
+            open_start = open_start.max(latest);
         }
         match opened {
             Ok(pr) => {
@@ -5013,6 +5119,7 @@ fn finalize_with_steps(
                                 pr_number,
                                 &url,
                                 run.run_id,
+                                steps,
                             ),
                             // A PR still a draft, or one whose number is
                             // unknown, is not merged here.
@@ -5518,12 +5625,25 @@ fn automerge_at_finalize(
     pr_number: u64,
     pr_url: &str,
     run_id: i64,
+    steps: crate::attempt_steps::StepSink<'_>,
 ) -> bool {
     if !automerge.enabled || automerge.finalize_status_timeout_secs == 0 {
         return false;
     }
     let timeout = Duration::from_secs(automerge.finalize_status_timeout_secs);
-    let status = match forge.pr_status_within(host, repo, pr_number, timeout) {
+    let read_start = chrono::Utc::now();
+    let read = forge.pr_status_within(host, repo, pr_number, timeout);
+    // SPEC-3.14 item 3: the one bounded CI status read (CLAUDE-549) is the
+    // attempt's `ci_wait` step; a failed or timed-out read closes it `ok = false`.
+    steps(vec![crate::attempt_steps::StepSpan {
+        kind: crate::attempt_steps::StepKind::CiWait,
+        label: "ci_wait",
+        start: read_start,
+        end: chrono::Utc::now(),
+        ok: read.is_ok(),
+        detail: None,
+    }]);
+    let status = match read {
         Ok(status) => status,
         Err(e) => {
             warn!(key = %issue_key, pr_number, error = %e, "finalize-time automerge: PR status read failed or timed out; leaving the PR at Code Review for the webhook and reconciler");
@@ -10260,6 +10380,7 @@ mod tests {
             None,
             "test-action",
             &mut clone_timing,
+            &mut None,
         );
         let calls = runner.calls.lock().unwrap();
         assert!(
@@ -10304,6 +10425,7 @@ mod tests {
             None,
             "test-action",
             &mut clone_timing,
+            &mut None,
         );
         let calls = runner.calls.lock().unwrap();
         assert!(!calls.iter().any(|c| c.contains("--assignee")), "{calls:?}");
@@ -10349,6 +10471,7 @@ mod tests {
             None,
             "test-action",
             &mut clone_timing,
+            &mut None,
         )
         .unwrap_err();
         assert!(err.starts_with("set Assignee=octocat:"), "{err}");
@@ -10407,6 +10530,7 @@ mod tests {
             Some("fix/existing"),
             "test-action",
             &mut clone_timing,
+            &mut None,
         )
         .unwrap();
 
@@ -10478,6 +10602,7 @@ mod tests {
             None,
             "test-action",
             &mut clone_timing,
+            &mut None,
         )
         .unwrap();
 
@@ -12333,7 +12458,8 @@ mod tests {
         )
         .unwrap();
 
-        install_hooks(dir.path());
+        // SPEC-3.14 item 3: a recipe that ran reports `Some(ok)` so `run_pre` times it.
+        assert_eq!(install_hooks(dir.path()), Some(true));
 
         let hook = dir.path().join(".git/hooks/pre-commit");
         assert!(hook.exists(), "hook must be written");
@@ -12352,7 +12478,8 @@ mod tests {
         // whether or not `just` is installed.
         let dir = tempfile::tempdir().unwrap();
         git_in(dir.path(), &["init"]);
-        install_hooks(dir.path());
+        // SPEC-3.14 item 3: nothing ran, so there is no `hook_install` step.
+        assert_eq!(install_hooks(dir.path()), None);
         assert!(
             !dir.path().join(".git/hooks/pre-commit").exists(),
             "no recipe means no hook"
@@ -15263,6 +15390,90 @@ mod tests {
                 .iter()
                 .any(|c| c.starts_with("yt issue comment MK-16 ") && c.contains("merged this PR")),
             "the merge must be announced on the issue: {calls:?}"
+        );
+    }
+
+    /// SPEC-3.14 item 3, CLAUDE-597: the Postgres steps a `test-postgres`
+    /// process reported are read back, and become holes in the derived steps.
+    #[test]
+    fn child_postgres_steps_reads_the_span_file_and_returns_holes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("k-attempt-1.jsonl");
+        // Whole milliseconds: the span file stores millisecond timestamps.
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        let file = crate::attempt_steps::spans_file_for(&log);
+        for (kind, a, b, ok) in [
+            (crate::attempt_steps::StepKind::PostgresStart, 0, 3, true),
+            (crate::attempt_steps::StepKind::PostgresHealthy, 3, 8, false),
+        ] {
+            crate::attempt_steps::append_file_step(
+                &file,
+                &crate::attempt_steps::FileStep {
+                    kind,
+                    start: at(a),
+                    end: at(b),
+                    ok,
+                    detail: (!ok).then(|| "unreachable".to_string()),
+                },
+            )
+            .unwrap();
+        }
+        let (steps, holes) = child_postgres_steps(&log, &[], "youtrack", "MK-16");
+        let seen: Vec<_> = steps.iter().map(|s| (s.kind.as_str(), s.ok)).collect();
+        assert_eq!(
+            seen,
+            vec![("postgres_start", true), ("postgres_healthy", false)]
+        );
+        assert_eq!(steps[1].detail.as_deref(), Some("unreachable"));
+        assert_eq!(holes, vec![(at(0), at(3)), (at(3), at(8))]);
+    }
+
+    /// SPEC-3.14 item 3, CLAUDE-597: the finalize-time bounded status read is
+    /// stored as a `ci_wait` step, `ok` when the read answered.
+    #[test]
+    fn finalize_time_status_read_is_a_ci_wait_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+            "fj",
+            &FINALIZE_PR_STATUS_ARGS,
+            r#"{"pr":7,"head_sha":"abc","state":"pending","mergeable":true,"behind_base":false}"#,
+        ));
+        let forge = CliBackend::new(runner).with_git_retry_waits([Duration::ZERO; 3]);
+        let seen: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+        let sink = |spans: Vec<crate::attempt_steps::StepSpan>| {
+            seen.lock()
+                .unwrap()
+                .extend(spans.iter().map(|s| (s.kind.as_str().to_string(), s.ok)));
+        };
+        finalize_with_steps(
+            &forge,
+            &forge,
+            &automerge_src(10),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            1,
+            1000,
+            &sink,
+        )
+        .unwrap();
+        assert!(
+            seen.lock()
+                .unwrap()
+                .contains(&("ci_wait".to_string(), true)),
+            "{:?}",
+            seen.lock().unwrap()
         );
     }
 

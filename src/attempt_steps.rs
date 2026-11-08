@@ -293,33 +293,40 @@ pub fn gate_spans(g: &GateTiming) -> Vec<StepSpan> {
         .collect()
 }
 
-type GateRegistry = std::sync::Mutex<std::collections::HashMap<String, Vec<GateTiming>>>;
+type SpanRegistry = std::sync::Mutex<std::collections::HashMap<String, Vec<StepSpan>>>;
 
-fn gate_registry() -> &'static GateRegistry {
-    static R: std::sync::OnceLock<GateRegistry> = std::sync::OnceLock::new();
+fn span_registry() -> &'static SpanRegistry {
+    static R: std::sync::OnceLock<SpanRegistry> = std::sync::OnceLock::new();
     R.get_or_init(Default::default)
 }
 
-/// Stash a gate run's timing under the job key. Only the final-push conflict
+/// Stash finished steps under the job key. Only the final-push conflict
 /// resolver uses this: it runs inside a provider call with no `finalize` sink
 /// or recorder in reach, so the caller of that call drains it with
-/// [`take_gate_timings`] as soon as the call returns (CLAUDE-604).
-pub fn stash_gate_timing(key: &str, timing: GateTiming) {
-    gate_registry()
+/// [`drain_stashed_spans`] as soon as the call returns (CLAUDE-604, CLAUDE-597).
+pub fn stash_step_spans(key: &str, spans: Vec<StepSpan>) {
+    span_registry()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .entry(key.to_string())
         .or_default()
-        .push(timing);
+        .extend(spans);
 }
 
-/// Drain the gate timings stashed for `key`.
-pub fn take_gate_timings(key: &str) -> Vec<GateTiming> {
-    gate_registry()
+/// Hand the steps stashed for `key` to `steps` and return the latest end among
+/// them, so the caller can start its own step after them and no rows overlap.
+/// `None` when nothing was stashed.
+pub fn drain_stashed_spans(key: &str, steps: StepSink<'_>) -> Option<DateTime<Utc>> {
+    let spans = span_registry()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(key)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let latest = spans.iter().map(|s| s.end).max();
+    if !spans.is_empty() {
+        steps(spans);
+    }
+    latest
 }
 
 impl<'a> StepRecorder<'a> {
@@ -335,6 +342,140 @@ impl<'a> StepRecorder<'a> {
     pub async fn record_gate(&mut self, stage: &str, g: &GateTiming) {
         self.record_spans(stage, &gate_spans(g)).await;
     }
+}
+
+/// SPEC-3.14 item 3: the env var through which the runner tells a `claude`
+/// child (and so the `test-postgres` process it runs) where to append the
+/// `postgres_start` / `postgres_healthy` spans only that process can time.
+pub const STEP_SPANS_FILE_ENV: &str = "CLAUDE_RUN_STEP_SPANS_FILE";
+
+/// The span file for the `claude` invocation whose stream log is `stream_log`.
+pub fn spans_file_for(stream_log: &std::path::Path) -> std::path::PathBuf {
+    let mut name = stream_log.as_os_str().to_owned();
+    name.push(".steps.jsonl");
+    name.into()
+}
+
+/// One step a child process timed itself and reported through the span file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStep {
+    pub kind: StepKind,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub ok: bool,
+    pub detail: Option<String>,
+}
+
+/// Append one span line to `path`. Only the two Postgres kinds are valid.
+pub fn append_file_step(path: &std::path::Path, step: &FileStep) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if !matches!(
+        step.kind,
+        StepKind::PostgresStart | StepKind::PostgresHealthy
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a child-reported step kind", step.kind.as_str()),
+        ));
+    }
+    let line = serde_json::json!({
+        "kind": step.kind.as_str(),
+        "start": fmt_ts(step.start),
+        "end": fmt_ts(step.end),
+        "ok": step.ok,
+        "detail": step.detail,
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(format!("{line}\n").as_bytes())
+}
+
+/// Read the span file for a stream log. A missing file is no spans (no
+/// `test-postgres` ran); an unreadable or malformed one is an error naming the
+/// line, never a silently short list (SPEC-3.14 item 8).
+pub fn read_file_steps(path: &std::path::Path) -> std::io::Result<Vec<FileStep>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let bad = |n: usize, why: String| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} line {}: {why}", path.display(), n + 1),
+        )
+    };
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let v: serde_json::Value = serde_json::from_str(line).map_err(|e| bad(n, e.to_string()))?;
+        let field = |k: &str| v.get(k).and_then(|x| x.as_str());
+        let kind = match field("kind") {
+            Some("postgres_start") => StepKind::PostgresStart,
+            Some("postgres_healthy") => StepKind::PostgresHealthy,
+            other => return Err(bad(n, format!("unknown step kind {other:?}"))),
+        };
+        let ts = |k: &str| -> std::io::Result<DateTime<Utc>> {
+            let raw = field(k).ok_or_else(|| bad(n, format!("missing {k}")))?;
+            DateTime::parse_from_rfc3339(raw)
+                .map(|t| t.with_timezone(&Utc))
+                .map_err(|e| bad(n, format!("bad {k} {raw:?}: {e}")))
+        };
+        out.push(FileStep {
+            kind,
+            start: ts("start")?,
+            end: ts("end")?,
+            ok: v
+                .get("ok")
+                .and_then(|x| x.as_bool())
+                .ok_or_else(|| bad(n, "missing ok".to_string()))?,
+            detail: field("detail").map(str::to_string),
+        });
+    }
+    Ok(out)
+}
+
+/// SPEC-3.14 item 6: trim `steps` so none overlaps another or a hole (parallel
+/// `test-postgres` runs, a checkpoint push), keeping every instant counted
+/// once. A step a hole splits keeps both pieces; a step it covers is dropped.
+pub fn disjoint_file_steps(
+    mut steps: Vec<FileStep>,
+    holes: &[(DateTime<Utc>, DateTime<Utc>)],
+) -> Vec<FileStep> {
+    steps.sort_by_key(|s| s.start);
+    let mut taken: Vec<(DateTime<Utc>, DateTime<Utc>)> = holes.to_vec();
+    let mut out = Vec::new();
+    for step in steps {
+        let mut pieces = vec![(step.start, step.end)];
+        for (hs, he) in &taken {
+            pieces = pieces
+                .into_iter()
+                .flat_map(|(s, e)| {
+                    if *he <= s || *hs >= e {
+                        return vec![(s, e)];
+                    }
+                    let mut kept = Vec::new();
+                    if *hs > s {
+                        kept.push((s, *hs));
+                    }
+                    if *he < e {
+                        kept.push((*he, e));
+                    }
+                    kept
+                })
+                .collect();
+        }
+        for (start, end) in pieces {
+            taken.push((start, end));
+            out.push(FileStep {
+                start,
+                end,
+                ..step.clone()
+            });
+        }
+    }
+    out
 }
 
 fn fmt_ts(ts: DateTime<Utc>) -> String {
@@ -1278,6 +1419,105 @@ mod tests {
                 ("gate".into(), "pre-push".into(), None),
                 ("gate".into(), "check".into(), Some(SUBSTEPS_UNKNOWN.into())),
             ]
+        );
+    }
+
+    /// SPEC-3.14 item 3, CLAUDE-597: a `conflict_resolution` span stashed by the
+    /// resolver and the gate span after it reach the sink in order, and the
+    /// latest end is returned so the caller's next step starts after them.
+    #[test]
+    fn stashed_conflict_resolution_and_gate_spans_drain_in_order() {
+        let span = |kind, label, start, end| StepSpan {
+            kind,
+            label,
+            start: at(start),
+            end: at(end),
+            ok: true,
+            detail: None,
+        };
+        stash_step_spans(
+            "T-DRAIN",
+            vec![span(
+                StepKind::ConflictResolution,
+                "conflict_resolution",
+                0,
+                30,
+            )],
+        );
+        stash_step_spans(
+            "T-DRAIN",
+            gate_spans(&GateTiming {
+                command: "pre-push",
+                start: at(30),
+                end: at(45),
+                ok: true,
+                stages: vec![],
+            }),
+        );
+        let seen = std::cell::RefCell::new(Vec::new());
+        let sink =
+            |spans: Vec<StepSpan>| seen.borrow_mut().extend(spans.into_iter().map(|s| s.kind));
+        assert_eq!(drain_stashed_spans("T-DRAIN", &sink), Some(at(45)));
+        assert_eq!(
+            *seen.borrow(),
+            vec![StepKind::ConflictResolution, StepKind::Gate]
+        );
+        assert_eq!(drain_stashed_spans("T-DRAIN", &sink), None);
+    }
+
+    /// SPEC-3.14 item 3, CLAUDE-597: the span file round-trips, a missing file
+    /// is no spans, and a malformed line is an error, not a short list.
+    #[test]
+    fn step_span_file_round_trips_and_rejects_malformed_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = spans_file_for(&dir.path().join("k-attempt-1.jsonl"));
+        assert!(read_file_steps(&path).unwrap().is_empty());
+        let start = FileStep {
+            kind: StepKind::PostgresStart,
+            start: at(0),
+            end: at(4),
+            ok: true,
+            detail: None,
+        };
+        let healthy = FileStep {
+            kind: StepKind::PostgresHealthy,
+            start: at(4),
+            end: at(9),
+            ok: false,
+            detail: Some("not reachable".to_string()),
+        };
+        append_file_step(&path, &start).unwrap();
+        append_file_step(&path, &healthy).unwrap();
+        assert_eq!(read_file_steps(&path).unwrap(), vec![start, healthy]);
+        let coding = FileStep {
+            kind: StepKind::Coding,
+            start: at(0),
+            end: at(1),
+            ok: true,
+            detail: None,
+        };
+        assert!(append_file_step(&path, &coding).is_err());
+        std::fs::write(&path, "not json\n").unwrap();
+        let err = read_file_steps(&path).unwrap_err();
+        assert!(err.to_string().contains("line 1"), "{err}");
+    }
+
+    /// SPEC-3.14 item 6: overlapping child-reported steps and a hole never
+    /// count an instant twice.
+    #[test]
+    fn overlapping_file_steps_are_trimmed_to_disjoint_spans() {
+        let step = |s, e| FileStep {
+            kind: StepKind::PostgresHealthy,
+            start: at(s),
+            end: at(e),
+            ok: true,
+            detail: None,
+        };
+        let out = disjoint_file_steps(vec![step(0, 10), step(5, 15)], &[(at(8), at(9))]);
+        let spans: Vec<_> = out.iter().map(|s| (s.start, s.end)).collect();
+        assert_eq!(
+            spans,
+            vec![(at(0), at(8)), (at(9), at(10)), (at(10), at(15))]
         );
     }
 }

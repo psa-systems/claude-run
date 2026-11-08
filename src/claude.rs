@@ -406,6 +406,12 @@ impl ClaudeInvoker {
         if stream_log.exists() {
             std::fs::remove_file(stream_log)?;
         }
+        // SPEC-3.14 item 3: a stale span file from an earlier run of this same
+        // stream-log name must not be read as this invocation's steps.
+        let spans_file = crate::attempt_steps::spans_file_for(stream_log);
+        if spans_file.exists() {
+            std::fs::remove_file(&spans_file)?;
+        }
 
         let cwd = claude_cfg
             .cwd
@@ -502,6 +508,8 @@ impl ClaudeInvoker {
             .env("BASH_MAX_TIMEOUT_MS", &timeout_ms);
         strip_database_url_env(&mut command);
         strip_smtp_password_env(&mut command);
+        // SPEC-3.14 item 3: where `test-postgres` reports its own timings.
+        command.env(crate::attempt_steps::STEP_SPANS_FILE_ENV, &spans_file);
         // SPEC-3.10 item 3: every `claude` child spawned for a repo workdir
         // shares that repo's compiled-dependency cache instead of rebuilding
         // every dependency into an empty `target/`. SPEC-3.10 item 4:
