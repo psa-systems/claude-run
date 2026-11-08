@@ -13615,6 +13615,26 @@ mod tests {
             assert!(!body.contains("Pause all activity"), "{body}");
         }
 
+        /// `htmx` fires a form's `submit` on its own and does not consult an
+        /// inline `onsubmit` handler's return value, so an `hx-post` form
+        /// relying on `return confirm(...)` sends the request even when the
+        /// user clicks Cancel. `hx-confirm` is htmx's own mechanism and
+        /// actually aborts the request on Cancel.
+        #[tokio::test]
+        async fn status_page_htmx_forms_use_hx_confirm_not_onsubmit() {
+            let s = web_state().await;
+            let body = body_string(status_page(State(s)).await.unwrap()).await;
+            assert!(
+                !body.contains(r#"onsubmit="return confirm"#),
+                "an hx-post form still relies on onsubmit confirm, which htmx ignores on Cancel: {body}"
+            );
+            assert!(body.contains(r#"hx-post="/api/pause""#), "{body}");
+            assert!(
+                body.contains(r#"hx-confirm="Pause all activity?"#),
+                "{body}"
+            );
+        }
+
         /// The indicator's three states. Idle says it is safe to restart; an
         /// open run row lists the run and links it; and a failed activity
         /// query renders UNKNOWN, never idle.
