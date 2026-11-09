@@ -698,13 +698,20 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
 `Failed`. `Working` is the only in-between state, and it is the only state whose truth lives inside claude-run.
 
 1. **`Working` is backed by a live run.** The field reads `Working` if and only if a `run_inflight_jobs` row exists for
-   the issue in a daemon that is running. The runner never leaves `Working` behind on any exit path, including a
-   crash, a restart, a kill, a timeout and a cancel.
+   the issue in a daemon that is running, OR the field was set to `Working` recently enough that a run started by a
+   DIFFERENT runner instance polling the same tracker query may still legitimately own it (item 2). The runner never
+   leaves `Working` behind on any exit path, including a crash, a restart, a kill, a timeout and a cancel.
 2. **Reconcile sweep.** On daemon start and every 300 seconds (the automerge reconciler interval), the runner lists
-   issues whose field reads `Working` and which have no in-flight row. Each is moved to `Needs Review` (or `Queued`
-   below the attempt cap, as in 3.3) with a comment naming the cause and the last recorded step (`SPEC-3.14`). Each
-   correction is logged at `warn` naming the issue key. A sweep that cannot read the tracker is logged at `error` and
-   retried, never treated as "nothing stuck".
+   issues whose field reads `Working` and which have no in-flight row. `run_inflight_jobs` only knows runs of the
+   daemon doing the sweep, so before correcting such an issue the sweep also reads the tracker history
+   (`IssueTracker::field_changed_at`) for the most recent change to `Working`; a change newer than the action's
+   `claude_timeout_seconds` plus a 600 second grace is left alone, since a run of another instance may still own it,
+   and the decision is logged at `info` naming the issue key. Past that window, the issue is moved to `Needs Review`
+   (or `Queued` below the attempt cap, as in 3.3) with a comment naming the cause and the last recorded step
+   (`SPEC-3.14`). Each correction is logged at `warn` naming the issue key. A sweep that cannot read the tracker, or
+   whose history read fails, is logged at `error` and retried, never treated as "nothing stuck". The startup-only
+   path (`run_inflight_jobs` rows left behind by a dead process of THIS daemon) is unaffected by the window: it
+   releases its own issues immediately.
 3. **Every finalize path ends in a closed outcome.** The table is exhaustive; a path not in it is a defect, and the
    code matches it with no wildcard arm.
 

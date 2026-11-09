@@ -831,6 +831,15 @@ fn stuck_working_comment(last_step: Option<&str>, at_cap: bool) -> String {
 /// among that action's currently open runs. A key with a live in-flight row
 /// is backed by a real run and is left untouched.
 ///
+/// CLAUDE-612: `run_inflight_jobs` only knows runs of the daemon doing the
+/// sweep, so a key with no local in-flight row may still be a live run on a
+/// DIFFERENT instance. Before correcting such a key, [`IssueTracker::field_changed_at`]
+/// is read for the most recent change to `Working`; a change newer than the
+/// action's `claude_timeout_seconds` plus a 600 second grace is left alone,
+/// on the assumption a run (anywhere) may still legitimately own it. The
+/// window passing corrects it as before; a crash of THIS daemon is still
+/// corrected immediately by [`reconcile_restart_inflight`] at startup.
+///
 /// Each stuck key is moved to `states.queued` when its recorded attempt
 /// count is below the action's `max_attempts_per_key`, else
 /// `states.needs_review`, with a comment naming the cause and the last
@@ -878,7 +887,14 @@ pub async fn reconcile_stuck_working(
         };
         let src = &cfg.youtrack;
         let action_name = &loaded.action.name;
-        let max_attempts_per_key = job::effective_limits(&defaults, &loaded).max_attempts_per_key;
+        let limits = job::effective_limits(&defaults, &loaded);
+        let max_attempts_per_key = limits.max_attempts_per_key;
+        // CLAUDE-612: a `Working` change newer than this is left alone, since
+        // a run of this action may legitimately still be running (on this
+        // daemon or another instance). 600s grace on top of the action's own
+        // timeout; revise if validation shows a legitimate run overrunning it
+        // by more.
+        let owner_window = limits.claude_timeout + Duration::from_secs(600);
 
         let creds = match secrets::resolve_youtrack_credentials(
             pool,
@@ -981,6 +997,35 @@ pub async fn reconcile_stuck_working(
                 Ok(_) => {}
                 Err(e) => {
                     error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: re-reading in-flight keys failed; key left on Working until the next tick");
+                    continue;
+                }
+            }
+
+            // CLAUDE-612: a `Working` change too recent to have timed out may
+            // be a live run owned by a different daemon instance, which this
+            // daemon's own `run_inflight_jobs` table (checked above) cannot
+            // see. Leave it alone until the window passes; a genuine stranded
+            // issue is still corrected once it does, and a crash of THIS
+            // daemon is still corrected immediately by the startup reconcile.
+            match backend.field_changed_at(key, &src.custom_field, &src.states.working) {
+                Ok(Some(changed_at)) => {
+                    let age = chrono::Utc::now().signed_duration_since(changed_at);
+                    let window =
+                        chrono::Duration::from_std(owner_window).unwrap_or(chrono::Duration::MAX);
+                    if age < window {
+                        info!(
+                            action = %action_name,
+                            key = %key,
+                            changed_at = %changed_at,
+                            window_secs = owner_window.as_secs(),
+                            "stuck-working sweep: Working change is within the owner window; left alone (another instance may own the run)"
+                        );
+                        continue;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: reading the Working change time failed; key left on Working until the next tick");
                     continue;
                 }
             }
