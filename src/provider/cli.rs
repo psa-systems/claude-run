@@ -3520,6 +3520,93 @@ mod tests {
         assert_eq!(b.get_estimation_minutes("MK-16").unwrap(), None);
     }
 
+    /// A captured `yt issue history <KEY> --json --category
+    /// CustomFieldCategory` sample (CLAUDE-612): an `Estimation` change (a
+    /// bare numeric `added`, irrelevant to the field this call cares about),
+    /// an older `AI Agent` -> `Working` change, then a newer `AI Agent` ->
+    /// `Queued` change. `field_changed_at` must skip the `Estimation` entry,
+    /// pick the newest `AI Agent`/`Working` entry (not just the last list
+    /// entry) and return its timestamp as milliseconds-since-epoch.
+    const CAPTURED_HISTORY_JSON: &str = r#"[
+      {
+        "id": "0-0.9-1",
+        "timestamp": 1794186541727,
+        "author": {"login": "x", "fullName": "X"},
+        "category": {"id": "CustomFieldCategory"},
+        "field": {"name": "Estimation", "customField": {"name": "Estimation"}},
+        "added": 120,
+        "removed": null
+      },
+      {
+        "id": "0-0.9-2",
+        "timestamp": 1794186573719,
+        "author": {"login": "x", "fullName": "X"},
+        "category": {"id": "CustomFieldCategory"},
+        "field": {"name": "AI Agent", "customField": {"name": "AI Agent"}},
+        "added": [
+          {"localizedName": null, "name": "Working", "id": "92-82", "$type": "EnumBundleElement"}
+        ],
+        "removed": [
+          {"localizedName": null, "name": "Queued", "id": "92-81", "$type": "EnumBundleElement"}
+        ]
+      },
+      {
+        "id": "0-0.9-3",
+        "timestamp": 1794186600000,
+        "author": {"login": "x", "fullName": "X"},
+        "category": {"id": "CustomFieldCategory"},
+        "field": {"name": "AI Agent", "customField": {"name": "AI Agent"}},
+        "added": [
+          {"localizedName": null, "name": "Queued", "id": "92-81", "$type": "EnumBundleElement"}
+        ],
+        "removed": [
+          {"localizedName": null, "name": "Working", "id": "92-82", "$type": "EnumBundleElement"}
+        ]
+      }
+    ]"#;
+
+    #[test]
+    fn field_changed_at_parses_captured_history_and_picks_the_newest_match() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &[
+                "issue",
+                "history",
+                "MK-16",
+                "--json",
+                "--category",
+                "CustomFieldCategory",
+            ],
+            CAPTURED_HISTORY_JSON,
+        ));
+        let at = b
+            .field_changed_at("MK-16", "AI Agent", "Working")
+            .unwrap()
+            .expect("one matching entry");
+        assert_eq!(at.timestamp_millis(), 1794186573719);
+    }
+
+    #[test]
+    fn field_changed_at_is_none_with_no_matching_entry() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &[
+                "issue",
+                "history",
+                "MK-16",
+                "--json",
+                "--category",
+                "CustomFieldCategory",
+            ],
+            CAPTURED_HISTORY_JSON,
+        ));
+        assert_eq!(
+            b.field_changed_at("MK-16", "AI Agent", "Needs Review")
+                .unwrap(),
+            None
+        );
+    }
+
     #[test]
     fn nonzero_exit_is_typed_cli_failure() {
         let b = backend(StubRunner::new().fail(
