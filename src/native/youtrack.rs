@@ -878,7 +878,14 @@ pub async fn reconcile_stuck_working(
         };
         let src = &cfg.youtrack;
         let action_name = &loaded.action.name;
-        let max_attempts_per_key = job::effective_limits(&defaults, &loaded).max_attempts_per_key;
+        let limits = job::effective_limits(&defaults, &loaded);
+        let max_attempts_per_key = limits.max_attempts_per_key;
+        // CLAUDE-612: a `Working` issue set within this window may still be
+        // backed by a live run owned by another runner instance, which this
+        // daemon's own in-flight table cannot see. 600s is an assumed grace on
+        // top of the action's own timeout; revisit if validation shows a
+        // legitimate run overrunning it by more.
+        let stuck_working_grace = limits.claude_timeout + Duration::from_secs(600);
 
         let creds = match secrets::resolve_youtrack_credentials(
             pool,
@@ -981,6 +988,35 @@ pub async fn reconcile_stuck_working(
                 Ok(_) => {}
                 Err(e) => {
                     error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: re-reading in-flight keys failed; key left on Working until the next tick");
+                    continue;
+                }
+            }
+
+            // CLAUDE-612: this daemon's own in-flight table only knows runs it
+            // started itself, so a `Working` issue with no local row can still
+            // be legitimately alive under another runner instance. The
+            // tracker's own history is the one source both instances agree
+            // on: leave the issue alone while its most recent change to
+            // `Working` is newer than this action's timeout plus a grace.
+            match backend.field_changed_at(key, &src.custom_field, &src.states.working) {
+                Ok(Some(changed_at)) => {
+                    let age = chrono::Utc::now().signed_duration_since(changed_at);
+                    let window = chrono::Duration::from_std(stuck_working_grace)
+                        .unwrap_or(chrono::Duration::MAX);
+                    if age < window {
+                        info!(
+                            action = %action_name,
+                            key = %key,
+                            changed_at = %changed_at,
+                            window_secs = stuck_working_grace.as_secs(),
+                            "stuck-working sweep: set to Working within the grace window; may be backed by another instance, left alone"
+                        );
+                        continue;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: reading the AI Agent field's history failed; key left on Working until the next tick");
                     continue;
                 }
             }

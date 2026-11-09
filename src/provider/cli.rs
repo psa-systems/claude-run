@@ -571,6 +571,38 @@ struct EstimationRaw {
     minutes: i64,
 }
 
+/// One entry of `yt issue history <KEY> --json --category CustomFieldCategory`.
+/// `added` varies by field type: an array of enum/user objects each carrying a
+/// `name` (what every custom field this backend cares about uses) or a bare
+/// scalar for a numeric field (`Estimation`, `Timer time`); `added_contains`
+/// handles both shapes. `timestamp` is epoch milliseconds.
+#[derive(Debug, Deserialize)]
+struct HistoryEntry {
+    timestamp: i64,
+    field: HistoryField,
+    #[serde(default)]
+    added: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryField {
+    name: String,
+}
+
+/// Whether a `yt issue history` entry's `added` value represents having been
+/// set to `value`: either a bare string equal to `value`, or (the common case
+/// for an enum/state/user field) an array holding an object whose `name`
+/// equals `value`.
+fn history_added_contains(added: &serde_json::Value, value: &str) -> bool {
+    match added {
+        serde_json::Value::String(s) => s == value,
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| item.get("name").and_then(|n| n.as_str()) == Some(value)),
+        _ => false,
+    }
+}
+
 /// One project as `yt project list --json` emits it. Only the short name and the
 /// archived flag are consumed; unknown fields are ignored.
 #[derive(Debug, Deserialize)]
@@ -2081,6 +2113,46 @@ impl IssueTracker for CliBackend {
         let parsed: EstimationField =
             Self::parse_json(&self.yt, "yt issue get-field --json", &stdout)?;
         Ok(parsed.raw.map(|r| r.minutes))
+    }
+
+    /// CLAUDE-612: the stuck-Working sweep's grace-window check. Takes the
+    /// newest history entry (by `timestamp`, not list order, so an
+    /// out-of-order response is still handled correctly) whose `field.name`
+    /// matches `field` and whose `added` holds `value`.
+    fn field_changed_at(
+        &self,
+        key: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let stdout = self.yt_ok(&[
+            "issue",
+            "history",
+            key,
+            "--json",
+            "--category",
+            "CustomFieldCategory",
+        ])?;
+        let parsed: Vec<HistoryEntry> =
+            Self::parse_json(&self.yt, "yt issue history --json", &stdout)?;
+        let mut newest: Option<(i64, chrono::DateTime<chrono::Utc>)> = None;
+        for entry in &parsed {
+            if entry.field.name != field || !history_added_contains(&entry.added, value) {
+                continue;
+            }
+            if newest.is_some_and(|(ts, _)| ts >= entry.timestamp) {
+                continue;
+            }
+            let at = chrono::DateTime::from_timestamp_millis(entry.timestamp).ok_or_else(|| {
+                Error::Other(anyhow::anyhow!(
+                    "yt issue history --json for {key}: field {field} has an out-of-range \
+                     timestamp {}",
+                    entry.timestamp
+                ))
+            })?;
+            newest = Some((entry.timestamp, at));
+        }
+        Ok(newest.map(|(_, at)| at))
     }
 
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo> {
