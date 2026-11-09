@@ -274,6 +274,15 @@ impl IssueTracker for AuditedTracker<'_> {
     fn get_estimation_minutes(&self, key: &str) -> Result<Option<i64>> {
         self.inner.get_estimation_minutes(key)
     }
+
+    fn field_changed_at(
+        &self,
+        key: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        self.inner.field_changed_at(key, field, value)
+    }
 }
 
 #[cfg(test)]
