@@ -3518,6 +3518,89 @@ mod tests {
         assert_eq!(b.get_estimation_minutes("MK-16").unwrap(), None);
     }
 
+    /// A captured `yt issue history --json --category CustomFieldCategory`
+    /// sample (CLAUDE-612): an `Estimation` change (a bare number, not an
+    /// enum array, so it must never match), two `AI Agent` changes TO
+    /// `Working` at different timestamps, and a later `AI Agent` change away
+    /// from `Working`. `field_changed_at` must pick the NEWER of the two
+    /// matching entries, not the first or last in the array.
+    const HISTORY_SAMPLE: &str = r#"[
+        {
+            "id": "0-0.9-1",
+            "timestamp": 1000,
+            "field": { "name": "Estimation" },
+            "added": 60,
+            "removed": null
+        },
+        {
+            "id": "0-0.9-2",
+            "timestamp": 2000,
+            "field": { "name": "AI Agent" },
+            "added": [{ "name": "Working", "id": "92-82" }],
+            "removed": [{ "name": "Queued", "id": "92-81" }]
+        },
+        {
+            "id": "0-0.9-3",
+            "timestamp": 5000,
+            "field": { "name": "AI Agent" },
+            "added": [{ "name": "Queued", "id": "92-81" }],
+            "removed": [{ "name": "Working", "id": "92-82" }]
+        },
+        {
+            "id": "0-0.9-4",
+            "timestamp": 4000,
+            "field": { "name": "AI Agent" },
+            "added": [{ "name": "Working", "id": "92-82" }],
+            "removed": [{ "name": "Queued", "id": "92-81" }]
+        }
+    ]"#;
+
+    #[test]
+    fn field_changed_at_picks_the_newest_matching_entry() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &[
+                "issue",
+                "history",
+                "MK-16",
+                "--json",
+                "--category",
+                "CustomFieldCategory",
+            ],
+            HISTORY_SAMPLE,
+        ));
+        let got = b
+            .field_changed_at("MK-16", "AI Agent", "Working")
+            .unwrap()
+            .expect("a matching entry exists");
+        assert_eq!(
+            got.timestamp_millis(),
+            4000,
+            "must pick timestamp 4000, not 2000 (older) or 5000 (a different value)"
+        );
+    }
+
+    #[test]
+    fn field_changed_at_is_none_with_no_matching_entry() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &[
+                "issue",
+                "history",
+                "MK-16",
+                "--json",
+                "--category",
+                "CustomFieldCategory",
+            ],
+            HISTORY_SAMPLE,
+        ));
+        assert_eq!(
+            b.field_changed_at("MK-16", "AI Agent", "Needs Review")
+                .unwrap(),
+            None
+        );
+    }
+
     #[test]
     fn nonzero_exit_is_typed_cli_failure() {
         let b = backend(StubRunner::new().fail(

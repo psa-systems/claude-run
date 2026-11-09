@@ -17827,6 +17827,18 @@ mod tests {
                     &["issue", "get-field", "MK-20", "AI Agent"],
                     "Working\n",
                 )
+                .ok(
+                    "yt",
+                    &[
+                        "issue",
+                        "history",
+                        "MK-20",
+                        "--json",
+                        "--category",
+                        "CustomFieldCategory",
+                    ],
+                    "[]",
+                )
                 .ok_prefix("yt issue comment MK-20", "")
                 .ok(
                     "yt",
@@ -17940,6 +17952,18 @@ mod tests {
                     &["issue", "get-field", "MK-22", "AI Agent"],
                     "Working\n",
                 )
+                .ok(
+                    "yt",
+                    &[
+                        "issue",
+                        "history",
+                        "MK-22",
+                        "--json",
+                        "--category",
+                        "CustomFieldCategory",
+                    ],
+                    "[]",
+                )
                 .ok_prefix("yt issue comment MK-22", "")
                 .ok(
                     "yt",
@@ -18030,6 +18054,239 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
         assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+    }
+
+    /// A single `yt issue history --json` entry changing `AI Agent` to
+    /// `Working` at `timestamp_ms`, in the shape `CliBackend::field_changed_at`
+    /// parses (CLAUDE-612).
+    fn working_history_json(timestamp_ms: i64) -> String {
+        format!(
+            r#"[{{"timestamp":{timestamp_ms},"field":{{"name":"AI Agent"}},"added":[{{"name":"Working"}}]}}]"#
+        )
+    }
+
+    /// CLAUDE-612: a `Working` issue with no local in-flight row, but whose
+    /// latest change to `Working` is only 10 minutes old (inside the default
+    /// action's 600s timeout + 600s grace = 1200s window), is left alone: no
+    /// write, no `run_events` row. A different runner instance may still own
+    /// the run.
+    #[tokio::test]
+    async fn reconcile_stuck_working_leaves_a_recently_set_working_issue_alone() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let ten_min_ago_ms =
+            (chrono::Utc::now() - chrono::Duration::minutes(10)).timestamp_millis();
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-30"}]"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-30", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "yt",
+                    &[
+                        "issue",
+                        "history",
+                        "MK-30",
+                        "--json",
+                        "--category",
+                        "CustomFieldCategory",
+                    ],
+                    &working_history_json(ten_min_ago_ms),
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        {
+            let calls = runner.calls.lock().unwrap();
+            assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+        }
+        let events = state::run_events_for_action(&pool, "yt-action", 10)
+            .await
+            .unwrap();
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// CLAUDE-612: the same shape, but the latest change to `Working` is
+    /// older than the window (25 minutes, past the default 1200s window), so
+    /// the issue is corrected to `Queued` as it would have been before this
+    /// change.
+    #[tokio::test]
+    async fn reconcile_stuck_working_corrects_a_working_issue_past_the_owner_window() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let twenty_five_min_ago_ms =
+            (chrono::Utc::now() - chrono::Duration::minutes(25)).timestamp_millis();
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-31"}]"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-31", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "yt",
+                    &[
+                        "issue",
+                        "history",
+                        "MK-31",
+                        "--json",
+                        "--category",
+                        "CustomFieldCategory",
+                    ],
+                    &working_history_json(twenty_five_min_ago_ms),
+                )
+                .ok_prefix("yt issue comment MK-31", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-31", "AI Agent", "Queued"],
+                    "",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-31 AI Agent Queued"),
+            "{calls:?}"
+        );
+    }
+
+    /// CLAUDE-612: a `field_changed_at` read failure leaves the issue on
+    /// `Working` (no write) and is retried next tick, exactly like the other
+    /// read failures in this loop.
+    #[tokio::test]
+    async fn reconcile_stuck_working_history_read_failure_changes_nothing() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-32"}]"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-32", "AI Agent"],
+                    "Working\n",
+                )
+                .fail(
+                    "yt",
+                    &[
+                        "issue",
+                        "history",
+                        "MK-32",
+                        "--json",
+                        "--category",
+                        "CustomFieldCategory",
+                    ],
+                    1,
+                    "boom",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+    }
+
+    /// CLAUDE-612: no recorded change to `Working` at all (`field_changed_at`
+    /// returns `None`, e.g. the issue was created directly in that state) is
+    /// corrected exactly as before the owner-window change.
+    #[tokio::test]
+    async fn reconcile_stuck_working_corrects_an_issue_with_no_recorded_working_change() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-33"}]"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-33", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "yt",
+                    &[
+                        "issue",
+                        "history",
+                        "MK-33",
+                        "--json",
+                        "--category",
+                        "CustomFieldCategory",
+                    ],
+                    "[]",
+                )
+                .ok_prefix("yt issue comment MK-33", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-33", "AI Agent", "Queued"],
+                    "",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-33 AI Agent Queued"),
+            "{calls:?}"
+        );
     }
 
     // --- CLAUDE-449: the post-success review session ---
