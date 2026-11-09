@@ -27,7 +27,6 @@ Thumbs.db
 
 # Project-internal docs and tooling that have no role in the build
 .claude
-.devcontainer
 CLAUDE.md
 README.md
 LICENSE.md

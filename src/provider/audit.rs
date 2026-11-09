@@ -267,14 +267,6 @@ impl IssueTracker for AuditedTracker<'_> {
         self.inner.list_query_top(query, top)
     }
 
-    fn project_show(&self, project_key: &str) -> Result<String> {
-        self.inner.project_show(project_key)
-    }
-
-    fn get_estimation_minutes(&self, key: &str) -> Result<Option<i64>> {
-        self.inner.get_estimation_minutes(key)
-    }
-
     fn field_changed_at(
         &self,
         key: &str,
@@ -282,6 +274,14 @@ impl IssueTracker for AuditedTracker<'_> {
         value: &str,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
         self.inner.field_changed_at(key, field, value)
+    }
+
+    fn project_show(&self, project_key: &str) -> Result<String> {
+        self.inner.project_show(project_key)
+    }
+
+    fn get_estimation_minutes(&self, key: &str) -> Result<Option<i64>> {
+        self.inner.get_estimation_minutes(key)
     }
 }
 
