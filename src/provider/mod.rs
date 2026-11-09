@@ -355,14 +355,14 @@ pub trait IssueTracker: Send + Sync {
         )))
     }
 
-    /// The time of the most recent change to `field` that set it to `value`,
-    /// e.g. `("CLAUDE-612", "AI Agent", "Working")`. `None` when the issue's
-    /// history holds no such change. Backs the stuck-Working sweep's grace
-    /// window (CLAUDE-612): a `Working` issue set recently enough may still be
-    /// backed by a live run owned by another instance, which this daemon's own
-    /// in-flight table cannot see. The default errs "not supported", like the
-    /// other optional methods above, so an implementor with no history read
-    /// (including the test stub in `src/web/webhooks.rs`) is unchanged.
+    /// The time of the most recent change that set `field` to `value` on
+    /// `key`, read from the issue's activity history; `None` when the
+    /// history holds no such change. Backs the stuck-Working sweep's
+    /// owner-window check (CLAUDE-612): a `Working` issue set recently
+    /// enough for a run to still be legitimately alive, on ANY instance, is
+    /// left alone rather than corrected. The default errors "not supported",
+    /// so a backend with no history support never silently treats every
+    /// issue as stranded.
     fn field_changed_at(
         &self,
         key: &str,

@@ -831,6 +831,15 @@ fn stuck_working_comment(last_step: Option<&str>, at_cap: bool) -> String {
 /// among that action's currently open runs. A key with a live in-flight row
 /// is backed by a real run and is left untouched.
 ///
+/// CLAUDE-612: `run_inflight_jobs` only knows runs of the daemon doing the
+/// sweep, so a key with no local in-flight row may still be a live run on a
+/// DIFFERENT instance. Before correcting such a key, [`IssueTracker::field_changed_at`]
+/// is read for the most recent change to `Working`; a change newer than the
+/// action's `claude_timeout_seconds` plus a 600 second grace is left alone,
+/// on the assumption a run (anywhere) may still legitimately own it. The
+/// window passing corrects it as before; a crash of THIS daemon is still
+/// corrected immediately by [`reconcile_restart_inflight`] at startup.
+///
 /// Each stuck key is moved to `states.queued` when its recorded attempt
 /// count is below the action's `max_attempts_per_key`, else
 /// `states.needs_review`, with a comment naming the cause and the last
@@ -880,12 +889,12 @@ pub async fn reconcile_stuck_working(
         let action_name = &loaded.action.name;
         let limits = job::effective_limits(&defaults, &loaded);
         let max_attempts_per_key = limits.max_attempts_per_key;
-        // CLAUDE-612: a `Working` issue set within this window may still be
-        // backed by a live run owned by another runner instance, which this
-        // daemon's own in-flight table cannot see. 600s is an assumed grace on
-        // top of the action's own timeout; revisit if validation shows a
-        // legitimate run overrunning it by more.
-        let stuck_working_grace = limits.claude_timeout + Duration::from_secs(600);
+        // CLAUDE-612: a `Working` change newer than this is left alone, since
+        // a run of this action may legitimately still be running (on this
+        // daemon or another instance). 600s grace on top of the action's own
+        // timeout; revise if validation shows a legitimate run overrunning it
+        // by more.
+        let owner_window = limits.claude_timeout + Duration::from_secs(600);
 
         let creds = match secrets::resolve_youtrack_credentials(
             pool,
@@ -992,31 +1001,31 @@ pub async fn reconcile_stuck_working(
                 }
             }
 
-            // CLAUDE-612: this daemon's own in-flight table only knows runs it
-            // started itself, so a `Working` issue with no local row can still
-            // be legitimately alive under another runner instance. The
-            // tracker's own history is the one source both instances agree
-            // on: leave the issue alone while its most recent change to
-            // `Working` is newer than this action's timeout plus a grace.
+            // CLAUDE-612: a `Working` change too recent to have timed out may
+            // be a live run owned by a different daemon instance, which this
+            // daemon's own `run_inflight_jobs` table (checked above) cannot
+            // see. Leave it alone until the window passes; a genuine stranded
+            // issue is still corrected once it does, and a crash of THIS
+            // daemon is still corrected immediately by the startup reconcile.
             match backend.field_changed_at(key, &src.custom_field, &src.states.working) {
                 Ok(Some(changed_at)) => {
                     let age = chrono::Utc::now().signed_duration_since(changed_at);
-                    let window = chrono::Duration::from_std(stuck_working_grace)
-                        .unwrap_or(chrono::Duration::MAX);
+                    let window =
+                        chrono::Duration::from_std(owner_window).unwrap_or(chrono::Duration::MAX);
                     if age < window {
                         info!(
                             action = %action_name,
                             key = %key,
                             changed_at = %changed_at,
-                            window_secs = stuck_working_grace.as_secs(),
-                            "stuck-working sweep: set to Working within the grace window; may be backed by another instance, left alone"
+                            window_secs = owner_window.as_secs(),
+                            "stuck-working sweep: Working change is within the owner window; left alone (another instance may own the run)"
                         );
                         continue;
                     }
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: reading the AI Agent field's history failed; key left on Working until the next tick");
+                    error!(action = %action_name, key = %key, error = %e, "stuck-working sweep: reading the Working change time failed; key left on Working until the next tick");
                     continue;
                 }
             }
@@ -18047,23 +18056,22 @@ mod tests {
         assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
     }
 
-    /// `yt issue history --json` entries for a `Working` change `ms_ago`
-    /// milliseconds in the past, in the shape `yt` actually emits (the `added`
-    /// array of an enum field, carrying the target `name`).
-    fn working_history_json(ms_ago: i64) -> String {
-        let ts = chrono::Utc::now().timestamp_millis() - ms_ago;
+    /// A single `yt issue history --json` entry changing `AI Agent` to
+    /// `Working` at `timestamp_ms`, in the shape `CliBackend::field_changed_at`
+    /// parses (CLAUDE-612).
+    fn working_history_json(timestamp_ms: i64) -> String {
         format!(
-            r#"[{{"id":"0-0.9-1","timestamp":{ts},"author":{{"login":"x","fullName":"X"}},"category":{{"id":"CustomFieldCategory"}},"field":{{"name":"AI Agent","customField":{{"name":"AI Agent"}}}},"added":[{{"localizedName":null,"name":"Working","id":"92-82","$type":"EnumBundleElement"}}],"removed":[{{"localizedName":null,"name":"Queued","id":"92-81","$type":"EnumBundleElement"}}]}}]"#
+            r#"[{{"timestamp":{timestamp_ms},"field":{{"name":"AI Agent"}},"added":[{{"name":"Working"}}]}}]"#
         )
     }
 
     /// CLAUDE-612: a `Working` issue with no local in-flight row, but whose
-    /// most recent change to `Working` is 10 minutes old (inside the default
+    /// latest change to `Working` is only 10 minutes old (inside the default
     /// action's 600s timeout + 600s grace = 1200s window), is left alone: no
-    /// write, no `run_events` row, because another instance may still own a
-    /// live run for it.
+    /// write, no `run_events` row. A different runner instance may still own
+    /// the run.
     #[tokio::test]
-    async fn reconcile_stuck_working_leaves_a_recently_working_issue_alone() {
+    async fn reconcile_stuck_working_leaves_a_recently_set_working_issue_alone() {
         let pool = mem_pool().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(dir.path());
@@ -18072,16 +18080,19 @@ mod tests {
             .await
             .unwrap();
 
+        let ten_min_ago_ms =
+            (chrono::Utc::now() - chrono::Duration::minutes(10)).timestamp_millis();
+
         let runner = Arc::new(
             StubRunner::new()
                 .ok(
                     "yt",
                     &["list", "--query=AI Agent: Working", "--json"],
-                    r#"[{"idReadable":"MK-24"}]"#,
+                    r#"[{"idReadable":"MK-30"}]"#,
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-24", "AI Agent"],
+                    &["issue", "get-field", "MK-30", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -18089,12 +18100,12 @@ mod tests {
                     &[
                         "issue",
                         "history",
-                        "MK-24",
+                        "MK-30",
                         "--json",
                         "--category",
                         "CustomFieldCategory",
                     ],
-                    &working_history_json(10 * 60 * 1000),
+                    &working_history_json(ten_min_ago_ms),
                 ),
         );
         let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
@@ -18112,11 +18123,12 @@ mod tests {
         assert!(events.is_empty(), "{events:?}");
     }
 
-    /// The same shape as above, but the `Working` change is 25 minutes old
-    /// (outside the 1200s window): the issue is corrected to `Queued`, same as
-    /// the no-history case.
+    /// CLAUDE-612: the same shape, but the latest change to `Working` is
+    /// older than the window (25 minutes, past the default 1200s window), so
+    /// the issue is corrected to `Queued` as it would have been before this
+    /// change.
     #[tokio::test]
-    async fn reconcile_stuck_working_corrects_a_stale_working_issue_past_the_window() {
+    async fn reconcile_stuck_working_corrects_a_working_issue_past_the_owner_window() {
         let pool = mem_pool().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(dir.path());
@@ -18125,16 +18137,19 @@ mod tests {
             .await
             .unwrap();
 
+        let twenty_five_min_ago_ms =
+            (chrono::Utc::now() - chrono::Duration::minutes(25)).timestamp_millis();
+
         let runner = Arc::new(
             StubRunner::new()
                 .ok(
                     "yt",
                     &["list", "--query=AI Agent: Working", "--json"],
-                    r#"[{"idReadable":"MK-25"}]"#,
+                    r#"[{"idReadable":"MK-31"}]"#,
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-25", "AI Agent"],
+                    &["issue", "get-field", "MK-31", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -18142,17 +18157,17 @@ mod tests {
                     &[
                         "issue",
                         "history",
-                        "MK-25",
+                        "MK-31",
                         "--json",
                         "--category",
                         "CustomFieldCategory",
                     ],
-                    &working_history_json(25 * 60 * 1000),
+                    &working_history_json(twenty_five_min_ago_ms),
                 )
-                .ok_prefix("yt issue comment MK-25", "")
+                .ok_prefix("yt issue comment MK-31", "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-25", "AI Agent", "Queued"],
+                    &["issue", "set-field", "MK-31", "AI Agent", "Queued"],
                     "",
                 ),
         );
@@ -18164,14 +18179,14 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-25 AI Agent Queued"),
+                .any(|c| c == "yt issue set-field MK-31 AI Agent Queued"),
             "{calls:?}"
         );
     }
 
-    /// A `field_changed_at` read failure (the `yt issue history` call erroring)
-    /// leaves the issue on `Working` and is retried next tick, exactly like the
-    /// other read failures in this loop.
+    /// CLAUDE-612: a `field_changed_at` read failure leaves the issue on
+    /// `Working` (no write) and is retried next tick, exactly like the other
+    /// read failures in this loop.
     #[tokio::test]
     async fn reconcile_stuck_working_history_read_failure_changes_nothing() {
         let pool = mem_pool().await;
@@ -18187,11 +18202,11 @@ mod tests {
                 .ok(
                     "yt",
                     &["list", "--query=AI Agent: Working", "--json"],
-                    r#"[{"idReadable":"MK-26"}]"#,
+                    r#"[{"idReadable":"MK-32"}]"#,
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-26", "AI Agent"],
+                    &["issue", "get-field", "MK-32", "AI Agent"],
                     "Working\n",
                 )
                 .fail(
@@ -18199,7 +18214,7 @@ mod tests {
                     &[
                         "issue",
                         "history",
-                        "MK-26",
+                        "MK-32",
                         "--json",
                         "--category",
                         "CustomFieldCategory",
@@ -18215,6 +18230,63 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
         assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+    }
+
+    /// CLAUDE-612: no recorded change to `Working` at all (`field_changed_at`
+    /// returns `None`, e.g. the issue was created directly in that state) is
+    /// corrected exactly as before the owner-window change.
+    #[tokio::test]
+    async fn reconcile_stuck_working_corrects_an_issue_with_no_recorded_working_change() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-33"}]"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-33", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "yt",
+                    &[
+                        "issue",
+                        "history",
+                        "MK-33",
+                        "--json",
+                        "--category",
+                        "CustomFieldCategory",
+                    ],
+                    "[]",
+                )
+                .ok_prefix("yt issue comment MK-33", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-33", "AI Agent", "Queued"],
+                    "",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_stuck_working(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-33 AI Agent Queued"),
+            "{calls:?}"
+        );
     }
 
     // --- CLAUDE-449: the post-success review session ---
