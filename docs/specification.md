@@ -698,13 +698,22 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
 `Failed`. `Working` is the only in-between state, and it is the only state whose truth lives inside claude-run.
 
 1. **`Working` is backed by a live run.** The field reads `Working` if and only if a `run_inflight_jobs` row exists for
-   the issue in a daemon that is running. The runner never leaves `Working` behind on any exit path, including a
-   crash, a restart, a kill, a timeout and a cancel.
+   the issue in a daemon that is running, OR the field was set to `Working` recently enough that a run elsewhere may
+   still legitimately own it (item 2's grace window; a second runner instance polling the same tracker query has no
+   visibility into another instance's `run_inflight_jobs` table). The runner never leaves `Working` behind on any exit
+   path, including a crash, a restart, a kill, a timeout and a cancel.
 2. **Reconcile sweep.** On daemon start and every 300 seconds (the automerge reconciler interval), the runner lists
-   issues whose field reads `Working` and which have no in-flight row. Each is moved to `Needs Review` (or `Queued`
-   below the attempt cap, as in 3.3) with a comment naming the cause and the last recorded step (`SPEC-3.14`). Each
-   correction is logged at `warn` naming the issue key. A sweep that cannot read the tracker is logged at `error` and
-   retried, never treated as "nothing stuck".
+   issues whose field reads `Working` and which have no in-flight row in this daemon's own state. Before correcting
+   such an issue, it reads the tracker's own history (`IssueTracker::field_changed_at`) for the most recent change
+   that set the field to `Working`; the issue is left alone (logged at `info`, naming the key) while that change is
+   newer than the action's `claude_timeout_seconds` plus a 600 second grace, since another runner instance may still
+   own a live run for it that this daemon's `run_inflight_jobs` table cannot see (CLAUDE-612). A history read failure
+   leaves the issue on `Working` and is logged at `error`, retried next tick; no recorded change to `Working` is
+   treated as stranded, same as before. Past that window, the issue is moved to `Needs Review` (or `Queued` below the
+   attempt cap, as in 3.3) with a comment naming the cause and the last recorded step (`SPEC-3.14`). Each correction is
+   logged at `warn` naming the issue key. A sweep that cannot read the tracker is logged at `error` and retried, never
+   treated as "nothing stuck". The startup-only restart-inflight reconcile (`reconcile_restart_inflight`) is unchanged
+   by this window: it only ever corrects this daemon's own issues, immediately, on its own restart.
 3. **Every finalize path ends in a closed outcome.** The table is exhaustive; a path not in it is a defect, and the
    code matches it with no wildcard arm.
 

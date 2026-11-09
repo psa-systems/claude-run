@@ -571,6 +571,38 @@ struct EstimationRaw {
     minutes: i64,
 }
 
+/// One entry of `yt issue history <KEY> --json --category CustomFieldCategory`.
+/// `added` varies by field type: an array of enum/user objects each carrying a
+/// `name` (what every custom field this backend cares about uses) or a bare
+/// scalar for a numeric field (`Estimation`, `Timer time`); `added_contains`
+/// handles both shapes. `timestamp` is epoch milliseconds.
+#[derive(Debug, Deserialize)]
+struct HistoryEntry {
+    timestamp: i64,
+    field: HistoryField,
+    #[serde(default)]
+    added: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryField {
+    name: String,
+}
+
+/// Whether a `yt issue history` entry's `added` value represents having been
+/// set to `value`: either a bare string equal to `value`, or (the common case
+/// for an enum/state/user field) an array holding an object whose `name`
+/// equals `value`.
+fn history_added_contains(added: &serde_json::Value, value: &str) -> bool {
+    match added {
+        serde_json::Value::String(s) => s == value,
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| item.get("name").and_then(|n| n.as_str()) == Some(value)),
+        _ => false,
+    }
+}
+
 /// One project as `yt project list --json` emits it. Only the short name and the
 /// archived flag are consumed; unknown fields are ignored.
 #[derive(Debug, Deserialize)]
@@ -2083,6 +2115,46 @@ impl IssueTracker for CliBackend {
         Ok(parsed.raw.map(|r| r.minutes))
     }
 
+    /// CLAUDE-612: the stuck-Working sweep's grace-window check. Takes the
+    /// newest history entry (by `timestamp`, not list order, so an
+    /// out-of-order response is still handled correctly) whose `field.name`
+    /// matches `field` and whose `added` holds `value`.
+    fn field_changed_at(
+        &self,
+        key: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let stdout = self.yt_ok(&[
+            "issue",
+            "history",
+            key,
+            "--json",
+            "--category",
+            "CustomFieldCategory",
+        ])?;
+        let parsed: Vec<HistoryEntry> =
+            Self::parse_json(&self.yt, "yt issue history --json", &stdout)?;
+        let mut newest: Option<(i64, chrono::DateTime<chrono::Utc>)> = None;
+        for entry in &parsed {
+            if entry.field.name != field || !history_added_contains(&entry.added, value) {
+                continue;
+            }
+            if newest.is_some_and(|(ts, _)| ts >= entry.timestamp) {
+                continue;
+            }
+            let at = chrono::DateTime::from_timestamp_millis(entry.timestamp).ok_or_else(|| {
+                Error::Other(anyhow::anyhow!(
+                    "yt issue history --json for {key}: field {field} has an out-of-range \
+                     timestamp {}",
+                    entry.timestamp
+                ))
+            })?;
+            newest = Some((entry.timestamp, at));
+        }
+        Ok(newest.map(|(_, at)| at))
+    }
+
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo> {
         // `vcs` is a command group; `list` is the subcommand that takes the
         // project short-name positional. Omitting it makes the project land in
@@ -3446,6 +3518,93 @@ mod tests {
             r#"{"field":"Estimation","value":null,"type":"","raw":null}"#,
         ));
         assert_eq!(b.get_estimation_minutes("MK-16").unwrap(), None);
+    }
+
+    /// A captured `yt issue history <KEY> --json --category
+    /// CustomFieldCategory` sample (CLAUDE-612): an `Estimation` change (a
+    /// bare numeric `added`, irrelevant to the field this call cares about),
+    /// an older `AI Agent` -> `Working` change, then a newer `AI Agent` ->
+    /// `Queued` change. `field_changed_at` must skip the `Estimation` entry,
+    /// pick the newest `AI Agent`/`Working` entry (not just the last list
+    /// entry) and return its timestamp as milliseconds-since-epoch.
+    const CAPTURED_HISTORY_JSON: &str = r#"[
+      {
+        "id": "0-0.9-1",
+        "timestamp": 1794186541727,
+        "author": {"login": "x", "fullName": "X"},
+        "category": {"id": "CustomFieldCategory"},
+        "field": {"name": "Estimation", "customField": {"name": "Estimation"}},
+        "added": 120,
+        "removed": null
+      },
+      {
+        "id": "0-0.9-2",
+        "timestamp": 1794186573719,
+        "author": {"login": "x", "fullName": "X"},
+        "category": {"id": "CustomFieldCategory"},
+        "field": {"name": "AI Agent", "customField": {"name": "AI Agent"}},
+        "added": [
+          {"localizedName": null, "name": "Working", "id": "92-82", "$type": "EnumBundleElement"}
+        ],
+        "removed": [
+          {"localizedName": null, "name": "Queued", "id": "92-81", "$type": "EnumBundleElement"}
+        ]
+      },
+      {
+        "id": "0-0.9-3",
+        "timestamp": 1794186600000,
+        "author": {"login": "x", "fullName": "X"},
+        "category": {"id": "CustomFieldCategory"},
+        "field": {"name": "AI Agent", "customField": {"name": "AI Agent"}},
+        "added": [
+          {"localizedName": null, "name": "Queued", "id": "92-81", "$type": "EnumBundleElement"}
+        ],
+        "removed": [
+          {"localizedName": null, "name": "Working", "id": "92-82", "$type": "EnumBundleElement"}
+        ]
+      }
+    ]"#;
+
+    #[test]
+    fn field_changed_at_parses_captured_history_and_picks_the_newest_match() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &[
+                "issue",
+                "history",
+                "MK-16",
+                "--json",
+                "--category",
+                "CustomFieldCategory",
+            ],
+            CAPTURED_HISTORY_JSON,
+        ));
+        let at = b
+            .field_changed_at("MK-16", "AI Agent", "Working")
+            .unwrap()
+            .expect("one matching entry");
+        assert_eq!(at.timestamp_millis(), 1794186573719);
+    }
+
+    #[test]
+    fn field_changed_at_is_none_with_no_matching_entry() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &[
+                "issue",
+                "history",
+                "MK-16",
+                "--json",
+                "--category",
+                "CustomFieldCategory",
+            ],
+            CAPTURED_HISTORY_JSON,
+        ));
+        assert_eq!(
+            b.field_changed_at("MK-16", "AI Agent", "Needs Review")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

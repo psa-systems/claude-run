@@ -354,6 +354,26 @@ pub trait IssueTracker: Send + Sync {
             "project_show not supported by this tracker backend"
         )))
     }
+
+    /// The time of the most recent change to `field` that set it to `value`,
+    /// e.g. `("CLAUDE-612", "AI Agent", "Working")`. `None` when the issue's
+    /// history holds no such change. Backs the stuck-Working sweep's grace
+    /// window (CLAUDE-612): a `Working` issue set recently enough may still be
+    /// backed by a live run owned by another instance, which this daemon's own
+    /// in-flight table cannot see. The default errs "not supported", like the
+    /// other optional methods above, so an implementor with no history read
+    /// (including the test stub in `src/web/webhooks.rs`) is unchanged.
+    fn field_changed_at(
+        &self,
+        key: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let _ = (key, field, value);
+        Err(Error::Other(anyhow::anyhow!(
+            "field_changed_at not supported by this tracker backend"
+        )))
+    }
 }
 
 /// SPEC-8.9: render a failed [`Forge::repo_access`] probe as an error an
