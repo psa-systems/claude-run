@@ -477,6 +477,66 @@ pub fn validate_pr_subject(subject: &str, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a PR tip body whose issue-reference tail is not the bare `#KEY-N`
+/// block the operator's rule requires (CLAUDE-623): a line anywhere in the
+/// body that is only `Closes` / `Fixes` / `Resolves` / `Refs` (any case), or
+/// that starts with one of those words (`Closes KEY-N` style), or a last
+/// block (after dropping trailing trailer lines such as `Co-Authored-By:`
+/// and blank lines) that is not one or more bare `#KEY-N` lines. Called at
+/// the same point [`validate_pr_subject`] is, so a bad tail refuses before
+/// any push or PR-create call; the error names the offending line.
+/// SPEC-8.7: rejects a PR tip body whose tail is not a bare issue-reference
+/// block.
+pub fn validate_pr_body(body: &str, branch: &str) -> Result<()> {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(first) = trimmed.split_whitespace().next() {
+            let word = first.trim_end_matches(':').to_ascii_lowercase();
+            if matches!(word.as_str(), "closes" | "fixes" | "resolves" | "refs") {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "branch `{branch}`'s tip commit body has the line `{trimmed}`: the PR \
+                     description tail must be the bare `#KEY-N` reference alone, with no \
+                     `Closes`/`Fixes`/`Resolves`/`Refs` wording"
+                )));
+            }
+        }
+    }
+
+    let mut lines: Vec<&str> = body.lines().collect();
+    while matches!(lines.last(), Some(l) if l.trim().is_empty()) {
+        lines.pop();
+    }
+    while matches!(lines.last(), Some(l) if cli::is_trailer_line(l.trim())) {
+        lines.pop();
+        while matches!(lines.last(), Some(l) if l.trim().is_empty()) {
+            lines.pop();
+        }
+    }
+
+    let mut tail: Vec<&str> = Vec::new();
+    while let Some(&last) = lines.last() {
+        if last.trim().is_empty() {
+            break;
+        }
+        tail.push(last);
+        lines.pop();
+    }
+    tail.reverse();
+
+    if tail.is_empty() || !tail.iter().all(|l| cli::bare_issue_ref(l.trim()).is_some()) {
+        let offending = tail
+            .iter()
+            .find(|l| cli::bare_issue_ref(l.trim()).is_none())
+            .copied()
+            .unwrap_or("<empty>");
+        return Err(Error::Other(anyhow::anyhow!(
+            "branch `{branch}`'s tip commit body's last block is `{offending}`, not one or more \
+             bare `#KEY-N` lines, so no PR can open from it"
+        )));
+    }
+    Ok(())
+}
+
 /// SPEC-8.2: the Forgejo-side operations native handlers need.
 pub trait Forge: Send + Sync {
     /// Open a PR from the local commits in `workdir` against `host`. `strategy`
@@ -1989,6 +2049,39 @@ mod tests {
     #[test]
     fn validate_pr_subject_accepts_a_real_subject() {
         validate_pr_subject("Pin base image digests", "feat/x").unwrap();
+    }
+
+    #[test]
+    fn validate_pr_body_accepts_a_valid_body() {
+        let body = "Summary of the change.\n\nMore detail.\n\n#CLAUDE-1";
+        validate_pr_body(body, "feat/x").unwrap();
+    }
+
+    #[test]
+    fn validate_pr_body_rejects_closes_then_the_id() {
+        let body = "Summary of the change.\n\nCloses\n#CLAUDE-1";
+        let err = validate_pr_body(body, "feat/x").unwrap_err().to_string();
+        assert!(err.contains("Closes"), "{err}");
+    }
+
+    #[test]
+    fn validate_pr_body_accepts_an_attribution_trailer_below_the_id() {
+        let body =
+            "Summary of the change.\n\n#CLAUDE-1\n\nCo-Authored-By: Claude <noreply@anthropic.com>";
+        validate_pr_body(body, "feat/x").unwrap();
+    }
+
+    #[test]
+    fn validate_pr_body_rejects_text_after_the_id() {
+        let body = "Summary of the change.\n\n#CLAUDE-1 and also #CLAUDE-2";
+        let err = validate_pr_body(body, "feat/x").unwrap_err().to_string();
+        assert!(err.contains("#CLAUDE-1 and also #CLAUDE-2"), "{err}");
+    }
+
+    #[test]
+    fn validate_pr_body_accepts_several_ids_one_per_line() {
+        let body = "Summary of the change.\n\n#CLAUDE-1\n#CLAUDE-2";
+        validate_pr_body(body, "feat/x").unwrap();
     }
 
     #[test]

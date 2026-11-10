@@ -610,13 +610,21 @@ impl GithubForge {
         let branch = self.git(workdir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
         let base = self.detect_base(workdir);
         let title = self.git(workdir, &["log", "-1", "--pretty=format:%s"])?;
+
+        // The subject guard (CLAUDE-398) runs before any push. The body
+        // guard (CLAUDE-623) runs alongside it, but only when `body_override`
+        // is `None`: an override (the timeout-salvage draft body) replaces
+        // the tip's own body outright, so the tip's `%b` is never read in
+        // that case.
+        crate::provider::validate_pr_subject(&title, &branch)?;
         let body = match body_override {
             Some(b) => b.to_string(),
-            None => self.git(workdir, &["log", "-1", "--pretty=format:%b"])?,
+            None => {
+                let tip_body = self.git(workdir, &["log", "-1", "--pretty=format:%b"])?;
+                crate::provider::validate_pr_body(&tip_body, &branch)?;
+                tip_body
+            }
         };
-
-        // The subject guard (CLAUDE-398) runs before any push.
-        crate::provider::validate_pr_subject(&title, &branch)?;
 
         // The push comment (CLAUDE-447) names the triggering issue; this
         // layer has no job key passed in directly, so it is read back out of
@@ -1017,6 +1025,7 @@ impl Forge for GithubForge {
         let title = self.git(workdir, &["log", "-1", "--pretty=format:%s"])?;
         crate::provider::validate_pr_subject(&title, &branch)?;
         let body = self.git(workdir, &["log", "-1", "--pretty=format:%b"])?;
+        crate::provider::validate_pr_body(&body, &branch)?;
 
         let envs: Vec<(&str, &str)> = match &self.token {
             Some(t) => vec![("GH_TOKEN", t.as_str())],
@@ -2446,7 +2455,11 @@ mod tests {
                 "origin/main\n",
             )
             .ok("git", &["log", "-1", "--pretty=format:%s"], "feat: x")
-            .ok("git", &["log", "-1", "--pretty=format:%b"], "body text")
+            .ok(
+                "git",
+                &["log", "-1", "--pretty=format:%b"],
+                "body text\n\n#CLAUDE-1\n",
+            )
             .ok("git", &push_args, "")
     }
 
@@ -2947,7 +2960,7 @@ mod tests {
                         "--title",
                         "feat: x",
                         "--body",
-                        "body text",
+                        "body text\n\n#CLAUDE-1",
                     ],
                     "https://github.com/octo/widget/pull/5\n",
                 ),
@@ -3010,7 +3023,7 @@ mod tests {
                         "--title",
                         "feat: x",
                         "--body",
-                        "body text",
+                        "body text\n\n#CLAUDE-1",
                     ],
                     "https://github.com/octo/widget/pull/5\n",
                 )
@@ -3289,7 +3302,7 @@ mod tests {
     }
 
     /// `gh pr create`'s args for the standard `with_git` fixture (branch
-    /// `feat/x`, base `main`, title `feat: x`, body `body text`).
+    /// `feat/x`, base `main`, title `feat: x`, body `body text\n\n#CLAUDE-1`).
     fn create_args() -> Vec<&'static str> {
         vec![
             "pr",
@@ -3301,7 +3314,7 @@ mod tests {
             "--title",
             "feat: x",
             "--body",
-            "body text",
+            "body text\n\n#CLAUDE-1",
         ]
     }
 

@@ -2042,12 +2042,18 @@ action's `token_ref`, which is injected per job.
 - `validate_pr_subject` rejects an empty subject or one starting with `#` (a template heading like `## Summary`, or
   a bare issue reference, mistaken for the commit's one-line subject) before every push or PR-create call on every
   path (branch, AGit, GitHub), naming the branch and the offending subject; a bad tip therefore opens no PR at all.
+- `validate_pr_body` (CLAUDE-623) rejects a commit body whose issue-reference tail is not the bare `#KEY-N` block
+  alone: a line anywhere in the body that is only `Closes` / `Fixes` / `Resolves` / `Refs` (any case) or starts
+  with one of those words, or a last block (after dropping trailing blank lines and trailer lines such as
+  `Co-Authored-By:`) that is not one or more bare `#KEY-N` lines. Runs at the same call sites as
+  `validate_pr_subject`, naming the offending line; the operator's rule is a bare issue-reference tail only, never
+  `Closes`-style wording.
 - A commit body intended as a PR description is reflowed before it is used as one: a hard-wrapped paragraph is
   rejoined onto one line (preserving fenced code blocks, headings, list items, block quotes and trailer lines as
   their own lines), mirroring the join the runner's own posting path performs, so a PR body built from a commit
   written with hard line breaks reads the same as one written as single long lines.
-- `refresh_pr_text` re-derives a PR's title and body from its branch's current tip (running the same subject
-  validation first) and overwrites the forge-side PR, used when a resumed run replaces a timeout-salvage
+- `refresh_pr_text` re-derives a PR's title and body from its branch's current tip (running the same subject and
+  body validation first) and overwrites the forge-side PR, used when a resumed run replaces a timeout-salvage
   placeholder (CLAUDE-398) with the finished tip's own text; it is a no-op on a PR that is not a draft.
 - `bare_issue_key` reads the bare `#<KEY>-N` reference every runner-made commit body ends with out of arbitrary
   text, for a push-comment call site with no YouTrack job key passed in directly.

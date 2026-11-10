@@ -32,6 +32,11 @@ const CLOCK_SKEW_WARN_SECS: i64 = 60;
 const PULL_TIMEOUT_MAX_SECS: u64 = 10;
 /// How long a claim bypass is counted on the Status page.
 const BYPASS_WINDOW: chrono::Duration = chrono::Duration::hours(24);
+/// Bound on the post-grant re-check retry in [`PeerClaims::claim`]: enough
+/// attempts to let a peer's own in-flight tie-break reassignment land.
+const RECHECK_ATTEMPTS: u32 = 5;
+/// Pause between re-check attempts.
+const RECHECK_INTERVAL: Duration = Duration::from_millis(20);
 
 /// A random (version 4) UUID in its canonical text form. `SPEC-3.17` item 2.
 pub fn new_uuid_v4() -> Result<String> {
@@ -720,20 +725,33 @@ impl PeerClaims {
         if decision != ClaimDecision::Proceed {
             return decision;
         }
-        // A peer's claim may have taken the row while ours was in flight.
-        match crate::state::peer_claim_get(&self.pool, event_key).await {
-            Ok(Some(row)) if row.holder_id != own_id => {
-                info!(source, delivery, event_key, holder = %row.holder_id, "event claimed by a peer meanwhile; delivery dropped");
-                ClaimDecision::Drop {
-                    holder: row.holder_id,
+        // A peer granted us, but its own self-claim for the same event can
+        // still be in flight behind that grant (its insert and ours raced
+        // for who writes first, and the loser's tie-break reassignment can
+        // land here moments after the grant went out). Re-read our own row
+        // a few times with a short pause so that reassignment has a chance
+        // to arrive before we settle on Proceed.
+        for attempt in 0..RECHECK_ATTEMPTS {
+            match crate::state::peer_claim_get(&self.pool, event_key).await {
+                Ok(Some(row)) if row.holder_id != own_id => {
+                    info!(source, delivery, event_key, holder = %row.holder_id, "event claimed by a peer meanwhile; delivery dropped");
+                    return ClaimDecision::Drop {
+                        holder: row.holder_id,
+                    };
+                }
+                Ok(_) => {
+                    if attempt + 1 == RECHECK_ATTEMPTS {
+                        return ClaimDecision::Proceed;
+                    }
+                    tokio::time::sleep(RECHECK_INTERVAL).await;
+                }
+                Err(e) => {
+                    error!(source, delivery, event_key, error = %e, "re-reading the claim row failed; processing the event");
+                    return ClaimDecision::Proceed;
                 }
             }
-            Ok(_) => ClaimDecision::Proceed,
-            Err(e) => {
-                error!(source, delivery, event_key, error = %e, "re-reading the claim row failed; processing the event");
-                ClaimDecision::Proceed
-            }
         }
+        ClaimDecision::Proceed
     }
 
     /// Our own local insert lost the race to a row already in the table

@@ -84,7 +84,7 @@ code task you could not finish: that stays `.claude-run-needs-review`.
 - The last commit's body becomes the pull request description, and the runner
   joins any hard-wrapped prose lines back together before posting it, so it
   must follow the format the run prompt specifies (headings, an optional
-  prerequisite section, the `Closes` tail). Do not hard-wrap it. Write each
+  prerequisite section, the bare issue-reference tail). Do not hard-wrap it. Write each
   paragraph as a single long line and let the Git host wrap it; insert a
   newline only between paragraphs, never inside one. Keep the subject line
   short (about 50 characters) and in the imperative.
