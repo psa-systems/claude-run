@@ -3718,12 +3718,11 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit whose body ends with the bare '#{{key}}' reference, so a kill leaves committed progress instead of none; the final commit still carries the full PR-description format from step 7 and stays the branch tip. The runner pushes your commits as WIP checkpoints automatically every 60 seconds while you work, from whatever feature branch is checked out, and opens a draft PR from the first one - this is not something you do, and a checkpoint landing is not a stopping point or a reason to wrap up early; keep working exactly as step 1 describes until you are done, blocked, or killed. Because of those checkpoint pushes, a commit on this branch may already be on the remote before you notice a mistake in it: never run 'git reset', 'git commit --amend', 'git rebase', 'git filter-branch', or any force push on this branch to fix it - any of those rewrites history the runner has already published and orphans the checkpoint. Fix a mistake, including a wrong commit message, with a new commit on top instead.",
         "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (the repo's 'just pre-push' recipe when it exists, else 'just check', else the repo's documented checks) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off. The runner itself re-runs the repository's own pre-push entrypoint (`just pre-push`, else `just check`) in the clone after this attempt finishes and before recording it as successful (SPEC-3.3.2): it does not trust this report, so a report that checks passed must name the exact command you ran, and a failing check still needs fixing here rather than left for the gate to catch.",
         "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
-        "7. The runner uses this commit's SUBJECT as the PR title and its body as the PR description (if you make more than one commit, the LAST commit carries both, since the runner reads only the branch tip). The subject is a SEPARATE line from the body, not the body's first heading: write one short imperative line (about 72 characters or fewer, no leading '#', not a Markdown heading like '## Summary') that names the change itself, e.g. 'Fix the off-by-one in the retry budget'; confirm it with 'git log -1 --format=%s' before you stop - if that prints a Markdown heading, a bare issue reference, or anything else that is not a one-line summary of the change, the commit is wrong and the runner will refuse to open the PR from it. The body (what 'git log -1 --format=%b' prints) is the PR description; it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the literal line 'Closes', then the bare issue reference on the next line alone, with nothing after it on that line and no line after it; a 'Co-Authored-By:' trailer goes above the 'Closes' line, never after the reference. If the commit owns more than one issue, put each '#<KEY>-N' on its own line below the single 'Closes' line. NO 'State ...' command after the reference. Example of the tail:",
+        "7. The runner uses this commit's SUBJECT as the PR title and its body as the PR description (if you make more than one commit, the LAST commit carries both, since the runner reads only the branch tip). The subject is a SEPARATE line from the body, not the body's first heading: write one short imperative line (about 72 characters or fewer, no leading '#', not a Markdown heading like '## Summary') that names the change itself, e.g. 'Fix the off-by-one in the retry budget'; confirm it with 'git log -1 --format=%s' before you stop - if that prints a Markdown heading, a bare issue reference, or anything else that is not a one-line summary of the change, the commit is wrong and the runner will refuse to open the PR from it. The body (what 'git log -1 --format=%b' prints) is the PR description; it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the bare issue reference alone, '#<KEY>-N' on its own line with nothing before or after it on that line and no line after it; a 'Co-Authored-By:' trailer goes above it, never after it. If the commit owns more than one issue, put each '#<KEY>-N' on its own line below the single attribution trailer. The reference is always bare; no linking word of any kind precedes it, in any case, anywhere in the body. NO 'State ...' command after the reference. Example of the tail:",
         "     ## Verification",
         "",
         "     `just check` passes.",
         "",
-        "     Closes",
         "     #{{key}}",
         "   Write the message to a file OUTSIDE {{workdir}} and commit with 'git commit --cleanup=verbatim --file <message-file>', so the '##' headings and the '#{{key}}' line survive verbatim. This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
         "8. Verify completion against the acceptance criteria before stopping. Re-read each criterion and state the concrete evidence that it is met: the file:line you changed, the command and its output, or the test that now passes. For any criterion that REMOVES or DELETES something, prove absence with a search (grep for the symbol or file) and confirm zero hits - never assert a removal you have not grep-verified - and add or extend a test or CI guard that fails if it reappears, so the removal is enforced mechanically. A green check suite is necessary but NOT sufficient: green checks do not prove the acceptance criteria are met. If you cannot produce objective evidence for EVERY criterion, you have NOT completed the issue - take the blocker path below instead of stopping as done. Ending the run as done while any acceptance criterion lacks objective evidence is forbidden.",
@@ -9982,7 +9981,10 @@ mod tests {
         assert!(p.contains("Working directory: /tmp/wd - the repo is already cloned here"));
         assert!(p.contains("60 minutes after it started"));
         assert!(p.contains("yt issue inspect MK-16"));
-        assert!(p.contains("Closes"));
+        assert!(
+            !p.contains("Closes"),
+            "preset prompt must not instruct writing a Closes line:\n{p}"
+        );
         assert!(p.contains("#MK-16"));
         assert!(p.contains("/tmp/wd/.claude-run-needs-review"));
         assert!(p.contains("/tmp/wd/.claude-run-skip-attempt"));
@@ -12571,6 +12573,11 @@ mod tests {
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .ok(
                     "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "#CLAUDE-1\n",
+                )
+                .ok(
+                    "git",
                     &["remote", "get-url", "origin"],
                     "https://dev.a8n.run/contoso/claude-run.git",
                 )
@@ -12874,6 +12881,7 @@ mod tests {
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok("git", &["log", "-1", "--format=%s", "HEAD"], "feat: x\n")
+                .ok("git", &["log", "-1", "--format=%b", "HEAD"], "#CLAUDE-1\n")
                 .ok(
                     "yt",
                     &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
@@ -13905,6 +13913,11 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "#CLAUDE-1\n",
+                )
                 .fail(
                     "git",
                     &[
@@ -14003,6 +14016,11 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "#CLAUDE-1\n",
+                )
                 .fail(
                     "git",
                     &[
@@ -14106,6 +14124,11 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "#CLAUDE-1\n",
+                )
                 .fail(
                     "git",
                     &[
@@ -14195,6 +14218,11 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "#CLAUDE-1\n",
+                )
                 .fail(
                     "git",
                     &[
@@ -14290,6 +14318,11 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "#CLAUDE-1\n",
+                )
                 .fail(
                     "git",
                     &[
@@ -14381,6 +14414,11 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "#CLAUDE-1\n",
+                )
                 .fail(
                     "git",
                     &[
@@ -14572,7 +14610,7 @@ mod tests {
                     "origin/main\n",
                 )
                 .ok("git", &["log", "-1", "--pretty=format:%s"], "feat: x")
-                .ok("git", &["log", "-1", "--pretty=format:%b"], "")
+                .ok("git", &["log", "-1", "--pretty=format:%b"], "#GH-1\n")
                 .ok(
                     "git",
                     &["push", "--no-verify", "origin", "HEAD:feat/gh"],
@@ -14646,6 +14684,7 @@ mod tests {
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok("git", &["log", "-1", "--format=%s", "HEAD"], "feat: x\n")
+                .ok("git", &["log", "-1", "--format=%b", "HEAD"], "#CLAUDE-1\n")
                 .ok(
                     "yt",
                     &[
@@ -16850,7 +16889,11 @@ mod tests {
                     "remotesha\trefs/heads/feat/x\n",
                 )
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "body\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
                 .ok(
                     "git",
                     &["fetch", "origin", "refs/heads/feat/x:refs/remotes/origin/feat/x"],
@@ -17074,6 +17117,7 @@ mod tests {
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok("git", &["log", "-1", "--format=%s", "HEAD"], "feat: x\n")
+                .ok("git", &["log", "-1", "--format=%b", "HEAD"], "#CLAUDE-1\n")
                 .ok(
                     "yt",
                     &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],

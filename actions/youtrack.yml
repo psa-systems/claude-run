@@ -43,8 +43,8 @@
 # every 60 seconds with hooks skipped (--no-verify, same as every other runner push of the agent branch including
 # the final push a successful run makes, CLAUDE-533), so a killed or timed-out run still leaves its work reachable
 # on the forge. The first successful
-# checkpoint push opens a draft PR (salvaged=true, same CLAUDE-398/CLAUDE-379 body shape as a timeout salvage, but
-# with no Closes line since the run is still going) and every push after that posts a `checkpoint push` PR comment
+# checkpoint push opens a draft PR (salvaged=true, same CLAUDE-398/CLAUDE-379 body shape as a timeout salvage: a
+# bare issue-reference tail, no linking word) and every push after that posts a `checkpoint push` PR comment
 # (CLAUDE-447). A run that resolves normally afterwards promotes that draft PR exactly like a resumed run does
 # (CLAUDE-429): refresh_pr_text + mark_pr_ready, salvaged cleared. If a checkpoint push is ever rejected by the forge
 # (for example a force-pushed or deleted branch), the watcher logs it, stops checkpointing for the rest of the run,

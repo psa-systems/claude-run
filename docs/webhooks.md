@@ -177,7 +177,7 @@ path does; only a terminal `action: "closed"` delivery does anything, everything
 The runner itself never resolves an issue on a PR merge. A YouTrack workflow does that instead
 (`docs/yt-workflow-resolve-on-pr-merge.js`), for any issue whose own PR merges - not only ones the runner opened - by
 setting `State` to `Done` when the merged PR's title or body claims the issue (a title token, a bare `#KEY-N` line, or
-`Closes KEY-N`; the runner's own PR bodies already end with `Closes` and the bare issue key). On a merged or closed
+`Closes KEY-N`; the runner's own PR bodies already end with the bare issue key alone). On a merged or closed
 delivery the runner only updates its own `agent_pull_requests` bookkeeping: a merge marks the row `merged`, a close
 without a merge marks it `closed`. Neither makes a tracker call or a forge run-list call.
 

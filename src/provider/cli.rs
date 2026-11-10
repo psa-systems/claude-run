@@ -203,7 +203,7 @@ fn repo_path_from_remote_url(url: &str) -> Option<String> {
 /// already-trimmed line, so any surrounding prose leaves trailing/leading bytes
 /// that make the match fail - which is precisely how a cross-link mention is
 /// distinguished from the owning-reference trailer.
-fn bare_issue_ref(s: &str) -> Option<String> {
+pub(crate) fn bare_issue_ref(s: &str) -> Option<String> {
     let rest = s.strip_prefix('#')?;
     let bytes = rest.as_bytes();
     let mut j = 0;
@@ -255,7 +255,7 @@ fn is_list_item(line: &str) -> bool {
 
 /// A `Co-Authored-By:` / `Signed-off-by:` / `Reviewed-by:` trailer,
 /// unindented (a commit trailer never is).
-fn is_trailer_line(line: &str) -> bool {
+pub(crate) fn is_trailer_line(line: &str) -> bool {
     line.starts_with("Co-Authored-By:")
         || line.starts_with("Signed-off-by:")
         || line.starts_with("Reviewed-by:")
@@ -976,8 +976,16 @@ impl CliBackend {
     ) -> Result<PullRequest> {
         // The subject guard (CLAUDE-398) runs before anything else here: a
         // tip whose subject is a template heading or a bare issue reference
-        // must refuse before any push or PR-create call is made.
+        // must refuse before any push or PR-create call is made. The body
+        // guard (CLAUDE-623) runs alongside it, but only when `body` is
+        // `None`: a caller-supplied override (the timeout-salvage draft body)
+        // replaces the tip's own body outright, so the tip's `%b` is never
+        // read in that case (mirroring the no-override path's own rule that
+        // the tip's own body, not a placeholder, becomes the PR description).
         crate::provider::validate_pr_subject(&self.tip_subject(workdir, branch)?, branch)?;
+        if body.is_none() {
+            crate::provider::validate_pr_body(&self.tip_body(workdir, branch)?, branch)?;
+        }
 
         // Repo path (`owner/repo`) for the open-PR lookup, derived from the
         // workdir's `origin` remote (the form `list_open_prs` expects).
@@ -1241,6 +1249,14 @@ impl CliBackend {
     /// --format=%s`), read for the [`validate_pr_subject`] guard (CLAUDE-398).
     fn tip_subject(&self, workdir: &Path, rev: &str) -> Result<String> {
         let args = ["log", "-1", "--format=%s", rev];
+        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        Ok(Self::checked("git", out, &args)?.trim().to_string())
+    }
+
+    /// The body of a revision's tip commit (`git log -1 --format=%b`), read
+    /// for the [`crate::provider::validate_pr_body`] guard (CLAUDE-623).
+    fn tip_body(&self, workdir: &Path, rev: &str) -> Result<String> {
+        let args = ["log", "-1", "--format=%b", rev];
         let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
         Ok(Self::checked("git", out, &args)?.trim().to_string())
     }
@@ -1758,8 +1774,10 @@ impl CliBackend {
     /// SPEC-8.8: posts the push comment on success.
     fn create_pr_agit(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
         // The subject guard (CLAUDE-398) runs before `fj` pushes anything.
+        // The body guard (CLAUDE-623) runs alongside it.
         let subject = self.tip_subject(workdir, "HEAD")?;
         crate::provider::validate_pr_subject(&subject, "HEAD")?;
+        crate::provider::validate_pr_body(&self.tip_body(workdir, "HEAD")?, "HEAD")?;
 
         let args = ["--host", host, "pr", "create", "-aA", "--json"];
         let stdout = self
@@ -2508,11 +2526,9 @@ impl Forge for CliBackend {
         let branch = self.resolve_feature_branch(workdir)?;
         let title = self.tip_subject(workdir, &branch)?;
         crate::provider::validate_pr_subject(&title, &branch)?;
-        let body_args = ["log", "-1", "--format=%b", &branch];
-        let out = self
-            .runner
-            .run_in_env(Some(workdir), "git", &body_args, &[])?;
-        let body = unwrap_prose(Self::checked("git", out, &body_args)?.trim());
+        let raw_body = self.tip_body(workdir, &branch)?;
+        crate::provider::validate_pr_body(&raw_body, &branch)?;
+        let body = unwrap_prose(&raw_body);
 
         let id = format!("{repo}#{pr_number}");
         let title_args = ["--host", host, "pr", "edit", &id, "title", title.as_str()];
@@ -3864,7 +3880,12 @@ mod tests {
                     &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
                     r#"{"number":42,"html_url":"https://dev.a8n.run/n/c/pulls/42"}"#,
                 )
-                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "fix: x\n"),
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "fix: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "HEAD"],
+                    "work\n\n#CLAUDE-1\n",
+                ),
             "origin/main",
             &["main", "fix/x"],
             &[("fix/x", "aaa\n")],
@@ -4312,6 +4333,11 @@ mod tests {
             "git",
             &["log", "-1", "--format=%s", "feat/yotun-96"],
             "feat: yotun\n",
+        )
+        .ok(
+            "git",
+            &["log", "-1", "--format=%b", "feat/yotun-96"],
+            "#CLAUDE-96\n",
         )
         .ok("git", &["merge", "--no-edit", "origin/feat/yotun-96"], "")
         .ok(
@@ -4971,7 +4997,11 @@ mod tests {
         );
         let runner = runner
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "Done.\n")
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "Done.\n\n#CLAUDE-1\n",
+            )
             .ok(
                 "fj",
                 &[
@@ -5489,6 +5519,11 @@ mod tests {
         let runner = Arc::new(
             with_remote_state(runner, "feat/x", "abc", "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "#CLAUDE-1\n",
+                )
                 .fail(
                     "git",
                     &[
@@ -5557,7 +5592,12 @@ mod tests {
             &[("feat/x", "abc123\n")],
         );
         let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n")
-            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "#CLAUDE-1\n",
+            );
         let runner = Arc::new(with_open_pr_search(
             runner,
             r#"[{"number":88,"head_ref":"feat/x","html_url":"https://dev.a8n.run/n/c/pulls/88"}]"#,
@@ -5597,7 +5637,12 @@ mod tests {
             &[("feat/x", "abc123\n")],
         );
         let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n")
-            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "#CLAUDE-1\n",
+            );
         let runner = with_open_pr_search(
             runner,
             r#"[{"number":777,"head_ref":"feat/x","html_url":"https://dev.a8n.run/n/c/pulls/777"}]"#,
@@ -5840,6 +5885,11 @@ mod tests {
             "git",
             &["log", "-1", "--format=%s", "feat/yotun-96"],
             "feat: yotun\n",
+        )
+        .ok(
+            "git",
+            &["log", "-1", "--format=%b", "feat/yotun-96"],
+            "#CLAUDE-96\n",
         );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
@@ -5921,7 +5971,12 @@ mod tests {
                 "",
             )
             .ok("git", &["merge", "--abort"], "")
-            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "#CLAUDE-1\n",
+            );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         match b
@@ -6005,7 +6060,12 @@ mod tests {
                 1,
                 "",
             )
-            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "#CLAUDE-1\n",
+            );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         match b
@@ -6103,7 +6163,12 @@ mod tests {
                 128,
                 "fatal: Could not reset index",
             )
-            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "#CLAUDE-1\n",
+            );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         match b
@@ -7695,7 +7760,12 @@ mod tests {
                     &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/n/c/pulls/7"}"#,
                 )
-                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "fix: x\n"),
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "fix: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "HEAD"],
+                    "work\n\n#CLAUDE-1\n",
+                ),
             "origin/main",
             &["main", "fix/x"],
             &[("fix/x", "aaa\n")],
@@ -7929,7 +7999,12 @@ mod tests {
                     &["remote", "get-url", "origin"],
                     "https://dev.a8n.run/contoso/gadgets.git",
                 )
-                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "fix: x\n"),
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "fix: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "HEAD"],
+                    "work\n\n#CLAUDE-1\n",
+                ),
             "origin/main",
             &["main", "fix/x"],
             &[("fix/x", "aaa\n")],
