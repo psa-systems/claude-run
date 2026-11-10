@@ -977,6 +977,53 @@ impl Default for CargoCacheConfig {
     }
 }
 
+/// One configured peer instance (`SPEC-3.17` item 3).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PeerConfig {
+    /// Unique among the peers; names the peer in logs and on the Status page.
+    pub name: String,
+    /// Base URL of the peer's web listener, e.g. `https://peer.example.org:7321`.
+    pub url: String,
+    /// Name of the secret holding the bearer token this peer's API accepts.
+    pub token_ref: String,
+}
+
+/// Optional peering between independently operating instances (settings key
+/// `config.peers`, editable on the web Settings page). `SPEC-3.17` item 3,
+/// SPEC-6.3. Disabled by default; a disabled section changes no behavior.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PeersConfig {
+    pub enabled: bool,
+    /// This instance's name as peers see it; required when `enabled`.
+    pub instance_name: String,
+    pub peers: Vec<PeerConfig>,
+    /// Seconds between liveness pulls; at least 5.
+    pub poll_secs: u64,
+    /// A peer with no successful pull within this many seconds is `unknown`;
+    /// at least twice `poll_secs`.
+    pub stale_after_secs: u64,
+    /// Bound on one claim call to a peer, 1 to 30 (used by the claim protocol).
+    pub claim_timeout_secs: u64,
+    /// Rows per summary pull, at least 1 (used by summary replication).
+    pub summary_batch: u64,
+}
+
+impl Default for PeersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            instance_name: String::new(),
+            peers: Vec::new(),
+            poll_secs: 30,
+            stale_after_secs: 120,
+            claim_timeout_secs: 5,
+            summary_batch: 500,
+        }
+    }
+}
+
 /// Global display preferences. A single-operator daemon has no
 /// `users` table, so this is one global section (settings key
 /// `config.preferences`, editable on the web Settings page) rather than

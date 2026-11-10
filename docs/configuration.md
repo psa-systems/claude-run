@@ -148,12 +148,12 @@ the Secrets store and are rendered as that name only. Each
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
 secret refs, adding a source), `next event` for mint, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
-`GET` / `PUT /api/settings/{mint,webhook,webhook_comment,log_filter,workdir_gc,stream_log_gc,preferences,concurrency,db_retention,docker_gc,claude}`.
+`GET` / `PUT /api/settings/{mint,webhook,webhook_comment,log_filter,workdir_gc,stream_log_gc,preferences,concurrency,db_retention,docker_gc,peers,claude}`.
 The `webhook_comment` (CLAUDE-220), `workdir_gc` (CLAUDE-106), `stream_log_gc` (CLAUDE-245), `preferences` (CLAUDE-154),
 `concurrency` (CLAUDE-162), `db_retention` (CLAUDE-175), `docker_gc` (CLAUDE-433: `enabled`, `volume_retention_days`, default 3,
 rejects values below 1), and `claude` (CLAUDE-239 `model`, CLAUDE-259 `effort`: the instance-wide `--model` and
 `--effort` defaults an action inherits when it pins neither in its own `claude:` block, each one null by default, which passes no flag and leaves
-the `claude` CLI's own default in force) sections are DB-only from birth (never `config.toml` keys), so
+the `claude` CLI's own default in force), and `peers` (CLAUDE-614: optional peering, disabled by default; see `SPEC-3.17`) sections are DB-only from birth (never `config.toml` keys), so
 they are not part of the one-time import below; each simply defaults until edited. `webhook_comment` is additionally rejected by the file parser:
 a `config.toml` declaring `[webhook_comment]` fails to start with serde's unknown-field error naming the section, so
 there is no way to end up with two sources of truth for it.

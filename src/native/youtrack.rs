@@ -859,6 +859,20 @@ pub async fn reconcile_stuck_working(
     paths: &Paths,
     runner: &Arc<dyn CommandRunner>,
 ) {
+    reconcile_stuck_working_with_peers(pool, paths, runner, &std::collections::HashMap::new())
+        .await;
+}
+
+/// [`reconcile_stuck_working`] that also leaves alone an issue a reachable
+/// peer lists in flight (`SPEC-3.17` item 6). `peer_in_flight` maps
+/// `(action, job_key)` to the listing peer's name, from
+/// [`crate::peer::PeerRegistry::live_peer_in_flight`]; empty with no peering.
+pub async fn reconcile_stuck_working_with_peers(
+    pool: &DbPool,
+    paths: &Paths,
+    runner: &Arc<dyn CommandRunner>,
+    peer_in_flight: &std::collections::HashMap<(String, String), String>,
+) {
     let rows = match state::action_index_list(pool).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -970,6 +984,10 @@ pub async fn reconcile_stuck_working(
             };
             if inflight.contains(key) {
                 info!(action = %action_name, key = %key, "stuck-working sweep: Working and backed by a live run; left alone");
+                continue;
+            }
+            if let Some(peer) = peer_in_flight.get(&(action_name.to_string(), key.to_string())) {
+                info!(action = %action_name, key = %key, peer = %peer, "stuck-working sweep: Working and listed in flight by a reachable peer; left alone");
                 continue;
             }
 
@@ -3983,18 +4001,12 @@ fn run_review_session(
     let pass = pass_marker.exists();
     let fail = fail_marker.exists();
     let outcome = match (pass, fail) {
-        (true, false) => ReviewOutcome::Pass(
-            std::fs::read_to_string(&pass_marker)
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
-        ),
-        (false, true) => ReviewOutcome::Fail(
-            std::fs::read_to_string(&fail_marker)
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
-        ),
+        (true, false) => ReviewOutcome::Pass(sanitize_marker_content(
+            &std::fs::read_to_string(&pass_marker).unwrap_or_default(),
+        )),
+        (false, true) => ReviewOutcome::Fail(sanitize_marker_content(
+            &std::fs::read_to_string(&fail_marker).unwrap_or_default(),
+        )),
         (true, true) => ReviewOutcome::NoVerdict(
             "the review session wrote both the pass and fail markers".to_string(),
         ),
@@ -4002,7 +4014,31 @@ fn run_review_session(
             ReviewOutcome::NoVerdict("the review session wrote no verdict marker".to_string())
         }
     };
+    // CLAUDE-621: strip the marker files from the workdir now the outcome is
+    // captured. Leaving them in place poisoned the SPEC-3.3.2 push gate in
+    // consumers that scan the whole tree (storefront's em-dash guard caught
+    // the agent's own narrative notes). `discard_review_changes` still has
+    // its PASS/FAIL skips for defense in depth on the retry path.
+    let _ = std::fs::remove_file(&pass_marker);
+    let _ = std::fs::remove_file(&fail_marker);
     (outcome, result)
+}
+
+/// CLAUDE-621: sanitize the agent's narrative notes before they are returned
+/// to the runner (they end up in the PR comment, the issue comment, and the
+/// attempt record). The agent writes em-dashes in its own prose, which both
+/// violates the fleet-wide rule and tripped storefront's
+/// `template_conventions::no_em_dash_anywhere_in_the_repository` test when
+/// the marker file lived in-tree. The file is now removed after reading, but
+/// the content still rides in the posted comment, so the replacement matters
+/// in its own right.
+fn sanitize_marker_content(raw: &str) -> String {
+    // An em-dash in prose is almost always surrounded by spaces (" X — Y "),
+    // so replacing it with `-` keeps the one-space-on-each-side spacing the
+    // writer already had; a bare em-dash between words (rare, "he said—that
+    // it works") becomes "he said-that it works", acceptable per the global
+    // CLAUDE.md "use a regular hyphen" rule.
+    raw.replace('\u{2014}', "-").trim().to_string()
 }
 
 /// SPEC-3.12 item 4: the instruction for the bounded conflict-resolution
@@ -18184,6 +18220,98 @@ mod tests {
         );
     }
 
+    /// CLAUDE-614: a `Working` issue a reachable peer lists in flight is left
+    /// alone (no history read, no write), even past the owner window.
+    #[tokio::test]
+    async fn reconcile_stuck_working_leaves_a_peer_listed_issue_alone() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+        let runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["list", "--query=AI Agent: Working", "--json"],
+            r#"[{"idReadable":"MK-41"}]"#,
+        ));
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            ("yt-action".to_string(), "MK-41".to_string()),
+            "peer-b".to_string(),
+        );
+
+        reconcile_stuck_working_with_peers(&pool, &paths, &dyn_runner, &peers).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("history")), "{calls:?}");
+    }
+
+    /// CLAUDE-614: an issue in no peer's list (the peer lists a different key)
+    /// is corrected exactly as before.
+    #[tokio::test]
+    async fn reconcile_stuck_working_still_corrects_an_issue_no_peer_lists() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+        let old_ms = (chrono::Utc::now() - chrono::Duration::minutes(25)).timestamp_millis();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-42"}]"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-42", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "yt",
+                    &[
+                        "issue",
+                        "history",
+                        "MK-42",
+                        "--json",
+                        "--category",
+                        "CustomFieldCategory",
+                    ],
+                    &working_history_json(old_ms),
+                )
+                .ok_prefix("yt issue comment MK-42", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-42", "AI Agent", "Queued"],
+                    "",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            ("yt-action".to_string(), "MK-99".to_string()),
+            "peer-b".to_string(),
+        );
+
+        reconcile_stuck_working_with_peers(&pool, &paths, &dyn_runner, &peers).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-42 AI Agent Queued"),
+            "{calls:?}"
+        );
+    }
+
     /// CLAUDE-612: a `field_changed_at` read failure leaves the issue on
     /// `Working` (no write) and is retried next tick, exactly like the other
     /// read failures in this loop.
@@ -18363,6 +18491,87 @@ mod tests {
             outcome,
             ReviewOutcome::Fail("criterion 2 has no test".to_string())
         );
+    }
+
+    /// CLAUDE-621: both marker files are removed from the workdir after the
+    /// outcome is captured, so a subsequent push gate scanning the tree
+    /// cannot trip on their content.
+    #[test]
+    fn run_review_session_removes_marker_files_after_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\necho 'all good' > {}\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                REVIEW_PASS_MARKER
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, _result) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &cancel,
+            None,
+            None,
+        );
+        assert_eq!(outcome, ReviewOutcome::Pass("all good".to_string()));
+        assert!(!dir.path().join(REVIEW_PASS_MARKER).exists());
+        assert!(!dir.path().join(REVIEW_FAIL_MARKER).exists());
+    }
+
+    /// CLAUDE-621: em-dashes in agent-written narrative are replaced before
+    /// they ride the outcome into PR / issue comments. The raw file content
+    /// may still have them while the file briefly exists, but every consumer
+    /// of the marker reads through `sanitize_marker_content`.
+    #[test]
+    fn run_review_session_strips_em_dashes_from_marker_content() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        // The agent's narrative uses an em-dash in a bullet, exactly like
+        // the SF-815 / SF-789 / SF-800 failures.
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\nprintf 'Review: PASS\\nfile.rs:42 \\xe2\\x80\\x94 checked\\n' > {}\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                REVIEW_PASS_MARKER
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, _result) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &cancel,
+            None,
+            None,
+        );
+        let text = match outcome {
+            ReviewOutcome::Pass(s) => s,
+            other => panic!("expected Pass, got {other:?}"),
+        };
+        assert!(
+            !text.contains('\u{2014}'),
+            "em-dash leaked into outcome: {text:?}"
+        );
+        assert!(text.contains("file.rs:42 - checked"), "got: {text:?}");
+        // Also sanity-check a bare, no-space em-dash is still replaced
+        // (common in the SF-815-style narrative).
+        let bare = sanitize_marker_content("line1\u{2014}line2");
+        assert_eq!(bare, "line1-line2");
     }
 
     #[test]

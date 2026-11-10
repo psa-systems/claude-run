@@ -5486,6 +5486,43 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "total ceiling across every Docker storage category (images, containers, local volumes, build cache); over it with no run in flight, storage is reclaimed in the SPEC-3.11 order until under it again; must be >= 1.",
             },
         ],
+        Peers => vec![
+            FieldDoc {
+                name: "enabled",
+                badge: "next tick",
+                note: "master toggle; false mounts no peer route, makes no outbound call and shows no peer on the Status page.",
+            },
+            FieldDoc {
+                name: "instance_name",
+                badge: "next tick",
+                note: "this instance's name as peers see it; required when enabled, and different from every peer name.",
+            },
+            FieldDoc {
+                name: "peers",
+                badge: "next tick",
+                note: "list of {name, url, token_ref}; token_ref names the secret holding that peer's bearer token; names unique, url http(s).",
+            },
+            FieldDoc {
+                name: "poll_secs",
+                badge: "next tick",
+                note: "seconds between liveness pulls; >= 5.",
+            },
+            FieldDoc {
+                name: "stale_after_secs",
+                badge: "next tick",
+                note: "a peer with no successful pull within this window is unknown; >= 2 x poll_secs.",
+            },
+            FieldDoc {
+                name: "claim_timeout_secs",
+                badge: "next tick",
+                note: "bound on one webhook-claim call to a peer; 1 to 30. Not used until claims land.",
+            },
+            FieldDoc {
+                name: "summary_batch",
+                badge: "next tick",
+                note: "rows per summary pull; >= 1. Not used until summary replication lands.",
+            },
+        ],
         CargoCache => vec![
             FieldDoc {
                 name: "enabled",
@@ -6661,6 +6698,8 @@ struct StatusTpl {
     /// confirmation can warn before the `409` the server would refuse with
     /// anyway.
     docker_run_in_flight: bool,
+    /// SPEC-3.17 item 11: `Some` only while peering is enabled.
+    peers: Option<Vec<crate::peer::PeerRow>>,
 }
 
 /// SPEC-4.3.9: the `/status` page handler.
@@ -6679,6 +6718,13 @@ async fn status_page(State(s): State<WebState>) -> Result<Response, WebError> {
     let docker_run_in_flight = !crate::api::activity(&s.api.pool, &s.api.in_flight)
         .await?
         .quiet;
+    let peers_cfg = s.api.settings.peers_handle().read().await.clone();
+    let peers = peers_cfg.enabled.then(|| {
+        s.api
+            .settings
+            .peer_registry()
+            .rows(&peers_cfg, chrono::Utc::now())
+    });
     let tpl = StatusTpl {
         version: s.api.version,
         global_pause,
@@ -6687,6 +6733,7 @@ async fn status_page(State(s): State<WebState>) -> Result<Response, WebError> {
         cargo_cache_total_human,
         docker_storage,
         docker_run_in_flight,
+        peers,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
