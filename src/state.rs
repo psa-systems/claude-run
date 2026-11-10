@@ -1157,6 +1157,43 @@ pub async fn run_inflight_rows_all(pool: &DbPool) -> Result<Vec<InflightJobRow>>
         .collect())
 }
 
+/// One in-flight job of a still-open run: its action, job key and the run's
+/// start time. Served to peers by `GET /api/peer/state` (`SPEC-3.17` item 4).
+#[derive(Debug, Clone)]
+pub struct InflightJobStart {
+    pub action_name: String,
+    pub job_key: String,
+    pub started_at: String,
+}
+
+/// Every `run_inflight_jobs` row of a still-open run, with the run's start.
+/// Unlike [`run_inflight_rows_all`] this is safe to call on a live daemon.
+pub async fn run_inflight_with_start(pool: &DbPool) -> Result<Vec<InflightJobStart>> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
+        SELECT r.action_name, rij.job_key, r.started_at
+        FROM run_inflight_jobs rij
+        JOIN runs r ON r.id = rij.run_id
+        WHERE r.ended_at IS NULL
+        ORDER BY r.started_at, rij.job_key
+        "#,
+        )
+        .into_owned(),
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(action_name, job_key, started_at)| InflightJobStart {
+            action_name,
+            job_key,
+            started_at,
+        })
+        .collect())
+}
+
 /// Reconcile runs left open at daemon SHUTDOWN, after the cancel
 /// grace elapsed. Those runs were stopped by this process, so they close as
 /// `exit::CANCELLED`, the same sentinel the live-cancel path uses.

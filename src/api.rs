@@ -876,6 +876,27 @@ mod tests {
         (state, rx)
     }
 
+    /// SPEC-3.17 item 4: `api::router` is the unix-socket router too, and the
+    /// peer API must never be served there.
+    #[tokio::test]
+    async fn the_unix_socket_router_serves_no_peer_route() {
+        use tower::ServiceExt;
+        let app = router((*app_state().await).clone());
+        for uri in ["/peer/state", "/api/peer/state"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
     /// `POST /access/check` returns the typed report as JSON. With
     /// no indexed action there is nothing to probe, and the endpoint says so as
     /// a failing row rather than an empty 200 that reads as "all good".

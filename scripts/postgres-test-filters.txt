@@ -27,6 +27,7 @@ mcp::
 mcp_http::
 native::youtrack::
 pause::
+peer::
 progress_list::
 report::
 retention::
