@@ -794,15 +794,29 @@ pub fn access_cred_base(paths: &crate::config::Paths) -> std::path::PathBuf {
 ///
 /// `POST /access/check`: run the on-demand access check and return the typed
 /// report. An absent / empty body checks everything. No secret value is ever
-/// part of the response (see `crate::access`).
+/// part of the response (see `crate::access`). The body is JSON for the CLI
+/// and API clients, or `application/x-www-form-urlencoded` for the `/access`
+/// page's own htmx form (which has no `json-enc` extension); dispatch on
+/// `Content-Type` the same way `pause_reason` does for the pause routes,
+/// since a urlencoded body is never valid JSON.
 async fn access_check(
     State(s): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<Json<crate::access::AccessReport>, AppError> {
     let req: crate::access::AccessRequest = if body.trim().is_empty() {
         crate::access::AccessRequest::default()
     } else {
-        serde_json::from_str(&body).map_err(|e| AppError {
+        let json = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("application/json"));
+        let parsed = if json {
+            serde_json::from_str(&body).map_err(|e| e.to_string())
+        } else {
+            serde_urlencoded::from_str(&body).map_err(|e| e.to_string())
+        };
+        parsed.map_err(|e| AppError {
             status: StatusCode::BAD_REQUEST,
             message: format!("invalid access check request: {e}"),
         })?
@@ -903,7 +917,13 @@ mod tests {
     #[tokio::test]
     async fn access_check_returns_the_typed_report() {
         let s = app_state().await;
-        let Json(report) = access_check(State(s.clone()), String::new()).await.unwrap();
+        let Json(report) = access_check(
+            State(s.clone()),
+            axum::http::HeaderMap::new(),
+            String::new(),
+        )
+        .await
+        .unwrap();
         assert!(!report.ok(), "{report:?}");
         assert_eq!(report.rows.len(), 1);
         assert_eq!(report.rows[0].kind, crate::access::CheckKind::Setup);
@@ -911,11 +931,54 @@ mod tests {
             .detail
             .contains("no enabled `youtrack` action"));
 
-        // A malformed body is a 400, not a 500.
-        let err = access_check(State(s), "{ not json".to_string())
+        // A malformed JSON body is a 400, not a 500.
+        let mut json_headers = axum::http::HeaderMap::new();
+        json_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        let err = access_check(State(s), json_headers, "{ not json".to_string())
             .await
             .expect_err("malformed body must be rejected");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// `POST /access/check` accepts the same two encodings the pause routes
+    /// do: a urlencoded body (what the `/access` page's own htmx form, with no
+    /// `json-enc` extension, serializes a filled-in field to) and a JSON body
+    /// (the CLI / API clients). Before this, only the empty-body "Check all"
+    /// button worked; filling in any field always 400'd because the handler
+    /// tried `serde_json` on a urlencoded body.
+    #[tokio::test]
+    async fn access_check_accepts_urlencoded_and_json_bodies() {
+        let s = app_state().await;
+        let mut form_headers = axum::http::HeaderMap::new();
+        form_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let mut json_headers = axum::http::HeaderMap::new();
+        json_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        // (a) urlencoded, as the `/access` form's "repo" field submits it.
+        let Json(report) = access_check(
+            State(s.clone()),
+            form_headers.clone(),
+            "repo=foo%2Fbar&host=&project=".to_string(),
+        )
+        .await
+        .expect("urlencoded body must not 400");
+        assert_eq!(report.rows[0].kind, crate::access::CheckKind::Setup);
+
+        // (b) JSON, as the CLI / API clients send it.
+        let Json(report) =
+            access_check(State(s), json_headers, r#"{"repo":"foo/bar"}"#.to_string())
+                .await
+                .expect("JSON body must not 400");
+        assert_eq!(report.rows[0].kind, crate::access::CheckKind::Setup);
     }
 
     /// Clearing a key with a live counter succeeds, records a
