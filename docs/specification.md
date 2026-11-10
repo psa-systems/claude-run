@@ -15,8 +15,9 @@ three kinds of input to Claude sessions and acts on the results:
 - Pull-request comments: a comment starting with a configurable trigger (default `/claude`) runs Claude against the
   pull-request branch or turns a plain-issue comment into a queued tracker issue.
 
-Users are operators of one runner instance. The web UI, the HTTP API and the CLI control a single daemon with a single
-state store.
+Users are operators of a runner instance. The web UI, the HTTP API and the CLI control a single daemon with a single
+state store. Several instances may be peered to share liveness, webhook claims and run summaries (`SPEC-3.17`); each
+still keeps its own state store.
 
 It does not: host a git forge or tracker, terminate TLS (a reverse proxy is expected), provide per-user permissions
 beyond "authenticated account", write to the tracker state outside the configured fields, or poll for CI failures
@@ -585,7 +586,8 @@ All sweeps are DB-backed settings, enabled by default flags in each section, and
 
 - Rows older than `retention_days` (180), by their stored `ts`, are deleted from `job_outcomes`, `run_events`,
   `ci_failure_runs` and `claude_invocations`. Each pruned table has a single-column index on `ts` so the cutoff
-  predicate seeks rather than scans.
+  predicate seeks rather than scans. `run_summaries` rows are pruned the same way by `ended_at`, and `peer_claims`
+  rows after 24 hours by `claimed_at` (`SPEC-3.17`).
 - `ci_failures`, `ci_failure_tests` and `agent_pull_requests` are never pruned by this sweep: a resolved failure or a
   merged PR must still be matchable against a regression months later, so only the per-sighting/per-invocation
   history tables above are bounded by age.
@@ -700,7 +702,8 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
 1. **`Working` is backed by a live run.** The field reads `Working` if and only if a `run_inflight_jobs` row exists for
    the issue in a daemon that is running, OR the field was set to `Working` recently enough that a run started by a
    DIFFERENT runner instance polling the same tracker query may still legitimately own it (item 2). The runner never
-   leaves `Working` behind on any exit path, including a crash, a restart, a kill, a timeout and a cancel.
+   leaves `Working` behind on any exit path, including a crash, a restart, a kill, a timeout and a cancel. With
+   peered instances (`SPEC-3.17`) the row may also be in a peer's daemon (`SPEC-3.17` item 6).
 2. **Reconcile sweep.** On daemon start and every 300 seconds (the automerge reconciler interval), the runner lists
    issues whose field reads `Working` and which have no in-flight row. `run_inflight_jobs` only knows runs of the
    daemon doing the sweep, so before correcting such an issue the sweep also reads the tracker history
@@ -711,7 +714,8 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
    (`SPEC-3.14`). Each correction is logged at `warn` naming the issue key. A sweep that cannot read the tracker, or
    whose history read fails, is logged at `error` and retried, never treated as "nothing stuck". The startup-only
    path (`run_inflight_jobs` rows left behind by a dead process of THIS daemon) is unaffected by the window: it
-   releases its own issues immediately.
+   releases its own issues immediately. With peered instances (`SPEC-3.17`), the sweep also leaves an issue alone
+   when a reachable peer's snapshot lists it in flight, per `SPEC-3.17` item 6.
 3. **Every finalize path ends in a closed outcome.** The table is exhaustive; a path not in it is a defect, and the
    code matches it with no wildcard arm.
 
@@ -862,6 +866,98 @@ linked, never pasted.
 5. **Scope.** The cap applies to the verdict, the failure comment and the `Needs Review` comment (`SPEC-3.12`). Push
    comments (`SPEC-8.8`) keep their commit list.
 
+### 3.17 Peered instances (`SPEC-3.17`)
+
+Two or more claude-run instances, typically at different sites joined by an overlay network and each possibly offline,
+may be peered. Peering is optional and best-effort. Each instance keeps its own state store and keeps working alone; a
+peer is never a dependency of a run. Duplicate work while peers cannot reach each other is accepted, exactly as it is
+without peering. The peer layer only narrows that window and merges what the instances report.
+
+1. **Autonomy.** No run, finalize, push, sweep or webhook response waits on a peer beyond the bounded timeouts below.
+   With `peers.enabled` false (the default) or no peer configured, behavior is exactly as without this section: no
+   route mounted, no outbound call, no row written to the tables below. No state store is shared between instances.
+2. **Identity.** Each instance generates a UUID `instance_id` on first start and stores it under the `settings` key
+   `instance.id`; it is never regenerated. `peers.instance_name` is required when peering is enabled and is unique among
+   the peers. A peer that reports this instance's own `instance_id` (a peer URL that points back at itself) is refused
+   and logged at `error`. A run is identified across instances by a `run_uuid`, never by its local integer id.
+3. **Configuration.** The DB-backed section `peers` (`config.peers`, `SPEC-6.3`): `enabled` (false), `instance_name`,
+   `peers` (a list of `name`, `url`, `token_ref`; `token_ref` names the secret holding that peer's bearer token, 7.6),
+   `poll_secs` (30, at least 5), `stale_after_secs` (120, at least twice `poll_secs`), `claim_timeout_secs` (5, between
+   1 and 30) and `summary_batch` (500). A save with a duplicate peer name, an unparseable URL or an out-of-range value
+   is rejected whole. The topology is a full mesh: every instance lists every other, and no instance relays another's
+   data.
+4. **Peer API.** Served only on the TCP listener under `/api/peer`, never on the unix socket (7.14), mounted only when
+   enabled, and requiring the bearer credential of 7.6 even on a loopback bind. It is read-only except the claim call,
+   and never starts, cancels or pauses a run or writes a setting. No response carries a secret, a prompt, log text or a
+   comment body.
+   - `GET /api/peer/state`: `instance_id`, `instance_name`, version, the server's current time, `load` (the count of
+     in-flight jobs) and `in_flight` (action, job key and run start for each `run_inflight_jobs` row).
+   - `POST /api/peer/claim`: body `event_key`, `claimant_id`, `claimant_load`; response `granted` plus the holder's id
+     and load (item 7).
+   - `GET /api/peer/summaries?after=<seq>&limit=<n>`: this instance's own `run_summaries` rows with `seq` above `after`,
+     ascending, at most `min(n, summary_batch)`, with a `next` cursor and a `more` flag (item 9).
+5. **Liveness.** Every `poll_secs` each instance pulls `/api/peer/state` from every peer. A peer is `reachable` if a
+   pull succeeded within `stale_after_secs` and `unknown` otherwise. A peer is never called dead, since a partition and
+   a crash look the same from here. A change of state is logged (`warn` to `unknown`, `info` to `reachable`) naming the
+   peer and the last error. A `401` or `403` from a peer is logged at `error` once per transition, naming the peer and a
+   token mismatch, because it is a configuration fault rather than an outage. The last error and last success time are
+   kept per peer and shown on the Status page (item 11). A peer whose reported time differs from the local clock by more
+   than 60 seconds is logged at `warn`; no decision compares two instances' clocks.
+6. **Sweep.** The stuck-`Working` sweep (`SPEC-3.12` item 2) leaves a `Working` issue alone if any of these holds: a
+   local `run_inflight_jobs` row exists for it; a reachable peer's latest snapshot, no older than `stale_after_secs`,
+   lists it in flight; or its last change to `Working` is within the action's session timeout plus 600 seconds. The
+   last condition applies whatever the peers' state, since `unknown` is not `dead`. Only an issue failing all three is
+   corrected. A failed read of the issue history leaves the issue alone and is logged at `error` naming the key.
+7. **Event claims.** Applied in the webhook pipeline after the pause and login gates and before dispatch (`SPEC-4.4`
+   point 8). A paused instance accepts and drops without claiming, so a peer that also received the event can take it.
+   - The `event_key` is `<provider>:<repo>:<event>:<identity>`, built from payload fields identical across every hook
+     target: for an action-run delivery the run index and outcome, for a pull-request delivery the PR number, action
+     and head commit, for a comment delivery the comment id. It never uses the delivery id, which differs per target. A
+     delivery whose identity cannot be built is processed without a claim and logged at `warn` naming the event type.
+   - The receiver inserts a `peer_claims` row (`event_key` primary key, `holder_id`, `holder_load`, `claimed_at`),
+     `holder_load` being its in-flight job count. If the row already exists, it drops the delivery with `200` and an
+     `info` log naming the holder. Otherwise it sends the claim to every `reachable` peer, each bounded by
+     `claim_timeout_secs`.
+   - A peer with no row for the key records the claimant as holder and grants. A peer holding its own row for the key
+     compares `(holder_load, holder_id)` pairs, lower wins: if the claimant's pair is lower the peer records the
+     claimant as holder, drops its own delivery and grants; otherwise it refuses and names its pair. A peer whose row
+     names a third party refuses. Both sides compare the same two fixed pairs, so simultaneous deliveries yield exactly
+     one holder.
+   - Any refusal drops the delivery with `200` and an `info` log naming the holder; a lost claim is never retried. All
+     grants, or no `reachable` peer, proceed to dispatch.
+   - A peer that times out, errors or returns an undecodable reply is bypassed: the receiver proceeds, logs at `warn`
+     naming the peer, the `event_key` and the error, and counts the bypass for the Status page. It is never retried.
+   - An instance claims only events delivered to it and never forwards an event to a peer. Load therefore decides
+     between instances that both received the event, not which instance receives it.
+   - `peer_claims` rows are pruned after 24 hours (`SPEC-3.8.4`).
+8. **Duplicates are accepted.** When a claim is bypassed, both instances may process the event. The dedupe of
+   `SPEC-3.5.2` is per store, so two instances may each open an issue for one failure. No reconciliation is attempted;
+   the replicated summaries (item 9) show both runs.
+9. **Summary replication.** Highlights and statistics only. On each job outcome an instance writes a `run_summaries`
+   row in the same call that writes `job_outcomes`: `run_uuid` (primary key), `instance_id`, `seq` (monotonic per
+   origin), `action_name`, `job_key`, `attempt`, `outcome`, `ok`, `started_at`, `ended_at`, `duration_ms`, `cost_usd`
+   and `timed_out`. A row is immutable once written. Every `poll_secs` each instance pulls each peer's rows after the
+   `peer_cursors` entry for that peer's `instance_id` and applies a batch and the cursor advance in one transaction,
+   inserting by `run_uuid` and ignoring a row already present. A row that fails validation fails the whole batch: it is
+   logged at `error` naming the peer and `run_uuid`, the cursor does not advance, and the Status page shows the fault.
+   A changed `instance_id` for a configured peer is a new origin and starts at cursor 0. The migration that adds
+   `run_summaries` backfills one row per existing `job_outcomes` row, with a fresh `run_uuid` and `seq` in time order,
+   so a new peer receives history through the same pull.
+   - Not replicated: stream logs, `run_events`, `attempt_steps`, comments, secrets, settings, pause state, attempt
+     counters, `daily_ledger`, the CI-failure store and `agent_pull_requests`.
+   - Spend ceilings (`SPEC-3.2.2`) and `daily_ledger` caps stay per instance. Replicated cost is for reporting only.
+10. **Reports.** With peering enabled, `/reports` and the `GET /report/{summary,daily,weekly,by-weekday,by-hour}`
+    series (`SPEC-4.3.13`) are merged across this instance and every peer's replicated rows by default. The `instance`
+    query parameter filters them: omitted or `all` merges, `local` shows this instance only, and a peer's `name` shows
+    that peer only. Every instance, this one included, is read from `run_summaries` in this mode, so the merged and
+    per-instance figures share one source. The step-time and CI-failure views (`SPEC-4.3.14`, `SPEC-4.3.15`) stay per
+    instance, and the page says so. A peer that is `unknown`, or whose cursor is behind, is named on the page with its
+    last sync time and a note that its figures may lack recent runs. The page never presents a partial total as
+    complete.
+11. **Status page.** With peering enabled the Status page (`SPEC-4.3.9`) lists each peer: name, state, last successful
+    pull, last error, summary sync state (caught up or behind), the peer's in-flight count when `reachable`, and the
+    number of claims bypassed in the last 24 hours.
+
 ## 4. Interfaces
 
 ### 4.1 CLI
@@ -928,8 +1024,9 @@ Served at the root of the unix socket (unless `--no-socket`) and under `/api` on
 | `POST /actions/{name}/delete` | Delete (403 synthetic, 409 when a run is in flight) |
 | `POST /runs/{id}/cancel` | Cancel a run |
 | `POST /pause`, `POST /resume` | Global pause |
-| `GET`/`PUT /settings/{section}` | Settings sections `mint`, `webhook`, `webhook_comment`, `log_filter`, `workdir_gc`, `stream_log_gc`, `preferences`, `concurrency`, `db_retention`, `docker_gc`, `claude`, `auth` |
-| `GET /report/summary`, `/report/daily`, `/report/weekly`, `/report/by-weekday`, `/report/by-hour` | Aggregations; query `range` (`30d`, `90d`, other values mean all time) and `action` |
+| `GET`/`PUT /settings/{section}` | Settings sections `mint`, `webhook`, `webhook_comment`, `log_filter`, `workdir_gc`, `stream_log_gc`, `preferences`, `concurrency`, `db_retention`, `docker_gc`, `claude`, `auth`, `peers` |
+| `GET /report/summary`, `/report/daily`, `/report/weekly`, `/report/by-weekday`, `/report/by-hour` | Aggregations; query `range` (`30d`, `90d`, other values mean all time), `action` and, with peering enabled, `instance` (`all`, `local` or a peer name; `SPEC-3.17` item 10) |
+| `GET /peer/state`, `POST /peer/claim`, `GET /peer/summaries` | Peer API (`SPEC-3.17` item 4); TCP listener only, bearer-authenticated, mounted only when peering is enabled |
 | `GET /report/time-by-kind`, `/report/checks`, `/report/stages`, `/report/funnel`, `/report/failure-causes`, `/report/postgres` | Step-time aggregations (`SPEC-4.3.14`); same `range` and `action` |
 | `POST /access/check` | Same typed report as `access check` |
 
@@ -1053,7 +1150,8 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
 #### 4.3.9 About and activity pages (`SPEC-4.3.9`)
 
 - `/about` and `/about/activity` render the version, build metadata and the same `quiet` restart-safety flag `GET
-  /api/status` exposes (`SPEC-9`), plus a recent-activity feed across all actions.
+  /api/status` exposes (`SPEC-9`), plus a recent-activity feed across all actions. With peering enabled the Status page
+  also lists each peer (`SPEC-3.17` item 11).
 
 #### 4.3.10 Run detail, job stream and live SSE (`SPEC-4.3.10`)
 
@@ -1097,6 +1195,8 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
   when a bucket has no data, rather than omitting an empty bucket.
 - The top-line `summary` totals spend and run count from `daily_ledger` and run minutes from `runs` (the only table
   with both a start and an end timestamp; a run with a NULL `ended_at` is excluded from the minutes total).
+- With peering enabled these five series read `run_summaries` instead, merged across instances by default and
+  filterable by an `instance` parameter (`SPEC-3.17` item 10).
 - The Claude plan-usage chart reads its series oldest first (so the chart draws left to right); the most-recent-
   invocations table is a separate newest-first query capped at 20 rows, not a reverse-and-slice of the chart's rows.
 
@@ -1167,6 +1267,9 @@ configured for a different provider, or a disabled listener returns 404. Pipelin
 7. Two gates run between replay (point 4) and event dispatch (point 5), both accept-and-drop (2xx) rather than reject:
    a hit on global pause, the action's own pause, or a failed pause read; and a configured Claude login that needs
    renewing. Both still record the delivery id as seen, since a retry could not help either way.
+8. With peering enabled, a claim runs after the gates of point 7 and before event dispatch (point 5), and decides
+   whether this instance processes the event (`SPEC-3.17` item 7). A lost claim returns 200 and drops the delivery; a
+   bypassed claim proceeds.
 
 #### 4.4.1 Ingress pipeline, types and shared primitives (`SPEC-4.4.1`)
 
@@ -1348,6 +1451,9 @@ same schema. Pool: 16 connections, 30-second acquire timeout. Timestamps are RFC
 | `agent_pull_requests` | Recorded agent PRs: unique (`host`, `repo`, `pr_number`), `issue_key`, `head_branch`, `fix_attempts`, `state`, `salvaged` |
 | `claude_invocations` | Per-invocation cost, token and rate-limit utilization record |
 | `attempt_steps` | Timed steps of an attempt (`SPEC-3.14`): `run_id`, `job_key`, `attempt`, `seq`, `stage`, `kind`, `label`, `started_at`, `ended_at`, `ok`, `detail`; `job_outcomes` gains `stage` and `outcome` |
+| `run_summaries` | Peered-instance run highlights (`SPEC-3.17` item 9): `run_uuid` (PK), `instance_id`, `seq`, `action_name`, `job_key`, `attempt`, `outcome`, `ok`, `started_at`, `ended_at`, `duration_ms`, `cost_usd`, `timed_out`; own and replicated rows |
+| `peer_cursors` | PK `peer_instance_id`: `after_seq`, `last_success_at`, `last_error` |
+| `peer_claims` | Webhook event claims (`SPEC-3.17` item 7): `event_key` (PK), `holder_id`, `holder_load`, `claimed_at` |
 | `web_accounts` | `username`, unique `username_key`, argon2 `password_hash`, `session_key`, TOTP secret (encrypted), `totp_enrolled_at`, `totp_last_step`, `created_by` |
 | `web_account_recovery_codes` | Hashed one-time recovery codes per account |
 | `web_invites` | `token_hash` (unique), `created_by`, `expires_at`, `used_at`, `email` |
@@ -1355,7 +1461,7 @@ same schema. Pool: 16 connections, 30-second acquire timeout. Timestamps are RFC
 
 Settings keys: `config.mint`, `config.webhook`, `config.webhook_comment`, `config.log_filter`, `config.workdir_gc`,
 `config.stream_log_gc`, `config.preferences`, `config.concurrency`, `config.db_retention`, `config.docker_gc`,
-`config.claude`, `config.auth`.
+`config.claude`, `config.auth`, `config.peers`. The key `instance.id` holds the instance UUID (`SPEC-3.17` item 2).
 
 On-disk layout: `<config dir>` (`config.toml`, `actions/`, `secrets.key`, MCP key files), `<data dir>` (`state.db`,
 `workdirs/<action>/<key>`, `mcp-web.db`), `<state dir>` (`logs/`, `snippets/`, `webhook-logs/`), `<runtime dir>`
@@ -1511,13 +1617,13 @@ requires `secret_ref` and `write_token_ref` on every source.
 Edited on the Settings page or through `PUT /api/settings/{section}`; changes apply without restart. Fields not listed in
 3.x: `webhook.analysis_timeout_secs` (600), `webhook.analysis_concurrency` (2); `concurrency.max_parallel_global` (0 =
 largest enabled action cap); `preferences` (`locale`, `timezone`, `datetime_format`); `claude` (`model`, `effort`,
-`autocompact`); `cargo_cache` (`enabled`, `max_bytes_per_repo`, 3.10); `docker_gc.max_bytes` (250 GB, 3.11); `auth` (service base URLs, secret names, git author name and email). `webhook_comment.sources.<name>`
+`autocompact`); `cargo_cache` (`enabled`, `max_bytes_per_repo`, 3.10); `docker_gc.max_bytes` (250 GB, 3.11); `auth` (service base URLs, secret names, git author name and email); `peers` (3.17). `webhook_comment.sources.<name>`
 adds `allowed_permissions`, `max_files`, `max_lines`, `bot_author`, `bot_email`, `skip_marker`.
 
 Each section is one JSON document keyed `config.<section>` in the `settings` table (5.2); the serde struct in
 `src/config.rs` IS the schema, so saving a section runs the identical `deny_unknown_fields` validation the
 `config.toml` parser uses, and the web Settings page and the `/api/settings/<section>` JSON endpoints share this
-one path. `Section` (`src/settings.rs`) enumerates the twelve sections (`Section::ALL`) and maps each to its
+one path. `Section` (`src/settings.rs`) enumerates the thirteen sections (`Section::ALL`) and maps each to its
 settings key, its URL path segment, its page title, and an "apply" badge (`next event` / `live` / `next tick` /
 `next sweep` / `next invocation`) describing when a save takes effect; a section-specific `validate_*` function
 rejects a value the serde schema alone would accept but that would be unsafe to apply (for example a DB-retention
@@ -1680,6 +1786,8 @@ appears in a log line or an error message. CI runs its Postgres leg through it
   account exists; once any account exists, only a DB account (7.9) can sign in through the form. The legacy pair's
   session is signed with the bearer token as its HMAC key under the sentinel account id `0`; every other session signs
   with that account's own rotating `session_key`, so rotating either invalidates exactly the sessions it signed.
+- `/api/peer/*` (`SPEC-3.17` item 4) is never exempt and never served unauthenticated, including on a loopback bind
+  with `require_auth_on_loopback` unset; it is not mounted at all while peering is disabled.
 - `/webhooks/`, `/login`, `/login/2fa`, `/logout`, `/setup` and `/invite/*` are exempt from this gate: webhooks
   authenticate by HMAC (4.4) and cannot carry a bearer header, and the auth routes themselves must stay reachable
   unauthenticated or there is no way to obtain a credential. `/account/2fa/setup` still requires a valid credential; it
@@ -1761,7 +1869,8 @@ appears in a log line or an error message. CI runs its Postgres leg through it
 
 ### 7.14 Unix-socket API (`SPEC-7.14`)
 
-- The unix-socket API has no authentication and is disabled by `--no-socket` in the container image.
+- The unix-socket API has no authentication and is disabled by `--no-socket` in the container image. The peer API
+  (`SPEC-3.17` item 4) is never served on it.
 
 ### 7.15 Agent write boundary (`SPEC-7.15`)
 
