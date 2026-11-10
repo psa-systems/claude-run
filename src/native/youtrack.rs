@@ -1624,14 +1624,16 @@ async fn process_job(
         }
     }
 
-    // ---- estimate vs session timeout (SPEC-3.12 item 7) ----
-    // "At pickup, if the issue's Estimation exceeds the action's session
-    // timeout, the runner does not start the attempt. It sets Needs Review
-    // with Needs-Info, and the comment names both numbers and asks for the
-    // issue to be split or the limit raised. An issue with no Estimation is
-    // picked up as before." Read-only and placed after the dependency gate,
-    // before the clone; like that gate, a read failure must not strand an
-    // otherwise-workable issue, so it falls back to proceeding with pickup.
+    // ---- estimate vs session timeout (SPEC-3.12 item 7, CLAUDE-617) ----
+    // An issue whose Estimation exceeds the session timeout is not refused and
+    // never coded: it runs as a split-only attempt whose one job is to file
+    // PR-sized pieces. The children it already has are read first, so the
+    // finalize can tell this run's pieces from an earlier split's. Read-only
+    // and placed after the dependency gate, before the clone; a failed
+    // Estimation read must not strand an otherwise-workable issue, so it falls
+    // back to a normal pickup.
+    let mut split_only: Option<i64> = None;
+    let mut children_before: Result<Vec<String>> = Ok(Vec::new());
     match backend.get_estimation_minutes(key) {
         Ok(Some(minutes)) if minutes * 60 > limits.claude_timeout.as_secs() as i64 => {
             info!(
@@ -1639,17 +1641,13 @@ async fn process_job(
                 key = %key,
                 estimation_minutes = minutes,
                 timeout_secs = limits.claude_timeout.as_secs(),
-                "estimate exceeds the session timeout; parking Needs Review, no attempt consumed"
+                "estimate exceeds the session timeout; running a split-only attempt"
             );
-            report_estimate_over_timeout(
-                backend,
-                src,
-                &action.name,
-                key,
-                minutes,
-                limits.claude_timeout,
-            );
-            return Ok(ProcessedJob::EstimateOverTimeout { key: key.clone() });
+            children_before = split_children(backend, key);
+            if let Err(e) = &children_before {
+                error!(action = %action.name, key = %key, error = %e, "reading the issue's existing children failed; the split attempt will end in Needs Review");
+            }
+            split_only = Some(minutes);
         }
         Ok(_) => {}
         Err(e) => {
@@ -1699,7 +1697,12 @@ async fn process_job(
     // instead of colliding on `agent_pull_requests`'s `UNIQUE(host, repo,
     // pr_number)`. Every other read of `resume` below happens before
     // `claude.invoke`, so this late mutation cannot affect them.
-    let mut resume = match resolve_pr_resume(pool, forge, job, pr_strategy).await {
+    let mut resume = match if split_only.is_some() {
+        // A split-only attempt opens no PR, so it never continues one.
+        Ok(None)
+    } else {
+        resolve_pr_resume(pool, forge, job, pr_strategy).await
+    } {
         Ok(r) => r,
         Err(e) => {
             warn!(action = %action.name, key = %key, error = %e, "PR-resume lookup failed; starting from the default branch");
@@ -1927,14 +1930,24 @@ async fn process_job(
             )
         }
         Ok(()) => {
-            let prompt = build_prompt(
-                src,
-                job,
-                &workdir_path,
-                limits.claude_timeout,
-                SystemTime::now(),
-                resume.as_ref(),
-            );
+            let prompt = match split_only {
+                Some(minutes) => build_split_prompt(
+                    src,
+                    job,
+                    &workdir_path,
+                    limits.claude_timeout,
+                    SystemTime::now(),
+                    minutes,
+                ),
+                None => build_prompt(
+                    src,
+                    job,
+                    &workdir_path,
+                    limits.claude_timeout,
+                    SystemTime::now(),
+                    resume.as_ref(),
+                ),
+            };
             let stream_log =
                 ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1);
             // SPEC-3.10 item 9: the run's start log line names the
@@ -2115,6 +2128,7 @@ async fn process_job(
     // deliberate no-code run never opens a PR, so there is nothing to
     // review). Billed exactly like the main invocation.
     let review = if claude_ran
+        && split_only.is_none()
         && claude_result.ok
         && !workdir_path.join(NEEDS_REVIEW_MARKER).exists()
         && !workdir_path.join(NO_CODE_MARKER).exists()
@@ -2307,7 +2321,29 @@ async fn process_job(
             },
         );
     };
+    // CLAUDE-617: a split-only attempt that ran to a result finalizes through
+    // the split path; a failed run, or one that parked itself with the
+    // needs-review marker, takes the ordinary closed outcome table.
+    let split_finalize =
+        split_only.filter(|_| claude_result.ok && !workdir_path.join(NEEDS_REVIEW_MARKER).exists());
     let finalize_res = crate::blocking::in_place(|| {
+        if let Some(minutes) = split_finalize {
+            return finalize_split(
+                backend,
+                src,
+                job,
+                limits.claude_timeout,
+                minutes,
+                &children_before,
+                crate::run_footer::CommentRun {
+                    run_id,
+                    attempt: attempts + 1,
+                    started: started_wall,
+                    source: "youtrack",
+                    trigger: Some(&trigger),
+                },
+            );
+        }
         finalize_with_steps(
             backend,
             forge,
@@ -4474,6 +4510,11 @@ enum Finalized {
     /// text is commented, AI Agent=`states.no_code` (default the `done` label),
     /// State untouched.
     NoCodeChange,
+    /// CLAUDE-617: a split-only attempt filed `pieces` (two or more), the
+    /// runner queued them and set the issue's Type to Story. No PR;
+    /// AI Agent=`states.no_code` (default the `done` label). A split that
+    /// fails its checks is `NeedsReview`, not this.
+    Split { pieces: Vec<String> },
     /// Success: PR opened; AI Agent=Code Review.
     CodeReview {
         pr_url: String,
@@ -4633,6 +4674,7 @@ fn finalized_line(f: &Finalized, attempt: u32) -> String {
     match f {
         Finalized::NeedsReview => "Needs Review".to_string(),
         Finalized::NoCodeChange => "No code change".to_string(),
+        Finalized::Split { .. } => "Split".to_string(),
         Finalized::CodeReview { .. } => "PR ready".to_string(),
         Finalized::Failed { requeued: true, .. } => retry(),
         Finalized::Failed {
@@ -4666,6 +4708,7 @@ impl Finalized {
         match self {
             Finalized::NeedsReview => "Needs Review",
             Finalized::NoCodeChange => "No Code Change",
+            Finalized::Split { .. } => "Split",
             Finalized::CodeReview { merged: true, .. } => "Merged",
             Finalized::CodeReview { merged: false, .. } => "Code Review",
             Finalized::Failed { requeued: true, .. } => "Queued (push)",
@@ -4691,6 +4734,7 @@ fn attempt_outcome_of(finalize_res: &Result<Finalized>) -> crate::attempt_steps:
         Err(_) => Outcome::Failed,
         Ok(Finalized::NeedsReview) => Outcome::NeedsReview,
         Ok(Finalized::NoCodeChange) => Outcome::NoCodeChange,
+        Ok(Finalized::Split { .. }) => Outcome::NoCodeChange,
         Ok(Finalized::CodeReview { .. }) => Outcome::CodeReview,
         Ok(Finalized::Failed { requeued: true, .. }) => Outcome::Queued,
         Ok(Finalized::Failed {
@@ -6064,45 +6108,182 @@ fn report_cap_reached(
     }
 }
 
-/// SPEC-3.12 item 7: comment naming both numbers (best-effort), then the
-/// `Needs-Info` tag (best-effort), then `AI Agent` = Needs Review as the
-/// authoritative write, mirroring [`report_cap_reached`]'s independent-writes
-/// shape: the issue is parked either way, so a write failure here is logged at
-/// `error` rather than aborting the caller, which must still return
-/// `ProcessedJob::EstimateOverTimeout` so the issue is not re-cloned this poll.
-fn report_estimate_over_timeout(
-    backend: &dyn IssueTracker,
-    src: &YoutrackSource,
-    action: &str,
-    key: &str,
-    estimation_minutes: i64,
-    session_timeout: Duration,
-) {
-    let body = estimate_over_timeout_comment(estimation_minutes, session_timeout);
-    if let Err(e) = backend.comment(key, &body) {
-        error!(action = %action, key = %key, error = %e, "estimate-over-timeout comment failed");
-    }
-    let needs_info_tag = src.tags.needs_info.trim();
-    if !needs_info_tag.is_empty() {
-        if let Err(e) = backend.add_tag(key, needs_info_tag) {
-            error!(action = %action, key = %key, tag = %needs_info_tag, error = %e, "estimate-over-timeout Needs-Info tag write failed");
-        }
-    }
-    if let Err(e) = backend.set_field(key, &src.custom_field, &src.states.needs_review) {
-        error!(action = %action, key = %key, error = %e, "estimate-over-timeout AI Agent write failed");
-    }
+/// CLAUDE-617: the issues `key` is already the parent of (the `parent for`
+/// rows of its links). A split-only attempt reads this before it starts and
+/// again at finalize, so the pieces it filed are the difference.
+fn split_children(backend: &dyn IssueTracker, key: &str) -> Result<Vec<String>> {
+    Ok(backend
+        .issue_links(key)?
+        .into_iter()
+        .filter(|l| l.verb == "parent for")
+        .map(|l| l.target)
+        .collect())
 }
 
-fn estimate_over_timeout_comment(estimation_minutes: i64, session_timeout: Duration) -> String {
-    let timeout_minutes = session_timeout.as_secs() / 60;
+/// CLAUDE-617: the split-only prompt. It is built-in and ignores a `prompt`
+/// override or preset, because the attempt has one fixed job and the runner's
+/// finalize depends on its exact outputs.
+fn split_youtrack_prompt() -> String {
     [
-        format!(
-            "This issue's Estimation ({estimation_minutes} minutes) exceeds this action's session timeout ({timeout_minutes} minutes), so it was not started."
-        ),
-        String::new(),
-        "Split this issue into pieces that each fit inside the timeout, or raise the action's `limits.claude_timeout_seconds`.".to_string(),
+        "You are splitting an oversized YouTrack issue into smaller issues. You write NO code in this run.",
+        "",
+        "Issue: {{key}}: {{summary}}",
+        "Repo: {{clone_url}}",
+        "Working directory: {{workdir}} - the repo is already cloned here, you are inside it.",
+        "",
+        "{{key}} has an Estimation of {{estimation_minutes}} minutes, which exceeds this action's session timeout of {{timeout_minutes}} minutes, so one session cannot finish it. The run is killed at {{deadline_utc}}. Run 'date -u' whenever you need the current time.",
+        "",
+        "Your only job: break {{key}} into at least two issues that are each PR-sized, one PR that is reviewable and mergeable on its own, and each small enough to finish inside the {{timeout_minutes}} minute session timeout. Do NOT change code, do NOT commit, do NOT push, do NOT open a PR, and do NOT write any marker file.",
+        "",
+        "Steps:",
+        "1. Run 'yt issue inspect {{key}}' and read the full description, acceptance criteria and every comment, including any person's answer about how to split it. Then read the repo to learn what each acceptance criterion touches.",
+        "2. Split by what one PR can deliver and verify alone, never by file, layer, commit or phase of one change. Every acceptance criterion of {{key}} must be owned by exactly one piece.",
+        "3. Create each piece with 'yt issue create' in exactly these projects: {{write_projects}}. Each piece gets a full spec: Background, Goal, Proposed approach, Acceptance criteria (each checkable from the repo alone), and the expected file set. Set its Estimation to a value in minutes strictly below {{timeout_minutes}} with 'yt issue set-field <new-issue> Estimation <value>'.",
+        "4. Link every piece to {{key}} with 'yt issue link <new-issue> {{key}} --type \"subtask of\"'. In this split-only run, and only here, that link is required: {{key}} becomes the grouping parent of its pieces.",
+        "5. When one piece genuinely needs another to land first, link them with 'depends on' / 'is required for'. Before creating such a link, check that it makes no cycle through the existing 'depends on' / 'is required for' links; if it would, skip it and say so in your final summary.",
+        "6. Stop and summarize: one line per piece with its key, its Estimation, and the acceptance criteria it owns.",
+        "",
+        "HARD BANS on YouTrack, no exceptions:",
+        "- NEVER set the 'AI Agent' field on ANY issue, including issues you created yourself: no 'yt issue set-field ... \"AI Agent\" ...', and no equivalent through 'yt issue update' or 'yt issue apply'. The runner queues the pieces itself after it checks their Estimations.",
+        "- No write to {{key}} other than the 'subtask of' links above and, if useful, 'yt issue comment {{key}}'. No description, summary, tag, assignee, State or Type change on {{key}}: the runner owns those.",
+        "- No write of any kind to an issue you did not create during this run.",
+        "- Never run 'yt issue delete' anywhere.",
+        "",
+        "If you cannot split {{key}} without a decision only a person can make, write the single question to {{workdir}}/{{needs_review_marker}} instead, and create no issues.",
     ]
     .join("\n")
+}
+
+/// Render [`split_youtrack_prompt`] for `job`.
+fn build_split_prompt(
+    src: &YoutrackSource,
+    job: &YoutrackJob,
+    workdir: &Path,
+    claude_timeout: Duration,
+    now: SystemTime,
+    estimation_minutes: i64,
+) -> String {
+    let template =
+        split_youtrack_prompt().replace("{{estimation_minutes}}", &estimation_minutes.to_string());
+    render_prompt_template(
+        &template,
+        job,
+        workdir,
+        claude_timeout,
+        now,
+        &write_projects(src, job),
+        None,
+    )
+}
+
+/// CLAUDE-617: the runner-side end of a split-only attempt, through the run's
+/// audited tracker. The pieces are the issue's `parent for` children that did
+/// not exist before the attempt. At least two, each with an Estimation that
+/// fits the session timeout, are required: otherwise nothing is queued and the
+/// issue ends in `Needs Review` with `Needs-Info` naming the cause (SPEC-3.12
+/// item 6). On success the issue becomes a `Story`, each piece is queued, and
+/// the issue leaves `Queued` on the no-code state with a comment listing the
+/// pieces. A failed write is logged at `error` naming the issue and returned,
+/// never read as a completed split.
+fn finalize_split(
+    backend: &dyn IssueTracker,
+    src: &YoutrackSource,
+    job: &YoutrackJob,
+    claude_timeout: Duration,
+    estimation_minutes: i64,
+    children_before: &Result<Vec<String>>,
+    run: crate::run_footer::CommentRun<'_>,
+) -> Result<Finalized> {
+    let public_url = crate::run_footer::resolved_public_url();
+    let timeout_minutes = claude_timeout.as_secs() / 60;
+    let park = |cause: String| -> Result<Finalized> {
+        let body = format!(
+            "Split attempt for {key} (Estimation {estimation_minutes} minutes, session timeout {timeout_minutes} minutes) did not produce a usable split: {cause}\n\nNothing was queued. Decide how to split {key}, or raise the action's `limits.claude_timeout_seconds`, then re-queue it.",
+            key = job.key
+        );
+        let body = lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Needs Review");
+        if let Err(e) = backend.comment(&job.key, &body) {
+            error!(key = %job.key, error = %e, "split attempt: the Needs Review comment failed (continuing to tag / AI Agent write)");
+        }
+        let tag = src.tags.needs_info.trim();
+        if !tag.is_empty() {
+            if let Err(e) = backend.add_tag(&job.key, tag) {
+                error!(key = %job.key, tag = %tag, error = %e, "split attempt: the Needs-Info tag write failed (continuing to AI Agent write)");
+            }
+        }
+        backend
+            .set_field(&job.key, &src.custom_field, &src.states.needs_review)
+            .inspect_err(
+                |e| error!(key = %job.key, error = %e, "split attempt: the AI Agent write failed"),
+            )?;
+        Ok(Finalized::NeedsReview)
+    };
+
+    let before = match children_before {
+        Ok(before) => before,
+        Err(e) => return park(format!("the issue's children could not be read before the attempt ({e}), so this run's pieces cannot be told from earlier ones.")),
+    };
+    let after = match split_children(backend, &job.key) {
+        Ok(after) => after,
+        Err(e) => {
+            error!(key = %job.key, error = %e, "split attempt: reading the issue's children failed");
+            return park(format!(
+                "the issue's children could not be read after the attempt ({e})."
+            ));
+        }
+    };
+    let pieces: Vec<String> = after.into_iter().filter(|k| !before.contains(k)).collect();
+    if pieces.len() < 2 {
+        return park(format!(
+            "it filed {} piece(s) linked `subtask of` {}; a split needs at least two.",
+            pieces.len(),
+            job.key
+        ));
+    }
+    let mut oversized = Vec::new();
+    for piece in &pieces {
+        match backend.get_estimation_minutes(piece) {
+            Ok(Some(m)) if m * 60 <= claude_timeout.as_secs() as i64 => {}
+            Ok(Some(m)) => oversized.push(format!("{piece} (Estimation {m} minutes)")),
+            Ok(None) => oversized.push(format!("{piece} (no Estimation)")),
+            Err(e) => {
+                error!(key = %job.key, piece = %piece, error = %e, "split attempt: reading a piece's Estimation failed");
+                oversized.push(format!("{piece} (Estimation unreadable: {e})"));
+            }
+        }
+    }
+    if !oversized.is_empty() {
+        return park(format!(
+            "these pieces do not fit the {timeout_minutes} minute session timeout: {}.",
+            oversized.join(", ")
+        ));
+    }
+
+    backend.set_field(&job.key, "Type", "Story").inspect_err(
+        |e| error!(key = %job.key, error = %e, "split attempt: setting Type to Story failed"),
+    )?;
+    for piece in &pieces {
+        backend
+            .set_field(piece, &src.custom_field, &src.states.queued)
+            .inspect_err(|e| error!(key = %job.key, piece = %piece, error = %e, "split attempt: queueing a piece failed"))?;
+    }
+    let list = pieces
+        .iter()
+        .map(|p| format!("- {p}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = format!(
+        "Split {key} (Estimation {estimation_minutes} minutes, session timeout {timeout_minutes} minutes) into {n} pieces, each queued:\n\n{list}",
+        key = job.key,
+        n = pieces.len()
+    );
+    let body = lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Split");
+    let label = src.states.no_code_label().to_string();
+    comment_then_field(backend, src, &job.key, &body, &label).inspect_err(
+        |e| error!(key = %job.key, error = %e, "split attempt: the AI Agent write failed"),
+    )?;
+    info!(key = %job.key, pieces = pieces.len(), %label, "split attempt: pieces queued");
+    Ok(Finalized::Split { pieces })
 }
 
 fn cap_reached_comment(attempts: u32, cap: u32) -> String {
@@ -7644,6 +7825,12 @@ mod tests {
         let table: Vec<(Finalized, &str)> = vec![
             (Finalized::NeedsReview, "Needs Review"),
             (Finalized::NoCodeChange, "No code change"),
+            (
+                Finalized::Split {
+                    pieces: vec!["MK-20".into(), "MK-21".into()],
+                },
+                "Split",
+            ),
             (cr(), "PR ready"),
             (
                 Finalized::Failed {
@@ -8029,29 +8216,271 @@ mod tests {
         (outcome, tracker)
     }
 
-    /// SPEC-3.12 item 7: an issue whose `Estimation` exceeds the action's
-    /// session timeout is parked `Needs Review` with `Needs-Info`, a comment
-    /// naming both numbers, and no attempt consumed.
+    /// SPEC-3.12 item 7 (CLAUDE-617): an issue whose `Estimation` exceeds the
+    /// action's session timeout is no longer parked at pickup. It proceeds as a
+    /// split-only attempt (here: past the gate to the cancel checkpoint), with
+    /// no Needs Review write, no comment and no Needs-Info tag from the gate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn process_job_parks_needs_review_when_estimate_exceeds_timeout() {
+    async fn process_job_runs_a_split_attempt_when_estimate_exceeds_timeout() {
         let pool = mem_pool().await;
         let (outcome, tracker) =
             run_estimation_gated_process_job(&pool, Some(60), Duration::from_secs(1800)).await;
         assert!(
-            matches!(&outcome, ProcessedJob::EstimateOverTimeout { key } if key == "MK-16"),
+            matches!(&outcome, ProcessedJob::Filtered { key } if key == "MK-16"),
             "got {outcome:?}"
         );
-        assert_eq!(tracker.field(), "Needs Review");
-        let comments = tracker.comments.lock().unwrap().clone();
-        assert_eq!(comments.len(), 1);
-        assert!(comments[0].contains("60 minutes"), "{comments:?}");
-        assert!(comments[0].contains("30 minutes"), "{comments:?}");
-        assert_eq!(tracker.tags.lock().unwrap().as_slice(), ["Needs-Info"]);
-        assert_eq!(
-            state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
-            0,
-            "no attempt is spent when the estimate parks the issue"
+        assert_eq!(tracker.field(), "Queued");
+        assert!(tracker.comments.lock().unwrap().is_empty());
+        assert!(tracker.tags.lock().unwrap().is_empty());
+    }
+
+    /// CLAUDE-617: a tracker keyed by issue, for [`finalize_split`]: canned
+    /// children before and after, canned Estimations, and every write recorded
+    /// as `(key, field, value)`.
+    #[derive(Default)]
+    struct SplitTracker {
+        children: Mutex<Vec<String>>,
+        children_fail: bool,
+        estimations: Mutex<std::collections::HashMap<String, Option<i64>>>,
+        sets: Mutex<Vec<(String, String, String)>>,
+        comments: Mutex<Vec<(String, String)>>,
+        tags: Mutex<Vec<(String, String)>>,
+        fail_set_on: Option<String>,
+    }
+
+    impl IssueTracker for SplitTracker {
+        fn list_queued(&self, _q: &str) -> Result<Vec<Value>> {
+            Ok(Vec::new())
+        }
+        fn get_field(&self, _k: &str, _f: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        fn set_field(&self, key: &str, field: &str, value: &str) -> Result<()> {
+            if self.fail_set_on.as_deref() == Some(field) {
+                return Err(Error::Other(anyhow::anyhow!("set-field failed")));
+            }
+            self.sets
+                .lock()
+                .unwrap()
+                .push((key.into(), field.into(), value.into()));
+            Ok(())
+        }
+        fn set_state(&self, _k: &str, _s: &str) -> Result<()> {
+            Ok(())
+        }
+        fn set_assignee(&self, _k: &str, _l: &str) -> Result<()> {
+            Ok(())
+        }
+        fn comment(&self, key: &str, body: &str) -> Result<()> {
+            self.comments
+                .lock()
+                .unwrap()
+                .push((key.into(), body.into()));
+            Ok(())
+        }
+        fn issue_links(&self, _key: &str) -> Result<Vec<crate::provider::IssueLink>> {
+            if self.children_fail {
+                return Err(Error::Other(anyhow::anyhow!("links failed")));
+            }
+            Ok(self
+                .children
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| crate::provider::IssueLink {
+                    direction: crate::provider::LinkDirection::Outward,
+                    verb: "parent for".into(),
+                    target: c.clone(),
+                    resolved: None,
+                })
+                .collect())
+        }
+        fn inspect_issue(&self, _k: &str) -> Result<crate::provider::IssueInspect> {
+            Ok(Default::default())
+        }
+        fn resolve_vcs(&self, _p: &str) -> Result<crate::provider::VcsRepo> {
+            Err(Error::Other(anyhow::anyhow!("unused")))
+        }
+        fn vcs_repo_map(&self) -> Result<Vec<crate::provider::VcsMapEntry>> {
+            Ok(Vec::new())
+        }
+        fn create_issue(&self, _p: &str, _s: &str, _d: &str, _a: Option<&str>) -> Result<String> {
+            Err(Error::Other(anyhow::anyhow!("unused")))
+        }
+        fn attach_file(&self, _k: &str, _f: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+        fn get_estimation_minutes(&self, key: &str) -> Result<Option<i64>> {
+            Ok(self.estimations.lock().unwrap().get(key).copied().flatten())
+        }
+        fn add_tag(&self, key: &str, tag: &str) -> Result<()> {
+            self.tags.lock().unwrap().push((key.into(), tag.into()));
+            Ok(())
+        }
+    }
+
+    fn split_run() -> crate::run_footer::CommentRun<'static> {
+        crate::run_footer::CommentRun {
+            run_id: 1,
+            attempt: 1,
+            started: chrono::Utc::now(),
+            source: "youtrack",
+            trigger: None,
+        }
+    }
+
+    fn split_tracker(after: &[&str], estimations: &[(&str, Option<i64>)]) -> SplitTracker {
+        SplitTracker {
+            children: Mutex::new(after.iter().map(|s| s.to_string()).collect()),
+            estimations: Mutex::new(
+                estimations
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), *v))
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn run_split(tracker: &SplitTracker, before: Result<Vec<String>>) -> Result<Finalized> {
+        finalize_split(
+            tracker,
+            &src(),
+            &job(),
+            Duration::from_secs(1800),
+            240,
+            &before,
+            split_run(),
+        )
+    }
+
+    /// CLAUDE-617: two new pieces that fit become queued, the issue becomes a
+    /// Story and leaves Queued on the no-code state, and the comment lists
+    /// the pieces. A child that existed before the attempt is not a piece.
+    #[test]
+    fn finalize_split_queues_fitting_pieces_and_makes_the_issue_a_story() {
+        let t = split_tracker(
+            &["MK-1", "MK-20", "MK-21"],
+            &[
+                ("MK-20", Some(30)),
+                ("MK-21", Some(20)),
+                ("MK-1", Some(999)),
+            ],
         );
+        let res = run_split(&t, Ok(vec!["MK-1".into()])).unwrap();
+        assert_eq!(
+            res,
+            Finalized::Split {
+                pieces: vec!["MK-20".into(), "MK-21".into()]
+            }
+        );
+        let sets = t.sets.lock().unwrap().clone();
+        let s = |k: &str, f: &str, v: &str| (k.to_string(), f.to_string(), v.to_string());
+        assert_eq!(
+            sets,
+            vec![
+                s("MK-16", "Type", "Story"),
+                s("MK-20", "AI Agent", "Queued"),
+                s("MK-21", "AI Agent", "Queued"),
+                s("MK-16", "AI Agent", src().states.no_code_label()),
+            ]
+        );
+        let comments = t.comments.lock().unwrap().clone();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].1.contains("- MK-20") && comments[0].1.contains("- MK-21"));
+        assert!(!comments[0].1.contains("MK-1\n"), "{comments:?}");
+        assert!(t.tags.lock().unwrap().is_empty());
+    }
+
+    /// CLAUDE-617 / SPEC-3.12 item 6: fewer than two new pieces ends in Needs
+    /// Review with Needs-Info and a comment naming the cause; nothing queued.
+    #[test]
+    fn finalize_split_with_fewer_than_two_pieces_parks_needs_review() {
+        let t = split_tracker(&["MK-20"], &[("MK-20", Some(30))]);
+        assert_eq!(run_split(&t, Ok(vec![])).unwrap(), Finalized::NeedsReview);
+        let sets = t.sets.lock().unwrap().clone();
+        assert_eq!(
+            sets,
+            vec![("MK-16".into(), "AI Agent".into(), "Needs Review".into())]
+        );
+        assert_eq!(
+            t.tags.lock().unwrap().as_slice(),
+            [("MK-16".to_string(), "Needs-Info".to_string())]
+        );
+        assert!(t.comments.lock().unwrap()[0].1.contains("at least two"));
+    }
+
+    /// CLAUDE-617: a piece still over the timeout (or with no Estimation)
+    /// parks the issue and queues nothing, naming the piece.
+    #[test]
+    fn finalize_split_with_an_oversized_piece_queues_nothing() {
+        let t = split_tracker(
+            &["MK-20", "MK-21", "MK-22"],
+            &[("MK-20", Some(30)), ("MK-21", Some(31)), ("MK-22", None)],
+        );
+        assert_eq!(run_split(&t, Ok(vec![])).unwrap(), Finalized::NeedsReview);
+        let sets = t.sets.lock().unwrap().clone();
+        assert!(
+            sets.iter()
+                .all(|(k, _, v)| k == "MK-16" && v == "Needs Review"),
+            "{sets:?}"
+        );
+        let body = t.comments.lock().unwrap()[0].1.clone();
+        assert!(body.contains("MK-21 (Estimation 31 minutes)"), "{body}");
+        assert!(body.contains("MK-22 (no Estimation)"), "{body}");
+        assert!(!body.contains("MK-20 ("), "{body}");
+    }
+
+    /// CLAUDE-617: a children read that failed before the attempt can never
+    /// read as "no pieces existed"; the split ends in Needs Review naming it.
+    #[test]
+    fn finalize_split_unreadable_children_park_with_the_cause() {
+        let t = split_tracker(&["MK-20", "MK-21"], &[]);
+        let before = Err(Error::Other(anyhow::anyhow!("links failed")));
+        assert_eq!(run_split(&t, before).unwrap(), Finalized::NeedsReview);
+        assert!(t.comments.lock().unwrap()[0].1.contains("links failed"));
+    }
+
+    /// CLAUDE-617: a failed runner write is returned, never read as a split.
+    #[test]
+    fn finalize_split_write_failure_is_an_error() {
+        let mut t = split_tracker(
+            &["MK-20", "MK-21"],
+            &[("MK-20", Some(30)), ("MK-21", Some(30))],
+        );
+        t.fail_set_on = Some("Type".into());
+        assert!(run_split(&t, Ok(vec![])).is_err());
+        assert!(
+            t.sets.lock().unwrap().is_empty(),
+            "nothing is queued after a failed Type write"
+        );
+    }
+
+    /// CLAUDE-617: the split prompt demands PR-sized pieces with full specs,
+    /// fitting Estimations and the `subtask of` link, and still forbids
+    /// setting `AI Agent`.
+    #[test]
+    fn split_prompt_requires_the_spec_and_forbids_ai_agent() {
+        let p = build_split_prompt(
+            &src(),
+            &job(),
+            std::path::Path::new("/w"),
+            Duration::from_secs(1800),
+            SystemTime::UNIX_EPOCH,
+            240,
+        );
+        assert!(p.contains("240 minutes") && p.contains("30 minute"), "{p}");
+        assert!(p.contains("--type \"subtask of\""), "{p}");
+        assert!(p.contains("PR-sized"), "{p}");
+        assert!(
+            p.contains("Background, Goal, Proposed approach, Acceptance criteria"),
+            "{p}"
+        );
+        assert!(
+            p.contains("NEVER set the 'AI Agent' field on ANY issue"),
+            "{p}"
+        );
+        assert!(!p.contains("{{"), "unrendered placeholder: {p}");
     }
 
     /// SPEC-3.12 item 7: an issue with no `Estimation`, and one at or below
@@ -20389,6 +20818,8 @@ mod tests {
             Finalized::NeedsReview => "Needs Review",
             // row: "marker `.claude-run-no-code-change`"
             Finalized::NoCodeChange => "done label",
+            // row: "split-only attempt, pieces queued" (CLAUDE-617)
+            Finalized::Split { .. } => "done label",
             // row: "success, verification gate and review pass"
             // (CLAUDE-549's `merged` flag never changes the field itself;
             // CLAUDE-327: a YouTrack workflow resolves the issue on merge)
@@ -20457,6 +20888,13 @@ mod tests {
             (
                 "marker .claude-run-no-code-change",
                 Finalized::NoCodeChange,
+                "done label",
+            ),
+            (
+                "split-only attempt, two or more fitting pieces",
+                Finalized::Split {
+                    pieces: vec!["MK-20".into(), "MK-21".into()],
+                },
                 "done label",
             ),
             (

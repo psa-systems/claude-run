@@ -685,11 +685,6 @@ pub enum ProcessedJob {
     /// with CI pending, so the issue was left Queued and never cloned or handed
     /// to claude. Consumes no attempt. `pending` is the count that was found.
     Deferred { key: String, pending: u32 },
-    /// SPEC-3.12 item 7: the issue's `Estimation` exceeds the action's
-    /// session timeout, so the issue was parked `Needs Review` with
-    /// `Needs-Info` instead of being cloned or handed to claude. Consumes no
-    /// attempt.
-    EstimateOverTimeout { key: String },
     /// Job reached at least pre steps; outcome record is meaningful.
     Done {
         key: String,
