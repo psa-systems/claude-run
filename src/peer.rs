@@ -688,7 +688,14 @@ impl PeerClaims {
         };
         match crate::state::peer_claim_insert(&self.pool, event_key, &own_id, load).await {
             Ok(true) => {}
-            Ok(false) => return self.drop_for_existing(event_key, source, delivery).await,
+            Ok(false) => {
+                if let Some(decision) = self
+                    .contend_for_existing(event_key, &own_id, load, source, delivery)
+                    .await
+                {
+                    return decision;
+                }
+            }
             Err(e) => {
                 error!(source, delivery, event_key, error = %e, "peer claim skipped: writing the claim row failed; processing without a claim");
                 return ClaimDecision::Proceed;
@@ -729,22 +736,82 @@ impl PeerClaims {
         }
     }
 
-    async fn drop_for_existing(
+    /// Our own local insert lost the race to a row already in the table
+    /// (most likely an inbound peer claim for the same event). Settle by the
+    /// same `(load, id)` precedence `respond_to_claim` uses for an inbound
+    /// conflict: take the row over when we rank lower, otherwise drop.
+    /// `None` means we now hold the row and `claim` should carry on asking
+    /// peers; `Some` is the final decision.
+    async fn contend_for_existing(
         &self,
         event_key: &str,
+        own_id: &str,
+        load: u64,
         source: &str,
         delivery: &str,
-    ) -> ClaimDecision {
-        let holder = match crate::state::peer_claim_get(&self.pool, event_key).await {
-            Ok(Some(row)) => row.holder_id,
-            Ok(None) => "unknown".to_string(),
+    ) -> Option<ClaimDecision> {
+        let row = match crate::state::peer_claim_get(&self.pool, event_key).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return Some(self.drop_unknown(event_key, source, delivery)),
             Err(e) => {
-                error!(event_key, error = %e, "reading the existing claim row failed");
-                "unknown".to_string()
+                error!(source, delivery, event_key, error = %e, "reading the existing claim row failed");
+                return Some(self.drop_unknown(event_key, source, delivery));
             }
         };
-        info!(source, delivery, event_key, holder = %holder, "event already claimed; delivery dropped");
-        ClaimDecision::Drop { holder }
+        if row.holder_id == own_id {
+            return None;
+        }
+        if (load, own_id) >= (row.holder_load, row.holder_id.as_str()) {
+            info!(source, delivery, event_key, holder = %row.holder_id, "event already claimed; delivery dropped");
+            return Some(ClaimDecision::Drop {
+                holder: row.holder_id,
+            });
+        }
+        match crate::state::peer_claim_reassign(&self.pool, event_key, &row.holder_id, own_id, load)
+            .await
+        {
+            Ok(true) => {
+                info!(event_key, holder = %own_id, "claim taken over locally: we have the lower load, so the existing local holder is dropped");
+                None
+            }
+            Ok(false) => {
+                // The row changed holder again between our read and our
+                // reassign attempt; settle on whatever it is now.
+                match crate::state::peer_claim_get(&self.pool, event_key).await {
+                    Ok(Some(now_row)) if now_row.holder_id == own_id => None,
+                    Ok(Some(now_row)) => {
+                        info!(source, delivery, event_key, holder = %now_row.holder_id, "event already claimed; delivery dropped");
+                        Some(ClaimDecision::Drop {
+                            holder: now_row.holder_id,
+                        })
+                    }
+                    Ok(None) => Some(self.drop_unknown(event_key, source, delivery)),
+                    Err(e) => {
+                        error!(source, delivery, event_key, error = %e, "re-reading the claim row failed");
+                        Some(self.drop_unknown(event_key, source, delivery))
+                    }
+                }
+            }
+            Err(e) => {
+                error!(source, delivery, event_key, error = %e, "reassigning the claim row failed");
+                Some(ClaimDecision::Drop {
+                    holder: row.holder_id,
+                })
+            }
+        }
+    }
+
+    fn drop_unknown(&self, event_key: &str, source: &str, delivery: &str) -> ClaimDecision {
+        info!(
+            source,
+            delivery,
+            event_key,
+            holder = "unknown",
+            "event already claimed; delivery dropped"
+        );
+        ClaimDecision::Drop {
+            holder: "unknown".to_string(),
+        }
     }
 
     /// Send the claim to every peer in `peers`, bounded by `claim_timeout_secs`.
