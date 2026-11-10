@@ -4361,7 +4361,7 @@ mod tests {
             None,
         );
         assert!(pushed_with_comment_failure.contains("Claude pushed a commit."));
-        assert!(pushed_with_comment_failure.contains("Note: boom"));
+        assert!(pushed_with_comment_failure.contains("Note:\n```\nboom\n```"));
         assert!(outcome_comment(&Decision::NoChanges, &ok, None, None, None)
             .contains("made no changes"));
         assert!(outcome_comment(
