@@ -35,8 +35,8 @@ use tokio::sync::{Mutex, RwLock};
 use crate::config::{
     AuthConfig, CargoCacheConfig, ClaudeConfig, ClaudeConfigHandle, CommentWebhookConfig,
     CommentWebhookSource, ConcurrencyConfig, DbRetentionConfig, DockerGcConfig, MintConfig,
-    OnDiskConfig, Paths, PreferencesConfig, StreamLogGcConfig, WebhookConfig, WebhookSource,
-    WorkdirGcConfig,
+    OnDiskConfig, Paths, PeersConfig, PreferencesConfig, StreamLogGcConfig, WebhookConfig,
+    WebhookSource, WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
@@ -74,11 +74,13 @@ pub enum Section {
     /// Per-repo shared Cargo target directory size ceiling (CLAUDE-512,
     /// `SPEC-3.10` item 6).
     CargoCache,
+    /// Optional peering between instances (`SPEC-3.17` item 3).
+    Peers,
 }
 
 impl Section {
     /// Every section, in display order (used by the Settings page). SPEC-6.3.
-    pub const ALL: [Section; 13] = [
+    pub const ALL: [Section; 14] = [
         Section::Mint,
         Section::Webhook,
         Section::WebhookComment,
@@ -90,6 +92,7 @@ impl Section {
         Section::DbRetention,
         Section::DockerGc,
         Section::CargoCache,
+        Section::Peers,
         Section::Claude,
         Section::Auth,
     ];
@@ -111,6 +114,7 @@ impl Section {
             Section::Auth => "config.auth",
             Section::DockerGc => "config.docker_gc",
             Section::CargoCache => "config.cargo_cache",
+            Section::Peers => "config.peers",
         }
     }
 
@@ -130,6 +134,7 @@ impl Section {
             Section::Auth => "auth",
             Section::DockerGc => "docker_gc",
             Section::CargoCache => "cargo_cache",
+            Section::Peers => "peers",
         }
     }
 
@@ -155,6 +160,7 @@ impl Section {
             Section::Auth => "Service auth",
             Section::DockerGc => "Docker volume GC",
             Section::CargoCache => "Cargo target cache",
+            Section::Peers => "Peered instances",
         }
     }
 
@@ -174,6 +180,7 @@ impl Section {
             Section::Auth => "live",
             Section::DockerGc => "next sweep",
             Section::CargoCache => "next sweep",
+            Section::Peers => "next tick",
         }
     }
 }
@@ -403,6 +410,9 @@ pub struct EffectiveRuntime {
     /// 6). Brand-new section (never in `config.toml`), so the DB value or the
     /// built-in default (60 GB).
     pub cargo_cache: CargoCacheConfig,
+    /// Peering (`SPEC-3.17`). Brand-new section: the DB value or the
+    /// built-in default (disabled).
+    pub peers: PeersConfig,
 }
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
@@ -448,6 +458,9 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
     let cargo_cache = get_json::<CargoCacheConfig>(pool, Section::CargoCache.key())
         .await?
         .unwrap_or_default();
+    let peers = get_json::<PeersConfig>(pool, Section::Peers.key())
+        .await?
+        .unwrap_or_default();
     Ok(EffectiveRuntime {
         mint,
         webhook,
@@ -462,6 +475,7 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
         auth,
         docker_gc,
         cargo_cache,
+        peers,
     })
 }
 
@@ -521,6 +535,87 @@ pub fn validate_cargo_cache(cfg: &CargoCacheConfig) -> std::result::Result<(), S
         return Err("max_bytes_per_repo must be >= 1".to_string());
     }
     Ok(())
+}
+
+/// `SPEC-3.17` item 3: validate a [`PeersConfig`] before it is persisted. The
+/// whole save is rejected on the first problem, so nothing is stored.
+pub fn validate_peers(cfg: &PeersConfig) -> std::result::Result<(), String> {
+    if cfg.poll_secs < 5 {
+        return Err("poll_secs must be >= 5".to_string());
+    }
+    if cfg.stale_after_secs < cfg.poll_secs.saturating_mul(2) {
+        return Err("stale_after_secs must be at least twice poll_secs".to_string());
+    }
+    if !(1..=30).contains(&cfg.claim_timeout_secs) {
+        return Err("claim_timeout_secs must be between 1 and 30".to_string());
+    }
+    if cfg.summary_batch < 1 {
+        return Err("summary_batch must be >= 1".to_string());
+    }
+    if cfg.enabled && cfg.instance_name.trim().is_empty() {
+        return Err("instance_name is required when peering is enabled".to_string());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for p in &cfg.peers {
+        if p.name.trim().is_empty() {
+            return Err("every peer needs a non-empty name".to_string());
+        }
+        if !seen.insert(p.name.as_str()) {
+            return Err(format!("duplicate peer name `{}`", p.name));
+        }
+        if p.name == cfg.instance_name {
+            return Err(format!(
+                "peer name `{}` equals this instance's instance_name",
+                p.name
+            ));
+        }
+        if p.token_ref.trim().is_empty() {
+            return Err(format!("peer `{}` needs a token_ref", p.name));
+        }
+        match reqwest::Url::parse(&p.url) {
+            Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "peer `{}` url `{}` must be an http or https URL with a host",
+                    p.name, p.url
+                ))
+            }
+            Err(e) => {
+                return Err(format!("peer `{}` url `{}` is invalid: {e}", p.name, p.url));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Settings key holding this instance's stable UUID (`SPEC-3.17` item 2).
+pub const INSTANCE_ID_KEY: &str = "instance.id";
+
+/// Return this instance's id, generating and storing a UUID on first call. It
+/// is never regenerated: the insert ignores an existing row and the value is
+/// read back, so concurrent first calls agree on one id. `SPEC-3.17` item 2.
+pub async fn ensure_instance_id(pool: &DbPool) -> Result<String> {
+    if let Some(id) = get_raw(pool, INSTANCE_ID_KEY).await? {
+        return Ok(id);
+    }
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO NOTHING",
+        )
+        .into_owned(),
+    ))
+    .bind(INSTANCE_ID_KEY)
+    .bind(crate::peer::new_uuid_v4()?)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    get_raw(pool, INSTANCE_ID_KEY).await?.ok_or_else(|| {
+        crate::error::Error::Other(anyhow::anyhow!(
+            "settings key `{INSTANCE_ID_KEY}` is missing right after it was inserted"
+        ))
+    })
 }
 
 /// Resolve the effective [`WebhookConfig`] for a consumer that holds
@@ -714,6 +809,11 @@ pub struct LiveSettings {
     /// sweeper on each tick so a Settings save applies on the next sweep.
     /// CLAUDE-512, `SPEC-3.10` item 6.
     cargo_cache: Arc<RwLock<CargoCacheConfig>>,
+    /// Peering config, read by the poller each tick and by the peer API.
+    peers: Arc<RwLock<PeersConfig>>,
+    /// Per-peer liveness state shared by the poller, the sweep and the Status
+    /// page (`SPEC-3.17` item 5).
+    peer_registry: crate::peer::PeerRegistry,
 }
 
 impl LiveSettings {
@@ -745,6 +845,8 @@ impl LiveSettings {
             auth: Arc::new(RwLock::new(eff.auth)),
             docker_gc: Arc::new(RwLock::new(eff.docker_gc)),
             cargo_cache: Arc::new(RwLock::new(eff.cargo_cache)),
+            peers: Arc::new(RwLock::new(eff.peers)),
+            peer_registry: crate::peer::PeerRegistry::default(),
         };
         if let (Some(apply), Some(filter)) = (s.log_apply.as_ref(), eff.log_filter.as_ref()) {
             match apply(filter) {
@@ -841,6 +943,16 @@ impl LiveSettings {
         self.cargo_cache.clone()
     }
 
+    /// Shared handle to the live peering config (`SPEC-3.17` item 3).
+    pub fn peers_handle(&self) -> Arc<RwLock<PeersConfig>> {
+        self.peers.clone()
+    }
+
+    /// The shared per-peer liveness registry (`SPEC-3.17` item 5).
+    pub fn peer_registry(&self) -> crate::peer::PeerRegistry {
+        self.peer_registry.clone()
+    }
+
     /// Shared handle to the live `claude` invocation defaults, read
     /// by [`crate::claude::ClaudeInvoker`] on each invocation so a Settings save
     /// applies to the next one without a daemon restart. SPEC-6.4.
@@ -868,6 +980,7 @@ impl LiveSettings {
             Section::Auth => to_pretty(&*self.auth.read().await),
             Section::DockerGc => to_pretty(&*self.docker_gc.read().await),
             Section::CargoCache => to_pretty(&*self.cargo_cache.read().await),
+            Section::Peers => to_pretty(&*self.peers.read().await),
         }
     }
 
@@ -983,6 +1096,12 @@ impl LiveSettings {
                 validate_cargo_cache(&v).map_err(SaveError::Invalid)?;
                 set_json(&self.pool, section.key(), &v).await?;
                 *self.cargo_cache.write().await = v;
+            }
+            Section::Peers => {
+                let v: PeersConfig = parse(json)?;
+                validate_peers(&v).map_err(SaveError::Invalid)?;
+                set_json(&self.pool, section.key(), &v).await?;
+                *self.peers.write().await = v;
             }
         }
         Ok(())
@@ -1245,6 +1364,7 @@ mod tests {
             auth: AuthConfig::default(),
             docker_gc: DockerGcConfig::default(),
             cargo_cache: CargoCacheConfig::default(),
+            peers: PeersConfig::default(),
         }
     }
 
@@ -2442,5 +2562,52 @@ mod tests {
         let pool = pool().await;
         retire_email_section(&pool).await.unwrap();
         assert!(get_raw(&pool, "config.email").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn instance_id_is_created_once_and_stable_across_a_settings_reload() {
+        let pool = pool().await;
+        let first = ensure_instance_id(&pool).await.unwrap();
+        let _reloaded = LiveSettings::new(pool.clone(), eff_default(), None);
+        assert_eq!(ensure_instance_id(&pool).await.unwrap(), first);
+        assert_eq!(first.len(), 36);
+    }
+
+    #[tokio::test]
+    async fn peers_save_rejects_each_bad_value_and_stores_nothing() {
+        let pool = pool().await;
+        let live = LiveSettings::new(pool.clone(), eff_default(), None);
+        let peer = r#"{"name":"b","url":"https://b.example.org","token_ref":"b-token"}"#;
+        let cases = [
+            format!(r#"{{"peers":[{peer},{peer}]}}"#),
+            r#"{"peers":[{"name":"b","url":"not a url","token_ref":"t"}]}"#.to_string(),
+            r#"{"peers":[{"name":"b","url":"ftp://b.example.org","token_ref":"t"}]}"#.to_string(),
+            r#"{"poll_secs":4}"#.to_string(),
+            r#"{"poll_secs":30,"stale_after_secs":59}"#.to_string(),
+            r#"{"claim_timeout_secs":0}"#.to_string(),
+            r#"{"claim_timeout_secs":31}"#.to_string(),
+            r#"{"summary_batch":0}"#.to_string(),
+            r#"{"enabled":true}"#.to_string(),
+            r#"{"unknown_field":1}"#.to_string(),
+        ];
+        for body in &cases {
+            let err = live
+                .save_section(Section::Peers, body)
+                .await
+                .expect_err(body);
+            assert!(matches!(err, SaveError::Invalid(_)), "{body}: {err}");
+        }
+        assert!(get_json::<PeersConfig>(&pool, Section::Peers.key())
+            .await
+            .unwrap()
+            .is_none());
+
+        live.save_section(
+            Section::Peers,
+            &format!(r#"{{"enabled":true,"instance_name":"a","peers":[{peer}]}}"#),
+        )
+        .await
+        .expect("a valid peers section saves");
+        assert!(live.peers_handle().read().await.enabled);
     }
 }
