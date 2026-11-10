@@ -1557,6 +1557,10 @@ struct DashboardTpl {
     stuck_count: i64,
     /// The stuck-Working corrections themselves, newest first.
     stuck_rows: Vec<StuckWorkRow>,
+    /// CLAUDE-625: `concurrency.stuck_working_sweep` read `false`. The card
+    /// then says the sweep is disabled instead of "No stuck-Working
+    /// corrections", so an empty `stuck_rows` is not read as "nothing stuck".
+    stuck_sweep_disabled: bool,
     /// SPEC-4.3.15: the in-flight panel and the 7-day graphs.
     live: LiveView,
 }
@@ -2238,6 +2242,15 @@ async fn dashboard(
     let stuck_since = stuck_work_window_start();
     let stuck_count = stuck_work_count(pool, &stuck_since).await?;
     let stuck_rows = stuck_work_corrections(pool, &stuck_since, STUCK_WORK_LIMIT).await?;
+    // CLAUDE-625: an empty `stuck_rows` reads as "nothing stuck" unless the
+    // card also says the sweep itself is off.
+    let stuck_sweep_disabled = !s
+        .api
+        .settings
+        .concurrency_handle()
+        .read()
+        .await
+        .stuck_working_sweep;
 
     let tpl = DashboardTpl {
         version: s.api.version,
@@ -2267,6 +2280,7 @@ async fn dashboard(
         ci_repo_options,
         stuck_count,
         stuck_rows,
+        stuck_sweep_disabled,
         live: live_view(pool, &s.paths.actions_dir()).await,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
@@ -5444,6 +5458,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 badge: "next tick",
                 note: "cadence (seconds) the scheduler starts overlapping pickup runs; >= 1.",
             },
+            FieldDoc {
+                name: "stuck_working_sweep",
+                badge: "next tick",
+                note: "moves an issue stranded on Working back to Queued or Needs Review when this instance has no live run for it. Can cause problems when more than one claude-run instance polls the same tracker and the instances are not clustered: another instance's live run can be re-queued. Disable it in that setup. Disabled, an issue stranded on Working stays there until a person moves it. Restart recovery of this instance's own runs is unaffected.",
+            },
         ],
         Claude => vec![
             FieldDoc {
@@ -8561,6 +8580,7 @@ mod tests {
             ci_repo_options: vec![],
             stuck_count: 0,
             stuck_rows: vec![],
+            stuck_sweep_disabled: false,
             live,
         }
         .render()
@@ -8660,6 +8680,7 @@ mod tests {
             ci_repo_options: vec![],
             stuck_count: 0,
             stuck_rows: vec![],
+            stuck_sweep_disabled: false,
             live: super::LiveView::default(),
         };
         let html = tpl.render().expect("render dashboard");
@@ -8773,6 +8794,7 @@ mod tests {
             ci_repo_options: vec![],
             stuck_count: 0,
             stuck_rows: vec![],
+            stuck_sweep_disabled: false,
             live: super::LiveView::default(),
         };
 
@@ -8856,6 +8878,7 @@ mod tests {
             ci_repo_options: vec![],
             stuck_count: 0,
             stuck_rows: vec![],
+            stuck_sweep_disabled: false,
             live: super::LiveView::default(),
         };
 
@@ -10046,6 +10069,29 @@ mod tests {
                 body.contains("CLAUDE-905: moved off Working (no live run) to Queued"),
                 "{body}"
             );
+
+            // CLAUDE-625: disabling the sweep says so on the card instead of
+            // the usual count/list, even though the seeded correction above
+            // would otherwise render a non-empty list; an empty `stuck_rows`
+            // must not be read as "nothing stuck" once the sweep itself is off.
+            s.api
+                .settings
+                .concurrency_handle()
+                .write()
+                .await
+                .stuck_working_sweep = false;
+            let body = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(
+                body.contains("Stuck-Working sweep is disabled in Settings."),
+                "{body}"
+            );
+            assert!(!body.contains("1 issue(s) corrected"), "{body}");
         }
 
         #[test]
