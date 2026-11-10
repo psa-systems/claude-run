@@ -2568,7 +2568,7 @@ async fn route_agent_pr_failure(
             backend.comment(&key, &body)?;
             // SPEC-3.12 item 3: this row's field value is "Needs Review with
             // Needs-Info" (CLAUDE-582); best-effort, matching
-            // `report_estimate_over_timeout`'s independent-writes shape.
+            // `report_cap_reached`'s independent-writes shape.
             let needs_info_tag = mint_cfg.needs_info_tag.trim();
             if !needs_info_tag.is_empty() {
                 if let Err(e) = backend.add_tag(&key, needs_info_tag) {
@@ -2834,7 +2834,7 @@ async fn route_agent_pr_failure(
             backend.comment(&key, &body)?;
             // SPEC-3.12 item 3: this row's field value is "Needs Review with
             // Needs-Info" (CLAUDE-582); best-effort, matching
-            // `report_estimate_over_timeout`'s independent-writes shape.
+            // `report_cap_reached`'s independent-writes shape.
             let needs_info_tag = mint_cfg.needs_info_tag.trim();
             if !needs_info_tag.is_empty() {
                 if let Err(e) = backend.add_tag(&key, needs_info_tag) {

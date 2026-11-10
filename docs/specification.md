@@ -732,6 +732,8 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
    | CI remediation ceiling reached | `Needs Review` with `Needs-Info` | run links, failure categories |
    | marker `.claude-run-needs-review` | `Needs Review` with `Needs-Info` | the decision needed |
    | marker `.claude-run-no-code-change` | done label | marker text |
+   | split-only attempt (item 7), two or more fitting pieces | done label; each piece `Queued` | the piece keys |
+   | split-only attempt (item 7), under two pieces or a piece over the timeout | `Needs Review` with `Needs-Info` | the cause |
    | hard failure | `Failed` | cause |
 
 4. **Conflict resolution.** When the final push finds a diverged remote branch (`SPEC-3.3.1`) and the merge conflicts,
@@ -745,8 +747,19 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
 6. **`Needs Review` names one action.** Its comment states the single decision or action a person must take, and the
    issue carries the `Needs-Info` tag only when that action is a decision.
 7. **Estimate against limit.** At pickup, if the issue's `Estimation` exceeds the action's session timeout, the runner
-   does not start the attempt. It sets `Needs Review` with `Needs-Info`, and the comment names both numbers and asks
-   for the issue to be split or the limit raised. An issue with no `Estimation` is picked up as before.
+   works it as a split-only attempt instead of refusing it, and coding on the issue never starts. The attempt is
+   counted like any other (`limits.max_attempts_per_key` binds a repeated split), clones the repo, runs `claude` with
+   the built-in split prompt, and produces no commit and no PR. The prompt requires at least two PR-sized issues, each
+   with a full spec and an `Estimation` that fits the timeout, filed in `native.youtrack.write_projects` and linked
+   `subtask of` the oversized issue (the one place the CLAUDE-454 rule is lifted: the oversized issue becomes the
+   grouping parent of its pieces), and still forbids setting `AI Agent` from inside the session. After the run exits
+   the runner, through the run's audited tracker, takes the oversized issue's children that did not exist before the
+   attempt as the pieces. With two or more pieces, all fitting the timeout, it sets the issue's `Type` to `Story`,
+   sets `AI Agent` to `Queued` on each piece, and moves the issue to the no-code state with a comment listing the
+   pieces. With fewer than two pieces, or any piece over the timeout or without an `Estimation`, nothing is queued and
+   the issue ends in `Needs Review` with `Needs-Info` and a comment naming the cause (item 6). A runner write that
+   fails is logged at `error` naming the issue and is never read as a completed split. An issue with no `Estimation`
+   is picked up as before.
 8. **CI failures are classified before they spend an attempt.** A CI failure whose log shows a job killed by its own
    `timeout-minutes`, a container that never started, a runner API deadline (`context deadline exceeded`), or no parsed
    test ids with no compiler diagnostic, is an infrastructure failure (`SPEC-3.5.1`). It does not count toward
