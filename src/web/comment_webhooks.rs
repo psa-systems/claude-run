@@ -1499,7 +1499,10 @@ fn serve_run(
     let (branch, base) = match pr_branches(backend, cmd) {
         Ok(b) => b,
         Err(e) => {
-            let body = error_comment(&format!("could not resolve the PR's head/base branch: {e}"));
+            let body = error_comment(
+                "could not resolve the PR's head/base branch.",
+                &e.to_string(),
+            );
             post_reply(backend, cmd, workdir, body);
             return RunOutcome::failed(format!("could not resolve the PR's head/base branch: {e}"));
         }
@@ -1835,9 +1838,10 @@ fn serve_mint(
                 backend,
                 cmd,
                 workdir,
-                error_comment(&format!(
-                    "creating a YouTrack issue in `{project}` failed: {e}"
-                )),
+                error_comment(
+                    &format!("creating a YouTrack issue in `{project}` failed."),
+                    &e.to_string(),
+                ),
             );
             return RunOutcome::failed(format!("mint failed in {project}: {e}"));
         }
@@ -2694,7 +2698,7 @@ pub fn mint_not_queued_comment(key: &str, field: &str, value: &str, detail: &str
             format!("The issue exists and carries the request, but `{field}` could not be set to `{value}`, so the agent will not pick it up. Set that field by hand to queue it."),
             String::new(),
             "Error:".to_string(),
-            detail.to_string(),
+            crate::provider::fenced_block("", detail),
         ]
         .join("\n"),
     )
@@ -2777,14 +2781,18 @@ pub fn cap_comment() -> String {
     )
 }
 
-/// Reply for a fault before the agent could run.
-pub fn error_comment(detail: &str) -> String {
+/// Reply for a fault before the agent could run. `cause` is the underlying
+/// error text (it can carry captured command output), so it is fenced and
+/// never pasted raw (CLAUDE-622, SPEC-3.16).
+pub fn error_comment(summary: &str, cause: &str) -> String {
     with_verdict(
         "Blocked.",
         [
             "**Command failed before the agent could run.**".to_string(),
             String::new(),
-            detail.to_string(),
+            summary.to_string(),
+            String::new(),
+            crate::provider::fenced_block("", cause),
             String::new(),
             "Nothing was pushed. See the runner journal for full context.".to_string(),
         ]
@@ -2848,16 +2856,16 @@ pub fn outcome_comment(
                      (SPEC-3.3.1), not to this PR's branch; this needs human review."
                 ),
                 Some(TooBigPush::Failed { error }) => format!(
-                    "Pushing any commits made before the measurement failed also FAILED: \
-                     {error}\n\nThey are still only in the runner's local checkout; this needs \
-                     human review."
+                    "Pushing any commits made before the measurement failed also FAILED:\n\n{}\n\n\
+                     They are still only in the runner's local checkout; this needs human review.",
+                    crate::provider::fenced_block("", error)
                 ),
                 None => "Nothing was pushed. See the runner journal for full context.".to_string(),
             };
             [
                 "**Measuring the change failed.**".to_string(),
                 String::new(),
-                reason.clone(),
+                crate::provider::fenced_block("", reason),
                 String::new(),
                 tail,
             ]
@@ -2870,8 +2878,9 @@ pub fn outcome_comment(
                      branch; this needs human review before it lands here."
                 ),
                 Some(TooBigPush::Failed { error }) => format!(
-                    "Pushing the commits to a side branch also FAILED: {error}\n\nThe commits \
-                     are still only in the runner's local checkout; this needs human review."
+                    "Pushing the commits to a side branch also FAILED:\n\n{}\n\nThe commits \
+                     are still only in the runner's local checkout; this needs human review.",
+                    crate::provider::fenced_block("", error)
                 ),
                 None => "Nothing was pushed; this needs human review.".to_string(),
             };
@@ -2894,7 +2903,7 @@ pub fn outcome_comment(
                 claude.summary.clone(),
                 String::new(),
                 "Error:".to_string(),
-                err.to_string(),
+                crate::provider::fenced_block("", err),
                 String::new(),
                 "No changes reached the PR; this needs human review.".to_string(),
             ]
@@ -2909,7 +2918,8 @@ pub fn outcome_comment(
                 ];
                 if let Some(err) = push_comment_failure {
                     lines.push(String::new());
-                    lines.push(format!("Note: {err}"));
+                    lines.push("Note:".to_string());
+                    lines.push(crate::provider::fenced_block("", err));
                 }
                 lines.join("\n")
             }
@@ -4119,7 +4129,7 @@ mod tests {
             (busy_comment(true), "**Blocked.**"),
             (login_required_comment("expired."), "**Blocked.**"),
             (cap_comment(), "**Blocked.**"),
-            (error_comment("boom"), "**Blocked.**"),
+            (error_comment("failed.", "boom"), "**Blocked.**"),
             (
                 started_comment(
                     "comment-webhook",
@@ -4543,7 +4553,10 @@ mod tests {
         assert!(stuck.contains("yt exited 1"), "{stuck}");
 
         // The create failure reuses the shared error body, which says nothing ran.
-        let failed = error_comment("creating a YouTrack issue in `CLAUDE` failed: yt exited 1");
+        let failed = error_comment(
+            "creating a YouTrack issue in `CLAUDE` failed.",
+            "yt exited 1",
+        );
         assert!(failed.contains("Nothing was pushed"), "{failed}");
 
         // Help and busy read for the thread they land on.
@@ -4552,6 +4565,66 @@ mod tests {
         assert!(!help.contains("head branch"), "{help}");
         assert!(busy_comment(false).contains("this issue"));
         assert!(busy_comment(true).contains("this pull request"));
+    }
+
+    /// CLAUDE-622: captured command text in a comment is fenced with a fence
+    /// the text cannot close, at every builder that embeds it.
+    #[test]
+    fn comment_builders_fence_embedded_command_text() {
+        let text = "fatal: x\n```\nnot a comment";
+        let fence = "````";
+        let ok = ClaudeResult::synthesized("s", "d");
+        let bodies = [
+            error_comment("failed.", text),
+            mint_not_queued_comment("CLAUDE-1", "AI Agent", "Queued", text),
+            outcome_comment(
+                &Decision::Push { files: 1, lines: 2 },
+                &ok,
+                Some(text),
+                None,
+                None,
+            ),
+            outcome_comment(
+                &Decision::Push { files: 1, lines: 2 },
+                &ok,
+                None,
+                Some(text),
+                None,
+            ),
+            outcome_comment(
+                &Decision::MeasureFailed {
+                    reason: text.to_string(),
+                },
+                &ok,
+                None,
+                None,
+                None,
+            ),
+            outcome_comment(
+                &Decision::MeasureFailed {
+                    reason: "r".to_string(),
+                },
+                &ok,
+                None,
+                None,
+                Some(&TooBigPush::Failed {
+                    error: text.to_string(),
+                }),
+            ),
+            outcome_comment(
+                &Decision::TooBig { files: 1, lines: 2 },
+                &ok,
+                None,
+                None,
+                Some(&TooBigPush::Failed {
+                    error: text.to_string(),
+                }),
+            ),
+        ];
+        for body in bodies {
+            let wrapped = format!("{fence}\n{text}\n{fence}");
+            assert!(body.contains(&wrapped), "{body}");
+        }
     }
 
     #[test]
