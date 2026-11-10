@@ -405,9 +405,17 @@ pub struct CommentWebhookState {
     /// The SHARED replay store instance (see the module docs).
     seen: Arc<Mutex<SeenDeliveries>>,
     rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
+    /// The peer claim step (`SPEC-3.17` item 7); `None` runs no claim.
+    claims: Option<crate::peer::PeerClaims>,
 }
 
 impl CommentWebhookState {
+    /// Attach the peer claim step, run after the pause gate and before dispatch.
+    pub fn with_peer_claims(mut self, claims: crate::peer::PeerClaims) -> Self {
+        self.claims = Some(claims);
+        self
+    }
+
     /// Build from the handles shared with [`crate::settings::LiveSettings`] and
     /// the CI-failure listener, so a Settings save routes live and the replay
     /// store is one instance across both endpoints.
@@ -426,6 +434,7 @@ impl CommentWebhookState {
             commands,
             seen,
             rate,
+            claims: None,
         }
     }
 
@@ -448,6 +457,7 @@ impl CommentWebhookState {
             commands,
             seen: Arc::new(Mutex::new(SeenDeliveries::new(Duration::from_secs(300)))),
             rate: Arc::new(RwLock::new(rate)),
+            claims: None,
         }
     }
 }
@@ -667,6 +677,27 @@ async fn forgejo_comment_webhook(
                 author = %command.author,
                 "comment command accepted"
             );
+            let key = if command.comment_id > 0 {
+                crate::web::webhooks::claim_key(
+                    provider,
+                    &command.repo,
+                    crate::web::webhooks::CLAIM_EVENT_COMMENT,
+                    &[command.comment_id.to_string()],
+                )
+            } else {
+                None
+            };
+            if let Some(resp) = crate::web::webhooks::claim_or_drop(
+                &st.claims,
+                key,
+                crate::web::webhooks::CLAIM_EVENT_COMMENT,
+                &source,
+                delivery,
+            )
+            .await
+            {
+                return resp;
+            }
             if st.commands.send(command).await.is_err() {
                 warn!(source = %source, "comment command channel closed; dropping command");
             }
@@ -5846,6 +5877,43 @@ mod tests {
             );
             assert!(rx.try_recv().is_err(), "case {i} must emit nothing");
         }
+    }
+
+    #[tokio::test]
+    async fn one_comment_delivered_to_both_instances_is_processed_once() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool_a = setup_pool(tmp.path()).await;
+        let pool_b = memory_pool().await;
+        let key = SecretsKey::load().unwrap();
+        state::secret_create(&pool_b, "hmac-comment", &key.encrypt(SECRET).unwrap())
+            .await
+            .unwrap();
+        let node_a = crate::peer::testkit::node_on(pool_a.clone(), "a", 2).await;
+        let node_b = crate::peer::testkit::node_on(pool_b.clone(), "b", 0).await;
+        crate::peer::testkit::link(&node_a, &node_b).await;
+        crate::peer::testkit::link(&node_b, &node_a).await;
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        let st_a = CommentWebhookState::new(pool_a, config(), tx_a)
+            .with_peer_claims(node_a.claims.clone());
+        let st_b = CommentWebhookState::new(pool_b, config(), tx_b)
+            .with_peer_claims(node_b.claims.clone());
+        let raw = payload_json("created", REPO, "/claude fix it", "alice", true);
+        let sig = sign(SECRET.as_bytes(), raw.as_bytes());
+        let (sa, sb) = tokio::join!(
+            post(&st_a, SOURCE, &raw, Some(&sig), Some("d-a")),
+            post(&st_b, SOURCE, &raw, Some(&sig), Some("d-b")),
+        );
+        assert_eq!((sa, sb), (StatusCode::OK, StatusCode::ACCEPTED));
+        assert!(
+            rx_a.try_recv().is_err(),
+            "the higher-load instance dropped it"
+        );
+        assert!(
+            rx_b.try_recv().is_ok(),
+            "the lower-load instance processed it"
+        );
     }
 
     #[tokio::test]

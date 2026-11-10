@@ -69,6 +69,7 @@
           <th>State</th>
           <th>Last success</th>
           <th>In flight</th>
+          <th>Claims bypassed (24h)</th>
           <th>Last error</th>
         </tr>
       </thead>
@@ -79,6 +80,7 @@
           <td>{{ row.state.as_str() }}</td>
           <td>{% if let Some(t) = row.last_success %}{{ t|datetime }}{% else %}<span class="dim">never</span>{% endif %}</td>
           <td>{% if let Some(n) = row.in_flight %}{{ n }}{% else %}<span class="dim">-</span>{% endif %}</td>
+          <td>{{ row.claims_bypassed }}</td>
           <td>{% if let Some(e) = row.last_error %}{{ e }}{% else %}<span class="dim">none</span>{% endif %}</td>
         </tr>
         {% endfor %}

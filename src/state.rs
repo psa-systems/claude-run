@@ -1157,6 +1157,105 @@ pub async fn run_inflight_rows_all(pool: &DbPool) -> Result<Vec<InflightJobRow>>
         .collect())
 }
 
+/// The count of in-flight jobs of still-open runs: this instance's `load` for
+/// peers and event claims (`SPEC-3.17` items 4 and 7). Same predicate as
+/// [`run_inflight_with_start`].
+pub async fn run_inflight_count(pool: &DbPool) -> Result<u64> {
+    let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
+        SELECT COUNT(*)
+        FROM run_inflight_jobs rij
+        JOIN runs r ON r.id = rij.run_id
+        WHERE r.ended_at IS NULL
+        "#,
+        )
+        .into_owned(),
+    ))
+    .fetch_one(pool)
+    .await?;
+    Ok(n.max(0) as u64)
+}
+
+/// One `peer_claims` row (`SPEC-3.17` item 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerClaimRow {
+    pub holder_id: String,
+    pub holder_load: u64,
+}
+
+/// Insert the claim row for `event_key`. True when this call inserted it,
+/// false when a row already existed (it is left untouched).
+pub async fn peer_claim_insert(
+    pool: &DbPool,
+    event_key: &str,
+    holder_id: &str,
+    holder_load: u64,
+) -> Result<bool> {
+    let res = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "INSERT INTO peer_claims (event_key, holder_id, holder_load, claimed_at)
+         VALUES (?, ?, ?, ?) ON CONFLICT(event_key) DO NOTHING",
+        )
+        .into_owned(),
+    ))
+    .bind(event_key)
+    .bind(holder_id)
+    .bind(holder_load as i64)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// The claim row for `event_key`, if any.
+pub async fn peer_claim_get(pool: &DbPool, event_key: &str) -> Result<Option<PeerClaimRow>> {
+    let row: Option<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT holder_id, holder_load FROM peer_claims WHERE event_key = ?",
+        )
+        .into_owned(),
+    ))
+    .bind(event_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(holder_id, load)| PeerClaimRow {
+        holder_id,
+        holder_load: load.max(0) as u64,
+    }))
+}
+
+/// Hand the claim for `event_key` from `from_holder` to a new holder. True when
+/// the row still named `from_holder` and was changed; the condition makes two
+/// concurrent handovers settle on exactly one.
+pub async fn peer_claim_reassign(
+    pool: &DbPool,
+    event_key: &str,
+    from_holder: &str,
+    new_holder: &str,
+    new_load: u64,
+) -> Result<bool> {
+    let res = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "UPDATE peer_claims SET holder_id = ?, holder_load = ?, claimed_at = ?
+         WHERE event_key = ? AND holder_id = ?",
+        )
+        .into_owned(),
+    ))
+    .bind(new_holder)
+    .bind(new_load as i64)
+    .bind(now_iso())
+    .bind(event_key)
+    .bind(from_holder)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 /// One in-flight job of a still-open run: its action, job key and the run's
 /// start time. Served to peers by `GET /api/peer/state` (`SPEC-3.17` item 4).
 #[derive(Debug, Clone)]

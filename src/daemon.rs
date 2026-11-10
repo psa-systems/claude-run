@@ -386,6 +386,12 @@ impl Daemon {
             mpsc::channel::<crate::web::webhooks::VerifiedActionSuccessEvent>(64);
         // The listener routes against the live config + limiter map shared with
         // LiveSettings, so a Settings save is routable immediately.
+        // SPEC-3.17 item 7: both listeners claim events through one handle.
+        let peer_claims = crate::peer::PeerClaims::new(
+            pool.clone(),
+            settings.peers_handle(),
+            settings.peer_registry(),
+        );
         let webhook_state = crate::web::webhooks::WebhookState::from_shared(
             pool.clone(),
             settings.webhook_handle(),
@@ -395,7 +401,8 @@ impl Daemon {
         )
         .with_readiness(readiness.clone())
         .with_pr_events(pr_tx)
-        .with_success_events(success_tx);
+        .with_success_events(success_tx)
+        .with_peer_claims(peer_claims.clone());
         // The `/claude` comment listener is a SECOND endpoint with its own
         // config section, write-scoped token, and Pause switch. It shares the
         // CI-failure listener's replay-store INSTANCE (so one delivery id fanned
@@ -414,7 +421,8 @@ impl Daemon {
             settings.webhook_comment_rate_handle(),
             webhook_state.seen_handle(),
             comment_tx,
-        );
+        )
+        .with_peer_claims(peer_claims);
         let webhook_router = crate::web::webhooks::router(webhook_state);
         let comment_router = crate::web::comment_webhooks::router(comment_state);
 

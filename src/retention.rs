@@ -90,6 +90,27 @@ pub async fn prune_older_than(pool: &DbPool, t: &RetentionTable, cutoff: &str) -
     Ok(res.rows_affected())
 }
 
+/// SPEC-3.17 item 7: `peer_claims` rows older than this are pruned. Fixed, not
+/// the `retention_days` window: a claim only has to outlive a forge's redelivery.
+pub const PEER_CLAIMS_TTL_HOURS: i64 = 24;
+
+/// SPEC-3.8.4 / SPEC-3.17 item 7: delete `peer_claims` rows claimed before
+/// `now - 24h`. Returns the number deleted.
+pub async fn prune_peer_claims(pool: &DbPool, now: DateTime<Utc>) -> Result<u64> {
+    let cutoff = (now - Duration::hours(PEER_CLAIMS_TTL_HOURS)).to_rfc3339();
+    let res = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "DELETE FROM peer_claims WHERE claimed_at < ?").into_owned(),
+    ))
+    .bind(&cutoff)
+    .execute(pool)
+    .await?;
+    let deleted = res.rows_affected();
+    if deleted > 0 {
+        tracing::info!(deleted, cutoff = %cutoff, "db retention: pruned peer_claims older than 24 hours");
+    }
+    Ok(deleted)
+}
+
 /// SPEC-3.8.4: prune every table in [`RETENTION_TABLES`] to the retention
 /// window, using `now` to compute the cutoff (`now - retention_days`). A
 /// disabled config is a no-op. `now` is injected so a test can age rows by
@@ -100,6 +121,9 @@ pub async fn sweep(
     now: DateTime<Utc>,
 ) -> Result<RetentionStats> {
     let mut stats = RetentionStats::default();
+    // Not a history table: claims are bounded by a fixed 24 hours whatever the
+    // operator's retention setting, so this runs even when retention is off.
+    stats.deleted += prune_peer_claims(pool, now).await?;
     if !cfg.enabled {
         return Ok(stats);
     }
@@ -198,6 +222,40 @@ mod tests {
             enabled,
             retention_days: days,
         }
+    }
+
+    #[tokio::test]
+    async fn sweep_prunes_peer_claims_older_than_24_hours_even_with_retention_off() {
+        let pool = pool().await;
+        let now = Utc::now();
+        for (key, age_hours) in [("old", 25), ("fresh", 23)] {
+            sqlx::query(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    &pool,
+                    "INSERT INTO peer_claims (event_key, holder_id, holder_load, claimed_at) VALUES (?, 'h', 0, ?)",
+                )
+                .into_owned(),
+            ))
+            .bind(key)
+            .bind((now - Duration::hours(age_hours)).to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let cfg = DbRetentionConfig {
+            enabled: false,
+            ..DbRetentionConfig::default()
+        };
+        let stats = sweep(&pool, &cfg, now).await.unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert!(crate::state::peer_claim_get(&pool, "old")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(crate::state::peer_claim_get(&pool, "fresh")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

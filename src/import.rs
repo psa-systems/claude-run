@@ -60,6 +60,7 @@ pub const TABLES: &[&str] = &[
     "ci_failure_runs",
     "agent_pull_requests",
     "claude_invocations",
+    "peer_claims",
 ];
 
 /// sqlx's own bookkeeping table. The target ran its own migration set before
@@ -775,6 +776,16 @@ mod tests {
         .bind(0i64)
         .bind(None::<String>)
         .bind("/logs/youtrack/streams/CLAUDE-1-attempt-1.jsonl")
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(q(
+            "INSERT INTO peer_claims (event_key, holder_id, holder_load, claimed_at) VALUES (?, ?, ?, ?)",
+        )))
+        .bind("forgejo:contoso/claude-run:action_run:7:failure")
+        .bind("instance-a")
+        .bind(2i64)
+        .bind("2026-09-01T00:00:00Z")
         .execute(pool)
         .await
         .unwrap();
