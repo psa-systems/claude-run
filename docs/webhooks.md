@@ -366,3 +366,14 @@ and one Pause switch, each keyed by its own `sources.<name>` entry.
 
 Fetching a GitHub-hosted run's own log (the text the triage classifier reads) goes over `gh`/the GitHub API for a
 `github.com` host; see the `GitHub log fetch (CLAUDE-363)` note in `actions/SCHEMA.md`.
+
+## Peered instances (CLAUDE-615)
+
+With `peers.enabled` and at least one peer configured, an event delivered to this instance and to a peer (two targets
+of one forge hook) is processed by exactly one of them. After the pause and login gates and before dispatch, the
+instance claims the event with every `reachable` peer, and the one with the lower `(in-flight load, instance id)`
+pair processes it; the other answers `200` and drops the delivery with an `info` log naming the holder. The claim key
+is built from payload fields identical across hook targets (run index and outcome, PR number, action and head commit,
+or comment id), never the delivery id. A peer that times out, errors or answers garbage is bypassed: the event is
+processed, a `warn` log names the peer and key, and the Status page counts the bypass per peer for 24 hours. A paused
+instance drops without claiming, so its peer takes the event. `SPEC-3.17` item 7 is the contract.

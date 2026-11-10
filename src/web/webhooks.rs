@@ -680,6 +680,9 @@ pub struct WebhookState {
     /// verified `success`/`recover` Action-run delivery. `None` (no daemon
     /// wiring, every pre-existing test) acks and drops with a log.
     success_events: Option<mpsc::Sender<VerifiedActionSuccessEvent>>,
+    /// The peer claim step (`SPEC-3.17` item 7). `None` outside the daemon, so
+    /// no claim runs.
+    claims: Option<crate::peer::PeerClaims>,
 }
 
 /// SPEC-4.4.1: builds one fixed-window rate limiter per source (point 1 of SPEC-4.4's pipeline), so one source's storm never starves another's bucket.
@@ -733,6 +736,7 @@ impl WebhookState {
             readiness: None,
             pr_events: None,
             success_events: None,
+            claims: None,
         }
     }
 
@@ -756,6 +760,7 @@ impl WebhookState {
             readiness: None,
             pr_events: None,
             success_events: None,
+            claims: None,
         }
     }
 
@@ -780,6 +785,13 @@ impl WebhookState {
     /// source-compatibility reason as [`Self::with_readiness`].
     pub fn with_success_events(mut self, events: mpsc::Sender<VerifiedActionSuccessEvent>) -> Self {
         self.success_events = Some(events);
+        self
+    }
+
+    /// Attach the peer claim step, run after the pause and login gates and
+    /// before dispatch (`SPEC-4.4` point 8).
+    pub fn with_peer_claims(mut self, claims: crate::peer::PeerClaims) -> Self {
+        self.claims = Some(claims);
         self
     }
 
@@ -3898,6 +3910,81 @@ fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
     }
 }
 
+/// The `event` segment of a claim key for an Action-run delivery.
+const CLAIM_EVENT_ACTION_RUN: &str = "action_run";
+/// The `event` segment of a claim key for a pull-request delivery.
+const CLAIM_EVENT_PULL_REQUEST: &str = "pull_request";
+/// The `event` segment of a claim key for a comment delivery.
+pub(crate) const CLAIM_EVENT_COMMENT: &str = "comment";
+
+/// Join `<provider>:<repo>:<event>:<identity>` (`SPEC-3.17` item 7), or `None`
+/// when the repo or an identity part is empty: a key built from a blank part
+/// could collide with an unrelated event.
+pub(crate) fn claim_key(
+    provider: WebhookProvider,
+    repo: &str,
+    event: &str,
+    identity: &[String],
+) -> Option<String> {
+    if repo.is_empty() || identity.is_empty() || identity.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    Some(format!("{provider}:{repo}:{event}:{}", identity.join(":")))
+}
+
+/// Claim key of an Action-run delivery: run index and outcome, both identical
+/// across hook targets. The run index is positive on both providers.
+pub(crate) fn action_run_claim_key(provider: WebhookProvider, p: &ActionPayload) -> Option<String> {
+    if p.run.index_in_repo <= 0 {
+        return None;
+    }
+    claim_key(
+        provider,
+        &p.run.repository.full_name,
+        CLAIM_EVENT_ACTION_RUN,
+        &[p.run.index_in_repo.to_string(), p.action.clone()],
+    )
+}
+
+/// Claim key of a pull-request delivery: PR number, action and head commit.
+pub(crate) fn pull_request_claim_key(
+    provider: WebhookProvider,
+    p: &PullRequestPayload,
+) -> Option<String> {
+    if p.number <= 0 {
+        return None;
+    }
+    claim_key(
+        provider,
+        &p.repository.full_name,
+        CLAIM_EVENT_PULL_REQUEST,
+        &[
+            p.number.to_string(),
+            p.action.clone(),
+            p.pull_request.head.sha.clone(),
+        ],
+    )
+}
+
+/// Run the peer claim step for one delivery. `Some(response)` when the
+/// delivery must be dropped (`200`); `None` to dispatch it.
+pub(crate) async fn claim_or_drop(
+    claims: &Option<crate::peer::PeerClaims>,
+    key: Option<String>,
+    event_type: &str,
+    source: &str,
+    delivery: &str,
+) -> Option<Response> {
+    let claims = claims.as_ref()?;
+    match claims
+        .claim(key.as_deref(), event_type, source, delivery)
+        .await
+    {
+        crate::peer::ClaimDecision::Proceed => None,
+        crate::peer::ClaimDecision::Drop { .. } => Some(StatusCode::OK.into_response()),
+    }
+}
+
 /// SPEC-4.4.1: the `forgejo_webhook` axum handler implementing SPEC-4.4's full numbered pipeline (points 0-6): provider/source resolution and 404s, rate limit, HMAC secret resolution, signature verification, delivery-id replay protection, event-type dispatch to the failure (SPEC-4.4.2/4.4.3), pull-request (SPEC-4.4.4) or action-success (SPEC-4.4.4) paths, and the accept/drop response codes.
 async fn forgejo_webhook(
     State(st): State<WebhookState>,
@@ -4070,6 +4157,7 @@ async fn forgejo_webhook(
     if event_type == PULL_REQUEST_EVENT_TYPE {
         return handle_pull_request_delivery(
             &st,
+            provider,
             &src_cfg,
             &source,
             delivery,
@@ -4141,11 +4229,17 @@ async fn forgejo_webhook(
     // success-event pipeline instead of `verified_failure_event`, which only
     // ever keeps `failure`.
     if payload.action == "success" || payload.action == "recover" {
-        return handle_action_success(&st, &src_cfg, &source, delivery, &payload).await;
+        return handle_action_success(&st, provider, &src_cfg, &source, delivery, &payload).await;
     }
 
     match verified_failure_event(&payload, &src_cfg.allowed_repos, &source) {
         Some(event) => {
+            let key = action_run_claim_key(provider, &payload);
+            if let Some(resp) =
+                claim_or_drop(&st.claims, key, &payload.action, &source, delivery).await
+            {
+                return resp;
+            }
             if st.events.send(event).await.is_err() {
                 warn!(source = %source, "webhook event channel closed; dropping event");
             }
@@ -4183,6 +4277,7 @@ async fn forgejo_webhook(
 /// response.
 async fn handle_action_success(
     st: &WebhookState,
+    provider: WebhookProvider,
     src_cfg: &WebhookSource,
     source: &str,
     delivery: &str,
@@ -4214,6 +4309,10 @@ async fn handle_action_success(
         );
         return StatusCode::OK.into_response();
     };
+    let key = action_run_claim_key(provider, payload);
+    if let Some(resp) = claim_or_drop(&st.claims, key, &payload.action, source, delivery).await {
+        return resp;
+    }
     if sender.send(event).await.is_err() {
         warn!(source = %source, delivery, "action-run success event channel closed; dropping event");
     }
@@ -4228,6 +4327,7 @@ async fn handle_action_success(
 /// path's own ack-drop branch.
 async fn handle_pull_request_delivery(
     st: &WebhookState,
+    provider: WebhookProvider,
     src_cfg: &WebhookSource,
     source: &str,
     delivery: &str,
@@ -4289,6 +4389,12 @@ async fn handle_pull_request_delivery(
         );
         return StatusCode::OK.into_response();
     };
+    let key = pull_request_claim_key(provider, &payload);
+    if let Some(resp) =
+        claim_or_drop(&st.claims, key, PULL_REQUEST_EVENT_TYPE, source, delivery).await
+    {
+        return resp;
+    }
     if sender.send(event).await.is_err() {
         warn!(source = %source, delivery, "pull-request event channel closed; dropping event");
     }
@@ -12073,6 +12179,236 @@ mod tests {
             let (pr_tx, pr_rx) = mpsc::channel(8);
             let st = WebhookState::new(pool, two_source_config(60), tx).with_pr_events(pr_tx);
             (st, rx, pr_rx)
+        }
+
+        // ---- Peer event claims (SPEC-3.17 item 7) ----
+
+        /// Two instances, each with its own store, HMAC secrets, replay store
+        /// and channels, peered with each other. `a` carries `load_a` in-flight
+        /// jobs and `b` carries `load_b`.
+        struct ClaimPair {
+            a: (
+                WebhookState,
+                mpsc::Receiver<VerifiedFailureEvent>,
+                mpsc::Receiver<VerifiedPullRequestEvent>,
+            ),
+            b: (
+                WebhookState,
+                mpsc::Receiver<VerifiedFailureEvent>,
+                mpsc::Receiver<VerifiedPullRequestEvent>,
+            ),
+            node_a: crate::peer::testkit::Node,
+            node_b: crate::peer::testkit::Node,
+        }
+
+        async fn claim_pair(tmp: &std::path::Path, load_a: usize, load_b: usize) -> ClaimPair {
+            let pool_a = setup_pool(tmp).await;
+            let pool_b = memory_pool().await;
+            let key = SecretsKey::load().unwrap();
+            for (name, value) in [("hmac-contoso", SECRET_A), ("hmac-fabrikam", SECRET_B)] {
+                state::secret_create(&pool_b, name, &key.encrypt(value).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let node_a = crate::peer::testkit::node_on(pool_a.clone(), "a", load_a).await;
+            let node_b = crate::peer::testkit::node_on(pool_b.clone(), "b", load_b).await;
+            crate::peer::testkit::link(&node_a, &node_b).await;
+            crate::peer::testkit::link(&node_b, &node_a).await;
+            let build = |pool: DbPool, node: &crate::peer::testkit::Node| {
+                let (tx, rx) = mpsc::channel(8);
+                let (pr_tx, pr_rx) = mpsc::channel(8);
+                let st = WebhookState::new(pool, two_source_config(60), tx)
+                    .with_pr_events(pr_tx)
+                    .with_peer_claims(node.claims.clone());
+                (st, rx, pr_rx)
+            };
+            ClaimPair {
+                a: build(pool_a, &node_a),
+                b: build(pool_b, &node_b),
+                node_a,
+                node_b,
+            }
+        }
+
+        async fn deliver(
+            st: &WebhookState,
+            raw: &str,
+            delivery: &str,
+            event: Option<&str>,
+        ) -> StatusCode {
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            forgejo_webhook(
+                State(st.clone()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
+                headers_with_event(Some(&sig), Some(delivery), event),
+                Bytes::from(raw.to_string()),
+            )
+            .await
+            .status()
+        }
+
+        #[tokio::test]
+        async fn one_action_run_event_delivered_to_both_instances_is_processed_once() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let mut p = claim_pair(tmp.path(), 3, 1).await;
+            let raw = failure_payload("contoso/claude-run");
+            let (sa, sb) = tokio::join!(
+                deliver(&p.a.0, &raw, "d-a", None),
+                deliver(&p.b.0, &raw, "d-b", None),
+            );
+            assert_eq!((sa, sb), (StatusCode::OK, StatusCode::ACCEPTED));
+            assert!(
+                p.a.1.try_recv().is_err(),
+                "the higher-load instance dropped it"
+            );
+            assert!(
+                p.b.1.try_recv().is_ok(),
+                "the lower-load instance processed it"
+            );
+        }
+
+        #[tokio::test]
+        async fn one_pull_request_event_delivered_to_both_instances_is_processed_once() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let mut p = claim_pair(tmp.path(), 0, 2).await;
+            let raw = pull_request_payload("contoso/claude-run", 42, "closed", true);
+            let (sa, sb) = tokio::join!(
+                deliver(&p.a.0, &raw, "d-a", Some(PULL_REQUEST_EVENT_TYPE)),
+                deliver(&p.b.0, &raw, "d-b", Some(PULL_REQUEST_EVENT_TYPE)),
+            );
+            assert_eq!((sa, sb), (StatusCode::ACCEPTED, StatusCode::OK));
+            assert!(p.a.2.try_recv().is_ok());
+            assert!(p.b.2.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn a_success_event_is_claimed_too_and_a_later_loser_is_refused() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let p = claim_pair(tmp.path(), 0, 4).await;
+            let (tx, mut rx_a) = mpsc::channel(8);
+            let st_a = p.a.0.clone().with_success_events(tx);
+            let (tx, mut rx_b) = mpsc::channel(8);
+            let st_b = p.b.0.clone().with_success_events(tx);
+            let raw = failure_payload("contoso/claude-run").replace("failure", "success");
+            assert_eq!(
+                deliver(&st_a, &raw, "d-a", None).await,
+                StatusCode::ACCEPTED
+            );
+            assert_eq!(deliver(&st_b, &raw, "d-b", None).await, StatusCode::OK);
+            assert!(rx_a.try_recv().is_ok());
+            assert!(rx_b.try_recv().is_err());
+            let row = state::peer_claim_get(
+                &p.node_b.pool,
+                "forgejo:contoso/claude-run:action_run:7:success",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(row.holder_id, p.node_a.id);
+        }
+
+        #[tokio::test]
+        async fn a_paused_instance_drops_without_claiming_so_its_peer_processes() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let mut p = claim_pair(tmp.path(), 0, 9).await;
+            state::global_pause_set(&p.node_a.pool, Some("maintenance"))
+                .await
+                .unwrap();
+            let raw = failure_payload("contoso/claude-run");
+            let (sa, sb) = tokio::join!(
+                deliver(&p.a.0, &raw, "d-a", None),
+                deliver(&p.b.0, &raw, "d-b", None),
+            );
+            // `a` has the lower load but is paused, so `b` must take the event.
+            assert_eq!((sa, sb), (StatusCode::OK, StatusCode::ACCEPTED));
+            assert!(p.a.1.try_recv().is_err());
+            assert!(p.b.1.try_recv().is_ok());
+            let key = "forgejo:contoso/claude-run:action_run:7:failure";
+            let row = state::peer_claim_get(&p.node_a.pool, key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.holder_id, p.node_b.id, "a only recorded b's claim");
+        }
+
+        #[tokio::test]
+        async fn disabled_peering_writes_no_claim_row_and_processes_the_event() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let mut p = claim_pair(tmp.path(), 5, 0).await;
+            p.node_a.cfg.write().await.enabled = false;
+            let raw = failure_payload("contoso/claude-run");
+            assert_eq!(
+                deliver(&p.a.0, &raw, "d-a", None).await,
+                StatusCode::ACCEPTED
+            );
+            assert!(p.a.1.try_recv().is_ok());
+            let key = "forgejo:contoso/claude-run:action_run:7:failure";
+            assert!(state::peer_claim_get(&p.node_a.pool, key)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(state::peer_claim_get(&p.node_b.pool, key)
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn an_unbuildable_identity_is_processed_without_a_claim() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let mut p = claim_pair(tmp.path(), 5, 0).await;
+            // An empty head commit leaves the pull-request identity blank.
+            let raw = pull_request_payload("contoso/claude-run", 9, "closed", true)
+                .replace("deadbeefcafefeed", "");
+            let logs = crate::testutil::LogCapture::start();
+            assert_eq!(
+                deliver(&p.a.0, &raw, "d-a", Some(PULL_REQUEST_EVENT_TYPE)).await,
+                StatusCode::ACCEPTED
+            );
+            assert!(p.a.2.try_recv().is_ok());
+            let text = logs.text();
+            assert!(
+                text.contains("WARN") && text.contains("pull_request"),
+                "{text}"
+            );
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM peer_claims")
+                .fetch_one(&p.node_a.pool)
+                .await
+                .unwrap();
+            assert_eq!(n, 0);
+        }
+
+        #[test]
+        fn claim_keys_use_payload_identity_never_the_delivery_id() {
+            let ar: ActionPayload =
+                serde_json::from_str(&failure_payload("contoso/claude-run")).unwrap();
+            assert_eq!(
+                action_run_claim_key(WebhookProvider::Forgejo, &ar).as_deref(),
+                Some("forgejo:contoso/claude-run:action_run:7:failure")
+            );
+            let pr: PullRequestPayload = serde_json::from_str(&pull_request_payload(
+                "contoso/claude-run",
+                42,
+                "closed",
+                true,
+            ))
+            .unwrap();
+            assert_eq!(
+                pull_request_claim_key(WebhookProvider::Github, &pr).as_deref(),
+                Some("github:contoso/claude-run:pull_request:42:closed:deadbeefcafefeed")
+            );
+            let mut blank = ar.clone();
+            blank.run.repository.full_name.clear();
+            assert!(action_run_claim_key(WebhookProvider::Forgejo, &blank).is_none());
+            let mut zero = ar;
+            zero.run.index_in_repo = 0;
+            assert!(action_run_claim_key(WebhookProvider::Forgejo, &zero).is_none());
         }
 
         #[tokio::test]
