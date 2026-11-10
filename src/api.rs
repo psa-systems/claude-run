@@ -403,9 +403,10 @@ struct PauseRequest {
 async fn pause_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
-    body: Option<Json<PauseRequest>>,
+    headers: axum::http::HeaderMap,
+    body: String,
 ) -> Result<Json<AckResponse>, AppError> {
-    let reason = body.and_then(|b| b.0.reason);
+    let reason = pause_reason(&headers, &body);
     state::action_pause_set(&s.pool, &name, reason.as_deref()).await?;
     Ok(Json(AckResponse {
         ok: true,
@@ -1312,5 +1313,94 @@ mod tests {
                 .expect_err("synthetic delete must error");
             assert_eq!(err.status, StatusCode::FORBIDDEN, "{name}");
         }
+    }
+
+    /// `POST /actions/{name}/pause` accepts the same bodies the global pause
+    /// does: an empty urlencoded body (the htmx form with no reason typed), a
+    /// urlencoded `reason=...` body (the htmx form with one typed), a JSON
+    /// `{"reason":...}` body (CLI/API clients), and no body at all. Before the
+    /// `Json` extractor was dropped for a plain `String` + `pause_reason`, the
+    /// two urlencoded cases 415'd before the handler ran.
+    #[tokio::test]
+    async fn pause_action_accepts_urlencoded_and_json_bodies() {
+        let s = app_state().await;
+        let mut json_headers = axum::http::HeaderMap::new();
+        json_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        let mut form_headers = axum::http::HeaderMap::new();
+        form_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+
+        // (a) urlencoded, empty body: this is what htmx's Pause button with no
+        // reason typed sends; it must not 415.
+        let Json(ack) = pause_action(
+            State(s.clone()),
+            AxumPath("act".into()),
+            form_headers.clone(),
+            String::new(),
+        )
+        .await
+        .expect("empty urlencoded body must not 415");
+        assert!(ack.ok);
+        let (_, reason) = state::action_pause_status(&s.pool, "act")
+            .await
+            .unwrap()
+            .expect("action is paused");
+        assert_eq!(reason, None);
+        state::action_pause_clear(&s.pool, "act").await.unwrap();
+
+        // (b) urlencoded, with a reason: the htmx form with a reason typed.
+        let Json(ack) = pause_action(
+            State(s.clone()),
+            AxumPath("act".into()),
+            form_headers.clone(),
+            "reason=maintenance".to_string(),
+        )
+        .await
+        .expect("urlencoded reason body must not 415");
+        assert!(ack.ok);
+        let (_, reason) = state::action_pause_status(&s.pool, "act")
+            .await
+            .unwrap()
+            .expect("action is paused");
+        assert_eq!(reason, Some("maintenance".to_string()));
+        state::action_pause_clear(&s.pool, "act").await.unwrap();
+
+        // (c) JSON, with a reason: CLI/API clients.
+        let Json(ack) = pause_action(
+            State(s.clone()),
+            AxumPath("act".into()),
+            json_headers.clone(),
+            r#"{"reason":"maintenance"}"#.to_string(),
+        )
+        .await
+        .expect("JSON reason body must succeed");
+        assert!(ack.ok);
+        let (_, reason) = state::action_pause_status(&s.pool, "act")
+            .await
+            .unwrap()
+            .expect("action is paused");
+        assert_eq!(reason, Some("maintenance".to_string()));
+        state::action_pause_clear(&s.pool, "act").await.unwrap();
+
+        // (d) no body, no content type at all.
+        let Json(ack) = pause_action(
+            State(s.clone()),
+            AxumPath("act".into()),
+            axum::http::HeaderMap::new(),
+            String::new(),
+        )
+        .await
+        .expect("no body must succeed");
+        assert!(ack.ok);
+        let (_, reason) = state::action_pause_status(&s.pool, "act")
+            .await
+            .unwrap()
+            .expect("action is paused");
+        assert_eq!(reason, None);
     }
 }
