@@ -73,7 +73,10 @@ marker paths themselves (an untracked marker file is an expected write, not evid
 work) before deciding anything else there counts as `workdir_touched`. Reading exactly one marker yields `Pass`/`Fail`
 with that marker's trimmed contents as the verdict text; both markers, no marker, a timed-out session
 (`ClaudeResult::timed_out`), or any `workdir_touched` all collapse to `NoVerdict`, since none of those is a reviewer
-opinion the runner can act on, only a malfunction it detected.
+opinion the runner can act on, only a malfunction it detected. The marker files are removed from the workdir once
+their contents have been captured into the outcome, and the captured text is run through `sanitize_marker_content` to
+replace any em-dash with `-` (CLAUDE-621); leaving them in place poisoned the SPEC-3.3.2 push gate in consumers that
+scan the whole tree for the char, and the sanitized text also rides into the posted PR / issue comments.
 
 `finalize`'s `review: Option<&ReviewOutcome>` parameter decides the outcome from there: `None` or `Some(Pass(_))`
 promotes the draft via `mark_pr_ready` and folds the verdict notes into the success comment's own "## Review" section;
