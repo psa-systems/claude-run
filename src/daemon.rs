@@ -418,8 +418,37 @@ impl Daemon {
         let webhook_router = crate::web::webhooks::router(webhook_state);
         let comment_router = crate::web::comment_webhooks::router(comment_state);
 
+        // SPEC-3.17 item 4: the peer API, TCP only, with its own bearer check
+        // that holds even where the gate below is off (loopback bind).
+        let peer_token = match self.on_disk.web.auth_token_ref.as_deref() {
+            Some(name) => match crate::secrets::SecretsKey::load() {
+                Ok(key) => match crate::secrets::resolve_secret(&pool, &key, name).await {
+                    Ok(t) if !t.is_empty() => Some(Arc::new(t)),
+                    Ok(_) => {
+                        warn!(secret = name, "web.auth_token_ref names an empty secret; the peer API refuses every request this run");
+                        None
+                    }
+                    Err(e) => {
+                        warn!(secret = name, error = %e, "web.auth_token_ref could not be resolved; the peer API refuses every request this run");
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!(error = %e, "the secrets key could not be loaded; the peer API refuses every request this run");
+                    None
+                }
+            },
+            None => None,
+        };
+        let peer_router = crate::peer::router(crate::peer::PeerApiState {
+            pool: pool.clone(),
+            cfg: settings.peers_handle(),
+            token: peer_token,
+        });
+
         let tcp_app = axum::Router::new()
             .merge(web_router)
+            .merge(peer_router)
             .merge(webhook_router)
             .merge(comment_router)
             .nest("/api", api_for_tcp);
@@ -545,8 +574,25 @@ impl Daemon {
         // Working by a run that exited without finalizing. Same cadence as
         // the automerge reconciler above; the first tick fires immediately,
         // so a sweep also runs on serve start.
-        let stuck_working_sweep_task =
-            tokio::spawn(stuck_working_sweep_loop(pool.clone(), self.paths.clone()));
+        let stuck_working_sweep_task = tokio::spawn(stuck_working_sweep_loop(
+            pool.clone(),
+            self.paths.clone(),
+            settings.peers_handle(),
+            settings.peer_registry(),
+        ));
+        match crate::settings::ensure_instance_id(&pool).await {
+            Ok(id) => info!(instance_id = %id, "instance identity"),
+            Err(e) => {
+                tracing::error!(error = %e, "could not create or read the instance id (SPEC-3.17 item 2)")
+            }
+        }
+        // SPEC-3.17 item 5: the liveness poller. Idle (no outbound call) while
+        // peering is disabled; reads the live config each tick.
+        let peer_poll_task = tokio::spawn(crate::peer::poll_loop(
+            pool.clone(),
+            settings.peers_handle(),
+            settings.peer_registry(),
+        ));
         let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(
             webhook_rx,
             pool.clone(),
@@ -773,6 +819,7 @@ impl Daemon {
         success_consumer.abort();
         automerge_reconciler_task.abort();
         stuck_working_sweep_task.abort();
+        peer_poll_task.abort();
         comment_consumer.abort();
         // pidfile lock released on drop
         if unix_socket {
@@ -2269,7 +2316,12 @@ async fn automerge_reconciler_loop(
 /// fresh each tick (never cached): a host with no usable `yt`/`fj` binary at
 /// serve start may still gain one later, and a tick that cannot resolve one
 /// logs and skips rather than blocking the daemon.
-async fn stuck_working_sweep_loop(pool: DbPool, paths: crate::config::Paths) {
+async fn stuck_working_sweep_loop(
+    pool: DbPool,
+    paths: crate::config::Paths,
+    peers_cfg: Arc<tokio::sync::RwLock<crate::config::PeersConfig>>,
+    peer_registry: crate::peer::PeerRegistry,
+) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
         AUTOMERGE_RECONCILE_TICK_SECS,
     ));
@@ -2277,7 +2329,15 @@ async fn stuck_working_sweep_loop(pool: DbPool, paths: crate::config::Paths) {
         ticker.tick().await;
         match crate::provider::resolve_runner(crate::provider::DEFAULT_PRIORITY) {
             Ok(runner) => {
-                crate::native::youtrack::reconcile_stuck_working(&pool, &paths, &runner).await;
+                let cfg = peers_cfg.read().await.clone();
+                let peer_in_flight = peer_registry.live_peer_in_flight(&cfg, chrono::Utc::now());
+                crate::native::youtrack::reconcile_stuck_working_with_peers(
+                    &pool,
+                    &paths,
+                    &runner,
+                    &peer_in_flight,
+                )
+                .await;
             }
             Err(e) => {
                 warn!(error = %e, "stuck-working sweep: no command runner available; skipped this tick");

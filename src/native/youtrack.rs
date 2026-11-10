@@ -859,6 +859,20 @@ pub async fn reconcile_stuck_working(
     paths: &Paths,
     runner: &Arc<dyn CommandRunner>,
 ) {
+    reconcile_stuck_working_with_peers(pool, paths, runner, &std::collections::HashMap::new())
+        .await;
+}
+
+/// [`reconcile_stuck_working`] that also leaves alone an issue a reachable
+/// peer lists in flight (`SPEC-3.17` item 6). `peer_in_flight` maps
+/// `(action, job_key)` to the listing peer's name, from
+/// [`crate::peer::PeerRegistry::live_peer_in_flight`]; empty with no peering.
+pub async fn reconcile_stuck_working_with_peers(
+    pool: &DbPool,
+    paths: &Paths,
+    runner: &Arc<dyn CommandRunner>,
+    peer_in_flight: &std::collections::HashMap<(String, String), String>,
+) {
     let rows = match state::action_index_list(pool).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -970,6 +984,10 @@ pub async fn reconcile_stuck_working(
             };
             if inflight.contains(key) {
                 info!(action = %action_name, key = %key, "stuck-working sweep: Working and backed by a live run; left alone");
+                continue;
+            }
+            if let Some(peer) = peer_in_flight.get(&(action_name.to_string(), key.to_string())) {
+                info!(action = %action_name, key = %key, peer = %peer, "stuck-working sweep: Working and listed in flight by a reachable peer; left alone");
                 continue;
             }
 
@@ -18180,6 +18198,98 @@ mod tests {
             calls
                 .iter()
                 .any(|c| c == "yt issue set-field MK-31 AI Agent Queued"),
+            "{calls:?}"
+        );
+    }
+
+    /// CLAUDE-614: a `Working` issue a reachable peer lists in flight is left
+    /// alone (no history read, no write), even past the owner window.
+    #[tokio::test]
+    async fn reconcile_stuck_working_leaves_a_peer_listed_issue_alone() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+        let runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["list", "--query=AI Agent: Working", "--json"],
+            r#"[{"idReadable":"MK-41"}]"#,
+        ));
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            ("yt-action".to_string(), "MK-41".to_string()),
+            "peer-b".to_string(),
+        );
+
+        reconcile_stuck_working_with_peers(&pool, &paths, &dyn_runner, &peers).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("history")), "{calls:?}");
+    }
+
+    /// CLAUDE-614: an issue in no peer's list (the peer lists a different key)
+    /// is corrected exactly as before.
+    #[tokio::test]
+    async fn reconcile_stuck_working_still_corrects_an_issue_no_peer_lists() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+        crate::daemon::scan_actions(&pool, &paths.actions_dir())
+            .await
+            .unwrap();
+        let old_ms = (chrono::Utc::now() - chrono::Duration::minutes(25)).timestamp_millis();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["list", "--query=AI Agent: Working", "--json"],
+                    r#"[{"idReadable":"MK-42"}]"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-42", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "yt",
+                    &[
+                        "issue",
+                        "history",
+                        "MK-42",
+                        "--json",
+                        "--category",
+                        "CustomFieldCategory",
+                    ],
+                    &working_history_json(old_ms),
+                )
+                .ok_prefix("yt issue comment MK-42", "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-42", "AI Agent", "Queued"],
+                    "",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            ("yt-action".to_string(), "MK-99".to_string()),
+            "peer-b".to_string(),
+        );
+
+        reconcile_stuck_working_with_peers(&pool, &paths, &dyn_runner, &peers).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-42 AI Agent Queued"),
             "{calls:?}"
         );
     }

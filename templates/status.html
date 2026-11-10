@@ -53,6 +53,41 @@
   </div>
 </div>
 
+{# SPEC-3.17 item 11: shown only with peering enabled. State is `reachable` or
+   `unknown`, never "dead": a partition and a crash look the same from here. #}
+{% if let Some(rows) = peers %}
+<h2>Peers</h2>
+
+<div class="card" style="margin-bottom: 16px;">
+  {% if rows.is_empty() %}
+    <span class="dim">Peering is enabled but no peer is configured.</span>
+  {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th>Peer</th>
+          <th>State</th>
+          <th>Last success</th>
+          <th>In flight</th>
+          <th>Last error</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td>{{ row.name }}</td>
+          <td>{{ row.state.as_str() }}</td>
+          <td>{% if let Some(t) = row.last_success %}{{ t|datetime }}{% else %}<span class="dim">never</span>{% endif %}</td>
+          <td>{% if let Some(n) = row.in_flight %}{{ n }}{% else %}<span class="dim">-</span>{% endif %}</td>
+          <td>{% if let Some(e) = row.last_error %}{{ e }}{% else %}<span class="dim">none</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+{% endif %}
+
 {# SPEC-3.10 items 9 and 10: the shared Cargo target directories, one row per
    repo, each with its size, last-used time and whether a run for that repo is
    in flight. Delete and Delete all post to the cargo-cache routes, mirrored
