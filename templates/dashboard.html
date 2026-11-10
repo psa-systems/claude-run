@@ -348,7 +348,9 @@
 {# SPEC-3.12 item 2 / SPEC-4.3.15: a count and list of issues the
    stuck-Working reconcile sweep corrected in the last 7 days. #}
 <h2>Stuck work (last 7 days)</h2>
-{% if stuck_count == 0 %}
+{% if stuck_sweep_disabled %}
+  <div class="card"><span class="dim">Stuck-Working sweep is disabled in Settings.</span></div>
+{% else if stuck_count == 0 %}
   <div class="card"><span class="dim">No stuck-Working corrections in the last 7 days.</span></div>
 {% else %}
   <div class="card" style="margin-bottom: 16px;">

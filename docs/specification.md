@@ -719,7 +719,14 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
    whose history read fails, is logged at `error` and retried, never treated as "nothing stuck". The startup-only
    path (`run_inflight_jobs` rows left behind by a dead process of THIS daemon) is unaffected by the window: it
    releases its own issues immediately. With peered instances (`SPEC-3.17`), the sweep also leaves an issue alone
-   when a reachable peer's snapshot lists it in flight, per `SPEC-3.17` item 6.
+   when a reachable peer's snapshot lists it in flight, per `SPEC-3.17` item 6. The sweep is NOT unconditional:
+   `concurrency.stuck_working_sweep` (default `true`, DB-backed, live-applied with no restart; CLAUDE-625) can turn
+   it off entirely for a multi-instance, non-clustered deployment, where the safeguards above are best-effort and do
+   not cover every case (an operator in that topology disables the sweep so this instance never re-queues another
+   instance's live run). `false` skips the tracker read and write on every tick: no listing, no correction, no
+   comment. A transition to disabled is logged at `warn`, naming the setting; a transition back to enabled is logged
+   at `info`. The startup-only path (item above) is unaffected: it only reads rows this daemon's own dead process
+   left behind, which no other instance can own.
 3. **Every finalize path ends in a closed outcome.** The table is exhaustive; a path not in it is a defect, and the
    code matches it with no wildcard arm.
 
@@ -1640,7 +1647,8 @@ requires `secret_ref` and `write_token_ref` on every source.
 
 Edited on the Settings page or through `PUT /api/settings/{section}`; changes apply without restart. Fields not listed in
 3.x: `webhook.analysis_timeout_secs` (600), `webhook.analysis_concurrency` (2); `concurrency.max_parallel_global` (0 =
-largest enabled action cap); `preferences` (`locale`, `timezone`, `datetime_format`); `claude` (`model`, `effort`,
+largest enabled action cap); `concurrency.stuck_working_sweep` (default `true`; `false` disables the `SPEC-3.12` item
+2 reconcile sweep, CLAUDE-625); `preferences` (`locale`, `timezone`, `datetime_format`); `claude` (`model`, `effort`,
 `autocompact`); `cargo_cache` (`enabled`, `max_bytes_per_repo`, 3.10); `docker_gc.max_bytes` (250 GB, 3.11); `auth` (service base URLs, secret names, git author name and email); `peers` (3.17). `webhook_comment.sources.<name>`
 adds `allowed_permissions`, `max_files`, `max_lines`, `bot_author`, `bot_email`, `skip_marker`.
 

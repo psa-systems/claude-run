@@ -587,6 +587,7 @@ impl Daemon {
             self.paths.clone(),
             settings.peers_handle(),
             settings.peer_registry(),
+            settings.concurrency_handle(),
         ));
         match crate::settings::ensure_instance_id(&pool).await {
             Ok(id) => info!(instance_id = %id, "instance identity"),
@@ -2324,32 +2325,81 @@ async fn automerge_reconciler_loop(
 /// fresh each tick (never cached): a host with no usable `yt`/`fj` binary at
 /// serve start may still gain one later, and a tick that cannot resolve one
 /// logs and skips rather than blocking the daemon.
+///
+/// `concurrency.stuck_working_sweep` (CLAUDE-625) is read at the top of every
+/// tick (live apply, no restart needed). `false` skips the tracker read and
+/// write entirely: a multi-instance, non-clustered deployment can disable the
+/// sweep so this instance never re-queues another instance's live run. A
+/// transition to disabled logs at `warn` (and so does the first tick observed
+/// disabled); a transition back to enabled logs at `info`.
 async fn stuck_working_sweep_loop(
     pool: DbPool,
     paths: crate::config::Paths,
     peers_cfg: Arc<tokio::sync::RwLock<crate::config::PeersConfig>>,
     peer_registry: crate::peer::PeerRegistry,
+    concurrency_cfg: Arc<tokio::sync::RwLock<crate::config::ConcurrencyConfig>>,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
         AUTOMERGE_RECONCILE_TICK_SECS,
     ));
+    let mut was_enabled = true;
     loop {
         ticker.tick().await;
-        match crate::provider::resolve_runner(crate::provider::DEFAULT_PRIORITY) {
-            Ok(runner) => {
-                let cfg = peers_cfg.read().await.clone();
-                let peer_in_flight = peer_registry.live_peer_in_flight(&cfg, chrono::Utc::now());
-                crate::native::youtrack::reconcile_stuck_working_with_peers(
-                    &pool,
-                    &paths,
-                    &runner,
-                    &peer_in_flight,
-                )
-                .await;
-            }
-            Err(e) => {
-                warn!(error = %e, "stuck-working sweep: no command runner available; skipped this tick");
-            }
+        stuck_working_sweep_tick(
+            &pool,
+            &paths,
+            &peers_cfg,
+            &peer_registry,
+            &concurrency_cfg,
+            &mut was_enabled,
+            || crate::provider::resolve_runner(crate::provider::DEFAULT_PRIORITY),
+        )
+        .await;
+    }
+}
+
+/// One tick's worth of work for [`stuck_working_sweep_loop`], extracted so a
+/// unit test can drive a single tick without an infinite loop. `was_enabled`
+/// is the loop's own transition-tracking state, threaded through by the
+/// caller across ticks. `resolve_runner` is injected so a test can supply a
+/// recording stub instead of the real [`crate::provider::resolve_runner`].
+async fn stuck_working_sweep_tick(
+    pool: &DbPool,
+    paths: &crate::config::Paths,
+    peers_cfg: &Arc<tokio::sync::RwLock<crate::config::PeersConfig>>,
+    peer_registry: &crate::peer::PeerRegistry,
+    concurrency_cfg: &Arc<tokio::sync::RwLock<crate::config::ConcurrencyConfig>>,
+    was_enabled: &mut bool,
+    resolve_runner: impl FnOnce() -> crate::error::Result<Arc<dyn crate::provider::CommandRunner>>,
+) {
+    let enabled = concurrency_cfg.read().await.stuck_working_sweep;
+    if !enabled {
+        if *was_enabled {
+            warn!(
+                "concurrency.stuck_working_sweep is disabled: an issue stranded on Working will no longer be corrected automatically"
+            );
+        }
+        *was_enabled = false;
+        return;
+    }
+    if !*was_enabled {
+        info!("concurrency.stuck_working_sweep is enabled again: resuming the stuck-Working sweep");
+    }
+    *was_enabled = true;
+    match resolve_runner() {
+        Ok(runner) => {
+            let cfg = peers_cfg.read().await.clone();
+            let peer_in_flight = peer_registry.live_peer_in_flight(&cfg, chrono::Utc::now());
+            crate::native::youtrack::reconcile_stuck_working_with_peers(
+                pool,
+                paths,
+                &runner,
+                &peer_in_flight,
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!(error = %e, "stuck-working sweep: no command runner available; skipped this tick");
         }
     }
 }
@@ -2724,6 +2774,80 @@ mod tests {
             state_dir: dir.to_path_buf(),
             runtime_dir: dir.to_path_buf(),
         }
+    }
+
+    /// CLAUDE-625: `concurrency.stuck_working_sweep == false` skips the tick
+    /// entirely, no tracker read or write; flipping it to `true` reaches the
+    /// sweep (here, the `yt list` read) on the very next tick.
+    #[tokio::test]
+    async fn stuck_working_sweep_tick_honors_the_disable_flag() {
+        use crate::provider::cli::testutil::StubRunner;
+        use crate::provider::CommandRunner;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        std::fs::create_dir_all(paths.actions_dir()).unwrap();
+        std::fs::write(
+            paths.actions_dir().join("yt-action.yml"),
+            "name: yt-action\nkind: youtrack\nnative: {}\n",
+        )
+        .unwrap();
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
+        scan_actions(&pool, &paths.actions_dir()).await.unwrap();
+
+        let peers_cfg = Arc::new(RwLock::new(crate::config::PeersConfig::default()));
+        let peer_registry = crate::peer::PeerRegistry::default();
+        let concurrency_cfg = Arc::new(RwLock::new(ConcurrencyConfig {
+            stuck_working_sweep: false,
+            ..ConcurrencyConfig::default()
+        }));
+        let mut was_enabled = true;
+
+        // Disabled: the tick returns before resolving any runner, so a
+        // `resolve_runner` that would panic if called proves no tracker call
+        // was attempted.
+        stuck_working_sweep_tick(
+            &pool,
+            &paths,
+            &peers_cfg,
+            &peer_registry,
+            &concurrency_cfg,
+            &mut was_enabled,
+            || panic!("disabled sweep must not resolve a command runner"),
+        )
+        .await;
+        assert!(!was_enabled);
+
+        // Flip the flag live, as `PUT /api/settings/concurrency` would: the
+        // very next tick reaches the sweep, which lists `Working` issues.
+        concurrency_cfg.write().await.stuck_working_sweep = true;
+        let runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["list", "--query=AI Agent: Working", "--json"],
+            "[]",
+        ));
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+        stuck_working_sweep_tick(
+            &pool,
+            &paths,
+            &peers_cfg,
+            &peer_registry,
+            &concurrency_cfg,
+            &mut was_enabled,
+            || Ok(dyn_runner.clone()),
+        )
+        .await;
+        assert!(was_enabled);
+        assert!(
+            runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == "yt list --query=AI Agent: Working --json"),
+            "an enabled sweep must still reach the tracker read; {:?}",
+            runner.calls.lock().unwrap()
+        );
     }
 
     /// A `loggedIn: false` probe trips the gate; a subsequent
@@ -3824,6 +3948,7 @@ mod tests {
         let explicit = ConcurrencyConfig {
             max_parallel_global: 2,
             regather_interval_secs: 60,
+            stuck_working_sweep: true,
         };
         assert_eq!(resolve_global_cap(&explicit, &rows), 2);
 
@@ -3831,6 +3956,7 @@ mod tests {
         let auto = ConcurrencyConfig {
             max_parallel_global: 0,
             regather_interval_secs: 60,
+            stuck_working_sweep: true,
         };
         assert_eq!(resolve_global_cap(&auto, &rows), 5);
 

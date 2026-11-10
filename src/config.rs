@@ -1126,6 +1126,15 @@ pub struct ConcurrencyConfig {
     /// run for each enabled non-manual action. Default 60s. The 5s scheduler tick
     /// is unchanged; this only governs the fire decision. Must be >= 1.
     pub regather_interval_secs: u64,
+    /// Whether `stuck_working_sweep_loop` moves an issue stranded on
+    /// `AI Agent = Working` with no local `run_inflight_jobs` row back to
+    /// `Queued` or `Needs Review`. Default `true`. Multiple unclustered
+    /// `claude-run` instances polling the same tracker query can each see the
+    /// others' live runs as stranded, so an operator in that topology disables
+    /// this to stop the sweep from re-queuing another instance's live run.
+    /// Restart recovery of this instance's own runs (`reconcile_restart_inflight`)
+    /// is unaffected: it only reads rows this process itself left behind.
+    pub stuck_working_sweep: bool,
 }
 
 impl Default for ConcurrencyConfig {
@@ -1133,6 +1142,7 @@ impl Default for ConcurrencyConfig {
         Self {
             max_parallel_global: 0,
             regather_interval_secs: 60,
+            stuck_working_sweep: true,
         }
     }
 }

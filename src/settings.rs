@@ -2226,12 +2226,17 @@ mod tests {
         let pool = pool().await;
         let live = LiveSettings::new(pool.clone(), eff_default(), None);
 
-        // Default is auto (0) + 60s, and is exposed on the shared handle.
+        // Default is auto (0) + 60s + sweep enabled, and is exposed on the
+        // shared handle. A stored document without the key (CLAUDE-625) also
+        // reads as enabled: `#[serde(default)]` on the struct fills it in.
         let handle = live.concurrency_handle();
         assert_eq!(handle.read().await.max_parallel_global, 0);
         assert_eq!(handle.read().await.regather_interval_secs, 60);
+        assert!(handle.read().await.stuck_working_sweep);
 
-        // Valid payload persists and is visible live.
+        // Valid payload persists and is visible live. The payload omits
+        // `stuck_working_sweep`, confirming an older stored document without
+        // the key still loads with the sweep enabled.
         live.save_section(
             Section::Concurrency,
             r#"{"max_parallel_global":8,"regather_interval_secs":30}"#,
@@ -2244,7 +2249,23 @@ mod tests {
             .unwrap();
         assert_eq!(stored.max_parallel_global, 8);
         assert_eq!(stored.regather_interval_secs, 30);
+        assert!(stored.stuck_working_sweep);
         assert_eq!(handle.read().await.max_parallel_global, 8);
+
+        // `stuck_working_sweep: false` round-trips through save and the
+        // live handle.
+        live.save_section(
+            Section::Concurrency,
+            r#"{"max_parallel_global":8,"regather_interval_secs":30,"stuck_working_sweep":false}"#,
+        )
+        .await
+        .unwrap();
+        let stored: ConcurrencyConfig = get_json(&pool, Section::Concurrency.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.stuck_working_sweep);
+        assert!(!handle.read().await.stuck_working_sweep);
 
         // A zero cadence is rejected and does not overwrite the stored value.
         let err = live
