@@ -4001,18 +4001,12 @@ fn run_review_session(
     let pass = pass_marker.exists();
     let fail = fail_marker.exists();
     let outcome = match (pass, fail) {
-        (true, false) => ReviewOutcome::Pass(
-            std::fs::read_to_string(&pass_marker)
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
-        ),
-        (false, true) => ReviewOutcome::Fail(
-            std::fs::read_to_string(&fail_marker)
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
-        ),
+        (true, false) => ReviewOutcome::Pass(sanitize_marker_content(
+            &std::fs::read_to_string(&pass_marker).unwrap_or_default(),
+        )),
+        (false, true) => ReviewOutcome::Fail(sanitize_marker_content(
+            &std::fs::read_to_string(&fail_marker).unwrap_or_default(),
+        )),
         (true, true) => ReviewOutcome::NoVerdict(
             "the review session wrote both the pass and fail markers".to_string(),
         ),
@@ -4020,7 +4014,31 @@ fn run_review_session(
             ReviewOutcome::NoVerdict("the review session wrote no verdict marker".to_string())
         }
     };
+    // CLAUDE-621: strip the marker files from the workdir now the outcome is
+    // captured. Leaving them in place poisoned the SPEC-3.3.2 push gate in
+    // consumers that scan the whole tree (storefront's em-dash guard caught
+    // the agent's own narrative notes). `discard_review_changes` still has
+    // its PASS/FAIL skips for defense in depth on the retry path.
+    let _ = std::fs::remove_file(&pass_marker);
+    let _ = std::fs::remove_file(&fail_marker);
     (outcome, result)
+}
+
+/// CLAUDE-621: sanitize the agent's narrative notes before they are returned
+/// to the runner (they end up in the PR comment, the issue comment, and the
+/// attempt record). The agent writes em-dashes in its own prose, which both
+/// violates the fleet-wide rule and tripped storefront's
+/// `template_conventions::no_em_dash_anywhere_in_the_repository` test when
+/// the marker file lived in-tree. The file is now removed after reading, but
+/// the content still rides in the posted comment, so the replacement matters
+/// in its own right.
+fn sanitize_marker_content(raw: &str) -> String {
+    // An em-dash in prose is almost always surrounded by spaces (" X — Y "),
+    // so replacing it with `-` keeps the one-space-on-each-side spacing the
+    // writer already had; a bare em-dash between words (rare, "he said—that
+    // it works") becomes "he said-that it works", acceptable per the global
+    // CLAUDE.md "use a regular hyphen" rule.
+    raw.replace('\u{2014}', "-").trim().to_string()
 }
 
 /// SPEC-3.12 item 4: the instruction for the bounded conflict-resolution
@@ -18473,6 +18491,87 @@ mod tests {
             outcome,
             ReviewOutcome::Fail("criterion 2 has no test".to_string())
         );
+    }
+
+    /// CLAUDE-621: both marker files are removed from the workdir after the
+    /// outcome is captured, so a subsequent push gate scanning the tree
+    /// cannot trip on their content.
+    #[test]
+    fn run_review_session_removes_marker_files_after_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\necho 'all good' > {}\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                REVIEW_PASS_MARKER
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, _result) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &cancel,
+            None,
+            None,
+        );
+        assert_eq!(outcome, ReviewOutcome::Pass("all good".to_string()));
+        assert!(!dir.path().join(REVIEW_PASS_MARKER).exists());
+        assert!(!dir.path().join(REVIEW_FAIL_MARKER).exists());
+    }
+
+    /// CLAUDE-621: em-dashes in agent-written narrative are replaced before
+    /// they ride the outcome into PR / issue comments. The raw file content
+    /// may still have them while the file briefly exists, but every consumer
+    /// of the marker reads through `sanitize_marker_content`.
+    #[test]
+    fn run_review_session_strips_em_dashes_from_marker_content() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        // The agent's narrative uses an em-dash in a bullet, exactly like
+        // the SF-815 / SF-789 / SF-800 failures.
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\nprintf 'Review: PASS\\nfile.rs:42 \\xe2\\x80\\x94 checked\\n' > {}\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n",
+                REVIEW_PASS_MARKER
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, _result) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &cancel,
+            None,
+            None,
+        );
+        let text = match outcome {
+            ReviewOutcome::Pass(s) => s,
+            other => panic!("expected Pass, got {other:?}"),
+        };
+        assert!(
+            !text.contains('\u{2014}'),
+            "em-dash leaked into outcome: {text:?}"
+        );
+        assert!(text.contains("file.rs:42 - checked"), "got: {text:?}");
+        // Also sanity-check a bare, no-space em-dash is still replaced
+        // (common in the SF-815-style narrative).
+        let bare = sanitize_marker_content("line1\u{2014}line2");
+        assert_eq!(bare, "line1-line2");
     }
 
     #[test]
