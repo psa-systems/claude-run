@@ -571,6 +571,36 @@ struct EstimationRaw {
     minutes: i64,
 }
 
+/// One entry of `yt issue history <KEY> --json --category
+/// CustomFieldCategory`: a single custom-field change with its millisecond
+/// epoch `timestamp`, the changed field's name, and the value(s) it was set
+/// to. `added` is left as raw JSON because its shape depends on the field
+/// type: an enum field (like `AI Agent`) carries an array of
+/// `{"name": ..., ...}` objects, a numeric field a bare number. Only the
+/// enum shape is consumed by [`CliBackend::field_changed_at`].
+#[derive(Debug, Deserialize)]
+struct HistoryEntry {
+    timestamp: i64,
+    field: HistoryField,
+    #[serde(default)]
+    added: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryField {
+    name: String,
+}
+
+/// `true` iff `added` (a `HistoryEntry::added` value) names `value`: an
+/// array of enum-bundle objects containing one whose `name` matches.
+fn history_added_names(added: &serde_json::Value, value: &str) -> bool {
+    added.as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|i| i.get("name").and_then(|n| n.as_str()) == Some(value))
+    })
+}
+
 /// One project as `yt project list --json` emits it. Only the short name and the
 /// archived flag are consumed; unknown fields are ignored.
 #[derive(Debug, Deserialize)]
@@ -2083,6 +2113,46 @@ impl IssueTracker for CliBackend {
         Ok(parsed.raw.map(|r| r.minutes))
     }
 
+    /// CLAUDE-612: the stuck-Working sweep's owner-window check. Reads
+    /// `yt issue history --json --category CustomFieldCategory` and returns
+    /// the newest entry that changed `field` to `value`, or `None` when none
+    /// did. A parse failure or an unrepresentable timestamp is an error, never
+    /// `None`, so a read that could not be understood never reads as "no such
+    /// change".
+    fn field_changed_at(
+        &self,
+        key: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let stdout = self.yt_ok(&[
+            "issue",
+            "history",
+            key,
+            "--json",
+            "--category",
+            "CustomFieldCategory",
+        ])?;
+        let entries: Vec<HistoryEntry> =
+            Self::parse_json(&self.yt, "yt issue history --json", &stdout)?;
+        let latest = entries
+            .iter()
+            .filter(|e| e.field.name == field && history_added_names(&e.added, value))
+            .max_by_key(|e| e.timestamp);
+        let Some(entry) = latest else {
+            return Ok(None);
+        };
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(entry.timestamp)
+            .ok_or_else(|| {
+                Error::Other(anyhow::anyhow!(
+                    "yt issue history --json: entry timestamp {} for `{key}` is not a valid \
+                     millisecond epoch",
+                    entry.timestamp
+                ))
+            })?;
+        Ok(Some(dt))
+    }
+
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo> {
         // `vcs` is a command group; `list` is the subcommand that takes the
         // project short-name positional. Omitting it makes the project land in
@@ -3446,6 +3516,89 @@ mod tests {
             r#"{"field":"Estimation","value":null,"type":"","raw":null}"#,
         ));
         assert_eq!(b.get_estimation_minutes("MK-16").unwrap(), None);
+    }
+
+    /// A captured `yt issue history --json --category CustomFieldCategory`
+    /// sample (CLAUDE-612): an `Estimation` change (a bare number, not an
+    /// enum array, so it must never match), two `AI Agent` changes TO
+    /// `Working` at different timestamps, and a later `AI Agent` change away
+    /// from `Working`. `field_changed_at` must pick the NEWER of the two
+    /// matching entries, not the first or last in the array.
+    const HISTORY_SAMPLE: &str = r#"[
+        {
+            "id": "0-0.9-1",
+            "timestamp": 1000,
+            "field": { "name": "Estimation" },
+            "added": 60,
+            "removed": null
+        },
+        {
+            "id": "0-0.9-2",
+            "timestamp": 2000,
+            "field": { "name": "AI Agent" },
+            "added": [{ "name": "Working", "id": "92-82" }],
+            "removed": [{ "name": "Queued", "id": "92-81" }]
+        },
+        {
+            "id": "0-0.9-3",
+            "timestamp": 5000,
+            "field": { "name": "AI Agent" },
+            "added": [{ "name": "Queued", "id": "92-81" }],
+            "removed": [{ "name": "Working", "id": "92-82" }]
+        },
+        {
+            "id": "0-0.9-4",
+            "timestamp": 4000,
+            "field": { "name": "AI Agent" },
+            "added": [{ "name": "Working", "id": "92-82" }],
+            "removed": [{ "name": "Queued", "id": "92-81" }]
+        }
+    ]"#;
+
+    #[test]
+    fn field_changed_at_picks_the_newest_matching_entry() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &[
+                "issue",
+                "history",
+                "MK-16",
+                "--json",
+                "--category",
+                "CustomFieldCategory",
+            ],
+            HISTORY_SAMPLE,
+        ));
+        let got = b
+            .field_changed_at("MK-16", "AI Agent", "Working")
+            .unwrap()
+            .expect("a matching entry exists");
+        assert_eq!(
+            got.timestamp_millis(),
+            4000,
+            "must pick timestamp 4000, not 2000 (older) or 5000 (a different value)"
+        );
+    }
+
+    #[test]
+    fn field_changed_at_is_none_with_no_matching_entry() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &[
+                "issue",
+                "history",
+                "MK-16",
+                "--json",
+                "--category",
+                "CustomFieldCategory",
+            ],
+            HISTORY_SAMPLE,
+        ));
+        assert_eq!(
+            b.field_changed_at("MK-16", "AI Agent", "Needs Review")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

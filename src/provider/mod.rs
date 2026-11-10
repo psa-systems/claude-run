@@ -354,6 +354,26 @@ pub trait IssueTracker: Send + Sync {
             "project_show not supported by this tracker backend"
         )))
     }
+
+    /// The time of the most recent change that set `field` to `value` on
+    /// `key`, read from the issue's activity history; `None` when the
+    /// history holds no such change. Backs the stuck-Working sweep's
+    /// owner-window check (CLAUDE-612): a `Working` issue set recently
+    /// enough for a run to still be legitimately alive, on ANY instance, is
+    /// left alone rather than corrected. The default errors "not supported",
+    /// so a backend with no history support never silently treats every
+    /// issue as stranded.
+    fn field_changed_at(
+        &self,
+        key: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let _ = (key, field, value);
+        Err(Error::Other(anyhow::anyhow!(
+            "field_changed_at not supported by this tracker backend"
+        )))
+    }
 }
 
 /// SPEC-8.9: render a failed [`Forge::repo_access`] probe as an error an
