@@ -380,8 +380,12 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   clone itself, rather than trusting the agent's own report that checks passed: `just pre-push` when the clone has
   that recipe, else `just check`, else no command at all. This runs after the final push (`SPEC-3.3.1`), so the
   commits this run produced are already on the branch before the gate's own verdict is known.
-- A non-zero exit from the chosen command is recorded as a failure, with its redacted, bounded output attached to the
-  run and posted on the PR and the issue, never reported as success. The PR the push already opened stays a draft.
+- A non-zero exit from the chosen command is recorded as a failure, never reported as success. The command's own
+  output is redacted, bounded (`append_stdout_tail`), and attached to the run record, but it is never posted on the
+  PR or the issue; the comment names the command that failed and says the output is attached to the run. The PR the
+  push already opened stays a draft. A gate that could not even be started (the command failed to spawn) carries a
+  short cause instead of output, and that cause IS posted, fenced, since it is a reason rather than the command's
+  own output.
 - A report that the checks passed must name the command that actually ran (`just pre-push`, `just check`, or that
   neither recipe exists and no command ran); a report naming no command is not evidence the checks passed.
 - A file change a failing check requires is allowed in the diff and is justified in the PR body; the gate checks the
@@ -722,7 +726,7 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
    | Path | Resulting field | Required comment content |
    |---|---|---|
    | success, verification gate and review pass | `Code Review` | PR link, step list |
-   | success, gate failed | `Failed` | gate command, bounded output |
+   | success, gate failed | `Failed` | gate command (output attached to the run record, not posted) |
    | review fail marker | `Queued` below the attempt cap, else `Needs Review` | findings |
    | review gave no verdict (the review session modified the workdir, timed out, or printed no marker) | one fresh review session is run; if it also gives no verdict, `Needs Review` | both causes |
    | push rejected, remote diverged | one conflict-resolution pass (item 4); on failure `Needs Review` | conflicting files, both SHAs |
@@ -865,6 +869,13 @@ linked, never pasted.
    Truncation is never silent.
 5. **Scope.** The cap applies to the verdict, the failure comment and the `Needs Review` comment (`SPEC-3.12`). Push
    comments (`SPEC-8.8`) keep their commit list.
+6. **Embedded command output (`CLAUDE-622`).** When a runner-posted comment or PR text embeds a captured command's
+   output or error text (`append_stdout_tail`, `git_error`, or a forge CLI failure's stderr tail), that text is
+   wrapped in a Markdown fenced code block (triple backticks, or more backticks when the text itself contains a run
+   of three or more, so the text can never close the fence early), and it has every terminal escape sequence (ANSI
+   colour/cursor codes) and control character other than newline and tab stripped first, since neither renders as
+   Markdown text. The SPEC-3.3.2 verification gate's own `just check` / `just pre-push` output never reaches a
+   comment at all; the comment names the failed command and says the full output is attached to the run record.
 
 ### 3.17 Peered instances (`SPEC-3.17`)
 
@@ -2006,6 +2017,12 @@ action's `token_ref`, which is injected per job.
   (never the raw URL) is what reaches `run_events` and, from there, a YouTrack comment.
 - The same `redact` function serves the CI-failure log fetch (SPEC-3.5) and every git-failure path here, so a secret
   pattern recognized in one place is masked in both.
+- Before the byte/line bound is applied, `append_stdout_tail` strips ANSI/terminal escape sequences (CSI, OSC, and
+  other `ESC`-introduced sequences) and every control character except newline and tab from both stdout and stderr,
+  so a colorized or cursor-moving tool's raw bytes never reach a comment or the stored run record.
+- Every comment builder that embeds `append_stdout_tail`-derived or otherwise untrusted command-error text wraps it
+  in a fenced Markdown code block (`provider::fenced_block`) whose backtick-fence length exceeds any backtick run
+  already present in that text, so the text can never prematurely close the fence.
 
 ### 8.7 PR subject and body integrity (`SPEC-8.7`)
 

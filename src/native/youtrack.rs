@@ -3381,15 +3381,29 @@ fn install_hooks(workdir: &Path) -> Option<bool> {
     }
 }
 
+/// SPEC-3.3.2, CLAUDE-622: whether a gate's failure text is the command's own
+/// captured output, or a cause naming why the command could not even start.
+/// The two are rendered differently in a comment: `Output` is never posted
+/// (it is already stored with the run; a reader does not need `just check`'s
+/// full report pasted into the issue), while `Cause` (an io error from
+/// trying to spawn the command at all) is a short, non-output reason that
+/// stays visible, fenced.
+enum GateFailure {
+    Output(String),
+    Cause(String),
+}
+
 /// SPEC-3.3.2: what the runner's own re-run of the repository's pre-push
 /// checks found, before any success outcome is recorded. `command` is the
 /// recipe the runner actually invoked (`"pre-push"` or `"check"`), or
 /// `None` when the clone has neither and the gate ran nothing. `failure`
-/// carries the redacted, bounded combined stdout/stderr of a non-zero exit;
-/// `None` means the chosen recipe passed, or there was no recipe to run.
+/// carries the redacted, bounded combined stdout/stderr of a non-zero exit
+/// as [`GateFailure::Output`], or the reason the command never ran as
+/// [`GateFailure::Cause`]; `None` means the chosen recipe passed, or there
+/// was no recipe to run.
 struct GateResult {
     command: Option<&'static str>,
-    failure: Option<String>,
+    failure: Option<GateFailure>,
     /// SPEC-3.14: when the recipe ran, its timing and timed stage spans, for
     /// the caller to hand to the step sink (CLAUDE-604).
     timing: Option<crate::attempt_steps::GateTiming>,
@@ -3485,14 +3499,17 @@ fn run_verification_gate(workdir: &Path) -> GateResult {
                 };
                 GateResult {
                     command: Some(recipe),
-                    failure: (!status.success())
-                        .then(|| provider::append_stdout_tail(&stderr, &stdout, &[])),
+                    failure: (!status.success()).then(|| {
+                        GateFailure::Output(provider::append_stdout_tail(&stderr, &stdout, &[]))
+                    }),
                     timing: Some(timing),
                 }
             }
             Err(e) => GateResult {
                 command: Some(recipe),
-                failure: Some(format!("running `just {recipe}` failed: {e}")),
+                failure: Some(GateFailure::Cause(format!(
+                    "running `just {recipe}` failed: {e}"
+                ))),
                 timing: None,
             },
         };
@@ -4152,11 +4169,24 @@ impl ConflictResolver for FinalPushConflictResolver {
         if let Some(t) = gate.timing.as_ref() {
             crate::attempt_steps::stash_step_spans(&self.key, crate::attempt_steps::gate_spans(t));
         }
-        if let Some(output) = gate.failure {
+        if let Some(failure) = gate.failure {
             let command = gate.command.unwrap_or("none");
+            // CLAUDE-622: the command's own output is never surfaced in the
+            // issue/PR comment this error eventually reaches (it is already
+            // stored with the run); it is still logged here so an operator
+            // reading the daemon log sees it. Only a cause naming why the
+            // command could not even start is kept in the comment text,
+            // since that is not command output.
+            let detail = match failure {
+                GateFailure::Output(output) => {
+                    error!(key = %self.key, command, output = %output, "conflict-resolution merge commit failed the SPEC-3.3.2 gate");
+                    String::new()
+                }
+                GateFailure::Cause(cause) => format!(": {cause}"),
+            };
             return Err(Error::Other(anyhow::anyhow!(
                 "the conflict-resolution pass's merge commit failed the SPEC-3.3.2 verification \
-                 gate (`just {command}`): {output}"
+                 gate (`just {command}`){detail}"
             )));
         }
         Ok(())
@@ -5110,6 +5140,13 @@ fn finalize_with_steps(
                 }
                 if let Some(output) = &gate.failure {
                     let command = gate.command.unwrap_or("none");
+                    // CLAUDE-622: the command's own output never reaches the
+                    // issue or PR comment below (it is already stored with
+                    // the run); logged here so an operator reading the
+                    // daemon log still sees it.
+                    if let GateFailure::Output(raw) = output {
+                        error!(key = %job.key, command, output = %raw, "SPEC-3.3.2 verification gate failed");
+                    }
                     if let Some(pr_number) = pr.number {
                         if let Err(e) = post_gate_failure_on_pr(
                             forge,
@@ -6222,25 +6259,37 @@ fn success_comment(r: &ClaudeResult, pr_url: &str, gate_command: Option<&str>) -
 /// SPEC-3.3.2: the issue comment for a verification-gate failure. The PR
 /// already exists (pushed as a draft before the gate ran), so the comment
 /// names it and says the gate, not the agent's own work, decided this.
-fn gate_failure_comment(r: &ClaudeResult, pr_url: &str, command: &str, output: &str) -> String {
-    [
+/// CLAUDE-622: the command's own output is never posted here, only named;
+/// the full output is already attached to the run record. A gate that could
+/// not even start carries a [`GateFailure::Cause`] instead, a short reason
+/// rather than command output, so it is kept, fenced.
+fn gate_failure_comment(
+    r: &ClaudeResult,
+    pr_url: &str,
+    command: &str,
+    failure: &GateFailure,
+) -> String {
+    let mut lines = vec![
         format!(
             "Claude AI agent run completed, but the runner's own re-run of `just {command}` \
              failed. This is recorded as a failure regardless of what the agent itself \
-             reported; the draft PR is left open with the agent's commits:"
+             reported; the draft PR is left open with the agent's commits. The command's \
+             output is not included here; it is attached to the run record."
         ),
         String::new(),
         format!("Draft PR: {pr_url}"),
-        String::new(),
-        format!("`just {command}` output:"),
-        String::new(),
-        output.to_string(),
-        String::new(),
-        r.summary.clone(),
-        String::new(),
-        format!("Cost: ${} USD", r.cost),
-    ]
-    .join("\n")
+    ];
+    if let GateFailure::Cause(cause) = failure {
+        lines.push(String::new());
+        lines.push(format!("`just {command}` could not be run:"));
+        lines.push(String::new());
+        lines.push(provider::fenced_block("", cause));
+    }
+    lines.push(String::new());
+    lines.push(r.summary.clone());
+    lines.push(String::new());
+    lines.push(format!("Cost: ${} USD", r.cost));
+    lines.join("\n")
 }
 
 /// CLAUDE-521: write `body` to a scratch file under `std::env::temp_dir()`
@@ -6271,10 +6320,12 @@ fn remove_scratch_file(scratch: tempfile::TempPath, what: &str) {
     }
 }
 
-/// Post a [`gate_failure_comment`]-shaped notice naming `output` as a
-/// comment on PR `pr_number`, through a scratch file since
-/// [`Forge::pr_comment`] reads its body from disk (mirrors
-/// `post_review_findings_on_pr`).
+/// Post a [`gate_failure_comment`]-shaped notice as a comment on PR
+/// `pr_number`, through a scratch file since [`Forge::pr_comment`] reads its
+/// body from disk (mirrors `post_review_findings_on_pr`). CLAUDE-622: the
+/// command's own output is never posted, only named; a [`GateFailure::Cause`]
+/// (the gate could not even start) is kept, fenced, since it is a reason,
+/// not command output.
 fn post_gate_failure_on_pr(
     forge: &dyn Forge,
     host: &str,
@@ -6282,11 +6333,19 @@ fn post_gate_failure_on_pr(
     pr_number: u64,
     key: &str,
     command: &str,
-    output: &str,
+    failure: &GateFailure,
 ) -> Result<()> {
-    let body = format!(
-        "SPEC-3.3.2 verification gate: the runner's own `just {command}` failed:\n\n{output}"
-    );
+    let body = match failure {
+        GateFailure::Output(_) => format!(
+            "SPEC-3.3.2 verification gate: the runner's own `just {command}` failed. The \
+             command's output is not included here; it is attached to the run record."
+        ),
+        GateFailure::Cause(cause) => format!(
+            "SPEC-3.3.2 verification gate: the runner's own `just {command}` could not be \
+             run:\n\n{}",
+            provider::fenced_block("", cause)
+        ),
+    };
     let scratch = scratch_file(&format!("claude-run-gate-pr-comment-{key}"), &body)?;
     let result = forge.pr_comment(host, repo, pr_number, &scratch);
     remove_scratch_file(scratch, "gate-failure PR comment");
@@ -6427,8 +6486,11 @@ fn pr_failure_comment(
         }
     };
     let mut body = crate::run_footer::failure_comment(&cause, &location_line);
+    // CLAUDE-622: `err` can carry `append_stdout_tail` text (e.g. `git_error`'s
+    // redacted stderr/stdout tail), so it is fenced rather than pasted
+    // inline into the collapsed detail block.
     let detail = [
-        err.to_string(),
+        provider::fenced_block("", &err.to_string()),
         String::new(),
         r.summary.clone(),
         String::new(),
@@ -6465,7 +6527,12 @@ fn conflict_resolution_failed_comment(
         format!("Remote SHA: `{remote_sha}`"),
         format!("Conflicting file(s): {files}"),
         String::new(),
-        format!("Conflict-resolution pass failure: {detail}"),
+        "Conflict-resolution pass failure:".to_string(),
+        String::new(),
+        // CLAUDE-622: `detail` can carry `append_stdout_tail` text (the
+        // SPEC-3.3.2 gate's cause, or a merge's own captured stderr), so it
+        // is fenced rather than pasted inline.
+        provider::fenced_block("", detail),
         String::new(),
         // SPEC-3.12 item 6: name the single action a human takes next,
         // rather than only describing the state.
@@ -6502,7 +6569,9 @@ fn push_failure_requeue_comment(
     let mut body = [
         format!("Claude AI agent run completed {step_line}:"),
         String::new(),
-        err.to_string(),
+        // CLAUDE-622: `err` can carry `append_stdout_tail` text, so it is
+        // fenced rather than pasted inline.
+        provider::fenced_block("", &err.to_string()),
         String::new(),
         format!(
             "This issue has a recorded open PR: {pr_url}. AI Agent has been returned to Queued \
@@ -6759,11 +6828,9 @@ fn timeout_salvage_pr_comment(
 ) -> String {
     let last_commit_note = match commit_error {
         None => "The last commit on this branch is a `WIP: uncommitted changes at timeout` commit the runner made from the working tree at kill time, not the agent's own work.".to_string(),
-        Some(e) => format!(
-            "Committing the working tree's uncommitted changes failed ({e}); only the agent's own prior commits (if any) made it onto this branch."
-        ),
+        Some(_) => "Committing the working tree's uncommitted changes failed (see the fenced detail below); only the agent's own prior commits (if any) made it onto this branch.".to_string(),
     };
-    [
+    let mut body = [
         "Claude AI agent run TIMED OUT; this draft PR salvages the work in progress at kill time.".to_string(),
         String::new(),
         format!("Timeout limit: {}s", timeout.as_secs()),
@@ -6775,7 +6842,14 @@ fn timeout_salvage_pr_comment(
         String::new(),
         r.summary.clone(),
     ]
-    .join("\n")
+    .join("\n");
+    // CLAUDE-622: `commit_error` carries `append_stdout_tail` text (a failed
+    // `git add`/`git commit`'s stdout tail, which can include a pre-commit
+    // hook's own report), so it is fenced rather than pasted inline.
+    if let Some(e) = commit_error {
+        body.push_str(&format!("\n\n{}", provider::fenced_block("", e)));
+    }
+    body
 }
 
 /// SPEC-3.12 item 3, the "timeout or cancel with commits" row: the
@@ -6801,10 +6875,11 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
         "No local work to salvage (clean working tree, no commits ahead of the remote default branch).".to_string()
     } else {
         let mut parts = Vec::new();
-        if let Some(e) = &salvage.commit_error {
-            parts.push(format!(
-                "Committing the uncommitted working tree failed: {e}"
-            ));
+        if salvage.commit_error.is_some() {
+            // CLAUDE-622: the detail (`append_stdout_tail` text) moves to a
+            // fenced block below the bullet list rather than inline, since a
+            // multi-line fence inside a single bullet line would break.
+            parts.push("Committing the uncommitted working tree failed (see below).".to_string());
         }
         match (&salvage.pr_url, &salvage.open_error) {
             (Some(url), _) => {
@@ -6841,6 +6916,10 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
 
     let mut body =
         format!("**Claude AI agent run TIMED OUT.**\n\n- {cause}\n- {salvage_line}\n- {action}");
+
+    if let Some(e) = &salvage.commit_error {
+        body.push_str(&format!("\n\n{}", provider::fenced_block("", e)));
+    }
 
     let detail = [
         "The agent may have completed all, some, or none of the work before being killed. A backgrounded command can hold the process open past the limit even after the functional work is done, so this is not necessarily a failure. The runner did NOT mark this issue Failed.".to_string(),
@@ -9109,6 +9188,56 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("agent error"), "{body}");
+    }
+
+    /// CLAUDE-622: a failed WIP commit's `append_stdout_tail` detail (which
+    /// can itself contain backticks, e.g. from a pre-commit hook's own
+    /// report) must be fenced past any backtick run already inside it,
+    /// never pasted inline into the bullet list.
+    #[test]
+    fn timeout_comment_fences_the_commit_error_past_its_own_backticks() {
+        let r = ClaudeResult::synthesized("claude exited 124, see stream.jsonl", "");
+        let salvage = SalvageReport {
+            commit_error: Some("`git commit` failed: ``pre-commit`` hook: lint failed".into()),
+            ..Default::default()
+        };
+        let body = timeout_comment(&r, Duration::from_secs(60), &salvage);
+        assert!(
+            body.contains("- Committing the uncommitted working tree failed (see below)."),
+            "{body}"
+        );
+        assert!(
+            body.contains("`git commit` failed: ``pre-commit`` hook: lint failed"),
+            "the commit error text itself must still be present: {body}"
+        );
+        assert!(
+            body.contains("```\n") || body.contains("````"),
+            "the commit error must be fenced past the backtick run already inside it: {body}"
+        );
+    }
+
+    /// CLAUDE-622: the same fencing applies to the timeout-salvage draft
+    /// PR's own comment, which carries the same `commit_error` detail.
+    #[test]
+    fn timeout_salvage_pr_comment_fences_the_commit_error_past_its_own_backticks() {
+        let r = ClaudeResult::synthesized("claude exited 124, see stream.jsonl", "");
+        let body = timeout_salvage_pr_comment(
+            &r,
+            Duration::from_secs(60),
+            Some("`git add` failed: ``pre-add`` hook: denied"),
+        );
+        assert!(
+            body.contains("Committing the working tree's uncommitted changes failed"),
+            "{body}"
+        );
+        assert!(
+            body.contains("`git add` failed: ``pre-add`` hook: denied"),
+            "the commit error text itself must still be present: {body}"
+        );
+        assert!(
+            body.contains("```\n") || body.contains("````"),
+            "the commit error must be fenced past the backtick run already inside it: {body}"
+        );
     }
 
     /// CLAUDE-447: a failed `timeout salvage push` comment post never fails
@@ -11952,7 +12081,14 @@ mod tests {
             .iter()
             .find(|c| c.starts_with("yt issue comment MK-16"))
             .unwrap_or_else(|| panic!("no issue comment call found: {calls:?}"));
-        assert!(comment_call.contains("FAIL some_test"), "{comment_call}");
+        assert!(
+            !comment_call.contains("FAIL some_test"),
+            "the issue comment must not carry gate output: {comment_call}"
+        );
+        assert!(
+            comment_call.contains("just pre-push"),
+            "the issue comment must still name the failed command: {comment_call}"
+        );
         assert!(
             calls
                 .iter()
@@ -12715,6 +12851,80 @@ mod tests {
         );
     }
 
+    /// CLAUDE-622: `err`'s text can itself carry backticks (e.g. a quoted
+    /// command in a `git`/`fj` error), so the fence wrapping it in the
+    /// collapsed detail must be longer than any backtick run already there.
+    /// CLAUDE-622: a conflict-resolution pass's own failure detail can carry
+    /// backticks (e.g. a quoted command from the SPEC-3.3.2 gate's cause),
+    /// so the fence wrapping it must be longer than any run already there.
+    #[test]
+    fn conflict_resolution_failed_comment_fences_a_detail_containing_backticks() {
+        let body = conflict_resolution_failed_comment(
+            &ok_result(),
+            "feat/x",
+            "abc123",
+            "def456",
+            "src/foo.rs",
+            "running ``just pre-push`` failed: exit 1",
+        );
+        assert!(
+            body.contains("running ``just pre-push`` failed: exit 1"),
+            "the detail text itself must still be present: {body}"
+        );
+        assert!(
+            body.contains("```\n") || body.contains("````"),
+            "the detail must be fenced past the backtick run already inside it: {body}"
+        );
+    }
+
+    /// CLAUDE-622: a push/PR-create requeue's error text can itself carry
+    /// backticks, so the fence wrapping it must be longer than any run
+    /// already there.
+    #[test]
+    fn push_failure_requeue_comment_fences_an_error_containing_backticks() {
+        let err = Error::Other(anyhow::anyhow!("running ``git push`` failed: denied"));
+        let body = push_failure_requeue_comment(
+            &ok_result(),
+            &err,
+            "push",
+            "https://dev.a8n.run/contoso/claude-run/pulls/9",
+            1,
+            3,
+        );
+        assert!(
+            body.contains("running ``git push`` failed: denied"),
+            "the error text itself must still be present: {body}"
+        );
+        assert!(
+            body.contains("```\n") || body.contains("````"),
+            "the error must be fenced past the backtick run already inside it: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_failure_comment_fences_an_error_containing_backticks() {
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        let err = Error::Other(anyhow::anyhow!("running ``git push`` failed: denied"));
+
+        let body = pr_failure_comment(
+            &ok_result(),
+            &err,
+            &work_location(&clone, None),
+            "push",
+            None,
+        );
+
+        assert!(
+            body.contains("running ``git push`` failed: denied"),
+            "the error text itself must still be present: {body}"
+        );
+        assert!(
+            body.contains("```\n") || body.contains("````"),
+            "the error must be fenced past the backtick run already inside it: {body}"
+        );
+    }
+
     #[test]
     fn pr_failure_comment_headline_names_pr_create_for_a_pr_create_failure() {
         let base = tempfile::tempdir().unwrap();
@@ -12828,6 +13038,166 @@ mod tests {
                 "the findings must still be reachable, in the collapsed detail: {body}"
             );
         }
+    }
+
+    #[test]
+    fn gate_failure_comment_names_the_command_but_never_its_output() {
+        let failure = GateFailure::Output("test result::FAIL some_test\n`backtick`".into());
+        let body = gate_failure_comment(
+            &ok_result(),
+            "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            "pre-push",
+            &failure,
+        );
+        assert!(
+            body.contains("just pre-push"),
+            "the failed command must still be named: {body}"
+        );
+        assert!(
+            !body.contains("FAIL some_test"),
+            "the gate's own output must never reach the comment: {body}"
+        );
+        assert!(
+            body.contains("attached to the run record"),
+            "the comment must say where the output actually went: {body}"
+        );
+    }
+
+    #[test]
+    fn gate_failure_comment_keeps_a_cause_fenced_past_any_backtick_run_inside_it() {
+        let failure = GateFailure::Cause("spawning `just` with ``double`` backticks failed".into());
+        let body = gate_failure_comment(
+            &ok_result(),
+            "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            "pre-push",
+            &failure,
+        );
+        assert!(
+            body.contains("could not be run"),
+            "a Cause must still be surfaced, since it is a reason not output: {body}"
+        );
+        assert!(
+            body.contains("spawning `just` with ``double`` backticks failed"),
+            "the cause text itself must be present: {body}"
+        );
+        assert!(
+            body.contains("```\n") || body.contains("````"),
+            "the cause must be fenced with more backticks than any run already inside it: {body}"
+        );
+    }
+
+    /// Minimal [`Forge`] whose only live method is `pr_comment`, which
+    /// captures the body file's contents before the caller removes the
+    /// scratch file, so the test can inspect exactly what would have been
+    /// posted.
+    struct CapturingForge {
+        captured: std::sync::Mutex<Option<String>>,
+    }
+
+    impl Forge for CapturingForge {
+        fn create_pr(
+            &self,
+            _workdir: &Path,
+            _host: &str,
+            _strategy: crate::action::PrStrategy,
+        ) -> Result<PullRequest> {
+            unreachable!("not exercised by this test")
+        }
+
+        fn clone_url(&self, _host: &str, _repo: &str) -> Result<String> {
+            unreachable!("not exercised by this test")
+        }
+
+        fn repo_access(&self, _host: &str, _repo: &str) -> Result<()> {
+            unreachable!("not exercised by this test")
+        }
+
+        fn list_open_prs(
+            &self,
+            _host: &str,
+            _repo: &str,
+        ) -> Result<Vec<provider::ForgePullRequest>> {
+            unreachable!("not exercised by this test")
+        }
+
+        fn pr_ci_state(&self, _host: &str, _repo: &str, _pr_number: u64) -> Result<String> {
+            unreachable!("not exercised by this test")
+        }
+
+        fn pr_comment(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _pr_number: u64,
+            body_file: &Path,
+        ) -> Result<()> {
+            *self.captured.lock().unwrap() = Some(std::fs::read_to_string(body_file).unwrap());
+            Ok(())
+        }
+
+        fn issue_comment(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _issue_number: u64,
+            _body_file: &Path,
+        ) -> Result<()> {
+            unreachable!("not exercised by this test")
+        }
+    }
+
+    #[test]
+    fn post_gate_failure_on_pr_posts_no_command_output() {
+        let forge = CapturingForge {
+            captured: std::sync::Mutex::new(None),
+        };
+        let failure = GateFailure::Output("test result::FAIL some_test".into());
+        post_gate_failure_on_pr(
+            &forge,
+            "dev.a8n.run",
+            "contoso/claude-run",
+            7,
+            "MK-16",
+            "pre-push",
+            &failure,
+        )
+        .unwrap();
+        let body = forge.captured.lock().unwrap().clone().unwrap();
+        assert!(
+            body.contains("just pre-push"),
+            "the PR comment must still name the failed command: {body}"
+        );
+        assert!(
+            !body.contains("FAIL some_test"),
+            "the PR comment must never carry the gate's own output: {body}"
+        );
+    }
+
+    #[test]
+    fn post_gate_failure_on_pr_fences_a_cause_with_backticks_in_it() {
+        let forge = CapturingForge {
+            captured: std::sync::Mutex::new(None),
+        };
+        let failure = GateFailure::Cause("running ``just`` failed: no such file".into());
+        post_gate_failure_on_pr(
+            &forge,
+            "dev.a8n.run",
+            "contoso/claude-run",
+            7,
+            "MK-16",
+            "pre-push",
+            &failure,
+        )
+        .unwrap();
+        let body = forge.captured.lock().unwrap().clone().unwrap();
+        assert!(
+            body.contains("running ``just`` failed: no such file"),
+            "the cause text must be present: {body}"
+        );
+        assert!(
+            body.contains("```\n") || body.contains("````"),
+            "the cause must be fenced past the backtick run already inside it: {body}"
+        );
     }
 
     #[test]

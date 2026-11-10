@@ -1606,18 +1606,24 @@ const STDOUT_TAIL_MAX_BYTES: usize = 4000;
 /// Append a bounded, redacted tail of a failed call's `stdout` to its error text
 /// (CLAUDE-422). A `pre-push` hook writes its test report to stdout, which git
 /// does not fold into stderr, so a stderr-only message names no failing test.
-/// The tail is the last [`STDOUT_TAIL_MAX_LINES`] lines and at most
-/// [`STDOUT_TAIL_MAX_BYTES`] bytes, redacted with `secrets` before it is cut so a
-/// credential straddling the cut is never half-shown. Empty stdout returns
-/// `stderr` unchanged.
-/// SPEC-8.6: append a bounded, redacted stdout tail to a failed call's error
-/// text (CLAUDE-422).
+/// `stderr` and `stdout` are both run through [`strip_terminal_escapes`]
+/// first (CLAUDE-622), so `just`'s ANSI colour/cursor codes and other control
+/// bytes never reach the bound, the stored tail, or a comment; the bound is
+/// then applied to the already-stripped text so it counts visible
+/// characters, not escape bytes. The tail is the last
+/// [`STDOUT_TAIL_MAX_LINES`] lines and at most [`STDOUT_TAIL_MAX_BYTES`]
+/// bytes, redacted with `secrets` before it is cut so a credential straddling
+/// the cut is never half-shown. Empty stdout returns `stderr` unchanged
+/// (still stripped).
+/// SPEC-8.6: append a bounded, redacted, escape-stripped stdout tail to a
+/// failed call's error text (CLAUDE-422, CLAUDE-622).
 pub(crate) fn append_stdout_tail(stderr: &str, stdout: &str, secrets: &[String]) -> String {
-    let stdout = stdout.trim();
+    let stderr = strip_terminal_escapes(stderr);
+    let stdout = strip_terminal_escapes(stdout.trim());
     if stdout.is_empty() {
-        return stderr.to_string();
+        return stderr;
     }
-    let redacted = crate::forge_log::redact(stdout, secrets);
+    let redacted = crate::forge_log::redact(&stdout, secrets);
     let lines: Vec<&str> = redacted.lines().collect();
     let by_lines = lines[lines.len().saturating_sub(STDOUT_TAIL_MAX_LINES)..].join("\n");
     let mut start = by_lines.len().saturating_sub(STDOUT_TAIL_MAX_BYTES);
@@ -1625,12 +1631,90 @@ pub(crate) fn append_stdout_tail(stderr: &str, stdout: &str, secrets: &[String])
         start += 1;
     }
     let tail = by_lines[start..].trim();
-    let stderr = crate::forge_log::redact(stderr, secrets);
+    let stderr = crate::forge_log::redact(&stderr, secrets);
     if stderr.is_empty() {
         format!("--- stdout ---\n{tail}")
     } else {
         format!("{stderr}\n--- stdout ---\n{tail}")
     }
+}
+
+/// SPEC-8.6: strip terminal escape sequences and raw control bytes from
+/// captured command text (CLAUDE-622), so `just` and the tools it runs never
+/// leave ANSI colour/cursor codes or other control characters in a stored
+/// tail or a comment. Removes every ESC (`0x1B`)-introduced sequence: CSI
+/// (`ESC [ ... <final byte 0x40-0x7E>`), OSC (`ESC ] ... ` terminated by BEL
+/// or `ESC \`), and any other two-character `ESC <byte>` sequence; and every
+/// remaining control character (as [`char::is_control`] defines it) except
+/// newline and tab, which are kept so the text's line structure survives.
+pub(crate) fn strip_terminal_escapes(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\u{1b}' {
+            match chars.get(i + 1) {
+                Some('[') => {
+                    let mut j = i + 2;
+                    while j < chars.len() && !('\u{40}'..='\u{7e}').contains(&chars[j]) {
+                        j += 1;
+                    }
+                    i = (j + 1).min(chars.len());
+                }
+                Some(']') => {
+                    let mut j = i + 2;
+                    loop {
+                        if j >= chars.len() {
+                            break;
+                        }
+                        if chars[j] == '\u{07}' {
+                            j += 1;
+                            break;
+                        }
+                        if chars[j] == '\u{1b}' && chars.get(j + 1) == Some(&'\\') {
+                            j += 2;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    i = j.min(chars.len());
+                }
+                Some(_) => i += 2,
+                None => i += 1,
+            }
+            continue;
+        }
+        let c = chars[i];
+        if c == '\n' || c == '\t' || !c.is_control() {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The longest run of consecutive backticks in `text`.
+fn longest_backtick_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for c in text.chars() {
+        if c == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
+/// SPEC-8.6: fence `text` (optionally tagged `lang`) in a Markdown code
+/// block, choosing a backtick run strictly longer than any run already
+/// inside `text` (at least 3) so untrusted captured command text can never
+/// close the fence early and spill out of the block (CLAUDE-622).
+pub(crate) fn fenced_block(lang: &str, text: &str) -> String {
+    let fence = "`".repeat((longest_backtick_run(text) + 1).max(3));
+    format!("{fence}{lang}\n{text}\n{fence}")
 }
 
 /// The credential inside a clone URL's userinfo (`https://user:TOKEN@host/...`),
@@ -2084,6 +2168,72 @@ mod tests {
         );
         assert!(!text.contains(&secret), "{text}");
         assert!(text.contains("failures:"), "{text}");
+    }
+
+    /// CLAUDE-622: a CSI sequence (`just`'s ANSI colour codes) is stripped
+    /// from both the stdout tail and the stderr it is appended to.
+    #[test]
+    fn append_stdout_tail_strips_csi_escapes() {
+        let stdout = "\u{1b}[31mFAILED\u{1b}[0m some::test\n";
+        let text = append_stdout_tail("\u{1b}[1merror\u{1b}[0m", stdout, &[]);
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(text.contains("FAILED some::test"), "{text}");
+        assert!(text.contains("error"), "{text}");
+    }
+
+    /// CLAUDE-622: an OSC sequence (a terminal title/hyperlink escape) is
+    /// stripped whether terminated by BEL or by `ESC \`.
+    #[test]
+    fn append_stdout_tail_strips_osc_escapes() {
+        let bel = "before \u{1b}]0;title\u{07} after\n";
+        let st = "before \u{1b}]8;;http://example\u{1b}\\ after\n";
+        assert_eq!(strip_terminal_escapes(bel), "before  after\n");
+        assert_eq!(strip_terminal_escapes(st), "before  after\n");
+    }
+
+    /// CLAUDE-622: a bare control byte (not part of any escape sequence) is
+    /// dropped, while newline and tab survive.
+    #[test]
+    fn append_stdout_tail_strips_bare_control_bytes() {
+        let stdout = "line one\x07\nline\ttwo\x0c\n";
+        let text = append_stdout_tail("e", stdout, &[]);
+        assert!(!text.contains('\u{07}'), "{text}");
+        assert!(!text.contains('\u{0c}'), "{text}");
+        assert!(text.contains("line one\n"), "{text}");
+        assert!(text.contains("line\ttwo"), "{text}");
+    }
+
+    /// CLAUDE-622: escapes are stripped before the byte/line bound is
+    /// applied, so a CSI sequence straddling what would otherwise be the
+    /// cut point never leaves a dangling half-escape in the tail.
+    #[test]
+    fn append_stdout_tail_strips_escapes_before_the_byte_cut() {
+        let filler = "x".repeat(STDOUT_TAIL_MAX_BYTES - 2);
+        let stdout = format!("{filler}\u{1b}[31mTAIL\u{1b}[0m\n");
+        let text = append_stdout_tail("e", &stdout, &[]);
+        assert!(!text.contains('\u{1b}'), "{text}");
+        let tail = text.split_once("--- stdout ---\n").unwrap().1;
+        assert!(tail.ends_with("TAIL"), "{tail}");
+    }
+
+    /// CLAUDE-622: the fence is longer than any backtick run already inside
+    /// the text, so the text can never close it early.
+    #[test]
+    fn fenced_block_picks_a_fence_longer_than_any_backtick_run_in_the_text() {
+        let text = "some output with ``` three backticks and ```` four";
+        let block = fenced_block("", text);
+        let fence = block.lines().next().unwrap();
+        assert_eq!(fence, "`````");
+        assert!(block.starts_with("`````\n"), "{block}");
+        assert!(block.ends_with("\n`````"), "{block}");
+        assert!(block.contains(text), "{block}");
+    }
+
+    #[test]
+    fn fenced_block_uses_three_backticks_for_plain_text() {
+        let block = fenced_block("", "no backticks here");
+        assert!(block.starts_with("```\n"), "{block}");
+        assert!(block.ends_with("\n```"), "{block}");
     }
 
     /// CLAUDE-422: a failing `pre-push` hook's report is on git's stdout.
@@ -3528,9 +3678,14 @@ mod tests {
         /// or otherwise never opens a real PR, so the adopt-first contract does
         /// not apply to them: `push_comment::tests::FailingForge`,
         /// `native::youtrack::tests::FakeCheckpointForge`,
+        /// `native::youtrack::tests::CapturingForge`,
         /// `web::webhooks::tests::StoreBackend`.
-        const TEST_ONLY_ALLOWLIST: &[&str] =
-            &["FailingForge", "FakeCheckpointForge", "StoreBackend"];
+        const TEST_ONLY_ALLOWLIST: &[&str] = &[
+            "FailingForge",
+            "FakeCheckpointForge",
+            "CapturingForge",
+            "StoreBackend",
+        ];
 
         let found = every_impl_forge_for();
         assert!(
