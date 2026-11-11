@@ -958,14 +958,11 @@ without peering. The peer layer only narrows that window and merges what the ins
      `info` log naming the holder. Otherwise it sends the claim to every `reachable` peer, each bounded by
      `claim_timeout_secs`.
    - A peer with no row for the key records the claimant as holder and grants. A peer holding its own row for the key
-     compares `(holder_load, holder_id)` pairs, lower wins: if the claimant's pair is lower the peer records the
-     claimant as holder, drops its own delivery and grants; otherwise it refuses and names its pair. A peer whose row
-     names a third party refuses. Both sides compare the same two fixed pairs, so simultaneous deliveries converge on one
-     holder: the lower pair.
-   - A peer that holds no row grants before its own delivery has claimed, because it cannot know whether that delivery
-     is still coming. The asker re-reads its own row for a bounded interval after the grant so a takeover that follows
-     can land first. A takeover that lands later still grants, and both instances dispatch the event. The instance that
-     had already dispatched logs this at `warn` naming the `event_key`, itself and the claimant.
+     compares `(holder_load, holder_id)` pairs, lower wins: if the claimant's pair is lower and the peer has not started
+     the event, it records the claimant as holder, drops its own delivery and grants; otherwise (a higher pair, or an
+     event it already started) it refuses and names its pair. A grant is final: a row naming a peer is never taken
+     back. A peer whose row names a third party refuses. Both sides compare the same two fixed pairs, so simultaneous deliveries yield exactly
+     one holder.
    - Any refusal drops the delivery with `200` and an `info` log naming the holder; a lost claim is never retried. All
      grants, or no `reachable` peer, proceed to dispatch.
    - A peer that times out, errors or returns an undecodable reply is bypassed: the receiver proceeds, logs at `warn`
@@ -973,8 +970,7 @@ without peering. The peer layer only narrows that window and merges what the ins
    - An instance claims only events delivered to it and never forwards an event to a peer. Load therefore decides
      between instances that both received the event, not which instance receives it.
    - `peer_claims` rows are pruned after 24 hours (`SPEC-3.8.4`).
-8. **Duplicates are accepted.** When a claim is bypassed or a takeover lands after dispatch (item 7), both instances may
-   process the event. The dedupe of
+8. **Duplicates are accepted.** When a claim is bypassed, both instances may process the event. The dedupe of
    `SPEC-3.5.2` is per store, so two instances may each open an issue for one failure. No reconciliation is attempted;
    the replicated summaries (item 9) show both runs.
 9. **Summary replication.** Highlights and statistics only. On each job outcome an instance writes a `run_summaries`
