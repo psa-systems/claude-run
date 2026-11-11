@@ -434,16 +434,16 @@ impl Daemon {
                 Ok(key) => match crate::secrets::resolve_secret(&pool, &key, name).await {
                     Ok(t) if !t.is_empty() => Some(Arc::new(t)),
                     Ok(_) => {
-                        warn!(secret = name, "web.auth_token_ref names an empty secret; the peer API refuses every request this run");
+                        warn!(secret = name, "web.auth_token_ref names an empty secret; the peer API accepts only a generated API key this run");
                         None
                     }
                     Err(e) => {
-                        warn!(secret = name, error = %e, "web.auth_token_ref could not be resolved; the peer API refuses every request this run");
+                        warn!(secret = name, error = %e, "web.auth_token_ref could not be resolved; the peer API accepts only a generated API key this run");
                         None
                     }
                 },
                 Err(e) => {
-                    warn!(error = %e, "the secrets key could not be loaded; the peer API refuses every request this run");
+                    warn!(error = %e, "the secrets key could not be loaded; the peer API accepts only a generated API key this run");
                     None
                 }
             },
