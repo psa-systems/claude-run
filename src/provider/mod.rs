@@ -3782,12 +3782,13 @@ mod tests {
         /// or otherwise never opens a real PR, so the adopt-first contract does
         /// not apply to them: `push_comment::tests::FailingForge`,
         /// `native::youtrack::tests::FakeCheckpointForge`,
-        /// `native::youtrack::tests::CapturingForge`,
+        /// `native::youtrack::tests::CapturingForge`, `native::youtrack::tests::ReviewForge`,
         /// `web::webhooks::tests::StoreBackend`.
         const TEST_ONLY_ALLOWLIST: &[&str] = &[
             "FailingForge",
             "FakeCheckpointForge",
             "CapturingForge",
+            "ReviewForge",
             "StoreBackend",
         ];
 
