@@ -26,8 +26,38 @@
       {% endfor %}
     </select>
   </label>
+  {% if peering %}
+  <label style="display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--fg-dim);">
+    Instance
+    <select name="instance" class="btn">
+      <option value="all" {% if instance == "all" %}selected{% endif %}>All instances</option>
+      <option value="local" {% if instance == "local" %}selected{% endif %}>This instance</option>
+      {% for n in peer_names %}
+        <option value="{{ n }}" {% if instance == n.as_str() %}selected{% endif %}>{{ n }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  {% endif %}
   <button class="btn" type="submit">Apply</button>
 </form>
+
+{# SPEC-3.17 item 10: with peering the five series read replicated run
+   summaries. A peer that is unknown or behind is named with its last sync, so
+   a partial total is never shown as complete. #}
+{% if peering %}
+  <div class="dim" style="font-size: 12px; margin-bottom: 8px;">
+    Spend, run counts and the time-of-day and weekday charts come from replicated run summaries; a run is one recorded attempt.
+    Step timing, stages, Postgres, funnel, failure causes and Claude plan usage stay per instance (this instance only).
+  </div>
+  {% for n in peer_notes %}
+  <div class="card" style="margin-bottom: 8px;">
+    <span class="badge warn">{{ n.state }}</span>
+    Peer {{ n.name }} ({{ n.sync }}): last sync
+    {% if let Some(t) = n.last_sync %}{{ t|datetime }}{% else %}never{% endif %}.
+    Its figures may lack recent runs, so the totals below may be incomplete.
+  </div>
+  {% endfor %}
+{% endif %}
 
 <h2>Spend</h2>
 <div class="grid">

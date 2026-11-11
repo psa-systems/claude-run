@@ -590,8 +590,9 @@ All sweeps are DB-backed settings, enabled by default flags in each section, and
 
 - Rows older than `retention_days` (180), by their stored `ts`, are deleted from `job_outcomes`, `run_events`,
   `ci_failure_runs` and `claude_invocations`. Each pruned table has a single-column index on `ts` so the cutoff
-  predicate seeks rather than scans. `run_summaries` rows are pruned the same way by `ended_at`, and `peer_claims`
-  rows after 24 hours by `claimed_at` (`SPEC-3.17`).
+  predicate seeks rather than scans. `run_summaries` rows are pruned the same way by `ended_at`, except that each
+  origin's newest row is kept so the next `seq` never restarts, and `peer_claims` rows after 24 hours by `claimed_at`
+  (`SPEC-3.17`).
 - `ci_failures`, `ci_failure_tests` and `agent_pull_requests` are never pruned by this sweep: a resolved failure or a
   merged PR must still be matchable against a regression months later, so only the per-sighting/per-invocation
   history tables above are bounded by age.
@@ -906,7 +907,8 @@ without peering. The peer layer only narrows that window and merges what the ins
 
 1. **Autonomy.** No run, finalize, push, sweep or webhook response waits on a peer beyond the bounded timeouts below.
    With `peers.enabled` false (the default) or no peer configured, behavior is exactly as without this section: no
-   route mounted, no outbound call, no row written to the tables below. No state store is shared between instances.
+   route mounted, no outbound call, no row written to `peer_claims` or `peer_cursors`. This instance's own
+   `run_summaries` rows are always written, so history is complete when peering is first enabled. No state store is shared between instances.
 2. **Identity.** Each instance generates a UUID `instance_id` on first start and stores it under the `settings` key
    `instance.id`; it is never regenerated. `peers.instance_name` is required when peering is enabled and is unique among
    the peers. A peer that reports this instance's own `instance_id` (a peer URL that points back at itself) is refused
@@ -914,7 +916,7 @@ without peering. The peer layer only narrows that window and merges what the ins
 3. **Configuration.** The DB-backed section `peers` (`config.peers`, `SPEC-6.3`): `enabled` (false), `instance_name`,
    `peers` (a list of `name`, `url`, `token_ref`; `token_ref` names the secret holding that peer's bearer token, 7.6),
    `poll_secs` (30, at least 5), `stale_after_secs` (120, at least twice `poll_secs`), `claim_timeout_secs` (5, between
-   1 and 30) and `summary_batch` (500). A save with a duplicate peer name, an unparseable URL or an out-of-range value
+   1 and 30) and `summary_batch` (500). A save with a duplicate peer name, a peer named `all` or `local` (values of the Reports `instance` filter), an unparseable URL or an out-of-range value
    is rejected whole. The topology is a full mesh: every instance lists every other, and no instance relays another's
    data.
 4. **Peer API.** Served only on the TCP listener under `/api/peer`, never on the unix socket (7.14), mounted only when
@@ -1227,7 +1229,10 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
 - The top-line `summary` totals spend and run count from `daily_ledger` and run minutes from `runs` (the only table
   with both a start and an end timestamp; a run with a NULL `ended_at` is excluded from the minutes total).
 - With peering enabled these five series read `run_summaries` instead, merged across instances by default and
-  filterable by an `instance` parameter (`SPEC-3.17` item 10).
+  filterable by an `instance` parameter (`SPEC-3.17` item 10). A "run" there is one recorded attempt (one summary
+  row), dated and bucketed by the local time its attempt ended (starts and minutes by the time it started), and run
+  minutes are the attempts' own durations. An `instance` that is not `all`, `local` or a configured peer is a `400`
+  (with peering disabled, any peer name is), and a peer not yet reached since the process started is a `409`.
 - The Claude plan-usage chart reads its series oldest first (so the chart draws left to right); the most-recent-
   invocations table is a separate newest-first query capped at 20 rows, not a reverse-and-slice of the chart's rows.
 

@@ -665,6 +665,10 @@ struct ReportQuery {
     range: Option<String>,
     #[serde(default)]
     action: Option<String>,
+    /// `all` (default), `local` or a peer name; honored by the five merged
+    /// series (`SPEC-3.17` item 10).
+    #[serde(default)]
+    instance: Option<String>,
 }
 
 impl ReportQuery {
@@ -679,13 +683,41 @@ impl ReportQuery {
     }
 }
 
+impl From<crate::peer::ViewError> for AppError {
+    fn from(e: crate::peer::ViewError) -> Self {
+        let status = match &e {
+            crate::peer::ViewError::BadInstance(_) => StatusCode::BAD_REQUEST,
+            crate::peer::ViewError::PeerUnresolved(_) => StatusCode::CONFLICT,
+            crate::peer::ViewError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self {
+            status,
+            message: e.to_string(),
+        }
+    }
+}
+
+/// Resolve the `instance` parameter for the five merged series.
+async fn report_view(s: &AppState, q: &ReportQuery) -> Result<crate::peer::ReportView, AppError> {
+    let cfg = s.settings.peers_handle().read().await.clone();
+    Ok(crate::peer::resolve_report_view(
+        &s.pool,
+        &cfg,
+        &s.settings.peer_registry(),
+        q.instance.as_deref(),
+        chrono::Utc::now(),
+    )
+    .await?)
+}
+
 /// SPEC-4.2: `GET /report/summary`.
 async fn report_summary(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
 ) -> Result<Json<crate::report::Summary>, AppError> {
+    let view = report_view(&s, &q).await?;
     Ok(Json(
-        crate::report::summary(&s.pool, q.range(), q.action()).await?,
+        crate::report::summary_scoped(&s.pool, q.range(), q.action(), &view.scope).await?,
     ))
 }
 
@@ -694,8 +726,9 @@ async fn report_daily(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
 ) -> Result<Json<Vec<crate::report::DailyPoint>>, AppError> {
+    let view = report_view(&s, &q).await?;
     Ok(Json(
-        crate::report::daily(&s.pool, q.range(), q.action()).await?,
+        crate::report::daily_scoped(&s.pool, q.range(), q.action(), &view.scope).await?,
     ))
 }
 
@@ -704,8 +737,9 @@ async fn report_weekly(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
 ) -> Result<Json<Vec<crate::report::WeeklyPoint>>, AppError> {
+    let view = report_view(&s, &q).await?;
     Ok(Json(
-        crate::report::weekly(&s.pool, q.range(), q.action()).await?,
+        crate::report::weekly_scoped(&s.pool, q.range(), q.action(), &view.scope).await?,
     ))
 }
 
@@ -714,8 +748,9 @@ async fn report_by_weekday(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
 ) -> Result<Json<Vec<crate::report::WeekdayBucket>>, AppError> {
+    let view = report_view(&s, &q).await?;
     Ok(Json(
-        crate::report::by_weekday(&s.pool, q.range(), q.action()).await?,
+        crate::report::by_weekday_scoped(&s.pool, q.range(), q.action(), &view.scope).await?,
     ))
 }
 
@@ -724,8 +759,9 @@ async fn report_by_hour(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
 ) -> Result<Json<Vec<crate::report::HourBucket>>, AppError> {
+    let view = report_view(&s, &q).await?;
     Ok(Json(
-        crate::report::by_hour(&s.pool, q.range(), q.action()).await?,
+        crate::report::by_hour_scoped(&s.pool, q.range(), q.action(), &view.scope).await?,
     ))
 }
 

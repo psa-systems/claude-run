@@ -90,6 +90,25 @@ pub async fn prune_older_than(pool: &DbPool, t: &RetentionTable, cutoff: &str) -
     Ok(res.rows_affected())
 }
 
+/// SPEC-3.8.4 / SPEC-3.17 item 9: delete `run_summaries` rows ended before
+/// `cutoff`, keeping each origin's newest row. That row anchors the next `seq`
+/// (`MAX(seq) + 1`): without it a fully aged-out table would restart at 1 and
+/// peers whose cursor is past that would never see the new rows.
+pub async fn prune_run_summaries(pool: &DbPool, cutoff: &str) -> Result<u64> {
+    let res = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "DELETE FROM run_summaries WHERE ended_at < ? AND seq < \
+             (SELECT MAX(r.seq) FROM run_summaries r WHERE r.instance_id = run_summaries.instance_id)",
+        )
+        .into_owned(),
+    ))
+    .bind(cutoff)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// SPEC-3.17 item 7: `peer_claims` rows older than this are pruned. Fixed, not
 /// the `retention_days` window: a claim only has to outlive a forge's redelivery.
 pub const PEER_CLAIMS_TTL_HOURS: i64 = 24;
@@ -141,6 +160,17 @@ pub async fn sweep(
         }
         stats.deleted += deleted;
     }
+    let deleted = prune_run_summaries(pool, &cutoff).await?;
+    if deleted > 0 {
+        tracing::info!(
+            table = "run_summaries",
+            deleted,
+            cutoff = %cutoff,
+            retention_days = cfg.retention_days,
+            "db retention: pruned rows older than the window"
+        );
+    }
+    stats.deleted += deleted;
     Ok(stats)
 }
 

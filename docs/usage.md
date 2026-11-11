@@ -177,7 +177,9 @@ will want to know about:
   row per probe. `/secrets` grows a per-secret **Check** button that lands here with that credential's identity probe
   already run. See "Access check".
 - **Reports** (`/reports`, CLAUDE-117) is the historical reporting page (spend / runs / time-of-day / day-of-week),
-  global by default and narrowable with `action` + `range` query params. Its "Claude plan usage" section (CLAUDE-315)
+  global by default and narrowable with `action` + `range` query params. With peering enabled (`SPEC-3.17`) it also
+  takes an `instance` param (`all`, `local` or a peer name), merges this instance with every peer's replicated run
+  summaries by default, and names any peer that is unknown or behind with its last sync time (CLAUDE-616). Its "Claude plan usage" section (CLAUDE-315)
   charts the Claude subscription's own rate-limit utilization (five-hour and seven-day windows, 0-100%) per `claude`
   invocation, separate from the dollar spend above: a solid line for the five-hour window, a dashed line for the
   seven-day window, a red marker for a timed-out or failed invocation, and a gap in the line (with a stated count)

@@ -1006,7 +1006,7 @@ pub struct PeersConfig {
     pub stale_after_secs: u64,
     /// Bound on one claim call to a peer, 1 to 30 (used by the claim protocol).
     pub claim_timeout_secs: u64,
-    /// Rows per summary pull, at least 1 (used by summary replication).
+    /// Rows per summary pull, at least 1.
     pub summary_batch: u64,
 }
 
