@@ -392,6 +392,7 @@ impl Daemon {
             settings.peers_handle(),
             settings.peer_registry(),
         );
+        let peer_dispatched = peer_claims.dispatched();
         let webhook_state = crate::web::webhooks::WebhookState::from_shared(
             pool.clone(),
             settings.webhook_handle(),
@@ -452,6 +453,7 @@ impl Daemon {
             pool: pool.clone(),
             cfg: settings.peers_handle(),
             token: peer_token,
+            dispatched: peer_dispatched,
         });
 
         let tcp_app = axum::Router::new()
