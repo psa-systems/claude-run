@@ -2505,6 +2505,13 @@ impl Forge for CliBackend {
             .runner
             .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
         Self::checked(&self.fj, out, &args)?;
+        // CLAUDE-630: the one auditable record that this PR was undrafted,
+        // naming the PR, the old/new draft state and the title change.
+        info!(
+            host, repo, pr_number, old_title = %title, new_title = %stripped,
+            old_draft = true, new_draft = false,
+            "mark_pr_ready: stripped the WIP: prefix"
+        );
         Ok(())
     }
 

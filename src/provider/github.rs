@@ -963,6 +963,21 @@ impl Forge for GithubForge {
             None => Vec::new(),
         };
         let number_str = pr_number.to_string();
+        let view_args = [
+            "pr",
+            "view",
+            &number_str,
+            "--repo",
+            repo,
+            "--json",
+            "isDraft",
+        ];
+        let was_draft = match self.run_gh_read(&view_args, &envs) {
+            Ok(out) if out.ok => serde_json::from_str::<serde_json::Value>(out.stdout.trim())
+                .ok()
+                .and_then(|v| v.get("isDraft").and_then(|d| d.as_bool())),
+            _ => None,
+        };
         let args = ["pr", "ready", &number_str, "--repo", repo];
         let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
         if !out.ok {
@@ -973,6 +988,14 @@ impl Forge for GithubForge {
                 stderr: out.stderr.trim().to_string(),
             });
         }
+        // CLAUDE-630: the one auditable record that this PR was undrafted,
+        // naming the PR and the old/new draft state (`was_draft` is `None`
+        // when the pre-read failed; the `ready` call above still ran and
+        // is idempotent either way).
+        tracing::info!(
+            repo, pr_number, old_draft = ?was_draft, new_draft = false,
+            "mark_pr_ready: flipped the draft flag off"
+        );
         Ok(())
     }
 
