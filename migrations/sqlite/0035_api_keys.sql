@@ -1,0 +1,17 @@
+-- CLAUDE-636: peer API keys, generated from the Secrets page so an instance
+-- with accounts and no `web.auth_token_ref` can mint a credential for a peer
+-- to call `/api/peer/*` with, with no `config.toml` edit and no restart.
+--
+-- `name` is the human handle shown on the Secrets page, unique the same way a
+-- secret's name is. `key_hash` is the lowercase hex SHA-256 of the plaintext
+-- key; the plaintext itself is never stored. `last_used_at` is bumped on a
+-- successful peer authentication (NULL until first use). Revoke deletes the
+-- row outright: there is no soft-revoke state to check against.
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    key_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT
+);

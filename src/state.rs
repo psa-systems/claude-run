@@ -2229,6 +2229,106 @@ pub async fn secret_touch(pool: &DbPool, name: &str) -> Result<()> {
     Ok(())
 }
 
+// ---- Peer API keys ---------------------------------------------------
+
+/// Metadata for one generated peer API key. The hash is never carried in this
+/// view, so the listing the Secrets page renders can never leak a key.
+/// CLAUDE-636.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct ApiKeyMeta {
+    pub name: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+}
+
+/// List generated API keys (names + timestamps only), alphabetical by name.
+/// CLAUDE-636.
+pub async fn api_key_list(pool: &DbPool) -> Result<Vec<ApiKeyMeta>> {
+    let rows = sqlx::query_as::<_, ApiKeyMeta>(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT name, created_at, last_used_at FROM api_keys ORDER BY name",
+        )
+        .into_owned(),
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// True when an API key with `name` already exists. CLAUDE-636.
+pub async fn api_key_exists(pool: &DbPool, name: &str) -> Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "SELECT id FROM api_keys WHERE name = ?").into_owned(),
+    ))
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// Store a newly generated API key's hash. Errors via the UNIQUE constraint
+/// when `name` is taken; callers should check [`api_key_exists`] first for a
+/// friendly message. CLAUDE-636.
+pub async fn api_key_create(pool: &DbPool, name: &str, key_hash: &str) -> Result<()> {
+    let now = now_iso();
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "INSERT INTO api_keys (name, key_hash, created_at) VALUES (?, ?, ?)",
+        )
+        .into_owned(),
+    ))
+    .bind(name)
+    .bind(key_hash)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Revoke (delete) an API key. Returns `false` when no key with `name` exists.
+/// CLAUDE-636.
+pub async fn api_key_revoke(pool: &DbPool, name: &str) -> Result<bool> {
+    let res = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "DELETE FROM api_keys WHERE name = ?").into_owned(),
+    ))
+    .bind(name)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// True when at least one API key is configured. CLAUDE-636.
+pub async fn api_key_any_exists(pool: &DbPool) -> Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "SELECT id FROM api_keys LIMIT 1").into_owned(),
+    ))
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// True when `key_hash` matches a stored (non-revoked, since revoke deletes
+/// the row) API key, bumping its `last_used_at` on a match. A database error
+/// is propagated rather than treated as "no match": the peer gate must answer
+/// `500`, never `401`, on a lookup failure. CLAUDE-636.
+pub async fn api_key_touch_if_matches(pool: &DbPool, key_hash: &str) -> Result<bool> {
+    let now = now_iso();
+    let res = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?",
+        )
+        .into_owned(),
+    ))
+    .bind(&now)
+    .bind(key_hash)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 // ---- Read-only reports shared by `claude-run status` and `mcp stdio` ----
 
 /// The DB-derived blocks `claude-run status` (no daemon reachable) and the

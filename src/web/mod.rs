@@ -142,6 +142,8 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         .route("/secrets", get(secrets_page).post(secret_create))
         .route("/secrets/{name}/rotate", post(secret_rotate))
         .route("/secrets/{name}/delete", post(secret_delete))
+        .route("/secrets/api-keys", post(api_key_create))
+        .route("/secrets/api-keys/{name}/revoke", post(api_key_revoke))
         // On-demand access check. GET renders the page (no probing);
         // POST runs the check and swaps the result table in. The per-secret
         // Check button on /secrets lands on the same page with that credential's
@@ -4973,6 +4975,12 @@ struct SecretsTpl {
     key_ready: bool,
     /// Why the key file did not load (shown when `key_ready` is false).
     key_error: Option<String>,
+    /// CLAUDE-636: generated peer API keys, name + timestamps only.
+    api_keys: Vec<state::ApiKeyMeta>,
+    /// CLAUDE-636: `(name, plaintext)` of a key just generated this request.
+    /// Shown exactly once: a redirect would lose it, so a successful generate
+    /// re-renders this page directly instead of redirecting.
+    new_api_key: Option<(String, String)>,
 }
 
 #[derive(Deserialize)]
@@ -5003,19 +5011,41 @@ async fn render_secrets(
     status: StatusCode,
     error: Option<String>,
 ) -> Result<Response, WebError> {
+    render_secrets_with_key(s, status, error, None).await
+}
+
+/// CLAUDE-636: as [`render_secrets`], additionally rendering `new_api_key`'s
+/// one-time plaintext banner when generate just succeeded. The caller sets
+/// `Cache-Control: no-store` on that response (never on any other secrets
+/// render) so the browser never caches the plaintext.
+async fn render_secrets_with_key(
+    s: &WebState,
+    status: StatusCode,
+    error: Option<String>,
+    new_api_key: Option<(String, String)>,
+) -> Result<Response, WebError> {
     let secrets = state::secret_list(&s.api.pool).await?;
+    let api_keys = state::api_key_list(&s.api.pool).await?;
     let (key_ready, key_error) = match crate::secrets::SecretsKey::load() {
         Ok(_) => (true, None),
         Err(e) => (false, Some(e.to_string())),
     };
+    let no_store = new_api_key.is_some();
     let tpl = SecretsTpl {
         version: s.api.version,
         secrets,
         error,
         key_ready,
         key_error,
+        api_keys,
+        new_api_key,
     };
-    Ok((status, Html(tpl.render().map_err(WebError::from)?)).into_response())
+    let html = Html(tpl.render().map_err(WebError::from)?);
+    Ok(if no_store {
+        (status, [(header::CACHE_CONTROL, "no-store")], html).into_response()
+    } else {
+        (status, html).into_response()
+    })
 }
 
 /// SPEC-4.3.6: the `/secrets` page handler.
@@ -5127,6 +5157,73 @@ async fn secret_delete(
             &s,
             StatusCode::NOT_FOUND,
             Some(format!("no secret named `{name}`")),
+        )
+        .await;
+    }
+    Ok(Redirect::to("/secrets").into_response())
+}
+
+// ---- Peer API keys -----------------------------------------------------
+//
+// CLAUDE-636: "An operator generates a peer API key on the receiving instance
+// from the Secrets page, pastes it once into a secret on the calling
+// instance, and peering works with no auth_token_ref, no config.toml edit and
+// no restart." A generated key is shown exactly once, in the response that
+// generates it; it is never stored or logged in plaintext, only its SHA-256.
+
+#[derive(Deserialize)]
+struct ApiKeyCreateForm {
+    name: String,
+}
+
+/// CLAUDE-636: "Generate rejects an invalid or duplicate name inline with
+/// 422, reusing valid_secret_name. On success it renders the page with 200,
+/// Cache-Control: no-store, and a one-time banner showing the plaintext key."
+/// The `/secrets/api-keys` generate handler.
+async fn api_key_create(
+    State(s): State<WebState>,
+    Form(form): Form<ApiKeyCreateForm>,
+) -> Result<Response, WebError> {
+    let name = form.name.trim().to_string();
+    if !valid_secret_name(&name) {
+        return render_secrets(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some(format!(
+                "API key name `{name}` is invalid (allowed: letters, digits, '-', '_', '.')"
+            )),
+        )
+        .await;
+    }
+    if state::api_key_exists(&s.api.pool, &name).await? {
+        return render_secrets(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some(format!("an API key named `{name}` already exists")),
+        )
+        .await;
+    }
+    let key = match crate::peer::generate_api_key() {
+        Ok(k) => k,
+        Err(e) => {
+            return render_secrets(&s, StatusCode::UNPROCESSABLE_ENTITY, Some(e.to_string())).await
+        }
+    };
+    state::api_key_create(&s.api.pool, &name, &crate::peer::hash_api_key(&key)).await?;
+    render_secrets_with_key(&s, StatusCode::OK, None, Some((name, key))).await
+}
+
+/// CLAUDE-636: "Revoke 404s an unknown name and redirects to the listing."
+/// The `/secrets/api-keys/{name}/revoke` handler.
+async fn api_key_revoke(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response, WebError> {
+    if !state::api_key_revoke(&s.api.pool, &name).await? {
+        return render_secrets(
+            &s,
+            StatusCode::NOT_FOUND,
+            Some(format!("no API key named `{name}`")),
         )
         .await;
     }
@@ -13743,6 +13840,103 @@ mod tests {
             assert!(!state::secret_exists(&s.api.pool, "yt-prod").await.unwrap());
 
             std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+        }
+
+        #[tokio::test]
+        async fn generate_shows_the_key_once_revoke_removes_it() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            // Invalid name is rejected inline, nothing stored.
+            let bad = super::super::api_key_create(
+                State(s.clone()),
+                Form(super::super::ApiKeyCreateForm {
+                    name: "bad name!".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+            // Generate: 200, no-store, the plaintext appears exactly once.
+            let resp = super::super::api_key_create(
+                State(s.clone()),
+                Form(super::super::ApiKeyCreateForm {
+                    name: "peer-b".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .unwrap(),
+                "no-store"
+            );
+            let page = body_string(resp).await;
+            let start = page.find("crk_").expect("plaintext key shown once");
+            let key = page[start..]
+                .split(|c: char| c == '<' || c.is_whitespace())
+                .next()
+                .unwrap()
+                .to_string();
+            assert_eq!(key.len(), 4 + 64);
+
+            // Duplicate name is rejected.
+            let dup = super::super::api_key_create(
+                State(s.clone()),
+                Form(super::super::ApiKeyCreateForm {
+                    name: "peer-b".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(dup.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+            // The stored row holds only the hash; the plaintext appears in no
+            // later render.
+            assert!(state::api_key_exists(&s.api.pool, "peer-b").await.unwrap());
+            let page2 = body_string(
+                secrets_page(State(s.clone()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(!page2.contains(&key), "plaintext key leaked on reload");
+
+            // The generated key hashes to the stored row's key_hash.
+            assert!(crate::state::api_key_touch_if_matches(
+                &s.api.pool,
+                &crate::peer::hash_api_key(&key)
+            )
+            .await
+            .unwrap());
+
+            // Revoke: 404 unknown, then 303 and the key stops matching.
+            let unknown =
+                super::super::api_key_revoke(State(s.clone()), AxumPath("nope".to_string()))
+                    .await
+                    .unwrap()
+                    .into_response();
+            assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+            let revoked =
+                super::super::api_key_revoke(State(s.clone()), AxumPath("peer-b".to_string()))
+                    .await
+                    .unwrap()
+                    .into_response();
+            assert_eq!(revoked.status(), StatusCode::SEE_OTHER);
+            assert!(!crate::state::api_key_touch_if_matches(
+                &s.api.pool,
+                &crate::peer::hash_api_key(&key)
+            )
+            .await
+            .unwrap());
         }
     }
 

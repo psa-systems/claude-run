@@ -36,3 +36,17 @@ run-comment footer (`docs/configuration.md#run-comment-footer-claude-446`) can l
 entirely unset or broken. The two readers deliberately stay separate: `EmailConfig::from_env()` still requires
 `smtp_host` and `from` alongside `public_url` before an invite can be emailed, but a footer link needs only the one
 variable.
+
+## Peer API keys (CLAUDE-636)
+
+A peered instance (`SPEC-3.17`) authenticated every `/api/peer/*` call solely against `web.auth_token_ref`, so an
+accounts-based deployment with that field unset had no way to mint a peer credential at all: the only fix was an
+operator hand-editing `config.toml` and restarting. CLAUDE-636 adds a self-service alternative: a new "API Keys"
+section on `/secrets` (`SPEC-4.3.6`) generates a `crk_`-prefixed random key, stores only its SHA-256 hash in the new
+`api_keys` table (`src/state.rs`, migrations `0035`/`0016`), and shows the plaintext exactly once on the generate
+response. The calling instance pastes that plaintext into its own `peers[].token_ref` secret, same as it would a
+legacy token. `require_peer_bearer` (`src/peer.rs`) checks a presented bearer against the legacy token first, then
+against a hash lookup in `api_keys`, bumping `last_used_at` on a match; a lookup failure answers `500`, never `401`,
+so a database outage is never mistaken for a bad credential. This gate is independent of the web/`/api/*` gate in
+`src/auth.rs`, which never reads `api_keys`, so a generated key authenticates `/api/peer/*` only. Revoking a key
+deletes its row outright: there is no soft-revoke state for `require_peer_bearer` to check against.

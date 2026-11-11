@@ -44,6 +44,7 @@ pub const TABLES: &[&str] = &[
     "global_pause",
     "paused_actions",
     "secrets",
+    "api_keys",
     "settings",
     "web_admin",
     "web_admin_recovery_codes",
@@ -79,6 +80,7 @@ const IDENTITY_COLUMNS: &[(&str, &str)] = &[
     ("job_outcomes", "id"),
     ("attempt_steps", "id"),
     ("secrets", "id"),
+    ("api_keys", "id"),
     ("web_admin_recovery_codes", "id"),
     ("web_accounts", "id"),
     ("web_account_recovery_codes", "id"),
@@ -618,6 +620,16 @@ mod tests {
         )))
         .bind("web-auth")
         .bind(vec![0u8, 159, 146, 150, 255])
+        .bind("2026-09-01T00:00:00Z")
+        .bind(None::<String>)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(q(
+            "INSERT INTO api_keys (name, key_hash, created_at, last_used_at) VALUES (?, ?, ?, ?)",
+        )))
+        .bind("peer-b")
+        .bind("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85")
         .bind("2026-09-01T00:00:00Z")
         .bind(None::<String>)
         .execute(pool)
