@@ -488,7 +488,11 @@ pub fn protect(router: Router, gate: TokenGate) -> Router {
 async fn require_token(State(gate): State<TokenGate>, request: Request, next: Next) -> Response {
     // The webhook route authenticates itself via HMAC and Forgejo cannot send a
     // bearer token, so it is never gated here. The auth routes (and invite
-    // acceptance) must be reachable unauthenticated or there is no way in.
+    // acceptance) must be reachable unauthenticated or there is no way in. The
+    // favicon, apple touch icon and header brand mark carry no instance data
+    // and are linked from every page head including `/login` and `/setup`, so
+    // they stay public in every gate state (unlike the mascot, which keeps the
+    // narrower SPEC-7.16 rule below: a signed-out browser only).
     let path = request.uri().path();
     if path.starts_with("/webhooks/")
         || path == "/login"
@@ -496,6 +500,9 @@ async fn require_token(State(gate): State<TokenGate>, request: Request, next: Ne
         || path == "/logout"
         || path == "/setup"
         || path.starts_with("/invite/")
+        || path == crate::web::FAVICON_PATH
+        || path == crate::web::APPLE_TOUCH_ICON_PATH
+        || path == crate::web::BRAND_MARK_PATH
     {
         return next.run(request).await;
     }
@@ -2078,6 +2085,51 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(status_of(router, req).await, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The favicon, apple touch icon and brand mark are public in every gate
+    /// state: unconfigured, bearer-only, and signed out. Unlike the mascot
+    /// (SPEC-7.16), they need no browser login to be reachable at all.
+    #[tokio::test]
+    async fn icon_paths_are_public_in_every_gate_state() {
+        fn icon_router() -> Router {
+            Router::new()
+                .route(crate::web::FAVICON_PATH, get(|| async { "ico" }))
+                .route(crate::web::APPLE_TOUCH_ICON_PATH, get(|| async { "png" }))
+                .route(crate::web::BRAND_MARK_PATH, get(|| async { "png" }))
+        }
+        for path in [
+            crate::web::FAVICON_PATH,
+            crate::web::APPLE_TOUCH_ICON_PATH,
+            crate::web::BRAND_MARK_PATH,
+        ] {
+            let req = || Request::builder().uri(path).body(Body::empty()).unwrap();
+
+            let router = protect(icon_router(), TokenGate::new("s3cret".to_string()));
+            assert_eq!(
+                status_of(router, req()).await,
+                StatusCode::OK,
+                "{path} bearer-only"
+            );
+
+            let router = protect(
+                icon_router(),
+                TokenGate::with_login("s3cret".to_string(), "admin".to_string()),
+            );
+            assert_eq!(
+                status_of(router, req()).await,
+                StatusCode::OK,
+                "{path} signed out"
+            );
+
+            let pool = setup_pool().await;
+            let router = protect(icon_router(), TokenGate::unconfigured(pool));
+            assert_eq!(
+                status_of(router, req()).await,
+                StatusCode::OK,
+                "{path} unconfigured"
+            );
+        }
     }
 
     /// SPEC-7.16: a bearer-only gate (no browser login at all) offers no Sign
