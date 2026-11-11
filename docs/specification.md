@@ -924,13 +924,16 @@ without peering. The peer layer only narrows that window and merges what the ins
    the peers. A peer that reports this instance's own `instance_id` (a peer URL that points back at itself) is refused
    and logged at `error`. A run is identified across instances by a `run_uuid`, never by its local integer id.
 3. **Configuration.** The DB-backed section `peers` (`config.peers`, `SPEC-6.3`): `enabled` (false), `instance_name`,
-   `peers` (a list of `name`, `url`, `token_ref`; `token_ref` names the secret holding that peer's bearer token, 7.6),
+   `peers` (a list of `name`, `url`, `token_ref`; `token_ref` names the secret holding that peer's bearer credential,
+   either the calling instance's own `auth_token_ref` or, more commonly, a key generated on the CALLED instance's
+   Secrets page (`SPEC-4.3.6`) and pasted here, 7.6),
    `poll_secs` (30, at least 5), `stale_after_secs` (120, at least twice `poll_secs`), `claim_timeout_secs` (5, between
    1 and 30) and `summary_batch` (500). A save with a duplicate peer name, a peer named `all` or `local` (values of the Reports `instance` filter), an unparseable URL or an out-of-range value
    is rejected whole. The topology is a full mesh: every instance lists every other, and no instance relays another's
    data.
 4. **Peer API.** Served only on the TCP listener under `/api/peer`, never on the unix socket (7.14), mounted only when
-   enabled, and requiring the bearer credential of 7.6 even on a loopback bind. It is read-only except the claim call,
+   enabled, and requiring the bearer credential of 7.6 (the legacy `auth_token_ref` token or a generated API key, 4.3.6)
+   even on a loopback bind. It is read-only except the claim call,
    and never starts, cancels or pauses a run or writes a setting. No response carries a secret, a prompt, log text or a
    comment body.
    - `GET /api/peer/state`: `instance_id`, `instance_name`, version, the server's current time, `load` (the count of
@@ -1175,6 +1178,11 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
   does not track or block on referential use.
 - The secrets page never renders a stored secret's value, only its name and `last_used_at`; `check` (`SPEC-7.1`)
   reports whether a name resolves, not what it resolves to.
+- An "API Keys" section lists every row of the `api_keys` table (name, created, last used, a Revoke button) and a
+  form to generate a new one. Generating mints `crk_` followed by 64 lowercase hex characters (32 bytes from
+  `getrandom`), stores only its SHA-256 hash, and renders the plaintext key exactly once, on the response to that
+  generate call; it is never shown or recoverable again. Revoke deletes the row outright; there is no soft-revoke
+  state. These keys authenticate `/api/peer/*` (`SPEC-3.17` item 4, `SPEC-7.6`) only, never the web UI or `/api/*`.
 
 #### 4.3.7 Access page (`SPEC-4.3.7`)
 
@@ -1506,6 +1514,7 @@ same schema. Pool: 16 connections, 30-second acquire timeout. Timestamps are RFC
 | `dependency_gate` | PK (`action_name`, `job_key`), `blocked_until`, `signature`, `blocked_since` |
 | `settings` | `key` (PK) to JSON `value` |
 | `secrets` | `name` (unique), age `ciphertext`, `created_at`, `last_used_at` |
+| `api_keys` | Generated peer API keys (`SPEC-4.3.6`): `name` (unique), `key_hash` (unique, SHA-256 hex of the plaintext), `created_at`, `last_used_at` |
 | `ci_failures`, `ci_failure_tests`, `ci_failure_runs` | Failure store: repo, workflow, job, `infra_kind`, `issue_key`, `state`; unique (`failure_id`, `test_id`); run index, commit, branch, PR number |
 | `agent_pull_requests` | Recorded agent PRs: unique (`host`, `repo`, `pr_number`), `issue_key`, `head_branch`, `fix_attempts`, `state`, `salvaged` |
 | `claude_invocations` | Per-invocation cost, token and rate-limit utilization record |
@@ -1847,7 +1856,11 @@ appears in a log line or an error message. CI runs its Postgres leg through it
   session is signed with the bearer token as its HMAC key under the sentinel account id `0`; every other session signs
   with that account's own rotating `session_key`, so rotating either invalidates exactly the sessions it signed.
 - `/api/peer/*` (`SPEC-3.17` item 4) is never exempt and never served unauthenticated, including on a loopback bind
-  with `require_auth_on_loopback` unset; it is not mounted at all while peering is disabled.
+  with `require_auth_on_loopback` unset; it is not mounted at all while peering is disabled. Its own gate accepts
+  either the `auth_token_ref` bearer above or a generated API key (`SPEC-4.3.6`): a presented bearer that matches
+  neither is `401`; a database error while checking the generated key answers `500`, never `401`, since a store
+  outage must never read as "wrong credential". This gate is independent of the web/`/api/*` gate above, so a
+  generated API key authenticates `/api/peer/*` only and is rejected everywhere else.
 - `/webhooks/`, `/login`, `/login/2fa`, `/logout`, `/setup` and `/invite/*` are exempt from this gate: webhooks
   authenticate by HMAC (4.4) and cannot carry a bearer header, and the auth routes themselves must stay reachable
   unauthenticated or there is no way to obtain a credential. `/account/2fa/setup` still requires a valid credential; it

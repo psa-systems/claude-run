@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file guides Claude Code (claude.ai/code) when working with code in this repository.
 
 # claude-run
 
@@ -10,20 +10,20 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 
 - Rust binary, library + bin. `clap` derive. Subcommand tree: `claude-run {run,serve,stop,restart,trigger,cancel,pause,resume,status,action,access,secret,mcp,migrate,import,test-postgres}`.
 - Actions are YAML files under `$CLAUDE_RUN_CONFIG_DIR/actions/` (`/config/actions/` in the container). Each action's `input.command` / `filter` / `pre[]` / `prompt` / `post[]` is a nu snippet shelled out via the host's `nu` binary.
-- Runtime state in SQLite at `$CLAUDE_RUN_DATA_DIR/state.db` by default, or in PostgreSQL when the operator sets one (CLAUDE-250; see the `[database]` note below). Per-attempt stream logs at `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`, bounded by the CLAUDE-245 sweep (see below).
+- Runtime state in SQLite at `$CLAUDE_RUN_DATA_DIR/state.db` by default, or in PostgreSQL when the operator sets one (CLAUDE-250; see the `[database]` note below). Per-attempt stream logs at `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`, bounded by the CLAUDE-245 sweep.
 - Daemon (`claude-run serve`) owns scheduling and exposes an HTTP API over `$CLAUDE_RUN_RUNTIME_DIR/daemon.sock`. CLI subcommands delegate to the daemon when reachable, else operate directly on the DB. The socket is the CLI's control plane and nothing else:
   `api::router` is built twice from one `api_state`, bare-path on the socket and nested under `/api` on the TCP listener, which is what the web UI's own buttons POST to.
-  `serve --no-socket` skips the bind for a deployment with no CLI operator, and the container image runs that way (`CMD ["serve", "--no-socket"]`) because the socket has no auth gate (the CLAUDE-48 token wraps only the TCP router) and would otherwise sit in the same container as the agent, running as the same user.
+  `serve --no-socket` skips the bind for a deployment with no CLI operator, and the container image runs that way (`CMD ["serve", "--no-socket"]`) because the socket has no auth gate (the CLAUDE-48 token wraps only the TCP router) and otherwise sits in the agent's own container, as the same user.
   `trigger` and `cancel` then fail naming that reason instead of "no daemon"; the DB-direct subcommands are unaffected.
 - Runtime tool dependencies ship in the runtime image, not in the binary: `nu`, `claude` (Claude Code CLI), `timeout` (coreutils), `yt`, `fj`, `gh`, `git`. Docker is the only supported install.
-- Forgejo home: `psa-systems/claude-run`.
+- Forgejo: `psa-systems/claude-run`.
 
 ## Commands
 
 - `just check`: fmt + clippy + build + tests + builder-stage docker compile (the full CI gate). It starts with the CLAUDE.md guard, `just check-claude-md` (CLAUDE-370). `just pre-commit` runs only a fmt-only check inside the builder image via `docker run` (common's default `hook_layout := "pre-push"`); `just pre-push` runs the full suite (fmt, clippy, compile, tests) there.
 - CI's exact steps (`.forgejo/workflows/check.yml`): `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build --all-targets`, then `cargo test` twice: once on SQLite, once with `CLAUDE_RUN_TEST_DATABASE_URL=postgres://...` set, which switches every test fixture onto Postgres (one schema per test, `SPEC-5.6`). A DB change must pass both.
-- Single test: `cargo test <name_substring>` (e.g. `cargo test shipped_action_queries_are_disjoint`); one module: `cargo test native::youtrack::`. Unit tests live inline in `src/**` under `mod tests` on the library target; `tests/fixtures/` holds data only.
-- `just run <args>` = `cargo run -- <args>` (debug build).
+- Single test: `cargo test <name_substring>` (e.g. `cargo test shipped_action_queries_are_disjoint`); one module: `cargo test native::youtrack::`. Unit tests live in `src/**` under `mod tests` on the library target; `tests/fixtures/` holds data only.
+- `just run <args>` = `cargo run -- <args>`.
 - Any test that execs a stub script must create it with `testutil::write_stub`, never `fs::write` + `set_permissions` (ETXTBSY race across test threads, CLAUDE-224 / CLAUDE-255).
 
 ## Code map
@@ -34,7 +34,7 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 - Native handlers reach YouTrack / Forgejo / GitHub only through the `provider` traits (`IssueTracker`, `Forge`); `provider/cli.rs` shells out to `yt` / `fj`, `provider/github.rs` covers GitHub, and `provider/audit.rs` wraps the tracker to cap and attribute a run's issue writes (CLAUDE-234). No raw REST in handlers.
 - Web: `web/mod.rs` (axum + askama templates from `templates/`, compiled into the binary) mounts `api::router` under `/api` plus the two webhook listeners. `settings.rs` owns DB-backed runtime config; `config.rs` holds the serde schema and bootstrap file.
 - DB: `db.rs` holds the pool and two embedded migrators, `migrations/sqlite/` and `migrations/postgres/`. Every schema change needs a matching migration in BOTH directories. Queries are runtime `sqlx::query` (no compile-time macros, no offline `.sqlx` data).
-- Shipped actions in `actions/*.yml` are `include_str!`'d by tests in `action.rs`, so editing one can break a unit test.
+- Shipped actions in `actions/*.yml` are `include_str!`'d by `action.rs` tests, so editing one can break a unit test.
 - `finalize` is a ~700-line state machine; the overview with every branch and terminal state is [docs/finalize-flow.md](docs/finalize-flow.md). Open that first before adding or removing a `Finalized` variant.
 
 ## Conventions
@@ -54,6 +54,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - An exposed instance with no credential serves only `/setup`, which writes the argon2id admin ([details](docs/conventions/web-auth.md#setup-bootstrap))
 - TOTP is mandatory for every `web_admin`/`web_accounts` row: recovery codes, replay guard, pending-2FA cookie ([CLAUDE-368](docs/conventions/web-auth.md#mandatory-totp-claude-368))
 - An invite's email goes through `src/mailer.rs`; its link is built from `public_url`, never the `Host` header ([CLAUDE-394](docs/conventions/web-auth.md#invite-by-email-claude-394))
+- Secrets page API keys authenticate peer calls; a lookup error is `500`, never `401` ([CLAUDE-636](docs/conventions/web-auth.md#peer-api-keys-claude-636))
 
 ### Credentials and logins
 
@@ -157,7 +158,7 @@ Cross-cutting (not a numbered phase): a container runtime (CLAUDE-37, made self-
 - The task runner is the shared `psa-systems/common` recipe set, vendored as the `common` submodule (`git submodule update --init` after a fresh clone).
   `justfile` configures it through variables (`pre_commit_mode := "docker"` + `dev_image` because there is no `compose.dev.yml`, `test_args := ""` so the library-target unit tests are not skipped) and overrides only `default`, `check`, and `run`. Prefer setting a common variable over shadowing a shared recipe.
   `default` is redefined locally (as the file's first recipe) because just resolves the default recipe by source order and a top-level definition outranks the imported one, so without it a bare `just` runs whichever local recipe comes first instead of common's `just --list` (CLAUDE-201).
-  CI keeps its own `.forgejo/workflows/check.yml` rather than calling common's reusable one, which hardcodes `cargo test --bins`; making that configurable is tracked in #PC-6. It also deviates from governance `CI.md` ("Check runs on every push / PR"):
+  CI keeps its own `.forgejo/workflows/check.yml` rather than calling common's reusable one, which hardcodes `cargo test --bins`; making that configurable is tracked in #PC-6. It deviates from governance `CI.md` ("Check runs on every push / PR"):
   the workflow still runs on every push and PR to `main`, but common's shared `classify-diff` action (a leading `changes` job and an `if:`, not a workflow-level `paths-ignore`) skips the compile job for a docs-only PR and everything but `cargo fmt --check` for a comment-only one (CLAUDE-570).
-- Daemon smoke-test pattern: `CLAUDE_RUN_*_DIR=/tmp/...` env vars + a stub `claude` on `PATH` (see `src/bin/claude-run.rs` smoke tests for the shape).
-- The legacy `scripts/claude-run.nu` is gone as of the governance-conformance PR. The Rust binary is the only runner.
+- Daemon smoke-test pattern: `CLAUDE_RUN_*_DIR=/tmp/...` env vars + a stub `claude` on `PATH` (see `src/bin/claude-run.rs`).
+- The legacy `scripts/claude-run.nu` is gone; the Rust binary is the only runner.
