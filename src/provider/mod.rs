@@ -2083,6 +2083,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_pr_body_rejects_a_trailer_on_the_line_above_the_id() {
+        // CLAUDE-638: the trailer and the id form one block, so the last
+        // block is not all bare references.
+        let body =
+            "Summary of the change.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n#CLAUDE-1";
+        let err = validate_pr_body(body, "feat/x").unwrap_err().to_string();
+        assert!(err.contains("Co-Authored-By: Claude"), "{err}");
+    }
+
+    #[test]
     fn validate_pr_body_rejects_text_after_the_id() {
         let body = "Summary of the change.\n\n#CLAUDE-1 and also #CLAUDE-2";
         let err = validate_pr_body(body, "feat/x").unwrap_err().to_string();
