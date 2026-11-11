@@ -1999,7 +1999,11 @@ mod tests {
         for href in html.split("href=\"").skip(1) {
             let href = href.split('"').next().unwrap();
             assert!(
-                href == "/" || href == "/login" || href == repo,
+                href == "/"
+                    || href == "/login"
+                    || href == repo
+                    || href == crate::web::FAVICON_PATH
+                    || href == crate::web::APPLE_TOUCH_ICON_PATH,
                 "unexpected link {href}"
             );
         }
