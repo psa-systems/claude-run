@@ -626,6 +626,16 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(sqlx::AssertSqlSafe(q(
+            "INSERT INTO api_keys (name, key_hash, created_at, last_used_at) VALUES (?, ?, ?, ?)",
+        )))
+        .bind("peer-b")
+        .bind("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85")
+        .bind("2026-09-01T00:00:00Z")
+        .bind(None::<String>)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
         )))
         .bind("config.claude")
