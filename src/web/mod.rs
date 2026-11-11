@@ -13833,7 +13833,9 @@ mod tests {
     mod status {
         use super::super::{
             about_activity_redirect, about_redirect, cargo_cache_delete_all,
-            cargo_cache_delete_one, status_activity, status_page, WebState,
+            cargo_cache_delete_one, cargo_cache_rows_sync, render_cargo_cache_fragment,
+            render_docker_storage_fragment, status_activity, status_page, status_storage_sse,
+            WebState,
         };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
@@ -13979,6 +13981,26 @@ mod tests {
             let resp = about_activity_redirect().await.into_response();
             assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
             assert_eq!(resp.headers().get("location").unwrap(), "/status/activity");
+        }
+
+        /// CLAUDE-637: `status_page` renders the Management part's loading
+        /// state and never walks the Cargo cache root or touches the Docker
+        /// client itself: a fixture cache directory's slug is absent from
+        /// the first response, which is pushed separately by
+        /// `status_storage_sse`.
+        #[tokio::test]
+        async fn status_page_defers_disk_usage_to_the_sse_push() {
+            let tmp = tempfile::tempdir().unwrap();
+            make_cargo_cache_dir(tmp.path(), "owner__repo-a", 2048);
+            let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
+            let body = body_string(status_page(State(s)).await.unwrap()).await;
+            assert!(!body.contains("owner__repo-a"), "{body}");
+            assert_eq!(
+                body.matches(r#"<span class="dim">Loading disk usage...</span>"#)
+                    .count(),
+                2,
+                "expected one loading placeholder for each Management table: {body}"
+            );
         }
 
         /// A helper that creates `<data_dir>/cache/cargo-target/<slug>` with
@@ -14299,6 +14321,83 @@ mod tests {
             .unwrap_err();
             assert_eq!(err.status, StatusCode::CONFLICT);
             assert!(err.message.contains("in flight"), "{}", err.message);
+        }
+
+        // ---- CLAUDE-637: pushed disk usage (`/sse/status/storage`) --------
+
+        /// A Cargo cache root that cannot be listed at all (not merely
+        /// absent) yields the fragment's whole-read error, never the
+        /// "no shared Cargo target directories yet" empty-table message.
+        #[tokio::test]
+        async fn cargo_cache_read_failure_shows_error_not_empty_table() {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = crate::config::Paths {
+                config_dir: tmp.path().join("config"),
+                data_dir: tmp.path().join("data"),
+                state_dir: tmp.path().join("state"),
+                runtime_dir: tmp.path().join("runtime"),
+            };
+            let cache_dir = paths.data_dir.join("cache");
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            // A plain file where the Cargo cache root directory should be:
+            // `read_dir` fails with "not a directory", not `NotFound`, so
+            // the whole-read error path is exercised rather than the
+            // empty-root case already covered by
+            // `management_part_is_empty_with_no_cargo_cache_dir_yet`.
+            std::fs::write(cache_dir.join("cargo-target"), b"not a directory").unwrap();
+
+            let result = cargo_cache_rows_sync(&paths, &[]);
+            assert!(result.is_err());
+
+            let html = render_cargo_cache_fragment(result);
+            assert!(html.contains("Disk usage unavailable"), "{html}");
+            assert!(
+                !html.contains("No shared Cargo target directories yet"),
+                "{html}"
+            );
+        }
+
+        /// The Docker storage fragment's own whole-read failure (the
+        /// `spawn_blocking` task itself failing, not a single category's
+        /// usage read) renders the same error message, never an empty
+        /// table.
+        #[tokio::test]
+        async fn docker_storage_read_failure_shows_error_not_empty_table() {
+            let html = render_docker_storage_fragment(Err("docker usage task failed".to_string()));
+            assert!(html.contains("Disk usage unavailable"), "{html}");
+            assert!(html.contains("docker usage task failed"), "{html}");
+            assert!(!html.contains("<table>"), "{html}");
+        }
+
+        /// `GET /sse/status/storage` pushes a `cargo-cache` event and a
+        /// `docker-storage` event, each carrying its fragment, followed by
+        /// `done`. `DOCKER_HOST` is unset in the test process, so the Docker
+        /// read fails fast (`gc::CliDockerVolumeClient::usage`) rather than
+        /// shelling out or blocking on a network call.
+        #[tokio::test]
+        async fn sse_storage_emits_both_fragments_then_done() {
+            let tmp = tempfile::tempdir().unwrap();
+            make_cargo_cache_dir(tmp.path(), "owner__repo-a", 16);
+            let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
+
+            let resp = status_storage_sse(State(s)).await.into_response();
+            let body = tokio::time::timeout(std::time::Duration::from_secs(10), body_string(resp))
+                .await
+                .expect("SSE stream did not close after its done event");
+
+            let cargo_pos = body
+                .find("event: cargo-cache")
+                .unwrap_or_else(|| panic!("missing cargo-cache event: {body}"));
+            let docker_pos = body
+                .find("event: docker-storage")
+                .unwrap_or_else(|| panic!("missing docker-storage event: {body}"));
+            let done_pos = body
+                .find("event: done")
+                .unwrap_or_else(|| panic!("missing done event: {body}"));
+            assert!(done_pos > cargo_pos, "{body}");
+            assert!(done_pos > docker_pos, "{body}");
+            assert!(body.contains("owner__repo-a"), "{body}");
+            assert!(body.contains("Stopped containers"), "{body}");
         }
     }
 
