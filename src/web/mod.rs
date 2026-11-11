@@ -5534,7 +5534,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "claim_timeout_secs",
                 badge: "next tick",
-                note: "bound on one webhook-claim call to a peer; 1 to 30. Not used until claims land.",
+                note: "bound on one webhook-claim call to a peer; 1 to 30.",
             },
             FieldDoc {
                 name: "summary_batch",
