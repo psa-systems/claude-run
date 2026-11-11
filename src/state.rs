@@ -1376,38 +1376,288 @@ pub struct JobOutcome<'a> {
     pub outcome: &'a str,
 }
 
-/// SPEC-5.2.
+/// How often a `run_summaries` insert is retried after losing the `seq` race
+/// to a concurrent writer on the same store (`SPEC-3.17` item 9).
+const SUMMARY_SEQ_ATTEMPTS: u32 = 8;
+
+/// SPEC-5.2. Also writes this outcome's `run_summaries` row in the same
+/// transaction (`SPEC-3.17` item 9), so the two never disagree.
 pub async fn job_outcome_insert(pool: &DbPool, r: &JobOutcome<'_>) -> Result<()> {
-    let now = now_iso();
-    sqlx::query(sqlx::AssertSqlSafe(
-        crate::db::q(
-            pool,
-            r#"
+    let own_id = crate::settings::ensure_instance_id(pool).await?;
+    let run_uuid = crate::peer::new_uuid_v4()?;
+    let ended = Utc::now();
+    let now = ended.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let started = (ended - chrono::Duration::milliseconds(r.duration_ms.max(0)))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    for attempt in 1..=SUMMARY_SEQ_ATTEMPTS {
+        let mut tx = pool.begin().await?;
+        sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                pool,
+                r#"
         INSERT INTO job_outcomes (
             run_id, action_name, job_key, attempt, ts, ok,
             claude_ran, claude_ok, claude_cost_usd, attempt_counted,
             summary, stream_log_path, duration_ms, timed_out, stage, outcome
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
+            )
+            .into_owned(),
+        ))
+        .bind(r.run_id)
+        .bind(r.action_name)
+        .bind(r.job_key)
+        .bind(r.attempt as i64)
+        .bind(&now)
+        .bind(r.ok as i64)
+        .bind(r.claude_ran as i64)
+        .bind(r.claude_ok as i64)
+        .bind(r.claude_cost_usd)
+        .bind(r.attempt_counted as i64)
+        .bind(r.summary)
+        .bind(r.stream_log_path)
+        .bind(r.duration_ms)
+        .bind(r.timed_out as i64)
+        .bind(r.stage)
+        .bind(r.outcome)
+        .execute(&mut *tx)
+        .await?;
+        // The next `seq` is read and written by one statement; the unique
+        // `(instance_id, seq)` index turns a concurrent writer's identical
+        // pick into an error, which rolls this transaction back and retries.
+        let summary = sqlx::query(sqlx::AssertSqlSafe(
+            crate::db::q(
+                pool,
+                r#"
+        INSERT INTO run_summaries (
+            run_uuid, instance_id, seq, action_name, job_key, attempt, outcome, ok,
+            started_at, ended_at, duration_ms, cost_usd, timed_out
+        )
+        SELECT ?, ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        FROM run_summaries WHERE instance_id = ?
+        "#,
+            )
+            .into_owned(),
+        ))
+        .bind(&run_uuid)
+        .bind(&own_id)
+        .bind(r.action_name)
+        .bind(r.job_key)
+        .bind(r.attempt as i64)
+        .bind(r.outcome)
+        .bind(r.ok as i64)
+        .bind(&started)
+        .bind(&now)
+        .bind(r.duration_ms)
+        .bind(r.claude_cost_usd)
+        .bind(r.timed_out as i64)
+        .bind(&own_id)
+        .execute(&mut *tx)
+        .await;
+        match summary {
+            Ok(_) => {
+                tx.commit().await?;
+                return Ok(());
+            }
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                warn!(
+                    attempt,
+                    job_key = r.job_key,
+                    "run_summaries seq collided with a concurrent writer; retrying"
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(crate::error::Error::Other(anyhow::anyhow!(
+        "run_summaries seq still collided after {SUMMARY_SEQ_ATTEMPTS} attempts for job `{}`",
+        r.job_key
+    )))
+}
+
+/// One `run_summaries` row (`SPEC-3.17` item 9): the highlights of one job
+/// outcome, as stored and as served to peers.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RunSummary {
+    pub run_uuid: String,
+    pub instance_id: String,
+    pub seq: i64,
+    pub action_name: String,
+    pub job_key: String,
+    pub attempt: i64,
+    pub outcome: String,
+    pub ok: bool,
+    pub started_at: String,
+    pub ended_at: String,
+    pub duration_ms: i64,
+    pub cost_usd: f64,
+    pub timed_out: bool,
+}
+
+type RunSummaryTuple = (
+    String,
+    String,
+    i64,
+    String,
+    String,
+    i64,
+    String,
+    i64,
+    String,
+    String,
+    i64,
+    f64,
+    i64,
+);
+
+const RUN_SUMMARY_COLUMNS: &str = "run_uuid, instance_id, seq, action_name, job_key, attempt, \
+     outcome, ok, started_at, ended_at, duration_ms, cost_usd, timed_out";
+
+fn run_summary_of(t: RunSummaryTuple) -> RunSummary {
+    RunSummary {
+        run_uuid: t.0,
+        instance_id: t.1,
+        seq: t.2,
+        action_name: t.3,
+        job_key: t.4,
+        attempt: t.5,
+        outcome: t.6,
+        ok: t.7 != 0,
+        started_at: t.8,
+        ended_at: t.9,
+        duration_ms: t.10,
+        cost_usd: t.11,
+        timed_out: t.12 != 0,
+    }
+}
+
+/// `instance_id`'s own rows with `seq` above `after`, ascending, at most
+/// `limit` (`SPEC-3.17` item 4, `GET /api/peer/summaries`).
+pub async fn run_summaries_since(
+    pool: &DbPool,
+    instance_id: &str,
+    after: i64,
+    limit: i64,
+) -> Result<Vec<RunSummary>> {
+    let sql = format!(
+        "SELECT {RUN_SUMMARY_COLUMNS} FROM run_summaries \
+         WHERE instance_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?"
+    );
+    let rows: Vec<RunSummaryTuple> =
+        sqlx::query_as(sqlx::AssertSqlSafe(crate::db::q(pool, &sql).into_owned()))
+            .bind(instance_id)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(run_summary_of).collect())
+}
+
+/// A peer's pull cursor (`SPEC-3.17` item 9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerCursor {
+    pub after_seq: i64,
+    pub last_success_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// The `peer_cursors` row for a peer's `instance_id`, if one exists.
+pub async fn peer_cursor_get(pool: &DbPool, peer_instance_id: &str) -> Result<Option<PeerCursor>> {
+    let row: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT after_seq, last_success_at, last_error FROM peer_cursors \
+             WHERE peer_instance_id = ?",
         )
         .into_owned(),
     ))
-    .bind(r.run_id)
-    .bind(r.action_name)
-    .bind(r.job_key)
-    .bind(r.attempt as i64)
-    .bind(&now)
-    .bind(r.ok as i64)
-    .bind(r.claude_ran as i64)
-    .bind(r.claude_ok as i64)
-    .bind(r.claude_cost_usd)
-    .bind(r.attempt_counted as i64)
-    .bind(r.summary)
-    .bind(r.stream_log_path)
-    .bind(r.duration_ms)
-    .bind(r.timed_out as i64)
-    .bind(r.stage)
-    .bind(r.outcome)
+    .bind(peer_instance_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(
+        row.map(|(after_seq, last_success_at, last_error)| PeerCursor {
+            after_seq,
+            last_success_at,
+            last_error,
+        }),
+    )
+}
+
+/// Apply one validated batch and advance the cursor to `new_after` in a single
+/// transaction (`SPEC-3.17` item 9). Rows already present by `run_uuid` are
+/// ignored. Returns how many rows were new. Any error rolls both back.
+pub async fn run_summaries_apply(
+    pool: &DbPool,
+    peer_instance_id: &str,
+    rows: &[RunSummary],
+    new_after: i64,
+) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let mut inserted = 0;
+    let insert = crate::db::q(
+        pool,
+        &format!(
+            "INSERT INTO run_summaries ({RUN_SUMMARY_COLUMNS}) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(run_uuid) DO NOTHING"
+        ),
+    )
+    .into_owned();
+    for r in rows {
+        let res = sqlx::query(sqlx::AssertSqlSafe(insert.clone()))
+            .bind(&r.run_uuid)
+            .bind(&r.instance_id)
+            .bind(r.seq)
+            .bind(&r.action_name)
+            .bind(&r.job_key)
+            .bind(r.attempt)
+            .bind(&r.outcome)
+            .bind(r.ok as i64)
+            .bind(&r.started_at)
+            .bind(&r.ended_at)
+            .bind(r.duration_ms)
+            .bind(r.cost_usd)
+            .bind(r.timed_out as i64)
+            .execute(&mut *tx)
+            .await?;
+        inserted += res.rows_affected();
+    }
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "INSERT INTO peer_cursors (peer_instance_id, after_seq, last_success_at, last_error) \
+             VALUES (?, ?, ?, NULL) ON CONFLICT(peer_instance_id) DO UPDATE SET \
+             after_seq = excluded.after_seq, last_success_at = excluded.last_success_at, \
+             last_error = NULL",
+        )
+        .into_owned(),
+    ))
+    .bind(peer_instance_id)
+    .bind(new_after)
+    .bind(now_iso())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(inserted)
+}
+
+/// Record a failed pull against the peer's cursor row, leaving `after_seq`
+/// untouched (`SPEC-3.17` item 9).
+pub async fn peer_cursor_record_error(
+    pool: &DbPool,
+    peer_instance_id: &str,
+    error: &str,
+) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "INSERT INTO peer_cursors (peer_instance_id, after_seq, last_success_at, last_error) \
+             VALUES (?, 0, NULL, ?) ON CONFLICT(peer_instance_id) DO UPDATE SET \
+             last_error = excluded.last_error",
+        )
+        .into_owned(),
+    ))
+    .bind(peer_instance_id)
+    .bind(error)
     .execute(pool)
     .await?;
     Ok(())

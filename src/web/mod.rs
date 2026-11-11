@@ -3062,6 +3062,15 @@ struct ReportsTpl {
     action: Option<String>,
     /// Action names offered in the filter dropdown.
     actions: Vec<String>,
+    /// SPEC-3.17 item 10: true while peering is enabled, so the instance
+    /// selector and the per-instance note show.
+    peering: bool,
+    /// Selected instance (`all`, `local` or a peer name).
+    instance: String,
+    /// Configured peer names offered in the instance selector.
+    peer_names: Vec<String>,
+    /// Peers that are `unknown` or behind, with their last sync time.
+    peer_notes: Vec<PeerReportNote>,
     summary: crate::report::Summary,
     daily: Vec<DailyBar>,
     weekly: Vec<WeeklyBar>,
@@ -3096,14 +3105,41 @@ struct ReportsTpl {
     failure_causes: crate::report::FailureCauseReport,
 }
 
-/// Query params for `/reports`: `range` (default all-time) and an optional
-/// `action` filter (empty string = all actions).
+/// Query params for `/reports`: `range` (default all-time), an optional
+/// `action` filter (empty string = all actions) and, with peering enabled, an
+/// `instance` filter (`all`, `local` or a peer name).
 #[derive(Deserialize, Default)]
 struct ReportsQuery {
     #[serde(default)]
     range: Option<String>,
     #[serde(default)]
     action: Option<String>,
+    #[serde(default)]
+    instance: Option<String>,
+}
+
+/// One peer named on the Reports page as possibly lacking recent runs
+/// (`SPEC-3.17` item 10).
+struct PeerReportNote {
+    name: String,
+    state: &'static str,
+    sync: String,
+    /// RFC 3339, or `None` when the peer never synced.
+    last_sync: Option<String>,
+}
+
+impl From<crate::peer::ViewError> for WebError {
+    fn from(e: crate::peer::ViewError) -> Self {
+        let status = match &e {
+            crate::peer::ViewError::BadInstance(_) => StatusCode::BAD_REQUEST,
+            crate::peer::ViewError::PeerUnresolved(_) => StatusCode::CONFLICT,
+            crate::peer::ViewError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self {
+            status,
+            message: e.to_string(),
+        }
+    }
 }
 
 /// Bar width as a percentage of the series max, guarded against an all-zero
@@ -3126,11 +3162,32 @@ async fn reports_page(
     let range = crate::report::Range::from_param(q.range.as_deref().unwrap_or("all"));
     let action_filter = q.action.as_deref().filter(|a| !a.is_empty());
 
-    let summary = crate::report::summary(pool, range, action_filter).await?;
-    let daily_pts = crate::report::daily(pool, range, action_filter).await?;
-    let weekly_pts = crate::report::weekly(pool, range, action_filter).await?;
-    let hour_pts = crate::report::by_hour(pool, range, action_filter).await?;
-    let weekday_pts = crate::report::by_weekday(pool, range, action_filter).await?;
+    let peers_cfg = s.api.settings.peers_handle().read().await.clone();
+    let view = crate::peer::resolve_report_view(
+        pool,
+        &peers_cfg,
+        &s.api.settings.peer_registry(),
+        q.instance.as_deref(),
+        chrono::Utc::now(),
+    )
+    .await?;
+    let scope = &view.scope;
+
+    let summary = crate::report::summary_scoped(pool, range, action_filter, scope).await?;
+    let daily_pts = crate::report::daily_scoped(pool, range, action_filter, scope).await?;
+    let weekly_pts = crate::report::weekly_scoped(pool, range, action_filter, scope).await?;
+    let hour_pts = crate::report::by_hour_scoped(pool, range, action_filter, scope).await?;
+    let weekday_pts = crate::report::by_weekday_scoped(pool, range, action_filter, scope).await?;
+    let peer_notes: Vec<PeerReportNote> = view
+        .notes
+        .iter()
+        .map(|n| PeerReportNote {
+            name: n.name.clone(),
+            state: n.state.as_str(),
+            sync: n.sync.label(),
+            last_sync: n.last_sync.clone(),
+        })
+        .collect();
 
     let daily_max = daily_pts.iter().map(|d| d.cost_usd).fold(0.0, f64::max);
     let daily = daily_pts
@@ -3284,6 +3341,10 @@ async fn reports_page(
         range: range.as_param().to_string(),
         action: action_filter.map(str::to_string),
         actions,
+        peering: view.peering,
+        instance: view.instance.as_param().to_string(),
+        peer_names: view.peer_names.clone(),
+        peer_notes,
         summary,
         daily,
         weekly,
@@ -5539,7 +5600,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "summary_batch",
                 badge: "next tick",
-                note: "rows per summary pull; >= 1. Not used until summary replication lands.",
+                note: "rows per summary pull; >= 1.",
             },
         ],
         CargoCache => vec![

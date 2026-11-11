@@ -61,6 +61,8 @@ pub const TABLES: &[&str] = &[
     "agent_pull_requests",
     "claude_invocations",
     "peer_claims",
+    "run_summaries",
+    "peer_cursors",
 ];
 
 /// sqlx's own bookkeeping table. The target ran its own migration set before
@@ -786,6 +788,38 @@ mod tests {
         .bind("instance-a")
         .bind(2i64)
         .bind("2026-09-01T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(q(
+            "INSERT INTO run_summaries (run_uuid, instance_id, seq, action_name, job_key, attempt, \
+             outcome, ok, started_at, ended_at, duration_ms, cost_usd, timed_out) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )))
+        .bind("0b9c2f0e-5d0a-4a43-9a53-7a8a8a1f0001")
+        .bind("instance-a")
+        .bind(1i64)
+        .bind("youtrack")
+        .bind("CLAUDE-1")
+        .bind(1i64)
+        .bind("success")
+        .bind(1i64)
+        .bind("2026-09-01T00:00:00Z")
+        .bind("2026-09-01T00:01:00Z")
+        .bind(60000i64)
+        .bind(0.5f64)
+        .bind(0i64)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(q(
+            "INSERT INTO peer_cursors (peer_instance_id, after_seq, last_success_at, last_error) \
+             VALUES (?, ?, ?, ?)",
+        )))
+        .bind("instance-b")
+        .bind(7i64)
+        .bind("2026-09-01T00:00:00Z")
+        .bind(None::<String>)
         .execute(pool)
         .await
         .unwrap();
