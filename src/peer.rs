@@ -35,11 +35,6 @@ const PULL_TIMEOUT_MAX_SECS: u64 = 10;
 const SUMMARY_PAGES_PER_TICK: usize = 20;
 /// How long a claim bypass is counted on the Status page.
 const BYPASS_WINDOW: chrono::Duration = chrono::Duration::hours(24);
-/// Bound on the post-grant re-check retry in [`PeerClaims::claim`]: enough
-/// attempts to let a peer's own in-flight tie-break reassignment land.
-const RECHECK_ATTEMPTS: u32 = 5;
-/// Pause between re-check attempts.
-const RECHECK_INTERVAL: Duration = Duration::from_millis(20);
 
 /// A random (version 4) UUID in its canonical text form. `SPEC-3.17` item 2.
 pub fn new_uuid_v4() -> Result<String> {
@@ -971,6 +966,8 @@ pub struct PeerApiState {
     /// The instance's own web bearer token (`SPEC-7.6`); `None` when it did not
     /// resolve, in which case every request is refused.
     pub token: Option<Arc<String>>,
+    /// Keys this instance already started, so a lower-load claim is refused.
+    pub dispatched: DispatchedClaims,
 }
 
 /// `/api/peer/*`: TCP listener only. While peering is disabled every request is
@@ -1081,10 +1078,12 @@ pub struct ClaimResponse {
 }
 
 /// Decide a peer's claim against this instance's `peer_claims` row
-/// (`SPEC-3.17` item 7). Both sides compare the same two `(load, id)` pairs, so
-/// simultaneous deliveries yield exactly one holder.
+/// (`SPEC-3.17` item 7). A row naming a peer is final: this instance granted
+/// it, so that peer may already be working the event. An own row that has not
+/// started yields to a lower `(load, id)` pair; one that has started refuses.
 pub async fn respond_to_claim(
     pool: &DbPool,
+    dispatched: &DispatchedClaims,
     own_id: &str,
     req: &ClaimRequest,
 ) -> Result<ClaimResponse> {
@@ -1093,6 +1092,24 @@ pub async fn respond_to_claim(
         holder_id: req.claimant_id.clone(),
         holder_load: req.claimant_load,
     };
+    // Our own claim step for this exact key may be mid-flight with no row
+    // written yet. Granting the inbound claimant outright here would race
+    // our own insert and, since a granted row is final, the loser of that
+    // race would wrongly settle the tie instead of the lower `(load, id)`
+    // pair. Weigh precedence now so the trivial grant below only fires when
+    // there is truly no contender.
+    if dispatched.is_pending(&req.event_key) {
+        let own_load = crate::state::run_inflight_count(pool).await?;
+        let own_pair = (own_load, own_id);
+        let their_pair = (req.claimant_load, req.claimant_id.as_str());
+        if own_pair < their_pair {
+            return Ok(ClaimResponse {
+                granted: false,
+                holder_id: own_id.to_string(),
+                holder_load: own_load,
+            });
+        }
+    }
     if crate::state::peer_claim_insert(pool, &req.event_key, &req.claimant_id, req.claimant_load)
         .await?
     {
@@ -1117,8 +1134,16 @@ pub async fn respond_to_claim(
     }
     let own_pair = (row.holder_load, row.holder_id.as_str());
     let their_pair = (req.claimant_load, req.claimant_id.as_str());
-    if their_pair < own_pair
-        && crate::state::peer_claim_reassign(
+    if their_pair < own_pair {
+        // The lock makes "has not started" and the handover one step: the
+        // claim step marks a key started under the same lock before it
+        // settles on Proceed.
+        let started = dispatched.keys.lock().await;
+        if started.iter().any(|k| k == &req.event_key) {
+            info!(event_key = %req.event_key, claimant = %req.claimant_id, "peer claim refused: this instance already started the event");
+            return Ok(refuse(row));
+        }
+        if crate::state::peer_claim_reassign(
             pool,
             &req.event_key,
             own_id,
@@ -1126,9 +1151,10 @@ pub async fn respond_to_claim(
             req.claimant_load,
         )
         .await?
-    {
-        info!(event_key = %req.event_key, holder = %req.claimant_id, "peer claim granted: the claimant has the lower load, so this instance drops its own delivery");
-        return Ok(grant);
+        {
+            info!(event_key = %req.event_key, holder = %req.claimant_id, "peer claim granted: the claimant has the lower load, so this instance drops its own delivery");
+            return Ok(grant);
+        }
     }
     // Re-read: a concurrent handover may have changed the holder since.
     match crate::state::peer_claim_get(pool, &req.event_key).await? {
@@ -1156,7 +1182,7 @@ async fn peer_claim(State(s): State<PeerApiState>, Json(req): Json<ClaimRequest>
             return (StatusCode::INTERNAL_SERVER_ERROR, "instance id unavailable").into_response();
         }
     };
-    match respond_to_claim(&s.pool, &own_id, &req).await {
+    match respond_to_claim(&s.pool, &s.dispatched, &own_id, &req).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => {
             error!(event_key = %req.event_key, claimant = %req.claimant_id, error = %e, "peer claim failed");
@@ -1174,6 +1200,63 @@ pub enum ClaimDecision {
     Drop { holder: String },
 }
 
+/// Most event keys [`DispatchedClaims`] remembers. A claim for a key older
+/// than this many later events cannot still be in flight.
+const DISPATCHED_KEYS_MAX: usize = 4096;
+
+/// The event keys this instance has started, shared between the claim step
+/// and the peer API so a started event refuses a lower-load claim
+/// (`SPEC-3.17` item 7). Cheap to clone; in process only.
+#[derive(Clone, Default)]
+pub struct DispatchedClaims {
+    keys: Arc<tokio::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// Event keys this instance's own claim step is currently negotiating,
+    /// set before its first DB write so an inbound claim for the same key
+    /// that reaches the brand-new-row grant first still yields to precedence
+    /// instead of winning the race outright.
+    pending: Arc<Mutex<HashSet<String>>>,
+}
+
+impl DispatchedClaims {
+    async fn mark(&self, key: &str) {
+        let mut keys = self.keys.lock().await;
+        if keys.iter().any(|k| k == key) {
+            return;
+        }
+        if keys.len() >= DISPATCHED_KEYS_MAX {
+            keys.pop_front();
+        }
+        keys.push_back(key.to_string());
+    }
+
+    /// Record `key` as being negotiated by our own claim step until the
+    /// returned guard drops (every return path of [`PeerClaims::claim`]).
+    fn begin_pending(&self, key: &str) -> PendingGuard {
+        self.pending.lock().unwrap().insert(key.to_string());
+        PendingGuard {
+            pending: self.pending.clone(),
+            key: key.to_string(),
+        }
+    }
+
+    fn is_pending(&self, key: &str) -> bool {
+        self.pending.lock().unwrap().contains(key)
+    }
+}
+
+/// Clears a [`DispatchedClaims::begin_pending`] entry when the claim step
+/// that started it returns, on every path.
+struct PendingGuard {
+    pending: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.key);
+    }
+}
+
 /// The claim step of the webhook pipeline (`SPEC-3.17` item 7). Cheap to clone.
 #[derive(Clone)]
 pub struct PeerClaims {
@@ -1181,6 +1264,7 @@ pub struct PeerClaims {
     cfg: Arc<RwLock<PeersConfig>>,
     registry: PeerRegistry,
     client: reqwest::Client,
+    dispatched: DispatchedClaims,
 }
 
 impl PeerClaims {
@@ -1190,7 +1274,14 @@ impl PeerClaims {
             cfg,
             registry,
             client: reqwest::Client::new(),
+            dispatched: DispatchedClaims::default(),
         }
+    }
+
+    /// The handle the peer API uses to refuse a claim for an event this
+    /// instance already started.
+    pub fn dispatched(&self) -> DispatchedClaims {
+        self.dispatched.clone()
     }
 
     /// Claim `event_key` for this instance. `event_type` names the event for
@@ -1216,6 +1307,11 @@ impl PeerClaims {
             );
             return ClaimDecision::Proceed;
         };
+        // Held until this call returns on any path: an inbound claim for the
+        // same key that beats our own insert still has to weigh our (load,
+        // id) pair instead of granting on an empty row (`contend_for_existing`
+        // below is otherwise final, so that race would settle wrong).
+        let _pending = self.dispatched.begin_pending(event_key);
         let own_id = match crate::settings::ensure_instance_id(&self.pool).await {
             Ok(id) => id,
             Err(e) => {
@@ -1234,7 +1330,7 @@ impl PeerClaims {
             Ok(true) => {}
             Ok(false) => {
                 if let Some(decision) = self
-                    .contend_for_existing(event_key, &own_id, load, source, delivery)
+                    .contend_for_existing(event_key, &own_id, source, delivery)
                     .await
                 {
                     return decision;
@@ -1264,46 +1360,34 @@ impl PeerClaims {
         if decision != ClaimDecision::Proceed {
             return decision;
         }
-        // A peer granted us, but its own self-claim for the same event can
-        // still be in flight behind that grant (its insert and ours raced
-        // for who writes first, and the loser's tie-break reassignment can
-        // land here moments after the grant went out). Re-read our own row
-        // a few times with a short pause so that reassignment has a chance
-        // to arrive before we settle on Proceed.
-        for attempt in 0..RECHECK_ATTEMPTS {
-            match crate::state::peer_claim_get(&self.pool, event_key).await {
-                Ok(Some(row)) if row.holder_id != own_id => {
-                    info!(source, delivery, event_key, holder = %row.holder_id, "event claimed by a peer meanwhile; delivery dropped");
-                    return ClaimDecision::Drop {
-                        holder: row.holder_id,
-                    };
-                }
-                Ok(_) => {
-                    if attempt + 1 == RECHECK_ATTEMPTS {
-                        return ClaimDecision::Proceed;
-                    }
-                    tokio::time::sleep(RECHECK_INTERVAL).await;
-                }
-                Err(e) => {
-                    error!(source, delivery, event_key, error = %e, "re-reading the claim row failed; processing the event");
-                    return ClaimDecision::Proceed;
+        // Mark the event started before the last read of our row: a peer's
+        // takeover either landed before this mark (the read sees it) or is
+        // refused after it (`respond_to_claim` checks the mark under a lock).
+        self.dispatched.mark(event_key).await;
+        match crate::state::peer_claim_get(&self.pool, event_key).await {
+            Ok(Some(row)) if row.holder_id != own_id => {
+                info!(source, delivery, event_key, holder = %row.holder_id, "event claimed by a peer meanwhile; delivery dropped");
+                ClaimDecision::Drop {
+                    holder: row.holder_id,
                 }
             }
+            Ok(_) => ClaimDecision::Proceed,
+            Err(e) => {
+                error!(source, delivery, event_key, error = %e, "re-reading the claim row failed; processing the event");
+                ClaimDecision::Proceed
+            }
         }
-        ClaimDecision::Proceed
     }
 
-    /// Our own local insert lost the race to a row already in the table
-    /// (most likely an inbound peer claim for the same event). Settle by the
-    /// same `(load, id)` precedence `respond_to_claim` uses for an inbound
-    /// conflict: take the row over when we rank lower, otherwise drop.
-    /// `None` means we now hold the row and `claim` should carry on asking
-    /// peers; `Some` is the final decision.
+    /// Our own local insert lost to a row already in the table, written by an
+    /// inbound peer claim this instance granted. That peer may already be
+    /// working the event, so the row is final whatever the loads: drop. A row
+    /// that already names this instance (a repeated delivery) returns `None`
+    /// so `claim` carries on asking peers; `Some` is the final decision.
     async fn contend_for_existing(
         &self,
         event_key: &str,
         own_id: &str,
-        load: u64,
         source: &str,
         delivery: &str,
     ) -> Option<ClaimDecision> {
@@ -1318,44 +1402,10 @@ impl PeerClaims {
         if row.holder_id == own_id {
             return None;
         }
-        if (load, own_id) >= (row.holder_load, row.holder_id.as_str()) {
-            info!(source, delivery, event_key, holder = %row.holder_id, "event already claimed; delivery dropped");
-            return Some(ClaimDecision::Drop {
-                holder: row.holder_id,
-            });
-        }
-        match crate::state::peer_claim_reassign(&self.pool, event_key, &row.holder_id, own_id, load)
-            .await
-        {
-            Ok(true) => {
-                info!(event_key, holder = %own_id, "claim taken over locally: we have the lower load, so the existing local holder is dropped");
-                None
-            }
-            Ok(false) => {
-                // The row changed holder again between our read and our
-                // reassign attempt; settle on whatever it is now.
-                match crate::state::peer_claim_get(&self.pool, event_key).await {
-                    Ok(Some(now_row)) if now_row.holder_id == own_id => None,
-                    Ok(Some(now_row)) => {
-                        info!(source, delivery, event_key, holder = %now_row.holder_id, "event already claimed; delivery dropped");
-                        Some(ClaimDecision::Drop {
-                            holder: now_row.holder_id,
-                        })
-                    }
-                    Ok(None) => Some(self.drop_unknown(event_key, source, delivery)),
-                    Err(e) => {
-                        error!(source, delivery, event_key, error = %e, "re-reading the claim row failed");
-                        Some(self.drop_unknown(event_key, source, delivery))
-                    }
-                }
-            }
-            Err(e) => {
-                error!(source, delivery, event_key, error = %e, "reassigning the claim row failed");
-                Some(ClaimDecision::Drop {
-                    holder: row.holder_id,
-                })
-            }
-        }
+        info!(source, delivery, event_key, holder = %row.holder_id, "event already claimed; delivery dropped");
+        Some(ClaimDecision::Drop {
+            holder: row.holder_id,
+        })
     }
 
     fn drop_unknown(&self, event_key: &str, source: &str, delivery: &str) -> ClaimDecision {
@@ -1523,16 +1573,17 @@ pub(crate) mod testkit {
             ..PeersConfig::default()
         }));
         let token = format!("tok-{name}");
+        let registry = PeerRegistry::default();
+        let claims = PeerClaims::new(pool.clone(), cfg.clone(), registry.clone());
         let app = router(PeerApiState {
             pool: pool.clone(),
             cfg: cfg.clone(),
             token: Some(Arc::new(token.clone())),
+            dispatched: claims.dispatched(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let registry = PeerRegistry::default();
-        let claims = PeerClaims::new(pool.clone(), cfg.clone(), registry.clone());
         Node {
             name: name.into(),
             pool,
@@ -1622,6 +1673,7 @@ mod tests {
             pool: pool.clone(),
             cfg: Arc::new(RwLock::new(cfg)),
             token: token.map(|t| Arc::new(t.to_string())),
+            dispatched: DispatchedClaims::default(),
         });
         (router, pool)
     }
@@ -2032,17 +2084,19 @@ mod tests {
         };
         // No row: grant and record the claimant.
         assert!(
-            respond_to_claim(&pool, "me", &req(3, "x"))
+            respond_to_claim(&pool, &DispatchedClaims::default(), "me", &req(3, "x"))
                 .await
                 .unwrap()
                 .granted
         );
         // The row names a third party: a different claimant is refused.
-        let r = respond_to_claim(&pool, "me", &req(0, "y")).await.unwrap();
+        let r = respond_to_claim(&pool, &DispatchedClaims::default(), "me", &req(0, "y"))
+            .await
+            .unwrap();
         assert!(!r.granted && r.holder_id == "x" && r.holder_load == 3);
         // The same claimant again is granted (idempotent).
         assert!(
-            respond_to_claim(&pool, "me", &req(3, "x"))
+            respond_to_claim(&pool, &DispatchedClaims::default(), "me", &req(3, "x"))
                 .await
                 .unwrap()
                 .granted
@@ -2056,10 +2110,12 @@ mod tests {
             claimant_id: id.into(),
             claimant_load: load,
         };
-        let r = respond_to_claim(&pool, "me", &own(3, "x")).await.unwrap();
+        let r = respond_to_claim(&pool, &DispatchedClaims::default(), "me", &own(3, "x"))
+            .await
+            .unwrap();
         assert!(!r.granted && r.holder_id == "me");
         assert!(
-            respond_to_claim(&pool, "me", &own(1, "x"))
+            respond_to_claim(&pool, &DispatchedClaims::default(), "me", &own(1, "x"))
                 .await
                 .unwrap()
                 .granted
@@ -2069,6 +2125,61 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((row.holder_id.as_str(), row.holder_load), ("x", 1));
+    }
+
+    #[tokio::test]
+    async fn a_started_event_refuses_a_lower_load_claimant() {
+        let pool = crate::db::test_pool().await;
+        let dispatched = DispatchedClaims::default();
+        let req = |key: &str| ClaimRequest {
+            event_key: key.into(),
+            claimant_id: "x".into(),
+            claimant_load: 1,
+        };
+        for (key, started) in [("started", true), ("pending", false)] {
+            crate::state::peer_claim_insert(&pool, key, "me", 2)
+                .await
+                .unwrap();
+            if started {
+                dispatched.mark(key).await;
+            }
+            let r = respond_to_claim(&pool, &dispatched, "me", &req(key))
+                .await
+                .unwrap();
+            assert_eq!(r.granted, !started, "{key}");
+            let row = crate::state::peer_claim_get(&pool, key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.holder_id, if started { "me" } else { "x" }, "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_row_a_peer_already_holds_is_final_whatever_the_loads() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (a, b) = pair(0, 5).await;
+        let key = "forgejo:o/r:action_run:900:failure";
+        // `b` claims first and `a` grants; `a`'s own copy arrives later with
+        // the lower load and must still drop.
+        let req = ClaimRequest {
+            event_key: key.into(),
+            claimant_id: b.id.clone(),
+            claimant_load: 5,
+        };
+        let r = respond_to_claim(&a.pool, &a.claims.dispatched(), &a.id, &req)
+            .await
+            .unwrap();
+        assert!(r.granted);
+        let d = a.claims.claim(Some(key), "failure", "src", "d-a").await;
+        assert_eq!(
+            d,
+            ClaimDecision::Drop {
+                holder: b.id.clone()
+            }
+        );
     }
 
     #[tokio::test]
@@ -2563,6 +2674,7 @@ mod summary_tests {
             pool: pool.clone(),
             cfg: Arc::new(RwLock::new(cfg)),
             token: Some(Arc::new("tok".to_string())),
+            dispatched: DispatchedClaims::default(),
         });
         let (st, body) = get_summaries(app.clone(), "?after=0&limit=100", "tok").await;
         assert_eq!(st, StatusCode::OK);
