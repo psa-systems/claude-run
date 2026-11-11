@@ -319,7 +319,11 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
     reaching the review session below. Otherwise a fresh read-only review session runs, and a pass marker
     `.claude-run-review-pass` promotes the PR to ready and sets the field to code-review. A fail marker
     `.claude-run-review-fail` or no verdict keeps the PR draft, posts the findings on the PR and the issue, and sets
-    the field to queued (below the attempt cap) or needs-review.
+    the field to queued (below the attempt cap) or needs-review. An audit action (`prompt_preset: audit`) differs on
+    a fail marker: one follow-up issue is filed through the run-scoped issue-write audit, the PR is promoted, the
+    findings are still posted on the PR and the issue, and the field is set to code-review, not queued. A follow-up
+    issue's own fail marker, or a failure to file the follow-up, keeps the draft disposition above (the latter always
+    parks at needs-review).
   - hard failure: commits pushed, field set to failed. A push or PR-create failure with a recorded open PR below the
     attempt cap requeues instead.
   - timeout or cancel: the final push in 3.3.1 runs; the checkpoint push (every 60 seconds while `claude` runs) is the
@@ -736,6 +740,8 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
    | success, verification gate and review pass | `Code Review` | PR link, step list |
    | success, gate failed | `Failed` | gate command (output attached to the run record, not posted) |
    | review fail marker | `Queued` below the attempt cap, else `Needs Review` | findings |
+   | review fail marker, audit action, follow-up issue filed | `Code Review`, PR promoted | findings, follow-up key |
+   | review fail marker, audit action, follow-up not filed | `Needs Review` | findings, the filing failure |
    | review gave no verdict (the review session modified the workdir, timed out, or printed no marker) | one fresh review session is run; if it also gives no verdict, `Needs Review` | both causes |
    | push rejected, remote diverged | one conflict-resolution pass (item 4); on failure `Needs Review` | conflicting files, both SHAs |
    | push or PR create failed, other cause | `Queued` below the attempt cap, else `Failed` | redacted git error |

@@ -324,6 +324,17 @@ pub trait IssueTracker: Send + Sync {
         Ok(())
     }
 
+    /// The names of the tags attached to issue `key` (`yt issue tag list
+    /// --json`). Backs reading an audit Epic's `Audit-<Type>` tag so a
+    /// follow-up issue can carry it (CLAUDE-611). The default errors, so a
+    /// backend with no tag support is never read as "no tags".
+    fn issue_tags(&self, key: &str) -> Result<Vec<String>> {
+        let _ = key;
+        Err(Error::Other(anyhow::anyhow!(
+            "issue_tags not supported by this tracker backend"
+        )))
+    }
+
     /// Verify the tracker token and return the authenticated login
     /// (`yt auth verify`, GET /api/users/me). The single read-only answer to "is
     /// this token still valid". Never returns the token itself.
@@ -3771,12 +3782,13 @@ mod tests {
         /// or otherwise never opens a real PR, so the adopt-first contract does
         /// not apply to them: `push_comment::tests::FailingForge`,
         /// `native::youtrack::tests::FakeCheckpointForge`,
-        /// `native::youtrack::tests::CapturingForge`,
+        /// `native::youtrack::tests::CapturingForge`, `native::youtrack::tests::ReviewForge`,
         /// `web::webhooks::tests::StoreBackend`.
         const TEST_ONLY_ALLOWLIST: &[&str] = &[
             "FailingForge",
             "FakeCheckpointForge",
             "CapturingForge",
+            "ReviewForge",
             "StoreBackend",
         ];
 

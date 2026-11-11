@@ -66,7 +66,8 @@
 # verdict notes, including the classified table, into the success comment. A fail (.claude-run-review-fail) leaves
 # the PR a draft, posts the findings on the PR and the issue, counts the attempt, and requeues to Queued below
 # max_attempts_per_key or parks at Needs Review at the cap - either way the built-in prompt's resume step (below)
-# tells the agent to read the PR's comments and fix what the review found. No marker, both markers, a timeout, or the
+# tells the agent to read the PR's comments and fix what the review found. (An audit action, audit-run.yml, instead
+# files a follow-up issue and promotes the PR, CLAUDE-611.) No marker, both markers, a timeout, or the
 # review session touching the workdir all collapse to no usable verdict, which always parks at Needs Review instead.
 #
 # Working can also revert to Queued (CLAUDE-439), with a comment naming the reason and no attempt counted: a transient

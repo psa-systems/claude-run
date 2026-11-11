@@ -80,7 +80,7 @@ scan the whole tree for the char, and the sanitized text also rides into the pos
 
 `finalize`'s `review: Option<&ReviewOutcome>` parameter decides the outcome from there: `None` or `Some(Pass(_))`
 promotes the draft via `mark_pr_ready` and folds the verdict notes into the success comment's own "## Review" section;
-`Some(Fail(findings))` leaves the PR a draft, posts `findings` on both the PR and the issue, and counts the attempt -
+`Some(Fail(findings))` (except on an audit action, see the CLAUDE-611 section below) leaves the PR a draft, posts `findings` on both the PR and the issue, and counts the attempt -
 below `max_attempts_per_key` it reverts `AI Agent` to `Queued` (`Finalized::ReviewFailed { requeued: true, .. }`) so a
 later run resumes onto the same branch and PR (the built-in prompt's resume step already tells a resumed run to read
 the PR's comments for a timed-out salvage's note; CLAUDE-449 extends that same sentence to also cover a review
@@ -91,6 +91,28 @@ there is no finding to fix and resuming would just repeat the same malfunction. 
 by its own `finalize`-level test in `src/native/youtrack.rs`; `run_review_session` itself has a dedicated test per
 verdict path (pass, fail, no marker, both markers, timeout, edited a tracked file, committed) plus one asserting the
 invocation's `--allowed-tools` and `--max-budget-usd` argv and its own stream log path.
+
+### Audit review failure files a follow-up (CLAUDE-611)
+
+An audit action (`prompt_preset: audit`) gets its own review prompt, `default_audit_review_prompt` in
+`src/native/youtrack.rs`: same read-only contract, marker protocol and evidence file, but it checks the audit report
+against the invariant sweep and writes each uncovered hit to the fail marker as `file:line - what is missing`. An audit
+PR only adds a dated report and ledger rows, and it must merge for its Epic to resolve and release the gated daily
+parent, so a review `Fail` on an audit run does not keep the PR a draft. `finalize` files ONE follow-up issue through
+the run-scoped `AuditedTracker` (so the CLAUDE-234 cap and attribution apply), then takes the pass path: the PR is
+promoted via `mark_pr_ready`, the findings are still posted on the PR and the issue, the Epic goes to Code Review, and
+the Epic is not re-queued. The outcome is `Finalized::CodeReview`; the comment's "## Review" section names the
+follow-up key.
+
+The follow-up is created in the Epic's own project with the summary prefix `Audit review follow-up: ` (the loop guard),
+tagged with the Epic's `Audit-<Type>` tag (read with `IssueTracker::issue_tags`) so `audit-run` picks it up by the
+existing routing, linked `relates to` the Epic (never `subtask of`), and set to `AI Agent = Queued` as the LAST write,
+after the tag and link, so neither action sees a half-filed issue. Its body carries the review findings and the
+evidence-file link, and tells the agent to file the real finding issues per the audits repository's `prompts/_filing.md`
+and update the report. A follow-up's own review `Fail` (summary starts with the prefix) files nothing and keeps the
+ordinary draft-and-park disposition. Any filing failure (tags unreadable, no `Audit-<Type>` tag, cap reached, a write
+failing partway) is logged at `error`, keeps the PR a draft, parks the Epic on `Needs Review` instead of re-queueing,
+and names the cause and any half-filed follow-up key in the comment. A non-audit action's `Fail` is unchanged.
 
 ## Checkpoint-push watcher runs off a plain OS thread, not a tokio task (CLAUDE-448)
 

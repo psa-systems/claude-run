@@ -259,6 +259,10 @@ impl IssueTracker for AuditedTracker<'_> {
         out
     }
 
+    fn issue_tags(&self, key: &str) -> Result<Vec<String>> {
+        self.inner.issue_tags(key)
+    }
+
     fn auth_verify(&self) -> Result<String> {
         self.inner.auth_verify()
     }
