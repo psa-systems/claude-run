@@ -102,6 +102,21 @@ impl Outcome {
         }
     }
 
+    /// The outcome whose [`Outcome::as_str`] is `s`, or `None` for any other
+    /// string (a replicated summary row is validated with this).
+    pub fn parse(s: &str) -> Option<Self> {
+        [
+            Outcome::Success,
+            Outcome::CodeReview,
+            Outcome::NoCodeChange,
+            Outcome::NeedsReview,
+            Outcome::Queued,
+            Outcome::Failed,
+        ]
+        .into_iter()
+        .find(|o| o.as_str() == s)
+    }
+
     /// The outcome of a job that has no tracker state machine.
     pub fn from_ok(ok: bool) -> Self {
         if ok {

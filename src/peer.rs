@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -30,6 +30,9 @@ use crate::error::{Error, Result};
 const CLOCK_SKEW_WARN_SECS: i64 = 60;
 /// Upper bound on one pull, further capped by `poll_secs`.
 const PULL_TIMEOUT_MAX_SECS: u64 = 10;
+/// Pages one summary sync fetches from one peer per tick; a peer with more
+/// history than this is `behind` until a later tick finishes it.
+const SUMMARY_PAGES_PER_TICK: usize = 20;
 /// How long a claim bypass is counted on the Status page.
 const BYPASS_WINDOW: chrono::Duration = chrono::Duration::hours(24);
 /// Bound on the post-grant re-check retry in [`PeerClaims::claim`]: enough
@@ -110,6 +113,41 @@ struct PeerStatus {
     skewed: bool,
     /// When each claim bypass happened, pruned to the last 24 hours.
     bypasses: Vec<DateTime<Utc>>,
+    /// The outcome of the last summary sync (`SPEC-3.17` item 9).
+    sync: SummarySync,
+}
+
+/// Where a peer's run-summary replication stands (`SPEC-3.17` items 9 and 11).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SummarySync {
+    /// No sync has run since this process started.
+    #[default]
+    Pending,
+    /// The last sync reached the end of the peer's rows.
+    CaughtUp,
+    /// The last sync applied rows and the peer has more.
+    Behind,
+    /// The peer sent a batch that failed validation; the cursor did not move.
+    Rejected(String),
+    /// The sync could not complete (transport, status or local store error).
+    Failed(String),
+}
+
+impl SummarySync {
+    /// The Status page and report note text.
+    pub fn label(&self) -> String {
+        match self {
+            SummarySync::Pending => "not yet synced".to_string(),
+            SummarySync::CaughtUp => "caught up".to_string(),
+            SummarySync::Behind => "behind".to_string(),
+            SummarySync::Rejected(m) => format!("batch rejected: {m}"),
+            SummarySync::Failed(m) => format!("failed: {m}"),
+        }
+    }
+
+    pub fn is_caught_up(&self) -> bool {
+        matches!(self, SummarySync::CaughtUp)
+    }
 }
 
 /// One Status page row (`SPEC-3.17` item 11, less the columns later issues add).
@@ -125,6 +163,8 @@ pub struct PeerRow {
     /// Event claims bypassed for this peer in the last 24 hours (`SPEC-3.17`
     /// item 11). Kept in memory, so a restart resets it.
     pub claims_bypassed: u64,
+    /// Summary replication state (`SPEC-3.17` item 11).
+    pub summary_sync: SummarySync,
 }
 
 /// Why one pull failed.
@@ -261,6 +301,7 @@ impl PeerRegistry {
                         .iter()
                         .filter(|t| now.signed_duration_since(**t) < BYPASS_WINDOW)
                         .count() as u64,
+                    summary_sync: st.sync.clone(),
                 }
             })
             .collect()
@@ -282,6 +323,47 @@ impl PeerRegistry {
             })
             .cloned()
             .collect()
+    }
+
+    /// The `instance_id` the peer last reported on a successful state pull,
+    /// kept across later failures. `None` until the first success.
+    pub fn peer_instance_id(&self, name: &str) -> Option<String> {
+        self.lock()
+            .get(name)
+            .and_then(|st| st.snapshot.as_ref().map(|d| d.instance_id.clone()))
+    }
+
+    /// The peer's current liveness state and summary sync state.
+    pub fn liveness_and_sync(
+        &self,
+        name: &str,
+        cfg: &PeersConfig,
+        now: DateTime<Utc>,
+    ) -> (PeerState, SummarySync) {
+        let map = self.lock();
+        match map.get(name) {
+            Some(st) => (state_at(st, now, cfg.stale_after_secs), st.sync.clone()),
+            None => (PeerState::Unknown, SummarySync::Pending),
+        }
+    }
+
+    /// Record the outcome of one summary sync and log a change of it.
+    pub fn record_sync(&self, name: &str, sync: SummarySync) {
+        let mut map = self.lock();
+        let st = map.entry(name.to_string()).or_default();
+        if st.sync != sync {
+            match &sync {
+                SummarySync::Rejected(m) => {
+                    error!(peer = %name, "peer summary batch rejected, cursor unchanged: {m}")
+                }
+                SummarySync::Failed(m) => warn!(peer = %name, "peer summary sync failed: {m}"),
+                SummarySync::CaughtUp | SummarySync::Behind => {
+                    info!(peer = %name, state = %sync.label(), "peer summary sync")
+                }
+                SummarySync::Pending => {}
+            }
+        }
+        st.sync = sync;
     }
 
     /// Count one bypassed claim against `name` for the Status page.
@@ -412,7 +494,11 @@ pub async fn poll_loop(pool: DbPool, cfg: Arc<RwLock<PeersConfig>>, registry: Pe
                     for p in &snapshot.peers {
                         tokens.insert(p.name.clone(), resolve_token(&pool, &p.token_ref).await);
                     }
-                    poll_with_tokens(&snapshot, &registry, &client, &own_id, tokens).await;
+                    poll_with_tokens(&snapshot, &registry, &client, &own_id, tokens.clone()).await;
+                    sync_summaries_with_tokens(
+                        &pool, &snapshot, &registry, &client, &own_id, tokens,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     error!(error = %e, "peer poll skipped: reading the instance id failed")
@@ -422,6 +508,458 @@ pub async fn poll_loop(pool: DbPool, cfg: Arc<RwLock<PeersConfig>>, registry: Pe
             registry.retain(&HashSet::new());
         }
         tokio::time::sleep(Duration::from_secs(snapshot.poll_secs.max(5))).await;
+    }
+}
+
+/// The `instance` filter of the report routes (`SPEC-3.17` item 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstanceFilter {
+    All,
+    Local,
+    Peer(String),
+}
+
+impl InstanceFilter {
+    /// Omitted, empty or `all` merges; `local` is this instance; anything else
+    /// names a peer.
+    pub fn from_param(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            None | Some("") | Some("all") => InstanceFilter::All,
+            Some("local") => InstanceFilter::Local,
+            Some(name) => InstanceFilter::Peer(name.to_string()),
+        }
+    }
+
+    /// The canonical query-param spelling.
+    pub fn as_param(&self) -> &str {
+        match self {
+            InstanceFilter::All => "all",
+            InstanceFilter::Local => "local",
+            InstanceFilter::Peer(n) => n,
+        }
+    }
+}
+
+/// A peer whose figures may lack recent runs: it is `unknown`, or its summary
+/// sync is not caught up (`SPEC-3.17` item 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerNote {
+    pub name: String,
+    pub state: PeerState,
+    pub sync: SummarySync,
+    /// The last successful summary sync, or `None` when there never was one.
+    pub last_sync: Option<String>,
+}
+
+/// What a report route reads and what the page must say about it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportView {
+    pub scope: crate::report::Scope,
+    /// Whether peering is enabled, so the instance selector and notes show.
+    pub peering: bool,
+    pub instance: InstanceFilter,
+    /// The configured peer names, for the instance selector.
+    pub peer_names: Vec<String>,
+    pub notes: Vec<PeerNote>,
+}
+
+/// Why a report view could not be resolved.
+#[derive(Debug)]
+pub enum ViewError {
+    /// The `instance` value is not usable: a client error (`400`).
+    BadInstance(String),
+    /// The named peer has not been reached since this process started, so its
+    /// origin id is unknown: `409`.
+    PeerUnresolved(String),
+    Store(Error),
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ViewError::BadInstance(m) | ViewError::PeerUnresolved(m) => f.write_str(m),
+            ViewError::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<Error> for ViewError {
+    fn from(e: Error) -> Self {
+        ViewError::Store(e)
+    }
+}
+
+/// Resolve the `instance` parameter against the live peer config and registry
+/// (`SPEC-3.17` item 10). With peering disabled the series read as before and
+/// only `all` and `local` are accepted.
+pub async fn resolve_report_view(
+    pool: &DbPool,
+    cfg: &PeersConfig,
+    registry: &PeerRegistry,
+    raw: Option<&str>,
+    now: DateTime<Utc>,
+) -> std::result::Result<ReportView, ViewError> {
+    let instance = InstanceFilter::from_param(raw);
+    if !cfg.enabled {
+        if let InstanceFilter::Peer(n) = &instance {
+            return Err(ViewError::BadInstance(format!(
+                "instance `{n}` is not available: peering is not enabled"
+            )));
+        }
+        return Ok(ReportView {
+            scope: crate::report::Scope::Ledger,
+            peering: false,
+            instance,
+            peer_names: Vec::new(),
+            notes: Vec::new(),
+        });
+    }
+    let peer_names: Vec<String> = cfg.peers.iter().map(|p| p.name.clone()).collect();
+    let (scope, watched): (_, Vec<&str>) = match &instance {
+        InstanceFilter::All => (
+            crate::report::Scope::Summaries { instance_id: None },
+            peer_names.iter().map(String::as_str).collect(),
+        ),
+        InstanceFilter::Local => (
+            crate::report::Scope::Summaries {
+                instance_id: Some(crate::settings::ensure_instance_id(pool).await?),
+            },
+            Vec::new(),
+        ),
+        InstanceFilter::Peer(n) => {
+            if !peer_names.contains(n) {
+                return Err(ViewError::BadInstance(format!(
+                    "instance `{n}` is not `all`, `local` or a configured peer ({})",
+                    peer_names.join(", ")
+                )));
+            }
+            let id = registry.peer_instance_id(n).ok_or_else(|| {
+                ViewError::PeerUnresolved(format!(
+                    "peer `{n}` has not been reached since this instance started, so its rows cannot be selected yet"
+                ))
+            })?;
+            (
+                crate::report::Scope::Summaries {
+                    instance_id: Some(id),
+                },
+                vec![n.as_str()],
+            )
+        }
+    };
+    let mut notes = Vec::new();
+    for name in watched {
+        let (state, sync) = registry.liveness_and_sync(name, cfg, now);
+        if state == PeerState::Reachable && sync.is_caught_up() {
+            continue;
+        }
+        let last_sync = match registry.peer_instance_id(name) {
+            Some(id) => crate::state::peer_cursor_get(pool, &id)
+                .await?
+                .and_then(|c| c.last_success_at),
+            None => None,
+        };
+        notes.push(PeerNote {
+            name: name.to_string(),
+            state,
+            sync,
+            last_sync,
+        });
+    }
+    Ok(ReportView {
+        scope,
+        peering: true,
+        instance,
+        peer_names,
+        notes,
+    })
+}
+
+/// The body of `GET /api/peer/summaries` (`SPEC-3.17` item 4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SummariesResponse {
+    pub instance_id: String,
+    pub rows: Vec<crate::state::RunSummary>,
+    /// The cursor to pass as `after` next: the last row's `seq`, or the
+    /// request's `after` when there are no rows.
+    pub next: i64,
+    /// True when rows beyond this page exist.
+    pub more: bool,
+}
+
+/// Query of `GET /api/peer/summaries`.
+#[derive(Debug, Deserialize)]
+struct SummariesQuery {
+    after: Option<i64>,
+    limit: Option<i64>,
+}
+
+async fn peer_summaries(
+    State(s): State<PeerApiState>,
+    Query(q): Query<SummariesQuery>,
+) -> Response {
+    let batch = s.cfg.read().await.summary_batch.max(1) as i64;
+    let after = q.after.unwrap_or(0);
+    let limit = q.limit.unwrap_or(batch);
+    if after < 0 || limit < 1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "after must be >= 0 and limit must be >= 1",
+        )
+            .into_response();
+    }
+    let cap = limit.min(batch);
+    let own_id = match crate::settings::ensure_instance_id(&s.pool).await {
+        Ok(id) => id,
+        Err(e) => {
+            error!(error = %e, "peer summaries: reading the instance id failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "instance id unavailable").into_response();
+        }
+    };
+    // One extra row tells `more` without a second query.
+    let mut rows = match crate::state::run_summaries_since(&s.pool, &own_id, after, cap + 1).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, after, "peer summaries: reading the rows failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "summary read failed").into_response();
+        }
+    };
+    let more = rows.len() as i64 > cap;
+    rows.truncate(cap as usize);
+    let next = rows.last().map_or(after, |r| r.seq);
+    Json(SummariesResponse {
+        instance_id: own_id,
+        rows,
+        next,
+        more,
+    })
+    .into_response()
+}
+
+/// Check one pulled page before any of it is applied (`SPEC-3.17` item 9). The
+/// whole batch is refused on the first bad row; the message names its
+/// `run_uuid`.
+pub fn validate_summaries(
+    peer_id: &str,
+    after: i64,
+    limit: i64,
+    resp: &SummariesResponse,
+) -> std::result::Result<(), String> {
+    if resp.instance_id != peer_id {
+        return Err(format!(
+            "response instance_id `{}` differs from the id `{peer_id}` the peer reported on its state pull",
+            resp.instance_id
+        ));
+    }
+    if resp.rows.len() as i64 > limit {
+        return Err(format!(
+            "{} rows returned for a limit of {limit}",
+            resp.rows.len()
+        ));
+    }
+    let mut prev = after;
+    for r in &resp.rows {
+        let bad = |why: String| Err(format!("row `{}`: {why}", r.run_uuid));
+        if !is_uuid(&r.run_uuid) {
+            return bad("run_uuid is not a UUID".to_string());
+        }
+        if r.instance_id != peer_id {
+            return bad(format!(
+                "instance_id `{}` is not the peer's own id (a peer never relays another's rows)",
+                r.instance_id
+            ));
+        }
+        if r.seq <= prev {
+            return bad(format!("seq {} does not ascend past {prev}", r.seq));
+        }
+        prev = r.seq;
+        if r.action_name.is_empty() || r.job_key.is_empty() {
+            return bad("action_name and job_key must not be empty".to_string());
+        }
+        if r.attempt < 0 {
+            return bad(format!("attempt {} is negative", r.attempt));
+        }
+        if crate::attempt_steps::Outcome::parse(&r.outcome).is_none() {
+            return bad(format!("outcome `{}` is not a known outcome", r.outcome));
+        }
+        let started = match DateTime::parse_from_rfc3339(&r.started_at) {
+            Ok(t) => t,
+            Err(e) => return bad(format!("started_at `{}` does not parse: {e}", r.started_at)),
+        };
+        let ended = match DateTime::parse_from_rfc3339(&r.ended_at) {
+            Ok(t) => t,
+            Err(e) => return bad(format!("ended_at `{}` does not parse: {e}", r.ended_at)),
+        };
+        if ended < started {
+            return bad("ended_at is before started_at".to_string());
+        }
+        if r.duration_ms < 0 {
+            return bad(format!("duration_ms {} is negative", r.duration_ms));
+        }
+        if !r.cost_usd.is_finite() || r.cost_usd < 0.0 {
+            return bad(format!(
+                "cost_usd {} is not a finite non-negative number",
+                r.cost_usd
+            ));
+        }
+    }
+    if resp.next != prev {
+        return Err(format!(
+            "next {} does not match the last row's seq {prev}",
+            resp.next
+        ));
+    }
+    if resp.more && resp.rows.is_empty() {
+        return Err("more is true on an empty page".to_string());
+    }
+    Ok(())
+}
+
+/// The canonical 8-4-4-4-12 hex UUID text form.
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// One bounded `GET <url>/api/peer/summaries` pull.
+pub async fn fetch_summaries(
+    client: &reqwest::Client,
+    peer: &PeerConfig,
+    token: &str,
+    after: i64,
+    limit: i64,
+    timeout: Duration,
+) -> std::result::Result<SummariesResponse, PullError> {
+    let url = format!("{}/api/peer/summaries", peer.url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .query(&[("after", after), ("limit", limit)])
+        .bearer_auth(token)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| PullError::Other(format!("request to {url} failed: {e}")))?;
+    let status = resp.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(PullError::Auth(status.as_u16()));
+    }
+    if !status.is_success() {
+        return Err(PullError::Other(format!("{url} answered {status}")));
+    }
+    resp.json::<SummariesResponse>()
+        .await
+        .map_err(|e| PullError::Other(format!("{url} returned an undecodable body: {e}")))
+}
+
+/// Remember a failed sync on the peer's cursor row. A failure to do even that
+/// is logged, never dropped.
+async fn note_sync_error(pool: &DbPool, peer_id: &str, msg: &str) {
+    if let Err(e) = crate::state::peer_cursor_record_error(pool, peer_id, msg).await {
+        error!(peer_instance_id = %peer_id, error = %e, "recording a summary sync error on the peer cursor failed");
+    }
+}
+
+/// Pull one peer's rows after its stored cursor until it has no more (or the
+/// per-tick page cap), applying each page and the cursor advance in one
+/// transaction (`SPEC-3.17` item 9).
+async fn sync_peer(
+    pool: &DbPool,
+    client: &reqwest::Client,
+    peer: &PeerConfig,
+    token: &str,
+    peer_id: &str,
+    batch: i64,
+    timeout: Duration,
+) -> SummarySync {
+    for _ in 0..SUMMARY_PAGES_PER_TICK {
+        let after = match crate::state::peer_cursor_get(pool, peer_id).await {
+            Ok(c) => c.map_or(0, |c| c.after_seq),
+            Err(e) => return SummarySync::Failed(format!("reading the cursor failed: {e}")),
+        };
+        let resp = match fetch_summaries(client, peer, token, after, batch, timeout).await {
+            Ok(r) => r,
+            Err(PullError::Auth(st)) => {
+                let msg = format!("peer answered {st}: token mismatch");
+                note_sync_error(pool, peer_id, &msg).await;
+                return SummarySync::Failed(msg);
+            }
+            Err(PullError::Other(msg)) => {
+                note_sync_error(pool, peer_id, &msg).await;
+                return SummarySync::Failed(msg);
+            }
+        };
+        if let Err(msg) = validate_summaries(peer_id, after, batch, &resp) {
+            note_sync_error(pool, peer_id, &msg).await;
+            return SummarySync::Rejected(msg);
+        }
+        if let Err(e) =
+            crate::state::run_summaries_apply(pool, peer_id, &resp.rows, resp.next).await
+        {
+            let msg = format!("applying the batch failed: {e}");
+            note_sync_error(pool, peer_id, &msg).await;
+            return SummarySync::Failed(msg);
+        }
+        if !resp.more {
+            return SummarySync::CaughtUp;
+        }
+    }
+    SummarySync::Behind
+}
+
+/// Sync every configured peer's summaries once, concurrently, and record each
+/// outcome. A peer never reached has no known `instance_id`, so it stays
+/// `Pending`. `tokens` is as for [`poll_with_tokens`].
+pub async fn sync_summaries_with_tokens(
+    pool: &DbPool,
+    cfg: &PeersConfig,
+    registry: &PeerRegistry,
+    client: &reqwest::Client,
+    own_id: &str,
+    tokens: HashMap<String, std::result::Result<String, String>>,
+) {
+    let timeout = Duration::from_secs(cfg.poll_secs.min(PULL_TIMEOUT_MAX_SECS));
+    let batch = cfg.summary_batch.max(1) as i64;
+    let mut set = tokio::task::JoinSet::new();
+    for p in &cfg.peers {
+        let Some(peer_id) = registry.peer_instance_id(&p.name) else {
+            continue;
+        };
+        if peer_id == own_id {
+            continue;
+        }
+        let token = match tokens.get(&p.name) {
+            Some(Ok(t)) => t.clone(),
+            Some(Err(e)) => {
+                registry.record_sync(
+                    &p.name,
+                    SummarySync::Failed(format!(
+                        "token_ref `{}` could not be resolved: {e}",
+                        p.token_ref
+                    )),
+                );
+                continue;
+            }
+            None => {
+                registry.record_sync(
+                    &p.name,
+                    SummarySync::Failed("no token was resolved".to_string()),
+                );
+                continue;
+            }
+        };
+        let (pool, client, peer) = (pool.clone(), client.clone(), p.clone());
+        set.spawn(async move {
+            let out = sync_peer(&pool, &client, &peer, &token, &peer_id, batch, timeout).await;
+            (peer.name, out)
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((name, out)) => registry.record_sync(&name, out),
+            Err(e) => error!(error = %e, "a peer summary sync task panicked or was cancelled"),
+        }
     }
 }
 
@@ -442,6 +980,7 @@ pub fn router(state: PeerApiState) -> Router {
     Router::new()
         .route("/api/peer/state", get(peer_state))
         .route("/api/peer/claim", post(peer_claim))
+        .route("/api/peer/summaries", get(peer_summaries))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_peer_bearer,
@@ -1568,5 +2107,762 @@ mod tests {
                 .status(),
             StatusCode::BAD_REQUEST
         );
+    }
+}
+
+/// Summary replication and the merged Reports view (`SPEC-3.17` items 9 and 10).
+#[cfg(test)]
+mod summary_tests {
+    use super::testkit::*;
+    use super::*;
+    use crate::report::{self, Range, Scope};
+    use crate::state::{self, JobOutcome, RunSummary};
+    use axum::body::Body;
+    use axum::http::Request;
+    use sqlx::Executor;
+    use tower::ServiceExt;
+
+    async fn outcome(pool: &DbPool, run: i64, key: &str, cost: f64) {
+        state::job_outcome_insert(
+            pool,
+            &JobOutcome {
+                run_id: run,
+                action_name: "act",
+                job_key: key,
+                attempt: 1,
+                ok: true,
+                claude_ran: true,
+                claude_ok: true,
+                claude_cost_usd: cost,
+                attempt_counted: true,
+                summary: None,
+                stream_log_path: None,
+                duration_ms: 90_000,
+                timed_out: false,
+                stage: "initial",
+                outcome: "success",
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn outcomes(pool: &DbPool, n: usize, cost: f64) {
+        let run = state::run_begin(pool, "act", "scheduler").await.unwrap();
+        for i in 0..n {
+            outcome(pool, run, &format!("K-{i}"), cost).await;
+        }
+    }
+
+    async fn own_rows(pool: &DbPool) -> Vec<RunSummary> {
+        let id = crate::settings::ensure_instance_id(pool).await.unwrap();
+        state::run_summaries_since(pool, &id, 0, 10_000)
+            .await
+            .unwrap()
+    }
+
+    async fn count(pool: &DbPool) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(pool, "SELECT COUNT(*) FROM run_summaries").into_owned(),
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn tokens_for(peer: &Node) -> HashMap<String, std::result::Result<String, String>> {
+        HashMap::from([(peer.name.clone(), Ok(peer.token.clone()))])
+    }
+
+    async fn sync(from: &Node, peer: &Node) {
+        let cfg = from.cfg.read().await.clone();
+        sync_summaries_with_tokens(
+            &from.pool,
+            &cfg,
+            &from.registry,
+            &reqwest::Client::new(),
+            &from.id,
+            tokens_for(peer),
+        )
+        .await;
+    }
+
+    fn summary(peer_id: &str, seq: i64) -> RunSummary {
+        RunSummary {
+            run_uuid: new_uuid_v4().unwrap(),
+            instance_id: peer_id.into(),
+            seq,
+            action_name: "act".into(),
+            job_key: format!("P-{seq}"),
+            attempt: 1,
+            outcome: "success".into(),
+            ok: true,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            ended_at: "2026-01-01T00:01:00Z".into(),
+            duration_ms: 60_000,
+            cost_usd: 1.0,
+            timed_out: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn every_outcome_writes_exactly_one_summary_with_a_rising_seq() {
+        let pool = crate::db::test_pool().await;
+        outcomes(&pool, 4, 0.5).await;
+        let rows = own_rows(&pool).await;
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        let outcomes_n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT COUNT(*) FROM job_outcomes").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(outcomes_n, 4);
+        assert!(rows.iter().all(|r| is_uuid(&r.run_uuid)));
+        let r = &rows[0];
+        assert_eq!((r.action_name.as_str(), r.job_key.as_str()), ("act", "K-0"));
+        assert_eq!(
+            (r.outcome.as_str(), r.ok, r.duration_ms),
+            ("success", true, 90_000)
+        );
+        assert_eq!(r.cost_usd, 0.5);
+    }
+
+    #[tokio::test]
+    async fn the_backfill_covers_every_existing_outcome_in_time_order() {
+        if std::env::var("CLAUDE_RUN_TEST_DATABASE_URL").is_ok() {
+            eprintln!("SKIP: the backfill is replayed on the SQLite chain only");
+            return;
+        }
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/sqlite");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+            .collect();
+        files.sort();
+        let (before, after): (Vec<_>, Vec<_>) = files.into_iter().partition(|p| {
+            !p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("0034_")
+        });
+        for f in &before {
+            pool.execute(sqlx::AssertSqlSafe(std::fs::read_to_string(f).unwrap()))
+                .await
+                .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+        }
+        pool.execute(
+            "INSERT INTO runs (id, action_name, started_at) VALUES (1, 'act', '2026-01-01T00:00:00Z')",
+        )
+        .await
+        .unwrap();
+        for (i, ts) in [
+            "2026-01-03T10:00:30Z",
+            "2026-01-01T10:00:00Z",
+            "2026-01-02T10:00:00Z",
+        ]
+        .iter()
+        .enumerate()
+        {
+            pool.execute(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO job_outcomes (run_id, action_name, job_key, attempt, ts, ok, claude_ran, \
+                 claude_ok, claude_cost_usd, attempt_counted, duration_ms, timed_out, stage, outcome) \
+                 VALUES (1, 'act', 'K-{i}', 1, '{ts}', 1, 1, 1, 0.25, 1, 90000, 0, 'initial', 'success')"
+            )))
+            .await
+            .unwrap();
+        }
+        assert_eq!(after.len(), 1, "exactly one 0034 migration");
+        pool.execute(sqlx::AssertSqlSafe(
+            std::fs::read_to_string(&after[0]).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        let id = crate::settings::ensure_instance_id(&pool).await.unwrap();
+        let rows = state::run_summaries_since(&pool, &id, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        // seq follows ts, not insertion order.
+        assert_eq!(
+            rows.iter().map(|r| r.job_key.as_str()).collect::<Vec<_>>(),
+            vec!["K-1", "K-2", "K-0"]
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let uuids: HashSet<_> = rows.iter().map(|r| r.run_uuid.as_str()).collect();
+        assert_eq!(uuids.len(), 3);
+        assert!(rows.iter().all(|r| is_uuid(&r.run_uuid)));
+        assert_eq!(rows[2].ended_at, "2026-01-03T10:00:30Z");
+        assert_eq!(rows[2].started_at, "2026-01-03T09:59:00Z");
+        assert_eq!(rows[2].cost_usd, 0.25);
+    }
+
+    #[tokio::test]
+    async fn a_joining_peer_gets_all_history_and_a_repull_inserts_nothing_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (a, b) = pair(0, 0).await;
+        outcomes(&b.pool, 5, 1.0).await;
+        a.cfg.write().await.summary_batch = 2;
+        b.cfg.write().await.summary_batch = 2;
+
+        sync(&a, &b).await;
+        let got = state::run_summaries_since(&a.pool, &b.id, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 5);
+        assert_eq!(got, own_rows(&b.pool).await);
+        let cursor = state::peer_cursor_get(&a.pool, &b.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.after_seq, 5);
+        assert!(cursor.last_error.is_none() && cursor.last_success_at.is_some());
+        let cfg = a.cfg.read().await.clone();
+        assert!(a.registry.rows(&cfg, Utc::now())[0]
+            .summary_sync
+            .is_caught_up());
+
+        // A second pull and a replayed batch both insert nothing.
+        sync(&a, &b).await;
+        assert_eq!(count(&a.pool).await, 5);
+        assert_eq!(
+            state::run_summaries_apply(&a.pool, &b.id, &got, 5)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(count(&a.pool).await, 5);
+    }
+
+    #[tokio::test]
+    async fn a_peer_returning_after_an_outage_resumes_from_its_stored_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (a, b) = pair(0, 0).await;
+        outcomes(&b.pool, 3, 1.0).await;
+        sync(&a, &b).await;
+        assert_eq!(count(&a.pool).await, 3);
+
+        outcomes(&b.pool, 2, 1.0).await;
+        let live_url = a.cfg.read().await.peers[0].url.clone();
+        a.cfg.write().await.peers[0].url = "http://127.0.0.1:1".to_string();
+        sync(&a, &b).await;
+        let cursor = state::peer_cursor_get(&a.pool, &b.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.after_seq, 3, "the outage left the cursor");
+        assert!(cursor.last_error.is_some(), "the outage is recorded");
+        let cfg = a.cfg.read().await.clone();
+        assert!(matches!(
+            a.registry.rows(&cfg, Utc::now())[0].summary_sync,
+            SummarySync::Failed(_)
+        ));
+
+        a.cfg.write().await.peers[0].url = live_url;
+        sync(&a, &b).await;
+        assert_eq!(count(&a.pool).await, 5);
+        let cursor = state::peer_cursor_get(&a.pool, &b.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((cursor.after_seq, cursor.last_error), (5, None));
+    }
+
+    #[tokio::test]
+    async fn a_new_instance_id_for_a_peer_starts_at_cursor_zero() {
+        let pool = crate::db::test_pool().await;
+        state::run_summaries_apply(&pool, "old-id", &[], 9)
+            .await
+            .unwrap();
+        assert!(state::peer_cursor_get(&pool, "new-id")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A stub peer that serves one fixed page of summaries.
+    async fn stub_peer(resp: SummariesResponse) -> String {
+        let app = Router::new().route(
+            "/api/peer/summaries",
+            get(move || {
+                let r = resp.clone();
+                async move { Json(r) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_batch_with_an_invalid_row_is_rejected_whole_and_leaves_the_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let a = node("a", 0).await;
+        let peer_id = new_uuid_v4().unwrap();
+        let good = summary(&peer_id, 1);
+        let mut bad = summary(&peer_id, 2);
+        bad.outcome = "bogus".into();
+        let url = stub_peer(SummariesResponse {
+            instance_id: peer_id.clone(),
+            rows: vec![good, bad.clone()],
+            next: 2,
+            more: false,
+        })
+        .await;
+        a.cfg.write().await.peers.push(PeerConfig {
+            name: "p".into(),
+            url,
+            token_ref: "p-token".into(),
+        });
+        let now = Utc::now();
+        a.registry.record(
+            "p",
+            &a.id,
+            Ok(PeerStateDoc {
+                instance_id: peer_id.clone(),
+                instance_name: "p".into(),
+                version: "t".into(),
+                time: now.to_rfc3339(),
+                load: 0,
+                in_flight: vec![],
+            }),
+            now,
+            120,
+        );
+        let cfg = a.cfg.read().await.clone();
+        sync_summaries_with_tokens(
+            &a.pool,
+            &cfg,
+            &a.registry,
+            &reqwest::Client::new(),
+            &a.id,
+            HashMap::from([("p".to_string(), Ok("t".to_string()))]),
+        )
+        .await;
+
+        assert_eq!(
+            count(&a.pool).await,
+            0,
+            "the valid row is not applied either"
+        );
+        let cursor = state::peer_cursor_get(&a.pool, &peer_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.after_seq, 0);
+        assert!(cursor.last_error.unwrap().contains(&bad.run_uuid));
+        let row = &a.registry.rows(&cfg, Utc::now())[0];
+        let SummarySync::Rejected(m) = &row.summary_sync else {
+            panic!("expected Rejected, got {:?}", row.summary_sync);
+        };
+        assert!(m.contains(&bad.run_uuid), "{m}");
+    }
+
+    type Mutation = Box<dyn Fn(&mut RunSummary)>;
+
+    #[test]
+    fn validation_refuses_each_kind_of_bad_row() {
+        let id = "peer";
+        let ok = |rows: Vec<RunSummary>, next: i64, more: bool| SummariesResponse {
+            instance_id: id.into(),
+            rows,
+            next,
+            more,
+        };
+        assert!(validate_summaries(id, 0, 10, &ok(vec![summary(id, 1)], 1, false)).is_ok());
+        let cases: Vec<(&str, Mutation)> = vec![
+            ("not a UUID", Box::new(|r| r.run_uuid = "x".into())),
+            (
+                "not the peer's own id",
+                Box::new(|r| r.instance_id = "other".into()),
+            ),
+            ("does not ascend", Box::new(|r| r.seq = 0)),
+            ("empty", Box::new(|r| r.job_key.clear())),
+            ("negative", Box::new(|r| r.duration_ms = -1)),
+            (
+                "does not parse",
+                Box::new(|r| r.started_at = "yesterday".into()),
+            ),
+            (
+                "before started_at",
+                Box::new(|r| r.ended_at = "2025-01-01T00:00:00Z".into()),
+            ),
+            ("finite", Box::new(|r| r.cost_usd = f64::NAN)),
+        ];
+        for (needle, mutate) in cases {
+            let mut r = summary(id, 1);
+            mutate(&mut r);
+            let seq = r.seq;
+            let err = validate_summaries(id, 0, 10, &ok(vec![r], seq, false)).unwrap_err();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        assert!(validate_summaries(id, 0, 10, &ok(vec![summary(id, 1)], 7, false)).is_err());
+        assert!(validate_summaries(id, 0, 10, &ok(vec![], 0, true)).is_err());
+        assert!(validate_summaries(id, 0, 0, &ok(vec![summary(id, 1)], 1, false)).is_err());
+        let mut wrong = ok(vec![], 0, false);
+        wrong.instance_id = "other".into();
+        assert!(validate_summaries(id, 0, 10, &wrong).is_err());
+    }
+
+    async fn get_summaries(app: Router, query: &str, token: &str) -> (StatusCode, Vec<u8>) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peer/summaries{query}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        (
+            status,
+            axum::body::to_bytes(resp.into_body(), 1 << 22)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_endpoint_serves_only_own_rows_capped_by_the_batch_setting() {
+        let pool = crate::db::test_pool().await;
+        let own = crate::settings::ensure_instance_id(&pool).await.unwrap();
+        outcomes(&pool, 5, 1.0).await;
+        state::run_summaries_apply(&pool, "peer-x", &[summary("peer-x", 1)], 1)
+            .await
+            .unwrap();
+        let mut cfg = PeersConfig {
+            enabled: true,
+            instance_name: "me".into(),
+            ..PeersConfig::default()
+        };
+        cfg.summary_batch = 2;
+        let app = router(PeerApiState {
+            pool: pool.clone(),
+            cfg: Arc::new(RwLock::new(cfg)),
+            token: Some(Arc::new("tok".to_string())),
+        });
+        let (st, body) = get_summaries(app.clone(), "?after=0&limit=100", "tok").await;
+        assert_eq!(st, StatusCode::OK);
+        let r: SummariesResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(r.instance_id, own);
+        assert_eq!(r.rows.iter().map(|x| x.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(r.rows.iter().all(|x| x.instance_id == own));
+        assert_eq!((r.next, r.more), (2, true));
+        let (_, body) = get_summaries(app.clone(), "?after=4&limit=1", "tok").await;
+        let r: SummariesResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!((r.rows.len(), r.next, r.more), (1, 5, false));
+        let (_, body) = get_summaries(app.clone(), "?after=5", "tok").await;
+        let r: SummariesResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!((r.rows.len(), r.next, r.more), (0, 5, false));
+        assert_eq!(
+            get_summaries(app.clone(), "?limit=0", "tok").await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get_summaries(app, "?after=0", "wrong").await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_totals_are_the_sum_and_local_is_this_instances_rows() {
+        let pool = crate::db::test_pool().await;
+        let own = crate::settings::ensure_instance_id(&pool).await.unwrap();
+        outcomes(&pool, 2, 1.5).await;
+        let now = Utc::now();
+        let peer_rows: Vec<RunSummary> = (1..=3)
+            .map(|i| RunSummary {
+                ended_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                started_at: (now - chrono::Duration::minutes(10))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                duration_ms: 600_000,
+                cost_usd: 4.0,
+                ..summary("peer-1", i)
+            })
+            .collect();
+        state::run_summaries_apply(&pool, "peer-1", &peer_rows, 3)
+            .await
+            .unwrap();
+
+        let all = Scope::Summaries { instance_id: None };
+        let local = Scope::Summaries {
+            instance_id: Some(own),
+        };
+        let peer = Scope::Summaries {
+            instance_id: Some("peer-1".into()),
+        };
+        let sum_all = report::summary_scoped(&pool, Range::All, None, &all)
+            .await
+            .unwrap();
+        let sum_local = report::summary_scoped(&pool, Range::All, None, &local)
+            .await
+            .unwrap();
+        let sum_peer = report::summary_scoped(&pool, Range::All, None, &peer)
+            .await
+            .unwrap();
+        assert_eq!((sum_local.total_runs, sum_local.total_cost_usd), (2, 3.0));
+        assert_eq!((sum_peer.total_runs, sum_peer.total_cost_usd), (3, 12.0));
+        assert_eq!(
+            sum_all.total_runs,
+            sum_local.total_runs + sum_peer.total_runs
+        );
+        assert_eq!(
+            sum_all.total_cost_usd,
+            sum_local.total_cost_usd + sum_peer.total_cost_usd
+        );
+        assert_eq!(
+            sum_all.total_run_minutes,
+            sum_local.total_run_minutes + sum_peer.total_run_minutes
+        );
+        let daily_all = report::daily_scoped(&pool, Range::All, None, &all)
+            .await
+            .unwrap();
+        assert_eq!(daily_all.iter().map(|d| d.run_count).sum::<i64>(), 5);
+        let hours = report::by_hour_scoped(&pool, Range::All, None, &all)
+            .await
+            .unwrap();
+        assert_eq!(hours.iter().map(|h| h.job_count).sum::<i64>(), 5);
+        assert_eq!(hours.iter().map(|h| h.run_starts).sum::<i64>(), 5);
+        let days = report::by_weekday_scoped(&pool, Range::All, None, &all)
+            .await
+            .unwrap();
+        assert_eq!(days.iter().map(|d| d.run_count).sum::<i64>(), 5);
+        let weeks = report::weekly_scoped(&pool, Range::All, None, &all)
+            .await
+            .unwrap();
+        assert_eq!(weeks.iter().map(|w| w.cost_usd).sum::<f64>(), 15.0);
+        let none = report::summary_scoped(&pool, Range::All, Some("other"), &all)
+            .await
+            .unwrap();
+        assert_eq!(none.total_runs, 0);
+    }
+
+    #[tokio::test]
+    async fn without_peer_data_the_summary_totals_equal_the_ledger_totals() {
+        let pool = crate::db::test_pool().await;
+        let run = state::run_begin(&pool, "act", "scheduler").await.unwrap();
+        for (i, cost) in [0.25, 0.5, 1.0].into_iter().enumerate() {
+            outcome(&pool, run, &format!("K-{i}"), cost).await;
+            // What `job.rs` writes next to every outcome whose claude ran.
+            state::daily_cost_add(&pool, "act", cost).await.unwrap();
+            state::daily_count_increment(&pool, "act").await.unwrap();
+        }
+        let all = Scope::Summaries { instance_id: None };
+        let legacy = report::summary_scoped(&pool, Range::All, None, &Scope::Ledger)
+            .await
+            .unwrap();
+        let merged = report::summary_scoped(&pool, Range::All, None, &all)
+            .await
+            .unwrap();
+        assert_eq!(merged.total_runs, legacy.total_runs);
+        assert_eq!(merged.total_cost_usd, legacy.total_cost_usd);
+        let legacy_daily = report::daily_scoped(&pool, Range::All, None, &Scope::Ledger)
+            .await
+            .unwrap();
+        let merged_daily = report::daily_scoped(&pool, Range::All, None, &all)
+            .await
+            .unwrap();
+        assert_eq!(merged_daily.len(), legacy_daily.len());
+        for (m, l) in merged_daily.iter().zip(&legacy_daily) {
+            assert_eq!(
+                (&m.date, m.run_count, m.cost_usd),
+                (&l.date, l.run_count, l.cost_usd)
+            );
+        }
+    }
+
+    fn two_peer_cfg(enabled: bool) -> PeersConfig {
+        PeersConfig {
+            enabled,
+            instance_name: "me".into(),
+            peers: vec![
+                PeerConfig {
+                    name: "east".into(),
+                    url: "http://127.0.0.1:1".into(),
+                    token_ref: "t".into(),
+                },
+                PeerConfig {
+                    name: "west".into(),
+                    url: "http://127.0.0.1:1".into(),
+                    token_ref: "t".into(),
+                },
+            ],
+            ..PeersConfig::default()
+        }
+    }
+
+    fn state_doc(id: &str, now: DateTime<Utc>) -> PeerStateDoc {
+        PeerStateDoc {
+            instance_id: id.into(),
+            instance_name: "x".into(),
+            version: "t".into(),
+            time: now.to_rfc3339(),
+            load: 0,
+            in_flight: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn the_view_names_a_stale_or_unknown_peer_with_its_last_sync() {
+        let pool = crate::db::test_pool().await;
+        let own = crate::settings::ensure_instance_id(&pool).await.unwrap();
+        let cfg = two_peer_cfg(true);
+        let reg = PeerRegistry::default();
+        let now = Utc::now();
+        // east: reachable and caught up. west: reached once, long ago, with a stored cursor.
+        reg.record("east", &own, Ok(state_doc("east-id", now)), now, 120);
+        reg.record_sync("east", SummarySync::CaughtUp);
+        let long_ago = now - chrono::Duration::hours(2);
+        reg.record(
+            "west",
+            &own,
+            Ok(state_doc("west-id", long_ago)),
+            long_ago,
+            120,
+        );
+        state::run_summaries_apply(&pool, "west-id", &[], 4)
+            .await
+            .unwrap();
+
+        let v = resolve_report_view(&pool, &cfg, &reg, None, now)
+            .await
+            .unwrap();
+        assert_eq!(v.scope, Scope::Summaries { instance_id: None });
+        assert_eq!(v.notes.len(), 1);
+        assert_eq!(v.notes[0].name, "west");
+        assert_eq!(v.notes[0].state, PeerState::Unknown);
+        assert!(v.notes[0].last_sync.is_some());
+
+        let v = resolve_report_view(&pool, &cfg, &reg, Some("east"), now)
+            .await
+            .unwrap();
+        assert_eq!(
+            v.scope,
+            Scope::Summaries {
+                instance_id: Some("east-id".into())
+            }
+        );
+        assert!(v.notes.is_empty());
+        let v = resolve_report_view(&pool, &cfg, &reg, Some("west"), now)
+            .await
+            .unwrap();
+        assert_eq!(v.notes.len(), 1);
+        let v = resolve_report_view(&pool, &cfg, &reg, Some("local"), now)
+            .await
+            .unwrap();
+        assert_eq!(
+            v.scope,
+            Scope::Summaries {
+                instance_id: Some(own)
+            }
+        );
+        assert!(v.notes.is_empty());
+
+        assert!(matches!(
+            resolve_report_view(&pool, &cfg, &reg, Some("nope"), now).await,
+            Err(ViewError::BadInstance(_))
+        ));
+        let fresh = PeerRegistry::default();
+        assert!(matches!(
+            resolve_report_view(&pool, &cfg, &fresh, Some("east"), now).await,
+            Err(ViewError::PeerUnresolved(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn with_peering_disabled_the_series_read_the_ledger() {
+        let pool = crate::db::test_pool().await;
+        let reg = PeerRegistry::default();
+        let cfg = two_peer_cfg(false);
+        let v = resolve_report_view(&pool, &cfg, &reg, None, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            (v.scope, v.peering, v.notes.is_empty()),
+            (Scope::Ledger, false, true)
+        );
+        assert!(matches!(
+            resolve_report_view(&pool, &cfg, &reg, Some("east"), Utc::now()).await,
+            Err(ViewError::BadInstance(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_poller_makes_no_summary_call_while_peering_is_disabled() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = Router::new().fallback(move || {
+            let h = h.clone();
+            async move {
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                StatusCode::NOT_FOUND
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let pool = crate::db::test_pool().await;
+        let mut cfg = two_peer_cfg(false);
+        cfg.peers.truncate(1);
+        cfg.peers[0].url = url;
+        let task = tokio::spawn(poll_loop(
+            pool,
+            Arc::new(RwLock::new(cfg)),
+            PeerRegistry::default(),
+        ));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        task.abort();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn retention_prunes_summaries_by_ended_at_and_keeps_each_origins_newest() {
+        let pool = crate::db::test_pool().await;
+        let old: Vec<RunSummary> = (1..=3).map(|i| summary("peer-1", i)).collect();
+        state::run_summaries_apply(&pool, "peer-1", &old, 3)
+            .await
+            .unwrap();
+        let mut fresh = summary("peer-2", 1);
+        fresh.ended_at = "2999-01-01T00:00:00Z".into();
+        fresh.started_at = "2999-01-01T00:00:00Z".into();
+        state::run_summaries_apply(&pool, "peer-2", &[fresh], 1)
+            .await
+            .unwrap();
+
+        let deleted = crate::retention::prune_run_summaries(&pool, "2026-06-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted, 2,
+            "seq 1 and 2 of peer-1 go; its newest stays as the seq anchor"
+        );
+        let left = state::run_summaries_since(&pool, "peer-1", 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(left.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(count(&pool).await, 2);
     }
 }

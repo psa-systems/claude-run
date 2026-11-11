@@ -563,6 +563,12 @@ pub fn validate_peers(cfg: &PeersConfig) -> std::result::Result<(), String> {
         if !seen.insert(p.name.as_str()) {
             return Err(format!("duplicate peer name `{}`", p.name));
         }
+        if p.name == "all" || p.name == "local" {
+            return Err(format!(
+                "peer name `{}` is reserved: it is a value of the Reports instance filter",
+                p.name
+            ));
+        }
         if p.name == cfg.instance_name {
             return Err(format!(
                 "peer name `{}` equals this instance's instance_name",

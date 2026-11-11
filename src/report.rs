@@ -260,7 +260,11 @@ pub async fn daily(pool: &DbPool, range: Range, action: Option<&str>) -> Result<
 /// aggregated in Rust rather than via SQLite date functions, which lack
 /// ISO-week support.
 pub async fn weekly(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Vec<WeeklyPoint>> {
-    let daily = daily(pool, range, action).await?;
+    Ok(weeks_of(daily(pool, range, action).await?))
+}
+
+/// ISO-week rollup of a daily series.
+fn weeks_of(daily: Vec<DailyPoint>) -> Vec<WeeklyPoint> {
     let mut weeks: BTreeMap<String, (f64, i64)> = BTreeMap::new();
     for d in daily {
         if let Ok(date) = chrono::NaiveDate::parse_from_str(&d.date, "%Y-%m-%d") {
@@ -271,14 +275,14 @@ pub async fn weekly(pool: &DbPool, range: Range, action: Option<&str>) -> Result
             e.1 += d.run_count;
         }
     }
-    Ok(weeks
+    weeks
         .into_iter()
         .map(|(week, (cost_usd, run_count))| WeeklyPoint {
             week,
             cost_usd,
             run_count,
         })
-        .collect())
+        .collect()
 }
 
 /// Spend (from `job_outcomes.ts`) and `(ts, claude_cost_usd)` rows over the
@@ -439,6 +443,203 @@ pub async fn summary(pool: &DbPool, range: Range, action: Option<&str>) -> Resul
         action: action.map(str::to_string),
         total_cost_usd,
         total_runs,
+        total_run_minutes,
+    })
+}
+
+// ---- replicated (peered) series -------------------------------------------
+
+/// Which store the five merged series (`daily`, `weekly`, `by_weekday`,
+/// `by_hour`, `summary`) read (`SPEC-3.17` item 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    /// Peering is off: `daily_ledger`, `job_outcomes` and `runs`, as before.
+    Ledger,
+    /// Peering is on: `run_summaries`, for one origin or, with `None`, every
+    /// origin this store holds (this instance and each peer).
+    Summaries { instance_id: Option<String> },
+}
+
+/// One `run_summaries` row's reporting columns: `(started_at, ended_at,
+/// cost_usd)`.
+type SummaryRow = (String, String, f64);
+
+/// The window's `run_summaries` rows, bounded by `ended_at`, optionally for
+/// one action and one origin.
+async fn summary_rows(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+    instance_id: Option<&str>,
+) -> Result<Vec<SummaryRow>> {
+    let cutoff = ts_cutoff(range);
+    let mut sql =
+        String::from("SELECT started_at, ended_at, cost_usd FROM run_summaries WHERE 1 = 1");
+    if cutoff.is_some() {
+        sql.push_str(" AND ended_at >= ?");
+    }
+    if action.is_some() {
+        sql.push_str(" AND action_name = ?");
+    }
+    if instance_id.is_some() {
+        sql.push_str(" AND instance_id = ?");
+    }
+    let sql = crate::db::q(pool, &sql).into_owned();
+    let mut q = sqlx::query_as::<_, SummaryRow>(sqlx::AssertSqlSafe(sql.as_str()));
+    if let Some(c) = &cutoff {
+        q = q.bind(c);
+    }
+    if let Some(a) = action {
+        q = q.bind(a);
+    }
+    if let Some(i) = instance_id {
+        q = q.bind(i);
+    }
+    Ok(q.fetch_all(pool).await?)
+}
+
+/// A stored timestamp that must parse; a bad one is reported, never skipped.
+fn parse_ts(ts: &str) -> Result<DateTime<chrono::FixedOffset>> {
+    DateTime::parse_from_rfc3339(ts).map_err(|e| {
+        crate::error::Error::Other(anyhow::anyhow!(
+            "run_summaries holds a timestamp `{ts}` that does not parse: {e}"
+        ))
+    })
+}
+
+/// [`span_minutes`] over stored timestamps that must parse.
+fn span_minutes_strict(started: &str, ended: &str) -> Result<f64> {
+    let ms = (parse_ts(ended)?.timestamp_millis() - parse_ts(started)?.timestamp_millis()).max(0);
+    Ok(ms as f64 / 60_000.0)
+}
+
+fn daily_from_summaries(rows: &[SummaryRow]) -> Result<Vec<DailyPoint>> {
+    let mut days: BTreeMap<String, (f64, i64)> = BTreeMap::new();
+    for (_, ended, cost) in rows {
+        let date = parse_ts(ended)?.with_timezone(&Local).date_naive();
+        let e = days.entry(date.to_string()).or_default();
+        e.0 += cost;
+        e.1 += 1;
+    }
+    Ok(days
+        .into_iter()
+        .map(|(date, (cost_usd, run_count))| DailyPoint {
+            date,
+            cost_usd,
+            run_count,
+        })
+        .collect())
+}
+
+/// `daily` for `scope`. From `run_summaries` a "run" is one recorded attempt.
+pub async fn daily_scoped(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+    scope: &Scope,
+) -> Result<Vec<DailyPoint>> {
+    match scope {
+        Scope::Ledger => daily(pool, range, action).await,
+        Scope::Summaries { instance_id } => {
+            let rows = summary_rows(pool, range, action, instance_id.as_deref()).await?;
+            daily_from_summaries(&rows)
+        }
+    }
+}
+
+/// `weekly` for `scope`.
+pub async fn weekly_scoped(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+    scope: &Scope,
+) -> Result<Vec<WeeklyPoint>> {
+    Ok(weeks_of(daily_scoped(pool, range, action, scope).await?))
+}
+
+/// `by_weekday` for `scope`: spend by the local weekday an attempt ended,
+/// attempts and minutes by the local weekday it started.
+pub async fn by_weekday_scoped(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+    scope: &Scope,
+) -> Result<Vec<WeekdayBucket>> {
+    let Scope::Summaries { instance_id } = scope else {
+        return by_weekday(pool, range, action).await;
+    };
+    let mut cost = [0.0_f64; 7];
+    let mut runs = [0_i64; 7];
+    let mut minutes = [0.0_f64; 7];
+    for (started, ended, c) in summary_rows(pool, range, action, instance_id.as_deref()).await? {
+        let ended_wd = parse_ts(&ended)?.with_timezone(&Local).weekday();
+        cost[ended_wd.num_days_from_sunday() as usize] += c;
+        let started_wd = parse_ts(&started)?.with_timezone(&Local).weekday();
+        let i = started_wd.num_days_from_sunday() as usize;
+        runs[i] += 1;
+        minutes[i] += span_minutes_strict(&started, &ended)?;
+    }
+    Ok((0..7)
+        .map(|wd| WeekdayBucket {
+            weekday: wd,
+            label: weekday_label(wd).to_string(),
+            cost_usd: cost[wd as usize],
+            run_count: runs[wd as usize],
+            run_minutes: minutes[wd as usize],
+        })
+        .collect())
+}
+
+/// `by_hour` for `scope`: spend and attempts by the local hour an attempt
+/// ended, starts by the local hour it started.
+pub async fn by_hour_scoped(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+    scope: &Scope,
+) -> Result<Vec<HourBucket>> {
+    let Scope::Summaries { instance_id } = scope else {
+        return by_hour(pool, range, action).await;
+    };
+    let mut cost = [0.0_f64; 24];
+    let mut jobs = [0_i64; 24];
+    let mut starts = [0_i64; 24];
+    for (started, ended, c) in summary_rows(pool, range, action, instance_id.as_deref()).await? {
+        let end_hour = parse_ts(&ended)?.with_timezone(&Local).hour() as usize;
+        cost[end_hour] += c;
+        jobs[end_hour] += 1;
+        starts[parse_ts(&started)?.with_timezone(&Local).hour() as usize] += 1;
+    }
+    Ok((0..24)
+        .map(|hour| HourBucket {
+            hour,
+            cost_usd: cost[hour as usize],
+            job_count: jobs[hour as usize],
+            run_starts: starts[hour as usize],
+        })
+        .collect())
+}
+
+/// `summary` for `scope`: spend, attempts and attempt minutes.
+pub async fn summary_scoped(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+    scope: &Scope,
+) -> Result<Summary> {
+    let Scope::Summaries { instance_id } = scope else {
+        return summary(pool, range, action).await;
+    };
+    let rows = summary_rows(pool, range, action, instance_id.as_deref()).await?;
+    let mut total_run_minutes = 0.0;
+    for (started, ended, _) in &rows {
+        total_run_minutes += span_minutes_strict(started, ended)?;
+    }
+    Ok(Summary {
+        range: range.as_param().to_string(),
+        action: action.map(str::to_string),
+        total_cost_usd: rows.iter().map(|r| r.2).sum(),
+        total_runs: rows.len() as i64,
         total_run_minutes,
     })
 }
