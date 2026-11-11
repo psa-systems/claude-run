@@ -2155,6 +2155,7 @@ async fn process_job(
                 claude,
                 &action.claude,
                 job,
+                src.prompt_preset,
                 &workdir_path,
                 limits.review_timeout,
                 &review_stream_log,
@@ -3905,11 +3906,50 @@ fn default_review_prompt() -> String {
     .join("\n")
 }
 
+/// CLAUDE-611: the review-session prompt for an audit action. Same read-only
+/// contract, marker protocol and evidence file as [`default_review_prompt`],
+/// but the subject is an audit report, not a code change, and each uncovered
+/// hit is written as a `file:line - what is missing` line, which `finalize`
+/// turns into one follow-up issue.
+fn default_audit_review_prompt() -> String {
+    [
+        "You are reviewing a completed audit run of another agent session on YouTrack issue {{key}}: {{summary}}, before its pull request (a dated audit report and ledger rows) is promoted from draft to ready.",
+        "",
+        "Working directory: {{workdir}} - the finished branch is already checked out here. You have READ-ONLY tools: no Edit, no Write. Do not modify ANY file, do not run 'git commit', 'git add', 'git checkout -b', or anything else that changes the working tree or history; a review that touches the workdir is discarded and the issue is parked for a human instead of trusting your verdict.",
+        "",
+        "1. Run 'yt issue inspect {{key}}' to read the description and every comment, then read the audit report this branch adds and the ledger rows it appends.",
+        "2. State in one sentence the invariant the audit covers, as a contract (for example: every field one upstream commit made newly persistable is accounted for in the report).",
+        "3. Derive a search pattern for the SHAPE of code or data that invariant governs, independent of what the report lists, and run it over the WHOLE audited repository with Glob/Grep.",
+        "4. Classify every hit as covered by the report, not-applicable (state the concrete reason), or uncovered.",
+        "5. Write your full working to this evidence file, in full, whether you pass or fail: the invariant, the search pattern, and the classified table.",
+        "     {{review_evidence_file}}",
+        "6. If every hit is covered or not-applicable, write the verdict to this file: a first line 'Review: PASS', then at most 4 more lines, one per area checked, each as 'file:line - what you checked'. No headings, no tables.",
+        "     {{workdir}}/{{review_pass_marker}}",
+        "7. If any hit is uncovered, write the verdict to this file instead: a first line 'Review: FAIL', then at most 4 more lines, one per uncovered hit, each as 'file:line - what is missing'. The runner files these as one follow-up issue and promotes the report, so list only what the report lacks, never what is wrong with the code you audited. No headings, no tables.",
+        "     {{workdir}}/{{review_fail_marker}}",
+        "8. Write to EXACTLY ONE of the two marker files above, after writing the evidence file from step 5. Do not write YouTrack comments, do not set any field, do not touch the tracker at all: this session reports only through the marker file, which the runner posts capped to 5 bullets with the evidence file linked.",
+    ]
+    .join("\n")
+}
+
+/// The review prompt template for `preset`.
+fn review_prompt_template(preset: PromptPreset) -> String {
+    match preset {
+        PromptPreset::Default => default_review_prompt(),
+        PromptPreset::Audit => default_audit_review_prompt(),
+    }
+}
+
 /// Build the review session's instruction text for `job`, substituting the
 /// same `{{...}}` placeholders [`build_prompt`] uses, plus `evidence_path`
 /// (SPEC-3.16 item 2) as `{{review_evidence_file}}`.
-fn build_review_prompt(job: &YoutrackJob, workdir: &Path, evidence_path: &Path) -> String {
-    let template = default_review_prompt().replace(
+fn build_review_prompt(
+    preset: PromptPreset,
+    job: &YoutrackJob,
+    workdir: &Path,
+    evidence_path: &Path,
+) -> String {
+    let template = review_prompt_template(preset).replace(
         "{{review_evidence_file}}",
         &evidence_path.display().to_string(),
     );
@@ -3978,6 +4018,8 @@ fn run_review_session(
     claude: &ClaudeInvoker,
     claude_cfg: &action::ClaudeBlock,
     job: &YoutrackJob,
+    // CLAUDE-611: selects the audit review prompt for an audit action.
+    preset: PromptPreset,
     workdir: &Path,
     timeout: Duration,
     stream_log: &Path,
@@ -3999,7 +4041,7 @@ fn run_review_session(
     let before_sha = git_head_sha(workdir);
     let mut review_cfg = claude_cfg.clone();
     review_cfg.allowed_tools = Some("Read,Glob,Grep,Bash".to_string());
-    let prompt = build_review_prompt(job, workdir, evidence_path);
+    let prompt = build_review_prompt(preset, job, workdir, evidence_path);
 
     let invoke_result = claude.invoke(
         &prompt,
@@ -4347,6 +4389,7 @@ fn run_review_session_with_retry(
     claude: &ClaudeInvoker,
     claude_cfg: &action::ClaudeBlock,
     job: &YoutrackJob,
+    preset: PromptPreset,
     workdir: &Path,
     timeout: Duration,
     stream_log: &Path,
@@ -4362,6 +4405,7 @@ fn run_review_session_with_retry(
         claude,
         claude_cfg,
         job,
+        preset,
         workdir,
         timeout,
         stream_log,
@@ -4385,6 +4429,7 @@ fn run_review_session_with_retry(
         claude,
         claude_cfg,
         job,
+        preset,
         workdir,
         timeout,
         retry_stream_log,
@@ -5217,7 +5262,43 @@ fn finalize_with_steps(
                         requeued: false,
                     });
                 }
-                match review {
+                // CLAUDE-611: an audit review `Fail` files one follow-up issue
+                // and then takes the pass path below (the report is additive
+                // and accurate for what it covers); any filing failure keeps
+                // the draft-and-park disposition and names the cause.
+                let followup = match review {
+                    Some(ReviewOutcome::Fail(findings)) => {
+                        file_audit_followup(backend, src, job, &url, findings)
+                    }
+                    _ => AuditFollowup::NotApplicable,
+                };
+                let filed_followup = match &followup {
+                    AuditFollowup::Filed(k) => Some(k.as_str()),
+                    _ => None,
+                };
+                if let (Some(fk), Some(ReviewOutcome::Fail(findings)), Some(pr_number)) =
+                    (filed_followup, review, pr.number)
+                {
+                    let findings = format!(
+                        "{findings}\n\nThe uncovered findings are filed as {fk}; this report PR is promoted."
+                    );
+                    if let Err(e) = post_review_findings_on_pr(
+                        forge,
+                        &host,
+                        &job.repo_path,
+                        pr_number,
+                        &job.key,
+                        &findings,
+                    ) {
+                        error!(key = %job.key, pr_number, error = %e, "posting review findings on the PR failed (continuing)");
+                    }
+                }
+                let branch_review = if filed_followup.is_some() {
+                    None
+                } else {
+                    review
+                };
+                match branch_review {
                     None | Some(ReviewOutcome::Pass(_)) => {
                         // Best-effort: a failed promotion does not block the
                         // success outcome, but it is logged and named in the
@@ -5244,10 +5325,13 @@ fn finalize_with_steps(
                             }
                             None => body,
                         };
-                        let body = match review {
-                            Some(ReviewOutcome::Pass(notes)) if !notes.is_empty() => {
+                        let body = match (review, filed_followup) {
+                            (Some(ReviewOutcome::Pass(notes)), _) if !notes.is_empty() => {
                                 format!("{body}\n\n## Review\n\n{notes}")
                             }
+                            (Some(ReviewOutcome::Fail(findings)), Some(fk)) => format!(
+                                "{body}\n\n## Review\n\nThe post-success review found uncovered findings. They are filed as {fk}, queued for the audit agent; the report PR is promoted because it is additive and accurate for what it covers.\n\n{findings}"
+                            ),
                             _ => body,
                         };
                         let body = text_refresh_note(body);
@@ -5336,7 +5420,16 @@ fn finalize_with_steps(
                         // workdir), not a reviewer opinion on the work, so it
                         // always parks for a human rather than feeding the
                         // ordinary attempt-cap-based requeue.
-                        let requeued = !no_verdict && attempts_after < max_attempts_per_key;
+                        // CLAUDE-611: a failed follow-up filing parks for a
+                        // human rather than re-queueing, so a retry cannot
+                        // file a second follow-up beside a half-filed one.
+                        let followup_failure = match &followup {
+                            AuditFollowup::Failed { key, cause } => Some((key.as_deref(), cause)),
+                            _ => None,
+                        };
+                        let requeued = !no_verdict
+                            && followup_failure.is_none()
+                            && attempts_after < max_attempts_per_key;
                         let target = if requeued {
                             &src.states.queued
                         } else {
@@ -5349,6 +5442,15 @@ fn finalize_with_steps(
                             no_verdict,
                             requeued,
                         );
+                        let body = match followup_failure {
+                            Some((Some(fk), cause)) => format!(
+                                "{body}\n\nThe audit review follow-up {fk} was created but not finished: {cause}. It is not queued; finish it by hand."
+                            ),
+                            Some((None, cause)) => format!(
+                                "{body}\n\nThe audit review follow-up issue could not be filed: {cause}."
+                            ),
+                            None => body,
+                        };
                         let body = text_refresh_note(body);
                         let body = push_comment_note(body);
                         let body = append_compaction_note(&body, stream_log, &job.key);
@@ -6589,6 +6691,102 @@ fn review_findings_comment(
         &detail,
     ));
     body
+}
+
+/// CLAUDE-611: the summary prefix the runner writes on an audit review
+/// follow-up issue and reads back as the loop guard: a follow-up's own review
+/// failure must not file another follow-up.
+const AUDIT_FOLLOWUP_SUMMARY_PREFIX: &str = "Audit review follow-up: ";
+
+/// What filing an audit review follow-up came to (CLAUDE-611).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuditFollowup {
+    /// Not an audit run, or the run is itself a follow-up (the loop guard):
+    /// the ordinary draft-and-park disposition applies.
+    NotApplicable,
+    /// The follow-up exists, is tagged, linked and queued.
+    Filed(String),
+    /// Filing stopped partway. `key` is the follow-up when it was already
+    /// created, so the comment can name the issue left half-filed.
+    Failed { key: Option<String>, cause: String },
+}
+
+/// CLAUDE-611: the follow-up issue's Markdown body for `epic`.
+fn audit_followup_description(epic: &str, pr_url: &str, findings: &str) -> String {
+    format!(
+        "## Background\n\nThe post-success review of the audit run for {epic} found hits its report does not cover. The report PR ({pr_url}) was promoted because it is additive and accurate for what it covers; the uncovered hits are filed here.\n\n## Review findings\n\n{findings}\n\n## Task\n\nFile the real finding issues for every uncovered hit above per the audit filing procedure (`prompts/_filing.md` in the audits repository), then update the audit report so it covers them."
+    )
+}
+
+/// CLAUDE-611: file the ONE follow-up issue for an audit review `Fail`
+/// through `backend` (the run-scoped `AuditedTracker`, so the issue-write cap
+/// and attribution apply). Created in the Epic's own project, tagged with the
+/// Epic's `Audit-<Type>` tag so the existing routing picks it up, related to
+/// the Epic, and queued LAST so `audit-run` never sees a half-filed issue.
+/// Every failure is logged here with the Epic key and returned, never dropped.
+fn file_audit_followup(
+    backend: &dyn IssueTracker,
+    src: &YoutrackSource,
+    job: &YoutrackJob,
+    pr_url: &str,
+    findings: &str,
+) -> AuditFollowup {
+    if src.prompt_preset != PromptPreset::Audit {
+        return AuditFollowup::NotApplicable;
+    }
+    if job.summary.starts_with(AUDIT_FOLLOWUP_SUMMARY_PREFIX) {
+        info!(key = %job.key, "audit review failed on a follow-up issue; not filing another (loop guard)");
+        return AuditFollowup::NotApplicable;
+    }
+    let fail = |key: Option<String>, cause: String| {
+        error!(key = %job.key, followup = ?key, cause = %cause, "filing the audit review follow-up failed");
+        AuditFollowup::Failed { key, cause }
+    };
+    let tags = match backend.issue_tags(&job.key) {
+        Ok(t) => t,
+        Err(e) => return fail(None, format!("reading the tags of {} failed: {e}", job.key)),
+    };
+    let Some(audit_tag) = tags
+        .iter()
+        .find(|t| t.to_ascii_lowercase().starts_with("audit-"))
+    else {
+        return fail(
+            None,
+            format!("{} carries no `Audit-<Type>` tag (tags: {tags:?})", job.key),
+        );
+    };
+    let summary = format!(
+        "{AUDIT_FOLLOWUP_SUMMARY_PREFIX}{} report is missing review findings",
+        job.key
+    );
+    let description = audit_followup_description(&job.key, pr_url, findings);
+    let followup = match backend.create_issue(&project_key(&job.key), &summary, &description, None)
+    {
+        Ok(k) => k,
+        Err(e) => return fail(None, format!("creating the follow-up issue failed: {e}")),
+    };
+    if let Err(e) = backend.add_tag(&followup, audit_tag) {
+        return fail(
+            Some(followup),
+            format!("tagging it `{audit_tag}` failed: {e}"),
+        );
+    }
+    if let Err(e) = backend.link_issue(&followup, "relates to", &job.key) {
+        return fail(
+            Some(followup),
+            format!("linking it to {} failed: {e}", job.key),
+        );
+    }
+    if let Err(e) = backend.set_field(&followup, &src.custom_field, &src.states.queued) {
+        return fail(
+            Some(followup),
+            format!(
+                "queueing it ({} = {}) failed: {e}",
+                src.custom_field, src.states.queued
+            ),
+        );
+    }
+    AuditFollowup::Filed(followup)
 }
 
 /// Post `findings` as a comment on PR `pr_number`, through a scratch file
@@ -19288,6 +19486,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -19321,6 +19520,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -19357,6 +19557,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -19394,6 +19595,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -19432,6 +19634,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -19463,6 +19666,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -19492,6 +19696,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(1),
             &scratch.path().join("stream.jsonl"),
@@ -19527,6 +19732,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -19558,6 +19764,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -19596,6 +19803,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -19644,6 +19852,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -19685,6 +19894,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -19735,6 +19945,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -19778,6 +19989,7 @@ mod tests {
             &claude,
             &action_claude_cfg,
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &stream_log,
@@ -19812,7 +20024,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let evidence_path = scratch.path().join("evidence.md");
-        let prompt = build_review_prompt(&job(), dir.path(), &evidence_path);
+        let prompt = build_review_prompt(PromptPreset::Default, &job(), dir.path(), &evidence_path);
         assert!(
             !prompt.contains("{{") && !prompt.contains("}}"),
             "every placeholder must resolve, got:\n{prompt}"
@@ -19831,7 +20043,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let evidence_path = scratch.path().join("evidence.md");
-        let prompt = build_review_prompt(&job(), dir.path(), &evidence_path);
+        let prompt = build_review_prompt(PromptPreset::Default, &job(), dir.path(), &evidence_path);
         assert!(
             prompt.contains(&evidence_path.display().to_string()),
             "the prompt must name the evidence file path, got:\n{prompt}"
@@ -19946,6 +20158,7 @@ mod tests {
             &claude,
             &action::ClaudeBlock::default(),
             &job(),
+            PromptPreset::Default,
             dir.path(),
             Duration::from_secs(30),
             &scratch.path().join("stream.jsonl"),
@@ -20398,6 +20611,444 @@ mod tests {
                 .iter()
                 .any(|c| c == "yt issue set-field MK-16 AI Agent Queued"),
             "below the attempt cap a review fail must requeue, not park: {calls:?}"
+        );
+    }
+
+    /// CLAUDE-611: tracker fake that records every write in order.
+    #[derive(Default)]
+    struct AuditFake {
+        tags: Vec<String>,
+        fail_tag_write: bool,
+        calls: Mutex<Vec<String>>,
+        created: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl AuditFake {
+        fn epic() -> Self {
+            Self {
+                tags: vec!["Audit-Rust".into(), "Other".into()],
+                ..Self::default()
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl IssueTracker for AuditFake {
+        fn list_queued(&self, _q: &str) -> Result<Vec<Value>> {
+            Ok(Vec::new())
+        }
+        fn get_field(&self, _k: &str, _f: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        fn set_field(&self, key: &str, field: &str, value: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_field {key} {field}={value}"));
+            Ok(())
+        }
+        fn set_state(&self, _k: &str, _s: &str) -> Result<()> {
+            Ok(())
+        }
+        fn set_assignee(&self, _k: &str, _l: &str) -> Result<()> {
+            Ok(())
+        }
+        fn comment(&self, key: &str, body: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("comment {key}: {body}"));
+            Ok(())
+        }
+        fn issue_links(&self, _k: &str) -> Result<Vec<IssueLink>> {
+            Ok(Vec::new())
+        }
+        fn inspect_issue(&self, _k: &str) -> Result<provider::IssueInspect> {
+            Ok(provider::IssueInspect::default())
+        }
+        fn resolve_vcs(&self, _p: &str) -> Result<provider::VcsRepo> {
+            unreachable!("not exercised by this test")
+        }
+        fn vcs_repo_map(&self) -> Result<Vec<provider::VcsMapEntry>> {
+            unreachable!("not exercised by this test")
+        }
+        fn create_issue(
+            &self,
+            project: &str,
+            summary: &str,
+            description: &str,
+            _assignee: Option<&str>,
+        ) -> Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("create_issue {project}"));
+            self.created.lock().unwrap().push((
+                project.to_string(),
+                summary.to_string(),
+                description.to_string(),
+            ));
+            Ok("AUD-100".to_string())
+        }
+        fn attach_file(&self, _k: &str, _f: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn add_tag(&self, key: &str, tag: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("add_tag {key} {tag}"));
+            if self.fail_tag_write {
+                return Err(Error::Other(anyhow::anyhow!("tag write failed")));
+            }
+            Ok(())
+        }
+        fn link_issue(&self, key: &str, link_type: &str, target: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("link_issue {key} {link_type} {target}"));
+            Ok(())
+        }
+        fn issue_tags(&self, key: &str) -> Result<Vec<String>> {
+            self.calls.lock().unwrap().push(format!("issue_tags {key}"));
+            Ok(self.tags.clone())
+        }
+    }
+
+    /// CLAUDE-611: forge fake that opens PR 7 and records promotions and
+    /// PR comments.
+    #[derive(Default)]
+    struct ReviewForge {
+        ready: Mutex<Vec<u64>>,
+        pr_comments: Mutex<Vec<String>>,
+    }
+
+    impl Forge for ReviewForge {
+        fn create_pr(
+            &self,
+            _workdir: &Path,
+            _host: &str,
+            _strategy: crate::action::PrStrategy,
+        ) -> Result<PullRequest> {
+            Ok(PullRequest {
+                number: Some(7),
+                url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                head_branch: Some("feat/x".into()),
+                push_comment_failure: None,
+                push_ended_at: None,
+            })
+        }
+        fn mark_pr_ready(&self, _host: &str, _repo: &str, pr_number: u64) -> Result<()> {
+            self.ready.lock().unwrap().push(pr_number);
+            Ok(())
+        }
+        fn clone_url(&self, _host: &str, _repo: &str) -> Result<String> {
+            unreachable!("not exercised by this test")
+        }
+        fn repo_access(&self, _host: &str, _repo: &str) -> Result<()> {
+            unreachable!("not exercised by this test")
+        }
+        fn list_open_prs(
+            &self,
+            _host: &str,
+            _repo: &str,
+        ) -> Result<Vec<provider::ForgePullRequest>> {
+            unreachable!("not exercised by this test")
+        }
+        fn pr_ci_state(&self, _host: &str, _repo: &str, _pr_number: u64) -> Result<String> {
+            unreachable!("not exercised by this test")
+        }
+        fn pr_comment(&self, _host: &str, _repo: &str, _pr: u64, body_file: &Path) -> Result<()> {
+            self.pr_comments
+                .lock()
+                .unwrap()
+                .push(std::fs::read_to_string(body_file).unwrap());
+            Ok(())
+        }
+        fn issue_comment(&self, _h: &str, _r: &str, _n: u64, _f: &Path) -> Result<()> {
+            unreachable!("not exercised by this test")
+        }
+    }
+
+    fn followup_src() -> YoutrackSource {
+        let mut s = src();
+        s.prompt_preset = PromptPreset::Audit;
+        s
+    }
+
+    fn audit_job() -> YoutrackJob {
+        YoutrackJob {
+            key: "AUD-9".into(),
+            summary: "Audit Rust: daily".into(),
+            ..job()
+        }
+    }
+
+    const AUDIT_FINDINGS: &str = "Review: FAIL\na.rs:1 - field x is not covered";
+
+    fn finalize_review_fail(
+        tracker: &dyn IssueTracker,
+        forge: &ReviewForge,
+        src: &YoutrackSource,
+        job: &YoutrackJob,
+    ) -> Finalized {
+        let dir = tempfile::tempdir().unwrap();
+        finalize(
+            tracker,
+            forge,
+            src,
+            job,
+            dir.path(),
+            &ok_result(),
+            crate::action::PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            Some(&ReviewOutcome::Fail(AUDIT_FINDINGS.to_string())),
+            1,
+            3,
+        )
+        .unwrap()
+    }
+
+    /// CLAUDE-611: an audit review Fail files one tagged, linked, queued
+    /// follow-up, promotes the PR, posts the findings on the PR and the issue,
+    /// and moves the Epic to Code Review instead of re-queueing it.
+    #[test]
+    fn audit_review_fail_files_followup_and_promotes() {
+        let tracker = AuditFake::epic();
+        let forge = ReviewForge::default();
+        let res = finalize_review_fail(&tracker, &forge, &followup_src(), &audit_job());
+        assert!(
+            matches!(
+                res,
+                Finalized::CodeReview {
+                    pr_number: Some(7),
+                    merged: false,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        assert_eq!(forge.ready.lock().unwrap().as_slice(), [7]);
+        let pr_comments = forge.pr_comments.lock().unwrap();
+        assert_eq!(pr_comments.len(), 1, "{pr_comments:?}");
+        assert!(pr_comments[0].contains("a.rs:1 - field x is not covered"));
+        assert!(pr_comments[0].contains("AUD-100"));
+
+        let created = tracker.created.lock().unwrap();
+        assert_eq!(created.len(), 1, "exactly one follow-up: {created:?}");
+        let (project, summary, description) = &created[0];
+        assert_eq!(project, "AUD");
+        assert!(
+            summary.starts_with(AUDIT_FOLLOWUP_SUMMARY_PREFIX),
+            "{summary}"
+        );
+        assert!(description.contains("a.rs:1 - field x is not covered"));
+        assert!(description.contains("_filing.md"));
+
+        let calls = tracker.calls();
+        let pos = |needle: &str| {
+            calls
+                .iter()
+                .position(|c| c.starts_with(needle))
+                .unwrap_or_else(|| panic!("missing {needle:?} in {calls:?}"))
+        };
+        assert!(pos("add_tag AUD-100 Audit-Rust") > pos("create_issue AUD"));
+        assert!(pos("link_issue AUD-100 relates to AUD-9") > pos("add_tag AUD-100"));
+        assert!(pos("set_field AUD-100 AI Agent=Queued") > pos("link_issue AUD-100"));
+        assert!(!calls.iter().any(|c| c.contains("subtask of")), "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| c == "set_field AUD-9 AI Agent=Queued"),
+            "the Epic must not be re-queued: {calls:?}"
+        );
+        let epic_comment = calls
+            .iter()
+            .find(|c| c.starts_with("comment AUD-9"))
+            .unwrap();
+        assert!(epic_comment.contains("AUD-100"), "{epic_comment}");
+        assert!(epic_comment.contains("a.rs:1 - field x is not covered"));
+        assert!(
+            calls.contains(&format!(
+                "set_field AUD-9 AI Agent={}",
+                followup_src().states.code_review
+            )),
+            "{calls:?}"
+        );
+    }
+
+    /// CLAUDE-611 loop guard: a follow-up's own review Fail files nothing
+    /// and keeps the draft-and-requeue disposition.
+    #[test]
+    fn audit_review_fail_on_a_followup_files_no_further_followup() {
+        let tracker = AuditFake::epic();
+        let forge = ReviewForge::default();
+        let job = YoutrackJob {
+            summary: format!(
+                "{AUDIT_FOLLOWUP_SUMMARY_PREFIX}AUD-9 report is missing review findings"
+            ),
+            ..audit_job()
+        };
+        let res = finalize_review_fail(&tracker, &forge, &followup_src(), &job);
+        assert!(
+            matches!(res, Finalized::ReviewFailed { requeued: true, .. }),
+            "{res:?}"
+        );
+        assert!(tracker.created.lock().unwrap().is_empty());
+        assert!(
+            forge.ready.lock().unwrap().is_empty(),
+            "the PR stays a draft"
+        );
+    }
+
+    /// CLAUDE-611: a non-audit action's review Fail is unchanged.
+    #[test]
+    fn non_audit_review_fail_is_unchanged() {
+        let tracker = AuditFake::epic();
+        let forge = ReviewForge::default();
+        let res = finalize_review_fail(&tracker, &forge, &src(), &job());
+        assert!(
+            matches!(res, Finalized::ReviewFailed { requeued: true, .. }),
+            "{res:?}"
+        );
+        assert!(tracker.created.lock().unwrap().is_empty());
+        assert!(!tracker.calls().iter().any(|c| c.starts_with("issue_tags")));
+        assert!(forge.ready.lock().unwrap().is_empty());
+        assert_eq!(forge.pr_comments.lock().unwrap().len(), 1);
+    }
+
+    /// CLAUDE-611: an Epic with no `Audit-<Type>` tag cannot be followed up;
+    /// the cause is named, nothing is created, and the issue parks.
+    #[test]
+    fn audit_review_fail_without_an_audit_tag_parks_and_names_the_cause() {
+        let tracker = AuditFake {
+            tags: vec!["Other".into()],
+            ..AuditFake::default()
+        };
+        let forge = ReviewForge::default();
+        let res = finalize_review_fail(&tracker, &forge, &followup_src(), &audit_job());
+        assert!(
+            matches!(
+                res,
+                Finalized::ReviewFailed {
+                    requeued: false,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        assert!(tracker.created.lock().unwrap().is_empty());
+        assert!(forge.ready.lock().unwrap().is_empty());
+        let calls = tracker.calls();
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("comment AUD-9"))
+            .unwrap();
+        assert!(
+            comment.contains("carries no `Audit-<Type>` tag"),
+            "{comment}"
+        );
+    }
+
+    /// CLAUDE-611: the follow-up goes through `AuditedTracker`, so the run's
+    /// issue-creation cap applies and a refusal is surfaced, not swallowed.
+    #[test]
+    fn audit_followup_is_capped_by_the_audited_tracker() {
+        let inner = AuditFake::epic();
+        let tracker = AuditedTracker::new(&inner, IssueWriteAudit::new(None, 0));
+        let forge = ReviewForge::default();
+        let res = finalize_review_fail(&tracker, &forge, &followup_src(), &audit_job());
+        assert!(
+            matches!(
+                res,
+                Finalized::ReviewFailed {
+                    requeued: false,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        assert!(inner.created.lock().unwrap().is_empty());
+        assert!(forge.ready.lock().unwrap().is_empty());
+        let comment = inner
+            .calls()
+            .into_iter()
+            .find(|c| c.starts_with("comment AUD-9"))
+            .unwrap();
+        assert!(comment.contains("could not be filed"), "{comment}");
+    }
+
+    /// CLAUDE-611: a follow-up created but not finished (tag write failed) is
+    /// never queued, is named in the comment, and the Epic parks.
+    #[test]
+    fn audit_followup_partial_failure_is_not_queued_and_is_named() {
+        let tracker = AuditFake {
+            fail_tag_write: true,
+            ..AuditFake::epic()
+        };
+        let forge = ReviewForge::default();
+        let res = finalize_review_fail(&tracker, &forge, &followup_src(), &audit_job());
+        assert!(
+            matches!(
+                res,
+                Finalized::ReviewFailed {
+                    requeued: false,
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
+        let calls = tracker.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("set_field AUD-100")),
+            "a half-filed follow-up must not be queued: {calls:?}"
+        );
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("comment AUD-9"))
+            .unwrap();
+        assert!(
+            comment.contains("AUD-100 was created but not finished"),
+            "{comment}"
+        );
+        assert!(forge.ready.lock().unwrap().is_empty());
+    }
+
+    /// CLAUDE-611: the audit review prompt keeps the read-only contract and
+    /// marker protocol, and asks for `file:line - what is missing` lines.
+    #[test]
+    fn audit_review_prompt_is_read_only_and_names_markers_and_evidence() {
+        let evidence = Path::new("/state/logs/audit-run/streams/review-evidence.md");
+        let p = build_review_prompt(
+            PromptPreset::Audit,
+            &audit_job(),
+            Path::new("/work/AUD-9"),
+            evidence,
+        );
+        assert!(p.contains("READ-ONLY tools: no Edit, no Write"), "{p}");
+        assert!(p.contains("/work/AUD-9/.claude-run-review-pass"), "{p}");
+        assert!(p.contains("/work/AUD-9/.claude-run-review-fail"), "{p}");
+        assert!(p.contains(&evidence.display().to_string()), "{p}");
+        assert!(p.contains("file:line - what is missing"), "{p}");
+        assert!(
+            p.contains("Review: FAIL") && p.contains("Review: PASS"),
+            "{p}"
+        );
+        assert!(
+            !p.contains("{{"),
+            "every placeholder must be substituted: {p}"
+        );
+        let default = build_review_prompt(PromptPreset::Default, &job(), Path::new("/w"), evidence);
+        assert!(
+            !default.contains("what is missing"),
+            "the default prompt is unchanged"
         );
     }
 

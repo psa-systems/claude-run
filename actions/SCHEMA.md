@@ -969,7 +969,10 @@ uncovered hit the sweep finds fails the review on its own; writing neither, both
 workdir (a new commit, or any tracked/untracked change beyond the two marker files) all collapse to no usable
 verdict. A pass promotes the draft PR to ready via `mark_pr_ready` and folds the capped verdict bullets into the
 success comment's own "## Review" section; the classified table stays in the evidence file, served on the run page
-(for a retried review, the retry session's file). A fail leaves the PR a draft, posts the
+(for a retried review, the retry session's file). An audit action (`prompt_preset: audit`, CLAUDE-611) uses its own
+review prompt whose fail marker lines read `file:line - what is missing`, and its fail does not leave the PR a draft:
+the runner files one follow-up issue, promotes the PR, sets `Code Review` and does not re-queue (see
+`docs/conventions/claude-runtime.md`). For every other action, a fail leaves the PR a draft, posts the
 findings on both the PR and the issue, and counts the attempt: below `max_attempts_per_key` it requeues to `Queued`
 (the built-in prompt's resume step, same as a CLAUDE-379/CLAUDE-448 resumed run, tells the agent to read the PR's
 comments and fix what the review found) so the issue leaves the candidate set and must be re-queued by a human

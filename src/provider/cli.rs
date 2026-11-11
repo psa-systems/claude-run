@@ -2317,6 +2317,16 @@ impl IssueTracker for CliBackend {
         self.yt_ok(&["issue", "tag", "add", key, tag, "--create"])?;
         Ok(())
     }
+
+    fn issue_tags(&self, key: &str) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct TagRow {
+            name: String,
+        }
+        let stdout = self.yt_ok(&["issue", "tag", "list", key, "--json"])?;
+        let rows: Vec<TagRow> = Self::parse_json(&self.yt, "yt issue tag list --json", &stdout)?;
+        Ok(rows.into_iter().map(|r| r.name).collect())
+    }
 }
 
 impl Forge for CliBackend {
@@ -3502,6 +3512,19 @@ mod tests {
             "",
         ));
         b.add_tag("CLAUDE-373", "Needs-Info").unwrap();
+    }
+
+    #[test]
+    fn issue_tags_parses_tag_names() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &["issue", "tag", "list", "AUD-7", "--json"],
+            r#"[{"id": "6-1", "name": "Audit-Rust"}, {"id": "6-2", "name": "Needs-Info"}]"#,
+        ));
+        assert_eq!(
+            b.issue_tags("AUD-7").unwrap(),
+            vec!["Audit-Rust".to_string(), "Needs-Info".to_string()]
+        );
     }
 
     #[test]

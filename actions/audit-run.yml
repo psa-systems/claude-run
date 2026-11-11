@@ -26,7 +26,11 @@
 # procedure itself (dedup, grouping, priority, tags, links) lives in the audits repo, `prompts/_filing.md`.
 #
 # `AI Agent` and `State` on the triggering issue remain the runner's alone, so the state machine in `youtrack.yml`'s
-# header applies here unchanged.
+# header applies here, except for the post-success review (CLAUDE-611): the audit preset gets its own review prompt, and
+# a review `Fail` does not leave the PR a draft. The runner files one follow-up issue in the audit project (same
+# `Audit-<Type>` tag, `relates to` the Epic, queued, summary prefix `Audit review follow-up: ` as the loop guard),
+# promotes the PR, and sets the Epic to Code Review, so the report merges and the Epic and the daily parent resolve. If
+# the follow-up cannot be filed, or the failing run is itself a follow-up, the draft-and-park disposition applies.
 #
 # Tag routing: the YouTrack workflow that files a day's audit tags the daily parent and every per-target Epic
 # `Audit-<Type>`, and that tag is what routes them here. This query selects `project: {{audit_project}} tag: Audit-*`;
