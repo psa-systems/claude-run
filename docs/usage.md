@@ -100,10 +100,15 @@ The daemon's TCP web UI (loopback by default; see [Web UI / API auth](auth.md#we
 will want to know about:
 
 - **Landing page** (`/`, signed out). On an instance behind the web login, a signed-out browser at `/` sees a short
-  page describing claude-run, with **Sign in** and a link to the documentation, instead of being sent straight to
-  `/login`. It shows no instance data. Signed in, `/` is the Dashboard; an instance with no account yet still serves
-  only `/setup`. The mascot is a placeholder: replace `assets/mascot.svg` (served at `/static/mascot.svg`) and rebuild
-  to change it. See `SPEC-7.16`.
+  page describing claude-run, with Clarence (the mascot), **Sign in** and a link to the documentation, instead of
+  being sent straight to `/login`. It shows no instance data. Signed in, `/` is the Dashboard; an instance with no
+  account yet still serves only `/setup`. The mascot is `assets/mascot.png` (served at `/static/mascot.png`); replace
+  it and rebuild to change the art. See `SPEC-7.16`.
+- **Favicon, touch icon and brand mark.** Every page links a favicon (`assets/favicon.ico`, served at
+  `/static/favicon.ico`) and an apple touch icon (`assets/apple-touch-icon.png`, served at
+  `/static/apple-touch-icon.png`); the header shows a small brand mark (`assets/brand-mark.png`, served at
+  `/static/brand-mark.png`) before the app name. Unlike the mascot, these three carry no instance data and stay
+  reachable in every gate state, including on `/login` and `/setup` while signed out. See `SPEC-4.3.11`.
 - **Dashboard** (`/`) leads with the conditions that make work stop without anything failing: the global-pause card, the
   24h diagnostics banner (CLAUDE-216 / CLAUDE-235, see "Access check"), the stale-dependency-gate banner
   (CLAUDE-225), and the attempt-cap banner (CLAUDE-232). The diagnostics banner is one line: how many `warn`/`error`
