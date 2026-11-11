@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -35,6 +36,28 @@ const PULL_TIMEOUT_MAX_SECS: u64 = 10;
 const SUMMARY_PAGES_PER_TICK: usize = 20;
 /// How long a claim bypass is counted on the Status page.
 const BYPASS_WINDOW: chrono::Duration = chrono::Duration::hours(24);
+
+/// The prefix every generated peer API key starts with (CLAUDE-636).
+pub const API_KEY_PREFIX: &str = "crk_";
+
+/// Generate a new peer API key: [`API_KEY_PREFIX`] followed by 64 lowercase
+/// hex characters from 32 bytes of randomness. The plaintext is never stored
+/// or logged; only [`hash_api_key`] of it is. CLAUDE-636.
+pub fn generate_api_key() -> Result<String> {
+    let mut b = [0u8; 32];
+    getrandom::getrandom(&mut b)
+        .map_err(|e| Error::Other(anyhow::anyhow!("generating an API key: {e}")))?;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!("{API_KEY_PREFIX}{hex}"))
+}
+
+/// Lowercase hex SHA-256 of `key`, for storage and lookup; never the
+/// plaintext itself. CLAUDE-636.
+pub fn hash_api_key(key: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(key.as_bytes());
+    hex::encode(h.finalize())
+}
 
 /// A random (version 4) UUID in its canonical text form. `SPEC-3.17` item 2.
 pub fn new_uuid_v4() -> Result<String> {
@@ -247,7 +270,7 @@ impl PeerRegistry {
             }
             Err(PullError::Auth(status)) => {
                 let msg = format!(
-                    "peer answered {status}: token mismatch (check this peer's token_ref against the peer's own web auth token)"
+                    "peer answered {status}: token mismatch (check that this peer's token_ref secret holds a key generated in the other instance's API Keys section)"
                 );
                 if !st.auth_fault {
                     error!(peer = %name, status, "{msg}");
@@ -993,13 +1016,35 @@ async fn require_peer_bearer(
     if !s.cfg.read().await.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some(expected) = s.token.as_ref() else {
-        error!("peer API request refused: this instance has no resolved web auth token, so no peer can authenticate");
+    if s.token.is_none() {
+        match crate::state::api_key_any_exists(&s.pool).await {
+            Ok(false) => {
+                error!("peer API request refused: this instance has no resolved web auth token and no API key is configured; generate one in the Secrets page's API Keys section");
+                return unauthorized();
+            }
+            Ok(true) => {}
+            Err(e) => {
+                error!(error = %e, "peer API request refused: checking for a configured API key failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "api key lookup failed")
+                    .into_response();
+            }
+        }
+    }
+    let Some(presented) = bearer(request.headers()) else {
         return unauthorized();
     };
-    match bearer(request.headers()) {
-        Some(p) if constant_time_eq(p.as_bytes(), expected.as_bytes()) => next.run(request).await,
-        _ => unauthorized(),
+    if let Some(expected) = s.token.as_ref() {
+        if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+            return next.run(request).await;
+        }
+    }
+    match crate::state::api_key_touch_if_matches(&s.pool, &hash_api_key(&presented)).await {
+        Ok(true) => next.run(request).await,
+        Ok(false) => unauthorized(),
+        Err(e) => {
+            error!(error = %e, "peer API request refused: looking up the presented key failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "api key lookup failed").into_response()
+        }
     }
 }
 
@@ -1731,6 +1776,64 @@ mod tests {
         let (r, _pool) = api(true, None).await;
         let resp = r.oneshot(get_state(Some("anything"))).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_generated_api_key_authenticates_with_no_legacy_token() {
+        let (r, pool) = api(true, None).await;
+        let key = generate_api_key().unwrap();
+        crate::state::api_key_create(&pool, "peer-b", &hash_api_key(&key))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.clone()
+                .oneshot(get_state(Some("unknown")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let resp = r.oneshot(get_state(Some(&key))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_api_key_stops_authenticating() {
+        let (r, pool) = api(true, None).await;
+        let key = generate_api_key().unwrap();
+        crate::state::api_key_create(&pool, "peer-b", &hash_api_key(&key))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.clone()
+                .oneshot(get_state(Some(&key)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert!(crate::state::api_key_revoke(&pool, "peer-b").await.unwrap());
+        let resp = r.oneshot(get_state(Some(&key))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_token_still_authenticates_alongside_generated_keys() {
+        let (r, pool) = api(true, Some("tok")).await;
+        let key = generate_api_key().unwrap();
+        crate::state::api_key_create(&pool, "peer-b", &hash_api_key(&key))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.clone()
+                .oneshot(get_state(Some("tok")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let resp = r.oneshot(get_state(Some(&key))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

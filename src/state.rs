@@ -2299,6 +2299,16 @@ pub async fn api_key_revoke(pool: &DbPool, name: &str) -> Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
+/// True when at least one API key is configured. CLAUDE-636.
+pub async fn api_key_any_exists(pool: &DbPool) -> Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "SELECT id FROM api_keys LIMIT 1").into_owned(),
+    ))
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
 /// True when `key_hash` matches a stored (non-revoked, since revoke deletes
 /// the row) API key, bumping its `last_used_at` on a match. A database error
 /// is propagated rather than treated as "no match": the peer gate must answer
