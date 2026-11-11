@@ -94,71 +94,22 @@
 
 {# SPEC-3.10 items 9 and 10: the shared Cargo target directories, one row per
    repo, each with its size, last-used time and whether a run for that repo is
-   in flight. Delete and Delete all post to the cargo-cache routes, mirrored
-   under /api the way the Pause form posts to /api/pause, and confirm with the
-   directory's path and size so a click cannot delete the wrong cache by
-   accident. #}
+   in flight. The table itself is slow to compute (a full recursive size of
+   every repo's build cache), so this card renders a loading state and the
+   actual content is pushed in by the `cargo-cache` SSE event below. #}
 <h2>Management</h2>
 
-<div class="card">
-  {% if cargo_cache.is_empty() %}
-    <span class="dim">No shared Cargo target directories yet.</span>
-  {% else %}
-    <table>
-      <thead>
-        <tr>
-          <th>Repo</th>
-          <th>Size</th>
-          <th>Last used</th>
-          <th>Status</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in cargo_cache %}
-        <tr>
-          <td class="mono">{{ row.slug }}</td>
-          <td>{{ row.size_human }}</td>
-          <td>{{ row.last_used|datetime }}</td>
-          <td>
-            {% if row.in_flight %}
-              <span class="badge warn">run in flight</span>
-            {% else %}
-              <span class="dim">idle</span>
-            {% endif %}
-          </td>
-          <td>
-            <form hx-post="/api/status/cargo-cache/{{ row.slug }}/delete"
-                  hx-swap="none"
-                  hx-disabled-elt="find button"
-                  hx-on::after-request="if (event.detail.successful) window.location.reload()"
-                  hx-confirm="Delete the Cargo target directory for `{{ row.slug }}` ({{ row.size_human }})? The next run for this repo rebuilds cold.">
-              <button class="btn" type="submit">Delete</button>
-            </form>
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    <div style="margin-top: 12px;">
-      <form hx-post="/api/status/cargo-cache/delete"
-            hx-swap="none"
-            hx-disabled-elt="find button"
-            hx-on::after-request="if (event.detail.successful) window.location.reload()"
-            hx-confirm="Delete every Cargo target directory ({{ cargo_cache_total_human }} total)? The next run for each repo rebuilds cold.">
-        <button class="btn" type="submit">Delete all</button>
-      </form>
-    </div>
-  {% endif %}
+<div class="card" id="cargo-cache-container">
+  <span class="dim">Loading disk usage...</span>
 </div>
 
 {# SPEC-3.11 item 4: the sidecar Docker storage categories, one row per
    category, each with its size (or "unknown" plus the error when the usage
-   read failed) and a Prune button. Posts to the Docker storage prune route,
-   mirrored under /api the way the Pause and cargo-cache forms are, and
-   confirms with the category's name and size so a click cannot prune the
-   wrong thing by accident. A run in flight refuses with 409; the banner
-   below warns before that round trip. #}
+   read failed) and a Prune button. The "run in flight" warning comes from a
+   cheap read (`docker_run_in_flight`) and renders immediately; the table
+   itself shells out to the sidecar Docker daemon, so it renders a loading
+   state here and the actual content is pushed in by the `docker-storage` SSE
+   event below. #}
 <h3>Docker storage</h3>
 
 <div class="card" style="margin-top: 16px;">
@@ -168,37 +119,60 @@
       Pruning is refused until every run finishes.
     </div>
   {% endif %}
-  <table>
-    <thead>
-      <tr>
-        <th>Category</th>
-        <th>Size</th>
-        <th></th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for row in docker_storage %}
-      <tr>
-        <td>{{ row.label }}</td>
-        <td>
-          {{ row.size_human }}
-          {% if let Some(e) = row.error %}
-            <span class="badge warn" title="{{ e }}">error</span>
-          {% endif %}
-        </td>
-        <td>
-          <form hx-post="/api/status/docker/{{ row.slug }}/prune"
-                hx-swap="none"
-                hx-disabled-elt="find button"
-                hx-on::after-request="if (event.detail.successful) window.location.reload()"
-                hx-confirm="Prune {{ row.label }} ({{ row.size_human }})? This removes every item in the category now.">
-            <button class="btn" type="submit">Prune</button>
-          </form>
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div id="docker-storage-container">
+    <span class="dim">Loading disk usage...</span>
+  </div>
 </div>
+
+<script>
+  // Pushes the two Management tables above once each finishes computing on
+  // the server (CLAUDE-637). One EventSource for both fragments; each named
+  // event swaps its own container and re-runs htmx.process so the Delete /
+  // Delete all / Prune forms inside the swapped-in markup keep working. The
+  // connection closes on `done`, on `pagehide` (so a viewer who leaves does
+  // not keep a read running for nobody), or on tab close/navigation, which is
+  // how the server knows to stop: no viewer, no pending work.
+  (function () {
+    var cargoContainer = document.getElementById('cargo-cache-container');
+    var dockerContainer = document.getElementById('docker-storage-container');
+    var done = false;
+
+    function swap(container, html) {
+      container.innerHTML = html;
+      htmx.process(container);
+    }
+
+    function connectionLost(container) {
+      container.innerHTML =
+        '<span class="dim">Disk usage unavailable: connection lost. <a href="/status">Reload</a></span>';
+    }
+
+    var source = new EventSource('/sse/status/storage');
+
+    source.addEventListener('cargo-cache', function (e) { swap(cargoContainer, e.data); });
+    source.addEventListener('docker-storage', function (e) { swap(dockerContainer, e.data); });
+
+    source.addEventListener('done', function () {
+      done = true;
+      source.close();
+    });
+
+    source.addEventListener('error', function () {
+      if (done) return;
+      if (source.readyState === EventSource.CLOSED) {
+        if (cargoContainer.querySelector('.dim') && cargoContainer.textContent.trim() === 'Loading disk usage...') {
+          connectionLost(cargoContainer);
+        }
+        if (dockerContainer.querySelector('.dim') && dockerContainer.textContent.trim() === 'Loading disk usage...') {
+          connectionLost(dockerContainer);
+        }
+      }
+    });
+
+    window.addEventListener('pagehide', function () {
+      if (!done) source.close();
+    });
+  })();
+</script>
 
 {% endblock %}
