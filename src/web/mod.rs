@@ -59,13 +59,28 @@ const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
 // morph the DOM in place instead of replacing it (preserves selection/scroll).
 const IDIOMORPH_JS: &[u8] = include_bytes!("../../assets/idiomorph-ext.min.js");
 
-/// SPEC-4.3.11/SPEC-7.16: the signed-out landing page's mascot. A placeholder;
-/// replacing `assets/mascot.svg` swaps the art with no other change.
-const MASCOT_SVG: &[u8] = include_bytes!("../../assets/mascot.svg");
+/// SPEC-4.3.11/SPEC-7.16: Clarence, the signed-out landing page's mascot.
+/// Replacing `assets/mascot.png` swaps the art with no other change.
+const MASCOT_PNG: &[u8] = include_bytes!("../../assets/mascot.png");
 
 /// SPEC-7.16: where the landing page's mascot is served. The auth gate lets a
 /// signed-out browser fetch this one asset, and nothing else under `/static/`.
-pub const MASCOT_PATH: &str = "/static/mascot.svg";
+pub const MASCOT_PATH: &str = "/static/mascot.png";
+
+/// SPEC-4.3.11: the favicon (`image/x-icon`), served to every browser whether
+/// signed in or not.
+const FAVICON_ICO: &[u8] = include_bytes!("../../assets/favicon.ico");
+pub const FAVICON_PATH: &str = "/static/favicon.ico";
+
+/// SPEC-4.3.11: the iOS/home-screen touch icon, Clarence's running figure
+/// cropped to a 180px chip.
+const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../../assets/apple-touch-icon.png");
+pub const APPLE_TOUCH_ICON_PATH: &str = "/static/apple-touch-icon.png";
+
+/// SPEC-4.3.11: the header brand mark, the same running-figure chip drawn
+/// small (48px asset, 24px display size).
+const BRAND_MARK_PNG: &[u8] = include_bytes!("../../assets/brand-mark.png");
+pub const BRAND_MARK_PATH: &str = "/static/brand-mark.png";
 
 /// SPEC-4.3: shared handler state (the daemon's `AppState` plus config
 /// paths) threaded through every web UI route.
@@ -208,6 +223,9 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         .route("/static/htmx.min.js", get(htmx_handler))
         .route("/static/idiomorph-ext.min.js", get(idiomorph_handler))
         .route(MASCOT_PATH, get(mascot_handler))
+        .route(FAVICON_PATH, get(favicon_handler))
+        .route(APPLE_TOUCH_ICON_PATH, get(apple_touch_icon_handler))
+        .route(BRAND_MARK_PATH, get(brand_mark_handler))
         .with_state(st)
 }
 
@@ -8124,18 +8142,46 @@ async fn idiomorph_handler() -> Response {
     resp
 }
 
-/// SPEC-4.3.11/SPEC-7.16: serves the landing page's mascot as `image/svg+xml`.
+/// SPEC-4.3.11/SPEC-7.16: serves the landing page's mascot as `image/png`.
 /// A one-day cache rather than immutable, so swapping the file reaches browsers
 /// after an upgrade.
 async fn mascot_handler() -> Response {
-    let mut resp = Response::new(Body::from(MASCOT_SVG));
+    png_response(MASCOT_PNG, 86400)
+}
+
+/// SPEC-4.3.11: serves the favicon as `image/x-icon` with a one-day cache.
+async fn favicon_handler() -> Response {
+    let mut resp = Response::new(Body::from(FAVICON_ICO));
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("image/svg+xml"),
+        HeaderValue::from_static("image/x-icon"),
     );
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=86400"),
+    );
+    resp
+}
+
+/// SPEC-4.3.11: serves the apple touch icon as `image/png` with a one-day cache.
+async fn apple_touch_icon_handler() -> Response {
+    png_response(APPLE_TOUCH_ICON_PNG, 86400)
+}
+
+/// SPEC-4.3.11: serves the header brand mark as `image/png` with a one-day cache.
+async fn brand_mark_handler() -> Response {
+    png_response(BRAND_MARK_PNG, 86400)
+}
+
+/// SPEC-4.3.11: a `image/png` response with a `public, max-age=<seconds>` cache
+/// header, shared by the three PNG icon handlers.
+fn png_response(bytes: &'static [u8], max_age_secs: u64) -> Response {
+    let mut resp = Response::new(Body::from(bytes));
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_str(&format!("public, max-age={max_age_secs}")).unwrap(),
     );
     resp
 }
@@ -8216,21 +8262,63 @@ mod tests {
         render_summary_markdown,
     };
 
-    /// SPEC-7.16: the landing page's mascot is served as SVG from the
+    /// SPEC-7.16: the landing page's mascot is served as PNG from the
     /// binary's embedded copy.
     #[tokio::test]
-    async fn mascot_is_served_as_svg() {
+    async fn mascot_is_served_as_png() {
         let resp = super::mascot_handler().await;
         assert_eq!(
             resp.headers()
                 .get(axum::http::header::CONTENT_TYPE)
                 .unwrap(),
-            "image/svg+xml"
+            "image/png"
         );
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(body.starts_with(b"<svg"));
+        assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    /// SPEC-4.3.11: the favicon and the two PNG icons (apple touch icon,
+    /// header brand mark) are each served with their own content type and a
+    /// one-day cache.
+    #[tokio::test]
+    async fn icons_are_served_with_their_types() {
+        let favicon = super::favicon_handler().await;
+        assert_eq!(
+            favicon
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "image/x-icon"
+        );
+        let favicon_body = axum::body::to_bytes(favicon.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // ICO files start with a zero reserved field and type 1 (icon).
+        assert!(favicon_body.starts_with(b"\x00\x00\x01\x00"));
+
+        for resp in [
+            super::apple_touch_icon_handler().await,
+            super::brand_mark_handler().await,
+        ] {
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .unwrap(),
+                "image/png"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .unwrap(),
+                "public, max-age=86400"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
     }
 
     // ---- summary markdown rendering ----------------------------------------

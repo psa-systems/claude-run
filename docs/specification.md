@@ -1106,7 +1106,8 @@ rotate, delete and check; `/access`; `/settings` with per-section saves and the 
 auth cards; `/reports`; `/status` and `/status/activity`, with `/about` and `/about/activity` redirecting permanently to
 them; `/status/cargo-cache/{repo-slug}/delete` and `/status/cargo-cache/delete`; `/status/docker/{category}/prune`; `/runs/{id}`; `/runs/{id}/jobs/{key}/attempt/{attempt}`;
 `/sse/runs/{id}/jobs/{key}/attempt/{attempt}` (live stream); `/static/htmx.min.js`, `/static/idiomorph-ext.min.js`,
-`/static/mascot.svg`. A signed-out browser at `/` gets the landing page instead of the dashboard (`SPEC-7.16`).
+`/static/mascot.png`, `/static/favicon.ico`, `/static/apple-touch-icon.png`, `/static/brand-mark.png`. A signed-out
+browser at `/` gets the landing page instead of the dashboard (`SPEC-7.16`).
 Auth routes: `/login`, `/login/2fa`, `/logout`, `/setup`, `/account/2fa/setup`, `/invite/{token}`, `/settings/accounts` with
 invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src/auth.rs` are specified separately
 (`SPEC-7`), this section's subsections cover only the pages owned by `src/web/mod.rs`, `src/web/native_forms.rs`,
@@ -1237,8 +1238,12 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
 
 - `/static/htmx.min.js` and `/static/idiomorph-ext.min.js` are served from the binary's own embedded copy, not fetched
   from a CDN, with a one-year immutable cache-control header so the browser never re-requests them.
-- `/static/mascot.svg`, the landing page's art (`SPEC-7.16`), is served the same way from `assets/mascot.svg` with a
-  one-day cache instead, so replacing the file reaches browsers after an upgrade.
+- `/static/mascot.png`, the landing page's art (`SPEC-7.16`), `/static/favicon.ico` (`image/x-icon`),
+  `/static/apple-touch-icon.png` and `/static/brand-mark.png` (`image/png`) are each served the same way from the
+  matching `assets/*` file, with a one-day cache instead of immutable, so replacing a file reaches browsers after an
+  upgrade. The favicon and apple touch icon are linked from every page head; the brand mark is the small running-figure
+  chip shown before the app name in the header. Unlike the mascot, all three are public in every gate state (`SPEC-7.6`):
+  they carry no instance data and are needed on `/login` and `/setup` while signed out.
 
 #### 4.3.12 Web error responses (`SPEC-4.3.12`)
 
@@ -1861,11 +1866,13 @@ appears in a log line or an error message. CI runs its Postgres leg through it
   neither is `401`; a database error while checking the generated key answers `500`, never `401`, since a store
   outage must never read as "wrong credential". This gate is independent of the web/`/api/*` gate above, so a
   generated API key authenticates `/api/peer/*` only and is rejected everywhere else.
-- `/webhooks/`, `/login`, `/login/2fa`, `/logout`, `/setup` and `/invite/*` are exempt from this gate: webhooks
-  authenticate by HMAC (4.4) and cannot carry a bearer header, and the auth routes themselves must stay reachable
-  unauthenticated or there is no way to obtain a credential. `/account/2fa/setup` still requires a valid credential; it
-  is exempt only from the enrollment check in 7.10, not from this gate.
-- A signed-out browser GET of `/` and of `/static/mascot.svg` is the one other exception, and only where a browser
+- `/webhooks/`, `/login`, `/login/2fa`, `/logout`, `/setup`, `/invite/*`, `/static/favicon.ico`,
+  `/static/apple-touch-icon.png` and `/static/brand-mark.png` are exempt from this gate: webhooks authenticate by HMAC
+  (4.4) and cannot carry a bearer header, the auth routes themselves must stay reachable unauthenticated or there is no
+  way to obtain a credential, and the three icon assets carry no instance data and are linked from every page head
+  including `/login` and `/setup`. `/account/2fa/setup` still requires a valid credential; it is exempt only from the
+  enrollment check in 7.10, not from this gate.
+- A signed-out browser GET of `/` and of `/static/mascot.png` is the one other exception, and only where a browser
   login exists (7.16).
 
 ### 7.7 Unconfigured instance (`SPEC-7.7`)
@@ -1953,12 +1960,12 @@ appears in a log line or an error message. CI runs its Postgres leg through it
 ### 7.16 Signed-out landing page (`SPEC-7.16`)
 
 - Where the gate would redirect a signed-out browser to `/login`, a GET of `/` that accepts `text/html` is answered
-  `200` with the landing page instead, and a GET of `/static/mascot.svg` is served. Every other path, `/api/`
+  `200` with the landing page instead, and a GET of `/static/mascot.png` is served. Every other path, `/api/`
   included, keeps its 7.6 behaviour (a browser is redirected to `/login`, anything else is refused with 401), and so
   does a request to `/` that is not a GET or does not accept `text/html`.
-- The page is static: it describes claude-run, links Sign in (`/login`) and the documentation (the `repository` URL
-  from the package metadata), and carries no instance data (no action names, runs, status or version). It needs no
-  JavaScript.
+- The page is static: it describes claude-run, shows Clarence (the mascot) and links Sign in (`/login`) and the
+  documentation (the `repository` URL from the package metadata), and carries no instance data (no action names, runs,
+  status or version). It needs no JavaScript.
 - A signed-in request to `/` is the dashboard, unchanged. An unconfigured instance (7.7) never shows the page: it still
   serves only `/setup`. A gate built with a bearer token and no browser login at all (no `auth_username` and no account
   store; the daemon always attaches the account store, so this is a library-level gate) offers no Sign in, so it shows
