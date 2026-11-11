@@ -971,6 +971,8 @@ pub struct PeerApiState {
     /// The instance's own web bearer token (`SPEC-7.6`); `None` when it did not
     /// resolve, in which case every request is refused.
     pub token: Option<Arc<String>>,
+    /// Keys this instance already dispatched, to flag a late takeover.
+    pub dispatched: DispatchedClaims,
 }
 
 /// `/api/peer/*`: TCP listener only. While peering is disabled every request is
@@ -1082,12 +1084,29 @@ pub struct ClaimResponse {
 
 /// Decide a peer's claim against this instance's `peer_claims` row
 /// (`SPEC-3.17` item 7). Both sides compare the same two `(load, id)` pairs, so
-/// simultaneous deliveries yield exactly one holder.
+/// simultaneous deliveries yield one holder unless a takeover lands after this
+/// instance already dispatched, which is logged at `warn` as a duplicate.
 pub async fn respond_to_claim(
     pool: &DbPool,
+    dispatched: &DispatchedClaims,
     own_id: &str,
     req: &ClaimRequest,
 ) -> Result<ClaimResponse> {
+    let (resp, late_duplicate) = decide_claim(pool, dispatched, own_id, req).await?;
+    if late_duplicate {
+        warn!(event_key = %req.event_key, instance = %own_id, claimant = %req.claimant_id, "late claim takeover: this instance already dispatched the event and the lower-ranked claimant will process it too, so it runs twice");
+    }
+    Ok(resp)
+}
+
+/// [`respond_to_claim`]'s decision; the flag is true when the grant took over
+/// this instance's own row after it had already dispatched the event.
+async fn decide_claim(
+    pool: &DbPool,
+    dispatched: &DispatchedClaims,
+    own_id: &str,
+    req: &ClaimRequest,
+) -> Result<(ClaimResponse, bool)> {
     let grant = ClaimResponse {
         granted: true,
         holder_id: req.claimant_id.clone(),
@@ -1096,7 +1115,7 @@ pub async fn respond_to_claim(
     if crate::state::peer_claim_insert(pool, &req.event_key, &req.claimant_id, req.claimant_load)
         .await?
     {
-        return Ok(grant);
+        return Ok((grant, false));
     }
     let Some(row) = crate::state::peer_claim_get(pool, &req.event_key).await? else {
         return Err(Error::Other(anyhow::anyhow!(
@@ -1110,10 +1129,10 @@ pub async fn respond_to_claim(
         holder_load: row.holder_load,
     };
     if row.holder_id == req.claimant_id {
-        return Ok(grant);
+        return Ok((grant, false));
     }
     if row.holder_id != own_id {
-        return Ok(refuse(row));
+        return Ok((refuse(row), false));
     }
     let own_pair = (row.holder_load, row.holder_id.as_str());
     let their_pair = (req.claimant_load, req.claimant_id.as_str());
@@ -1128,12 +1147,13 @@ pub async fn respond_to_claim(
         .await?
     {
         info!(event_key = %req.event_key, holder = %req.claimant_id, "peer claim granted: the claimant has the lower load, so this instance drops its own delivery");
-        return Ok(grant);
+        let late = dispatched.contains(&req.event_key).await;
+        return Ok((grant, late));
     }
     // Re-read: a concurrent handover may have changed the holder since.
     match crate::state::peer_claim_get(pool, &req.event_key).await? {
-        Some(now_row) if now_row.holder_id == req.claimant_id => Ok(grant),
-        Some(now_row) => Ok(refuse(now_row)),
+        Some(now_row) if now_row.holder_id == req.claimant_id => Ok((grant, false)),
+        Some(now_row) => Ok((refuse(now_row), false)),
         None => Err(Error::Other(anyhow::anyhow!(
             "peer claim row for `{}` vanished during a claim",
             req.event_key
@@ -1156,7 +1176,7 @@ async fn peer_claim(State(s): State<PeerApiState>, Json(req): Json<ClaimRequest>
             return (StatusCode::INTERNAL_SERVER_ERROR, "instance id unavailable").into_response();
         }
     };
-    match respond_to_claim(&s.pool, &own_id, &req).await {
+    match respond_to_claim(&s.pool, &s.dispatched, &own_id, &req).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => {
             error!(event_key = %req.event_key, claimant = %req.claimant_id, error = %e, "peer claim failed");
@@ -1174,6 +1194,35 @@ pub enum ClaimDecision {
     Drop { holder: String },
 }
 
+/// Most event keys [`DispatchedClaims`] remembers. A takeover for a key older
+/// than this many later events cannot still be in flight.
+const DISPATCHED_KEYS_MAX: usize = 4096;
+
+/// The event keys this instance has settled on Proceed for, shared between the
+/// claim step and the peer API so a takeover that lands after dispatch is
+/// recognised (`SPEC-3.17` item 7). Cheap to clone; in process only.
+#[derive(Clone, Default)]
+pub struct DispatchedClaims {
+    keys: Arc<tokio::sync::Mutex<std::collections::VecDeque<String>>>,
+}
+
+impl DispatchedClaims {
+    async fn mark(&self, key: &str) {
+        let mut keys = self.keys.lock().await;
+        if keys.iter().any(|k| k == key) {
+            return;
+        }
+        if keys.len() >= DISPATCHED_KEYS_MAX {
+            keys.pop_front();
+        }
+        keys.push_back(key.to_string());
+    }
+
+    async fn contains(&self, key: &str) -> bool {
+        self.keys.lock().await.iter().any(|k| k == key)
+    }
+}
+
 /// The claim step of the webhook pipeline (`SPEC-3.17` item 7). Cheap to clone.
 #[derive(Clone)]
 pub struct PeerClaims {
@@ -1181,6 +1230,7 @@ pub struct PeerClaims {
     cfg: Arc<RwLock<PeersConfig>>,
     registry: PeerRegistry,
     client: reqwest::Client,
+    dispatched: DispatchedClaims,
 }
 
 impl PeerClaims {
@@ -1190,13 +1240,36 @@ impl PeerClaims {
             cfg,
             registry,
             client: reqwest::Client::new(),
+            dispatched: DispatchedClaims::default(),
         }
+    }
+
+    /// The handle the peer API uses to spot a takeover that lands after this
+    /// instance has already dispatched.
+    pub fn dispatched(&self) -> DispatchedClaims {
+        self.dispatched.clone()
     }
 
     /// Claim `event_key` for this instance. `event_type` names the event for
     /// the log when no key could be built. With peering disabled or no peer
     /// configured this writes nothing and calls no peer.
     pub async fn claim(
+        &self,
+        event_key: Option<&str>,
+        event_type: &str,
+        source: &str,
+        delivery: &str,
+    ) -> ClaimDecision {
+        let decision = self
+            .claim_inner(event_key, event_type, source, delivery)
+            .await;
+        if let (ClaimDecision::Proceed, Some(key)) = (&decision, event_key) {
+            self.dispatched.mark(key).await;
+        }
+        decision
+    }
+
+    async fn claim_inner(
         &self,
         event_key: Option<&str>,
         event_type: &str,
@@ -1523,16 +1596,17 @@ pub(crate) mod testkit {
             ..PeersConfig::default()
         }));
         let token = format!("tok-{name}");
+        let registry = PeerRegistry::default();
+        let claims = PeerClaims::new(pool.clone(), cfg.clone(), registry.clone());
         let app = router(PeerApiState {
             pool: pool.clone(),
             cfg: cfg.clone(),
             token: Some(Arc::new(token.clone())),
+            dispatched: claims.dispatched(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let registry = PeerRegistry::default();
-        let claims = PeerClaims::new(pool.clone(), cfg.clone(), registry.clone());
         Node {
             name: name.into(),
             pool,
@@ -1622,6 +1696,7 @@ mod tests {
             pool: pool.clone(),
             cfg: Arc::new(RwLock::new(cfg)),
             token: token.map(|t| Arc::new(t.to_string())),
+            dispatched: DispatchedClaims::default(),
         });
         (router, pool)
     }
@@ -1830,7 +1905,9 @@ mod tests {
                 a.claims.claim(Some(&key), "failure", "src", "d-a"),
                 b.claims.claim(Some(&key), "failure", "src", "d-b"),
             );
-            assert!(!proceeds(&da) && proceeds(&db), "key {key}: {da:?} {db:?}");
+            // The lower-ranked instance always processes; the other drops
+            // unless a takeover landed after it settled (SPEC-3.17 item 7).
+            assert!(proceeds(&db), "key {key}: {da:?} {db:?}");
         }
     }
 
@@ -1847,8 +1924,9 @@ mod tests {
                 a.claims.claim(Some(&key), "comment", "src", "d-a"),
                 b.claims.claim(Some(&key), "comment", "src", "d-b"),
             );
-            assert_eq!(proceeds(&da), a_wins, "key {key}: {da:?} {db:?}");
-            assert_eq!(proceeds(&db), !a_wins, "key {key}: {da:?} {db:?}");
+            // The winner always processes; see the note on the test above.
+            let winner = if a_wins { &da } else { &db };
+            assert!(proceeds(winner), "key {key}: {da:?} {db:?}");
         }
     }
 
@@ -2032,17 +2110,19 @@ mod tests {
         };
         // No row: grant and record the claimant.
         assert!(
-            respond_to_claim(&pool, "me", &req(3, "x"))
+            respond_to_claim(&pool, &DispatchedClaims::default(), "me", &req(3, "x"))
                 .await
                 .unwrap()
                 .granted
         );
         // The row names a third party: a different claimant is refused.
-        let r = respond_to_claim(&pool, "me", &req(0, "y")).await.unwrap();
+        let r = respond_to_claim(&pool, &DispatchedClaims::default(), "me", &req(0, "y"))
+            .await
+            .unwrap();
         assert!(!r.granted && r.holder_id == "x" && r.holder_load == 3);
         // The same claimant again is granted (idempotent).
         assert!(
-            respond_to_claim(&pool, "me", &req(3, "x"))
+            respond_to_claim(&pool, &DispatchedClaims::default(), "me", &req(3, "x"))
                 .await
                 .unwrap()
                 .granted
@@ -2056,10 +2136,12 @@ mod tests {
             claimant_id: id.into(),
             claimant_load: load,
         };
-        let r = respond_to_claim(&pool, "me", &own(3, "x")).await.unwrap();
+        let r = respond_to_claim(&pool, &DispatchedClaims::default(), "me", &own(3, "x"))
+            .await
+            .unwrap();
         assert!(!r.granted && r.holder_id == "me");
         assert!(
-            respond_to_claim(&pool, "me", &own(1, "x"))
+            respond_to_claim(&pool, &DispatchedClaims::default(), "me", &own(1, "x"))
                 .await
                 .unwrap()
                 .granted
@@ -2069,6 +2151,32 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((row.holder_id.as_str(), row.holder_load), ("x", 1));
+    }
+
+    #[tokio::test]
+    async fn a_takeover_after_dispatch_is_granted_and_flagged_as_a_duplicate() {
+        let pool = crate::db::test_pool().await;
+        let dispatched = DispatchedClaims::default();
+        let req = ClaimRequest {
+            event_key: "late".into(),
+            claimant_id: "x".into(),
+            claimant_load: 1,
+        };
+        for (key, settled) in [("late", true), ("early", false)] {
+            crate::state::peer_claim_insert(&pool, key, "me", 2)
+                .await
+                .unwrap();
+            if settled {
+                dispatched.mark(key).await;
+            }
+            let req = ClaimRequest {
+                event_key: key.into(),
+                ..req.clone()
+            };
+            let (resp, late) = decide_claim(&pool, &dispatched, "me", &req).await.unwrap();
+            assert!(resp.granted, "{key}: the lower-ranked claimant is granted");
+            assert_eq!(late, settled, "{key}: duplicate flag");
+        }
     }
 
     #[tokio::test]
@@ -2563,6 +2671,7 @@ mod summary_tests {
             pool: pool.clone(),
             cfg: Arc::new(RwLock::new(cfg)),
             token: Some(Arc::new("tok".to_string())),
+            dispatched: DispatchedClaims::default(),
         });
         let (st, body) = get_summaries(app.clone(), "?after=0&limit=100", "tok").await;
         assert_eq!(st, StatusCode::OK);

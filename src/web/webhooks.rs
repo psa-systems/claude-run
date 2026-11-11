@@ -12257,14 +12257,18 @@ mod tests {
                 deliver(&p.a.0, &raw, "d-a", None),
                 deliver(&p.b.0, &raw, "d-b", None),
             );
-            assert_eq!((sa, sb), (StatusCode::OK, StatusCode::ACCEPTED));
-            assert!(
-                p.a.1.try_recv().is_err(),
-                "the higher-load instance dropped it"
-            );
+            // The lower-load instance always processes the event; the other
+            // drops it unless a takeover landed after it had settled, which
+            // runs the event twice (SPEC-3.17 item 7).
+            assert_eq!(sb, StatusCode::ACCEPTED, "{sa} {sb}");
             assert!(
                 p.b.1.try_recv().is_ok(),
                 "the lower-load instance processed it"
+            );
+            assert_eq!(
+                (sa == StatusCode::ACCEPTED),
+                p.a.1.try_recv().is_ok(),
+                "the higher-load instance's status matches whether it dispatched"
             );
         }
 
@@ -12278,9 +12282,14 @@ mod tests {
                 deliver(&p.a.0, &raw, "d-a", Some(PULL_REQUEST_EVENT_TYPE)),
                 deliver(&p.b.0, &raw, "d-b", Some(PULL_REQUEST_EVENT_TYPE)),
             );
-            assert_eq!((sa, sb), (StatusCode::ACCEPTED, StatusCode::OK));
+            // See the note on the action-run test above.
+            assert_eq!(sa, StatusCode::ACCEPTED, "{sa} {sb}");
             assert!(p.a.2.try_recv().is_ok());
-            assert!(p.b.2.try_recv().is_err());
+            assert_eq!(
+                (sb == StatusCode::ACCEPTED),
+                p.b.2.try_recv().is_ok(),
+                "the higher-load instance's status matches whether it dispatched"
+            );
         }
 
         #[tokio::test]
