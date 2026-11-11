@@ -1,0 +1,46 @@
+{# SPEC-3.11 item 4, pushed by GET /sse/status/storage's `docker-storage`
+   event (CLAUDE-637): the sidecar Docker storage categories, one row per
+   category, each with its size (or "unknown" plus the error when the usage
+   read failed) and a Prune button. Posts to the Docker storage prune route,
+   mirrored under /api the way the Pause and cargo-cache forms are, and
+   confirms with the category's name and size so a click cannot prune the
+   wrong thing by accident. A run in flight refuses with 409; the "run in
+   flight" banner lives inline on status.html, not in this fragment, since it
+   comes from a cheap read that does not need to wait on this push. `error`
+   here is a whole-read failure (the blocking task itself did not run), never
+   an empty table. #}
+{% if let Some(e) = error %}
+<span class="dim">Disk usage unavailable: {{ e }}</span>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th>Category</th>
+      <th>Size</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in docker_storage %}
+    <tr>
+      <td>{{ row.label }}</td>
+      <td>
+        {{ row.size_human }}
+        {% if let Some(e) = row.error %}
+          <span class="badge warn" title="{{ e }}">error</span>
+        {% endif %}
+      </td>
+      <td>
+        <form hx-post="/api/status/docker/{{ row.slug }}/prune"
+              hx-swap="none"
+              hx-disabled-elt="find button"
+              hx-on::after-request="if (event.detail.successful) window.location.reload()"
+              hx-confirm="Prune {{ row.label }} ({{ row.size_human }})? This removes every item in the category now.">
+          <button class="btn" type="submit">Prune</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}

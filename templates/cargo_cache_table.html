@@ -1,0 +1,60 @@
+{# SPEC-3.10 items 9 and 10, pushed by GET /sse/status/storage's `cargo-cache`
+   event (CLAUDE-637): the shared Cargo target directories, one row per repo,
+   each with its size, last-used time and whether a run for that repo is in
+   flight. Delete and Delete all post to the cargo-cache routes, mirrored
+   under /api the way the Pause form posts to /api/pause, and confirm with
+   the directory's path and size so a click cannot delete the wrong cache by
+   accident. `error` is a whole-read failure (the directory could not be
+   listed at all); it never falls back to "no shared Cargo target
+   directories yet". #}
+{% if let Some(e) = error %}
+<span class="dim">Disk usage unavailable: {{ e }}</span>
+{% else if cargo_cache.is_empty() %}
+<span class="dim">No shared Cargo target directories yet.</span>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th>Repo</th>
+      <th>Size</th>
+      <th>Last used</th>
+      <th>Status</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in cargo_cache %}
+    <tr>
+      <td class="mono">{{ row.slug }}</td>
+      <td>{{ row.size_human }}</td>
+      <td>{{ row.last_used|datetime }}</td>
+      <td>
+        {% if row.in_flight %}
+          <span class="badge warn">run in flight</span>
+        {% else %}
+          <span class="dim">idle</span>
+        {% endif %}
+      </td>
+      <td>
+        <form hx-post="/api/status/cargo-cache/{{ row.slug }}/delete"
+              hx-swap="none"
+              hx-disabled-elt="find button"
+              hx-on::after-request="if (event.detail.successful) window.location.reload()"
+              hx-confirm="Delete the Cargo target directory for `{{ row.slug }}` ({{ row.size_human }})? The next run for this repo rebuilds cold.">
+          <button class="btn" type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<div style="margin-top: 12px;">
+  <form hx-post="/api/status/cargo-cache/delete"
+        hx-swap="none"
+        hx-disabled-elt="find button"
+        hx-on::after-request="if (event.detail.successful) window.location.reload()"
+        hx-confirm="Delete every Cargo target directory ({{ cargo_cache_total_human }} total)? The next run for each repo rebuilds cold.">
+    <button class="btn" type="submit">Delete all</button>
+  </form>
+</div>
+{% endif %}

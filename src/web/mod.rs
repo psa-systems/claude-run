@@ -167,6 +167,10 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         // handler and an activity-query failure cannot be mistaken for idle.
         .route("/status/activity", get(status_activity))
         .route("/about/activity", get(about_activity_redirect))
+        // Pushes the Management part's two slow disk-usage tables once a
+        // viewer is connected (CLAUDE-637). Web listener only, like the
+        // other `/sse` route below; never mounted on the unix socket.
+        .route("/sse/status/storage", get(status_storage_sse))
         // Cargo-cache delete routes (SPEC-3.10 item 10). Posted under `/api`
         // the way the Pause form posts to `/api/pause`, but defined here
         // (not in `api::router`) rather than there so they add no route to
@@ -6523,18 +6527,31 @@ fn cargo_cache_slug_in_flight(inflight_keys: &[String], slug: &str) -> bool {
     })
 }
 
-/// SPEC-3.10 items 9 and 10: list every shared Cargo target directory under
-/// [`cargo_cache_root`], each with its size, last-used time and in-flight
-/// status. A root that does not exist yet (no repo has built there) is an
-/// empty list, not an error.
-async fn cargo_cache_rows(paths: &Paths, pool: &DbPool) -> Result<Vec<CargoCacheRow>, WebError> {
+/// The disk-walk half of [`cargo_cache_rows`]: given the in-flight
+/// concurrency keys already fetched by the one async DB read, lists every
+/// shared Cargo target directory under [`cargo_cache_root`], each with its
+/// size, last-used time and in-flight status. A root that does not exist yet
+/// (no repo has built there) is an empty list, not an error. Split out as its
+/// own sync function so [`status_storage_sse`] can run it on a blocking
+/// thread (`tokio::task::spawn_blocking`) without needing to `.await` inside
+/// that closure.
+fn cargo_cache_rows_sync(
+    paths: &Paths,
+    inflight_keys: &[String],
+) -> Result<Vec<CargoCacheRow>, WebError> {
     let root = cargo_cache_root(paths);
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            tracing::error!(
+                path = %root.display(),
+                error = %e,
+                "Status page: Cargo cache directory read failed"
+            );
+            return Err(e.into());
+        }
     };
-    let inflight_keys = state::all_inflight_concurrency_keys(pool).await?;
     let mut rows = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -6547,7 +6564,7 @@ async fn cargo_cache_rows(paths: &Paths, pool: &DbPool) -> Result<Vec<CargoCache
             .and_then(|m| m.modified())
             .map(|m| chrono::DateTime::<chrono::Utc>::from(m).to_rfc3339())
             .unwrap_or_default();
-        let in_flight = cargo_cache_slug_in_flight(&inflight_keys, &slug);
+        let in_flight = cargo_cache_slug_in_flight(inflight_keys, &slug);
         rows.push(CargoCacheRow {
             slug,
             size_bytes,
@@ -6558,6 +6575,14 @@ async fn cargo_cache_rows(paths: &Paths, pool: &DbPool) -> Result<Vec<CargoCache
     }
     rows.sort_by(|a, b| a.slug.cmp(&b.slug));
     Ok(rows)
+}
+
+/// SPEC-3.10 items 9 and 10: the one async DB read (in-flight concurrency
+/// keys) plus the sync disk walk ([`cargo_cache_rows_sync`]) that together
+/// build the Management part's Cargo-cache rows.
+async fn cargo_cache_rows(paths: &Paths, pool: &DbPool) -> Result<Vec<CargoCacheRow>, WebError> {
+    let inflight_keys = state::all_inflight_concurrency_keys(pool).await?;
+    cargo_cache_rows_sync(paths, &inflight_keys)
 }
 
 // ---- SPEC-3.11 item 4: Docker storage prune (CLAUDE-517) -------------------
@@ -6651,6 +6676,9 @@ struct DockerStorageRow {
 /// querying per category.
 fn docker_storage_rows(client: &dyn crate::gc::DockerVolumeClient) -> Vec<DockerStorageRow> {
     let usage = client.usage();
+    if let Err(e) = &usage {
+        tracing::error!(error = %e, "Status page: Docker storage usage read failed");
+    }
     DockerCategory::ALL
         .into_iter()
         .map(|cat| match &usage {
@@ -6768,21 +6796,20 @@ struct StatusTpl {
     /// The first render of the live indicator; the 2s poll then replaces it
     /// from `/status/activity`.
     activity: ActivityView,
-    /// SPEC-3.10 item 10: the Management part's cargo-cache rows.
-    cargo_cache: Vec<CargoCacheRow>,
-    /// Pre-formatted total, for the Delete all confirmation.
-    cargo_cache_total_human: String,
-    /// SPEC-3.11 item 4: the Management part's Docker storage rows.
-    docker_storage: Vec<DockerStorageRow>,
-    /// Whether any run is in flight, so the Docker storage Prune buttons'
-    /// confirmation can warn before the `409` the server would refuse with
-    /// anyway.
+    /// Whether any run is in flight. Cheap (one DB read), so it stays on the
+    /// first render rather than deferred to `status_storage_sse`: it drives
+    /// the Docker storage "run in flight" warning, shown immediately while
+    /// the Docker storage table itself is still loading.
     docker_run_in_flight: bool,
     /// SPEC-3.17 item 11: `Some` only while peering is enabled.
     peers: Option<Vec<crate::peer::PeerRow>>,
 }
 
-/// SPEC-4.3.9: the `/status` page handler.
+/// SPEC-4.3.9: the `/status` page handler. Renders immediately with the
+/// cheap reads only: the Management part's two slow disk-usage tables
+/// (`cargo_cache_rows`, `docker_storage_rows`, `crate::gc::dir_size`) are not
+/// called here. They are pushed separately once a viewer is connected to
+/// `status_storage_sse` (CLAUDE-637).
 async fn status_page(State(s): State<WebState>) -> Result<Response, WebError> {
     let global_pause = state::global_pause_status(&s.api.pool)
         .await?
@@ -6790,11 +6817,6 @@ async fn status_page(State(s): State<WebState>) -> Result<Response, WebError> {
             paused_at: a,
             reason: r,
         });
-    let cargo_cache = cargo_cache_rows(&s.paths, &s.api.pool).await?;
-    let cargo_cache_total_human =
-        human_bytes(cargo_cache.iter().map(|r| r.size_bytes).sum::<u64>());
-    let docker_storage =
-        crate::blocking::in_place(|| docker_storage_rows(&crate::gc::CliDockerVolumeClient));
     let docker_run_in_flight = !crate::api::activity(&s.api.pool, &s.api.in_flight)
         .await?
         .quiet;
@@ -6809,13 +6831,153 @@ async fn status_page(State(s): State<WebState>) -> Result<Response, WebError> {
         version: s.api.version,
         global_pause,
         activity: activity_view(&s).await,
-        cargo_cache,
-        cargo_cache_total_human,
-        docker_storage,
         docker_run_in_flight,
         peers,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
+}
+
+/// SPEC-4.3.9 / SPEC-3.10 item 10: the Management part's Cargo-cache
+/// fragment, pushed by `status_storage_sse` as the `cargo-cache` event.
+/// `error` carries a whole-read failure (the directory could not be listed at
+/// all); there is no per-row "unknown" the way Docker storage has one,
+/// because `crate::gc::dir_size` is best-effort and never fails for a single
+/// directory.
+#[derive(Template)]
+#[template(path = "cargo_cache_table.html")]
+struct CargoCacheTpl {
+    cargo_cache: Vec<CargoCacheRow>,
+    /// Pre-formatted total, for the Delete all confirmation.
+    cargo_cache_total_human: String,
+    error: Option<String>,
+}
+
+/// Render the `cargo-cache` SSE fragment from a [`cargo_cache_rows`] result.
+/// The read's own failure is already logged at its source
+/// (`cargo_cache_rows_sync`, `state::all_inflight_concurrency_keys`); this
+/// only turns the result into the fragment's HTML.
+fn render_cargo_cache_fragment(result: Result<Vec<CargoCacheRow>, WebError>) -> String {
+    let tpl = match result {
+        Ok(cargo_cache) => {
+            let cargo_cache_total_human =
+                human_bytes(cargo_cache.iter().map(|r| r.size_bytes).sum::<u64>());
+            CargoCacheTpl {
+                cargo_cache,
+                cargo_cache_total_human,
+                error: None,
+            }
+        }
+        Err(e) => CargoCacheTpl {
+            cargo_cache: Vec::new(),
+            cargo_cache_total_human: String::new(),
+            error: Some(e.message),
+        },
+    };
+    tpl.render()
+        .unwrap_or_else(|e| format!("template error: {e}"))
+}
+
+/// SPEC-4.3.9 / SPEC-3.11 item 4: the Management part's Docker storage
+/// fragment (just the table; the "run in flight" warning stays inline on
+/// `status.html`, not deferred), pushed by `status_storage_sse` as the
+/// `docker-storage` event. `error` is a whole-read failure (the blocking task
+/// itself failed to run); a single category's Docker API failure instead
+/// shows "unknown" plus an `error` badge on that row
+/// (`DockerStorageRow::error`, set by `docker_storage_rows`, which also logs
+/// it), not this field.
+#[derive(Template)]
+#[template(path = "docker_storage_table.html")]
+struct DockerStorageTpl {
+    docker_storage: Vec<DockerStorageRow>,
+    error: Option<String>,
+}
+
+/// Render the `docker-storage` SSE fragment.
+fn render_docker_storage_fragment(result: Result<Vec<DockerStorageRow>, String>) -> String {
+    let tpl = match result {
+        Ok(docker_storage) => DockerStorageTpl {
+            docker_storage,
+            error: None,
+        },
+        Err(e) => DockerStorageTpl {
+            docker_storage: Vec::new(),
+            error: Some(e),
+        },
+    };
+    tpl.render()
+        .unwrap_or_else(|e| format!("template error: {e}"))
+}
+
+/// SPEC-4.3.10: `GET /sse/status/storage` pushes the Status page's two slow
+/// Management reads (SPEC-3.10 item 10, SPEC-3.11 item 4) to a connected
+/// viewer as each finishes, then closes with a `done` event. Mounted only on
+/// the web router, not the unix socket, like the other `/status` controls
+/// (CLAUDE-637). Both reads are started only by this connection, never by a
+/// timer; a viewer who navigates away drops the connection, which drops this
+/// stream future (and the two spawned tasks it is still awaiting go on
+/// running to completion on their own threads, but their results are never
+/// sent anywhere once this future is gone).
+async fn status_storage_sse(
+    State(s): State<WebState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    status_storage_sse_stream(
+        s.paths.clone(),
+        s.api.pool.clone(),
+        std::sync::Arc::new(crate::gc::CliDockerVolumeClient),
+    )
+}
+
+/// The body of [`status_storage_sse`], with the Docker client injected so a
+/// test can swap in a fake rather than reach the real, reachable sidecar
+/// daemon the way the Docker storage prune route's own tests do.
+fn status_storage_sse_stream(
+    paths: Paths,
+    pool: DbPool,
+    docker_client: std::sync::Arc<dyn crate::gc::DockerVolumeClient + Send + Sync>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let mut cargo_task =
+        tokio::spawn(
+            async move { render_cargo_cache_fragment(cargo_cache_rows(&paths, &pool).await) },
+        );
+    let mut docker_task =
+        tokio::task::spawn_blocking(move || docker_storage_rows(docker_client.as_ref()));
+
+    let stream = async_stream::stream! {
+        let mut cargo_done = false;
+        let mut docker_done = false;
+        while !cargo_done || !docker_done {
+            tokio::select! {
+                res = &mut cargo_task, if !cargo_done => {
+                    cargo_done = true;
+                    let html = match res {
+                        Ok(html) => html,
+                        Err(e) => {
+                            tracing::error!(error = %e, "Status page: Cargo cache read task failed");
+                            render_cargo_cache_fragment(Err(WebError {
+                                status: StatusCode::INTERNAL_SERVER_ERROR,
+                                message: e.to_string(),
+                            }))
+                        }
+                    };
+                    yield Ok(Event::default().event("cargo-cache").data(html));
+                }
+                res = &mut docker_task, if !docker_done => {
+                    docker_done = true;
+                    let html = match res {
+                        Ok(rows) => render_docker_storage_fragment(Ok(rows)),
+                        Err(e) => {
+                            tracing::error!(error = %e, "Status page: Docker storage read task failed");
+                            render_docker_storage_fragment(Err(e.to_string()))
+                        }
+                    };
+                    yield Ok(Event::default().event("docker-storage").data(html));
+                }
+            }
+        }
+        yield Ok(Event::default().event("done").data(""));
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// Permanent redirect from the pre-rename `/about` to `/status`.
@@ -13683,7 +13845,8 @@ mod tests {
     mod status {
         use super::super::{
             about_activity_redirect, about_redirect, cargo_cache_delete_all,
-            cargo_cache_delete_one, status_activity, status_page, WebState,
+            cargo_cache_delete_one, cargo_cache_rows_sync, render_cargo_cache_fragment,
+            render_docker_storage_fragment, status_activity, status_page, WebState,
         };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
@@ -13829,6 +13992,26 @@ mod tests {
             let resp = about_activity_redirect().await.into_response();
             assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
             assert_eq!(resp.headers().get("location").unwrap(), "/status/activity");
+        }
+
+        /// CLAUDE-637: `status_page` renders the Management part's loading
+        /// state and never walks the Cargo cache root or touches the Docker
+        /// client itself: a fixture cache directory's slug is absent from
+        /// the first response, which is pushed separately by
+        /// `status_storage_sse`.
+        #[tokio::test]
+        async fn status_page_defers_disk_usage_to_the_sse_push() {
+            let tmp = tempfile::tempdir().unwrap();
+            make_cargo_cache_dir(tmp.path(), "owner__repo-a", 2048);
+            let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
+            let body = body_string(status_page(State(s)).await.unwrap()).await;
+            assert!(!body.contains("owner__repo-a"), "{body}");
+            assert_eq!(
+                body.matches(r#"<span class="dim">Loading disk usage...</span>"#)
+                    .count(),
+                2,
+                "expected one loading placeholder for each Management table: {body}"
+            );
         }
 
         /// A helper that creates `<data_dir>/cache/cargo-target/<slug>` with
@@ -14149,6 +14332,91 @@ mod tests {
             .unwrap_err();
             assert_eq!(err.status, StatusCode::CONFLICT);
             assert!(err.message.contains("in flight"), "{}", err.message);
+        }
+
+        // ---- CLAUDE-637: pushed disk usage (`/sse/status/storage`) --------
+
+        /// A Cargo cache root that cannot be listed at all (not merely
+        /// absent) yields the fragment's whole-read error, never the
+        /// "no shared Cargo target directories yet" empty-table message.
+        #[tokio::test]
+        async fn cargo_cache_read_failure_shows_error_not_empty_table() {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = crate::config::Paths {
+                config_dir: tmp.path().join("config"),
+                data_dir: tmp.path().join("data"),
+                state_dir: tmp.path().join("state"),
+                runtime_dir: tmp.path().join("runtime"),
+            };
+            let cache_dir = paths.data_dir.join("cache");
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            // A plain file where the Cargo cache root directory should be:
+            // `read_dir` fails with "not a directory", not `NotFound`, so
+            // the whole-read error path is exercised rather than the
+            // empty-root case already covered by
+            // `management_part_is_empty_with_no_cargo_cache_dir_yet`.
+            std::fs::write(cache_dir.join("cargo-target"), b"not a directory").unwrap();
+
+            let result = cargo_cache_rows_sync(&paths, &[]);
+            assert!(result.is_err());
+
+            let html = render_cargo_cache_fragment(result);
+            assert!(html.contains("Disk usage unavailable"), "{html}");
+            assert!(
+                !html.contains("No shared Cargo target directories yet"),
+                "{html}"
+            );
+        }
+
+        /// The Docker storage fragment's own whole-read failure (the
+        /// `spawn_blocking` task itself failing, not a single category's
+        /// usage read) renders the same error message, never an empty
+        /// table.
+        #[tokio::test]
+        async fn docker_storage_read_failure_shows_error_not_empty_table() {
+            let html = render_docker_storage_fragment(Err("docker usage task failed".to_string()));
+            assert!(html.contains("Disk usage unavailable"), "{html}");
+            assert!(html.contains("docker usage task failed"), "{html}");
+            assert!(!html.contains("<table>"), "{html}");
+        }
+
+        /// `GET /sse/status/storage` pushes a `cargo-cache` event and a
+        /// `docker-storage` event, each carrying its fragment, followed by
+        /// `done`. The Docker read is a fake, the same way the prune route's
+        /// own tests are, so this never shells out to the real, reachable
+        /// sidecar daemon that a CI job container's `DOCKER_HOST` points at.
+        #[tokio::test]
+        async fn sse_storage_emits_both_fragments_then_done() {
+            let tmp = tempfile::tempdir().unwrap();
+            make_cargo_cache_dir(tmp.path(), "owner__repo-a", 16);
+            let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
+
+            let resp = super::super::status_storage_sse_stream(
+                s.paths.clone(),
+                s.api.pool.clone(),
+                std::sync::Arc::new(FakeDockerStorageClient {
+                    usage: Ok(crate::gc::DockerUsage::default()),
+                    build_cache_result: Ok(0),
+                }),
+            )
+            .into_response();
+            let body = tokio::time::timeout(std::time::Duration::from_secs(10), body_string(resp))
+                .await
+                .expect("SSE stream did not close after its done event");
+
+            let cargo_pos = body
+                .find("event: cargo-cache")
+                .unwrap_or_else(|| panic!("missing cargo-cache event: {body}"));
+            let docker_pos = body
+                .find("event: docker-storage")
+                .unwrap_or_else(|| panic!("missing docker-storage event: {body}"));
+            let done_pos = body
+                .find("event: done")
+                .unwrap_or_else(|| panic!("missing done event: {body}"));
+            assert!(done_pos > cargo_pos, "{body}");
+            assert!(done_pos > docker_pos, "{body}");
+            assert!(body.contains("owner__repo-a"), "{body}");
+            assert!(body.contains("Stopped containers"), "{body}");
         }
     }
 
