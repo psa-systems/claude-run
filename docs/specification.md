@@ -668,14 +668,16 @@ dependency. Runs of the same repo share one compiled-dependency cache instead.
    own build cache (9). This requirement does not change them.
 9. **Visibility.** A run's start log line names the `CARGO_TARGET_DIR` it was given. The Status page (4.3) lists each
    repo directory with its size and last-used time.
-10. **Management.** The Status page has a Management part listing each directory with its size, last-used time and
-    whether a run for that repo is in flight. Each row has a Delete button, and a Delete all button covers every row;
-    both ask for confirmation naming the directory and its size. A delete is a `POST` (`/status/cargo-cache/{repo-slug}/delete`
-    and `/status/cargo-cache/delete`, mirrored under `/api` as the UI's own buttons use it, 4.2). While a run for the repo
+10. **Management.** The Status page's Management part lists each directory with its size, last-used time and whether a
+    run for that repo is in flight. `GET /status` itself never walks these directories; the table renders a loading
+    state on first paint and the actual rows are pushed to a connected viewer once computed, over `/sse/status/storage`
+    (4.3.10). Each row has a Delete button, and a Delete all button covers every row; both ask for confirmation naming
+    the directory and its size. A delete is a `POST` (`/status/cargo-cache/{repo-slug}/delete` and
+    `/status/cargo-cache/delete`, mirrored under `/api` as the UI's own buttons use it, 4.2). While a run for the repo
     is in flight the delete is refused with `409` and the page shows the refusal where the person clicked. Each delete
     is logged at `info` with the repo, path and bytes reclaimed; an I/O failure is logged at `error` and shown on the
-    page. The controls need the same authentication as the other Status page controls and add no route to the unix
-    socket.
+    page, never as an empty table. The controls need the same authentication as the other Status page controls and add
+    no route to the unix socket.
 
 ### 3.11 Sidecar Docker storage (`SPEC-3.11`)
 
@@ -693,10 +695,12 @@ volume (9). Only unreferenced named volumes were bounded before this requirement
 3. **Logging.** Each step logs the category, bytes reclaimed, and the size before and after. A failed step logs at
    `error` and the pass continues with the next step; a failed pass is never reported as clean.
 4. **Management.** The Status page's Management part (3.10 item 10) has one row per category with its size and a Prune
-   button. A prune is a `POST` (`/status/docker/{category}/prune`, mirrored under `/api` as the UI's own buttons use it,
-   4.2), refused with `409` while any run is in flight because any run may be using the sidecar, and shown where the
-   person clicked. It logs bytes reclaimed at `info`; a failure is logged at `error` and shown. It needs the same
-   authentication as the other Status controls and adds no route to the unix socket.
+   button. This table is also one of the two pushed, not rendered on `GET /status` itself (3.10 item 10, 4.3.10): a
+   loading state renders first and the rows arrive over `/sse/status/storage` once the usage read completes. A prune
+   is a `POST` (`/status/docker/{category}/prune`, mirrored under `/api` as the UI's own buttons use it, 4.2), refused
+   with `409` while any run is in flight because any run may be using the sidecar, and shown where the person clicked.
+   It logs bytes reclaimed at `info`; a failure is logged at `error` and shown. It needs the same authentication as the
+   other Status controls and adds no route to the unix socket.
 5. **Scope.** The runner never removes an image, container or volume that a running container references, never uses a
    prune command that needs a force flag to skip its confirmation (removal is by explicit id from a listing), and never
    touches the app's own `/data`, `/config` or `/state` volumes.
@@ -1190,7 +1194,8 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
 
 - `/about` and `/about/activity` render the version, build metadata and the same `quiet` restart-safety flag `GET
   /api/status` exposes (`SPEC-9`), plus a recent-activity feed across all actions. With peering enabled the Status page
-  also lists each peer (`SPEC-3.17` item 11).
+  also lists each peer (`SPEC-3.17` item 11). The Management part's two disk-usage tables (3.10 item 10, 3.11 item 4)
+  render a loading state on this first paint; their rows are pushed separately once computed (4.3.10).
 
 #### 4.3.10 Run detail, job stream and live SSE (`SPEC-4.3.10`)
 
@@ -1207,6 +1212,15 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
 - Each SSE line carries a server-formatted `ts_fmt` alongside its raw `ts` (the browser cannot run the daemon's
   strftime), honoring the operator's configured locale/timezone/datetime format (`SPEC-6.3`); a line that is not a JSON
   object, or carries no string `ts`, passes through unchanged.
+- `/sse/status/storage`, mounted on the web router only (never the unix socket), pushes the Status page's two slow
+  Management reads (3.10 item 10, 3.11 item 4) to a connected viewer. On connect it starts the Cargo cache directory
+  walk and the Docker storage usage read independently, each as its own task, and emits one named event per read as it
+  finishes (`cargo-cache`, `docker-storage`), each carrying a server-rendered HTML fragment, then a `done` event before
+  closing. The two reads are started only by this connection, never by a timer, so an unattended daemon walks neither
+  directory for this page. A viewer who navigates away drops the connection, which drops the stream future; no further
+  event is produced for that viewer. A failed read (the Cargo directory unreadable, the Docker usage read failing)
+  still emits its named event, carrying an error fragment naming the cause instead of an empty table, and logs at
+  `error`.
 
 #### 4.3.11 Static assets (`SPEC-4.3.11`)
 
