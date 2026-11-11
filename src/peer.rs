@@ -1836,6 +1836,67 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// CLAUDE-636: the full flow the Secrets page's API Keys section exists
+    /// for. B has accounts and no `auth_token_ref` (`token: None`); A has
+    /// never generated a token for B either, so the only credential in play
+    /// is the key B's operator generates and A's operator pastes into a
+    /// secret named by `peers[].token_ref`, with no `config.toml` edit and no
+    /// restart of either instance.
+    #[tokio::test]
+    async fn two_instances_peer_end_to_end_with_a_generated_api_key() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+
+        // Instance B: peering enabled, no legacy token, one generated key.
+        let pool_b = crate::db::test_pool().await;
+        let b_id = crate::settings::ensure_instance_id(&pool_b).await.unwrap();
+        let cfg_b = Arc::new(RwLock::new(PeersConfig {
+            enabled: true,
+            instance_name: "b".into(),
+            ..PeersConfig::default()
+        }));
+        let app_b = router(PeerApiState {
+            pool: pool_b.clone(),
+            cfg: cfg_b,
+            token: None,
+            dispatched: DispatchedClaims::default(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app_b).await.unwrap() });
+
+        let generated = generate_api_key().unwrap();
+        crate::state::api_key_create(&pool_b, "a", &hash_api_key(&generated))
+            .await
+            .unwrap();
+
+        // Instance A: the operator pastes B's generated key into the secret
+        // named by `peers[].token_ref` for peer "b" (`b-token`, per `peer()`
+        // above), exactly as the issue's acceptance criterion describes.
+        let pool_a = crate::db::test_pool().await;
+        let a_id = crate::settings::ensure_instance_id(&pool_a).await.unwrap();
+        let key = crate::secrets::SecretsKey::load().unwrap();
+        crate::state::secret_create(&pool_a, "b-token", &key.encrypt(&generated).unwrap())
+            .await
+            .unwrap();
+        let cfg_a = cfg_for(vec![peer("b", &addr_b)]);
+        let reg_a = PeerRegistry::default();
+        let mut tokens = HashMap::new();
+        tokens.insert("b".to_string(), Ok(generated.clone()));
+        poll_with_tokens(&cfg_a, &reg_a, &reqwest::Client::new(), &a_id, tokens).await;
+
+        let rows = reg_a.rows(&cfg_a, Utc::now());
+        assert_eq!(rows[0].name, "b");
+        assert_eq!(rows[0].state, PeerState::Reachable, "{rows:?}");
+        assert_eq!(reg_a.peer_instance_id("b"), Some(b_id));
+
+        // `last_used_at` on B's key row proves the presented bearer, not the
+        // (absent) legacy token, is what authenticated the pull.
+        let b_keys = crate::state::api_key_list(&pool_b).await.unwrap();
+        assert!(b_keys[0].last_used_at.is_some());
+    }
+
     #[tokio::test]
     async fn peer_state_lists_an_open_runs_in_flight_job() {
         let (r, pool) = api(true, Some("tok")).await;
