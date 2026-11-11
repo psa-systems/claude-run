@@ -6920,15 +6920,27 @@ fn render_docker_storage_fragment(result: Result<Vec<DockerStorageRow>, String>)
 async fn status_storage_sse(
     State(s): State<WebState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let paths = s.paths.clone();
-    let pool = s.api.pool.clone();
+    status_storage_sse_stream(
+        s.paths.clone(),
+        s.api.pool.clone(),
+        std::sync::Arc::new(crate::gc::CliDockerVolumeClient),
+    )
+}
 
+/// The body of [`status_storage_sse`], with the Docker client injected so a
+/// test can swap in a fake rather than reach the real, reachable sidecar
+/// daemon the way the Docker storage prune route's own tests do.
+fn status_storage_sse_stream(
+    paths: Paths,
+    pool: DbPool,
+    docker_client: std::sync::Arc<dyn crate::gc::DockerVolumeClient + Send + Sync>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut cargo_task =
         tokio::spawn(
             async move { render_cargo_cache_fragment(cargo_cache_rows(&paths, &pool).await) },
         );
     let mut docker_task =
-        tokio::task::spawn_blocking(|| docker_storage_rows(&crate::gc::CliDockerVolumeClient));
+        tokio::task::spawn_blocking(move || docker_storage_rows(docker_client.as_ref()));
 
     let stream = async_stream::stream! {
         let mut cargo_done = false;
@@ -13834,8 +13846,7 @@ mod tests {
         use super::super::{
             about_activity_redirect, about_redirect, cargo_cache_delete_all,
             cargo_cache_delete_one, cargo_cache_rows_sync, render_cargo_cache_fragment,
-            render_docker_storage_fragment, status_activity, status_page, status_storage_sse,
-            WebState,
+            render_docker_storage_fragment, status_activity, status_page, WebState,
         };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
@@ -14371,16 +14382,24 @@ mod tests {
 
         /// `GET /sse/status/storage` pushes a `cargo-cache` event and a
         /// `docker-storage` event, each carrying its fragment, followed by
-        /// `done`. `DOCKER_HOST` is unset in the test process, so the Docker
-        /// read fails fast (`gc::CliDockerVolumeClient::usage`) rather than
-        /// shelling out or blocking on a network call.
+        /// `done`. The Docker read is a fake, the same way the prune route's
+        /// own tests are, so this never shells out to the real, reachable
+        /// sidecar daemon that a CI job container's `DOCKER_HOST` points at.
         #[tokio::test]
         async fn sse_storage_emits_both_fragments_then_done() {
             let tmp = tempfile::tempdir().unwrap();
             make_cargo_cache_dir(tmp.path(), "owner__repo-a", 16);
             let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
 
-            let resp = status_storage_sse(State(s)).await.into_response();
+            let resp = super::super::status_storage_sse_stream(
+                s.paths.clone(),
+                s.api.pool.clone(),
+                std::sync::Arc::new(FakeDockerStorageClient {
+                    usage: Ok(crate::gc::DockerUsage::default()),
+                    build_cache_result: Ok(0),
+                }),
+            )
+            .into_response();
             let body = tokio::time::timeout(std::time::Duration::from_secs(10), body_string(resp))
                 .await
                 .expect("SSE stream did not close after its done event");
