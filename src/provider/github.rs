@@ -4640,7 +4640,10 @@ mod tests {
             .pr_comment("github.com", "octo/widget", 42, Path::new("/tmp/b.md"))
             .is_err());
 
-        assert_eq!(runner.calls.lock().unwrap().len(), 4);
+        // CLAUDE-630: mark_pr_ready now reads the prior draft state before
+        // the write, so one extra (unstubbed, failing) read call is expected
+        // alongside the four writes.
+        assert_eq!(runner.calls.lock().unwrap().len(), 5);
     }
 
     /// `gh pr create` is a write (CLAUDE-407): a failed open runs exactly
