@@ -1092,6 +1092,24 @@ pub async fn respond_to_claim(
         holder_id: req.claimant_id.clone(),
         holder_load: req.claimant_load,
     };
+    // Our own claim step for this exact key may be mid-flight with no row
+    // written yet. Granting the inbound claimant outright here would race
+    // our own insert and, since a granted row is final, the loser of that
+    // race would wrongly settle the tie instead of the lower `(load, id)`
+    // pair. Weigh precedence now so the trivial grant below only fires when
+    // there is truly no contender.
+    if dispatched.is_pending(&req.event_key) {
+        let own_load = crate::state::run_inflight_count(pool).await?;
+        let own_pair = (own_load, own_id);
+        let their_pair = (req.claimant_load, req.claimant_id.as_str());
+        if own_pair < their_pair {
+            return Ok(ClaimResponse {
+                granted: false,
+                holder_id: own_id.to_string(),
+                holder_load: own_load,
+            });
+        }
+    }
     if crate::state::peer_claim_insert(pool, &req.event_key, &req.claimant_id, req.claimant_load)
         .await?
     {
@@ -1192,6 +1210,11 @@ const DISPATCHED_KEYS_MAX: usize = 4096;
 #[derive(Clone, Default)]
 pub struct DispatchedClaims {
     keys: Arc<tokio::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// Event keys this instance's own claim step is currently negotiating,
+    /// set before its first DB write so an inbound claim for the same key
+    /// that reaches the brand-new-row grant first still yields to precedence
+    /// instead of winning the race outright.
+    pending: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DispatchedClaims {
@@ -1204,6 +1227,33 @@ impl DispatchedClaims {
             keys.pop_front();
         }
         keys.push_back(key.to_string());
+    }
+
+    /// Record `key` as being negotiated by our own claim step until the
+    /// returned guard drops (every return path of [`PeerClaims::claim`]).
+    fn begin_pending(&self, key: &str) -> PendingGuard {
+        self.pending.lock().unwrap().insert(key.to_string());
+        PendingGuard {
+            pending: self.pending.clone(),
+            key: key.to_string(),
+        }
+    }
+
+    fn is_pending(&self, key: &str) -> bool {
+        self.pending.lock().unwrap().contains(key)
+    }
+}
+
+/// Clears a [`DispatchedClaims::begin_pending`] entry when the claim step
+/// that started it returns, on every path.
+struct PendingGuard {
+    pending: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.key);
     }
 }
 
@@ -1257,6 +1307,11 @@ impl PeerClaims {
             );
             return ClaimDecision::Proceed;
         };
+        // Held until this call returns on any path: an inbound claim for the
+        // same key that beats our own insert still has to weigh our (load,
+        // id) pair instead of granting on an empty row (`contend_for_existing`
+        // below is otherwise final, so that race would settle wrong).
+        let _pending = self.dispatched.begin_pending(event_key);
         let own_id = match crate::settings::ensure_instance_id(&self.pool).await {
             Ok(id) => id,
             Err(e) => {

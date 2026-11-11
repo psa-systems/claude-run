@@ -957,8 +957,10 @@ without peering. The peer layer only narrows that window and merges what the ins
      `holder_load` being its in-flight job count. If the row already exists, it drops the delivery with `200` and an
      `info` log naming the holder. Otherwise it sends the claim to every `reachable` peer, each bounded by
      `claim_timeout_secs`.
-   - A peer with no row for the key records the claimant as holder and grants. A peer holding its own row for the key
-     compares `(holder_load, holder_id)` pairs, lower wins: if the claimant's pair is lower and the peer has not started
+   - A peer with no row for the key records the claimant as holder and grants, unless its own claim step is mid-flight
+     for the same key with no row written yet, in which case it compares pairs as below instead of granting outright.
+     A peer holding its own row for the key compares `(holder_load, holder_id)` pairs, lower wins: if the claimant's
+     pair is lower and the peer has not started
      the event, it records the claimant as holder, drops its own delivery and grants; otherwise (a higher pair, or an
      event it already started) it refuses and names its pair. A grant is final: a row naming a peer is never taken
      back. A peer whose row names a third party refuses. Both sides compare the same two fixed pairs, so simultaneous deliveries yield exactly
