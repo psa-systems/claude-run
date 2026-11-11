@@ -3,6 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/static/favicon.ico" sizes="any">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
   <meta name="color-scheme" content="dark light">
   <title>claude-run</title>
   {# SPEC-7.16: the signed-out landing page. Static text only: nothing here
@@ -42,7 +44,7 @@
     .wrap { max-width: 1120px; margin: 0 auto; padding: 0 16px; }
     header.top { border-bottom: 1px solid var(--border); }
     header.top .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
-    .brand { color: var(--fg); font-weight: 700; font-size: 18px; letter-spacing: -0.01em; }
+    .brand { color: var(--fg); font-weight: 700; font-size: 18px; letter-spacing: -0.01em; display: inline-flex; align-items: center; gap: 8px; }
     .brand span { color: var(--accent); }
     .brand:hover { text-decoration: none; }
     .btn { display: inline-block; border-radius: 6px; padding: 10px 18px; font-size: 14px; font-weight: 600; border: 1px solid var(--border); background: var(--panel); color: var(--fg); }
@@ -83,7 +85,7 @@
 <body>
   <header class="top">
     <div class="wrap">
-      <a class="brand" href="/">claude-<span>run</span></a>
+      <a class="brand" href="/"><img src="/static/brand-mark.png" alt="" width="24" height="24">claude-<span>run</span></a>
       <a class="btn primary small" href="/login">Sign in</a>
     </div>
   </header>
@@ -100,10 +102,9 @@
         </div>
       </div>
       <div class="art">
-        {# Placeholder mascot: replace assets/mascot.svg (served at
-           /static/mascot.svg) to swap in the real art. Decorative, so the alt
-           text is empty. #}
-        <img src="/static/mascot.svg" alt="" width="320" height="320">
+        {# Clarence, the claude-run mascot (served from assets/mascot.png).
+           Decorative, so the alt text is empty. #}
+        <img src="/static/mascot.png" alt="" width="320" height="296">
         <p class="quote">"Queue it up. I'll take it from here."</p>
       </div>
     </section>

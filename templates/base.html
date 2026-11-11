@@ -3,6 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/static/favicon.ico" sizes="any">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
   <title>{% block title %}claude-run{% endblock %}</title>
   <style>
     :root {
@@ -99,7 +101,7 @@
      (poll regions opt in per-element via hx-swap="morph:..."). -->
 <body hx-ext="morph">
   <header>
-    <h1><a href="/" style="color: var(--fg);">claude-run</a></h1>
+    <h1><a href="/" style="color: var(--fg); display: flex; align-items: center; gap: 8px;"><img src="/static/brand-mark.png" alt="" width="24" height="24">claude-run</a></h1>
     <nav>
       <a href="/">Dashboard</a>
       <a href="/logs">Logs</a>
