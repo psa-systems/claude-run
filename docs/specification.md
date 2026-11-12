@@ -853,11 +853,16 @@ Every runner-posted lifecycle comment on an issue or PR (the start notice, check
 results, CI remediation, review verdict, final outcome) carries the same step table, so a reader sees where the work
 is on any comment.
 
-1. The table has the header row `| # | Step | Type | Step time | Since previous | Total |` and a separator row.
+1. The table has the header row `| # | Step | Type | Step time | Other time before | Total |` and a separator row.
    `Step time` is the step's own duration, `Total` is the elapsed time since the first step; both are `m:ss`, or
-   `h:mm:ss` from one hour. `Since previous` is `Total` minus the previous row's `Total` (the first row's own
-   `Total`), so it includes any unlisted time (`coding`, `build`, `other`, clone, Postgres) between two listed steps;
-   `Step time` never exceeds it. A step not yet reached has empty cells.
+   `h:mm:ss` from one hour. `Other time before` is the time between the previous listed step's end and this step's
+   start, taken from the stored rows the table's milestones otherwise skip, broken down by kind and ordered largest
+   first, for example `coding 3:10, build 1:20, clone 0:15`; it is empty when there is none. Kinds are `coding`,
+   `build`, `clone`, `hook_install`, `postgres_start`, `postgres_healthy`, `other` and the stored `unaccounted`
+   remainder (`SPEC-3.14` items 4 and 6), so nothing is left unattributed; a span of real elapsed time that has no
+   stored row to explain it (for example the gap before a `Retry N` row) folds into `other`. `Step time` plus the sum
+   of `Other time before` always equals the difference of `Total` from the previous row. A step not yet reached has
+   empty cells.
 2. `Type` is empty for a non-check row. For a `Checks N` row it is the check type(s) of the folded rows: the `label`
    of the parent `check` or `gate` row (`pre-commit`, `pre-push`, `check`, `verify`, `ad-hoc`, or the gate command).
    A recipe's per-stage sub-step rows (`fmt`, `clippy`, ...) do not add their own type. When one `Checks N` folds
@@ -870,11 +875,11 @@ is on any comment.
 4. The happy path is:
 
    ```text
-   | # | Step | Type | Step time | Since previous | Total |
+   | # | Step | Type | Step time | Other time before | Total |
    | --- | --- | --- | --- | --- | --- |
-   | 1 | Initial commit |  | 0:01 | 0:02 | 0:02 |
-   | 2 | Checkpoint 1 |  | 1:26 | 1:26 | 1:28 |
-   | 3 | Checks 1 | check | 15:52 | 15:52 | 17:20 |
+   | 1 | Initial commit |  | 0:01 | clone 0:01 | 0:02 |
+   | 2 | Checkpoint 1 |  | 1:26 |  | 1:28 |
+   | 3 | Checks 1 | check | 15:52 |  | 17:20 |
    | 4 | Checkpoint 2 |  | <-- This comment | <-- This comment | <-- This comment |
    | 5 | Checks 2 |  |  |  |  |
    | 6 | Verdict |  |  |  |  |

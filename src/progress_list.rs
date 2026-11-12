@@ -39,13 +39,16 @@ pub struct StepRow {
 }
 
 /// A listed step that has happened: its label, the check type(s) it folds
-/// (SPEC-3.15 item 2, empty for a non-check step), its own duration and the
-/// elapsed time at its end, both in whole seconds.
+/// (SPEC-3.15 item 2, empty for a non-check step), its own duration, the
+/// unlisted time before it broken down by kind (SPEC-3.15 item 1, largest
+/// first, empty when there is none) and the elapsed time at its end, all
+/// durations in whole seconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Milestone {
     pub label: String,
     pub check_type: Option<String>,
     pub step_secs: i64,
+    pub other_before: Vec<(String, i64)>,
     pub total_secs: i64,
 }
 
@@ -124,6 +127,44 @@ struct Counts {
     ci_remediation: usize,
 }
 
+/// SPEC-3.15 item 1: the breakdown bucket name for an unlisted row: the
+/// stored `kind`, except `kind = "other"` splits by `label` (`"other"` for an
+/// unclassified command, `"unaccounted"` for the recorder's own gap filler,
+/// SPEC-3.14 items 4 and 6).
+fn unlisted_bucket(kind: &str, label: &str) -> String {
+    if kind == "other" {
+        label.to_string()
+    } else {
+        kind.to_string()
+    }
+}
+
+/// SPEC-3.15 item 1: close the pending breakdown window that ends at a listed
+/// point spanning `start` to `end`: the buckets accumulated since the last
+/// listed point, plus any part of the raw gap no stored row explains folded
+/// into `other` so nothing is left unattributed, sorted largest duration
+/// first. Advances `prev_end` to `end` and empties `pending`.
+fn close_window(
+    prev_end: &mut DateTime<Utc>,
+    pending: &mut Vec<(String, i64)>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Vec<(String, i64)> {
+    let gap = (start - *prev_end).num_seconds().max(0);
+    let known: i64 = pending.iter().map(|(_, d)| d).sum();
+    let mut breakdown = std::mem::take(pending);
+    let leftover = gap - known;
+    if leftover > 0 {
+        match breakdown.iter_mut().find(|(k, _)| k == "other") {
+            Some(entry) => entry.1 += leftover,
+            None => breakdown.push(("other".to_string(), leftover)),
+        }
+    }
+    breakdown.sort_by_key(|(_, dur)| std::cmp::Reverse(*dur));
+    *prev_end = end;
+    breakdown
+}
+
 /// SPEC-3.15 items 1, 5 and 6: fold `rows` (all attempts of one job, ordered by
 /// attempt then sequence) into the milestones that have happened. A later
 /// attempt opens with its `Retry N` line, so a resumed run continues the
@@ -144,11 +185,15 @@ pub fn milestones(rows: &[StepRow]) -> Vec<Milestone> {
     let mut current_attempt = first.attempt;
     let mut in_attempt = 0usize;
     let mut open_checks: Option<OpenChecks> = None;
+    let mut prev_end = origin;
+    let mut pending: Vec<(String, i64)> = Vec::new();
     let secs = |a: DateTime<Utc>, b: DateTime<Utc>| (b - a).num_seconds().max(0);
 
     let flush_checks = |open: &mut Option<OpenChecks>,
                         counts: &mut Counts,
                         in_attempt: &mut usize,
+                        prev_end: &mut DateTime<Utc>,
+                        pending: &mut Vec<(String, i64)>,
                         out: &mut Vec<Milestone>| {
         if let Some((start, end, ok, types)) = open.take() {
             counts.checks += 1;
@@ -157,11 +202,13 @@ pub fn milestones(rows: &[StepRow]) -> Vec<Milestone> {
             } else {
                 format!("Checks {} (failed)", counts.checks)
             };
+            let other_before = close_window(prev_end, pending, start, end);
             *in_attempt += 1;
             out.push(Milestone {
                 label,
                 check_type: (!types.is_empty()).then(|| types.join(", ")),
                 step_secs: secs(start, end),
+                other_before,
                 total_secs: secs(origin, end),
             });
         }
@@ -169,13 +216,23 @@ pub fn milestones(rows: &[StepRow]) -> Vec<Milestone> {
 
     for row in rows {
         if row.attempt != current_attempt {
-            flush_checks(&mut open_checks, &mut counts, &mut in_attempt, &mut out);
+            flush_checks(
+                &mut open_checks,
+                &mut counts,
+                &mut in_attempt,
+                &mut prev_end,
+                &mut pending,
+                &mut out,
+            );
             current_attempt = row.attempt;
             in_attempt = 0;
+            let other_before =
+                close_window(&mut prev_end, &mut pending, row.started_at, row.started_at);
             out.push(Milestone {
                 label: format!("Retry {}", row.attempt),
                 check_type: None,
                 step_secs: 0,
+                other_before,
                 total_secs: secs(origin, row.started_at),
             });
         }
@@ -191,28 +248,62 @@ pub fn milestones(rows: &[StepRow]) -> Vec<Milestone> {
             }
             continue;
         }
-        flush_checks(&mut open_checks, &mut counts, &mut in_attempt, &mut out);
+        flush_checks(
+            &mut open_checks,
+            &mut counts,
+            &mut in_attempt,
+            &mut prev_end,
+            &mut pending,
+            &mut out,
+        );
         let Some(mut label) = listed_label(&row.kind, &row.stage, in_attempt, &mut counts) else {
-            // Unlisted time also breaks adjacency between two check groups.
+            // Unlisted time accumulates into the next listed point's
+            // `Other time before` instead of being silently dropped.
+            let bucket = unlisted_bucket(&row.kind, &row.label);
+            let dur = secs(row.started_at, row.ended_at);
+            match pending.iter_mut().find(|(k, _)| *k == bucket) {
+                Some(entry) => entry.1 += dur,
+                None => pending.push((bucket, dur)),
+            }
             continue;
         };
         if row.kind == "review" && !row.ok {
             label = "Review (no verdict)".to_string();
         }
+        let other_before = close_window(&mut prev_end, &mut pending, row.started_at, row.ended_at);
         in_attempt += 1;
         out.push(Milestone {
             label,
             check_type: None,
             step_secs: secs(row.started_at, row.ended_at),
+            other_before,
             total_secs: secs(origin, row.ended_at),
         });
     }
-    flush_checks(&mut open_checks, &mut counts, &mut in_attempt, &mut out);
+    flush_checks(
+        &mut open_checks,
+        &mut counts,
+        &mut in_attempt,
+        &mut prev_end,
+        &mut pending,
+        &mut out,
+    );
     out
 }
 
 /// SPEC-3.15 item 2: what the `Type` column's check-type names mean.
 const LEGEND: &str = "`pre-commit`, `pre-push`, `check` and `verify` are the repo's own recipes run by the agent, `ad-hoc` is any other test or lint command the agent chose to run, and a gate command is run by the runner.";
+
+/// SPEC-3.15 item 1: `Other time before` cell text, each bucket as its name
+/// and `format_secs` duration, largest first, joined with `, `; empty when
+/// there is none.
+fn format_other_before(entries: &[(String, i64)]) -> String {
+    entries
+        .iter()
+        .map(|(kind, secs)| format!("{kind} {}", format_secs(*secs)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// SPEC-3.15 items 1 to 4: render the step table. `done` are the earlier
 /// steps, `current` is the row this comment reports (marked
@@ -224,13 +315,12 @@ const LEGEND: &str = "`pre-commit`, `pre-push`, `check` and `verify` are the rep
 pub fn render(done: &[Milestone], current: &str, incomplete: bool) -> String {
     const MARK: &str = "<-- This comment";
     let mut lines: Vec<String> = vec![
-        "| # | Step | Type | Step time | Since previous | Total |".to_string(),
+        "| # | Step | Type | Step time | Other time before | Total |".to_string(),
         "| --- | --- | --- | --- | --- | --- |".to_string(),
     ];
-    let mut prev_total = 0i64;
     for (i, m) in done.iter().enumerate() {
         let check_type = m.check_type.as_deref().unwrap_or("");
-        let (step_time, since_previous, total) = if incomplete {
+        let (step_time, other_before, total) = if incomplete {
             (
                 UNKNOWN_TIME.to_string(),
                 UNKNOWN_TIME.to_string(),
@@ -239,13 +329,12 @@ pub fn render(done: &[Milestone], current: &str, incomplete: bool) -> String {
         } else {
             (
                 format_secs(m.step_secs),
-                format_secs(m.total_secs - prev_total),
+                format_other_before(&m.other_before),
                 format_secs(m.total_secs),
             )
         };
-        prev_total = m.total_secs;
         lines.push(format!(
-            "| {} | {} | {check_type} | {step_time} | {since_previous} | {total} |",
+            "| {} | {} | {check_type} | {step_time} | {other_before} | {total} |",
             i + 1,
             m.label
         ));
@@ -488,9 +577,9 @@ mod tests {
     }
 
     /// The SPEC-3.15 item 4 happy-path example, as a table: headings, a check
-    /// type on the folded `Checks N` row, a `Since previous` column that
-    /// reconciles with `Total`, the current-comment marker and the
-    /// not-yet-reached rows with empty cells.
+    /// type on the folded `Checks N` row, an `Other time before` column that
+    /// names the unlisted clone time ahead of the first listed step, the
+    /// current-comment marker and the not-yet-reached rows with empty cells.
     #[test]
     fn renders_the_spec_happy_path_example() {
         let rows = [
@@ -503,11 +592,11 @@ mod tests {
         assert_eq!(
             list,
             format!(
-                "| # | Step | Type | Step time | Since previous | Total |\n\
+                "| # | Step | Type | Step time | Other time before | Total |\n\
                  | --- | --- | --- | --- | --- | --- |\n\
-                 | 1 | Initial commit |  | 0:01 | 0:02 | 0:02 |\n\
-                 | 2 | Checkpoint 1 |  | 1:26 | 1:26 | 1:28 |\n\
-                 | 3 | Checks 1 | check | 15:52 | 15:52 | 17:20 |\n\
+                 | 1 | Initial commit |  | 0:01 | clone 0:01 | 0:02 |\n\
+                 | 2 | Checkpoint 1 |  | 1:26 |  | 1:28 |\n\
+                 | 3 | Checks 1 | check | 15:52 |  | 17:20 |\n\
                  | 4 | Checkpoint 2 |  | <-- This comment | <-- This comment | <-- This comment |\n\
                  | 5 | Checks 2 |  |  |  |  |\n\
                  | 6 | Verdict |  |  |  |  |\n\
@@ -527,7 +616,7 @@ mod tests {
         ];
         let list = render_rows(&rows, "Checks 2", false);
         assert!(
-            list.contains("| 1 | Checks 1 | pre-commit, ad-hoc | 0:20 | 0:20 | 0:20 |"),
+            list.contains("| 1 | Checks 1 | pre-commit, ad-hoc | 0:20 |  | 0:20 |"),
             "{list}"
         );
     }
@@ -538,7 +627,7 @@ mod tests {
         let rows = [gate_row(1, "just check-docker", 0, 15, true)];
         let list = render_rows(&rows, "Checks 2", false);
         assert!(
-            list.contains("| 1 | Checks 1 | just check-docker | 0:15 | 0:15 | 0:15 |"),
+            list.contains("| 1 | Checks 1 | just check-docker | 0:15 |  | 0:15 |"),
             "{list}"
         );
     }
@@ -554,29 +643,31 @@ mod tests {
         ];
         let list = render_rows(&rows, "Checks 2", false);
         assert!(
-            list.contains("| 1 | Checks 1 | pre-push | 0:20 | 0:20 | 0:20 |"),
+            list.contains("| 1 | Checks 1 | pre-push | 0:20 |  | 0:20 |"),
             "{list}"
         );
     }
 
     /// SPEC-3.15 acceptance example: the gap between `Checkpoint 2` (total
-    /// 7:16) and `Verdict` (total 12:08) shows as a 4:52 `Since previous`,
-    /// where the old shape hid it between two step times that summed to far
-    /// less than the elapsed time.
+    /// 7:16) and `Verdict` (total 12:08) is attributed by kind in `Other
+    /// time before` (coding then build, largest first) instead of appearing
+    /// as one undifferentiated number.
     #[test]
-    fn since_previous_shows_the_unlisted_gap_between_checkpoint_2_and_review() {
+    fn other_time_before_breaks_down_the_unlisted_gap_between_checkpoint_2_and_review() {
         let rows = [
             row(1, "checkpoint", 0, 1, true),
             row(1, "checkpoint", 1, 436, true),
+            row(1, "coding", 436, 626, true),
+            row(1, "build", 626, 708, true),
             row(1, "review", 708, 728, true),
         ];
         let list = render_rows(&rows, "PR ready", false);
         assert!(
-            list.contains("| 2 | Checkpoint 2 |  | 7:15 | 7:15 | 7:16 |"),
+            list.contains("| 2 | Checkpoint 2 |  | 7:15 |  | 7:16 |"),
             "{list}"
         );
         assert!(
-            list.contains("| 3 | Verdict |  | 0:20 | 4:52 | 12:08 |"),
+            list.contains("| 3 | Verdict |  | 0:20 | coding 3:10, build 1:22 | 12:08 |"),
             "{list}"
         );
     }
@@ -600,7 +691,7 @@ mod tests {
         let list = render_push("PUSH-1", crate::push_comment::PushEvent::CheckpointPush);
         clear_context("PUSH-1");
         assert!(
-            list.contains("| 1 | Checkpoint 1 |  | 1:26 | 1:28 | 1:28 |"),
+            list.contains("| 1 | Checkpoint 1 |  | 1:26 | clone 0:01, other 0:01 | 1:28 |"),
             "{list}"
         );
         assert!(
@@ -621,7 +712,7 @@ mod tests {
         assert_eq!(
             list,
             format!(
-                "| # | Step | Type | Step time | Since previous | Total |\n\
+                "| # | Step | Type | Step time | Other time before | Total |\n\
                  | --- | --- | --- | --- | --- | --- |\n\
                  | 1 | Branch update |  | <-- This comment | <-- This comment | <-- This comment |\n\n{LEGEND}"
             )
@@ -695,7 +786,7 @@ mod tests {
         let rows = [row(1, "checkpoint", 0, 3725, true)];
         let list = render_rows(&rows, "Checks 1", false);
         assert!(
-            list.contains("| 1 | Checkpoint 1 |  | 1:02:05 | 1:02:05 | 1:02:05 |"),
+            list.contains("| 1 | Checkpoint 1 |  | 1:02:05 |  | 1:02:05 |"),
             "{list}"
         );
     }
@@ -711,8 +802,10 @@ mod tests {
         assert!(!list.contains("0:00"), "{list}");
     }
 
-    /// A `(failed)` check and a `Retry N` row, with `Since previous`
-    /// reconciling against `Total` across the retry boundary.
+    /// A `(failed)` check and a `Retry N` row: the inter-attempt gap has no
+    /// stored row to explain it, so it folds into `other` (SPEC-3.15 item 1),
+    /// reconciling `Other time before` against `Total` across the retry
+    /// boundary.
     #[test]
     fn a_resumed_run_continues_the_earlier_numbering() {
         let rows = [
@@ -724,12 +817,12 @@ mod tests {
         assert_eq!(
             list,
             format!(
-                "| # | Step | Type | Step time | Since previous | Total |\n\
+                "| # | Step | Type | Step time | Other time before | Total |\n\
                  | --- | --- | --- | --- | --- | --- |\n\
-                 | 1 | Checkpoint 1 |  | 1:00 | 1:00 | 1:00 |\n\
-                 | 2 | Checks 1 (failed) | check | 1:00 | 1:00 | 2:00 |\n\
-                 | 3 | Retry 2 |  | 0:00 | 1:20 | 3:20 |\n\
-                 | 4 | Checkpoint 2 |  | 1:00 | 1:00 | 4:20 |\n\
+                 | 1 | Checkpoint 1 |  | 1:00 |  | 1:00 |\n\
+                 | 2 | Checks 1 (failed) | check | 1:00 |  | 2:00 |\n\
+                 | 3 | Retry 2 |  | 0:00 | other 1:20 | 3:20 |\n\
+                 | 4 | Checkpoint 2 |  | 1:00 |  | 4:20 |\n\
                  | 5 | Failed |  | <-- This comment | <-- This comment | <-- This comment |\n\n{LEGEND}"
             )
         );
@@ -743,7 +836,7 @@ mod tests {
         ];
         let list = render_rows(&rows, "Needs Review", false);
         assert!(
-            list.contains("| 2 | Review (no verdict) |  | 0:20 | 0:20 | 0:30 |"),
+            list.contains("| 2 | Review (no verdict) |  | 0:20 |  | 0:30 |"),
             "{list}"
         );
         assert!(
@@ -776,16 +869,16 @@ mod tests {
         assert_eq!(
             list,
             format!(
-                "| # | Step | Type | Step time | Since previous | Total |\n\
+                "| # | Step | Type | Step time | Other time before | Total |\n\
                  | --- | --- | --- | --- | --- | --- |\n\
-                 | 1 | Checks 1 | check | 1:30 | 1:30 | 1:30 |\n\
+                 | 1 | Checks 1 | check | 1:30 |  | 1:30 |\n\
                  | 2 | Failed |  | <-- This comment | <-- This comment | <-- This comment |\n\n{LEGEND}"
             )
         );
         assert_eq!(
             render_with_context("CTX-1", "Failed"),
             format!(
-                "| # | Step | Type | Step time | Since previous | Total |\n\
+                "| # | Step | Type | Step time | Other time before | Total |\n\
                  | --- | --- | --- | --- | --- | --- |\n\
                  | 1 | Failed |  | <-- This comment | <-- This comment | <-- This comment |\n\n{LEGEND}"
             ),
@@ -812,7 +905,7 @@ mod tests {
         .await;
         let list = render_for(&pool, "youtrack", "T-9", "Verdict").await;
         assert!(
-            list.contains("| 1 | Checks 1 | pre-push | 1:30 | 1:30 | 1:30 |"),
+            list.contains("| 1 | Checks 1 | pre-push | 1:30 |  | 1:30 |"),
             "{list}"
         );
         assert!(

@@ -261,7 +261,7 @@ mod tests {
     /// step, before the SPEC-3.9 footer.
     #[test]
     fn the_step_list_precedes_the_footer_with_the_marker_on_the_current_step() {
-        let list = "| # | Step | Type | Step time | Since previous | Total |\n\
+        let list = "| # | Step | Type | Step time | Other time before | Total |\n\
                     | --- | --- | --- | --- | --- | --- |\n\
                     | 1 | Initial commit |  | 0:02 | 0:02 | 0:02 |\n\
                     | 2 | Checkpoint 1 |  | <-- This comment | <-- This comment | <-- This comment |\n\
