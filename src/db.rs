@@ -826,7 +826,9 @@ async fn ensure_template(url: &str) -> &'static str {
 /// [`test_pg_pool_single_connection`]) is exposed to the identical race, a
 /// dropped transaction's background rollback losing to full-suite CPU
 /// contention, just on the Postgres leg of CI instead of the SQLite one
-/// (CLAUDE-524). SPEC-5.6.1.
+/// (CLAUDE-524). A connect failure panics with the server's state attached
+/// (SPEC-5.6.12), since it carries the same "what was the server doing"
+/// question as a clone failure. SPEC-5.6.1.
 #[cfg(test)]
 async fn pool_on_database(url: &str, database: &str, max_connections: u32) -> DbPool {
     sqlx::any::install_default_drivers();
@@ -834,21 +836,32 @@ async fn pool_on_database(url: &str, database: &str, max_connections: u32) -> Db
         .unwrap_or_else(|e| panic!("derive the fixture database url: {e}"));
     let acquire_timeout = Duration::from_secs(120);
     let started = Instant::now();
-    AnyPoolOptions::new()
+    match AnyPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(acquire_timeout)
         .connect(&database_url)
         .await
-        .map_err(|e| {
-            map_connect_error(
+    {
+        Ok(pool) => pool,
+        Err(e) => {
+            let mapped = map_connect_error(
                 "postgres test fixture",
                 max_connections,
                 acquire_timeout,
                 started,
                 e,
-            )
-        })
-        .unwrap_or_else(|e: Error| panic!("{e}"))
+            );
+            let ctx = FixtureStallContext {
+                waited_for_clone_slot: Duration::ZERO,
+                step: started.elapsed(),
+            };
+            let snapshot = fetch_server_snapshot(url).await;
+            panic!(
+                "{}",
+                fixture_failure_message(&mapped.to_string(), ctx, snapshot)
+            );
+        }
+    }
 }
 
 /// Whether `e` is Postgres reporting SQLSTATE `55006` (`object_in_use`): a
@@ -1012,25 +1025,156 @@ fn drop_database_when_closed(pool: &DbPool, url: &str, database: &str) {
         .expect("the test database cleanup worker is running");
 }
 
+/// Guards the `CREATE DATABASE ... TEMPLATE` step in [`test_pg_pool_at`] so
+/// only one clone runs at a time in this process. Postgres already refuses a
+/// second concurrent clone from the same template with `55006`
+/// ("being accessed by other users"), so retrying through that refusal (what
+/// [`run_database_statement_with_retry`] still does for a cross-process
+/// collision) is racing a lock this process could just take. The lock is held
+/// only for the clone statement itself and released before
+/// [`pool_on_database`] connects. SPEC-5.6.11.
+#[cfg(test)]
+fn clone_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// How long a fixture waited for [`clone_lock`] and how long the step that
+/// then failed actually ran, carried into [`fixture_failure_message`] so a
+/// stall panic says which part of the sequence was slow. SPEC-5.6.12.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct FixtureStallContext {
+    waited_for_clone_slot: Duration,
+    step: Duration,
+}
+
+/// One row of `pg_stat_activity`'s backend count, grouped by database and
+/// state. Either can be `NULL` on the server (a backend not yet attached to a
+/// database, or between states), hence `Option`.
+#[cfg(test)]
+type BackendCount = (Option<String>, Option<String>, i64);
+
+/// A snapshot of what the Postgres server was doing, taken over a fresh
+/// maintenance connection when a fixture fails to clone or connect, so the
+/// panic says what the server was doing instead of just that the fixture
+/// timed out. SPEC-5.6.12.
+#[cfg(test)]
+struct ServerSnapshot {
+    max_connections: String,
+    backends: Vec<BackendCount>,
+}
+
+#[cfg(test)]
+impl ServerSnapshot {
+    fn render(&self) -> String {
+        let mut rendered = format!("max_connections={}", self.max_connections);
+        for (datname, state, count) in &self.backends {
+            let datname = datname.as_deref().unwrap_or("<none>");
+            let state = state.as_deref().unwrap_or("<none>");
+            rendered.push_str(&format!("; {datname}/{state}={count}"));
+        }
+        rendered
+    }
+}
+
+/// Fetches [`ServerSnapshot`] over a fresh connection to the maintenance
+/// database named by `url`. Never panics: a failure here is appended to the
+/// original fixture failure by [`fixture_failure_message`] rather than
+/// replacing it, so a snapshot query that itself fails to connect or query
+/// still surfaces as text in the panic message. SPEC-5.6.12.
+#[cfg(test)]
+async fn fetch_server_snapshot(url: &str) -> std::result::Result<ServerSnapshot, String> {
+    use sqlx::Connection;
+    let mut conn = sqlx::AnyConnection::connect(url)
+        .await
+        .map_err(|e| format!("connect for the server snapshot: {e}"))?;
+    let max_connections: String =
+        sqlx::query_scalar("SELECT setting FROM pg_settings WHERE name = 'max_connections'")
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| format!("read max_connections for the server snapshot: {e}"))?;
+    let backends: Vec<BackendCount> = sqlx::query_as(
+        "SELECT datname, state, COUNT(*) FROM pg_stat_activity GROUP BY datname, state \
+         ORDER BY datname, state",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .map_err(|e| format!("read pg_stat_activity for the server snapshot: {e}"))?;
+    let _ = conn.close().await;
+    Ok(ServerSnapshot {
+        max_connections,
+        backends,
+    })
+}
+
+/// Builds the panic message for a fixture clone or connect failure:
+/// `original_error` (never dropped, only ever appended to) plus how long the
+/// fixture waited for the clone slot, how long the failed step ran, and the
+/// server snapshot, or the snapshot query's own error when that failed too.
+/// SPEC-5.6.12.
+#[cfg(test)]
+fn fixture_failure_message(
+    original_error: &str,
+    ctx: FixtureStallContext,
+    snapshot: std::result::Result<ServerSnapshot, String>,
+) -> String {
+    let snapshot = match snapshot {
+        Ok(s) => s.render(),
+        Err(e) => format!("server snapshot failed: {e}"),
+    };
+    format!(
+        "{original_error} (waited {:?} for the clone slot, failed step ran {:?}); server state: {snapshot}",
+        ctx.waited_for_clone_slot, ctx.step
+    )
+}
+
 /// A Postgres pool backed by a disposable database of its own, cloned from the
 /// per-process template (SPEC-5.6.2) so `cargo test`'s parallel tests neither
 /// share tables nor each replay the migration set. The database is created
 /// with `CREATE DATABASE ... TEMPLATE` (a block copy on one maintenance
 /// connection, which cannot run in a transaction) and dropped when the pool
-/// is. SPEC-5.6.1, SPEC-5.6.3.
+/// is. The clone itself runs under [`clone_lock`] so this process's own
+/// clones never race each other for the template (SPEC-5.6.11); a failure
+/// panics with the server's state attached (SPEC-5.6.12). SPEC-5.6.1,
+/// SPEC-5.6.3.
 #[cfg(test)]
 async fn test_pg_pool_at(url: &str, max_connections: u32) -> DbPool {
     use sqlx::Connection;
     let template = ensure_template(url).await;
     let database = next_fixture_database();
     let mut maint = connect_maintenance(url).await;
-    run_database_statement_with_retry(
+
+    let wait_started = Instant::now();
+    let guard = clone_lock().lock().await;
+    let waited_for_clone_slot = wait_started.elapsed();
+    let step_started = Instant::now();
+    let clone_result = run_database_statement_with_retry(
         &mut maint,
         format!("CREATE DATABASE {database} TEMPLATE {template}"),
         Duration::from_secs(60),
     )
-    .await
-    .unwrap_or_else(|e| panic!("clone the test fixture database {database}: {e}"));
+    .await;
+    // Released before pool_on_database connects: the lock only needs to cover
+    // the clone statement itself. SPEC-5.6.11.
+    drop(guard);
+
+    if let Err(e) = clone_result {
+        let ctx = FixtureStallContext {
+            waited_for_clone_slot,
+            step: step_started.elapsed(),
+        };
+        let snapshot = fetch_server_snapshot(url).await;
+        panic!(
+            "{}",
+            fixture_failure_message(
+                &format!("clone the test fixture database {database}: {e}"),
+                ctx,
+                snapshot
+            )
+        );
+    }
+
     maint
         .close()
         .await
@@ -1692,5 +1836,105 @@ mod tests {
             sqlx::Error::RowNotFound,
         );
         assert!(!matches!(reported, Error::PoolAcquireTimeout { .. }));
+    }
+
+    /// SPEC-5.6.11: two concurrent acquirers of [`clone_lock`] must never both
+    /// hold it at once. Each task increments a shared counter on acquire and
+    /// decrements it on release; a `Mutex::lock` guarantees mutual exclusion,
+    /// so the counter must never be observed above 1. Against code that skips
+    /// the lock (both tasks running the critical section unguarded) this same
+    /// assertion fails under load, which is how this test would have caught
+    /// an unserialized clone step.
+    #[tokio::test]
+    async fn clone_lock_never_lets_two_holders_overlap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let holders = Arc::new(AtomicUsize::new(0));
+        let max_observed = Arc::new(AtomicUsize::new(0));
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let holders = Arc::clone(&holders);
+            let max_observed = Arc::clone(&max_observed);
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..20 {
+                    let _guard = clone_lock().lock().await;
+                    let now_holding = holders.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_observed.fetch_max(now_holding, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    holders.fetch_sub(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("clone lock task panicked");
+        }
+
+        assert_eq!(
+            max_observed.load(Ordering::SeqCst),
+            1,
+            "two tasks held clone_lock at the same time"
+        );
+    }
+
+    /// SPEC-5.6.12: the fixture failure message must carry the server's
+    /// `max_connections`, the `pg_stat_activity` backend counts by database
+    /// and state, the wait for the clone slot, and the duration of the failed
+    /// step, built here from fixed rows rather than a live server. Before the
+    /// snapshot was wired in, the panic message was just the bare clone/connect
+    /// error with none of these fields, so this assertion set fails against
+    /// that message and passes once the fields are appended.
+    #[test]
+    fn fixture_failure_message_includes_every_snapshot_field() {
+        let ctx = FixtureStallContext {
+            waited_for_clone_slot: Duration::from_millis(1234),
+            step: Duration::from_secs(60),
+        };
+        let snapshot = ServerSnapshot {
+            max_connections: "100".to_string(),
+            backends: vec![
+                (
+                    Some("cr_test_template_42".to_string()),
+                    Some("active".to_string()),
+                    3,
+                ),
+                (None, None, 1),
+            ],
+        };
+        let message = fixture_failure_message(
+            "clone the test fixture database cr_test_42_7: boom",
+            ctx,
+            Ok(snapshot),
+        );
+
+        assert!(message.contains("boom"), "{message}");
+        assert!(message.contains("max_connections=100"), "{message}");
+        assert!(
+            message.contains("cr_test_template_42/active=3"),
+            "{message}"
+        );
+        assert!(message.contains("<none>/<none>=1"), "{message}");
+        assert!(message.contains("1.234"), "{message}");
+        assert!(message.contains("60"), "{message}");
+    }
+
+    /// SPEC-5.6.12: a failing snapshot query must be appended to the original
+    /// error, never replace it.
+    #[test]
+    fn fixture_failure_message_appends_a_failed_snapshot_without_losing_the_original_error() {
+        let ctx = FixtureStallContext {
+            waited_for_clone_slot: Duration::ZERO,
+            step: Duration::from_secs(5),
+        };
+        let message = fixture_failure_message(
+            "clone the test fixture database cr_test_42_7: boom",
+            ctx,
+            Err("connect for the server snapshot: refused".to_string()),
+        );
+
+        assert!(message.contains("boom"), "{message}");
+        assert!(message.contains("server snapshot failed"), "{message}");
+        assert!(message.contains("refused"), "{message}");
     }
 }
