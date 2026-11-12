@@ -2483,8 +2483,9 @@ impl Forge for CliBackend {
     /// Strip the `WIP: ` title prefix a timeout-salvaged draft PR (CLAUDE-379)
     /// carries, when a re-queued run resumes onto it and now succeeds. A PR
     /// whose title already lacks the prefix (not a salvaged draft, or already
-    /// stripped) is left untouched.
-    fn mark_pr_ready(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
+    /// stripped) is left untouched; returns whether the prefix was present
+    /// (CLAUDE-651).
+    fn mark_pr_ready(&self, host: &str, repo: &str, pr_number: u64) -> Result<bool> {
         let prs = self.list_open_prs(host, repo)?;
         let title = prs
             .into_iter()
@@ -2497,7 +2498,7 @@ impl Forge for CliBackend {
                 ))
             })?;
         let Some(stripped) = title.strip_prefix("WIP: ") else {
-            return Ok(());
+            return Ok(false);
         };
         let id = format!("{repo}#{pr_number}");
         let args = ["--host", host, "pr", "edit", &id, "title", stripped];
@@ -2512,7 +2513,7 @@ impl Forge for CliBackend {
             old_draft = true, new_draft = false,
             "mark_pr_ready: stripped the WIP: prefix"
         );
-        Ok(())
+        Ok(true)
     }
 
     /// A no-op on a PR whose title lacks the `WIP: ` draft prefix (the same
