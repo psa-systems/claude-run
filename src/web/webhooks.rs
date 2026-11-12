@@ -14908,8 +14908,7 @@ mod tests {
                     format!("repos/{repo}/actions/runs?head_sha=abc123"),
                 ]
             }
-            const GH_PR_RUNS_JSON_GREEN: &str =
-                r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+            const GH_PR_RUNS_JSON_GREEN: &str = r#"{"workflow_runs":[{"status":"completed","conclusion":"success","workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z"}]}"#;
 
             fn gh_pr_commit_status_args(repo: &str) -> Vec<String> {
                 vec![

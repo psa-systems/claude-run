@@ -956,8 +956,15 @@ impl Forge for GithubForge {
     /// `gh pr ready <number> --repo <repo>` clears the draft flag a
     /// timeout-salvaged PR (CLAUDE-379) opened with, when a re-queued run
     /// resumes onto it and now succeeds. A no-op (exit 0, "is already ready
-    /// for review") on a PR that was never a draft.
-    fn mark_pr_ready(&self, _host: &str, repo: &str, pr_number: u64) -> Result<()> {
+    /// for review") on a PR that was never a draft. Returns whether the PR
+    /// was a draft before this call (CLAUDE-651): the caller uses this to
+    /// decide whether a finalize-time merge is safe (a PR just promoted from
+    /// draft may have only skipped, draft-time CI runs on its head SHA; see
+    /// `latest_runs_per_workflow` and `run_verdict`). A failed or
+    /// unparseable `isDraft` pre-read is an error naming the PR and the
+    /// cause, returned before `gh pr ready` runs: "could not read" is never
+    /// collapsed into "was not a draft".
+    fn mark_pr_ready(&self, _host: &str, repo: &str, pr_number: u64) -> Result<bool> {
         let envs: Vec<(&str, &str)> = match &self.token {
             Some(t) => vec![("GH_TOKEN", t.as_str())],
             None => Vec::new(),
@@ -972,12 +979,25 @@ impl Forge for GithubForge {
             "--json",
             "isDraft",
         ];
-        let was_draft = match self.run_gh_read(&view_args, &envs) {
-            Ok(out) if out.ok => serde_json::from_str::<serde_json::Value>(out.stdout.trim())
-                .ok()
-                .and_then(|v| v.get("isDraft").and_then(|d| d.as_bool())),
-            _ => None,
-        };
+        let out = self.run_gh_read(&view_args, &envs)?;
+        if !out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: view_args.join(" "),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        let was_draft = serde_json::from_str::<serde_json::Value>(out.stdout.trim())
+            .ok()
+            .and_then(|v| v.get("isDraft").and_then(|d| d.as_bool()))
+            .ok_or_else(|| {
+                Error::Other(anyhow::anyhow!(
+                    "gh pr view --json isDraft for PR #{pr_number} in `{repo}`: could not read \
+                     the draft state from `{}`",
+                    out.stdout.trim()
+                ))
+            })?;
         let args = ["pr", "ready", &number_str, "--repo", repo];
         let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
         if !out.ok {
@@ -989,14 +1009,15 @@ impl Forge for GithubForge {
             });
         }
         // CLAUDE-630: the one auditable record that this PR was undrafted,
-        // naming the PR and the old/new draft state (`was_draft` is `None`
-        // when the pre-read failed; the `ready` call above still ran and
-        // is idempotent either way).
+        // naming the PR and the old/new draft state.
         tracing::info!(
-            repo, pr_number, old_draft = ?was_draft, new_draft = false,
+            repo,
+            pr_number,
+            old_draft = was_draft,
+            new_draft = false,
             "mark_pr_ready: flipped the draft flag off"
         );
-        Ok(())
+        Ok(was_draft)
     }
 
     /// A no-op on a PR that is not a real GitHub draft: a non-draft adopted
@@ -1268,7 +1289,11 @@ impl Forge for GithubForge {
     /// `mergeable`). An unrecognised run conclusion, status state,
     /// `mergeable`, or `mergeStateStatus` value is an error naming the
     /// value, never a default: silently guessing a CI verdict is worse than
-    /// failing loudly.
+    /// failing loudly. Only the latest run per workflow on the head SHA
+    /// counts (`latest_runs_per_workflow`), and a latest run concluded
+    /// `skipped` is `pending`, not `success` (SPEC-8.11, CLAUDE-651): a repo
+    /// whose required checks gate on `if: !draft` leaves exactly this shape
+    /// on the head SHA for as long as the PR stays a draft.
     fn pr_status(&self, _host: &str, repo: &str, pr_number: u64) -> Result<super::PrStatus> {
         let envs: Vec<(&str, &str)> = match &self.token {
             Some(t) => vec![("GH_TOKEN", t.as_str())],
@@ -1378,7 +1403,8 @@ impl Forge for GithubForge {
                 source: e,
             })?;
 
-        let state = combined_ci_state(&runs_doc.workflow_runs, &status_doc.statuses)?;
+        let latest_runs = latest_runs_per_workflow(&runs_doc.workflow_runs)?;
+        let state = combined_ci_state(&latest_runs, &status_doc.statuses)?;
         Ok(super::PrStatus {
             state,
             mergeable,
@@ -1776,13 +1802,19 @@ struct GhWorkflowRunsDoc {
 }
 
 /// One entry of `workflow_runs`. REST reports `status` and `conclusion` in
-/// lowercase, unlike the GraphQL rollup's uppercase enums.
+/// lowercase, unlike the GraphQL rollup's uppercase enums. `workflow_id` and
+/// `run_number` identify the latest run per workflow (CLAUDE-651:
+/// `latest_runs_per_workflow` below); `created_at` breaks a `run_number` tie.
 #[derive(Debug, Default, serde::Deserialize)]
 struct GhWorkflowRun {
     #[serde(default)]
     status: String,
     #[serde(default)]
     conclusion: Option<String>,
+    workflow_id: Option<u64>,
+    run_number: Option<u64>,
+    #[serde(default)]
+    created_at: String,
 }
 
 /// `gh api repos/<repo>/commits/<sha>/status`.
@@ -1807,13 +1839,19 @@ enum CheckVerdict {
 }
 
 /// Resolve one workflow run to a [`CheckVerdict`], or an error naming an
-/// unrecognised `conclusion` value.
+/// unrecognised `conclusion` value. `skipped` is `Pending`, never `Success`
+/// (CLAUDE-651): a skipped run (for example a draft-only job-level `if`)
+/// verified nothing. [`latest_runs_per_workflow`] is what makes this safe to
+/// call directly: it has already dropped every run but the latest per
+/// workflow, so a draft-time `skipped` run superseded by a real run never
+/// reaches here.
 fn run_verdict(run: &GhWorkflowRun) -> Result<CheckVerdict> {
     if run.status != "completed" {
         return Ok(CheckVerdict::Pending);
     }
     match run.conclusion.as_deref().unwrap_or("") {
-        "success" | "neutral" | "skipped" => Ok(CheckVerdict::Success),
+        "success" | "neutral" => Ok(CheckVerdict::Success),
+        "skipped" => Ok(CheckVerdict::Pending),
         "failure" | "timed_out" | "cancelled" | "startup_failure" | "action_required" | "stale" => {
             Ok(CheckVerdict::Failure)
         }
@@ -1821,6 +1859,44 @@ fn run_verdict(run: &GhWorkflowRun) -> Result<CheckVerdict> {
             "gh api .../actions/runs: unrecognised workflow run conclusion `{other}`"
         ))),
     }
+}
+
+/// Collapse `runs` to the latest run per `workflow_id`: highest `run_number`,
+/// then latest `created_at` on a tie. Older runs of the same workflow are
+/// dropped so a superseded draft-time run (CLAUDE-651) can neither pass nor
+/// fail the verdict. A run missing `workflow_id` or `run_number` is an error
+/// naming the field, never defaulted: silently keeping or dropping it would
+/// hide a real GitHub API response shape this code does not understand.
+fn latest_runs_per_workflow(runs: &[GhWorkflowRun]) -> Result<Vec<&GhWorkflowRun>> {
+    let mut latest: std::collections::HashMap<u64, &GhWorkflowRun> =
+        std::collections::HashMap::new();
+    for run in runs {
+        let workflow_id = run.workflow_id.ok_or_else(|| {
+            Error::Other(anyhow::anyhow!(
+                "gh api .../actions/runs: workflow run is missing `workflow_id`"
+            ))
+        })?;
+        let run_number = run.run_number.ok_or_else(|| {
+            Error::Other(anyhow::anyhow!(
+                "gh api .../actions/runs: workflow run is missing `run_number`"
+            ))
+        })?;
+        match latest.entry(workflow_id) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(run);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let current = *slot.get();
+                let current_number = current.run_number.unwrap_or(0);
+                let is_newer = run_number > current_number
+                    || (run_number == current_number && run.created_at > current.created_at);
+                if is_newer {
+                    slot.insert(run);
+                }
+            }
+        }
+    }
+    Ok(latest.into_values().collect())
 }
 
 /// Resolve one combined-status entry to a [`CheckVerdict`], or an error
@@ -1839,8 +1915,9 @@ fn status_verdict(entry: &GhCommitStatusEntry) -> Result<CheckVerdict> {
 /// Combine every workflow run's and commit status's verdict: any failure
 /// wins, else any pending, else success. An empty set (no runs and no
 /// statuses) is `"pending"`, never `"success"`: nothing reported is not a
-/// green verdict.
-fn combined_ci_state(runs: &[GhWorkflowRun], statuses: &[GhCommitStatusEntry]) -> Result<String> {
+/// green verdict. `runs` must already be collapsed to the latest run per
+/// workflow ([`latest_runs_per_workflow`]); this function does not filter.
+fn combined_ci_state(runs: &[&GhWorkflowRun], statuses: &[GhCommitStatusEntry]) -> Result<String> {
     if runs.is_empty() && statuses.is_empty() {
         return Ok("pending".to_string());
     }
@@ -4072,7 +4149,7 @@ mod tests {
     #[test]
     fn pr_status_all_checks_green_and_clean() {
         let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
-        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+        let runs = r#"{"workflow_runs":[{"workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"success"}]}"#;
         let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(
@@ -4090,7 +4167,7 @@ mod tests {
     #[test]
     fn pr_status_failed_check() {
         let view = r#"{"state":"OPEN","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","headRefOid":"abc123"}"#;
-        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"},{"status":"completed","conclusion":"failure"}]}"#;
+        let runs = r#"{"workflow_runs":[{"workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"success"},{"workflow_id":2,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"failure"}]}"#;
         let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.state, "failure");
@@ -4110,7 +4187,7 @@ mod tests {
     #[test]
     fn pr_status_in_progress_check() {
         let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
-        let runs = r#"{"workflow_runs":[{"status":"in_progress","conclusion":null}]}"#;
+        let runs = r#"{"workflow_runs":[{"workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"in_progress","conclusion":null}]}"#;
         let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.state, "pending");
@@ -4129,7 +4206,7 @@ mod tests {
         // `mergeable` stays `Some(true)` for a BEHIND PR, which is what
         // `apply_automerge_decision` expects (behind-base checked first).
         let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"BEHIND","headRefOid":"abc123"}"#;
-        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+        let runs = r#"{"workflow_runs":[{"workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"success"}]}"#;
         let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.behind_base, Some(true));
@@ -4139,7 +4216,7 @@ mod tests {
     #[test]
     fn pr_status_conflicting() {
         let view = r#"{"state":"OPEN","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","headRefOid":"abc123"}"#;
-        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+        let runs = r#"{"workflow_runs":[{"workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"success"}]}"#;
         let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.mergeable, Some(false));
@@ -4149,7 +4226,7 @@ mod tests {
     #[test]
     fn pr_status_non_dirty_leaves_conflicted_unknown() {
         let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
-        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+        let runs = r#"{"workflow_runs":[{"workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"success"}]}"#;
         let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.conflicted, None);
@@ -4158,7 +4235,7 @@ mod tests {
     #[test]
     fn pr_status_unknown_mergeability() {
         let view = r#"{"state":"OPEN","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefOid":"abc123"}"#;
-        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+        let runs = r#"{"workflow_runs":[{"workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"success"}]}"#;
         let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.mergeable, None);
@@ -4199,13 +4276,51 @@ mod tests {
     #[test]
     fn pr_status_unrecognised_run_conclusion_errors() {
         let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
-        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"weird"}]}"#;
+        let runs = r#"{"workflow_runs":[{"workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"weird"}]}"#;
         let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let err = forge
             .pr_status("github.com", "octo/widget", 42)
             .unwrap_err()
             .to_string();
         assert!(err.contains("weird"), "got {err}");
+    }
+
+    // ---- CLAUDE-651: skipped draft-time runs never pass a PR -------------
+
+    #[test]
+    fn pr_status_only_skipped_draft_time_runs_give_pending_never_success() {
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let runs = r#"{"workflow_runs":[{"workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"skipped"},{"workflow_id":2,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"skipped"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(status.state, "pending");
+    }
+
+    #[test]
+    fn pr_status_skipped_run_superseded_by_newer_success_gives_success() {
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let runs = r#"{"workflow_runs":[{"workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"skipped"},{"workflow_id":1,"run_number":2,"created_at":"2026-01-01T00:05:00Z","status":"completed","conclusion":"success"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(status.state, "success");
+    }
+
+    #[test]
+    fn pr_status_superseded_failure_followed_by_newer_success_gives_success() {
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let runs = r#"{"workflow_runs":[{"workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"failure"},{"workflow_id":1,"run_number":2,"created_at":"2026-01-01T00:05:00Z","status":"completed","conclusion":"success"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(status.state, "success");
+    }
+
+    #[test]
+    fn pr_status_newer_in_progress_run_over_older_skipped_gives_pending() {
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let runs = r#"{"workflow_runs":[{"workflow_id":1,"run_number":1,"created_at":"2026-01-01T00:00:00Z","status":"completed","conclusion":"skipped"},{"workflow_id":1,"run_number":2,"created_at":"2026-01-01T00:05:00Z","status":"in_progress","conclusion":null}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(status.state, "pending");
     }
 
     #[test]
@@ -4640,10 +4755,124 @@ mod tests {
             .pr_comment("github.com", "octo/widget", 42, Path::new("/tmp/b.md"))
             .is_err());
 
-        // CLAUDE-630: mark_pr_ready now reads the prior draft state before
-        // the write, so one extra (unstubbed, failing) read call is expected
-        // alongside the four writes.
-        assert_eq!(runner.calls.lock().unwrap().len(), 5);
+        // CLAUDE-630/CLAUDE-651: mark_pr_ready reads the prior draft state
+        // before the write; the isDraft read here is unstubbed and fails, so
+        // mark_pr_ready errors there and never reaches the `gh pr ready`
+        // write. One read call for mark_pr_ready plus the three other
+        // writes.
+        assert_eq!(runner.calls.lock().unwrap().len(), 4);
+    }
+
+    // ---- CLAUDE-651: mark_pr_ready's return value and pre-read error -----
+
+    #[test]
+    fn mark_pr_ready_returns_true_when_the_pr_was_a_draft() {
+        let view_args = [
+            "pr",
+            "view",
+            "42",
+            "--repo",
+            "octo/widget",
+            "--json",
+            "isDraft",
+        ];
+        let ready_args = ["pr", "ready", "42", "--repo", "octo/widget"];
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("gh", &view_args, r#"{"isDraft":true}"#)
+                .ok("gh", &ready_args, ""),
+        );
+        let forge = pr_status_forge(runner);
+        let was_draft = forge
+            .mark_pr_ready("github.com", "octo/widget", 42)
+            .unwrap();
+        assert!(was_draft);
+    }
+
+    #[test]
+    fn mark_pr_ready_returns_false_when_the_pr_was_already_ready() {
+        let view_args = [
+            "pr",
+            "view",
+            "42",
+            "--repo",
+            "octo/widget",
+            "--json",
+            "isDraft",
+        ];
+        let ready_args = ["pr", "ready", "42", "--repo", "octo/widget"];
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("gh", &view_args, r#"{"isDraft":false}"#)
+                .ok("gh", &ready_args, ""),
+        );
+        let forge = pr_status_forge(runner);
+        let was_draft = forge
+            .mark_pr_ready("github.com", "octo/widget", 42)
+            .unwrap();
+        assert!(!was_draft);
+    }
+
+    #[test]
+    fn mark_pr_ready_fails_the_isdraft_preread_without_calling_gh_pr_ready() {
+        let view_args = [
+            "pr",
+            "view",
+            "42",
+            "--repo",
+            "octo/widget",
+            "--json",
+            "isDraft",
+        ];
+        let runner = Arc::new(StubRunner::new().fail("gh", &view_args, 1, "connect timeout"));
+        let forge = pr_status_forge(runner.clone()).with_gh_read_retry_waits(NO_WAIT);
+        let err = forge
+            .mark_pr_ready("github.com", "octo/widget", 42)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("connect timeout"), "got {err}");
+        let ready_calls = runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("gh pr ready"))
+            .count();
+        assert_eq!(
+            ready_calls, 0,
+            "gh pr ready must not run after a failed pre-read"
+        );
+    }
+
+    #[test]
+    fn mark_pr_ready_fails_an_unparseable_isdraft_preread_without_calling_gh_pr_ready() {
+        let view_args = [
+            "pr",
+            "view",
+            "42",
+            "--repo",
+            "octo/widget",
+            "--json",
+            "isDraft",
+        ];
+        let runner = Arc::new(StubRunner::new().ok("gh", &view_args, "not json"));
+        let forge = pr_status_forge(runner.clone());
+        let err = forge
+            .mark_pr_ready("github.com", "octo/widget", 42)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not read"), "got {err}");
+        let ready_calls = runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("gh pr ready"))
+            .count();
+        assert_eq!(
+            ready_calls, 0,
+            "gh pr ready must not run after a failed pre-read"
+        );
     }
 
     /// `gh pr create` is a write (CLAUDE-407): a failed open runs exactly

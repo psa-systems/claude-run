@@ -590,10 +590,15 @@ pub trait Forge: Send + Sync {
     /// Strip PR `pr_number` in `repo` on `host` of its draft status (Forgejo:
     /// remove the `WIP: ` title prefix; GitHub: `gh pr ready`). Used when a
     /// re-queued run resumes onto a draft PR a prior timed-out run salvaged
-    /// (CLAUDE-379) and now succeeds. The default errors so a backend without
+    /// (CLAUDE-379) and now succeeds. Returns whether the PR was a draft
+    /// before this call: `true` for GitHub `isDraft: true` or a Forgejo
+    /// `WIP: ` prefix that was stripped, `false` when it was already ready
+    /// (CLAUDE-651). The caller uses this to skip a finalize-time merge on a
+    /// PR just promoted from draft, since its only CI evidence may be
+    /// skipped draft-time runs. The default errors so a backend without
     /// draft support (including every test-only stub) reports clearly rather
     /// than silently no-op'ing.
-    fn mark_pr_ready(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
+    fn mark_pr_ready(&self, host: &str, repo: &str, pr_number: u64) -> Result<bool> {
         let _ = (host, repo, pr_number);
         Err(Error::Other(anyhow::anyhow!(
             "mark_pr_ready not supported by this forge backend"
