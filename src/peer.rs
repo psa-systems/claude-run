@@ -1614,7 +1614,7 @@ pub(crate) mod testkit {
         let cfg = Arc::new(RwLock::new(PeersConfig {
             enabled: true,
             instance_name: name.into(),
-            claim_timeout_secs: 1,
+            claim_timeout_secs: 10,
             ..PeersConfig::default()
         }));
         let token = format!("tok-{name}");
@@ -2117,6 +2117,7 @@ mod tests {
     /// `a` with one reachable peer `bad` at `url`.
     async fn node_with_stub_peer(url: &str) -> Node {
         let a = node("a", 0).await;
+        a.cfg.write().await.claim_timeout_secs = 1;
         a.cfg.write().await.peers.push(peer("bad", url));
         let key = crate::secrets::SecretsKey::load().unwrap();
         crate::state::secret_create(&a.pool, "bad-token", &key.encrypt("t").unwrap())
@@ -2176,6 +2177,7 @@ mod tests {
         let now = Utc::now();
         a.registry
             .record("dead", &a.id, Ok(doc("x", &[], now)), now, 120);
+        let logs = LogCapture::start();
         let d = a
             .claims
             .claim(Some("k:o/r:comment:1"), "comment", "s", "d")
@@ -2183,8 +2185,8 @@ mod tests {
         assert!(proceeds(&d));
         let row = crate::state::peer_claim_get(&b.pool, "k:o/r:comment:1")
             .await
-            .unwrap()
             .unwrap();
+        let row = row.unwrap_or_else(|| panic!("no claim row recorded: {}", logs.text()));
         assert_eq!(row.holder_id, a.id, "the live peer recorded the claimant");
     }
 
