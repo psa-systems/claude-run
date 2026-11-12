@@ -464,7 +464,7 @@ impl Daemon {
             .nest("/api", api_for_tcp);
 
         // Phase 5: gate the TCP surface (web UI + /api/*) whenever the bind is
-        // non-loopback. The /webhooks/ prefix keeps its own HMAC and is exempt.
+        // non-loopback. The /webhooks/ prefix keeps its own HMAC and /api/peer/ its own bearer gate; both are exempt.
         // An instance with no credential at all serves only its first-run setup
         // page (see `auth::resolve_gate`), so the surface is never
         // unauthenticated but the operator can still reach it to create an
