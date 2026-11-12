@@ -9576,7 +9576,8 @@ mod tests {
             action_create, action_delete, action_detail, action_durations, action_edit_page,
             action_edit_save, action_env_save, action_events_redirect, action_export,
             action_to_youtrack_form, auth_claude_banner, auth_login_code, auth_login_start,
-            auth_save_claude, dashboard, logs, settings_page, settings_save, youtrack_create,
+            auth_save_claude, dashboard, logs, redirect_to_action_edit,
+            redirect_to_actions_new_raw, settings_page, settings_save, youtrack_create,
             youtrack_edit_page, youtrack_edit_save, youtrack_form_to_yaml, youtrack_new_page,
             ActionDetailQuery, ActionForm, AuthClaudeForm, AuthCodeForm, DashboardQuery,
             EventsView, LogsQuery, SettingsForm, WebState, YoutrackEditForm,
@@ -10884,6 +10885,29 @@ mod tests {
             assert!(!s.paths.actions_dir().join("yt-native.yml").exists());
             let body = body_string(resp).await;
             assert!(body.contains("bogus"));
+        }
+
+        #[tokio::test]
+        async fn get_actions_redirects_instead_of_405ing() {
+            // CLAUDE-650: `action_create`'s own error path can leave `/actions`
+            // in the address bar; a GET there must redirect, not 405.
+            let resp = redirect_to_actions_new_raw().await.into_response();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert_eq!(resp.headers().get("location").unwrap(), "/actions/new/raw");
+        }
+
+        #[tokio::test]
+        async fn get_action_env_redirects_to_the_edit_page() {
+            // CLAUDE-650: `action_env_save`'s own error path re-renders the
+            // edit page at this same URL; a GET must redirect there, not 405.
+            let resp = redirect_to_action_edit(AxumPath("yt-native".to_string()))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                resp.headers().get("location").unwrap(),
+                "/actions/yt-native/edit"
+            );
         }
 
         #[tokio::test]
@@ -13483,8 +13507,9 @@ mod tests {
     /// instead of a CLI (the container has no CLI operator).
     mod service_auth_ui {
         use super::super::{
-            auth_save_forgejo, auth_save_git, auth_save_github, auth_save_youtrack, settings_page,
-            AuthForgejoForm, AuthGitForm, AuthGithubForm, AuthYoutrackForm, SettingsQuery,
+            auth_save_forgejo, auth_save_git, auth_save_github, auth_save_youtrack,
+            redirect_to_settings, settings_page, AuthForgejoForm, AuthGitForm, AuthGithubForm,
+            AuthYoutrackForm, SettingsQuery,
         };
         use super::secrets_ui::{body_string, web_state};
         use age::secrecy::ExposeSecret;
@@ -13801,12 +13826,23 @@ mod tests {
 
             std::env::remove_var(crate::secrets::KEY_FILE_ENV);
         }
+
+        #[tokio::test]
+        async fn get_settings_post_only_routes_redirect_instead_of_405ing() {
+            // CLAUDE-650: a section save, a service-auth card save, or a
+            // brokered Claude login step can each re-render the full Settings
+            // page inline on error; a GET on any of those URLs must redirect
+            // to `/settings`, not 405.
+            let resp = redirect_to_settings().await.into_response();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert_eq!(resp.headers().get("location").unwrap(), "/settings");
+        }
     }
 
     mod secrets_ui {
         use super::super::{
-            secret_create, secret_delete, secret_rotate, secrets_page, SecretCreateForm,
-            SecretValueForm, WebState,
+            redirect_to_access, redirect_to_secrets, secret_create, secret_delete, secret_rotate,
+            secrets_page, SecretCreateForm, SecretValueForm, WebState,
         };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
@@ -14041,6 +14077,32 @@ mod tests {
             )
             .await
             .unwrap());
+        }
+
+        #[tokio::test]
+        async fn get_secrets_post_only_routes_redirect_instead_of_405ing() {
+            // CLAUDE-650: rotate, delete, generate and revoke each can leave
+            // their own URL in the address bar (an inline error, or, for
+            // generate, the one-time-key success render); a GET on any of
+            // them must redirect to `/secrets`, not 405.
+            for resp in [
+                redirect_to_secrets().await.into_response(),
+                redirect_to_secrets().await.into_response(),
+                redirect_to_secrets().await.into_response(),
+                redirect_to_secrets().await.into_response(),
+            ] {
+                assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+                assert_eq!(resp.headers().get("location").unwrap(), "/secrets");
+            }
+        }
+
+        #[tokio::test]
+        async fn get_secret_check_redirects_to_access() {
+            // CLAUDE-650: `secret_check` renders the full Access page at this
+            // same URL; a GET must redirect to `/access`, not 405.
+            let resp = redirect_to_access().await.into_response();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert_eq!(resp.headers().get("location").unwrap(), "/access");
         }
     }
 

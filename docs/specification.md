@@ -1164,6 +1164,9 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
   every other line as they were; the result goes through the same `validate_str` path, and nothing is written unless
   its parsed `env` equals the submitted values. A key not already in the block, or a native action, is refused with
   the editor's validation message. Keys are added or removed in the raw YAML only.
+- `/actions` and `/actions/{name}/env` are POST-only; each also answers `GET` with a `303` redirect (to
+  `/actions/new/raw`, or the action's own `/edit` page) rather than `405`, since a rejected submission can leave
+  that URL in the address bar (`CLAUDE-650`).
 
 #### 4.3.4 Native action editor forms (`SPEC-4.3.4`)
 
@@ -1202,6 +1205,9 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
   `getrandom`), stores only its SHA-256 hash, and renders the plaintext key exactly once, on the response to that
   generate call; it is never shown or recoverable again. Revoke deletes the row outright; there is no soft-revoke
   state. These keys authenticate `/api/peer/*` (`SPEC-3.17` item 4, `SPEC-7.6`) only, never the web UI or `/api/*`.
+- `/secrets/api-keys`, `/secrets/api-keys/{name}/revoke`, `/secrets/{name}/rotate`, `/secrets/{name}/delete` and
+  `/secrets/{name}/check` are POST-only; each also answers `GET` with a `303` redirect (to `/secrets`, or `/access`
+  for `check`) rather than `405`, since a POST response at that URL can leave it in the address bar (`CLAUDE-650`).
 
 #### 4.3.7 Access page (`SPEC-4.3.7`)
 
@@ -1219,6 +1225,11 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
   reports delivery failure inline, without persisting anything.
 - The Claude login card starts, submits a code to, and can cancel, the interactive broker session (`SPEC-7.5`); the
   rendered banner reflects the broker's own session state, not a separate poll of `claude auth status`.
+- Every section save and service-auth card save is POST-only (`/settings/{section}`, `/settings/auth/claude`,
+  `/settings/auth/claude/login`, `/settings/auth/claude/code`, `/settings/auth/youtrack`, `/settings/auth/forgejo`,
+  `/settings/auth/github`, `/settings/auth/git`, `/settings/auth/email/test`); each also answers `GET` with a `303`
+  redirect to `/settings` rather than `405`, since a rejected submission re-renders the full page at that same URL
+  (`CLAUDE-650`). `/settings/auth/claude/cancel` stays POST-only: it always redirects and never renders a page.
 
 #### 4.3.9 About and activity pages (`SPEC-4.3.9`)
 
