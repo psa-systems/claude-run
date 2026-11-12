@@ -10,7 +10,7 @@
 # stops with a message until `BLOG_FEED_URL` and `NEWSLETTER_URL` are yours. See docs/blog-newsletter.md.
 #
 # The input reads the blog's RSS feed. Each item not seen before is one job (`dedup_key: guid`), and Claude writes a
-# short teaser that links to the post. The post step creates it as a draft (`POST <NEWSLETTER_URL>/api/v1/editions`)
+# short summary of the post; the email is that one paragraph and a link to the post. The post step creates it as a draft (`POST <NEWSLETTER_URL>/api/v1/editions`)
 # and then asks for review (`POST .../editions/{id}/review`); a newsletter system without that call (404 or 405) keeps
 # the plain draft. The action never sends or schedules.
 #
@@ -48,9 +48,6 @@ input:
     let items = (child $channel "item" | each {|it|
       let link = (child $it "link" | each {|e| text-of $e } | get --optional 0 | default "")
       let guid = (child $it "guid" | each {|e| text-of $e } | get --optional 0 | default $link)
-      let cover = (child $it "enclosure"
-        | where {|e| ($e.attributes.type? | default "" | str starts-with "image/") }
-        | get --optional 0.attributes.url | default "")
       {
         guid: $guid,
         title: (child $it "title" | each {|e| text-of $e } | get --optional 0 | default ""),
@@ -60,7 +57,6 @@ input:
         # nu drops the namespace prefix: `dc:creator` arrives as `creator`.
         author: (child $it "creator" | each {|e| text-of $e } | get --optional 0 | default ""),
         categories: (child $it "category" | each {|e| text-of $e }),
-        cover: $cover,
       }
     } | where {|i| ($i.guid | is-not-empty) and ($i.link | is-not-empty) })
     let blog = ($env.BLOG_FEED_URL | url parse | get host)
@@ -101,16 +97,15 @@ prompt: |
   Write `edition.json` in the current directory, and no other file, with this shape:
   {\"subject\": string, \"preview_text\": string, \"body_md\": string}
 
-  The email is a teaser that sends readers to the post. It never replaces the post.
+  The email is just a summary and a link: it sends readers to the post and never replaces it.
   - `subject`: the post title, or a short newsletter-style version of it, under 70 characters.
   - `preview_text`: one sentence that adds to the subject, at most 150 characters, not repeating it.
-  - `body_md`: Markdown, two or three short paragraphs \(under 150 words in all\) saying what the post covers and why a
-    reader would care. No heading, no greeting, no sign-off, no image and no link: the cover image and the
-    \"Read the full post\" link are added for you.
+  - `body_md`: ONE short paragraph of two or three sentences, in your own words, saying what the post covers. Plain
+    text: no heading, greeting, sign-off, list, image or link. The \"Read the full post\" link is added for you.
 
   Rules:
   - Use only what the post says. Invent nothing: no numbers, quotes, dates, features or claims that are not in it.
-  - Never paste the article or long passages of it. Short phrases in your own sentences only.
+  - Never copy text from the article, not even a sentence.
   - Write for people who subscribed to this newsletter, in plain words.
 
   If the page is not a readable article \(empty, an error page, or a login wall\), write instead:
@@ -140,10 +135,7 @@ post:
     } else {
       let subject = ($edition.subject? | default $job.title | str trim)
       let preview = ($edition.preview_text? | default "" | str trim | str substring --grapheme-clusters 0..<150)
-      let alt = ($job.title | str replace --all --regex '[\[\]]' '')
-      let cover = (if ($job.cover | is-empty) { [] } else { [$"![($alt)]\(($job.cover)\)"] })
-      let body_md = ($cover | append ($edition.body_md | str trim) | append $"[Read the full post]\(($job.link)\)"
-        | str join "\n\n")
+      let body_md = $"($edition.body_md | str trim)\n\n[Read the full post]\(($job.link)\)"
       let body = ({list: $env.NEWSLETTER_LIST, subject: $subject, body_md: $body_md}
         | merge (if ($preview | is-empty) { {} } else { {preview_text: $preview} }))
       let base = ($env.NEWSLETTER_URL | str trim --right --char '/')

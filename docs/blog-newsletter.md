@@ -1,6 +1,6 @@
 # Example action: a newsletter draft for each new blog post (CLAUDE-644)
 
-`actions/examples/blog-newsletter.yml` turns each new blog post into a newsletter email that a person approves. It reads the blog's RSS feed, and for each post it has not seen before it has Claude write a short teaser that links to the post, creates it as a **draft** with `POST <NEWSLETTER_URL>/api/v1/editions`, and then asks for review with `POST <NEWSLETTER_URL>/api/v1/editions/{id}/review`, so the newsletter's administrators are told a draft is waiting. It never sends or schedules: an administrator approves and sends it in the newsletter system.
+`actions/examples/blog-newsletter.yml` turns each new blog post into a newsletter email that a person approves. It reads the blog's RSS feed, and for each post it has not seen before it has Claude write a short summary of the post, creates it as a **draft** with `POST <NEWSLETTER_URL>/api/v1/editions`, and then asks for review with `POST <NEWSLETTER_URL>/api/v1/editions/{id}/review`, so the newsletter's administrators are told a draft is waiting. It never sends or schedules: an administrator approves and sends it in the newsletter system.
 
 It is an example, so a new install does not get it: `actions/examples/` is not seeded. The post step expects the same API as [release-notes](release-notes.md): `{"list", "subject", "preview_text", "body_md"}` with a bearer token, answering `201` with the edition's `id`. A newsletter system without the review call (`404` or `405`) keeps the plain draft, and the run logs a warning; any other answer to the review call is logged the same way and the draft stays.
 
@@ -10,9 +10,9 @@ Claude reads the post's feed entry (title, link, summary, author, categories) an
 
 - `subject`: the post title or a short newsletter-style version of it, under 70 characters;
 - `preview_text`: one sentence, at most 150 characters (the post step cuts a longer one);
-- `body_md`: two or three short paragraphs on what the post covers and why a reader would care.
+- `body_md`: one short paragraph of two or three sentences on what the post covers.
 
-The post step adds the cover image when the feed item has an image enclosure, and ends the body with `[Read the full post](<post URL>)`. The prompt forbids inventing anything that is not in the post and pasting the article: the email sends readers to the blog, it does not replace it. A page that is not a readable article (an error page, a login wall) makes no draft.
+The post step ends the body with `[Read the full post](<post URL>)`, so the email is just that summary and the link: no cover image, no headings, never text copied from the article. The prompt also forbids inventing anything that is not in the post. A page that is not a readable article (an error page, a login wall) makes no draft.
 
 ## Setup
 

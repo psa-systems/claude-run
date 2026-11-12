@@ -1970,7 +1970,8 @@ native:
     const BLOG_NEWSLETTER: &str = include_str!("../actions/examples/blog-newsletter.yml");
 
     /// The example `actions/examples/blog-newsletter.yml` (CLAUDE-644): one job per
-    /// feed guid that never repeats, and a post step that drafts and asks for review only.
+    /// feed guid that never repeats, and a post step that drafts a summary plus link and asks
+    /// for review only.
     #[test]
     fn shipped_blog_newsletter_action_is_scripted_and_per_post() {
         let loaded = validate_str(BLOG_NEWSLETTER, "actions/examples/blog-newsletter.yml")
@@ -1994,6 +1995,9 @@ native:
         let post = action.post[0].code();
         assert!(post.contains("/api/v1/editions"), "{post}");
         assert!(post.contains("/review"), "{post}");
+        // Summary plus link only (CLAUDE-644): no image is added to the body.
+        assert!(post.contains("[Read the full post]"), "{post}");
+        assert!(!post.contains("!["), "{post}");
         for call in ["/send", "/schedule"] {
             assert!(!post.contains(call), "post must never call {call}");
         }
@@ -2110,7 +2114,10 @@ native:
         assert_eq!(jobs[0]["link"], "https://blog.test/blog/p3");
         assert_eq!(jobs[0]["author"], "Ann");
         assert_eq!(jobs[0]["categories"], serde_json::json!(["News"]));
-        assert_eq!(jobs[0]["cover"], "https://blog.test/p3.png");
+        assert!(
+            jobs[0].get("cover").is_none(),
+            "the email carries no cover image"
+        );
 
         // What the post step does once a job ran, draft or not.
         let mut f = std::fs::OpenOptions::new()
