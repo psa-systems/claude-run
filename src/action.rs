@@ -1985,7 +1985,9 @@ native:
         assert_eq!(action.pre.len(), 1);
         assert_eq!(action.post.len(), 1);
         assert_eq!(action.dedup_key.as_deref(), Some("guid"));
-        assert_eq!(action.limits.max_attempts_per_key, Some(1));
+        // Retries a transient failure; the filter keeps an overlapping run from drafting twice.
+        assert_eq!(action.limits.max_attempts_per_key, Some(3));
+        assert!(action.filter.is_some());
         assert_eq!(action.claude.allowed_tools.as_deref(), Some("Read,Write"));
         assert_eq!(action.env["NEWSLETTER_LIST"], "your-list-slug");
         assert_eq!(
@@ -2051,17 +2053,41 @@ native:
         )
     }
 
-    /// CLAUDE-644: the first run only seeds the seen file; later runs yield each new guid
-    /// once, oldest first, and a guid the post step recorded never comes back.
-    /// Runs the real `input.command` through `nu`; skipped where `nu` is not installed.
-    #[test]
-    fn blog_newsletter_input_seeds_then_yields_each_new_guid_once() {
-        if std::process::Command::new("nu")
+    /// True when `nu` runs. Where `CI` is set (Forgejo Actions sets `CI=true`) a missing
+    /// `nu` fails the test instead of skipping it.
+    fn nu_available() -> bool {
+        let ok = std::process::Command::new("nu")
             .arg("--version")
             .output()
-            .is_err()
-        {
+            .is_ok_and(|o| o.status.success());
+        if !ok {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "nu is not on PATH; CI must run the nu-based tests"
+            );
             eprintln!("skipped: nu is not on PATH");
+        }
+        ok
+    }
+
+    /// The env every blog-newsletter snippet expects, with the placeholders replaced.
+    fn blog_newsletter_env(feed_url: &str, newsletter_url: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("BLOG_FEED_URL", feed_url.to_string()),
+            ("NEWSLETTER_URL", newsletter_url.to_string()),
+            ("NEWSLETTER_LIST", "news".to_string()),
+            ("BLOG_NAME", "Test Blog".to_string()),
+            ("SENDER_NAME", "Test Co".to_string()),
+            ("NEWSLETTER_API_TOKEN", "tok".to_string()),
+        ]
+    }
+
+    /// CLAUDE-644: the first run only seeds the seen file; later runs yield each new guid
+    /// once, oldest first, and a guid the post step recorded never comes back.
+    /// Runs the real `input.command` through `nu`.
+    #[test]
+    fn blog_newsletter_input_seeds_then_yields_each_new_guid_once() {
+        if !nu_available() {
             return;
         }
         let action = validate_str(BLOG_NEWSLETTER, "t").unwrap().action;
@@ -2075,9 +2101,8 @@ native:
         let run = |feed_url: &str| {
             let out = std::process::Command::new("nu")
                 .arg(&script)
+                .envs(blog_newsletter_env(feed_url, "https://news.test"))
                 .env("CLAUDE_RUN_DATA_DIR", &data)
-                .env("BLOG_FEED_URL", feed_url)
-                .env("NEWSLETTER_URL", "https://news.test")
                 .output()
                 .unwrap();
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -2108,7 +2133,9 @@ native:
             .join("blog-newsletter")
             .join(format!("{host}--news.test.seen"));
         let seen = std::fs::read_to_string(&seen_file).unwrap();
-        assert_eq!(seen.lines().collect::<Vec<_>>(), ["p2", "p1"]);
+        let mut lines = seen.lines();
+        assert!(lines.next().unwrap().starts_with("# seeded "), "{seen}");
+        assert_eq!(lines.collect::<Vec<_>>(), ["p2", "p1"]);
 
         let (jobs, stderr) = run(&url);
         assert_eq!(jobs.as_deref(), Some(&[][..]), "{stderr}");
@@ -2138,6 +2165,312 @@ native:
         std::io::Write::write_all(&mut f, b"p3\n").unwrap();
         let (jobs, stderr) = run(&url);
         assert_eq!(guids(&jobs.unwrap_or_else(|| panic!("{stderr}"))), ["p4"]);
+
+        // At most 5 jobs per check, oldest first; the rest wait and are logged.
+        *body.lock().unwrap() = feed_with(&[
+            "q7", "q6", "q5", "q4", "q3", "q2", "q1", "p4", "p3", "p2", "p1",
+        ]);
+        let (jobs, stderr) = run(&url);
+        let jobs = jobs.unwrap_or_else(|| panic!("{stderr}"));
+        assert_eq!(guids(&jobs), ["p4", "q1", "q2", "q3", "q4"]);
+        assert!(stderr.contains("drafting the oldest 5"), "{stderr}");
+    }
+
+    /// CLAUDE-644: a placeholder list or a missing token stops the input before any job
+    /// or seen file exists.
+    #[test]
+    fn blog_newsletter_input_refuses_placeholders_and_a_missing_token() {
+        if !nu_available() {
+            return;
+        }
+        let action = validate_str(BLOG_NEWSLETTER, "t").unwrap().action;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("input.nu");
+        std::fs::write(&script, action.input.as_ref().unwrap().command.code()).unwrap();
+        let data = dir.path().join("data");
+        let url = serve_feed(std::sync::Arc::new(std::sync::Mutex::new(feed_with(&[
+            "p1",
+        ]))));
+        for (var, value, said) in [
+            ("NEWSLETTER_LIST", "your-list-slug", "NEWSLETTER_LIST"),
+            ("BLOG_NAME", "Your Blog", "BLOG_NAME"),
+            ("NEWSLETTER_API_TOKEN", "", "newsletter-api-token"),
+        ] {
+            let out = std::process::Command::new("nu")
+                .arg(&script)
+                .envs(blog_newsletter_env(&url, "https://news.test"))
+                .env(var, value)
+                .env("CLAUDE_RUN_DATA_DIR", &data)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{var} must stop the run");
+            assert!(stderr.contains(said), "{var}: {stderr}");
+        }
+        assert!(
+            !data.exists(),
+            "no seen file before the placeholders are replaced"
+        );
+    }
+
+    /// One request a stub newsletter API saw: `METHOD path` and the body.
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// Answers `METHOD path` with the status and body of the matching route, 404 otherwise,
+    /// and records every request.
+    fn serve_api(routes: &[(&str, u16, &str)]) -> (String, Seen) {
+        use std::io::{BufRead, Read, Write};
+        let routes: Vec<(String, u16, String)> = routes
+            .iter()
+            .map(|(r, s, b)| (r.to_string(), *s, b.to_string()))
+            .collect();
+        let seen: Seen = Default::default();
+        let log = seen.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let mut parts = line.split_whitespace();
+                let route = format!(
+                    "{} {}",
+                    parts.next().unwrap_or(""),
+                    parts.next().unwrap_or("")
+                );
+                let mut len = 0usize;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
+                        break;
+                    }
+                    if let Some((k, v)) = header.split_once(':') {
+                        if k.eq_ignore_ascii_case("content-length") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let mut body = vec![0u8; len];
+                let _ = reader.read_exact(&mut body);
+                log.lock()
+                    .unwrap()
+                    .push((route.clone(), String::from_utf8_lossy(&body).into_owned()));
+                let (status, out) = routes
+                    .iter()
+                    .find(|(r, _, _)| *r == route)
+                    .map(|(_, s, b)| (*s, b.clone()))
+                    .unwrap_or((404, "not found".to_string()));
+                let kind = if out.starts_with('{') {
+                    "application/json"
+                } else {
+                    "text/plain"
+                };
+                let mut stream = reader.into_inner();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                    out.len()
+                );
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// What one run of the blog-newsletter post step left behind.
+    struct PostRun {
+        ok: bool,
+        stdout: String,
+        stderr: String,
+        seen: String,
+        failed: String,
+    }
+
+    /// Runs the real post step through `nu` with the runner's binding prelude, for the job
+    /// `p1` and Claude's `edition` (None: no edition.json).
+    fn run_blog_post(api: &str, edition: Option<&str>, claude_ok: bool) -> PostRun {
+        let action = validate_str(BLOG_NEWSLETTER, "t").unwrap().action;
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        if let Some(e) = edition {
+            std::fs::write(workdir.join("edition.json"), e).unwrap();
+        }
+        let claude_result = if claude_ok {
+            serde_json::json!({"ok": true, "summary": "done", "error": "", "cost": 0.0})
+        } else {
+            serde_json::json!({"ok": false, "summary": "boom", "error": "claude exited 1", "cost": 0.0})
+        };
+        let bindings = [
+            (
+                "job",
+                serde_json::json!({"guid": "p1", "title": "Post p1", "link": "https://blog.test/blog/p 1(x)"}),
+            ),
+            ("workdir", serde_json::json!(workdir.display().to_string())),
+            ("claude_result", claude_result),
+        ];
+        let mut script = String::new();
+        for (name, value) in &bindings {
+            let path = dir.path().join(format!("binding-{name}.json"));
+            std::fs::write(&path, value.to_string()).unwrap();
+            script.push_str(&format!(
+                "let {name} = (open --raw '{}' | from json)\n",
+                path.display()
+            ));
+        }
+        script.push_str(action.post[0].code());
+        let script_path = dir.path().join("post.nu");
+        std::fs::write(&script_path, script).unwrap();
+        let data = dir.path().join("data");
+        let out = std::process::Command::new("nu")
+            .arg(&script_path)
+            .envs(blog_newsletter_env(
+                "https://blog.test/blog/newsletter.xml",
+                api,
+            ))
+            .env("CLAUDE_RUN_DATA_DIR", &data)
+            .output()
+            .unwrap();
+        let state = |ext: &str| {
+            std::fs::read_to_string(
+                data.join("blog-newsletter")
+                    .join(format!("blog.test--127.0.0.1.{ext}")),
+            )
+            .unwrap_or_default()
+        };
+        PostRun {
+            ok: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            seen: state("seen"),
+            failed: state("failed"),
+        }
+    }
+
+    const GOOD_EDITION: &str = r#"{"subject": "", "preview_text": "What changed.", "body_md": "A short note on p1.\nIt says what p1 covers."}"#;
+
+    /// CLAUDE-644: a 201 marks the post seen and asks for review; an empty subject falls
+    /// back to the title, and the link is percent-encoded.
+    #[test]
+    fn blog_newsletter_post_drafts_then_asks_for_review() {
+        if !nu_available() {
+            return;
+        }
+        let (api, requests) = serve_api(&[
+            ("POST /api/v1/editions", 201, r#"{"id": 42}"#),
+            ("POST /api/v1/editions/42/review", 200, "{}"),
+        ]);
+        let run = run_blog_post(&api, Some(GOOD_EDITION), true);
+        assert!(run.ok, "{}", run.stderr);
+        assert!(
+            run.stdout.contains("edition 42 is in review"),
+            "{}",
+            run.stdout
+        );
+        assert_eq!(run.seen, "p1\n");
+        let requests = requests.lock().unwrap();
+        let routes: Vec<&str> = requests.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(
+            routes,
+            ["POST /api/v1/editions", "POST /api/v1/editions/42/review"]
+        );
+        let draft: serde_json::Value = serde_json::from_str(&requests[0].1).unwrap();
+        assert_eq!(draft["list"], "news");
+        assert_eq!(
+            draft["subject"], "Post p1",
+            "empty subject falls back to the title"
+        );
+        assert_eq!(draft["preview_text"], "What changed.");
+        assert_eq!(
+            draft["body_md"],
+            "A short note on p1. It says what p1 covers.\n\n[Read the full post](https://blog.test/blog/p%201%28x%29)"
+        );
+    }
+
+    /// CLAUDE-644: a newsletter system without the review call keeps the draft, and the job
+    /// still counts as done.
+    #[test]
+    fn blog_newsletter_post_tolerates_a_missing_review_call() {
+        if !nu_available() {
+            return;
+        }
+        let (api, _) = serve_api(&[("POST /api/v1/editions", 201, r#"{"id": 7}"#)]);
+        let run = run_blog_post(&api, Some(GOOD_EDITION), true);
+        assert!(run.ok, "{}", run.stderr);
+        assert!(
+            run.stderr.contains("edition 7 stays a draft"),
+            "{}",
+            run.stderr
+        );
+        assert_eq!(run.seen, "p1\n");
+    }
+
+    /// CLAUDE-644: a refused draft leaves the guid unseen, so a later check retries it, and
+    /// records the failed attempt.
+    #[test]
+    fn blog_newsletter_post_failure_leaves_the_guid_unseen() {
+        if !nu_available() {
+            return;
+        }
+        let (api, _) = serve_api(&[("POST /api/v1/editions", 500, r#"{"error": "down"}"#)]);
+        let run = run_blog_post(&api, Some(GOOD_EDITION), true);
+        assert!(!run.ok);
+        assert!(run.stderr.contains("answered 500"), "{}", run.stderr);
+        assert!(run.stderr.contains("Attempt 1 of 3"), "{}", run.stderr);
+        assert_eq!(run.seen, "");
+        assert_eq!(run.failed, "p1\n");
+    }
+
+    /// CLAUDE-644: output that breaks the summary rules posts nothing and stays unseen; a
+    /// failed claude run does the same; a deliberate skip marks the post seen.
+    #[test]
+    fn blog_newsletter_post_refuses_invalid_model_output() {
+        if !nu_available() {
+            return;
+        }
+        let (api, requests) = serve_api(&[("POST /api/v1/editions", 201, r#"{"id": 1}"#)]);
+        for (edition, said) in [
+            (r#"{"subject": "S", "body_md": ""}"#, "body_md is empty"),
+            (
+                r#"{"subject": "S", "body_md": "One.\n\nTwo."}"#,
+                "blank line",
+            ),
+            (
+                r#"{"subject": "S", "body_md": "See https://x.test"}"#,
+                "URL",
+            ),
+            (r#"{"subject": "S", "body_md": "A ![cat](c.png)"}"#, "image"),
+            (r#"{"subject": "S", "body_md": "<b>Hi</b>"}"#, "`<`"),
+            (
+                r#"{"subject": 5, "body_md": "Fine."}"#,
+                "subject is not a string",
+            ),
+            ("not json", "edition.json is not"),
+        ] {
+            let run = run_blog_post(&api, Some(edition), true);
+            assert!(!run.ok, "{edition}");
+            assert!(run.stderr.contains(said), "{edition}: {}", run.stderr);
+            assert_eq!(run.seen, "", "{edition}");
+        }
+        let long = format!(r#"{{"subject": "S", "body_md": "{}"}}"#, "a".repeat(600));
+        let run = run_blog_post(&api, Some(&long), true);
+        assert!(run.stderr.contains("not under 600"), "{}", run.stderr);
+        let run = run_blog_post(&api, Some(GOOD_EDITION), false);
+        assert!(!run.ok);
+        assert!(run.stderr.contains("claude exited 1"), "{}", run.stderr);
+        assert_eq!(run.seen, "");
+        assert!(requests.lock().unwrap().is_empty(), "nothing is posted");
+
+        let run = run_blog_post(
+            &api,
+            Some(r#"{"skip": true, "reason": "login wall"}"#),
+            true,
+        );
+        assert!(run.ok, "{}", run.stderr);
+        assert_eq!(run.seen, "p1\n");
+        assert!(requests.lock().unwrap().is_empty(), "a skip posts nothing");
     }
 
     /// Query partition: the reporting action and the worker action

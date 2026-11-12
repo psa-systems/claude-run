@@ -129,7 +129,8 @@ GitHub MCP endpoint (GitHub), `git`, `claude`, `nu` (default interpreter for scr
   checked before the general YAML parse so it reads as an invalid preset, not an untagged-enum mismatch naming no
   field.
 - `scripted` runs `input.command` (emits a JSON array) -> `filter` -> `pre` -> `prompt` -> `claude` -> `post`; each
-  script is a plain string or `{run, shell}`, with `nu` as the default interpreter.
+  script is a plain string or `{run, shell}`, with `nu` as the default interpreter. A successful `input.command`'s
+  non-empty stderr is logged at `info`.
 - Schedule: `kind: interval` (`humantime` duration, e.g. `30m`), `kind: cron` (5-field or 6-field expression), or
   `kind: manual` (only `trigger` fires it).
 - Per-action `limits`: `max_attempts_per_key` (default 3), `max_runs_per_day` (20), `claude_timeout_seconds` (600),
