@@ -90,9 +90,9 @@ pre:
 prompt: |
   $"You write the newsletter email of ($env.SENDER_NAME) that tells subscribers about a new post on ($env.BLOG_NAME).
 
-  Read `item.json` in the current directory: the post's feed entry \(title, link, summary, author, categories\). Read
-  `post.html`: the published post page. The article is the main content of that page; ignore navigation, footers and
-  other posts it links to.
+  Read `item.json` in the current directory: the post's feed entry \(title, link, summary, author, categories\); the
+  summary may be empty. Read `post.html`: the published post page, your main source. The article is the main content of
+  that page; ignore navigation, footers and other posts it links to.
 
   Write `edition.json` in the current directory, and no other file, with this shape:
   {\"subject\": string, \"preview_text\": string, \"body_md\": string}
@@ -134,7 +134,10 @@ post:
       print $"no draft: ($job.link): ($edition.reason? | default '')"
     } else {
       let subject = ($edition.subject? | default $job.title | str trim)
-      let preview = ($edition.preview_text? | default "" | str trim | str substring --grapheme-clusters 0..<150)
+      # No preview from Claude: fall back to the post title.
+      let preview = ($edition.preview_text? | default "" | str trim
+        | if ($in | is-empty) { $job.title | str trim } else { $in }
+        | str substring --grapheme-clusters 0..<150)
       let body_md = $"($edition.body_md | str trim)\n\n[Read the full post]\(($job.link)\)"
       let body = ({list: $env.NEWSLETTER_LIST, subject: $subject, body_md: $body_md}
         | merge (if ($preview | is-empty) { {} } else { {preview_text: $preview} }))

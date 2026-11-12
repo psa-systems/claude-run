@@ -2030,9 +2030,15 @@ native:
         let items: String = guids
             .iter()
             .map(|g| {
+                // p4 has no summary, so its item carries no `description`.
+                let summary = if *g == "p4" {
+                    String::new()
+                } else {
+                    format!("<description>About {g}</description>")
+                };
                 format!(
                     "<item><title>Post {g}</title><link>https://blog.test/blog/{g}</link>\
-                     <guid isPermaLink=\"false\">{g}</guid><description>About {g}</description>\
+                     <guid isPermaLink=\"false\">{g}</guid>{summary}\
                      <dc:creator>Ann</dc:creator><category>News</category>\
                      <enclosure url=\"https://blog.test/{g}.png\" length=\"1\" type=\"image/png\"/></item>"
                 )
@@ -2117,6 +2123,11 @@ native:
         assert!(
             jobs[0].get("cover").is_none(),
             "the email carries no cover image"
+        );
+        assert_eq!(jobs[0]["summary"], "About p3");
+        assert_eq!(
+            jobs[1]["summary"], "",
+            "a missing description is an empty summary"
         );
 
         // What the post step does once a job ran, draft or not.

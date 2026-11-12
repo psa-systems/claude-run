@@ -6,10 +6,10 @@ It is an example, so a new install does not get it: `actions/examples/` is not s
 
 ## What the email says
 
-Claude reads the post's feed entry (title, link, summary, author, categories) and the published post page, and writes:
+Claude reads the post's feed entry (title, link, summary, author, categories) and the published post page, and writes the email mainly from the page. A post with no summary has no `description` in the feed; the action then works from the page alone. It writes:
 
 - `subject`: the post title or a short newsletter-style version of it, under 70 characters;
-- `preview_text`: one sentence, at most 150 characters (the post step cuts a longer one);
+- `preview_text`: one sentence, at most 150 characters (the post step cuts a longer one, and uses the post title when there is none);
 - `body_md`: one short paragraph of two or three sentences on what the post covers.
 
 The post step ends the body with `[Read the full post](<post URL>)`, so the email is just that summary and the link: no cover image, no headings, never text copied from the article. The prompt also forbids inventing anything that is not in the post. A page that is not a readable article (an error page, a login wall) makes no draft.
