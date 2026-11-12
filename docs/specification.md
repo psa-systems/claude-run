@@ -129,7 +129,8 @@ GitHub MCP endpoint (GitHub), `git`, `claude`, `nu` (default interpreter for scr
   checked before the general YAML parse so it reads as an invalid preset, not an untagged-enum mismatch naming no
   field.
 - `scripted` runs `input.command` (emits a JSON array) -> `filter` -> `pre` -> `prompt` -> `claude` -> `post`; each
-  script is a plain string or `{run, shell}`, with `nu` as the default interpreter.
+  script is a plain string or `{run, shell}`, with `nu` as the default interpreter. A successful `input.command`'s
+  non-empty stderr is logged at `info`.
 - Schedule: `kind: interval` (`humantime` duration, e.g. `30m`), `kind: cron` (5-field or 6-field expression), or
   `kind: manual` (only `trigger` fires it).
 - Per-action `limits`: `max_attempts_per_key` (default 3), `max_runs_per_day` (20), `claude_timeout_seconds` (600),
@@ -2203,7 +2204,8 @@ action's `token_ref`, which is injected per job.
 - The app service defines no container healthcheck. Liveness is available from `GET /api/status` and the `status`
   command.
 - Shipped action files: `youtrack.yml` (interval 5m), `audit-run.yml` (interval 5m), `closed-issue-summary.yml` (interval
-  24h). `examples/release-notes.yml` (weekly, gated in its input) is an example and is not seeded into a new install.
+  24h). `examples/release-notes.yml` (weekly, gated in its input) and `examples/blog-newsletter.yml` (interval 15m, one draft
+  per new blog post) are examples and are not seeded into a new install.
 - The shared Cargo target directories (`SPEC-3.10`) live under the `/data` volume, which is disk-backed.
 - Restart safety: `GET /api/status` and the Status page expose a `quiet` flag that is true only when no run is open and
   no run is dispatched.
