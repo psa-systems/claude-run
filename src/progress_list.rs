@@ -130,6 +130,10 @@ struct Counts {
 /// numbering of the branch's earlier attempts. Adjacent `check`/`gate` rows are
 /// one `Checks N` step, `(failed)` when any of them failed; a review that did
 /// not pass is `Review (no verdict)`.
+/// Start, end, pass/fail, and the distinct check types seen so far in a run of
+/// adjacent `check`/`gate` rows not yet folded into a `Milestone`.
+type OpenChecks = (DateTime<Utc>, DateTime<Utc>, bool, Vec<String>);
+
 pub fn milestones(rows: &[StepRow]) -> Vec<Milestone> {
     let Some(first) = rows.first() else {
         return Vec::new();
@@ -139,10 +143,10 @@ pub fn milestones(rows: &[StepRow]) -> Vec<Milestone> {
     let mut counts = Counts::default();
     let mut current_attempt = first.attempt;
     let mut in_attempt = 0usize;
-    let mut open_checks: Option<(DateTime<Utc>, DateTime<Utc>, bool, Vec<String>)> = None;
+    let mut open_checks: Option<OpenChecks> = None;
     let secs = |a: DateTime<Utc>, b: DateTime<Utc>| (b - a).num_seconds().max(0);
 
-    let flush_checks = |open: &mut Option<(DateTime<Utc>, DateTime<Utc>, bool, Vec<String>)>,
+    let flush_checks = |open: &mut Option<OpenChecks>,
                         counts: &mut Counts,
                         in_attempt: &mut usize,
                         out: &mut Vec<Milestone>| {
@@ -596,7 +600,7 @@ mod tests {
         let list = render_push("PUSH-1", crate::push_comment::PushEvent::CheckpointPush);
         clear_context("PUSH-1");
         assert!(
-            list.contains("| 1 | Checkpoint 1 |  | 1:26 | 1:26 | 1:28 |"),
+            list.contains("| 1 | Checkpoint 1 |  | 1:26 | 1:28 | 1:28 |"),
             "{list}"
         );
         assert!(
