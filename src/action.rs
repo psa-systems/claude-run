@@ -1999,7 +1999,10 @@ native:
         assert!(post.contains("/review"), "{post}");
         // Summary plus link only (CLAUDE-644): no image is added to the body.
         assert!(post.contains("[Read the full post]"), "{post}");
-        assert!(!post.contains("!["), "{post}");
+        // The only "![" allowed is the guard that rejects an image in the summary.
+        for line in post.lines().filter(|l| l.contains("![")) {
+            assert!(line.contains("body_md has an image"), "{line}");
+        }
         for call in ["/send", "/schedule"] {
             assert!(!post.contains(call), "post must never call {call}");
         }
