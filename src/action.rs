@@ -1967,6 +1967,161 @@ native:
         crate::scheduler::parse_schedule(schedule).expect("cron spec parses");
     }
 
+    const BLOG_NEWSLETTER: &str = include_str!("../actions/examples/blog-newsletter.yml");
+
+    /// The example `actions/examples/blog-newsletter.yml` (CLAUDE-644): one job per
+    /// feed guid that never repeats, and a post step that drafts and asks for review only.
+    #[test]
+    fn shipped_blog_newsletter_action_is_scripted_and_per_post() {
+        let loaded = validate_str(BLOG_NEWSLETTER, "actions/examples/blog-newsletter.yml")
+            .expect("shipped action valid");
+        let action = loaded.action;
+        assert_eq!(action.name, "blog-newsletter");
+        assert_eq!(action.kind, ActionKind::Scripted);
+        assert!(action.native.is_none());
+        assert!(action.input.is_some());
+        assert!(action.prompt.is_some());
+        assert_eq!(action.pre.len(), 1);
+        assert_eq!(action.post.len(), 1);
+        assert_eq!(action.dedup_key.as_deref(), Some("guid"));
+        assert_eq!(action.limits.max_attempts_per_key, Some(1));
+        assert_eq!(action.claude.allowed_tools.as_deref(), Some("Read,Write"));
+        assert_eq!(action.env["NEWSLETTER_LIST"], "your-list-slug");
+        assert_eq!(
+            action.secrets["NEWSLETTER_API_TOKEN"],
+            "newsletter-api-token"
+        );
+        let post = action.post[0].code();
+        assert!(post.contains("/api/v1/editions"), "{post}");
+        assert!(post.contains("/review"), "{post}");
+        for call in ["/send", "/schedule"] {
+            assert!(!post.contains(call), "post must never call {call}");
+        }
+        let schedule = action.schedule.as_ref().expect("scheduled");
+        assert_eq!(schedule.kind, ScheduleKind::Interval);
+        crate::scheduler::parse_schedule(schedule).expect("interval spec parses");
+    }
+
+    /// Serves `body` for every request until the test process ends.
+    fn serve_feed(body: std::sync::Arc<std::sync::Mutex<String>>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let feed = body.lock().unwrap().clone();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{feed}",
+                    feed.len()
+                );
+            }
+        });
+        format!("http://{addr}/blog/feed.xml")
+    }
+
+    fn feed_with(guids: &[&str]) -> String {
+        let items: String = guids
+            .iter()
+            .map(|g| {
+                format!(
+                    "<item><title>Post {g}</title><link>https://blog.test/blog/{g}</link>\
+                     <guid isPermaLink=\"false\">{g}</guid><description>About {g}</description>\
+                     <dc:creator>Ann</dc:creator><category>News</category>\
+                     <enclosure url=\"https://blog.test/{g}.png\" length=\"1\" type=\"image/png\"/></item>"
+                )
+            })
+            .collect();
+        format!(
+            "<?xml version=\"1.0\"?><rss version=\"2.0\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\
+             <channel><title>Blog</title><link>https://blog.test/blog</link><description>d</description>\
+             {items}</channel></rss>"
+        )
+    }
+
+    /// CLAUDE-644: the first run only seeds the seen file; later runs yield each new guid
+    /// once, oldest first, and a guid the post step recorded never comes back.
+    /// Runs the real `input.command` through `nu`; skipped where `nu` is not installed.
+    #[test]
+    fn blog_newsletter_input_seeds_then_yields_each_new_guid_once() {
+        if std::process::Command::new("nu")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: nu is not on PATH");
+            return;
+        }
+        let action = validate_str(BLOG_NEWSLETTER, "t").unwrap().action;
+        let command = action.input.as_ref().unwrap().command.code().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("input.nu");
+        std::fs::write(&script, command).unwrap();
+        let data = dir.path().join("data");
+        let body = std::sync::Arc::new(std::sync::Mutex::new(feed_with(&["p2", "p1"])));
+        let url = serve_feed(body.clone());
+        let run = |feed_url: &str| {
+            let out = std::process::Command::new("nu")
+                .arg(&script)
+                .env("CLAUDE_RUN_DATA_DIR", &data)
+                .env("BLOG_FEED_URL", feed_url)
+                .env("NEWSLETTER_URL", "https://news.test")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            let jobs: Option<Vec<serde_json::Value>> = out
+                .status
+                .success()
+                .then(|| serde_json::from_slice(&out.stdout).expect("a JSON array"));
+            (jobs, stderr)
+        };
+        let guids = |jobs: &[serde_json::Value]| -> Vec<String> {
+            jobs.iter()
+                .map(|j| j["guid"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let (jobs, stderr) = run("https://blog.example.com/blog/feed.xml");
+        assert!(jobs.is_none(), "placeholders must stop the run");
+        assert!(stderr.contains("replace the placeholders"), "{stderr}");
+
+        let (jobs, stderr) = run(&url);
+        assert_eq!(
+            jobs.as_deref(),
+            Some(&[][..]),
+            "first run drafts nothing: {stderr}"
+        );
+        let host = url.split('/').nth(2).unwrap().split(':').next().unwrap();
+        let seen_file = data
+            .join("blog-newsletter")
+            .join(format!("{host}--news.test.seen"));
+        let seen = std::fs::read_to_string(&seen_file).unwrap();
+        assert_eq!(seen.lines().collect::<Vec<_>>(), ["p2", "p1"]);
+
+        let (jobs, stderr) = run(&url);
+        assert_eq!(jobs.as_deref(), Some(&[][..]), "{stderr}");
+
+        *body.lock().unwrap() = feed_with(&["p4", "p3", "p2", "p1"]);
+        let (jobs, stderr) = run(&url);
+        let jobs = jobs.unwrap_or_else(|| panic!("{stderr}"));
+        assert_eq!(guids(&jobs), ["p3", "p4"], "oldest first");
+        assert_eq!(jobs[0]["link"], "https://blog.test/blog/p3");
+        assert_eq!(jobs[0]["author"], "Ann");
+        assert_eq!(jobs[0]["categories"], serde_json::json!(["News"]));
+        assert_eq!(jobs[0]["cover"], "https://blog.test/p3.png");
+
+        // What the post step does once a job ran, draft or not.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&seen_file)
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"p3\n").unwrap();
+        let (jobs, stderr) = run(&url);
+        assert_eq!(guids(&jobs.unwrap_or_else(|| panic!("{stderr}"))), ["p4"]);
+    }
+
     /// Query partition: the reporting action and the worker action
     /// must never gather the same issue. The worker pins the single `AI Agent`
     /// value `Queued`; the reporter ships with no query at all, and its

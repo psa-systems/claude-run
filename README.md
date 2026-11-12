@@ -26,6 +26,7 @@ Operator and developer docs live in [`docs/`](docs/):
 - [webhooks.md](docs/webhooks.md) - CI-failure webhooks, automerge, auto-fix, GitHub setup
 - [comment-commands.md](docs/comment-commands.md) - commands posted as pull request or issue comments
 - [release-notes.md](docs/release-notes.md) - an example action: a weekly release-notes draft into a newsletter system
+- [blog-newsletter.md](docs/blog-newsletter.md) - an example action: a newsletter draft for review per new blog post
 - [self-hosting.md](docs/self-hosting.md) - install: the container image and `compose.yml`
 - [ROADMAP.md](docs/ROADMAP.md) - planned work
 

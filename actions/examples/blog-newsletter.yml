@@ -1,0 +1,177 @@
+---
+# yaml-embedded-languages: nushell
+# https://github.com/harrydowning/vscode-yaml-embedded-languages
+# https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
+
+# One newsletter draft per new blog post, for a person to approve: an example to adapt (CLAUDE-644).
+#
+# Not installed by default: `actions/examples/` is not seeded into a new install. To use it, paste this file into the
+# web UI (New action, raw YAML), replace the placeholders in `env` and store the token on the Secrets page. The run
+# stops with a message until `BLOG_FEED_URL` and `NEWSLETTER_URL` are yours. See docs/blog-newsletter.md.
+#
+# The input reads the blog's RSS feed. Each item not seen before is one job (`dedup_key: guid`), and Claude writes a
+# short teaser that links to the post. The post step creates it as a draft (`POST <NEWSLETTER_URL>/api/v1/editions`)
+# and then asks for review (`POST .../editions/{id}/review`); a newsletter system without that call (404 or 405) keeps
+# the plain draft. The action never sends or schedules.
+#
+# The first run against a blog only records the items already in the feed as seen, so an existing blog is not mailed
+# in one go. Seen guids live in `$CLAUDE_RUN_DATA_DIR/blog-newsletter/<blog host>--<newsletter host>.seen`, one per
+# line; the post step adds each guid it handled, draft or not, so an edited post never drafts twice.
+
+name: blog-newsletter
+kind: scripted
+env:
+  # Replace all of these.
+  BLOG_FEED_URL: https://blog.example.com/blog/feed.xml
+  BLOG_NAME: Your Blog
+  SENDER_NAME: Your Company
+  NEWSLETTER_URL: https://news.example.com
+  NEWSLETTER_LIST: your-list-slug
+secrets:
+  # The name of a secret on the Secrets page, never the token itself.
+  NEWSLETTER_API_TOKEN: newsletter-api-token
+input:
+  command: |
+    if ($env.BLOG_FEED_URL | url parse | get host | str ends-with "example.com") or ($env.NEWSLETTER_URL | url parse | get host | str ends-with "example.com") {
+      error make {msg: "blog-newsletter: replace the placeholders in this action's env block first"}
+    }
+    def text-of [el] {
+      $el.content | where {|c| $c.tag == null } | get --optional content | str join "" | str trim
+    }
+    def child [el, name: string] {
+      $el.content | where {|c| $c.tag == $name }
+    }
+    let raw = (http get --raw $env.BLOG_FEED_URL)
+    let xml = (if ($raw | describe) == "binary" { $raw | decode utf-8 } else { $raw })
+    let feed = ($xml | from xml)
+    let channel = (child $feed "channel" | first)
+    let items = (child $channel "item" | each {|it|
+      let link = (child $it "link" | each {|e| text-of $e } | get --optional 0 | default "")
+      let guid = (child $it "guid" | each {|e| text-of $e } | get --optional 0 | default $link)
+      let cover = (child $it "enclosure"
+        | where {|e| ($e.attributes.type? | default "" | str starts-with "image/") }
+        | get --optional 0.attributes.url | default "")
+      {
+        guid: $guid,
+        title: (child $it "title" | each {|e| text-of $e } | get --optional 0 | default ""),
+        link: $link,
+        published: (child $it "pubDate" | each {|e| text-of $e } | get --optional 0 | default ""),
+        summary: (child $it "description" | each {|e| text-of $e } | get --optional 0 | default ""),
+        # nu drops the namespace prefix: `dc:creator` arrives as `creator`.
+        author: (child $it "creator" | each {|e| text-of $e } | get --optional 0 | default ""),
+        categories: (child $it "category" | each {|e| text-of $e }),
+        cover: $cover,
+      }
+    } | where {|i| ($i.guid | is-not-empty) and ($i.link | is-not-empty) })
+    let blog = ($env.BLOG_FEED_URL | url parse | get host)
+    let site = ($env.NEWSLETTER_URL | url parse | get host)
+    let dir = ($env.CLAUDE_RUN_DATA_DIR | path join "blog-newsletter")
+    let seen_file = ($dir | path join $"($blog)--($site).seen")
+    if not ($seen_file | path exists) {
+      # First run: record what is already published, draft nothing.
+      mkdir $dir
+      $items | get guid | str join "\n" | $in + "\n" | save $seen_file
+      print --stderr $"blog-newsletter: first run, ($items | length) existing posts marked as seen"
+      [] | to json
+    } else {
+      let seen = (open --raw $seen_file | lines | where {|l| $l | is-not-empty })
+      # The feed lists newest first; draft the oldest first.
+      $items | where {|i| $i.guid not-in $seen } | reverse | to json
+    }
+dedup_key: guid
+pre:
+  - |
+    let item_path = ($workdir | path join "item.json")
+    let page_path = ($workdir | path join "post.html")
+    for p in [$item_path $page_path] { if ($p | path exists) { rm $p } }
+    $job | to json | save $item_path
+    let page = (http get --raw --full --allow-errors $job.link)
+    if $page.status != 200 {
+      error make {msg: $"no draft: the post page answered ($page.status): ($job.link)"}
+    }
+    let body = (if ($page.body | describe) == "binary" { $page.body | decode utf-8 } else { $page.body })
+    $body | save $page_path
+prompt: |
+  $"You write the newsletter email of ($env.SENDER_NAME) that tells subscribers about a new post on ($env.BLOG_NAME).
+
+  Read `item.json` in the current directory: the post's feed entry \(title, link, summary, author, categories\). Read
+  `post.html`: the published post page. The article is the main content of that page; ignore navigation, footers and
+  other posts it links to.
+
+  Write `edition.json` in the current directory, and no other file, with this shape:
+  {\"subject\": string, \"preview_text\": string, \"body_md\": string}
+
+  The email is a teaser that sends readers to the post. It never replaces the post.
+  - `subject`: the post title, or a short newsletter-style version of it, under 70 characters.
+  - `preview_text`: one sentence that adds to the subject, at most 150 characters, not repeating it.
+  - `body_md`: Markdown, two or three short paragraphs \(under 150 words in all\) saying what the post covers and why a
+    reader would care. No heading, no greeting, no sign-off, no image and no link: the cover image and the
+    \"Read the full post\" link are added for you.
+
+  Rules:
+  - Use only what the post says. Invent nothing: no numbers, quotes, dates, features or claims that are not in it.
+  - Never paste the article or long passages of it. Short phrases in your own sentences only.
+  - Write for people who subscribed to this newsletter, in plain words.
+
+  If the page is not a readable article \(empty, an error page, or a login wall\), write instead:
+  {\"skip\": true, \"reason\": string}"
+claude:
+  allowed_tools: "Read,Write"
+  model: sonnet
+  effort: medium
+post:
+  - |
+    let blog = ($env.BLOG_FEED_URL | url parse | get host)
+    let site = ($env.NEWSLETTER_URL | url parse | get host)
+    let dir = ($env.CLAUDE_RUN_DATA_DIR | path join "blog-newsletter")
+    mkdir $dir
+    # Seen before anything can fail, so this post never drafts twice.
+    $"($job.guid)\n" | save --append ($dir | path join $"($blog)--($site).seen")
+    if not $claude_result.ok {
+      error make {msg: $"no draft: claude failed: ($claude_result.error? | default $claude_result.summary)"}
+    }
+    let path = ($workdir | path join "edition.json")
+    if not ($path | path exists) {
+      error make {msg: "no draft: claude wrote no edition.json"}
+    }
+    let edition = (open $path)
+    if ($edition.skip? | default false) {
+      print $"no draft: ($job.link): ($edition.reason? | default '')"
+    } else {
+      let subject = ($edition.subject? | default $job.title | str trim)
+      let preview = ($edition.preview_text? | default "" | str trim | str substring --grapheme-clusters 0..<150)
+      let alt = ($job.title | str replace --all --regex '[\[\]]' '')
+      let cover = (if ($job.cover | is-empty) { [] } else { [$"![($alt)]\(($job.cover)\)"] })
+      let body_md = ($cover | append ($edition.body_md | str trim) | append $"[Read the full post]\(($job.link)\)"
+        | str join "\n\n")
+      let body = ({list: $env.NEWSLETTER_LIST, subject: $subject, body_md: $body_md}
+        | merge (if ($preview | is-empty) { {} } else { {preview_text: $preview} }))
+      let base = ($env.NEWSLETTER_URL | str trim --right --char '/')
+      let headers = {Authorization: $"Bearer ($env.NEWSLETTER_API_TOKEN)"}
+      let answer = (http post --full --allow-errors --content-type application/json --headers $headers
+        $"($base)/api/v1/editions" $body)
+      if $answer.status != 201 {
+        error make {msg: $"no draft: the newsletter system answered ($answer.status): ($answer.body | to json --raw)"}
+      }
+      let id = $answer.body.id
+      print $"draft edition ($id) created on ($body.list): ($subject)"
+      let review = (http post --full --allow-errors --content-type application/json --headers $headers
+        $"($base)/api/v1/editions/($id)/review" {})
+      if $review.status == 200 {
+        print $"edition ($id) is in review"
+      } else if $review.status in [404 405] {
+        print --stderr $"warning: no review call on this newsletter system \(($review.status)\): edition ($id) stays a draft"
+      } else {
+        print --stderr $"warning: asking for review answered ($review.status): edition ($id) stays as it is: ($review.body | to json --raw)"
+      }
+    }
+limits:
+  max_attempts_per_key: 1
+  max_runs_per_day: 20
+  claude_timeout_seconds: 600
+  run_budget_usd: 1.00
+# Due 15 minutes after the last run; a check that finds no new post starts no run and checks again every
+# `regather_interval` (SPEC-2.2).
+schedule:
+  kind: interval
+  spec: 15m

@@ -2201,7 +2201,8 @@ action's `token_ref`, which is injected per job.
 - The app service defines no container healthcheck. Liveness is available from `GET /api/status` and the `status`
   command.
 - Shipped action files: `youtrack.yml` (interval 5m), `audit-run.yml` (interval 5m), `closed-issue-summary.yml` (interval
-  24h). `examples/release-notes.yml` (weekly, gated in its input) is an example and is not seeded into a new install.
+  24h). `examples/release-notes.yml` (weekly, gated in its input) and `examples/blog-newsletter.yml` (interval 15m, one draft
+  per new blog post) are examples and are not seeded into a new install.
 - The shared Cargo target directories (`SPEC-3.10`) live under the `/data` volume, which is disk-backed.
 - Restart safety: `GET /api/status` and the Status page expose a `quiet` flag that is true only when no run is open and
   no run is dispatched.
