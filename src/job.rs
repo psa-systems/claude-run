@@ -276,6 +276,11 @@ pub async fn gather_jobs(
             stderr: outcome.stderr,
         });
     }
+    // An input says what it skipped or held back on stderr (CLAUDE-644).
+    let said = outcome.stderr.trim();
+    if !said.is_empty() {
+        info!(action = %action.action.name, stderr = %said, "input.command stderr");
+    }
     let parsed: Value = serde_json::from_str(&outcome.stdout)
         .map_err(|e| Error::InputNotJsonArray(format!("{e}: stdout={}", outcome.stdout)))?;
     match parsed {

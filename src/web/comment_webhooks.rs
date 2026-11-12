@@ -1299,10 +1299,9 @@ async fn run_instruction(
             &expected,
             cmd.is_pull_request,
         );
-        let body = crate::run_footer::append_run(
+        let body = crate::run_footer::append_start_notice(
             &body,
             crate::run_footer::resolved_public_url().as_deref(),
-            None,
             None,
             COMMENT_WEBHOOK_SOURCE,
             Some(&trigger),
@@ -1540,6 +1539,12 @@ fn serve_run(
     };
 
     if let Err(e) = std::fs::create_dir_all(workdir) {
+        // SPEC-4.4.5: no outcome is silent. Mirrors the branch-resolve fault
+        // above. `post_reply` re-attempts `create_dir_all(workdir)` and
+        // logs-and-skips on its own failure, so a hard fault still exits
+        // cleanly, but a transient one now reaches the thread (CLAUDE-646).
+        let body = error_comment("creating the comment workdir failed.", &e.to_string());
+        post_reply(backend, cmd, workdir, body);
         warn!(error = %e, "creating the comment workdir failed");
         return RunOutcome::failed(format!("creating the workdir failed: {e}"));
     }

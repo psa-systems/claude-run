@@ -715,6 +715,9 @@ does not parse or inject secrets.
 
 If the snippet exits non-zero, or stdout is not a JSON array, the run aborts with exit code 5.
 
+On success its stderr, when not empty, is logged at `info` (`input.command stderr`), so an input can say what it
+skipped or held back (CLAUDE-644).
+
 ### `dedup_key` (string, optional)
 
 The name of a field on each job whose value uniquely identifies the unit of work. The runner tracks attempts keyed on

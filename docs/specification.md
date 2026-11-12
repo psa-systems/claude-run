@@ -129,7 +129,8 @@ GitHub MCP endpoint (GitHub), `git`, `claude`, `nu` (default interpreter for scr
   checked before the general YAML parse so it reads as an invalid preset, not an untagged-enum mismatch naming no
   field.
 - `scripted` runs `input.command` (emits a JSON array) -> `filter` -> `pre` -> `prompt` -> `claude` -> `post`; each
-  script is a plain string or `{run, shell}`, with `nu` as the default interpreter.
+  script is a plain string or `{run, shell}`, with `nu` as the default interpreter. A successful `input.command`'s
+  non-empty stderr is logged at `info`.
 - Schedule: `kind: interval` (`humantime` duration, e.g. `30m`), `kind: cron` (5-field or 6-field expression), or
   `kind: manual` (only `trigger` fires it).
 - Per-action `limits`: `max_attempts_per_key` (default 3), `max_runs_per_day` (20), `claude_timeout_seconds` (600),
@@ -1163,6 +1164,9 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
   every other line as they were; the result goes through the same `validate_str` path, and nothing is written unless
   its parsed `env` equals the submitted values. A key not already in the block, or a native action, is refused with
   the editor's validation message. Keys are added or removed in the raw YAML only.
+- `/actions` and `/actions/{name}/env` are POST-only; each also answers `GET` with a `303` redirect (to
+  `/actions/new/raw`, or the action's own `/edit` page) rather than `405`, since a rejected submission can leave
+  that URL in the address bar (`CLAUDE-650`).
 
 #### 4.3.4 Native action editor forms (`SPEC-4.3.4`)
 
@@ -1201,6 +1205,9 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
   `getrandom`), stores only its SHA-256 hash, and renders the plaintext key exactly once, on the response to that
   generate call; it is never shown or recoverable again. Revoke deletes the row outright; there is no soft-revoke
   state. These keys authenticate `/api/peer/*` (`SPEC-3.17` item 4, `SPEC-7.6`) only, never the web UI or `/api/*`.
+- `/secrets/api-keys`, `/secrets/api-keys/{name}/revoke`, `/secrets/{name}/rotate`, `/secrets/{name}/delete` and
+  `/secrets/{name}/check` are POST-only; each also answers `GET` with a `303` redirect (to `/secrets`, or `/access`
+  for `check`) rather than `405`, since a POST response at that URL can leave it in the address bar (`CLAUDE-650`).
 
 #### 4.3.7 Access page (`SPEC-4.3.7`)
 
@@ -1218,6 +1225,11 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
   reports delivery failure inline, without persisting anything.
 - The Claude login card starts, submits a code to, and can cancel, the interactive broker session (`SPEC-7.5`); the
   rendered banner reflects the broker's own session state, not a separate poll of `claude auth status`.
+- Every section save and service-auth card save is POST-only (`/settings/{section}`, `/settings/auth/claude`,
+  `/settings/auth/claude/login`, `/settings/auth/claude/code`, `/settings/auth/youtrack`, `/settings/auth/forgejo`,
+  `/settings/auth/github`, `/settings/auth/git`, `/settings/auth/email/test`); each also answers `GET` with a `303`
+  redirect to `/settings` rather than `405`, since a rejected submission re-renders the full page at that same URL
+  (`CLAUDE-650`). `/settings/auth/claude/cancel` stays POST-only: it always redirects and never renders a page.
 
 #### 4.3.9 About and activity pages (`SPEC-4.3.9`)
 
@@ -1258,7 +1270,7 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
 - `/static/mascot.png`, the landing page's art (`SPEC-7.16`), `/static/favicon.ico` (`image/x-icon`),
   `/static/apple-touch-icon.png` and `/static/brand-mark.png` (`image/png`) are each served the same way from the
   matching `assets/*` file, with a one-day cache instead of immutable, so replacing a file reaches browsers after an
-  upgrade. The favicon and apple touch icon are linked from every page head; the brand mark is the small running-figure
+  upgrade. The favicon and apple touch icon are linked from every page head; the brand mark is the small Clarence head
   chip shown before the app name in the header. Unlike the mascot, all three are public in every gate state (`SPEC-7.6`):
   they carry no instance data and are needed on `/login` and `/setup` while signed out.
 
@@ -1899,11 +1911,13 @@ appears in a log line or an error message. CI runs its Postgres leg through it
   with `require_auth_on_loopback` unset; it is not mounted at all while peering is disabled. Its own gate accepts
   either the `auth_token_ref` bearer above or a generated API key (`SPEC-4.3.6`): a presented bearer that matches
   neither is `401`; a database error while checking the generated key answers `500`, never `401`, since a store
-  outage must never read as "wrong credential". This gate is independent of the web/`/api/*` gate above, so a
-  generated API key authenticates `/api/peer/*` only and is rejected everywhere else.
-- `/webhooks/`, `/login`, `/login/2fa`, `/logout`, `/setup`, `/invite/*`, `/static/favicon.ico`,
+  outage must never read as "wrong credential". This gate is independent of the web/`/api/*` gate above, which
+  exempts the `/api/peer/` prefix so the two never both apply, so a generated API key authenticates `/api/peer/*` only
+  and is rejected everywhere else.
+- `/webhooks/`, `/api/peer/*`, `/login`, `/login/2fa`, `/logout`, `/setup`, `/invite/*`, `/static/favicon.ico`,
   `/static/apple-touch-icon.png` and `/static/brand-mark.png` are exempt from this gate: webhooks authenticate by HMAC
-  (4.4) and cannot carry a bearer header, the auth routes themselves must stay reachable unauthenticated or there is no
+  (4.4) and cannot carry a bearer header, `/api/peer/*` authenticates through its own gate above (which this gate cannot
+  evaluate, since it never reads generated keys), the auth routes themselves must stay reachable unauthenticated or there is no
   way to obtain a credential, and the three icon assets carry no instance data and are linked from every page head
   including `/login` and `/setup`. `/account/2fa/setup` still requires a valid credential; it is exempt only from the
   enrollment check in 7.10, not from this gate.
@@ -2216,7 +2230,8 @@ action's `token_ref`, which is injected per job.
 - The app service defines no container healthcheck. Liveness is available from `GET /api/status` and the `status`
   command.
 - Shipped action files: `youtrack.yml` (interval 5m), `audit-run.yml` (interval 5m), `closed-issue-summary.yml` (interval
-  24h). `examples/release-notes.yml` (weekly, gated in its input) is an example and is not seeded into a new install.
+  24h). `examples/release-notes.yml` (weekly, gated in its input) and `examples/blog-newsletter.yml` (interval 15m, one draft
+  per new blog post) are examples and are not seeded into a new install.
 - The shared Cargo target directories (`SPEC-3.10`) live under the `/data` volume, which is disk-backed.
 - Restart safety: `GET /api/status` and the Status page expose a `quiet` flag that is true only when no run is open and
   no run is dispatched.
