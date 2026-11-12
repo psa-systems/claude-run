@@ -1259,7 +1259,7 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
 - `/static/mascot.png`, the landing page's art (`SPEC-7.16`), `/static/favicon.ico` (`image/x-icon`),
   `/static/apple-touch-icon.png` and `/static/brand-mark.png` (`image/png`) are each served the same way from the
   matching `assets/*` file, with a one-day cache instead of immutable, so replacing a file reaches browsers after an
-  upgrade. The favicon and apple touch icon are linked from every page head; the brand mark is the small running-figure
+  upgrade. The favicon and apple touch icon are linked from every page head; the brand mark is the small Clarence head
   chip shown before the app name in the header. Unlike the mascot, all three are public in every gate state (`SPEC-7.6`):
   they carry no instance data and are needed on `/login` and `/setup` while signed out.
 
