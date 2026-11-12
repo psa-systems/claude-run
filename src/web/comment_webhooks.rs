@@ -2444,7 +2444,7 @@ fn post_fix_push_comment(
     } else {
         crate::push_comment::PushEvent::CommentWebhookFixPush
     };
-    // SPEC-3.15 item 5, SPEC-8.8: a comment-driven run stores no steps, so the
+    // SPEC-3.15 item 6, SPEC-8.8: a comment-driven run stores no steps, so the
     // list is this comment's own line unless a context was stashed for the key.
     let progress = crate::progress_list::render_push(&issue_key, event);
     let ctx = crate::push_comment::PushCommentContext {

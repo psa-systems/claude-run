@@ -1,9 +1,9 @@
-//! SPEC-3.15: the numbered step list on runner lifecycle comments.
+//! SPEC-3.15: the step table on runner lifecycle comments.
 //!
-//! The list is rendered from the stored `attempt_steps` rows (SPEC-3.14), not
+//! The table is rendered from the stored `attempt_steps` rows (SPEC-3.14), not
 //! from comment text, so it survives a restart. Rows are folded into listed
-//! milestones ([`milestones`]); the current comment's own line is marked
-//! `<-- This comment`, earlier lines carry their times, and the rest of the
+//! milestones ([`milestones`]); the current comment's own row is marked
+//! `<-- This comment`, earlier rows carry their times, and the rest of the
 //! expected happy path is listed with no times. Steps are ASCII only.
 
 use chrono::{DateTime, Utc};
@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use crate::db::DbPool;
 use crate::error::{Error, Result};
 
-/// SPEC-3.15 item 3: the happy path, in order.
+/// SPEC-3.15 item 4: the happy path, in order.
 pub const HAPPY_PATH: &[&str] = &[
     "Initial commit",
     "Checkpoint 1",
@@ -28,6 +28,9 @@ pub const HAPPY_PATH: &[&str] = &[
 pub struct StepRow {
     pub attempt: i64,
     pub kind: String,
+    /// The `attempt_steps.label` the row was stored under: a check/gate row's
+    /// recipe or stage name, otherwise the same as `kind` for most rows.
+    pub label: String,
     /// The SPEC-3.14 item 1 stage the row was stored under.
     pub stage: String,
     pub started_at: DateTime<Utc>,
@@ -35,12 +38,17 @@ pub struct StepRow {
     pub ok: bool,
 }
 
-/// A listed step that has happened: its label, its own duration and the
-/// elapsed time at its end, both in whole seconds.
+/// A listed step that has happened: its label, the check type(s) it folds
+/// (SPEC-3.15 item 2, empty for a non-check step), its own duration, the
+/// unlisted time before it broken down by kind (SPEC-3.15 item 1, largest
+/// first, empty when there is none) and the elapsed time at its end, all
+/// durations in whole seconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Milestone {
     pub label: String,
+    pub check_type: Option<String>,
     pub step_secs: i64,
+    pub other_before: Vec<(String, i64)>,
     pub total_secs: i64,
 }
 
@@ -55,12 +63,32 @@ pub fn format_secs(secs: i64) -> String {
     }
 }
 
-/// SPEC-3.15 item 6: a step with no recorded time because its data is
+/// SPEC-3.15 item 7: a step with no recorded time because its data is
 /// incomplete.
 pub const UNKNOWN_TIME: &str = "?:??";
 
 fn is_check_kind(kind: &str) -> bool {
     kind == "check" || kind == "gate"
+}
+
+/// SPEC-3.15 item 2: the check type `label` names for a `check`/`gate` row, or
+/// `None` for a per-stage sub-step row (`fmt`, `clippy`, `test`, `build`) that
+/// folds into its parent's type instead of adding its own. A `gate` row's
+/// label is always its gate command; a `check` row's label is a type only when
+/// it is one of the repo-recipe or ad-hoc names `classify_bash_command` emits.
+fn check_type<'a>(kind: &str, label: &'a str) -> Option<&'a str> {
+    match kind {
+        "gate" => Some(label),
+        "check"
+            if matches!(
+                label,
+                "pre-commit" | "pre-push" | "check" | "verify" | "ad-hoc"
+            ) =>
+        {
+            Some(label)
+        }
+        _ => None,
+    }
 }
 
 /// The label a stored kind lists under, or `None` for a kind that only adds
@@ -99,12 +127,54 @@ struct Counts {
     ci_remediation: usize,
 }
 
-/// SPEC-3.15 items 1, 4 and 5: fold `rows` (all attempts of one job, ordered by
+/// SPEC-3.15 item 1: the breakdown bucket name for an unlisted row: the
+/// stored `kind`, except `kind = "other"` splits by `label` (`"other"` for an
+/// unclassified command, `"unaccounted"` for the recorder's own gap filler,
+/// SPEC-3.14 items 4 and 6).
+fn unlisted_bucket(kind: &str, label: &str) -> String {
+    if kind == "other" {
+        label.to_string()
+    } else {
+        kind.to_string()
+    }
+}
+
+/// SPEC-3.15 item 1: close the pending breakdown window that ends at a listed
+/// point spanning `start` to `end`: the buckets accumulated since the last
+/// listed point, plus any part of the raw gap no stored row explains folded
+/// into `other` so nothing is left unattributed, sorted largest duration
+/// first. Advances `prev_end` to `end` and empties `pending`.
+fn close_window(
+    prev_end: &mut DateTime<Utc>,
+    pending: &mut Vec<(String, i64)>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Vec<(String, i64)> {
+    let gap = (start - *prev_end).num_seconds().max(0);
+    let known: i64 = pending.iter().map(|(_, d)| d).sum();
+    let mut breakdown = std::mem::take(pending);
+    let leftover = gap - known;
+    if leftover > 0 {
+        match breakdown.iter_mut().find(|(k, _)| k == "other") {
+            Some(entry) => entry.1 += leftover,
+            None => breakdown.push(("other".to_string(), leftover)),
+        }
+    }
+    breakdown.sort_by_key(|(_, dur)| std::cmp::Reverse(*dur));
+    *prev_end = end;
+    breakdown
+}
+
+/// SPEC-3.15 items 1, 5 and 6: fold `rows` (all attempts of one job, ordered by
 /// attempt then sequence) into the milestones that have happened. A later
 /// attempt opens with its `Retry N` line, so a resumed run continues the
 /// numbering of the branch's earlier attempts. Adjacent `check`/`gate` rows are
 /// one `Checks N` step, `(failed)` when any of them failed; a review that did
 /// not pass is `Review (no verdict)`.
+/// Start, end, pass/fail, and the distinct check types seen so far in a run of
+/// adjacent `check`/`gate` rows not yet folded into a `Milestone`.
+type OpenChecks = (DateTime<Utc>, DateTime<Utc>, bool, Vec<String>);
+
 pub fn milestones(rows: &[StepRow]) -> Vec<Milestone> {
     let Some(first) = rows.first() else {
         return Vec::new();
@@ -114,24 +184,31 @@ pub fn milestones(rows: &[StepRow]) -> Vec<Milestone> {
     let mut counts = Counts::default();
     let mut current_attempt = first.attempt;
     let mut in_attempt = 0usize;
-    let mut open_checks: Option<(DateTime<Utc>, DateTime<Utc>, bool)> = None;
+    let mut open_checks: Option<OpenChecks> = None;
+    let mut prev_end = origin;
+    let mut pending: Vec<(String, i64)> = Vec::new();
     let secs = |a: DateTime<Utc>, b: DateTime<Utc>| (b - a).num_seconds().max(0);
 
-    let flush_checks = |open: &mut Option<(DateTime<Utc>, DateTime<Utc>, bool)>,
+    let flush_checks = |open: &mut Option<OpenChecks>,
                         counts: &mut Counts,
                         in_attempt: &mut usize,
+                        prev_end: &mut DateTime<Utc>,
+                        pending: &mut Vec<(String, i64)>,
                         out: &mut Vec<Milestone>| {
-        if let Some((start, end, ok)) = open.take() {
+        if let Some((start, end, ok, types)) = open.take() {
             counts.checks += 1;
             let label = if ok {
                 format!("Checks {}", counts.checks)
             } else {
                 format!("Checks {} (failed)", counts.checks)
             };
+            let other_before = close_window(prev_end, pending, start, end);
             *in_attempt += 1;
             out.push(Milestone {
                 label,
+                check_type: (!types.is_empty()).then(|| types.join(", ")),
                 step_secs: secs(start, end),
+                other_before,
                 total_secs: secs(origin, end),
             });
         }
@@ -139,67 +216,143 @@ pub fn milestones(rows: &[StepRow]) -> Vec<Milestone> {
 
     for row in rows {
         if row.attempt != current_attempt {
-            flush_checks(&mut open_checks, &mut counts, &mut in_attempt, &mut out);
+            flush_checks(
+                &mut open_checks,
+                &mut counts,
+                &mut in_attempt,
+                &mut prev_end,
+                &mut pending,
+                &mut out,
+            );
             current_attempt = row.attempt;
             in_attempt = 0;
+            let other_before =
+                close_window(&mut prev_end, &mut pending, row.started_at, row.started_at);
             out.push(Milestone {
                 label: format!("Retry {}", row.attempt),
+                check_type: None,
                 step_secs: 0,
+                other_before,
                 total_secs: secs(origin, row.started_at),
             });
         }
         if is_check_kind(&row.kind) {
-            open_checks = Some(match open_checks {
-                Some((s, _, ok)) => (s, row.ended_at, ok && row.ok),
-                None => (row.started_at, row.ended_at, row.ok),
-            });
+            let entry =
+                open_checks.get_or_insert_with(|| (row.started_at, row.ended_at, true, Vec::new()));
+            entry.1 = row.ended_at;
+            entry.2 = entry.2 && row.ok;
+            if let Some(t) = check_type(&row.kind, &row.label) {
+                if !entry.3.iter().any(|x| x == t) {
+                    entry.3.push(t.to_string());
+                }
+            }
             continue;
         }
-        flush_checks(&mut open_checks, &mut counts, &mut in_attempt, &mut out);
+        flush_checks(
+            &mut open_checks,
+            &mut counts,
+            &mut in_attempt,
+            &mut prev_end,
+            &mut pending,
+            &mut out,
+        );
         let Some(mut label) = listed_label(&row.kind, &row.stage, in_attempt, &mut counts) else {
-            // Unlisted time also breaks adjacency between two check groups.
+            // Unlisted time accumulates into the next listed point's
+            // `Other time before` instead of being silently dropped.
+            let bucket = unlisted_bucket(&row.kind, &row.label);
+            let dur = secs(row.started_at, row.ended_at);
+            match pending.iter_mut().find(|(k, _)| *k == bucket) {
+                Some(entry) => entry.1 += dur,
+                None => pending.push((bucket, dur)),
+            }
             continue;
         };
         if row.kind == "review" && !row.ok {
             label = "Review (no verdict)".to_string();
         }
+        let other_before = close_window(&mut prev_end, &mut pending, row.started_at, row.ended_at);
         in_attempt += 1;
         out.push(Milestone {
             label,
+            check_type: None,
             step_secs: secs(row.started_at, row.ended_at),
+            other_before,
             total_secs: secs(origin, row.ended_at),
         });
     }
-    flush_checks(&mut open_checks, &mut counts, &mut in_attempt, &mut out);
+    flush_checks(
+        &mut open_checks,
+        &mut counts,
+        &mut in_attempt,
+        &mut prev_end,
+        &mut pending,
+        &mut out,
+    );
     out
 }
 
-/// SPEC-3.15 items 1 to 3: render the list. `done` are the earlier steps,
-/// `current` is the line this comment reports (marked `<-- This comment`), and
-/// the rest of [`HAPPY_PATH`] after `current` is listed with no times. When
-/// `current` is not a happy-path label (`Failed`, `Needs Review`, `Retry 2`,
-/// ...) nothing follows it, so a terminal line ends the list. `incomplete`
-/// renders every time as `?:??` (SPEC-3.15 item 6, SPEC-3.14 item 8).
+/// SPEC-3.15 item 2: what the `Type` column's check-type names mean.
+const LEGEND: &str = "`pre-commit`, `pre-push`, `check` and `verify` are the repo's own recipes run by the agent, `ad-hoc` is any other test or lint command the agent chose to run, and a gate command is run by the runner.";
+
+/// SPEC-3.15 item 1: `Other time before` cell text, each bucket as its name
+/// and `format_secs` duration, largest first, joined with `, `; empty when
+/// there is none.
+fn format_other_before(entries: &[(String, i64)]) -> String {
+    entries
+        .iter()
+        .map(|(kind, secs)| format!("{kind} {}", format_secs(*secs)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// SPEC-3.15 items 1 to 4: render the step table. `done` are the earlier
+/// steps, `current` is the row this comment reports (marked
+/// `<-- This comment` in every time cell), and the rest of [`HAPPY_PATH`]
+/// after `current` is listed with empty cells. When `current` is not a
+/// happy-path label (`Failed`, `Needs Review`, `Retry 2`, ...) nothing follows
+/// it, so a terminal row ends the table. `incomplete` renders every time cell
+/// as `?:??` (SPEC-3.15 item 7, SPEC-3.14 item 8).
 pub fn render(done: &[Milestone], current: &str, incomplete: bool) -> String {
-    let mut lines: Vec<String> = Vec::new();
+    const MARK: &str = "<-- This comment";
+    let mut lines: Vec<String> = vec![
+        "| # | Step | Type | Step time | Other time before | Total |".to_string(),
+        "| --- | --- | --- | --- | --- | --- |".to_string(),
+    ];
     for (i, m) in done.iter().enumerate() {
-        let times = if incomplete {
-            format!("{UNKNOWN_TIME} / {UNKNOWN_TIME}")
+        let check_type = m.check_type.as_deref().unwrap_or("");
+        let (step_time, other_before, total) = if incomplete {
+            (
+                UNKNOWN_TIME.to_string(),
+                UNKNOWN_TIME.to_string(),
+                UNKNOWN_TIME.to_string(),
+            )
         } else {
-            format!(
-                "{} / {}",
+            (
                 format_secs(m.step_secs),
-                format_secs(m.total_secs)
+                format_other_before(&m.other_before),
+                format_secs(m.total_secs),
             )
         };
-        lines.push(format!("{}. {}: {times}", i + 1, m.label));
+        lines.push(format!(
+            "| {} | {} | {check_type} | {step_time} | {other_before} | {total} |",
+            i + 1,
+            m.label
+        ));
     }
-    lines.push(format!("{}. {current}: <-- This comment", done.len() + 1));
+    lines.push(format!(
+        "| {} | {current} |  | {MARK} | {MARK} | {MARK} |",
+        done.len() + 1
+    ));
     if let Some(pos) = HAPPY_PATH.iter().position(|l| *l == current) {
         for (offset, label) in HAPPY_PATH[pos + 1..].iter().enumerate() {
-            lines.push(format!("{}. {label}:", done.len() + 2 + offset));
+            lines.push(format!(
+                "| {} | {label} |  |  |  |  |",
+                done.len() + 2 + offset
+            ));
         }
     }
+    lines.push(String::new());
+    lines.push(LEGEND.to_string());
     lines.join("\n")
 }
 
@@ -220,13 +373,13 @@ async fn load_rows_where(pool: &DbPool, action: Option<&str>, key: &str) -> Resu
     // SPEC-3.14: step-end writes (a checkpoint, the clone) interleave with the
     // attempt-end rows, so chronological order is `started_at`, not `seq`.
     let sql = if action.is_some() {
-        "SELECT attempt, kind, stage, started_at, ended_at, ok FROM attempt_steps \
+        "SELECT attempt, kind, label, stage, started_at, ended_at, ok FROM attempt_steps \
          WHERE action_name = ? AND job_key = ? ORDER BY attempt, started_at, seq"
     } else {
-        "SELECT attempt, kind, stage, started_at, ended_at, ok FROM attempt_steps \
+        "SELECT attempt, kind, label, stage, started_at, ended_at, ok FROM attempt_steps \
          WHERE job_key = ? ORDER BY attempt, started_at, seq"
     };
-    let mut query = sqlx::query_as::<_, (i64, String, String, String, String, i64)>(
+    let mut query = sqlx::query_as::<_, (i64, String, String, String, String, String, i64)>(
         sqlx::AssertSqlSafe(crate::db::q(pool, sql).into_owned()),
     );
     if let Some(action) = action {
@@ -234,7 +387,7 @@ async fn load_rows_where(pool: &DbPool, action: Option<&str>, key: &str) -> Resu
     }
     let raw = query.bind(key).fetch_all(pool).await?;
     raw.into_iter()
-        .map(|(attempt, kind, stage, started, ended, ok)| {
+        .map(|(attempt, kind, label, stage, started, ended, ok)| {
             let parse = |what: &str, v: &str| {
                 DateTime::parse_from_rfc3339(v)
                     .map(|t| t.with_timezone(&Utc))
@@ -247,6 +400,7 @@ async fn load_rows_where(pool: &DbPool, action: Option<&str>, key: &str) -> Resu
             Ok(StepRow {
                 attempt,
                 kind,
+                label,
                 stage,
                 started_at: parse("started_at", &started)?,
                 ended_at: parse("ended_at", &ended)?,
@@ -256,7 +410,7 @@ async fn load_rows_where(pool: &DbPool, action: Option<&str>, key: &str) -> Resu
         .collect()
 }
 
-/// SPEC-3.15 item 5: the list for `current` rendered from the stored rows of
+/// SPEC-3.15 item 6: the list for `current` rendered from the stored rows of
 /// `key`. A failed read is logged at `error` with the key and renders an
 /// all-unknown list (`?:??`), so the comment never shows a made-up time.
 pub async fn render_for(pool: &DbPool, action: &str, key: &str, current: &str) -> String {
@@ -269,7 +423,7 @@ pub async fn render_for(pool: &DbPool, action: &str, key: &str, current: &str) -
     }
 }
 
-/// SPEC-3.15 item 5: the stored rows of `key` as a [`ListContext`]. A failed
+/// SPEC-3.15 item 6: the stored rows of `key` as a [`ListContext`]. A failed
 /// read is logged at `error` with the key and marks the context incomplete, so
 /// every time renders `?:??` instead of a made-up one. `action` is `None` for
 /// a caller with no action name (a webhook handler).
@@ -311,7 +465,7 @@ pub fn push_step_label(event: crate::push_comment::PushEvent, done: &[Milestone]
     }
 }
 
-/// SPEC-3.15 item 5 + SPEC-8.8: the list for a push comment of `event`,
+/// SPEC-3.15 item 6 + SPEC-8.8: the list for a push comment of `event`,
 /// rendered from the context stashed for `key` (see [`stash_context`]). No
 /// stashed context is logged at `info` with the key and renders the current
 /// line alone: a push outside any run has no earlier steps to list.
@@ -398,6 +552,7 @@ mod tests {
         StepRow {
             attempt,
             kind: kind.to_string(),
+            label: kind.to_string(),
             stage: "initial".to_string(),
             started_at: at(start),
             ended_at: at(end),
@@ -405,7 +560,26 @@ mod tests {
         }
     }
 
-    /// The SPEC-3.15 item 3 happy-path example.
+    /// A `check`-kind row naming its recipe or ad-hoc type explicitly.
+    fn check_row(attempt: i64, label: &str, start: i64, end: i64, ok: bool) -> StepRow {
+        StepRow {
+            label: label.to_string(),
+            ..row(attempt, "check", start, end, ok)
+        }
+    }
+
+    /// A `gate`-kind row naming its gate command.
+    fn gate_row(attempt: i64, command: &str, start: i64, end: i64, ok: bool) -> StepRow {
+        StepRow {
+            label: command.to_string(),
+            ..row(attempt, "gate", start, end, ok)
+        }
+    }
+
+    /// The SPEC-3.15 item 4 happy-path example, as a table: headings, a check
+    /// type on the folded `Checks N` row, an `Other time before` column that
+    /// names the unlisted clone time ahead of the first listed step, the
+    /// current-comment marker and the not-yet-reached rows with empty cells.
     #[test]
     fn renders_the_spec_happy_path_example() {
         let rows = [
@@ -417,18 +591,88 @@ mod tests {
         let list = render_rows(&rows, "Checkpoint 2", false);
         assert_eq!(
             list,
-            "1. Initial commit: 0:01 / 0:02\n\
-             2. Checkpoint 1: 1:26 / 1:28\n\
-             3. Checks 1: 15:52 / 17:20\n\
-             4. Checkpoint 2: <-- This comment\n\
-             5. Checks 2:\n\
-             6. Verdict:\n\
-             7. Final commit:\n\
-             8. PR ready:"
+            format!(
+                "| # | Step | Type | Step time | Other time before | Total |\n\
+                 | --- | --- | --- | --- | --- | --- |\n\
+                 | 1 | Initial commit |  | 0:01 | clone 0:01 | 0:02 |\n\
+                 | 2 | Checkpoint 1 |  | 1:26 |  | 1:28 |\n\
+                 | 3 | Checks 1 | check | 15:52 |  | 17:20 |\n\
+                 | 4 | Checkpoint 2 |  | <-- This comment | <-- This comment | <-- This comment |\n\
+                 | 5 | Checks 2 |  |  |  |  |\n\
+                 | 6 | Verdict |  |  |  |  |\n\
+                 | 7 | Final commit |  |  |  |  |\n\
+                 | 8 | PR ready |  |  |  |  |\n\n{LEGEND}"
+            )
         );
     }
 
-    /// CLAUDE-603 / SPEC-3.15 item 5, SPEC-8.8: a push comment renders the
+    /// SPEC-3.15 item 2: two distinct check types folded into one `Checks N`
+    /// row join in order, separated by `, `.
+    #[test]
+    fn a_mixed_type_check_fold_joins_distinct_types_in_order() {
+        let rows = [
+            check_row(1, "pre-commit", 0, 10, true),
+            check_row(1, "ad-hoc", 10, 20, true),
+        ];
+        let list = render_rows(&rows, "Checks 2", false);
+        assert!(
+            list.contains("| 1 | Checks 1 | pre-commit, ad-hoc | 0:20 |  | 0:20 |"),
+            "{list}"
+        );
+    }
+
+    /// SPEC-3.15 item 2: a `gate` row's type is the gate command itself.
+    #[test]
+    fn a_gate_rows_type_is_its_gate_command() {
+        let rows = [gate_row(1, "just check-docker", 0, 15, true)];
+        let list = render_rows(&rows, "Checks 2", false);
+        assert!(
+            list.contains("| 1 | Checks 1 | just check-docker | 0:15 |  | 0:15 |"),
+            "{list}"
+        );
+    }
+
+    /// SPEC-3.15 item 2: a recipe's own per-stage sub-step rows (`fmt`,
+    /// `clippy`, ...) do not add their own type.
+    #[test]
+    fn a_per_stage_sub_step_does_not_add_its_own_type() {
+        let rows = [
+            check_row(1, "pre-push", 0, 5, true),
+            check_row(1, "fmt", 5, 10, true),
+            check_row(1, "clippy", 10, 20, true),
+        ];
+        let list = render_rows(&rows, "Checks 2", false);
+        assert!(
+            list.contains("| 1 | Checks 1 | pre-push | 0:20 |  | 0:20 |"),
+            "{list}"
+        );
+    }
+
+    /// SPEC-3.15 acceptance example: the gap between `Checkpoint 2` (total
+    /// 7:16) and `Verdict` (total 12:08) is attributed by kind in `Other
+    /// time before` (coding then build, largest first) instead of appearing
+    /// as one undifferentiated number.
+    #[test]
+    fn other_time_before_breaks_down_the_unlisted_gap_between_checkpoint_2_and_review() {
+        let rows = [
+            row(1, "checkpoint", 0, 1, true),
+            row(1, "checkpoint", 1, 436, true),
+            row(1, "coding", 436, 626, true),
+            row(1, "build", 626, 708, true),
+            row(1, "review", 708, 728, true),
+        ];
+        let list = render_rows(&rows, "PR ready", false);
+        assert!(
+            list.contains("| 2 | Checkpoint 2 |  | 7:15 |  | 7:16 |"),
+            "{list}"
+        );
+        assert!(
+            list.contains("| 3 | Verdict |  | 0:20 | coding 3:10, build 1:22 | 12:08 |"),
+            "{list}"
+        );
+    }
+
+    /// CLAUDE-603 / SPEC-3.15 item 6, SPEC-8.8: a push comment renders the
     /// stashed rows with its own line marked, and the next checkpoint is
     /// numbered after the stored ones.
     #[test]
@@ -446,8 +690,16 @@ mod tests {
         );
         let list = render_push("PUSH-1", crate::push_comment::PushEvent::CheckpointPush);
         clear_context("PUSH-1");
-        assert!(list.contains("1. Checkpoint 1: 1:26 / 1:28"), "{list}");
-        assert!(list.contains("2. Checkpoint 2: <-- This comment"), "{list}");
+        assert!(
+            list.contains("| 1 | Checkpoint 1 |  | 1:26 | clone 0:01, other 0:01 | 1:28 |"),
+            "{list}"
+        );
+        assert!(
+            list.contains(
+                "| 2 | Checkpoint 2 |  | <-- This comment | <-- This comment | <-- This comment |"
+            ),
+            "{list}"
+        );
     }
 
     /// A push with no stashed steps still lists its own line, never a made-up time.
@@ -457,7 +709,14 @@ mod tests {
             "PUSH-NONE",
             crate::push_comment::PushEvent::BranchUpdatedFromBase,
         );
-        assert_eq!(list, "1. Branch update: <-- This comment");
+        assert_eq!(
+            list,
+            format!(
+                "| # | Step | Type | Step time | Other time before | Total |\n\
+                 | --- | --- | --- | --- | --- | --- |\n\
+                 | 1 | Branch update |  | <-- This comment | <-- This comment | <-- This comment |\n\n{LEGEND}"
+            )
+        );
     }
 
     /// `context_for` reads the key's stored rows from the database.
@@ -527,7 +786,7 @@ mod tests {
         let rows = [row(1, "checkpoint", 0, 3725, true)];
         let list = render_rows(&rows, "Checks 1", false);
         assert!(
-            list.contains("1. Checkpoint 1: 1:02:05 / 1:02:05"),
+            list.contains("| 1 | Checkpoint 1 |  | 1:02:05 |  | 1:02:05 |"),
             "{list}"
         );
     }
@@ -536,10 +795,17 @@ mod tests {
     fn incomplete_data_renders_unknown_not_zero() {
         let rows = [row(1, "checkpoint", 0, 60, true)];
         let list = render_rows(&rows, "Checks 1", true);
-        assert!(list.contains("1. Checkpoint 1: ?:?? / ?:??"), "{list}");
+        assert!(
+            list.contains("| 1 | Checkpoint 1 |  | ?:?? | ?:?? | ?:?? |"),
+            "{list}"
+        );
         assert!(!list.contains("0:00"), "{list}");
     }
 
+    /// A `(failed)` check and a `Retry N` row: the inter-attempt gap has no
+    /// stored row to explain it, so it folds into `other` (SPEC-3.15 item 1),
+    /// reconciling `Other time before` against `Total` across the retry
+    /// boundary.
     #[test]
     fn a_resumed_run_continues_the_earlier_numbering() {
         let rows = [
@@ -550,11 +816,15 @@ mod tests {
         let list = render_rows(&rows, "Failed", false);
         assert_eq!(
             list,
-            "1. Checkpoint 1: 1:00 / 1:00\n\
-             2. Checks 1 (failed): 1:00 / 2:00\n\
-             3. Retry 2: 0:00 / 3:20\n\
-             4. Checkpoint 2: 1:00 / 4:20\n\
-             5. Failed: <-- This comment"
+            format!(
+                "| # | Step | Type | Step time | Other time before | Total |\n\
+                 | --- | --- | --- | --- | --- | --- |\n\
+                 | 1 | Checkpoint 1 |  | 1:00 |  | 1:00 |\n\
+                 | 2 | Checks 1 (failed) | check | 1:00 |  | 2:00 |\n\
+                 | 3 | Retry 2 |  | 0:00 | other 1:20 | 3:20 |\n\
+                 | 4 | Checkpoint 2 |  | 1:00 |  | 4:20 |\n\
+                 | 5 | Failed |  | <-- This comment | <-- This comment | <-- This comment |\n\n{LEGEND}"
+            )
         );
     }
 
@@ -566,13 +836,16 @@ mod tests {
         ];
         let list = render_rows(&rows, "Needs Review", false);
         assert!(
-            list.contains("2. Review (no verdict): 0:20 / 0:30"),
+            list.contains("| 2 | Review (no verdict) |  | 0:20 |  | 0:30 |"),
             "{list}"
         );
         assert!(
-            list.ends_with("3. Needs Review: <-- This comment"),
+            list.contains(
+                "| 3 | Needs Review |  | <-- This comment | <-- This comment | <-- This comment |"
+            ),
             "{list}"
         );
+        assert!(list.ends_with(LEGEND), "{list}");
     }
 
     #[test]
@@ -595,11 +868,20 @@ mod tests {
         clear_context("CTX-1");
         assert_eq!(
             list,
-            "1. Checks 1: 1:30 / 1:30\n2. Failed: <-- This comment"
+            format!(
+                "| # | Step | Type | Step time | Other time before | Total |\n\
+                 | --- | --- | --- | --- | --- | --- |\n\
+                 | 1 | Checks 1 | check | 1:30 |  | 1:30 |\n\
+                 | 2 | Failed |  | <-- This comment | <-- This comment | <-- This comment |\n\n{LEGEND}"
+            )
         );
         assert_eq!(
             render_with_context("CTX-1", "Failed"),
-            "1. Failed: <-- This comment",
+            format!(
+                "| # | Step | Type | Step time | Other time before | Total |\n\
+                 | --- | --- | --- | --- | --- | --- |\n\
+                 | 1 | Failed |  | <-- This comment | <-- This comment | <-- This comment |\n\n{LEGEND}"
+            ),
             "a cleared context lists only the current line"
         );
     }
@@ -622,9 +904,17 @@ mod tests {
         )
         .await;
         let list = render_for(&pool, "youtrack", "T-9", "Verdict").await;
-        assert!(list.contains("1. Checks 1: 1:30 / 1:30"), "{list}");
-        assert!(list.contains("2. Verdict: <-- This comment"), "{list}");
-        assert!(list.contains("3. Final commit:"), "{list}");
+        assert!(
+            list.contains("| 1 | Checks 1 | pre-push | 1:30 |  | 1:30 |"),
+            "{list}"
+        );
+        assert!(
+            list.contains(
+                "| 2 | Verdict |  | <-- This comment | <-- This comment | <-- This comment |"
+            ),
+            "{list}"
+        );
+        assert!(list.contains("| 3 | Final commit |  |  |  |  |"), "{list}");
     }
 
     /// CLAUDE-597: a `ci_wait` row lists as `CI remediation N` only in the

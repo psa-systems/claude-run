@@ -261,8 +261,11 @@ mod tests {
     /// step, before the SPEC-3.9 footer.
     #[test]
     fn the_step_list_precedes_the_footer_with_the_marker_on_the_current_step() {
-        let list =
-            "1. Initial commit: 0:02 / 0:02\n2. Checkpoint 1: <-- This comment\n3. Checks 1:";
+        let list = "| # | Step | Type | Step time | Other time before | Total |\n\
+                    | --- | --- | --- | --- | --- | --- |\n\
+                    | 1 | Initial commit |  | 0:02 | 0:02 | 0:02 |\n\
+                    | 2 | Checkpoint 1 |  | <-- This comment | <-- This comment | <-- This comment |\n\
+                    | 3 | Checks 1 |  |  |  |  |";
         let mut c = ctx(
             PushEvent::CheckpointPush,
             CommitSubjects::Listed(vec!["Add thing".into()]),
@@ -272,7 +275,12 @@ mod tests {
         let list_at = body.find(list).expect("the list is in the body");
         let footer_at = body.find("Run: ").expect("the footer is in the body");
         assert!(list_at < footer_at, "{body}");
-        assert!(body.contains("2. Checkpoint 1: <-- This comment"), "{body}");
+        assert!(
+            body.contains(
+                "| 2 | Checkpoint 1 |  | <-- This comment | <-- This comment | <-- This comment |"
+            ),
+            "{body}"
+        );
     }
 
     #[test]
