@@ -115,7 +115,13 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             get(native_forms::closed_issue_summary_new_page)
                 .post(native_forms::closed_issue_summary_create),
         )
-        .route("/actions", post(action_create))
+        // CLAUDE-650: a GET of a POST-only path that can render a full page
+        // redirects there instead of 405ing when the browser re-requests the
+        // URL left in its address bar (reload, history nav, session restore).
+        .route(
+            "/actions",
+            get(redirect_to_actions_new_raw).post(action_create),
+        )
         .route("/actions/{name}", get(action_detail))
         .route("/actions/{name}/durations", get(action_durations))
         // The log page is global and lives at `/logs`. This route is
@@ -127,7 +133,12 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             get(action_edit_page).post(action_edit_save),
         )
         // CLAUDE-571: a scripted action's `env` values, from a form.
-        .route("/actions/{name}/env", post(action_env_save))
+        // CLAUDE-650: a GET redirects to the edit page the form lives on
+        // (`action_env_save`'s own error path re-renders that same page).
+        .route(
+            "/actions/{name}/env",
+            get(redirect_to_action_edit).post(action_env_save),
+        )
         // Dispatches to the structured editor for the action's own
         // native kind (raw editor for `scripted`).
         .route(
@@ -140,34 +151,86 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         // every action, undeduplicated and filterable; `?action=` narrows it.
         .route("/logs", get(logs))
         .route("/secrets", get(secrets_page).post(secret_create))
-        .route("/secrets/{name}/rotate", post(secret_rotate))
-        .route("/secrets/{name}/delete", post(secret_delete))
-        .route("/secrets/api-keys", post(api_key_create))
-        .route("/secrets/api-keys/{name}/revoke", post(api_key_revoke))
+        // CLAUDE-650: each of these can render the full Secrets page on
+        // error (or, for generate, on success), so a GET redirects there
+        // instead of 405ing.
+        .route(
+            "/secrets/{name}/rotate",
+            get(redirect_to_secrets).post(secret_rotate),
+        )
+        .route(
+            "/secrets/{name}/delete",
+            get(redirect_to_secrets).post(secret_delete),
+        )
+        .route(
+            "/secrets/api-keys",
+            get(redirect_to_secrets).post(api_key_create),
+        )
+        .route(
+            "/secrets/api-keys/{name}/revoke",
+            get(redirect_to_secrets).post(api_key_revoke),
+        )
         // On-demand access check. GET renders the page (no probing);
         // POST runs the check and swaps the result table in. The per-secret
         // Check button on /secrets lands on the same page with that credential's
         // identity probe already run.
         .route("/access", get(access_page))
         .route("/access/check", post(access_check))
-        .route("/secrets/{name}/check", post(secret_check))
+        // CLAUDE-650: `secret_check` renders the full Access page, so a GET
+        // redirects to `/access` (without the pre-run probe) instead of
+        // 405ing.
+        .route(
+            "/secrets/{name}/check",
+            get(redirect_to_access).post(secret_check),
+        )
         // Runtime settings page. GET renders all sections; POST saves
         // one section (re-rendering inline serde errors on rejection). Behind the
         // same auth gate as every other TCP route.
         .route("/settings", get(settings_page))
-        .route("/settings/auth/claude", post(auth_save_claude))
-        .route("/settings/auth/claude/login", post(auth_login_start))
-        .route("/settings/auth/claude/code", post(auth_login_code))
+        // CLAUDE-650: each of these can re-render the full Settings page
+        // inline on error, so a GET redirects to `/settings` instead of
+        // 405ing. `auth_login_cancel` never renders a page (it only
+        // redirects), so it stays POST-only.
+        .route(
+            "/settings/auth/claude",
+            get(redirect_to_settings).post(auth_save_claude),
+        )
+        .route(
+            "/settings/auth/claude/login",
+            get(redirect_to_settings).post(auth_login_start),
+        )
+        .route(
+            "/settings/auth/claude/code",
+            get(redirect_to_settings).post(auth_login_code),
+        )
         .route("/settings/auth/claude/cancel", post(auth_login_cancel))
         // The shared not-ready banner fragment, polled from every
         // page's base template.
         .route("/settings/auth/claude/banner", get(auth_claude_banner))
-        .route("/settings/auth/youtrack", post(auth_save_youtrack))
-        .route("/settings/auth/forgejo", post(auth_save_forgejo))
-        .route("/settings/auth/github", post(auth_save_github))
-        .route("/settings/auth/git", post(auth_save_git))
-        .route("/settings/auth/email/test", post(auth_test_email))
-        .route("/settings/{section}", post(settings_save))
+        .route(
+            "/settings/auth/youtrack",
+            get(redirect_to_settings).post(auth_save_youtrack),
+        )
+        .route(
+            "/settings/auth/forgejo",
+            get(redirect_to_settings).post(auth_save_forgejo),
+        )
+        .route(
+            "/settings/auth/github",
+            get(redirect_to_settings).post(auth_save_github),
+        )
+        .route(
+            "/settings/auth/git",
+            get(redirect_to_settings).post(auth_save_git),
+        )
+        .route(
+            "/settings/auth/email/test",
+            get(redirect_to_settings).post(auth_test_email),
+        )
+        .route(
+            "/settings/{section}",
+            get(redirect_to_settings).post(settings_save),
+        )
         // Historical reporting page (spend / runs / time-of-day /
         // day-of-week). Global by default; `action` + `range` query params narrow
         // it. The shared aggregations live in `crate::report`.
@@ -3596,6 +3659,14 @@ async fn action_edit_save(
     Ok(Redirect::to(&format!("/actions/{name}")).into_response())
 }
 
+/// CLAUDE-650: a GET of `/actions/{name}/env` redirects to the edit page
+/// the Environment form lives on, instead of 405ing when the browser
+/// re-requests a URL that `action_env_save`'s own error path can leave in
+/// the address bar.
+async fn redirect_to_action_edit(AxumPath(name): AxumPath<String>) -> Redirect {
+    Redirect::to(&format!("/actions/{name}/edit"))
+}
+
 /// SPEC-4.3.3, CLAUDE-571: the Environment form's save. Rewrites only the
 /// submitted `env` values in place ([`env_form::set_env_values`]), then
 /// takes the raw editor's path: the same validation, and nothing is written
@@ -3731,6 +3802,13 @@ async fn action_new_raw_page(State(s): State<WebState>) -> Result<Html<String>, 
         env_fields: Vec::new(),
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
+}
+
+/// CLAUDE-650: a GET of `/actions` redirects to the raw-YAML new-action
+/// page that posts here, instead of 405ing when the browser re-requests a
+/// URL that `action_create`'s own error path can leave in the address bar.
+async fn redirect_to_actions_new_raw() -> Redirect {
+    Redirect::to("/actions/new/raw")
 }
 
 /// SPEC-4.3.3: "Creating an action from raw YAML rejects a name that is not
@@ -5053,6 +5131,16 @@ async fn secrets_page(State(s): State<WebState>) -> Result<Response, WebError> {
     render_secrets(&s, StatusCode::OK, None).await
 }
 
+/// CLAUDE-650: a GET of a POST-only `/secrets/...` route (rotate, delete,
+/// the API-key generate and revoke routes) redirects here instead of
+/// 405ing when the browser re-requests a URL those handlers' own
+/// success/error paths can leave in the address bar. Never used for the
+/// generate route's one-time key banner itself: that is rendered only in
+/// the POST response, with `Cache-Control: no-store`.
+async fn redirect_to_secrets() -> Redirect {
+    Redirect::to("/secrets")
+}
+
 /// SPEC-4.3.6: "Create rejects an invalid name, an empty value, a missing
 /// key file, or a name that already exists (which must go through rotate
 /// instead), each inline with 422 and the listing preserved." The
@@ -5297,6 +5385,14 @@ async fn access_check(
         report: Some(report),
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
+}
+
+/// CLAUDE-650: a GET of `/secrets/{name}/check` redirects to the bare
+/// `/access` page (no probe pre-run) instead of 405ing when the browser
+/// re-requests a URL that `secret_check` leaves in the address bar after
+/// rendering the full Access page there.
+async fn redirect_to_access() -> Redirect {
+    Redirect::to("/access")
 }
 
 /// SPEC-4.3.7: "The per-secret Check button on `/secrets` runs the identity
@@ -5889,6 +5985,14 @@ async fn settings_page(
     Query(q): Query<SettingsQuery>,
 ) -> Result<Response, WebError> {
     render_settings(&s, StatusCode::OK, q.saved, None).await
+}
+
+/// CLAUDE-650: a GET of any POST-only `/settings/...` route (a section
+/// save, or a service-auth card save / brokered-login step) redirects
+/// here instead of 405ing when the browser re-requests a URL those
+/// handlers' own error paths can leave in the address bar.
+async fn redirect_to_settings() -> Redirect {
+    Redirect::to("/settings")
 }
 
 /// SPEC-4.3.8: "Saving a section 404s an unknown section path; an invalid
