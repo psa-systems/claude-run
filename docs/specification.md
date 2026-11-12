@@ -1884,11 +1884,13 @@ appears in a log line or an error message. CI runs its Postgres leg through it
   with `require_auth_on_loopback` unset; it is not mounted at all while peering is disabled. Its own gate accepts
   either the `auth_token_ref` bearer above or a generated API key (`SPEC-4.3.6`): a presented bearer that matches
   neither is `401`; a database error while checking the generated key answers `500`, never `401`, since a store
-  outage must never read as "wrong credential". This gate is independent of the web/`/api/*` gate above, so a
-  generated API key authenticates `/api/peer/*` only and is rejected everywhere else.
-- `/webhooks/`, `/login`, `/login/2fa`, `/logout`, `/setup`, `/invite/*`, `/static/favicon.ico`,
+  outage must never read as "wrong credential". This gate is independent of the web/`/api/*` gate above, which
+  exempts the `/api/peer/` prefix so the two never both apply, so a generated API key authenticates `/api/peer/*` only
+  and is rejected everywhere else.
+- `/webhooks/`, `/api/peer/*`, `/login`, `/login/2fa`, `/logout`, `/setup`, `/invite/*`, `/static/favicon.ico`,
   `/static/apple-touch-icon.png` and `/static/brand-mark.png` are exempt from this gate: webhooks authenticate by HMAC
-  (4.4) and cannot carry a bearer header, the auth routes themselves must stay reachable unauthenticated or there is no
+  (4.4) and cannot carry a bearer header, `/api/peer/*` authenticates through its own gate above (which this gate cannot
+  evaluate, since it never reads generated keys), the auth routes themselves must stay reachable unauthenticated or there is no
   way to obtain a credential, and the three icon assets carry no instance data and are linked from every page head
   including `/login` and `/setup`. `/account/2fa/setup` still requires a valid credential; it is exempt only from the
   enrollment check in 7.10, not from this gate.

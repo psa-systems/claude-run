@@ -48,5 +48,5 @@ response. The calling instance pastes that plaintext into its own `peers[].token
 legacy token. `require_peer_bearer` (`src/peer.rs`) checks a presented bearer against the legacy token first, then
 against a hash lookup in `api_keys`, bumping `last_used_at` on a match; a lookup failure answers `500`, never `401`,
 so a database outage is never mistaken for a bad credential. This gate is independent of the web/`/api/*` gate in
-`src/auth.rs`, which never reads `api_keys`, so a generated key authenticates `/api/peer/*` only. Revoking a key
+`src/auth.rs`, which never reads `api_keys`, so a generated key authenticates `/api/peer/*` only. `require_token` therefore exempts the `/api/peer/` prefix: `daemon.rs` wraps the merged peer router in that gate, and without the exemption it answered `401` to every generated key before `require_peer_bearer` ran (CLAUDE-647). Revoking a key
 deletes its row outright: there is no soft-revoke state for `require_peer_bearer` to check against.

@@ -1897,6 +1897,49 @@ mod tests {
         assert!(b_keys[0].last_used_at.is_some());
     }
 
+    /// CLAUDE-647: the daemon wraps the merged peer router in the web gate, which
+    /// never reads `api_keys`. A generated key must still reach the peer gate,
+    /// and must stay refused on the rest of `/api/*`.
+    #[tokio::test]
+    async fn a_generated_key_passes_the_web_gate_on_peer_routes_only() {
+        let (peer_router, pool) = api(true, Some("legacy")).await;
+        let key = generate_api_key().unwrap();
+        crate::state::api_key_create(&pool, "k", &hash_api_key(&key))
+            .await
+            .unwrap();
+        let app = crate::auth::protect(
+            peer_router.route("/api/status", get(|| async { "ok" })),
+            crate::auth::TokenGate::new("legacy".to_string()),
+        );
+        let call = |uri: &str, bearer: Option<&str>| {
+            let mut b = Request::builder().uri(uri.to_string());
+            if let Some(t) = bearer {
+                b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+            }
+            app.clone().oneshot(b.body(Body::empty()).unwrap())
+        };
+
+        let ok = call("/api/peer/state", Some(&key)).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK, "generated key on a peer route");
+        let b_keys = crate::state::api_key_list(&pool).await.unwrap();
+        assert!(b_keys[0].last_used_at.is_some(), "the key row was touched");
+
+        let legacy = call("/api/peer/state", Some("legacy")).await.unwrap();
+        assert_eq!(legacy.status(), StatusCode::OK, "legacy token");
+
+        for bearer in [None, Some("wrong")] {
+            let r = call("/api/peer/state", bearer).await.unwrap();
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{bearer:?}");
+        }
+
+        let other = call("/api/status", Some(&key)).await.unwrap();
+        assert_eq!(
+            other.status(),
+            StatusCode::UNAUTHORIZED,
+            "a generated key stays refused outside /api/peer/"
+        );
+    }
+
     #[tokio::test]
     async fn peer_state_lists_an_open_runs_in_flight_job() {
         let (r, pool) = api(true, Some("tok")).await;

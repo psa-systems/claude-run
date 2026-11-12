@@ -8,7 +8,8 @@
 //! non-loopback (or auth is explicitly required on loopback for testing).
 //!
 //! Exemptions: the `/webhooks/` prefix is never gated. Forgejo cannot send a
-//! bearer token, and the webhook carries its own HMAC verification.
+//! bearer token, and the webhook carries its own HMAC verification. `/api/peer/`
+//! is never gated here either: `peer::require_peer_bearer` authenticates it.
 //!
 //! Two credentials answer that gate, and they serve different callers:
 //!
@@ -492,9 +493,13 @@ async fn require_token(State(gate): State<TokenGate>, request: Request, next: Ne
     // favicon, apple touch icon and header brand mark carry no instance data
     // and are linked from every page head including `/login` and `/setup`, so
     // they stay public in every gate state (unlike the mascot, which keeps the
-    // narrower SPEC-7.16 rule below: a signed-out browser only).
+    // narrower SPEC-7.16 rule below: a signed-out browser only). `/api/peer/`
+    // is authenticated by `peer::require_peer_bearer` (legacy token or a
+    // generated API key); this gate never reads `api_keys`, so gating it here
+    // would refuse every generated key.
     let path = request.uri().path();
     if path.starts_with("/webhooks/")
+        || path.starts_with("/api/peer/")
         || path == "/login"
         || path == "/login/2fa"
         || path == "/logout"
