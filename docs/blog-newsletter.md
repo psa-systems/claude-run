@@ -1,8 +1,12 @@
 # Example action: a newsletter draft for each new blog post (CLAUDE-644)
 
-`actions/examples/blog-newsletter.yml` turns each new blog post into a newsletter email that a person approves. It reads the blog's RSS feed, and for each post it has not seen before it has Claude write a short summary of the post, creates it as a **draft** with `POST <NEWSLETTER_URL>/api/v1/editions`, and then asks for review with `POST <NEWSLETTER_URL>/api/v1/editions/{id}/review`, so the newsletter's administrators are told a draft is waiting. It never sends or schedules: an administrator approves and sends it in the newsletter system.
+`actions/examples/blog-newsletter.yml` turns each new blog post into a newsletter email that a person approves. It reads the blog's newsletter feed, and for each post it has not seen before it has Claude write a short summary of the post, creates it as a **draft** with `POST <NEWSLETTER_URL>/api/v1/editions`, and then asks for review with `POST <NEWSLETTER_URL>/api/v1/editions/{id}/review`, so the newsletter's administrators are told a draft is waiting. It never sends or schedules: an administrator approves and sends it in the newsletter system.
 
 It is an example, so a new install does not get it: `actions/examples/` is not seeded. The post step expects the same API as [release-notes](release-notes.md): `{"list", "subject", "preview_text", "body_md"}` with a bearer token, answering `201` with the edition's `id`. A newsletter system without the review call (`404` or `405`) keeps the plain draft, and the run logs a warning; any other answer to the review call is logged the same way and the draft stays.
+
+## The newsletter feed
+
+Authors choose per post whether it goes to the newsletter. The storefront lists only those posts in its newsletter feed, `/blog/newsletter.xml` (`/newsletter.xml` on the blog's own host), in the same RSS shape as the public `/blog/feed.xml`. Point `BLOG_FEED_URL` at the newsletter feed: the public feed would draft every post. A post marked for the newsletter after it was published appears in the feed then and is drafted on the next check.
 
 ## What the email says
 
@@ -25,13 +29,13 @@ Everything is done in the web UI; the deployment needs no change.
 
 | Variable | Value |
 |---|---|
-| `BLOG_FEED_URL` | the blog's RSS feed, for example `https://blog.example.com/blog/feed.xml` |
+| `BLOG_FEED_URL` | the blog's newsletter feed (only posts marked for the newsletter), for example `https://blog.example.com/blog/newsletter.xml`; not the public `/blog/feed.xml` |
 | `BLOG_NAME` | the blog's name, as readers know it |
 | `SENDER_NAME` | the name the newsletter goes out under |
 | `NEWSLETTER_URL` | your newsletter system's base URL |
 | `NEWSLETTER_LIST` | the list to draft into |
 
-5. Wait for the first check (or trigger it from the action's page). It only records the posts already in the feed, so it drafts nothing. Publish a post and the next check drafts it.
+5. Wait for the first check (or trigger it from the action's page). It only records the posts already in the feed, so it drafts nothing. Publish a post marked for the newsletter and the next check drafts it.
 
 ## The first run drafts nothing
 

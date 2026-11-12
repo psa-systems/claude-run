@@ -9,7 +9,8 @@
 # web UI (New action, raw YAML), replace the placeholders in `env` and store the token on the Secrets page. The run
 # stops with a message until `BLOG_FEED_URL` and `NEWSLETTER_URL` are yours. See docs/blog-newsletter.md.
 #
-# The input reads the blog's RSS feed. Each item not seen before is one job (`dedup_key: guid`), and Claude writes a
+# The input reads the blog's newsletter feed: the storefront's `/blog/newsletter.xml` lists only the posts their
+# authors chose to send to the newsletter, in the same RSS shape as the public feed. Each item not seen before is one job (`dedup_key: guid`), and Claude writes a
 # short summary of the post; the email is that one paragraph and a link to the post. The post step creates it as a draft (`POST <NEWSLETTER_URL>/api/v1/editions`)
 # and then asks for review (`POST .../editions/{id}/review`); a newsletter system without that call (404 or 405) keeps
 # the plain draft. The action never sends or schedules.
@@ -22,7 +23,8 @@ name: blog-newsletter
 kind: scripted
 env:
   # Replace all of these.
-  BLOG_FEED_URL: https://blog.example.com/blog/feed.xml
+  # The newsletter feed (only posts marked for the newsletter), not the public `/blog/feed.xml`.
+  BLOG_FEED_URL: https://blog.example.com/blog/newsletter.xml
   BLOG_NAME: Your Blog
   SENDER_NAME: Your Company
   NEWSLETTER_URL: https://news.example.com
