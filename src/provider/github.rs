@@ -1289,7 +1289,11 @@ impl Forge for GithubForge {
     /// `mergeable`). An unrecognised run conclusion, status state,
     /// `mergeable`, or `mergeStateStatus` value is an error naming the
     /// value, never a default: silently guessing a CI verdict is worse than
-    /// failing loudly.
+    /// failing loudly. Only the latest run per workflow on the head SHA
+    /// counts (`latest_runs_per_workflow`), and a latest run concluded
+    /// `skipped` is `pending`, not `success` (SPEC-8.11, CLAUDE-651): a repo
+    /// whose required checks gate on `if: !draft` leaves exactly this shape
+    /// on the head SHA for as long as the PR stays a draft.
     fn pr_status(&self, _host: &str, repo: &str, pr_number: u64) -> Result<super::PrStatus> {
         let envs: Vec<(&str, &str)> = match &self.token {
             Some(t) => vec![("GH_TOKEN", t.as_str())],
