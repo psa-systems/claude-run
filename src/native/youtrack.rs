@@ -2232,7 +2232,7 @@ async fn process_job(
     // this issue, whether from a re-queue or a checkpoint push opened one
     // mid-run, so a PR-step failure comment can say truthfully whether a
     // re-queue resumes that PR's branch.
-    // SPEC-3.15 item 5: the steps `finalize`'s comments list: the stored rows
+    // SPEC-3.15 item 6: the steps `finalize`'s comments list: the stored rows
     // of earlier attempts plus this attempt's steps derived so far (they are
     // written to `attempt_steps` right after `finalize` returns). Handed over
     // through a keyed stash because `finalize` is synchronous with no pool.
@@ -2254,12 +2254,14 @@ async fn process_job(
         };
         let attempt_no = i64::from(attempts + 1);
         let mut push_row = |kind: &str,
+                            label: &str,
                             start: chrono::DateTime<chrono::Utc>,
                             end: chrono::DateTime<chrono::Utc>,
                             ok: bool| {
             rows.push(crate::progress_list::StepRow {
                 attempt: attempt_no,
                 kind: kind.to_string(),
+                label: label.to_string(),
                 stage: stage.to_string(),
                 started_at: start,
                 ended_at: end,
@@ -2274,10 +2276,10 @@ async fn process_job(
                     let (pg_steps, holes) =
                         child_postgres_steps(log_path, &checkpoint_spans, &action.name, key);
                     for step in crate::attempt_steps::carve_steps(steps, &holes) {
-                        push_row(step.kind.as_str(), step.start, step.end, true);
+                        push_row(step.kind.as_str(), step.label, step.start, step.end, true);
                     }
                     for pg in &pg_steps {
-                        push_row(pg.kind.as_str(), pg.start, pg.end, pg.ok);
+                        push_row(pg.kind.as_str(), pg.kind.as_str(), pg.start, pg.end, pg.ok);
                     }
                 }
                 Err(e) => {
@@ -2307,6 +2309,7 @@ async fn process_job(
             rows.push(crate::progress_list::StepRow {
                 attempt: i64::from(attempts + 1),
                 kind: s.kind.as_str().to_string(),
+                label: s.label.to_string(),
                 stage: stage.to_string(),
                 started_at: s.start,
                 ended_at: s.end,
@@ -2950,7 +2953,7 @@ fn run_checkpoint_watcher(
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
-        // SPEC-3.15 item 5, SPEC-8.8, CLAUDE-603: stash the stored rows of this
+        // SPEC-3.15 item 6, SPEC-8.8, CLAUDE-603: stash the stored rows of this
         // job just before the push, so the push comment lists every step that
         // ended before it and marks its own `Checkpoint N` line.
         crate::progress_list::stash_context(
@@ -4707,7 +4710,7 @@ impl DeliveryBlockedReason {
     }
 }
 
-/// SPEC-3.15 item 4: the step-list line a lifecycle comment about `f` is
+/// SPEC-3.15 item 5: the step-list line a lifecycle comment about `f` is
 /// marked with. Reference table for the literal labels `finalize` passes to
 /// [`lifecycle_footer`]; the test below pins one line per variant. One arm per [`Finalized`] variant, no wildcard. A re-queue
 /// announces the next attempt's `Retry N`; a run that ends in `Needs Review` or
@@ -8008,7 +8011,7 @@ mod tests {
         assert_eq!(state::attempts_get(&pool, "yt", "MK-16").await.unwrap(), 0);
     }
 
-    /// CLAUDE-587 / SPEC-3.15 item 4: every `Finalized` variant maps to its
+    /// CLAUDE-587 / SPEC-3.15 item 5: every `Finalized` variant maps to its
     /// own step-list line, and a lifecycle comment ends its list with that
     /// line marked, before the run footer.
     #[test]
@@ -8093,7 +8096,9 @@ mod tests {
                 trigger: Some(&trigger),
             };
             let body = lifecycle_footer("outcome", None, run, "TBL-1", &line);
-            let marked = format!("1. {line}: <-- This comment");
+            let marked = format!(
+                "| 1 | {line} |  | <-- This comment | <-- This comment | <-- This comment |"
+            );
             let list_end = body.find(&marked).expect("the marked line is present");
             assert!(
                 body.find("Run: ").unwrap() > list_end,
@@ -8164,7 +8169,9 @@ mod tests {
         assert!(first.contains("Session timeout: 30s"), "{first:?}");
         assert!(first.contains("Expected duration: no history"), "{first:?}");
         assert!(
-            first.contains("1. Initial commit: <-- This comment"),
+            first.contains(
+                "| 1 | Initial commit |  | <-- This comment | <-- This comment | <-- This comment |"
+            ),
             "{first:?}"
         );
     }
@@ -9204,7 +9211,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-603 / SPEC-3.15 item 5, SPEC-8.8: each checkpoint push comment
+    /// CLAUDE-603 / SPEC-3.15 item 6, SPEC-8.8: each checkpoint push comment
     /// is rendered from rows stored before that push. The clone row exists
     /// first, the first checkpoint's own row is written when its push ends,
     /// and the second comment lists it and marks `Checkpoint 2`.
@@ -9270,17 +9277,22 @@ mod tests {
         let lists = forge.lists.lock().unwrap().clone();
         assert!(lists.len() >= 2, "{lists:?}");
         assert!(
-            lists[0].contains("1. Checkpoint 1: <-- This comment"),
+            lists[0].contains(
+                "| 1 | Checkpoint 1 |  | <-- This comment | <-- This comment | <-- This comment |"
+            ),
             "{}",
             lists[0]
         );
         assert!(
-            lists[1].contains("1. Checkpoint 1: ") && !lists[1].contains("1. Checkpoint 1: <--"),
+            lists[1].contains("| 1 | Checkpoint 1 |  | ")
+                && !lists[1].contains("| 1 | Checkpoint 1 |  | <-- This comment"),
             "{}",
             lists[1]
         );
         assert!(
-            lists[1].contains("2. Checkpoint 2: <-- This comment"),
+            lists[1].contains(
+                "| 2 | Checkpoint 2 |  | <-- This comment | <-- This comment | <-- This comment |"
+            ),
             "{}",
             lists[1]
         );

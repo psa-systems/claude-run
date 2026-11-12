@@ -850,33 +850,45 @@ never summarized by one duration.
 ### 3.15 Progress comment (`SPEC-3.15`)
 
 Every runner-posted lifecycle comment on an issue or PR (the start notice, checkpoint push comments `SPEC-8.8`, check
-results, CI remediation, review verdict, final outcome) carries the same numbered step list, so a reader sees where
-the work is on any comment.
+results, CI remediation, review verdict, final outcome) carries the same step table, so a reader sees where the work
+is on any comment.
 
-1. Each line is `N. Label: <step time> / <total time>`. `<step time>` is the step's own duration, `<total time>` is the
-   elapsed time since the first step; both are `m:ss`, or `h:mm:ss` from one hour. A step not yet reached has no times.
-2. The step the current comment reports is marked `<-- This comment`. Earlier steps show their times, later steps are
-   listed with no times, so the list shows the whole expected path. The comment never edits an earlier comment; later
-   comments carry the later numbers.
-3. The happy path is:
+1. The table has the header row `| # | Step | Type | Step time | Since previous | Total |` and a separator row.
+   `Step time` is the step's own duration, `Total` is the elapsed time since the first step; both are `m:ss`, or
+   `h:mm:ss` from one hour. `Since previous` is `Total` minus the previous row's `Total` (the first row's own
+   `Total`), so it includes any unlisted time (`coding`, `build`, `other`, clone, Postgres) between two listed steps;
+   `Step time` never exceeds it. A step not yet reached has empty cells.
+2. `Type` is empty for a non-check row. For a `Checks N` row it is the check type(s) of the folded rows: the `label`
+   of the parent `check` or `gate` row (`pre-commit`, `pre-push`, `check`, `verify`, `ad-hoc`, or the gate command).
+   A recipe's per-stage sub-step rows (`fmt`, `clippy`, ...) do not add their own type. When one `Checks N` folds
+   rows of more than one type, the distinct types are joined with `, ` in order. A one-line legend under the table
+   states what the types mean: `pre-commit`, `pre-push`, `check` and `verify` are the repo's own recipes run by the
+   agent, `ad-hoc` is any other test or lint command the agent chose to run, and a gate command is run by the runner.
+3. The row the current comment reports is marked `<-- This comment` in every time cell. Earlier rows show their
+   times, later rows are listed with empty cells, so the table shows the whole expected path. The comment never edits
+   an earlier comment; later comments carry the later row numbers.
+4. The happy path is:
 
    ```text
-   1. Initial commit: 0:02 / 0:02
-   2. Checkpoint 1: 1:26 / 1:28
-   3. Checks 1: 15:52 / 17:20
-   4. Checkpoint 2: <-- This comment
-   5. Checks 2:
-   6. Verdict:
-   7. Final commit:
-   8. PR ready:
+   | # | Step | Type | Step time | Since previous | Total |
+   | --- | --- | --- | --- | --- | --- |
+   | 1 | Initial commit |  | 0:01 | 0:02 | 0:02 |
+   | 2 | Checkpoint 1 |  | 1:26 | 1:26 | 1:28 |
+   | 3 | Checks 1 | check | 15:52 | 15:52 | 17:20 |
+   | 4 | Checkpoint 2 |  | <-- This comment | <-- This comment | <-- This comment |
+   | 5 | Checks 2 |  |  |  |  |
+   | 6 | Verdict |  |  |  |  |
+   | 7 | Final commit |  |  |  |  |
+   | 8 | PR ready |  |  |  |  |
    ```
 
-4. An unhappy path inserts its steps where they happen and numbers them in order: `Checks 1 (failed)`, `Retry 2`,
-   `CI remediation 1`, `Conflict resolution`, `Review (no verdict)`, `Failed`. The list for a run that ended in
-   `Needs Review` or `Failed` ends with that line, marked `<-- This comment`.
-5. The list is rendered from `attempt_steps` (`SPEC-3.14`), not from comment text, so it survives a restart and a
+5. An unhappy path inserts its steps where they happen and numbers them in order: `Checks 1 (failed)`, `Retry 2`,
+   `CI remediation 1`, `Conflict resolution`, `Review (no verdict)`, `Failed`. The table for a run that ended in
+   `Needs Review` or `Failed` ends with that row, marked `<-- This comment`.
+6. The table is rendered from `attempt_steps` (`SPEC-3.14`), not from comment text, so it survives a restart and a
    resumed run (a resumed run continues the numbering of the branch's earlier attempts).
-6. Steps are ASCII only. A step with no recorded time because its data is incomplete shows `?:??`, not `0:00`.
+7. The table is ASCII only. A row with no recorded time because its data is incomplete shows `?:??` in every time
+   cell, not `0:00`.
 
 ### 3.16 Comment brevity: verdict and failure (`SPEC-3.16`)
 

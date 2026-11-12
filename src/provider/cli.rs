@@ -1151,7 +1151,7 @@ impl CliBackend {
                 return;
             }
         };
-        // SPEC-3.15 item 5, SPEC-8.8: the list is rendered from stored rows.
+        // SPEC-3.15 item 6, SPEC-8.8: the list is rendered from stored rows.
         let progress = crate::progress_list::render_push(&issue_key, event);
         let ctx = crate::push_comment::PushCommentContext {
             event,
@@ -2421,7 +2421,7 @@ impl Forge for CliBackend {
             let public_url = crate::run_footer::resolved_public_url();
             match self.git_dir_scratch(workdir) {
                 Ok(scratch) => {
-                    // SPEC-3.15 item 5, SPEC-8.8: the watcher stashed the stored
+                    // SPEC-3.15 item 6, SPEC-8.8: the watcher stashed the stored
                     // rows for this key just before the push.
                     let progress = crate::progress_list::render_push(
                         issue_key,

@@ -898,7 +898,7 @@ impl GithubForge {
             None => crate::push_comment::CommitSubjects::Unavailable,
         };
         let public_url = crate::run_footer::resolved_public_url();
-        // SPEC-3.15 item 5, SPEC-8.8: the list is rendered from stored rows.
+        // SPEC-3.15 item 6, SPEC-8.8: the list is rendered from stored rows.
         let progress = crate::progress_list::render_push(issue_key, event);
         let ctx = crate::push_comment::PushCommentContext {
             event,

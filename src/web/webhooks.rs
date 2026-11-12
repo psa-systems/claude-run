@@ -2673,7 +2673,7 @@ async fn route_agent_pr_failure(
         let expected_duration = state::expected_duration(&ctx.pool, "youtrack", "ci-remediation")
             .await
             .render();
-        // SPEC-3.15 item 4: this comment is the `CI remediation N` line.
+        // SPEC-3.15 item 5: this comment is the `CI remediation N` line.
         let step_list = crate::progress_list::render_for(
             &ctx.pool,
             "youtrack",
@@ -6228,7 +6228,7 @@ async fn post_branch_updated_push_comment(
     let repo = repo.to_string();
     let issue_key = issue_key.to_string();
     let old_sha = old_sha.map(str::to_string);
-    // SPEC-3.15 item 5, SPEC-8.8: the list is rendered from the key's stored
+    // SPEC-3.15 item 6, SPEC-8.8: the list is rendered from the key's stored
     // `attempt_steps` rows, read here because the blocking task has no pool.
     let list_ctx = crate::progress_list::context_for(pool, None, &issue_key).await;
     let progress = crate::progress_list::render_push_with(
@@ -9712,11 +9712,13 @@ mod tests {
                 .any(|c| c.starts_with("comment CLAUDE-40") && c.contains("Run: ")),
             "the requeue comment carries the run footer: {calls:?}"
         );
-        // CLAUDE-587 / SPEC-3.15 item 4: the remediation comment carries the
+        // CLAUDE-587 / SPEC-3.15 item 5: the remediation comment carries the
         // step list with its own `CI remediation N` line marked, before the footer.
         assert!(
             calls.iter().any(|c| c.starts_with("comment CLAUDE-40")
-                && c.contains("1. CI remediation 1: <-- This comment")
+                && c.contains(
+                    "| 1 | CI remediation 1 |  | <-- This comment | <-- This comment | <-- This comment |"
+                )
                 && c.find("<-- This comment") < c.rfind("Run: ")),
             "the requeue comment carries the step list: {calls:?}"
         );
