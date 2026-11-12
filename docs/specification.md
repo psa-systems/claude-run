@@ -468,8 +468,8 @@ Hybrid: a cheap deterministic pass runs first and only the residue it cannot lab
 
 - `ci_failures` (one row per distinct failure, keyed on `(repo, workflow_id, job_name)`), `ci_failure_tests` (its
   failing-test fingerprint), `ci_failure_runs` (one row per sighting: commit, branch, PR number, timestamp), and
-  `agent_pull_requests` (every PR the runner's own `youtrack` action opens, carrying `fix_attempts` and a `salvaged`
-  flag) replace a YouTrack full-text search for dedupe: an unindexed issue is invisible to that search, and a
+  `agent_pull_requests` (every PR the runner's own `youtrack` action opens, carrying `fix_attempts`, a `salvaged`
+  flag and a `finished` flag) replace a YouTrack full-text search for dedupe: an unindexed issue is invisible to that search, and a
   failure every PR inherits from `main` would otherwise mint one issue per PR.
 - The fingerprint is the sorted, deduplicated `<target>::<test>` ids parsed from cargo test output (a target that
   failed to build or run at all, with no parsed test, contributes a bare `<target>` id), or `infra:<kind>` when the
@@ -1398,6 +1398,9 @@ configured for a different provider, or a disabled listener returns 404. Pipelin
   synthetic command to the comment listener (`SPEC-4.4.5`) instead of leaving a "needs a human" comment.
 - An automerge outcome (conflict dispatch, behind-base update/merge, or clean merge) is recorded and its comment
   posted exactly once per decision, guarded against double-posting.
+- A PR whose row is `finished` (CLAUDE-630: `finalize` observed `Finalized::CodeReview`, i.e. the run that owns it
+  already reported success and the PR was promoted to ready) is skipped before any status read: no behind-base
+  branch update, no merge attempt, no comment, on either the webhook decision path or the periodic reconciler.
 
 #### 4.4.4 Action-run success and pull-request delivery consumption (`SPEC-4.4.4`)
 
@@ -1533,7 +1536,7 @@ same schema. Pool: 16 connections, 30-second acquire timeout. Timestamps are RFC
 | `secrets` | `name` (unique), age `ciphertext`, `created_at`, `last_used_at` |
 | `api_keys` | Generated peer API keys (`SPEC-4.3.6`): `name` (unique), `key_hash` (unique, SHA-256 hex of the plaintext), `created_at`, `last_used_at` |
 | `ci_failures`, `ci_failure_tests`, `ci_failure_runs` | Failure store: repo, workflow, job, `infra_kind`, `issue_key`, `state`; unique (`failure_id`, `test_id`); run index, commit, branch, PR number |
-| `agent_pull_requests` | Recorded agent PRs: unique (`host`, `repo`, `pr_number`), `issue_key`, `head_branch`, `fix_attempts`, `state`, `salvaged` |
+| `agent_pull_requests` | Recorded agent PRs: unique (`host`, `repo`, `pr_number`), `issue_key`, `head_branch`, `fix_attempts`, `state`, `salvaged`, `finished` |
 | `claude_invocations` | Per-invocation cost, token and rate-limit utilization record |
 | `attempt_steps` | Timed steps of an attempt (`SPEC-3.14`): `run_id`, `job_key`, `attempt`, `seq`, `stage`, `kind`, `label`, `started_at`, `ended_at`, `ok`, `detail`; `job_outcomes` gains `stage` and `outcome` |
 | `run_summaries` | Peered-instance run highlights (`SPEC-3.17` item 9): `run_uuid` (PK), `instance_id`, `seq`, `action_name`, `job_key`, `attempt`, `outcome`, `ok`, `started_at`, `ended_at`, `duration_ms`, `cost_usd`, `timed_out`; own and replicated rows |

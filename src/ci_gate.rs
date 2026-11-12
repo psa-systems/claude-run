@@ -171,6 +171,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             salvaged: false,
+            finished: false,
             conflict_resolve_attempts: 0,
             conflict_resolve_started_at: None,
             conflict_files: Vec::new(),
