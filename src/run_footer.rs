@@ -202,6 +202,30 @@ pub fn append_run(
     format!("{body}{footer}")
 }
 
+/// CLAUDE-646: start-notice footer for a comment posted BEFORE the work
+/// begins. Renders `Run:`, `Posted:`, `Source:`, and `Trigger:`, but NOT
+/// `Finished:` or `Duration:`. [`append_run`] with `started=None` collapses
+/// to Start==Finish and Duration 0s, which on a start notice reads as if the
+/// attempt already completed in zero seconds doing nothing; a reader then
+/// stops looking for the follow-up reply.
+pub fn append_start_notice(
+    body: &str,
+    public_url: Option<&str>,
+    run_id: Option<i64>,
+    source: &'static str,
+    trigger: Option<&Trigger>,
+) -> String {
+    let posted = Utc::now();
+    let run_line = run_line(public_url, run_id, None);
+    let trigger_line = trigger
+        .map(|t| format!("\nTrigger: {}", t.render()))
+        .unwrap_or_default();
+    format!(
+        "{body}\n\n{run_line}\nPosted: {}\nSource: {source}{trigger_line}",
+        posted.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
 /// SPEC-3.9: full footer text, all three link/no-link/no-run-id cases, the
 /// `Started:` / `Finished:` / `Duration:` lines, and the `Source:` line
 /// (CLAUDE-555) naming the action that produced the comment.
@@ -217,7 +241,22 @@ pub fn render(
     source: &'static str,
     trigger: Option<&Trigger>,
 ) -> String {
-    let run_line = match (public_url, run_id) {
+    let run_line = run_line(public_url, run_id, attempt);
+
+    let trigger_line = trigger
+        .map(|t| format!("\nTrigger: {}", t.render()))
+        .unwrap_or_default();
+
+    format!(
+        "\n\n{run_line}\nStarted: {}\nFinished: {}\nDuration: {}\nSource: {source}{trigger_line}",
+        started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        finished.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        humanize(finished - started),
+    )
+}
+
+fn run_line(public_url: Option<&str>, run_id: Option<i64>, attempt: Option<Attempt<'_>>) -> String {
+    match (public_url, run_id) {
         (Some(base), Some(id)) => {
             let base = base.trim_end_matches('/');
             match attempt {
@@ -235,18 +274,7 @@ pub fn render(
             }
         },
         (_, None) => "Run: no run id is available for this comment".to_string(),
-    };
-
-    let trigger_line = trigger
-        .map(|t| format!("\nTrigger: {}", t.render()))
-        .unwrap_or_default();
-
-    format!(
-        "\n\n{run_line}\nStarted: {}\nFinished: {}\nDuration: {}\nSource: {source}{trigger_line}",
-        started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        finished.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        humanize(finished - started),
-    )
+    }
 }
 
 /// SPEC-3.16.3: "The cause is one line from a closed set." One variant per
@@ -479,6 +507,53 @@ mod tests {
         assert!(body.contains("Run: https://claude-run.example.com/runs/5"));
         assert!(!body.contains("/jobs/"));
         assert!(body.contains("Source: closed-issue-summary"));
+    }
+
+    /// CLAUDE-646: the start-notice footer must not render `Finished:` or
+    /// `Duration:`, which on a pre-work comment would read as a 0s bailout
+    /// and hide the fact that a reply is still coming.
+    #[test]
+    fn append_start_notice_omits_finished_and_duration() {
+        let body = append_start_notice(
+            "Started.",
+            Some("https://claude-run.example.com"),
+            Some(7),
+            "comment-webhook",
+            Some(&Trigger::UserCommand {
+                login: "alice".to_string(),
+            }),
+        );
+        assert!(body.starts_with("Started.\n\n"));
+        assert!(body.contains("Run: https://claude-run.example.com/runs/7"));
+        assert!(body.contains("Posted:"));
+        assert!(body.contains("Source: comment-webhook"));
+        assert!(body.contains("Trigger: /claude command from alice"));
+        assert!(
+            !body.contains("Finished:"),
+            "start-notice must not render Finished: {body}"
+        );
+        assert!(
+            !body.contains("Duration:"),
+            "start-notice must not render Duration: {body}"
+        );
+    }
+
+    /// CLAUDE-646: with no run id, the start-notice still labels the Run line
+    /// explicitly rather than omitting it, matching `append_run`'s policy.
+    #[test]
+    fn append_start_notice_with_no_run_id_says_so() {
+        let body = append_start_notice(
+            "Started.",
+            Some("https://claude-run.example.com"),
+            None,
+            "comment-webhook",
+            None,
+        );
+        assert!(body.contains("Run: no run id is available for this comment"));
+        assert!(body.contains("Posted:"));
+        assert!(!body.contains("Finished:"));
+        assert!(!body.contains("Duration:"));
+        assert!(!body.contains("Trigger:"));
     }
 
     #[test]
