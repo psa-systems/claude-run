@@ -6609,6 +6609,33 @@ mod tests {
         assert_eq!(prs[0].base_ref, "main");
         assert_eq!(prs[0].author, "David");
         assert_eq!(prs[0].updated_at, "2026-05-29T11:10:28Z");
+        assert_eq!(prs[0].draft, Some(false));
+    }
+
+    /// CLAUDE-652: `fj`'s own `draft: true` maps to `Some(true)`, distinct
+    /// from an unreported flag.
+    #[test]
+    fn list_open_prs_maps_fj_draft_true() {
+        let json = r#"{"total_count":1,"pull_requests":[{"number":52,"title":"feat: x","state":"open","head_sha":"abc","head_ref":"feat/x","base_ref":"main","author":"David","html_url":"https://dev.a8n.run/n/c/pulls/52","updated_at":"2026-05-29T11:10:28Z","draft":true,"labels":[]}]}"#;
+        let b = backend(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "search",
+                "--repo",
+                "contoso/claude-run",
+                "--state",
+                "open",
+                "--json",
+            ],
+            json,
+        ));
+        let prs = b
+            .list_open_prs("dev.a8n.run", "contoso/claude-run")
+            .unwrap();
+        assert_eq!(prs[0].draft, Some(true));
     }
 
     #[test]

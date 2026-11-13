@@ -1424,6 +1424,9 @@ configured for a different provider, or a disabled listener returns 404. Pipelin
 - A PR whose row is `finished` (CLAUDE-630: `finalize` observed `Finalized::CodeReview`, i.e. the run that owns it
   already reported success and the PR was promoted to ready) is skipped before any status read: no behind-base
   branch update, no merge attempt, no comment, on either the webhook decision path or the periodic reconciler.
+- A PR the forge reports as a draft (CLAUDE-652) never has its branch updated by automerge, is never commented on by
+  it, and is never merged by it: a green, behind-base draft is a no-action outcome on either the webhook decision
+  path or the periodic reconciler. An unreported draft flag is treated as not-a-draft.
 
 #### 4.4.4 Action-run success and pull-request delivery consumption (`SPEC-4.4.4`)
 

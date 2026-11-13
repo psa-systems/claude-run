@@ -5141,6 +5141,32 @@ enum ConflictRoute {
     Skipped,
 }
 
+/// Look up one PR's draft flag in its repo's open-PR listing (CLAUDE-652),
+/// the single draft definition shared by [`route_conflicting_pr`] and
+/// [`apply_automerge_decision`]. `Ok(None)` means the PR is absent from the
+/// listing; `Ok(Some(draft))` carries the forge's own `draft` flag, itself
+/// `None` when the forge did not report it (never collapsed to `false`). A
+/// listing failure is logged with its cause here and returned as an error.
+async fn pr_draft_status(
+    forge: &Arc<dyn Forge>,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+) -> Result<Option<Option<bool>>, String> {
+    let (forge_for_list, host_owned, repo_owned) =
+        (forge.clone(), host.to_string(), repo.to_string());
+    let prs =
+        tokio::task::spawn_blocking(move || forge_for_list.list_open_prs(&host_owned, &repo_owned))
+            .await
+            .map_err(|e| format!("list_open_prs task panicked: {e}"))?
+            .map_err(|e| {
+                let msg = format!("list_open_prs for {repo} failed: {e}");
+                error!(repo = %repo, pr = pr_number, error = %e, "{msg}");
+                msg
+            })?;
+    Ok(prs.iter().find(|p| p.number == pr_number).map(|p| p.draft))
+}
+
 /// CLAUDE-547: send one conflict-resolution run for a runner PR that reports
 /// `mergeable: false`, whatever its CI state, through the CLAUDE-535 per-repo
 /// push cap. A Forgejo WIP/draft PR reports `mergeable: false` without
@@ -5165,22 +5191,10 @@ async fn route_conflicting_pr(
         return Ok(ConflictRoute::NotApplicable);
     }
     if !github {
-        let (forge_for_list, host_owned, repo_owned) =
-            (forge.clone(), host.to_string(), repo.to_string());
-        let prs = tokio::task::spawn_blocking(move || {
-            forge_for_list.list_open_prs(&host_owned, &repo_owned)
-        })
-        .await
-        .map_err(|e| format!("list_open_prs task panicked: {e}"))?
-        .map_err(|e| {
-            let msg = format!("conflict routing: list_open_prs for {repo} failed: {e}");
-            error!(repo = %repo, pr = pr_number, error = %e, "{msg}");
-            msg
-        })?;
-        let draft = prs
-            .iter()
-            .find(|p| p.number == pr_number)
-            .is_some_and(|p| p.title.starts_with("WIP: "));
+        let draft = pr_draft_status(forge, host, repo, pr_number)
+            .await?
+            .and_then(|d| d)
+            == Some(true);
         // A draft reports `mergeable: false` conflict or not, so only fj's `conflicted` verdict routes it.
         if draft && !conflicted {
             info!(repo = %repo, pr = pr_number, conflicted = ?status.conflicted, "conflict routing: WIP PR without a conflict verdict; not dispatched");
@@ -5551,6 +5565,40 @@ async fn apply_automerge_decision(
                 Err(msg)
             }
             Some(true) => {
+                // CLAUDE-652: a draft the runner does not own mid-run (a
+                // failed-review leftover) is never acted on here: no branch
+                // update, no comment of any kind, just one `info` log. A
+                // non-draft, `mergeable: true` PR never reports `behind_base`
+                // as true in a durable way the forge would still call a
+                // draft, so this guard only ever fires for a real draft. An
+                // unreported draft flag warns and proceeds as before; a PR
+                // absent from the listing is a no-op the reconciler's own
+                // stale-row retirement handles separately.
+                match pr_draft_status(&forge, host, repo, pr_number).await {
+                    Ok(Some(Some(true))) => {
+                        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR is a draft; automerge skipped");
+                        return Ok(AutomergeOutcome::NoAction(
+                            "PR is a draft; automerge skipped".to_string(),
+                        ));
+                    }
+                    Ok(Some(None)) => {
+                        warn!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR draft flag unreported by the forge; proceeding");
+                    }
+                    Ok(Some(Some(false))) => {}
+                    Ok(None) => {
+                        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR not found in open-PR listing; no action");
+                        return Ok(AutomergeOutcome::NoAction(
+                            "PR not found in open-PR listing; no action".to_string(),
+                        ));
+                    }
+                    Err(msg) => {
+                        let msg = format!("checking PR draft status failed: {msg}");
+                        error!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: {msg}");
+                        record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone())
+                            .await;
+                        return Err(msg);
+                    }
+                }
                 // CLAUDE-535: bring the branch current only when CI capacity
                 // allows, so one merge to base does not retrigger full CI on
                 // every open agent PR at once. A wait takes no action and posts
@@ -8690,6 +8738,7 @@ mod tests {
             author: String::new(),
             html_url: String::new(),
             updated_at: String::new(),
+            draft: None,
         };
         assert!(pr_matches_commit(&[pr("abc123")], "abc123"));
         // Full failing SHA, short PR head SHA -> prefix match still counts.
@@ -9587,6 +9636,7 @@ mod tests {
             author: String::new(),
             html_url: String::new(),
             updated_at: String::new(),
+            draft: None,
         }
     }
 
@@ -12723,7 +12773,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("success", true),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             let result = handle_action_success_for_pr(
@@ -12782,7 +12836,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let backend = Arc::new(StoreBackend::new().with_pr_status("pending", false));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("pending", false),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             let result = handle_action_success_for_pr(
@@ -12835,7 +12893,11 @@ mod tests {
             // not a recorded agent PR changes nothing.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
-            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("success", true),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             let result = handle_action_success_for_pr(
@@ -12892,11 +12954,7 @@ mod tests {
             .await
             .unwrap();
             assert!(result.contains("automerge disabled"), "{result}");
-            let calls = backend.calls();
-            assert!(
-                calls.iter().all(|c| c == "pr_status 7"),
-                "only pr_status should be called when automerge is off and the PR is not conflicted: {calls:?}"
-            );
+            assert_eq!(backend.calls(), vec!["pr_status 7".to_string()]);
         }
 
         #[tokio::test]
@@ -12919,7 +12977,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let backend = Arc::new(StoreBackend::new());
+            let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(7, "")]));
             *backend.pr_status.lock().unwrap() = Some(crate::provider::PrStatus {
                 state: "merged".to_string(),
                 mergeable: None,
@@ -12978,7 +13036,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let backend = Arc::new(StoreBackend::new().with_pr_status("success", false));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("success", false),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             let result = handle_action_success_for_pr(
@@ -13057,8 +13119,11 @@ mod tests {
             for (issue, pr) in [("MK-16", 7), ("MK-17", 8), ("MK-18", 9)] {
                 record_open_pr(&pool, issue, pr).await;
             }
-            let backend =
-                Arc::new(StoreBackend::new().with_pr_status_behind("success", true, Some(true)));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", true, Some(true)),
+            );
             backend.set_pr_status_for(8, "pending", Some(false));
             backend.set_pr_status_for(9, "pending", Some(false));
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
@@ -13087,8 +13152,11 @@ mod tests {
             write_youtrack_action(dir.path(), "yt", true);
             record_open_pr(&pool, "MK-16", 7).await;
             record_open_pr(&pool, "MK-17", 8).await;
-            let backend =
-                Arc::new(StoreBackend::new().with_pr_status_behind("success", true, Some(true)));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, ""), pr(8, "")])
+                    .with_pr_status_behind("success", true, Some(true)),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             let first = run_success_for(&ctx, &pool, 7).await;
@@ -13134,8 +13202,11 @@ mod tests {
             .unwrap();
             record_open_pr(&pool, "MK-16", 7).await;
             record_open_pr(&pool, "MK-17", 8).await;
-            let backend =
-                Arc::new(StoreBackend::new().with_pr_status_behind("success", true, Some(true)));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", true, Some(true)),
+            );
             backend.set_pr_status_for(8, "pending", Some(false));
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
             ctx.ci_update_holders
@@ -13167,8 +13238,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let backend =
-                Arc::new(StoreBackend::new().with_pr_status_behind("success", true, Some(true)));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", true, Some(true)),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             let result = handle_action_success_for_pr(
@@ -13210,6 +13284,72 @@ mod tests {
             assert!(pr_comments[0].contains("MK-16"), "{:?}", pr_comments[0]);
         }
 
+        /// CLAUDE-652: a draft PR, green and behind base, gets no branch
+        /// update, no issue comment, and no push comment: automerge takes
+        /// no action on a draft the runner does not own mid-run.
+        #[tokio::test]
+        async fn draft_pr_behind_base_takes_no_action() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                false,
+                now,
+            )
+            .await
+            .unwrap();
+            let draft_pr = ForgePullRequest {
+                draft: Some(true),
+                ..pr(7, "")
+            };
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![draft_pr])
+                    .with_pr_status_behind("success", true, Some(true)),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result.contains("draft"), "{result}");
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c == "update_pr_branch 7"),
+                "{calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|c| c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+            assert!(!calls.iter().any(|c| c.starts_with("comment")), "{calls:?}");
+            assert!(
+                !calls.iter().any(|c| c.starts_with("pr_comment")),
+                "{calls:?}"
+            );
+            assert!(
+                backend.pr_comments().is_empty(),
+                "{:?}",
+                backend.pr_comments()
+            );
+        }
+
         /// CLAUDE-519: two concurrent branch-updated-from-base push comments
         /// for the same PR number (two routing decisions racing, or just
         /// parallel test threads sharing the fixture PR number 7) must not
@@ -13221,7 +13361,7 @@ mod tests {
         async fn concurrent_branch_updated_push_comments_for_the_same_pr_do_not_corrupt_each_other()
         {
             let pool = crate::db::test_pool().await;
-            let backend = Arc::new(StoreBackend::new());
+            let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(7, "")]));
             let forge: Arc<dyn crate::provider::Forge> = backend.clone();
             let (left, right) = tokio::join!(
                 post_branch_updated_push_comment(
@@ -13282,6 +13422,7 @@ mod tests {
             .unwrap();
             let backend = Arc::new(
                 StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
                     .with_pr_status_behind("success", true, Some(true))
                     .with_pr_comment_error("fj exited 1"),
             );
@@ -13339,6 +13480,7 @@ mod tests {
             .unwrap();
             let backend = Arc::new(
                 StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
                     .with_pr_status_behind("success", true, Some(true))
                     .with_update_pr_branch_error(
                         "409 Conflict: unable to fast-forward: not up to date",
@@ -13400,8 +13542,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let backend =
-                Arc::new(StoreBackend::new().with_pr_status_behind("success", true, None));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", true, None),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             let result = handle_action_success_for_pr(
@@ -13459,7 +13604,7 @@ mod tests {
             .await
             .unwrap();
             let backend = Arc::new(
-                StoreBackend::new().with_pr_status("success", true).with_merge_pr_error(
+                StoreBackend::new().with_open_prs(vec![pr(7, "")]).with_pr_status("success", true).with_merge_pr_error(
                     "405 Method Not Allowed: not allowed to merge [reason: The head branch is behind the base branch]",
                 ),
             );
@@ -13623,6 +13768,99 @@ mod tests {
             assert_same_decision("pending", false, Some(false), false).await; // not green
             assert_same_decision("success", true, Some(false), true).await; // salvaged: green + mergeable still blocked
             assert_same_conflict_decision().await; // behind base + update conflict (CLAUDE-380)
+            assert_same_draft_decision().await; // CLAUDE-652: draft + green + behind base
+        }
+
+        /// CLAUDE-652: a draft PR, green and behind base, takes no action on
+        /// either entry point: no branch update, no comment. Both paths see
+        /// the same `NoAction` outcome via the shared [`pr_draft_status`]
+        /// lookup.
+        async fn assert_same_draft_decision() {
+            let now = "2026-09-01T00:00:00Z";
+            let draft_pr = ForgePullRequest {
+                draft: Some(true),
+                ..pr(7, "")
+            };
+
+            let pool_a = crate::db::test_pool().await;
+            let dir_a = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir_a.path(), "yt", true);
+            ci_failure_store::record_agent_pr(
+                &pool_a,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                false,
+                now,
+            )
+            .await
+            .unwrap();
+            let backend_a = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![draft_pr.clone()])
+                    .with_pr_status_behind("success", true, Some(true)),
+            );
+            let ctx_a = ctx_for(pool_a.clone(), backend_a.clone(), dir_a.path());
+            let result_a = handle_action_success_for_pr(
+                &ctx_a,
+                &pool_a,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result_a.contains("draft"), "{result_a}");
+            assert!(
+                !backend_a
+                    .calls()
+                    .iter()
+                    .any(|c| c.starts_with("update_pr_branch") || c.starts_with("comment")),
+                "a draft PR must get no branch update and no comment: {:?}",
+                backend_a.calls()
+            );
+
+            let pool_b = crate::db::test_pool().await;
+            let dir_b = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir_b.path(), "yt", true);
+            ci_failure_store::record_agent_pr(
+                &pool_b,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                false,
+                now,
+            )
+            .await
+            .unwrap();
+            let backend_b = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![draft_pr])
+                    .with_pr_status_behind("success", true, Some(true)),
+            );
+            let ctx_b = ctx_for(pool_b.clone(), backend_b.clone(), dir_b.path());
+            reconcile_automerge(
+                &pool_b,
+                &ctx_b,
+                &crate::concurrency::KeyGate::new(),
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
+
+            assert_eq!(
+                without_listing(backend_a.calls()),
+                without_listing(backend_b.calls()),
+                "webhook path and reconciler diverged on the draft decision shape"
+            );
         }
 
         /// The CLAUDE-380 conflict-dispatch decision shape: behind base, and
@@ -13785,10 +14023,12 @@ mod tests {
             )
             .await;
 
-            // The reconciler lists open PRs for the (host, repo) group and,
-            // after CLAUDE-595, reads this PR's `pr_status` so the stale-PR
-            // conflict sweep can see whether it is conflicted. It is not,
-            // so no further forge call is made.
+            // The reconciler lists open PRs for the (host, repo) group, and
+            // after CLAUDE-595 it reads this PR's `pr_status` so the
+            // stale-PR conflict sweep can see whether it is conflicted. It
+            // is not, so no further forge call is made; the CLAUDE-652 draft
+            // check lives inside the `behind_base == Some(true)` branch,
+            // which this automerge-disabled PR never reaches.
             assert_eq!(
                 backend.calls(),
                 vec![
@@ -14838,7 +15078,7 @@ mod tests {
                     "--limit",
                     "1000",
                     "--json",
-                    "number,title,headRefOid,headRefName,baseRefName,author,url",
+                    "number,title,headRefOid,headRefName,baseRefName,author,url,isDraft",
                 ]
             }
 
@@ -14918,6 +15158,11 @@ mod tests {
             }
             const GH_PR_COMMIT_STATUS_JSON_EMPTY: &str = r#"{"statuses":[]}"#;
 
+            /// `gh pr list`'s JSON for PR 42, open and not a draft: the
+            /// CLAUDE-652 draft lookup `apply_automerge_decision` makes
+            /// before reading `pr_status`.
+            const GH_OPEN_PRS_JSON: &str = r#"[{"number":42,"title":"fix","headRefOid":"abc123","headRefName":"fix/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42","isDraft":false}]"#;
+
             async fn seeded_github_row(pool: &DbPool) -> ci_failure_store::AgentPullRequest {
                 ci_failure_store::record_agent_pr(
                     pool,
@@ -14958,6 +15203,11 @@ mod tests {
                 let status_args: Vec<&str> = status_args.iter().map(String::as_str).collect();
                 let runner = Arc::new(
                     crate::provider::cli::testutil::StubRunner::new()
+                        .ok(
+                            "gh",
+                            &gh_list_open_prs_args("octo/widget"),
+                            GH_OPEN_PRS_JSON,
+                        )
                         .ok(
                             "gh",
                             &gh_pr_view_args("octo/widget"),
@@ -15042,6 +15292,11 @@ mod tests {
                     crate::provider::cli::testutil::StubRunner::new()
                         .ok(
                             "gh",
+                            &gh_list_open_prs_args("octo/widget"),
+                            GH_OPEN_PRS_JSON,
+                        )
+                        .ok(
+                            "gh",
                             &gh_pr_view_args("octo/widget"),
                             &gh_pr_view_json("UNKNOWN"),
                         )
@@ -15117,6 +15372,11 @@ mod tests {
                 let status_args: Vec<&str> = status_args.iter().map(String::as_str).collect();
                 let runner = Arc::new(
                     crate::provider::cli::testutil::StubRunner::new()
+                        .ok(
+                            "gh",
+                            &gh_list_open_prs_args("octo/widget"),
+                            GH_OPEN_PRS_JSON,
+                        )
                         .ok(
                             "gh",
                             &gh_pr_view_args("octo/widget"),
@@ -15555,7 +15815,7 @@ mod tests {
                 "--limit",
                 "1000",
                 "--json",
-                "number,title,headRefOid,headRefName,baseRefName,author,url",
+                "number,title,headRefOid,headRefName,baseRefName,author,url,isDraft",
             ]
         }
 
@@ -16046,7 +16306,7 @@ mod tests {
 
         fn wip_pr(number: u64) -> ForgePullRequest {
             ForgePullRequest {
-                title: "WIP: feat: x".to_string(),
+                draft: Some(true),
                 ..pr(number, "")
             }
         }
