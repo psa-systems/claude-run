@@ -786,23 +786,31 @@ pub async fn run_events_for_action(
     Ok(rows)
 }
 
-/// The newest message an action recorded that contains `needle`,
-/// so a caller can tell whether a fault it is about to report repeats the one
-/// it reported last time. SPEC-10.
+/// The newest message an action recorded that contains `needle` and does not
+/// start with `needle` followed by any of `skip_heads`, so a caller can tell
+/// whether a fault it is about to report repeats the one it reported last
+/// time while other writers share `needle` as a prefix. SPEC-10.
 pub async fn run_events_last_message_containing(
     pool: &DbPool,
     action: &str,
     needle: &str,
+    skip_heads: &[&str],
 ) -> Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(crate::db::q(
-        pool,
-        "SELECT message FROM run_events WHERE action_name = ? AND strpos(message, ?) > 0 ORDER BY ts DESC, id DESC LIMIT 1",
-    ).into_owned()))
-    .bind(action)
-    .bind(needle)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|r| r.0))
+    let mut sql = String::from(
+        "SELECT message FROM run_events WHERE action_name = ? AND strpos(message, ?) > 0",
+    );
+    for _ in skip_heads {
+        sql.push_str(" AND strpos(message, ?) <> 1");
+    }
+    sql.push_str(" ORDER BY ts DESC, id DESC LIMIT 1");
+    let mut query =
+        sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(crate::db::q(pool, &sql).into_owned()))
+            .bind(action)
+            .bind(needle);
+    for head in skip_heads {
+        query = query.bind(format!("{needle}{head}"));
+    }
+    Ok(query.fetch_optional(pool).await?.map(|r| r.0))
 }
 
 /// How many input-phase diagnostics an action has recorded since

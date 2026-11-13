@@ -4859,6 +4859,16 @@ struct AutomergePr<'a> {
     issue_key: &'a str,
 }
 
+/// CLAUDE-655: message heads (after the `PR <repo>#<n>: ` prefix) of the rows
+/// `dispatch_conflict_auto_resolve` writes. They share the prefix but are not
+/// an automerge outcome, so the once-per-outcome comment dedupe must not read
+/// one as the "previous" outcome.
+const CONFLICT_DISPATCH_EVENT_HEADS: &[&str] = &[
+    "conflict auto-resolve dispatch skipped",
+    "conflict auto-resolve dispatched (attempt",
+    "conflict auto-resolve dispatch send failed",
+];
+
 /// SPEC-4.4.3: records an automerge outcome and posts its comment exactly once, guarding against the same decision being posted twice for one PR.
 async fn record_automerge_outcome_and_comment_once(
     mint: &MintContext,
@@ -4871,8 +4881,13 @@ async fn record_automerge_outcome_and_comment_once(
 ) -> bool {
     let prefix = format!("PR {}#{}: ", pr.repo, pr.pr_number);
     let msg = format!("{prefix}{outcome}");
-    let previous = state::run_events_last_message_containing(pool, WEBHOOK_MINT_ACTION, &prefix)
-        .await
+    let previous = state::run_events_last_message_containing(
+        pool,
+        WEBHOOK_MINT_ACTION,
+        &prefix,
+        CONFLICT_DISPATCH_EVENT_HEADS,
+    )
+    .await
         .unwrap_or_else(|read_err| {
             warn!(error = %read_err, "reading the previous automerge outcome failed; commenting anyway");
             None
@@ -5750,6 +5765,36 @@ async fn apply_automerge_decision(
                 }
             }
             Some(false) if status.mergeable != Some(true) => {
+                // CLAUDE-655: a draft with no conflict verdict (for example one
+                // a no-verdict review left behind) reports `mergeable: false`
+                // and can never merge, so it gets no comment on any pass.
+                if status.conflicted != Some(true) {
+                    match pr_draft_status(&forge, host, repo, pr_number).await {
+                        Ok(Some(Some(true))) => {
+                            info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR is a draft; automerge skipped");
+                            return Ok(AutomergeOutcome::NoAction(
+                                "PR is a draft; automerge skipped".to_string(),
+                            ));
+                        }
+                        Ok(Some(Some(false))) => {}
+                        Ok(Some(None)) => {
+                            warn!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR draft flag unreported by the forge; proceeding");
+                        }
+                        Ok(None) => {
+                            info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR not found in open-PR listing; no action");
+                            return Ok(AutomergeOutcome::NoAction(
+                                "PR not found in open-PR listing; no action".to_string(),
+                            ));
+                        }
+                        Err(msg) => {
+                            let msg = format!("checking PR draft status failed: {msg}");
+                            error!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: {msg}");
+                            record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone())
+                                .await;
+                            return Err(msg);
+                        }
+                    }
+                }
                 let route = route_conflicting_pr(
                     mint,
                     pool,
@@ -13348,6 +13393,116 @@ mod tests {
                 "{:?}",
                 backend.pr_comments()
             );
+        }
+
+        /// CLAUDE-655: a green draft PR with no conflict verdict (what a
+        /// no-verdict review leaves behind) reports `mergeable: false`; no
+        /// pass comments on it.
+        #[tokio::test]
+        async fn draft_pr_not_mergeable_takes_no_action() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                false,
+                "2026-09-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            let draft_pr = ForgePullRequest {
+                draft: Some(true),
+                ..pr(7, "")
+            };
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![draft_pr])
+                    .with_pr_status("success", false),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            for _ in 0..2 {
+                let result = handle_action_success_for_pr(
+                    &ctx,
+                    &pool,
+                    "dev.a8n.run",
+                    "contoso/claude-run",
+                    7,
+                    "https://dev.a8n.run/contoso/claude-run/pulls/7",
+                )
+                .await
+                .unwrap();
+                assert!(result.contains("draft"), "{result}");
+            }
+            let calls = backend.calls();
+            assert!(!calls.iter().any(|c| c.starts_with("comment")), "{calls:?}");
+            assert!(
+                !calls.iter().any(|c| c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+        }
+
+        /// CLAUDE-655: a conflict-dispatch row between two passes must not
+        /// make the unchanged not-mergeable outcome comment again.
+        #[tokio::test]
+        async fn not_mergeable_comments_once_despite_conflict_dispatch_rows() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                false,
+                "2026-09-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("success", false),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            for _ in 0..3 {
+                handle_action_success_for_pr(
+                    &ctx,
+                    &pool,
+                    "dev.a8n.run",
+                    "contoso/claude-run",
+                    7,
+                    "https://dev.a8n.run/contoso/claude-run/pulls/7",
+                )
+                .await
+                .unwrap();
+                record_run_event(
+                    &pool,
+                    None,
+                    WEBHOOK_MINT_ACTION,
+                    "error",
+                    "PR contoso/claude-run#7: conflict auto-resolve dispatch skipped (no comment webhook source covers this repo)".to_string(),
+                )
+                .await;
+            }
+            let comments = backend
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("comment MK-16"))
+                .count();
+            assert_eq!(comments, 1, "{:?}", backend.calls());
         }
 
         /// CLAUDE-519: two concurrent branch-updated-from-base push comments
