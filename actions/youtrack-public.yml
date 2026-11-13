@@ -1,0 +1,60 @@
+---
+# yaml-embedded-languages: nushell
+# https://github.com/harrydowning/vscode-yaml-embedded-languages
+# https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
+
+# Same native youtrack handler as actions/youtrack.yml, scoped to the public-repo projects (SF, SFT) and run with
+# `repo_tracker_refs: false` (CLAUDE-470): the target repo for those projects is public, so the handler never writes
+# a bare tracker key ([A-Z][A-Z0-9]*-[0-9]+) into it. Before every push this action makes, the checkpoint-push
+# watcher and the final PR-open step both scan the branch name, every commit on the branch ahead of base, and the
+# PR title/body for a bare tracker key; a hit aborts the run, pushes nothing further, opens no PR, and parks the
+# issue Needs Review naming the offending text and where it was found, instead of publishing it. The triggering
+# issue still gets its PR link through the runner's own YouTrack comment (never repo text), and CI-fix escalation
+# still finds the owning issue through the `agent_pull_requests.issue_key` column populated directly, so neither
+# needs the key to appear in the repo. See actions/youtrack.yml for the full AI Agent state machine, checkpoint-push,
+# review-session, and bounded-tracker-write documentation shared by both actions; this file only documents what
+# differs.
+#
+# Query partition: this action owns the `SF` and `SFT` projects outright regardless of tag, and `youtrack.yml`'s
+# query excludes both, so the two queries stay an exact complement on that axis the same way the audit/worker pair
+# is partitioned on the audit project (CLAUDE-215). `shipped_action_queries_are_disjoint` in src/action.rs is the
+# mechanical guard.
+
+name: youtrack-public
+
+kind: youtrack
+
+limits:
+  max_attempts_per_key: 3
+  max_runs_per_day: 100
+  claude_timeout_seconds: 3600
+  review_timeout_seconds: 1800
+  daily_budget_usd: 150.00
+
+schedule:
+  kind: interval
+  spec: 5m
+
+claude:
+  allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
+  permission_mode: acceptEdits
+
+concurrency:
+  max_parallel: 4
+
+native:
+  youtrack:
+    # Owns the SF and SFT projects outright; see the partition note above.
+    query: "project: SF, SFT and -Resolved AI Agent: Queued"
+    custom_field: "AI Agent"
+    # CLAUDE-470: the target repo is public, so no bare tracker key may reach it.
+    repo_tracker_refs: false
+    # base_url / token_ref (CLAUDE-26): omitted here, so the host-configured yt CLI is used.
+    # states: defaults to Queued / Working / Code Review / Needs Review / Failed and State=In Progress; override here
+    #         only if the project renames these AI Agent values.
+  forgejo: {}
+    # base_url / token_ref (CLAUDE-26): omitted, so the host fj credentials are used and the forge host derives from
+    # each issue's resolved VCS integration.
+
+output:
+  file: youtrack-public.jsonl

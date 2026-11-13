@@ -1856,6 +1856,12 @@ async fn process_job(
     // watcher's own outcome; every other arm never checkpoints, so this
     // stays `None` for them, which `finalize` treats as "nothing rejected".
     let mut checkpoint_rejected: Option<String> = None;
+    // CLAUDE-470: set only when the checkpoint watcher found (or failed to
+    // rule out) a bare tracker key before a push, on a `repo_tracker_refs:
+    // false` action. Distinct from `checkpoint_rejected`: this forces
+    // `finalize_with_steps` to abort to Needs Review rather than falling
+    // through to the ordinary outcome table.
+    let mut tracker_key_hit: Option<String> = None;
     // CLAUDE-603: the spans of the checkpoint pushes the watcher recorded
     // during `claude.invoke`, carved out of the derived coding/check/build steps.
     let mut checkpoint_spans: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
@@ -1984,6 +1990,8 @@ async fn process_job(
                         started_wall,
                         &recorder,
                         stage,
+                        !src.repo_tracker_refs,
+                        cancel,
                     )
                 });
                 let invoke_result = claude.invoke(
@@ -2004,6 +2012,7 @@ async fn process_job(
                     opened: None,
                     rejected: None,
                     spans: Vec::new(),
+                    tracker_key_hit: None,
                 });
                 (invoke_result, outcome)
             });
@@ -2011,6 +2020,7 @@ async fn process_job(
             claude_span = Some((stream_log.clone(), invoke_step_start, chrono::Utc::now()));
             checkpoint_rejected = checkpoint_outcome.rejected;
             checkpoint_spans = checkpoint_outcome.spans;
+            tracker_key_hit = checkpoint_outcome.tracker_key_hit;
             if resume.is_none() {
                 resume = checkpoint_outcome.opened;
             }
@@ -2368,6 +2378,7 @@ async fn process_job(
                 trigger: Some(&trigger),
             },
             checkpoint_rejected.as_deref(),
+            tracker_key_hit.as_deref(),
             review.as_ref(),
             attempts + 1,
             limits.max_attempts_per_key,
@@ -2937,6 +2948,16 @@ struct CheckpointOutcome {
     /// CLAUDE-603: the span of every checkpoint push that landed, so the
     /// caller can carve them out of the derived steps they fall inside.
     spans: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    /// CLAUDE-470: set, instead of attempting the push, when a
+    /// `repo_tracker_refs: false` action's pre-push scan found a bare
+    /// tracker key (or the scan itself failed, treated the same way,
+    /// fail-closed) in the branch name or a commit on it. Distinct from
+    /// `rejected`, which is purely informational: this field is what tells
+    /// `finalize_with_steps` to abort the run and park Needs Review instead
+    /// of falling through to the ordinary outcome table. The watcher also
+    /// cancels the run the moment this is set, so `claude` stops promptly
+    /// rather than running out the clock.
+    tracker_key_hit: Option<String>,
 }
 
 /// Tick `forge.checkpoint_push` on `interval` while `claude` is still running,
@@ -2984,16 +3005,49 @@ fn run_checkpoint_watcher(
     run_started: chrono::DateTime<chrono::Utc>,
     recorder: &tokio::sync::Mutex<crate::attempt_steps::StepRecorder<'_>>,
     stage: &str,
+    // CLAUDE-470: `!src.repo_tracker_refs` at the call site. When set, every
+    // tick scans for a bare tracker key before pushing, and the draft PR
+    // body carries no `#{{key}}` reference.
+    tracker_free: bool,
+    // CLAUDE-470: cancelled the instant a tracker-key hit (or scan failure)
+    // is found, so `claude.invoke` on the other `thread::scope` leg stops
+    // promptly instead of running out the clock after the run is already
+    // doomed to Needs Review.
+    cancel: &CancellationToken,
 ) -> CheckpointOutcome {
     use std::sync::mpsc::RecvTimeoutError;
     let host = host_only(&job.repo_host);
-    let body = checkpoint_pr_body(&job.key);
+    let body = if tracker_free {
+        checkpoint_pr_body_tracker_free()
+    } else {
+        checkpoint_pr_body(&job.key)
+    };
     let mut opened: Option<PrResume> = None;
     let mut spans = Vec::new();
     loop {
         match stop_rx.recv_timeout(interval) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
+        }
+        if tracker_free {
+            let hit = match forge.scan_tracker_refs(workdir, None) {
+                Ok(hits) if hits.is_empty() => None,
+                Ok(hits) => Some(hits.join(", ")),
+                Err(e) => Some(format!(
+                    "tracker-key scan failed ({e}); refusing to push for safety"
+                )),
+            };
+            if let Some(hit) = hit {
+                error!(key = %job.key, hit = %hit, "CLAUDE-470: tracker-key scan hit before a checkpoint push; cancelling the run and skipping the push");
+                cancel.cancel();
+                let _ = stop_rx.recv();
+                return CheckpointOutcome {
+                    opened,
+                    rejected: None,
+                    spans,
+                    tracker_key_hit: Some(hit),
+                };
+            }
         }
         // SPEC-3.15 item 6, SPEC-8.8, CLAUDE-603: stash the stored rows of this
         // job just before the push, so the push comment lists every step that
@@ -3078,6 +3132,7 @@ fn run_checkpoint_watcher(
                     opened,
                     rejected,
                     spans,
+                    tracker_key_hit: None,
                 };
             }
         }
@@ -3086,6 +3141,7 @@ fn run_checkpoint_watcher(
         opened,
         rejected: None,
         spans,
+        tracker_key_hit: None,
     }
 }
 
@@ -3794,6 +3850,83 @@ pub(crate) fn default_youtrack_prompt() -> String {
     .join("\n")
 }
 
+/// CLAUDE-470: [`default_youtrack_prompt`] for a `repo_tracker_refs: false`
+/// action, whose target repo is public. Identical except for the two steps
+/// that otherwise put the tracker key into repo text: step 4's commit
+/// message (no bare `#{{key}}` reference, and an explicit ban on any
+/// tracker key / internal hostname / local path / person's name / realistic
+/// secret anywhere in the branch name or a commit message) and step 7's PR
+/// body (no trailing bare issue-reference block). The runner scans the
+/// branch name and every commit on it before every push (the periodic
+/// checkpoint push and the final PR open) and aborts the run, parking the
+/// issue Needs Review, on any hit - this prompt exists so a well-behaved
+/// agent never trips that scan in the first place. The triggering issue
+/// still gets its PR link through the runner's own YouTrack comment, never
+/// through repo text.
+pub(crate) fn default_youtrack_prompt_tracker_free() -> String {
+    [
+        "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.",
+        "",
+        "Issue: {{key}}: {{summary}}",
+        "Repo: {{clone_url}}",
+        "Working directory: {{workdir}} - the repo is already cloned here, you are inside it.",
+        "",
+        "This repo is PUBLIC. Never put the issue key {{key}}, any other tracker key, an internal hostname, a local file path, a person's name, or a realistic-looking password, token, or secret into the branch name, a commit message, or (later) the PR title/body - not even as a passing example. The runner scans the branch name and every commit on this branch ahead of the default branch, and the PR title/body, before every push (the periodic checkpoint push and the final PR open); any hit aborts the run immediately with nothing further pushed and no PR opened, and parks the issue Needs Review naming exactly what it found. The triggering issue still gets linked to its PR through the runner's own YouTrack comment, never through repo text, so leaving the key out costs nothing.",
+        "",
+        "The run is killed at {{deadline_utc}}, {{timeout_minutes}} minutes after it started. Run 'date -u' whenever you need the current time; never estimate it. Commit your work in checkpoints as you go (see step 4) so a kill still leaves committed progress, and spend the time on targeted verification rather than repeated full runs (see step 5). Never stop early because time is running out.",
+        "",
+        "Do ONLY local engineering work on code: do NOT push and do NOT open a PR. The runner finalizes the issue after you exit: it opens the PR from your local commits and sets the AI Agent field based on the run outcome.",
+        "",
+        "YouTrack writes. You MAY do exactly the following, and nothing else:",
+        "- Read anything the token can see, across every project: 'yt list --query=...', 'yt search', 'yt issue inspect <KEY>', 'yt project list' / 'yt project show' / 'yt project vcs list'.",
+        "- Create an issue with 'yt issue create' in exactly two cases:",
+        "  1. A gap, deferred item, or descoped piece of {{key}} itself: create it ONLY in these projects: {{write_projects}}, then link it with 'yt issue link <new-issue> {{key}} --type \"relates to\"', or with 'depends on' / 'is required for' when one of the two issues genuinely blocks the other. Never link it 'subtask of' {{key}}: that verb is reserved for linking under an epic or milestone root (an issue that only groups), never under a work issue, because closing a child auto-closes its parent and the dependency gate treats a parent as blocked by its own children, so a work issue made the parent of its own follow-up can never close its own loop. This is how the CLAUDE.md 'No orphan notes' rule is satisfied: the piece becomes its own tracked issue instead of a sentence in the PR body that nobody owns. Never file an issue whose only purpose is to verify, after {{key}}'s PR exists, that infrastructure or configuration outside the PR (a secret, a grant, a runner label, a deployed service, a dispatched workflow) took effect; assume that change was made and is correct. Never file an issue that can only start once {{key}}'s own PR is open or merged, since the agent that would work it is just as local-only as this one and cannot push, dispatch workflows, or open a PR to unblock it either.",
+        "  2. A bug you find that is NOT part of {{key}}, in this repo or in any other repo (for example a defect in a server repo you hit while working on the app that calls it). If it blocks {{key}}'s acceptance criteria and lives in this repo, fix it as part of {{key}}'s change and file nothing. Otherwise do NOT fix it in this run; file it. First run 'yt search' for an open issue that already reports it; if one exists, file nothing and name that issue in your final summary. Create it in the project whose VCS integration binds the repo the bug lives in: find that project with 'yt project list' and 'yt project vcs list <PROJECT>', and if no project or more than one project binds that repo, create it in {{write_projects}}. Its description states what you observed, how to reproduce it, and the file:line or command output that shows it. Then link it with 'yt issue link <new-issue> {{key}} --type \"relates to\"'. If the bug blocks {{key}}'s acceptance criteria from another repo, also take the blocker path below and name the new issue in the reason.",
+        "- Before creating any link above, check whether it would make a cycle: whether the target is already blocked, directly or through a chain of 'depends on' / 'is required for' links, by the issue you are about to link it to. If creating the link would produce a cycle, do not create it, and say so in your final summary instead.",
+        "- Update, comment on, and link ONLY the issues you created during THIS run: 'yt issue update', 'yt issue comment', 'yt issue link'.",
+        "- On the triggering issue {{key}}, you MAY comment with 'yt issue comment {{key}}', and you MAY add the links named in the two create cases above, one per issue you created. The runner still posts its own outcome comment on {{key}}; do not duplicate it.",
+        "",
+        "HARD BANS on YouTrack, no exceptions:",
+        "- NEVER set the 'AI Agent' field on ANY issue, including issues you created yourself: no 'yt issue set-field ... \"AI Agent\" ...', and no equivalent through 'yt issue update' or 'yt issue apply'. Setting that field queues an agent run, so an agent that can set it can spawn runs. It belongs to the runner alone.",
+        "- No other write to {{key}}: no description or summary edit, no tag, no assignee change, no 'yt issue set-state', no 'yt issue set-field'. The runner owns the outcome comment and the fields on {{key}}, and its State stays In Progress until a human merges the PR.",
+        "- No write of any kind to an issue you did not create during this run.",
+        "- Never run 'yt issue delete' anywhere.",
+        "",
+        "Steps:",
+        "1. Run 'yt issue inspect {{key}}' to read the full description, acceptance criteria and every comment. Then decide, before you change any code, whether you can finish and verify ALL of it before the deadline. If you cannot, do not start: take the blocker path below immediately, with a reason that begins 'Task too large:', says why, proposes a split of {{key}} into PR-sized pieces (one line per piece naming the acceptance criteria it would own), and ends with the question 'Split {{key}} as proposed?'. If you can, commit to finishing: from this point the only ways to end the run are completing every acceptance criterion with evidence (step 8), the blocker path for a real blocker, or the no-code path. Running short on time is never a reason to stop; keep working until you are done or the runner kills the run, because your committed work is kept either way.",
+        "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
+        "3. If {{existing_branch}} is empty, create a feature branch off the default branch, named only for the change itself (e.g. 'fix/redact-log-output', 'feat/add-export-button', 'chore/bump-deps') - never include {{key}} or any other tracker key in the branch name, per the ban above. If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, ALSO read that PR's own comments (a prior timed-out run may have left one explaining what it salvaged and why, e.g. a draft PR opened from uncommitted work at kill time, or a separate fresh-context review session may have left one listing findings that kept the PR a draft), then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
+        "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit with a plain commit message describing only the change itself - no bare issue reference, no tracker key, no internal hostname, local path, person's name, or realistic-looking secret anywhere in the subject or body, per the ban above. The final commit still carries the full PR-description format from step 7 and stays the branch tip. The runner pushes your commits as WIP checkpoints automatically every 60 seconds while you work, from whatever feature branch is checked out, and opens a draft PR from the first one that passes its tracker-key scan - this is not something you do, and a checkpoint landing is not a stopping point or a reason to wrap up early; keep working exactly as step 1 describes until you are done, blocked, or killed. Because of those checkpoint pushes, a commit on this branch may already be on the remote before you notice a mistake in it: never run 'git reset', 'git commit --amend', 'git rebase', 'git filter-branch', or any force push on this branch to fix it - any of those rewrites history the runner has already published and orphans the checkpoint. Fix a mistake, including a wrong commit message, with a new commit on top instead.",
+        "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (the repo's 'just pre-push' recipe when it exists, else 'just check', else the repo's documented checks) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off. The runner itself re-runs the repository's own pre-push entrypoint (`just pre-push`, else `just check`) in the clone after this attempt finishes and before recording it as successful (SPEC-3.3.2): it does not trust this report, so a report that checks passed must name the exact command you ran, and a failing check still needs fixing here rather than left for the gate to catch.",
+        "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
+        "7. The runner uses this commit's SUBJECT as the PR title and its body as the PR description (if you make more than one commit, the LAST commit carries both, since the runner reads only the branch tip). The subject is a SEPARATE line from the body, not the body's first heading: write one short imperative line (about 72 characters or fewer, no leading '#', not a Markdown heading like '## Summary') that names the change itself, e.g. 'Fix the off-by-one in the retry budget'; confirm it with 'git log -1 --format=%s' before you stop - if that prints a Markdown heading, a bare issue reference, or anything else that is not a one-line summary of the change, the commit is wrong and the runner will refuse to open the PR from it. The body (what 'git log -1 --format=%b' prints) is the PR description; it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) Nothing after the last section: unlike a repo where the key may appear, this body ends with the '## Verification' (or last non-empty) section and carries NO bare issue reference, no '#<KEY>-N' anywhere, and no linking word toward {{key}} or any other tracker key, anywhere in the subject or body - the runner links {{key}} to this PR itself, through its own YouTrack comment, not through repo text. A 'Co-Authored-By:' trailer, when you add one, is the only thing allowed after the last section, as its own block separated by one blank line. Example of the tail:",
+        "     ## Verification",
+        "",
+        "     `just check` passes.",
+        "   Write the message to a file OUTSIDE {{workdir}} and commit with 'git commit --cleanup=verbatim --file <message-file>', so the '##' headings survive verbatim. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
+        "8. Verify completion against the acceptance criteria before stopping. Re-read each criterion and state the concrete evidence that it is met: the file:line you changed, the command and its output, or the test that now passes. For any criterion that REMOVES or DELETES something, prove absence with a search (grep for the symbol or file) and confirm zero hits - never assert a removal you have not grep-verified - and add or extend a test or CI guard that fails if it reappears, so the removal is enforced mechanically. A green check suite is necessary but NOT sufficient: green checks do not prove the acceptance criteria are met. If you cannot produce objective evidence for EVERY criterion, you have NOT completed the issue - take the blocker path below instead of stopping as done. Ending the run as done while any acceptance criterion lacks objective evidence is forbidden.",
+        "9. Stop. Do not push and do not open a PR; beyond the YouTrack writes permitted above, do not touch the tracker. The runner opens the PR from your commits and transitions the issue.",
+        "",
+        "If the issue asks for tracker output rather than code - a survey across repos, a report, issues to file - and you therefore finish DELIBERATELY with no commits:",
+        "  a. Do the permitted YouTrack writes above: create the issue(s), and link each one per the case 1 or 2 rules above.",
+        "  b. Write the human-facing summary of what you produced, naming every issue you created, to this file (the file contents are posted verbatim as the issue comment by the runner):",
+        "       {{workdir}}/{{no_code_marker}}",
+        "  c. Do NOT write the blocker markers below; this is a successful outcome, not a parked one. The runner skips the PR entirely, posts your summary, and sets the AI Agent field to its no-code label.",
+        "  This path is ONLY for a run whose deliverable is tracker output rather than code. It is NEVER an escape hatch for a code task you could not finish - that is the blocker path below. A run that was supposed to change code and leaves no commits without this marker is failed by the runner, which is intended.",
+        "",
+        "If you CANNOT safely complete the issue - missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue, or you cannot produce objective evidence that every acceptance criterion is met:",
+        "  a. Do NOT start changing code for this. If you already committed work before finding the blocker, leave those commits as they are; do not revert them.",
+        "  b. Write the human-facing explanation of exactly what information or decision you need to proceed to this file (the file contents are the reason, posted verbatim as the issue comment by the runner); end it with exactly one explicit question a human can answer directly:",
+        "       {{workdir}}/{{needs_review_marker}}",
+        "  c. Touch this marker file so the runner does NOT count this attempt toward the per-key cap (the job is parked pending human input, not failed):",
+        "       {{workdir}}/{{skip_attempt_marker}}",
+        "  d. Do NOT set any YouTrack field yourself; the runner reads the marker and sets AI Agent to 'Needs Review'.",
+        "",
+        "When you finish, summarize what you did as an acceptance-criteria checklist: one line per criterion with the concrete evidence that proves it is met. Include one more line: 'Re-read {{key}} before the final commit: unchanged', or 'Re-read {{key}} before the final commit: changed (<what changed>, <how it was handled>)'. Do not include a PR URL - the runner creates the PR.",
+    ]
+    .join("\n")
+}
+
 /// SPEC-3.3.1: "`prompt_preset` is `default` or `audit`."
 pub(crate) fn preset_prompt(p: PromptPreset) -> String {
     match p {
@@ -3807,6 +3940,9 @@ pub(crate) fn preset_prompt(p: PromptPreset) -> String {
 pub(crate) fn prompt_template(src: &YoutrackSource) -> String {
     match &src.prompt {
         Some(p) => p.clone(),
+        // CLAUDE-470: an explicit `prompt` override always wins, regardless
+        // of `repo_tracker_refs`.
+        None if !src.repo_tracker_refs => default_youtrack_prompt_tracker_free(),
         None => preset_prompt(src.prompt_preset),
     }
 }
@@ -4713,6 +4849,11 @@ pub(crate) enum DeliveryBlockedReason {
     /// `agent_conflict_resolve_attempts` without clearing it; the webhook
     /// path drives this outcome rather than `finalize`.
     UnresolvedConflicts,
+    /// CLAUDE-470: a `repo_tracker_refs: false` action's pre-push scan found
+    /// (or could not rule out) a bare tracker key in the branch name, a
+    /// commit message, or the PR title/body; the run aborts rather than
+    /// write a tracker key into a public repo.
+    TrackerKeyLeak,
 }
 
 impl DeliveryBlockedReason {
@@ -4724,6 +4865,7 @@ impl DeliveryBlockedReason {
             DeliveryBlockedReason::ReviewModifiedWorkdir => "review-modified-workdir",
             DeliveryBlockedReason::NoCommitsAhead => "no-commits-ahead",
             DeliveryBlockedReason::UnresolvedConflicts => "unresolved-conflicts",
+            DeliveryBlockedReason::TrackerKeyLeak => "tracker-key-leak",
         }
     }
 
@@ -4747,6 +4889,9 @@ impl DeliveryBlockedReason {
             }
             DeliveryBlockedReason::UnresolvedConflicts => {
                 "Claude AI agent run DELIVERY BLOCKED: the PR has merge conflicts with its base that the runner's conflict auto-resolve attempts could not clear."
+            }
+            DeliveryBlockedReason::TrackerKeyLeak => {
+                "Claude AI agent run DELIVERY BLOCKED: a bare tracker key was found where this action's `repo_tracker_refs: false` forbids one, so nothing further was pushed and no PR was opened."
             }
         }
     }
@@ -5004,6 +5149,58 @@ fn finish_delivery_blocked(
     })
 }
 
+/// CLAUDE-470: [`delivery_blocked_comment`] for [`DeliveryBlockedReason::TrackerKeyLeak`],
+/// with `detail` (the offending key and exactly where it was found) and the
+/// work's actual location appended as two more bullets, matching
+/// [`pr_failure_comment`]'s preserve-or-safe wording.
+fn tracker_key_leak_comment(detail: &str, work: &WorkLocation) -> String {
+    let mut body = delivery_blocked_comment(DeliveryBlockedReason::TrackerKeyLeak, None);
+    let location_line = match work {
+        WorkLocation::PreservedWorkdir(p) => format!(
+            "The committed branch is PRESERVED on the daemon host at: `{}` (nothing was pushed from this run).",
+            p.display()
+        ),
+        WorkLocation::UncommittedChanges { workdir, paths } => format!(
+            "The work was never committed and is PRESERVED on the daemon host at: `{}` ({} changed path(s), uncommitted).",
+            workdir.display(),
+            paths.len()
+        ),
+        WorkLocation::RemoteBranch { branch, sha } => format!(
+            "An earlier checkpoint push already landed commits on branch `{branch}` (at `{sha}`) before this leak was found; nothing further was pushed."
+        ),
+        WorkLocation::None => "No local commits were found to preserve.".to_string(),
+    };
+    body.push_str(&format!("\n- Found: {detail}\n- {location_line}"));
+    body
+}
+
+/// CLAUDE-470: the [`Finalized::DeliveryBlocked`] exit for a `repo_tracker_refs:
+/// false` action whose pre-push scan found (or could not rule out) a bare
+/// tracker key. `detail` names the offending text and where it was found;
+/// `workdir` is queried the same way [`pr_failure_comment`]'s caller does, so
+/// the comment never contradicts whether the work was actually preserved.
+fn finish_tracker_key_blocked(
+    backend: &dyn IssueTracker,
+    src: &YoutrackSource,
+    job: &YoutrackJob,
+    detail: &str,
+    workdir: &Path,
+    public_url: Option<&str>,
+    run: crate::run_footer::CommentRun<'_>,
+) -> Result<Finalized> {
+    let work = work_location(workdir, None);
+    let body = tracker_key_leak_comment(detail, &work);
+    let body = lifecycle_footer(&body, public_url, run, &job.key, "Needs Review");
+    let label = src.states.delivery_blocked_label().to_string();
+    comment_then_field(backend, src, &job.key, &body, &label)?;
+    Ok(Finalized::DeliveryBlocked {
+        reason: DeliveryBlockedReason::TrackerKeyLeak,
+        pr_url: None,
+        pr_number: None,
+        head_branch: None,
+    })
+}
+
 /// [`finalize_with_steps`] with the step hand-off discarded, for the unit tests
 /// that do not assert on stored steps.
 #[cfg(test)]
@@ -5040,6 +5237,7 @@ fn finalize(
         resume_pr_url,
         run,
         checkpoint_push_rejected,
+        None,
         review,
         attempts_after,
         max_attempts_per_key,
@@ -5083,6 +5281,11 @@ fn finalize_with_steps(
     // fails the job; named in whichever outcome comment this call produces so
     // it is never silent.
     checkpoint_push_rejected: Option<&str>,
+    // CLAUDE-470: a bare tracker key the checkpoint watcher found (or could
+    // not rule out) before a mid-run push, on a `repo_tracker_refs: false`
+    // action. When set, this overrides every other outcome: nothing further
+    // is pushed and no PR is opened or promoted.
+    tracker_key_hit: Option<&str>,
     // CLAUDE-449: the post-success review session's verdict, or `None` when
     // no review ran (claude did not succeed, or the review step itself was
     // never reached). Only consulted in the success branch below.
@@ -5112,7 +5315,53 @@ fn finalize_with_steps(
     let skip_marker = workdir.join(SKIP_ATTEMPT_MARKER);
     let no_code = workdir.join(NO_CODE_MARKER);
 
+    // CLAUDE-470: checked before every other branch. A mid-run tracker-key
+    // hit already stopped the checkpoint watcher from pushing further; this
+    // routes the whole run to Needs Review without attempting any push or PR
+    // call here, regardless of how `claude_result` or the marker files look.
+    if let Some(hit) = tracker_key_hit {
+        return finish_tracker_key_blocked(
+            backend,
+            src,
+            job,
+            hit,
+            workdir,
+            public_url.as_deref(),
+            run,
+        );
+    }
+
+    // CLAUDE-470: on a `repo_tracker_refs: false` action, scan before every
+    // push this function itself makes (the checkpoint watcher already
+    // scanned before each of its own ticks, mid-run). `pr_text`, when
+    // given, is also scanned; the success branch below passes `None` since
+    // the PR's title/body are autofilled from the same branch and commits
+    // this already scans.
+    let scan_before_push = |pr_text: Option<(&str, &str)>| -> Option<String> {
+        if src.repo_tracker_refs {
+            return None;
+        }
+        match forge.scan_tracker_refs(workdir, pr_text) {
+            Ok(hits) if hits.is_empty() => None,
+            Ok(hits) => Some(hits.join(", ")),
+            Err(e) => Some(format!(
+                "tracker-key scan failed ({e}); refusing to push for safety"
+            )),
+        }
+    };
+
     if needs_review.exists() {
+        if let Some(hit) = scan_before_push(None) {
+            return finish_tracker_key_blocked(
+                backend,
+                src,
+                job,
+                &hit,
+                workdir,
+                public_url.as_deref(),
+                run,
+            );
+        }
         // SPEC-3.3.1: push any commits before anything else, since this path
         // opens no PR of its own and would otherwise leave them local-only.
         // A failed push overrides this outcome with Failed, never Needs
@@ -5166,6 +5415,17 @@ fn finalize_with_steps(
         backend.set_field(&job.key, &src.custom_field, &src.states.needs_review)?;
         Ok(Finalized::NeedsReview)
     } else if claude_result.ok && no_code.exists() {
+        if let Some(hit) = scan_before_push(None) {
+            return finish_tracker_key_blocked(
+                backend,
+                src,
+                job,
+                &hit,
+                workdir,
+                public_url.as_deref(),
+                run,
+            );
+        }
         // The run usually produced tracker output rather than code, with
         // nothing to push, but an attempt can still leave commits alongside
         // the marker (SPEC-3.3.1: "any commits the attempt made are
@@ -5204,6 +5464,17 @@ fn finalize_with_steps(
         info!(key = %job.key, %label, "no-code-change marker present; skipping PR");
         Ok(Finalized::NoCodeChange)
     } else if claude_result.ok {
+        if let Some(hit) = scan_before_push(None) {
+            return finish_tracker_key_blocked(
+                backend,
+                src,
+                job,
+                &hit,
+                workdir,
+                public_url.as_deref(),
+                run,
+            );
+        }
         // Success: open the PR from the agent's local commits via the resolved
         // Forge (`fj` agit+autofill for Forgejo hosts, the GitHub
         // backend for GitHub hosts), then report it. Both derive the title/body
@@ -5747,7 +6018,24 @@ fn finalize_with_steps(
             pr_strategy,
             claude_result,
             claude_timeout,
+            !src.repo_tracker_refs,
         );
+        // CLAUDE-470: a `repo_tracker_refs: false` action's salvage found (or
+        // could not rule out) a bare tracker key; nothing further was pushed
+        // or opened, so this routes to the same Needs-Review terminal state
+        // the mid-run checkpoint-watcher hit uses, instead of falling
+        // through to the ordinary timeout handling below.
+        if let Some(hit) = &salvage.tracker_key_hit {
+            return finish_tracker_key_blocked(
+                backend,
+                src,
+                job,
+                hit,
+                workdir,
+                public_url.as_deref(),
+                run,
+            );
+        }
         let current = backend
             .get_field(&job.key, &src.custom_field)
             .unwrap_or_default();
@@ -7060,6 +7348,13 @@ struct SalvageReport {
     /// apart from "agent was still editing when the timeout fired" (true -
     /// stay as TimedOut, needs human review).
     wip_commit_made: bool,
+    /// CLAUDE-470: set, instead of committing/pushing/opening a PR, when a
+    /// `repo_tracker_refs: false` action's pre-push scan found (or could not
+    /// rule out) a bare tracker key on the branch being salvaged. Mirrors
+    /// `CheckpointOutcome::tracker_key_hit`; the caller routes this straight
+    /// to [`finish_tracker_key_blocked`] instead of the ordinary timeout
+    /// handling.
+    tracker_key_hit: Option<String>,
 }
 
 /// SPEC-3.3: "timeout or cancel: the final push in 3.3.1 runs ... A draft PR
@@ -7079,6 +7374,11 @@ fn salvage_timeout_work(
     pr_strategy: crate::action::PrStrategy,
     claude_result: &ClaudeResult,
     timeout: Duration,
+    // CLAUDE-470: `!src.repo_tracker_refs` at the call site. When set, the
+    // WIP commit (if any) carries no `#{{key}}` reference, the branch is
+    // scanned for a bare tracker key before the draft PR is opened, and the
+    // draft PR body carries no `#{{key}}` reference either.
+    tracker_free: bool,
 ) -> SalvageReport {
     let work = match crate::workdir::local_only_work(workdir) {
         Ok(w) => w,
@@ -7101,14 +7401,33 @@ fn salvage_timeout_work(
     let mut report = SalvageReport::default();
     if !work.dirty.paths.is_empty() {
         report.wip_commit_made = true;
-        if let Err(e) = commit_timeout_wip(workdir, &job.key) {
+        if let Err(e) = commit_timeout_wip(workdir, &job.key, tracker_free) {
             error!(key = %job.key, error = %e, "timeout salvage: committing the uncommitted working tree failed");
             report.commit_error = Some(e);
         }
     }
 
+    if tracker_free {
+        let hit = match forge.scan_tracker_refs(workdir, None) {
+            Ok(hits) if hits.is_empty() => None,
+            Ok(hits) => Some(hits.join(", ")),
+            Err(e) => Some(format!(
+                "tracker-key scan failed ({e}); refusing to push for safety"
+            )),
+        };
+        if let Some(hit) = hit {
+            error!(key = %job.key, hit = %hit, "CLAUDE-470: tracker-key scan hit before timeout-salvage push; skipping the push/PR-create");
+            report.tracker_key_hit = Some(hit);
+            return report;
+        }
+    }
+
     let host = host_only(&job.repo_host);
-    let body = draft_pr_body(&job.key);
+    let body = if tracker_free {
+        draft_pr_body_tracker_free()
+    } else {
+        draft_pr_body(&job.key)
+    };
     match forge.create_pr_with_draft(workdir, &host, pr_strategy, true, Some(&body)) {
         Ok(pr) => {
             report.pr_url = Some(pr_url(job, &pr));
@@ -7159,7 +7478,13 @@ fn salvage_timeout_work(
 /// `provider::append_stdout_tail` rule `git_error` applies elsewhere
 /// (CLAUDE-432), because `git commit` runs the repo's `pre-commit` hook and a
 /// failing hook's report goes to stdout, not stderr.
-fn commit_timeout_wip(workdir: &Path, key: &str) -> std::result::Result<(), String> {
+fn commit_timeout_wip(
+    workdir: &Path,
+    key: &str,
+    // CLAUDE-470: on a `repo_tracker_refs: false` action, the commit body
+    // carries no `#{{key}}` reference.
+    tracker_free: bool,
+) -> std::result::Result<(), String> {
     // Bare `git` resolves through the process-wide `PATH`; serialize against
     // the CLAUDE-410 PATH-stub test's mutation/deletion window the same way
     // `comment_webhooks::git_output` does.
@@ -7179,12 +7504,19 @@ fn commit_timeout_wip(workdir: &Path, key: &str) -> std::result::Result<(), Stri
         );
         return Err(format!("`git add` failed: {detail}"));
     }
-    let message = format!(
+    let message = if tracker_free {
         "WIP: uncommitted changes at timeout\n\n\
-         The runner committed the working tree a run of {key} left uncommitted when it hit its \
-         time limit.\n\n\
-         #{key}"
-    );
+         The runner committed the working tree a run left uncommitted when it hit its time \
+         limit."
+            .to_string()
+    } else {
+        format!(
+            "WIP: uncommitted changes at timeout\n\n\
+             The runner committed the working tree a run of {key} left uncommitted when it hit its \
+             time limit.\n\n\
+             #{key}"
+        )
+    };
     let commit = Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -7238,6 +7570,22 @@ fn draft_pr_body(key: &str) -> String {
     .join("\n")
 }
 
+/// CLAUDE-470: [`draft_pr_body`] for a `repo_tracker_refs: false` action. No
+/// `#{key}` reference: the issue is public, so the timeout-salvaged draft PR
+/// carries no tracker key, same as the tracker-free prompt's commits.
+fn draft_pr_body_tracker_free() -> String {
+    [
+        "## Summary".to_string(),
+        String::new(),
+        "This draft PR was opened by the runner from a run that hit its time limit."
+            .to_string(),
+        "The branch holds the work committed so far; it may be incomplete.".to_string(),
+        "The first comment on this PR has the timeout limit, the run's cost, and the agent's last summary at kill time.".to_string(),
+        "A re-queued run that finishes replaces this description with the agent's own.".to_string(),
+    ]
+    .join("\n")
+}
+
 /// Runner-written PR body for a draft PR opened mid-run by the checkpoint-push
 /// watcher (CLAUDE-448): the tip commit at checkpoint time is agent work in
 /// progress, not a finished change, so (mirroring `draft_pr_body`'s CLAUDE-398
@@ -7253,6 +7601,19 @@ fn checkpoint_pr_body(key: &str) -> String {
         "The branch holds work committed so far; the agent is still working and the PR will be marked ready when the run finishes.".to_string(),
         String::new(),
         format!("#{key}"),
+    ]
+    .join("\n")
+}
+
+/// CLAUDE-470: [`checkpoint_pr_body`] for a `repo_tracker_refs: false`
+/// action. No `#{key}` reference: the issue is public, so the draft PR
+/// carries no tracker key, same as the tracker-free prompt's commits.
+fn checkpoint_pr_body_tracker_free() -> String {
+    [
+        "## Summary".to_string(),
+        String::new(),
+        "This draft PR was opened by the runner from an in-progress run.".to_string(),
+        "The branch holds work committed so far; the agent is still working and the PR will be marked ready when the run finishes.".to_string(),
     ]
     .join("\n")
 }
@@ -7466,6 +7827,9 @@ pub(crate) fn delivery_blocked_comment(
         }
         DeliveryBlockedReason::UnresolvedConflicts => {
             "- Merge the base branch into the PR branch and resolve the conflicts by hand, or close the PR and re-queue the issue (set AI Agent = Queued) to redo the work on the current base."
+        }
+        DeliveryBlockedReason::TrackerKeyLeak => {
+            "- Remove the tracker key from the named location, then re-queue the issue (set AI Agent = Queued) to retry."
         }
     };
     lines.push(follow_up.to_string());
@@ -9077,6 +9441,10 @@ mod tests {
         /// The step list each push would carry (CLAUDE-603), rendered the way
         /// the provider sites do.
         lists: Mutex<Vec<String>>,
+        /// CLAUDE-470: what `scan_tracker_refs` reports on every call; empty
+        /// (the default) means a clean scan, so only a test exercising a
+        /// tracker-key hit needs to set this.
+        scan_hits: Mutex<Vec<String>>,
     }
 
     impl FakeCheckpointForge {
@@ -9085,7 +9453,14 @@ mod tests {
                 results: Mutex::new(results),
                 calls: Mutex::new(0),
                 lists: Mutex::new(Vec::new()),
+                scan_hits: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_scan_hits(results: Vec<Result<Option<PullRequest>>>, hits: Vec<String>) -> Self {
+            let forge = Self::new(results);
+            *forge.scan_hits.lock().unwrap() = hits;
+            forge
         }
 
         fn call_count(&self) -> u32 {
@@ -9170,6 +9545,14 @@ mod tests {
         ) -> Result<()> {
             unreachable!("run_checkpoint_watcher never calls issue_comment")
         }
+
+        fn scan_tracker_refs(
+            &self,
+            _workdir: &Path,
+            _pr: Option<(&str, &str)>,
+        ) -> Result<Vec<String>> {
+            Ok(self.scan_hits.lock().unwrap().clone())
+        }
     }
 
     fn checkpoint_pr(number: u64, branch: &str) -> PullRequest {
@@ -9219,6 +9602,7 @@ mod tests {
         let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
             &pool, 1, "act", "MK-16", 1,
         ));
+        let cancel = CancellationToken::new();
         let outcome = std::thread::scope(|scope| {
             let watcher = scope.spawn(|| {
                 run_checkpoint_watcher(
@@ -9235,6 +9619,8 @@ mod tests {
                     chrono::Utc::now(),
                     &recorder,
                     "initial",
+                    false,
+                    &cancel,
                 )
             });
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -9308,6 +9694,7 @@ mod tests {
         let wd = tempfile::tempdir().unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let pool_handle = tokio::runtime::Handle::current();
+        let cancel = CancellationToken::new();
         let outcome = std::thread::scope(|scope| {
             let watcher = scope.spawn(|| {
                 run_checkpoint_watcher(
@@ -9324,6 +9711,8 @@ mod tests {
                     t0,
                     &recorder,
                     "initial",
+                    false,
+                    &cancel,
                 )
             });
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -9390,6 +9779,7 @@ mod tests {
         let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
             &pool, 1, "act", "MK-16", 1,
         ));
+        let cancel = CancellationToken::new();
         let outcome = std::thread::scope(|scope| {
             let watcher = scope.spawn(|| {
                 run_checkpoint_watcher(
@@ -9406,6 +9796,8 @@ mod tests {
                     chrono::Utc::now(),
                     &recorder,
                     "initial",
+                    false,
+                    &cancel,
                 )
             });
             std::thread::sleep(Duration::from_millis(30));
@@ -9441,6 +9833,7 @@ mod tests {
         let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
             &pool, 1, "act", "MK-16", 1,
         ));
+        let cancel = CancellationToken::new();
         let outcome = std::thread::scope(|scope| {
             let watcher = scope.spawn(|| {
                 run_checkpoint_watcher(
@@ -9457,6 +9850,8 @@ mod tests {
                     chrono::Utc::now(),
                     &recorder,
                     "initial",
+                    false,
+                    &cancel,
                 )
             });
             // Wait for the rejecting tick (CLAUDE-462), then leave several more
@@ -9482,6 +9877,70 @@ mod tests {
             forge.call_count(),
             1,
             "a rejected push must stop further ticks for the rest of the run"
+        );
+    }
+
+    /// CLAUDE-470 acceptance criterion: a bare tracker key already present
+    /// (e.g. in a commit message) before the watcher's first tick is caught
+    /// by the pre-push scan, so the watcher never calls `checkpoint_push` at
+    /// all, cancels the run so `claude.invoke` stops promptly, and reports
+    /// the hit instead of an opened or rejected push.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_checkpoint_watcher_never_pushes_when_a_tracker_key_is_found_first() {
+        let pool = mem_pool().await;
+        let forge = FakeCheckpointForge::with_scan_hits(
+            vec![Ok(Some(checkpoint_pr(77, "fix/MK-16")))],
+            vec!["CLAUDE-470".to_string()],
+        );
+        let wd = tempfile::tempdir().unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let pool_handle = tokio::runtime::Handle::current();
+        let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
+            &pool, 1, "act", "MK-16", 1,
+        ));
+        let cancel = CancellationToken::new();
+        let outcome = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                run_checkpoint_watcher(
+                    &forge,
+                    &job(),
+                    wd.path(),
+                    &pool,
+                    &pool_handle,
+                    "act",
+                    false,
+                    watcher_test_interval(),
+                    stop_rx,
+                    1,
+                    chrono::Utc::now(),
+                    &recorder,
+                    "initial",
+                    true,
+                    &cancel,
+                )
+            });
+            // Wait for the watcher to find the hit and cancel (it then
+            // blocks draining `stop_rx`) before dropping `stop_tx`; dropping
+            // it any earlier races the watcher's first `recv_timeout` and
+            // could break the loop before the scan ever runs.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !cancel.is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(stop_tx);
+            watcher.join().unwrap()
+        });
+        assert!(outcome.opened.is_none());
+        assert!(outcome.rejected.is_none());
+        assert_eq!(outcome.tracker_key_hit.as_deref(), Some("CLAUDE-470"));
+        assert_eq!(
+            forge.call_count(),
+            0,
+            "a tracker-key hit must stop the watcher before its first push"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "a tracker-key hit must cancel the run so claude.invoke stops promptly"
         );
     }
 
@@ -10286,6 +10745,25 @@ mod tests {
         assert!(p.contains("Never run 'git checkout main'"));
     }
 
+    #[test]
+    fn build_prompt_tracker_free_substitutes_job_fields_and_omits_the_key_in_repo_text() {
+        let src = YoutrackSource {
+            repo_tracker_refs: false,
+            ..src()
+        };
+        let wd = std::path::Path::new("/tmp/wd");
+        let p = build_prompt(&src, &job(), wd, hour(), SystemTime::now(), None);
+        assert!(p.contains("Issue: MK-16: Do the thing"));
+        assert!(p.contains("Repo: https://dev.a8n.run/contoso/claude-run.git"));
+        assert!(p.contains("/tmp/wd/.claude-run-needs-review"));
+        assert!(p.contains("/tmp/wd/.claude-run-skip-attempt"));
+        assert!(!p.contains("{{"), "unresolved placeholder:\n{p}");
+        assert!(
+            !p.contains("#MK-16"),
+            "the tracker-free prompt must never put the issue key into repo text:\n{p}"
+        );
+    }
+
     /// CLAUDE-377: the agent must know its wall-clock budget, checkpoint its
     /// work with per-layer commits carrying the bare issue reference, and
     /// follow the four test-discipline rules rather than re-running the full
@@ -10450,6 +10928,45 @@ mod tests {
         );
         assert!(preset_prompt(PromptPreset::Audit)
             .starts_with("You are executing a scheduled AUDIT run"));
+    }
+
+    #[test]
+    fn prompt_template_uses_the_tracker_free_default_when_repo_tracker_refs_is_false() {
+        let src = YoutrackSource {
+            repo_tracker_refs: false,
+            ..YoutrackSource::default()
+        };
+        assert_eq!(
+            prompt_template(&src),
+            default_youtrack_prompt_tracker_free()
+        );
+        assert_ne!(prompt_template(&src), default_youtrack_prompt());
+    }
+
+    #[test]
+    fn prompt_template_keeps_the_ordinary_default_when_repo_tracker_refs_is_true() {
+        let src = YoutrackSource::default();
+        assert!(src.repo_tracker_refs);
+        assert_eq!(prompt_template(&src), default_youtrack_prompt());
+    }
+
+    #[test]
+    fn prompt_template_override_wins_regardless_of_repo_tracker_refs() {
+        let src = YoutrackSource {
+            prompt: Some("custom prompt".to_string()),
+            repo_tracker_refs: false,
+            ..YoutrackSource::default()
+        };
+        assert_eq!(prompt_template(&src), "custom prompt");
+    }
+
+    #[test]
+    fn default_youtrack_prompt_tracker_free_never_puts_the_key_in_commit_or_pr_text() {
+        let p = default_youtrack_prompt_tracker_free();
+        // The ordinary default tells the agent to end the commit body with a
+        // bare `#{{key}}` reference; the tracker-free variant must not.
+        assert!(!p.contains("#{{key}}"));
+        assert!(default_youtrack_prompt().contains("#{{key}}"));
     }
 
     fn audit_src() -> YoutrackSource {
@@ -11892,6 +12409,174 @@ mod tests {
         );
     }
 
+    /// CLAUDE-470 acceptance criterion: a tracker-key hit found mid-run
+    /// (passed in as `tracker_key_hit`) overrides every other outcome,
+    /// before `finalize_with_steps` even looks at the marker files or
+    /// `claude_result`: it never touches the forge (no push, no PR), posts a
+    /// comment naming the hit, and parks the issue on the delivery-blocked
+    /// label.
+    #[test]
+    fn finalize_tracker_key_hit_blocks_delivery_without_touching_the_forge() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        // A success-shaped workdir (no marker files, ok result) to prove the
+        // tracker-key-hit check runs before the ordinary branches, not just
+        // in the Needs-Review path.
+        let backend = FakeTracker::new("Working");
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let res = finalize_with_steps(
+            &backend,
+            &forge,
+            &src(),
+            &job(),
+            wd,
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            Some("CLAUDE-470 (found in commit message)"),
+            None,
+            1,
+            1000,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::TrackerKeyLeak,
+                pr_url: None,
+                pr_number: None,
+                head_branch: None,
+            }
+        );
+        let comments = backend.comments.lock().unwrap();
+        assert!(
+            comments
+                .iter()
+                .any(|c| c.contains("CLAUDE-470 (found in commit message)")),
+            "{comments:?}"
+        );
+        let set_calls = backend.set_calls.lock().unwrap();
+        assert!(
+            set_calls
+                .iter()
+                .any(|(field, value)| field == "AI Agent" && value == "Needs Review"),
+            "{set_calls:?}"
+        );
+    }
+
+    /// CLAUDE-470 acceptance criterion: on a `repo_tracker_refs: false`
+    /// action, the success branch's pre-push scan runs before
+    /// `create_pr_with_draft`; a hit there must block delivery without ever
+    /// opening a PR. `FakeCheckpointForge::create_pr` (which
+    /// `create_pr_with_draft`'s default falls back to) panics if reached, so
+    /// this also proves the guard runs first, not just that it exists.
+    #[test]
+    fn finalize_success_scan_hit_blocks_before_opening_a_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        let backend = FakeTracker::new("Working");
+        let forge = FakeCheckpointForge::with_scan_hits(vec![], vec!["CLAUDE-470".to_string()]);
+        let source = YoutrackSource {
+            repo_tracker_refs: false,
+            ..src()
+        };
+        let res = finalize_with_steps(
+            &backend,
+            &forge,
+            &source,
+            &job(),
+            wd,
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            None,
+            1,
+            1000,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::TrackerKeyLeak,
+                pr_url: None,
+                pr_number: None,
+                head_branch: None,
+            }
+        );
+        let comments = backend.comments.lock().unwrap();
+        assert!(
+            comments.iter().any(|c| c.contains("CLAUDE-470")),
+            "{comments:?}"
+        );
+    }
+
+    /// CLAUDE-470 acceptance criterion: a timed-out run's salvage path also
+    /// scans before opening its draft PR on a `repo_tracker_refs: false`
+    /// action. `FakeCheckpointForge::create_pr` panics if reached, so a hit
+    /// here proves the scan runs before `create_pr_with_draft`, not just
+    /// that it exists, and the run is parked `DeliveryBlocked{TrackerKeyLeak}`
+    /// instead of the ordinary `TimedOut` outcome.
+    #[test]
+    fn finalize_timeout_salvage_scan_hit_blocks_before_opening_a_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        repo_with_commit(wd);
+        let backend = FakeTracker::new("Working");
+        let forge = FakeCheckpointForge::with_scan_hits(vec![], vec!["CLAUDE-470".to_string()]);
+        let source = YoutrackSource {
+            repo_tracker_refs: false,
+            ..src()
+        };
+        let res = finalize_with_steps(
+            &backend,
+            &forge,
+            &source,
+            &job(),
+            wd,
+            &timed_out_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            None,
+            1,
+            1000,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::TrackerKeyLeak,
+                pr_url: None,
+                pr_number: None,
+                head_branch: None,
+            }
+        );
+        let comments = backend.comments.lock().unwrap();
+        assert!(
+            comments.iter().any(|c| c.contains("CLAUDE-470")),
+            "{comments:?}"
+        );
+    }
+
     /// The agent-signalled blocker park (CLAUDE-373) attaches the
     /// Needs-Info tag alongside the marker comment and the `AI Agent` write,
     /// in that order: comment, then tag, then field.
@@ -12618,6 +13303,7 @@ mod tests {
             false,
             None,
             test_comment_run(),
+            None,
             None,
             None,
             1,
@@ -16323,7 +17009,7 @@ mod tests {
         // in isolation): `git add` fails loudly rather than panicking or
         // silently no-op'ing.
         let dir = tempfile::tempdir().unwrap();
-        let err = commit_timeout_wip(dir.path(), "MK-16").unwrap_err();
+        let err = commit_timeout_wip(dir.path(), "MK-16", false).unwrap_err();
         assert!(
             err.contains("git add"),
             "the commit-step failure must name `git add`: {err}"
@@ -16345,7 +17031,7 @@ mod tests {
             &hooks_dir.join("pre-commit"),
             "#!/bin/sh\nprintf 'pre-commit hook: lint failed\\n'\nexit 1\n",
         );
-        let err = commit_timeout_wip(dir.path(), "MK-16").unwrap_err();
+        let err = commit_timeout_wip(dir.path(), "MK-16", false).unwrap_err();
         assert!(
             err.contains("pre-commit hook: lint failed"),
             "failure text must carry the hook's stdout tail: {err}"
@@ -16363,7 +17049,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
         std::fs::write(dir.path().join("dirty.txt"), "uncommitted\n").unwrap();
-        commit_timeout_wip(dir.path(), "MK-16").unwrap();
+        commit_timeout_wip(dir.path(), "MK-16", false).unwrap();
         let out = {
             let _path_guard = crate::testutil::path_env_lock();
             Command::new("git")
@@ -16377,6 +17063,30 @@ mod tests {
         assert!(
             message.trim_end().ends_with("#MK-16"),
             "the commit body must end with the bare issue reference: {message}"
+        );
+    }
+
+    #[test]
+    fn commit_timeout_wip_tracker_free_omits_the_issue_key() {
+        // CLAUDE-470: a `repo_tracker_refs: false` action's timeout-salvage
+        // WIP commit must carry no bare tracker key anywhere in its message.
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        std::fs::write(dir.path().join("dirty.txt"), "uncommitted\n").unwrap();
+        commit_timeout_wip(dir.path(), "SF-16", true).unwrap();
+        let out = {
+            let _path_guard = crate::testutil::path_env_lock();
+            Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["log", "-1", "--format=%B"])
+                .output()
+                .unwrap()
+        };
+        let message = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !message.contains("SF-16"),
+            "a tracker-free WIP commit must not carry the issue key: {message}"
         );
     }
 
@@ -16782,6 +17492,7 @@ mod tests {
             true,
             None,
             test_comment_run(),
+            None,
             None,
             None,
             1,
@@ -21798,7 +22509,11 @@ mod tests {
                 | DeliveryBlockedReason::NoCommitsAhead
                 // driven by the automerge conflict auto-resolve ceiling,
                 // not `finalize`; included for an exhaustive inventory
-                | DeliveryBlockedReason::UnresolvedConflicts => {
+                | DeliveryBlockedReason::UnresolvedConflicts
+                // substitutes for "push or PR create failed, other cause"
+                // when a `repo_tracker_refs: false` action's scan found a
+                // bare tracker key before a push
+                | DeliveryBlockedReason::TrackerKeyLeak => {
                     "Needs Review (configured delivery-blocked label)"
                 }
             },

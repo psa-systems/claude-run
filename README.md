@@ -6,6 +6,7 @@ A YAML-driven runner for Claude Code: poll a source (YouTrack issues, Forgejo or
 
 - **Actions** are YAML files under `$CLAUDE_RUN_CONFIG_DIR/actions/`. A scripted action runs nu snippets for its input, filter, pre and post steps; a native action (`youtrack`, `closed-issue-summary`) is a Rust handler that owns the whole run. The schema is [`actions/SCHEMA.md`](actions/SCHEMA.md).
 - **Guard rails**: per-run and per-day spend ceilings, attempt caps, a global pause honored at every entry point, and audited, capped tracker writes.
+- **Public repos**: a native `youtrack` action can set `repo_tracker_refs: false` to keep every bare tracker key (`PROJ-123`) out of the target repo's branch names, commit messages, and pull request title/body; a hit aborts the run and parks the issue Needs Review instead of publishing it. See `actions/SCHEMA.md`.
 - **State** lives in SQLite by default, or PostgreSQL when the operator sets one.
 
 ## Install

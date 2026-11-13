@@ -472,6 +472,61 @@ pub fn bare_issue_key(text: &str) -> Option<String> {
         })
 }
 
+/// CLAUDE-470: find every bare tracker key (`[A-Z][A-Z0-9]*-[0-9]+`, no
+/// leading `#` required) in `text`, in the order first seen, deduplicated.
+/// Unlike [`bare_issue_key`] this has no `#` prefix requirement, so it also
+/// catches a key written into a branch name or a PR body sentence. A
+/// boundary check (the character immediately before and after a candidate
+/// must not itself be alphanumeric or `_`) keeps it from matching a
+/// substring of a larger token. Used only by `repo_tracker_refs: false`
+/// actions to refuse publishing a tracker key into a public repo; every
+/// other action keeps scraping for `#<KEY>` through [`bare_issue_key`].
+pub(crate) fn scan_tracker_keys(text: &str) -> Vec<String> {
+    fn is_word_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut hits = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if !chars[i].is_ascii_uppercase() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut j = i + 1;
+        while j < n && (chars[j].is_ascii_uppercase() || chars[j].is_ascii_digit()) {
+            j += 1;
+        }
+        if j >= n || chars[j] != '-' {
+            i += 1;
+            continue;
+        }
+        let digits_start = j + 1;
+        let mut k = digits_start;
+        while k < n && chars[k].is_ascii_digit() {
+            k += 1;
+        }
+        if k == digits_start {
+            i += 1;
+            continue;
+        }
+        let prev_ok = start == 0 || !is_word_char(chars[start - 1]);
+        let next_ok = k == n || !is_word_char(chars[k]);
+        if prev_ok && next_ok {
+            let key: String = chars[start..k].iter().collect();
+            if !hits.contains(&key) {
+                hits.push(key);
+            }
+            i = k;
+        } else {
+            i += 1;
+        }
+    }
+    hits
+}
+
 /// Reject a PR tip subject that is empty or a template heading/bare issue
 /// reference rather than a one-line subject (CLAUDE-398). Called before any
 /// push or PR-create call, so a bad tip opens nothing: the error names the
@@ -678,6 +733,30 @@ pub trait Forge: Send + Sync {
         let _ = (workdir, host);
         Err(Error::Other(anyhow::anyhow!(
             "final_push not supported by this forge backend"
+        )))
+    }
+
+    /// CLAUDE-470: scan the resolved feature branch's name, every commit
+    /// message on it ahead of the repo's default branch, and (when `pr` is
+    /// given) a PR title/body, for a bare tracker key
+    /// (`[A-Z][A-Z0-9]*-[0-9]+`, see [`scan_tracker_keys`]). Called before
+    /// every push (the periodic checkpoint push and the final `create_pr`
+    /// call) by a `repo_tracker_refs: false` action, never by any other.
+    /// Returns every distinct key found, in the order first seen; an empty
+    /// vec means the branch is clean to push. Every call site treats `Err`
+    /// as fail-closed, exactly like a hit: "cannot verify safety" aborts the
+    /// run the same as "found a key". The default errors so a backend
+    /// without support (every test-only stub, and the GitHub backend, which
+    /// no `repo_tracker_refs: false` action targets) reports clearly rather
+    /// than silently no-op'ing.
+    fn scan_tracker_refs(
+        &self,
+        workdir: &std::path::Path,
+        pr: Option<(&str, &str)>,
+    ) -> Result<Vec<String>> {
+        let _ = (workdir, pr);
+        Err(Error::Other(anyhow::anyhow!(
+            "scan_tracker_refs not supported by this forge backend"
         )))
     }
 
@@ -2142,6 +2221,43 @@ mod tests {
     #[test]
     fn bare_issue_key_rejects_non_numeric_suffix() {
         assert_eq!(bare_issue_key("#CLAUDE-abc"), None);
+    }
+
+    #[test]
+    fn scan_tracker_keys_empty_text_finds_nothing() {
+        assert_eq!(scan_tracker_keys(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn scan_tracker_keys_rejects_lowercase_and_no_trailing_digits() {
+        assert_eq!(
+            scan_tracker_keys("sf-123 and DASH- and nothing else"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn scan_tracker_keys_matches_without_a_hash_prefix() {
+        assert_eq!(scan_tracker_keys("(SF-1)"), vec!["SF-1".to_string()]);
+    }
+
+    #[test]
+    fn scan_tracker_keys_finds_every_key_in_order_deduplicated() {
+        let text = "fix/CLAUDE-470-repo-tracker-refs mentions CLAUDE-470 again and also SFT-9";
+        assert_eq!(
+            scan_tracker_keys(text),
+            vec!["CLAUDE-470".to_string(), "SFT-9".to_string()]
+        );
+    }
+
+    #[test]
+    fn scan_tracker_keys_respects_alphanumeric_boundaries() {
+        // A digit or letter glued to either side means the candidate is part
+        // of a larger token, not a standalone key, so it is rejected.
+        assert_eq!(
+            scan_tracker_keys("v1CLAUDE-470 CLAUDE-4700x"),
+            Vec::<String>::new()
+        );
     }
 
     /// A failed clone must say WHY. `git clone exited 128` alone is
