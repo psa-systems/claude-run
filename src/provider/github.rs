@@ -1240,7 +1240,7 @@ impl Forge for GithubForge {
             "--limit",
             &limit_str,
             "--json",
-            "number,title,headRefOid,headRefName,baseRefName,author,url",
+            "number,title,headRefOid,headRefName,baseRefName,author,url,isDraft",
         ];
         let out = self.run_gh_read(&args, &envs)?;
         if !out.ok {
@@ -1959,6 +1959,8 @@ struct GhPrEntry {
     author: GhPrAuthor,
     #[serde(default)]
     url: String,
+    #[serde(default, rename = "isDraft")]
+    is_draft: Option<bool>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -1978,6 +1980,7 @@ impl GhPrEntry {
             author: self.author.login,
             html_url: self.url,
             updated_at: String::new(),
+            draft: self.is_draft,
         }
     }
 }
@@ -3907,7 +3910,7 @@ mod tests {
             "--limit",
             "1000",
             "--json",
-            "number,title,headRefOid,headRefName,baseRefName,author,url",
+            "number,title,headRefOid,headRefName,baseRefName,author,url,isDraft",
         ]
     }
 
@@ -3929,6 +3932,22 @@ mod tests {
         assert_eq!(prs[0].base_ref, "main");
         assert_eq!(prs[0].author, "octocat");
         assert_eq!(prs[0].html_url, "https://github.com/octo/widget/pull/52");
+        assert_eq!(prs[0].draft, None);
+    }
+
+    /// CLAUDE-652: `isDraft` maps to `ForgePullRequest::draft`, distinct from
+    /// an unreported flag.
+    #[test]
+    fn list_open_prs_maps_is_draft_to_draft() {
+        let json = r#"[{"number":52,"headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"octocat"},"url":"https://github.com/octo/widget/pull/52","isDraft":true}]"#;
+        let runner = Arc::new(StubRunner::new().ok("gh", &list_open_prs_args("octo/widget"), json));
+        let forge = GithubForge::new(
+            runner,
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        );
+        let prs = forge.list_open_prs("github.com", "octo/widget").unwrap();
+        assert_eq!(prs[0].draft, Some(true));
     }
 
     #[test]

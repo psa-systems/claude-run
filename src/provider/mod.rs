@@ -98,6 +98,13 @@ pub struct ForgePullRequest {
     /// Last-update timestamp (RFC 3339), used for the scan window.
     #[serde(default)]
     pub updated_at: String,
+    /// Whether the forge reports this PR as a draft (`fj`'s `draft`, GitHub's
+    /// `isDraft`). `None` when the forge did not report it, never collapsed
+    /// to `false` (same convention as [`PrStatus::behind_base`]): automerge
+    /// treats an unknown draft flag as a reason to warn and proceed, not as
+    /// "not a draft".
+    #[serde(default)]
+    pub draft: Option<bool>,
 }
 
 /// The mergeability snapshot of a PR as `fj pr status --json` reports it.

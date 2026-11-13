@@ -18205,6 +18205,7 @@ mod tests {
             author: String::new(),
             html_url: format!("https://dev.a8n.run/contoso/claude-run/pulls/{number}"),
             updated_at: String::new(),
+            draft: None,
         }
     }
 
