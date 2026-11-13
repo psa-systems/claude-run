@@ -1025,14 +1025,14 @@ fn drop_database_when_closed(pool: &DbPool, url: &str, database: &str) {
         .expect("the test database cleanup worker is running");
 }
 
-/// Guards the `CREATE DATABASE ... TEMPLATE` step in [`test_pg_pool_at`] so
-/// only one clone runs at a time in this process. Postgres already refuses a
-/// second concurrent clone from the same template with `55006`
+/// Guards the `CREATE DATABASE ... TEMPLATE` step in [`clone_fixture_database`]
+/// so only one clone runs at a time in this process. Postgres already refuses
+/// a second concurrent clone from the same template with `55006`
 /// ("being accessed by other users"), so retrying through that refusal (what
 /// [`run_database_statement_with_retry`] still does for a cross-process
 /// collision) is racing a lock this process could just take. The lock is held
-/// only for the clone statement itself and released before
-/// [`pool_on_database`] connects. SPEC-5.6.11.
+/// only for the clone statement itself and released before the caller
+/// connects a pool. SPEC-5.6.11.
 #[cfg(test)]
 fn clone_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -1129,34 +1129,31 @@ fn fixture_failure_message(
     )
 }
 
-/// A Postgres pool backed by a disposable database of its own, cloned from the
-/// per-process template (SPEC-5.6.2) so `cargo test`'s parallel tests neither
-/// share tables nor each replay the migration set. The database is created
-/// with `CREATE DATABASE ... TEMPLATE` (a block copy on one maintenance
-/// connection, which cannot run in a transaction) and dropped when the pool
-/// is. The clone itself runs under [`clone_lock`] so this process's own
-/// clones never race each other for the template (SPEC-5.6.11); a failure
-/// panics with the server's state attached (SPEC-5.6.12). SPEC-5.6.1,
-/// SPEC-5.6.3.
+/// Clones `database` from `template` over `maint`, serialized by
+/// [`clone_lock`] so this process's own clones never race each other for the
+/// template (SPEC-5.6.11); a failure panics with the server's state attached
+/// (SPEC-5.6.12). The one path any fixture uses to clone a database of its
+/// own, so a direct `CREATE DATABASE ... TEMPLATE` never bypasses the lock or
+/// the failure snapshot.
 #[cfg(test)]
-async fn test_pg_pool_at(url: &str, max_connections: u32) -> DbPool {
-    use sqlx::Connection;
-    let template = ensure_template(url).await;
-    let database = next_fixture_database();
-    let mut maint = connect_maintenance(url).await;
-
+async fn clone_fixture_database(
+    url: &str,
+    maint: &mut sqlx::AnyConnection,
+    template: &str,
+    database: &str,
+) {
     let wait_started = Instant::now();
     let guard = clone_lock().lock().await;
     let waited_for_clone_slot = wait_started.elapsed();
     let step_started = Instant::now();
     let clone_result = run_database_statement_with_retry(
-        &mut maint,
+        maint,
         format!("CREATE DATABASE {database} TEMPLATE {template}"),
         Duration::from_secs(60),
     )
     .await;
-    // Released before pool_on_database connects: the lock only needs to cover
-    // the clone statement itself. SPEC-5.6.11.
+    // Released before the caller connects a pool: the lock only needs to
+    // cover the clone statement itself. SPEC-5.6.11.
     drop(guard);
 
     if let Err(e) = clone_result {
@@ -1174,6 +1171,22 @@ async fn test_pg_pool_at(url: &str, max_connections: u32) -> DbPool {
             )
         );
     }
+}
+
+/// A Postgres pool backed by a disposable database of its own, cloned from the
+/// per-process template (SPEC-5.6.2) so `cargo test`'s parallel tests neither
+/// share tables nor each replay the migration set. The database is created
+/// with `CREATE DATABASE ... TEMPLATE` (a block copy on one maintenance
+/// connection, which cannot run in a transaction) and dropped when the pool
+/// is, via [`clone_fixture_database`]. SPEC-5.6.1, SPEC-5.6.3.
+#[cfg(test)]
+async fn test_pg_pool_at(url: &str, max_connections: u32) -> DbPool {
+    use sqlx::Connection;
+    let template = ensure_template(url).await;
+    let database = next_fixture_database();
+    let mut maint = connect_maintenance(url).await;
+
+    clone_fixture_database(url, &mut maint, template, &database).await;
 
     maint
         .close()
@@ -1434,17 +1447,14 @@ mod tests {
 
         // Clone a fixture database of our own from the template, but do not
         // register the background drop worker: this test owns the drop so it
-        // can prove the path deterministically.
+        // can prove the path deterministically. The clone goes through
+        // clone_fixture_database, the same serialized, snapshot-on-failure
+        // path test_pg_pool_at uses, so this test's clone does not race it
+        // for the template (SPEC-5.6.11, SPEC-5.6.12).
         let template = ensure_template(&url).await;
         let database = next_fixture_database();
         let mut maint = connect_maintenance(&url).await;
-        run_database_statement_with_retry(
-            &mut maint,
-            format!("CREATE DATABASE {database} TEMPLATE {template}"),
-            Duration::from_secs(60),
-        )
-        .await
-        .unwrap();
+        clone_fixture_database(&url, &mut maint, template, &database).await;
 
         let pool = pool_on_database(&url, &database, 2).await;
         let tables: i64 = sqlx::query_scalar(

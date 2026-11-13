@@ -1678,18 +1678,20 @@ implementation.
   and an uncapped thread count on a HEAVY/MASSIVE runner contends for CPU badly enough to starve a sibling test's
   acquire past even that raised timeout, the same mechanism `SPEC-5.6.9` already had to lower its own cap from 16 to
   8 to tolerate (CLAUDE-524).
-- **SPEC-5.6.11**: `test_pg_pool_at`'s `CREATE DATABASE ... TEMPLATE` clone step MUST run under a process-wide async
-  lock held only for that statement and released before the fixture's pool connects, instead of relying on
-  `run_database_statement_with_retry`'s `55006` polling loop to arbitrate this process's own concurrent clones against
-  each other. Postgres allows only one clone from a given template at a time, so eight test threads cloning
-  simultaneously under `SPEC-5.6.9` otherwise fight over the template and whichever clones lose for the whole 60s
-  retry deadline fail the test (run #1194). `run_database_statement_with_retry` stays in place for the `DROP DATABASE`
-  path (`SPEC-5.6.4`) and for a clone that still hits `55006` from a source outside this lock's reach (another
-  process), since the lock only arbitrates this process's own clones.
-- **SPEC-5.6.12**: A clone failure in `test_pg_pool_at` or a connect failure in `pool_on_database` MUST panic with a
-  message that states what the Postgres server was doing: `max_connections`, the `pg_stat_activity` backend count
-  grouped by `datname` and `state`, how long the fixture waited for the `SPEC-5.6.11` clone lock, and how long the
-  failed step itself ran, read over a fresh maintenance connection taken only after the failure. The snapshot is
+- **SPEC-5.6.11**: Every fixture's `CREATE DATABASE ... TEMPLATE` clone step MUST go through `clone_fixture_database`,
+  the one path that runs the statement under a process-wide async lock held only for that statement and released
+  before the caller's pool connects, instead of relying on `run_database_statement_with_retry`'s `55006` polling loop
+  to arbitrate this process's own concurrent clones against each other. Postgres allows only one clone from a given
+  template at a time, so eight test threads cloning simultaneously under `SPEC-5.6.9` otherwise fight over the
+  template and whichever clones lose for the whole 60s retry deadline fail the test (run #1194). A fixture that clones
+  a database of its own directly, bypassing `clone_fixture_database`, reintroduces that race against `test_pg_pool_at`
+  in the same parallel test binary even though its own clones are serialized. `run_database_statement_with_retry`
+  stays in place for the `DROP DATABASE` path (`SPEC-5.6.4`) and for a clone that still hits `55006` from a source
+  outside this lock's reach (another process), since the lock only arbitrates this process's own clones.
+- **SPEC-5.6.12**: A clone failure in `clone_fixture_database` or a connect failure in `pool_on_database` MUST panic
+  with a message that states what the Postgres server was doing: `max_connections`, the `pg_stat_activity` backend
+  count grouped by `datname` and `state`, how long the fixture waited for the `SPEC-5.6.11` clone lock, and how long
+  the failed step itself ran, read over a fresh maintenance connection taken only after the failure. The snapshot is
   appended to the original error, never a replacement for it; if the snapshot query itself fails (for example the
   maintenance connection is also exhausted), that failure is appended as text instead. Without this, a stall like
   run #1194's reports only that the fixture timed out, not what the server was doing at the time.
