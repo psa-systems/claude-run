@@ -90,6 +90,11 @@ PR comment "/claude ..." -> webhook -> authorize -> claude session -> push withi
 Every external effect goes through external CLIs resolved from `PATH`: `yt` (YouTrack), `fj` (Forgejo), `gh` and a
 GitHub MCP endpoint (GitHub), `git`, `claude`, `nu` (default interpreter for scripted actions), `timeout` and `docker`.
 
+Every message the runner posts to a tracker issue or a forge thread that names a forge uses that forge's own name,
+"Forgejo" or "GitHub" (`SPEC-2.3`), never a fixed one: a job's messages follow the host routing of 3.3.1, and a
+comment-webhook source's messages follow its configured `provider`. The not-mergeable comment also uses the forge's own
+word for an unfinished PR ("WIP PR" on Forgejo, "draft PR" on GitHub).
+
 ### 2.4 Source layout
 
 | Path | Role |

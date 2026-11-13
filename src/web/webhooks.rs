@@ -304,6 +304,14 @@ impl WebhookProvider {
         }
     }
 
+    /// The forge's own name, for any message that names it (SPEC-2.3).
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            WebhookProvider::Forgejo => "Forgejo",
+            WebhookProvider::Github => "GitHub",
+        }
+    }
+
     /// Header carrying the hex-encoded HMAC-SHA256 of the raw body.
     pub fn signature_header(&self) -> &'static str {
         match self {
@@ -5817,7 +5825,13 @@ async fn apply_automerge_decision(
                     | ConflictRoute::NotApplicable
                     | ConflictRoute::Skipped => {}
                 }
-                let body = crate::native::youtrack::automerge_not_mergeable_comment(pr_url);
+                let backend = if is_github_host(host, &github_cfg.hosts) {
+                    BehindBaseBackend::GitHub
+                } else {
+                    BehindBaseBackend::Forgejo
+                };
+                let body =
+                    crate::native::youtrack::automerge_not_mergeable_comment(pr_url, backend);
                 record_automerge_outcome_and_comment_once(
                     mint,
                     pool,

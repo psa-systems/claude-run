@@ -232,7 +232,7 @@ daemon's own tick (CLAUDE-328, see below). Both entry points make the same decis
    - **`behind_base: false` and not mergeable** (a real conflict, still-checking, or a WIP PR): dispatches a
      conflict-resolution run (CLAUDE-547) through the same CI cap as a branch update, and comments that the runner is
      resolving it. A WIP PR is skipped. With no run to send (no comment source covering the repo, a failed send), it
-     comments that the PR is not mergeable and leaves the issue at Code Review.
+     comments that the PR is not mergeable, naming its own forge (Forgejo or GitHub), and leaves the issue at Code Review.
    - **Checks failed and not mergeable** (CLAUDE-547): a non-WIP PR gets the same resolution run; with none to send,
      no action.
    - **Conflict-resolution bound** (CLAUDE-550): resolution runs share one per-PR budget,

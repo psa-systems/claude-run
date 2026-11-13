@@ -1382,6 +1382,7 @@ async fn run_instruction(
         let backend = &env.backend;
         let route_cache = ctx.route_cache.clone();
         let cmd = cmd.clone();
+        let provider = src.provider;
         let workdir = workdir.clone();
         // One ledger for this delivery's run, so the mint's writes
         // are journalled with `run_id` and bounded by the run's ceiling.
@@ -1394,6 +1395,7 @@ async fn run_instruction(
                 &mint_cfg,
                 &route_cache,
                 &cmd,
+                provider,
                 &instruction,
                 &workdir,
             )
@@ -1856,12 +1858,13 @@ fn serve_mint(
     mint_cfg: &MintConfig,
     route_cache: &crate::mint::VcsRouteCache,
     cmd: &VerifiedCommentCommand,
+    provider: WebhookProvider,
     instruction: &str,
     workdir: &FsPath,
 ) -> RunOutcome {
     let (project, source) = route_cache.resolve_project(backend, mint_cfg, &cmd.repo, &cmd.host);
     let summary = mint_summary(cmd);
-    let description = mint_description(cmd, instruction);
+    let description = mint_description(cmd, provider, instruction);
 
     // The tracker writes go through this delivery's ledger (the
     // backend is per-delivery but the ledger carries the run id and the
@@ -1943,11 +1946,16 @@ fn mint_summary(cmd: &VerifiedCommentCommand) -> String {
 /// Body of a minted issue: the human's instruction VERBATIM in a fenced block
 /// (so nothing in it reads as a directive to the runner), the requester, and the
 /// link back to the Forgejo issue.
-fn mint_description(cmd: &VerifiedCommentCommand, instruction: &str) -> String {
+fn mint_description(
+    cmd: &VerifiedCommentCommand,
+    provider: WebhookProvider,
+    instruction: &str,
+) -> String {
+    let forge = provider.display_name();
     [
         "## Request".to_string(),
         format!(
-            "@{} left this `/claude` command on Forgejo issue {} in `{}`. It is reproduced verbatim:",
+            "@{} left this `/claude` command on {forge} issue {} in `{}`. It is reproduced verbatim:",
             cmd.author, cmd.html_url, cmd.repo
         ),
         String::new(),
@@ -1957,7 +1965,7 @@ fn mint_description(cmd: &VerifiedCommentCommand, instruction: &str) -> String {
         String::new(),
         "## Source".to_string(),
         format!("- Repo: `{}`", cmd.repo),
-        format!("- Forgejo issue: {}", cmd.html_url),
+        format!("- {forge} issue: {}", cmd.html_url),
         format!("- Requested by: @{}", cmd.author),
     ]
     .join("\n")
@@ -4741,13 +4749,32 @@ mod tests {
         .expect("accepted")
     }
 
+    /// CLAUDE-656: the minted issue names the forge the source is configured
+    /// for, never a fixed "Forgejo".
+    #[test]
+    fn the_minted_issue_names_the_sources_own_forge() {
+        let cmd = issue_command("do it");
+        let gh = mint_description(&cmd, WebhookProvider::Github, "do it");
+        assert!(gh.contains("on GitHub issue"), "{gh}");
+        assert!(gh.contains("- GitHub issue: "), "{gh}");
+        assert!(!gh.contains("Forgejo"), "{gh}");
+        let fj = mint_description(&cmd, WebhookProvider::Forgejo, "do it");
+        assert!(fj.contains("on Forgejo issue"), "{fj}");
+        assert!(fj.contains("- Forgejo issue: "), "{fj}");
+        assert!(!fj.contains("GitHub"), "{fj}");
+    }
+
     /// The minted issue's body carries the instruction VERBATIM and links back
     /// to the Forgejo issue it came from; its summary names the source thread
     /// rather than inlining the (potentially huge) instruction.
     #[test]
     fn the_minted_issue_carries_the_instruction_and_a_link_back() {
         let cmd = issue_command("add a retention sweep\nand a test");
-        let body = mint_description(&cmd, "add a retention sweep\nand a test");
+        let body = mint_description(
+            &cmd,
+            WebhookProvider::Forgejo,
+            "add a retention sweep\nand a test",
+        );
         assert!(body.contains("add a retention sweep\nand a test"), "{body}");
         assert!(
             body.contains(&format!("https://dev.a8n.run/{REPO}/issues/7")),
@@ -4777,7 +4804,7 @@ mod tests {
         let instruction = "add a retention sweep";
         let cmd = issue_command(instruction);
         let summary = mint_summary(&cmd);
-        let description = mint_description(&cmd, instruction);
+        let description = mint_description(&cmd, WebhookProvider::Forgejo, instruction);
 
         let runner = Arc::new(
             StubRunner::new()
@@ -4826,6 +4853,7 @@ mod tests {
             &MintConfig::default(),
             &cache,
             &cmd,
+            WebhookProvider::Forgejo,
             instruction,
             &workdir,
         );
@@ -4898,6 +4926,7 @@ mod tests {
             &MintConfig::default(),
             &cache,
             &cmd,
+            WebhookProvider::Forgejo,
             "do the thing",
             &workdir,
         );
