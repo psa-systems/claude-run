@@ -273,6 +273,20 @@ pub struct YoutrackSource {
     /// verification gate and CI, which still run unconditionally.
     #[serde(skip_serializing_if = "is_true")]
     pub install_hooks: bool,
+    /// Allow a bare tracker key (`[A-Z][A-Z0-9]*-[0-9]+`) into this repo's
+    /// branch name, commit messages, or PR title/body. Enabled by default
+    /// (today's behavior, unchanged). Set `false` for an action whose
+    /// target repo is public (e.g. `actions/youtrack-public.yml`): every
+    /// checkpoint push and the final PR open then scans the branch name,
+    /// every commit on the branch ahead of base, and the PR title/body for
+    /// a bare tracker key first; a hit aborts the run and parks the issue
+    /// Needs Review naming the offending text, instead of publishing it.
+    /// The triggering issue still gets its PR link through the runner's own
+    /// YouTrack comment, and CI-fix escalation still finds the owning issue
+    /// through the `agent_pull_requests.issue_key` column, so neither needs
+    /// the key to appear in repo text.
+    #[serde(skip_serializing_if = "is_true")]
+    pub repo_tracker_refs: bool,
 }
 
 impl Default for YoutrackSource {
@@ -292,6 +306,7 @@ impl Default for YoutrackSource {
             dependencies: Dependencies::default(),
             tags: Tags::default(),
             install_hooks: true,
+            repo_tracker_refs: true,
         }
     }
 }
@@ -1459,6 +1474,49 @@ native:
 
         let yaml = serde_yaml::to_string(&cfg.youtrack).unwrap();
         assert!(yaml.contains("install_hooks: false"));
+        let back: YoutrackSource = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(cfg.youtrack, back);
+    }
+
+    #[test]
+    fn youtrack_repo_tracker_refs_defaults_to_true_when_absent() {
+        // A youtrack config with no `repo_tracker_refs` key deserializes to
+        // the enabled default, so existing actions keep today's behavior.
+        let raw = "name: yt\nkind: youtrack\nnative:\n  youtrack: {}\n";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert!(cfg.youtrack.repo_tracker_refs);
+    }
+
+    #[test]
+    fn youtrack_repo_tracker_refs_default_is_omitted_on_serialize() {
+        let src = YoutrackSource::default();
+        let yaml = serde_yaml::to_string(&src).unwrap();
+        assert!(
+            !yaml.contains("repo_tracker_refs"),
+            "default repo_tracker_refs must be omitted from serialized YAML, got:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn youtrack_repo_tracker_refs_false_round_trips_through_yaml() {
+        let raw = "\
+name: yt
+kind: youtrack
+native:
+  youtrack:
+    repo_tracker_refs: false
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert!(!cfg.youtrack.repo_tracker_refs);
+
+        let yaml = serde_yaml::to_string(&cfg.youtrack).unwrap();
+        assert!(yaml.contains("repo_tracker_refs: false"));
         let back: YoutrackSource = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(cfg.youtrack, back);
     }

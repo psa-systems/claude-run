@@ -2480,6 +2480,47 @@ impl Forge for CliBackend {
         Ok(Some(crate::provider::FinalPushReport { branch }))
     }
 
+    /// CLAUDE-470: see [`crate::provider::Forge::scan_tracker_refs`]. No
+    /// feature branch yet (the very first checkpoint tick, before any
+    /// commit) means nothing to scan, same as [`Self::final_push`]
+    /// degrading to `Ok(None)` in that case.
+    fn scan_tracker_refs(&self, workdir: &Path, pr: Option<(&str, &str)>) -> Result<Vec<String>> {
+        let branch = match self.resolve_feature_branch(workdir) {
+            Ok(b) => b,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut hits = crate::provider::scan_tracker_keys(&branch);
+
+        let base_args = ["rev-parse", "--abbrev-ref", "origin/HEAD"];
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &base_args, &[])?;
+        let base_ref = Self::checked("git", out, &base_args)?.trim().to_string();
+        let range = format!("{base_ref}..{branch}");
+        let log_args = ["log", "--format=%B", range.as_str()];
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &log_args, &[])?;
+        let log = Self::checked("git", out, &log_args)?;
+        for key in crate::provider::scan_tracker_keys(&log) {
+            if !hits.contains(&key) {
+                hits.push(key);
+            }
+        }
+
+        if let Some((title, body)) = pr {
+            for key in crate::provider::scan_tracker_keys(title)
+                .into_iter()
+                .chain(crate::provider::scan_tracker_keys(body))
+            {
+                if !hits.contains(&key) {
+                    hits.push(key);
+                }
+            }
+        }
+        Ok(hits)
+    }
+
     /// Strip the `WIP: ` title prefix a timeout-salvaged draft PR (CLAUDE-379)
     /// carries, when a re-queued run resumes onto it and now succeeds. A PR
     /// whose title already lacks the prefix (not a salvaged draft, or already
@@ -8516,6 +8557,190 @@ mod tests {
         let b = CliBackend::new(Arc::new(ProcessRunner::new()));
         let branch = b.resolve_feature_branch(&clone).unwrap();
         assert_eq!(branch, "feat");
+    }
+
+    /// Shared fixture for the `scan_tracker_refs` tests below: an origin with
+    /// a `main` branch and a `feat` branch checked out, ready for the test to
+    /// add its own commits before cloning.
+    fn tracker_scan_origin(tmp: &Path) -> std::path::PathBuf {
+        let origin = tmp.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let git_in = |args: &[&str]| {
+            let _path_guard = crate::testutil::path_env_lock();
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&["init", "-q", "-b", "main"]);
+        git_in(&["config", "user.name", "t"]);
+        git_in(&["config", "user.email", "t@t.example"]);
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        git_in(&["add", "."]);
+        git_in(&["commit", "-q", "-m", "init"]);
+        origin
+    }
+
+    #[test]
+    fn scan_tracker_refs_finds_nothing_in_a_clean_branch_and_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tracker_scan_origin(tmp.path());
+        let git_in = |dir: &Path, args: &[&str]| {
+            let _path_guard = crate::testutil::path_env_lock();
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&origin, &["checkout", "-q", "-b", "feat/add-widget"]);
+        std::fs::write(origin.join("g.txt"), "y").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-q", "-m", "Add the widget module"]);
+        git_in(&origin, &["checkout", "-q", "main"]);
+
+        let url = format!("file://{}", origin.display());
+        let clone = tmp.path().join("clone");
+        crate::provider::shallow_clone(&url, Some("feat/add-widget"), &clone, 50).unwrap();
+
+        let b = CliBackend::new(Arc::new(ProcessRunner::new()));
+        let hits = b
+            .scan_tracker_refs(&clone, Some(("Add the widget module", "A plain PR body.")))
+            .unwrap();
+        assert_eq!(hits, Vec::<String>::new());
+    }
+
+    #[test]
+    fn scan_tracker_refs_finds_a_key_in_a_commit_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tracker_scan_origin(tmp.path());
+        let git_in = |dir: &Path, args: &[&str]| {
+            let _path_guard = crate::testutil::path_env_lock();
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&origin, &["checkout", "-q", "-b", "feat/add-widget"]);
+        std::fs::write(origin.join("g.txt"), "y").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(
+            &origin,
+            &["commit", "-q", "-m", "Add the widget module\n\n#SF-123"],
+        );
+        git_in(&origin, &["checkout", "-q", "main"]);
+
+        let url = format!("file://{}", origin.display());
+        let clone = tmp.path().join("clone");
+        crate::provider::shallow_clone(&url, Some("feat/add-widget"), &clone, 50).unwrap();
+
+        let b = CliBackend::new(Arc::new(ProcessRunner::new()));
+        let hits = b.scan_tracker_refs(&clone, None).unwrap();
+        assert_eq!(hits, vec!["SF-123".to_string()]);
+    }
+
+    #[test]
+    fn scan_tracker_refs_finds_a_key_in_the_branch_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tracker_scan_origin(tmp.path());
+        let git_in = |dir: &Path, args: &[&str]| {
+            let _path_guard = crate::testutil::path_env_lock();
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&origin, &["checkout", "-q", "-b", "fix/SF-9-widget"]);
+        std::fs::write(origin.join("g.txt"), "y").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-q", "-m", "Add the widget module"]);
+        git_in(&origin, &["checkout", "-q", "main"]);
+
+        let url = format!("file://{}", origin.display());
+        let clone = tmp.path().join("clone");
+        crate::provider::shallow_clone(&url, Some("fix/SF-9-widget"), &clone, 50).unwrap();
+
+        let b = CliBackend::new(Arc::new(ProcessRunner::new()));
+        let hits = b.scan_tracker_refs(&clone, None).unwrap();
+        assert_eq!(hits, vec!["SF-9".to_string()]);
+    }
+
+    #[test]
+    fn scan_tracker_refs_finds_a_key_in_the_pr_title_or_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tracker_scan_origin(tmp.path());
+        let git_in = |dir: &Path, args: &[&str]| {
+            let _path_guard = crate::testutil::path_env_lock();
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&origin, &["checkout", "-q", "-b", "feat/add-widget"]);
+        std::fs::write(origin.join("g.txt"), "y").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-q", "-m", "Add the widget module"]);
+        git_in(&origin, &["checkout", "-q", "main"]);
+
+        let url = format!("file://{}", origin.display());
+        let clone = tmp.path().join("clone");
+        crate::provider::shallow_clone(&url, Some("feat/add-widget"), &clone, 50).unwrap();
+
+        let b = CliBackend::new(Arc::new(ProcessRunner::new()));
+        let hits = b
+            .scan_tracker_refs(
+                &clone,
+                Some(("Add the widget module", "See SFT-42 for context.")),
+            )
+            .unwrap();
+        assert_eq!(hits, vec!["SFT-42".to_string()]);
+    }
+
+    #[test]
+    fn scan_tracker_refs_returns_empty_when_no_feature_branch_exists_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tracker_scan_origin(tmp.path());
+        let url = format!("file://{}", origin.display());
+        let clone = tmp.path().join("clone");
+        crate::provider::shallow_clone(&url, None, &clone, 50).unwrap();
+
+        let b = CliBackend::new(Arc::new(ProcessRunner::new()));
+        let hits = b.scan_tracker_refs(&clone, None).unwrap();
+        assert_eq!(hits, Vec::<String>::new());
     }
 
     // `unwrap_prose` reflows hard-wrapped commit-body prose so the
