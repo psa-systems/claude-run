@@ -354,6 +354,12 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   answer, error or timeout leaves it at Code Review for the reconciler and webhooks (CLAUDE-549). The legacy
   `wait_seconds` / `check_interval_seconds` keys are deprecated and ignored (a load-time warning names them); loading
   still succeeds so an existing action file keeps working.
+- Finalize never makes this status read, and never merges, when the same finalize call just promoted the PR from
+  draft (`Forge::mark_pr_ready` reports it was a draft before the call): a repo whose required checks skip on draft
+  PRs leaves only completed-but-skipped runs on the head SHA until the forge's own "ready for review" event starts
+  the real ones, so a read made right after promotion could see nothing but that stale, skipped evidence and merge a
+  PR whose checks never actually ran. The PR is left at Code Review for the reconciler and webhooks, which read
+  again once the real runs exist (CLAUDE-651).
 - Automerge separates a behind-base PR (its branch is simply behind its base, `behind_base: true`) from a real
   conflict: a green, behind-base PR is updated through the forge's update-branch endpoint, which retriggers CI, and a
   later success event re-evaluates and merges once that run goes green; a PR whose checks are green but the forge
@@ -2202,6 +2208,22 @@ action's `token_ref`, which is injected per job.
   with an explicit destination tracking ref (`refs/heads/<branch>:refs/remotes/origin/<branch>`, no leading `+`,
   since the ref does not exist yet in a fresh workdir) rather than a bare `git fetch origin <branch>`, which would
   write `FETCH_HEAD` only and leave `origin/<branch>` unresolvable to the merge that follows.
+
+### 8.11 GitHub CI-evidence: latest run per workflow, and the draft-promotion race (`SPEC-8.11`)
+
+- `GithubForge::pr_status` evaluates only the latest workflow run per `workflow_id` on the head SHA (highest
+  `run_number`, ties broken by `created_at`); older, superseded runs of the same workflow are dropped before the
+  verdict is computed, so a stale `failure` or `skipped` run a newer run of that workflow has since overtaken never
+  holds the PR back. A latest run concluded `skipped` yields `pending`, not `success`: a repo whose required checks
+  gate on `if: github.event.pull_request.draft == false` leaves exactly this shape (a completed, skipped run) on the
+  head SHA for the whole time the PR is a draft, and GitHub's own API reports `skipped` as a non-failing conclusion,
+  so counting it as passing would merge a PR whose checks never ran at all.
+- `Forge::mark_pr_ready` returns whether the PR was a draft immediately before the call. `GithubForge`'s
+  implementation reads `isDraft` with `gh pr view` before calling `gh pr ready`; a failed or unparseable read is
+  returned as an error naming the PR, never collapsed to "was not a draft" (a wrong `false` there is the one failure
+  mode that would make a just-promoted PR look already-ready and let the race in SPEC-3.3.1 back in through the
+  read side instead of the write side). `CliBackend`'s Forgejo implementation reports the same thing by whether it
+  found and stripped the `WIP: ` title prefix. See `SPEC-3.3.1` for how finalize uses this return value (CLAUDE-651).
 
 ## 9. Deployment and operations
 

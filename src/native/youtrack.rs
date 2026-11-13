@@ -5348,10 +5348,19 @@ fn finalize_with_steps(
                         // Best-effort: a failed promotion does not block the
                         // success outcome, but it is logged and named in the
                         // comment so a PR left as a draft is never silent.
+                        // `was_draft` (CLAUDE-651) is `true` when this call
+                        // just promoted the PR from draft; that disqualifies
+                        // it from the finalize-time merge below, since its
+                        // only CI evidence on the head SHA may be skipped
+                        // draft-time runs.
+                        let mut was_draft = false;
                         let promote_error = match pr.number {
                             Some(pr_number) => {
                                 match forge.mark_pr_ready(&host, &job.repo_path, pr_number) {
-                                    Ok(()) => None,
+                                    Ok(draft) => {
+                                        was_draft = draft;
+                                        None
+                                    }
                                     Err(e) => {
                                         error!(key = %job.key, pr_number, error = %e, "promoting the reviewed PR to ready failed (continuing)");
                                         Some(e.to_string())
@@ -5397,9 +5406,13 @@ fn finalize_with_steps(
                         // anything else stays at Code Review and the
                         // `success`/`recover` Action-run webhook (see
                         // `crate::web::webhooks`) or the reconciler merges it
-                        // later.
-                        let merged = match (pr.number, &promote_error) {
-                            (Some(pr_number), None) => automerge_at_finalize(
+                        // later. CLAUDE-651: a PR this same finalize promoted
+                        // from draft is never merged here, even green,
+                        // because its head SHA may carry nothing but skipped
+                        // draft-time runs; it is left at Code Review for the
+                        // webhook or reconciler to pick up once real runs land.
+                        let merged = match (pr.number, &promote_error, was_draft) {
+                            (Some(pr_number), None, false) => automerge_at_finalize(
                                 backend,
                                 forge,
                                 &src.automerge,
@@ -5411,8 +5424,12 @@ fn finalize_with_steps(
                                 run.run_id,
                                 steps,
                             ),
-                            // A PR still a draft, or one whose number is
-                            // unknown, is not merged here.
+                            (Some(pr_number), None, true) => {
+                                info!(key = %job.key, pr_number, "PR was promoted from draft in this finalize; leaving it at Code Review for the success/recover webhook or the reconciler");
+                                false
+                            }
+                            // A PR whose promotion failed, or one whose
+                            // number is unknown, is not merged here.
                             _ => false,
                         };
                         Ok(Finalized::CodeReview {
@@ -5783,7 +5800,7 @@ fn finalize_with_steps(
                 let promote_error = match pr.number {
                     Some(pr_number) => {
                         match forge.mark_pr_ready(&host, &job.repo_path, pr_number) {
-                            Ok(()) => None,
+                            Ok(_was_draft) => None,
                             Err(e) => {
                                 error!(key = %job.key, pr_number, error = %e, "timeout salvage: promoting the agent-completed PR from draft failed (continuing)");
                                 Some(e.to_string())
@@ -16484,6 +16501,91 @@ mod tests {
             .ok_prefix("yt issue comment MK-16 ", "")
     }
 
+    /// CLAUDE-651: same fixture as [`automerge_finalize_runner`], but the PR
+    /// was already ready (no `WIP: ` prefix) before this finalize, so
+    /// `mark_pr_ready` is a no-op (`was_draft = false`) rather than a
+    /// promotion. Used to show a PR that did not just come out of draft
+    /// still reaches the finalize-time merge.
+    fn automerge_finalize_runner_already_ready(git_dir: &Path) -> StubRunner {
+        StubRunner::new()
+            .ok(
+                "git",
+                &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                "origin/main",
+            )
+            .ok(
+                "git",
+                &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                "main\nfeat/x",
+            )
+            .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+            .ok(
+                "git",
+                &["remote", "get-url", "origin"],
+                "https://dev.a8n.run/contoso/claude-run.git",
+            )
+            .ok("git", &["rev-parse", "feat/x"], "abc\n")
+            .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "search",
+                    "--repo",
+                    "contoso/claude-run",
+                    "--state",
+                    "open",
+                    "--json",
+                ],
+                r#"{"pull_requests":[{"number":7,"title":"feat: x","head_sha":"abc","head_ref":"feat/x"}]}"#,
+            )
+            .ok(
+                "git",
+                &[
+                    "push",
+                    "--no-verify",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
+                "",
+            )
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "body\n\n#MK-16\n",
+            )
+            .ok(
+                "git",
+                &["rev-parse", "--absolute-git-dir"],
+                &git_dir.to_string_lossy(),
+            )
+            .ok(
+                "yt",
+                &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                "",
+            )
+            .ok_prefix("fj --host dev.a8n.run pr edit contoso/claude-run#7 ", "")
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "merge",
+                    "contoso/claude-run#7",
+                    "--method",
+                    "merge",
+                    "--delete",
+                ],
+                "",
+            )
+            .ok_prefix("yt issue comment MK-16 ", "")
+    }
+
     /// A [`CommandRunner`] that delegates to `inner` but holds every call
     /// whose joined args contain `slow_on` for `delay` first, so a test can
     /// make one forge read outlast a timeout.
@@ -16556,14 +16658,18 @@ mod tests {
 
     #[test]
     fn finalize_merges_a_pr_whose_ci_is_already_green() {
-        // CLAUDE-549: green, current and mergeable at finalize time -> the
-        // PR merges in the same tick and the outcome reads Merged.
+        // CLAUDE-549: green, current and mergeable at finalize time, and the
+        // PR was already ready before this finalize (CLAUDE-651: not just
+        // promoted from draft) -> the PR merges in the same tick and the
+        // outcome reads Merged.
         let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
-            "fj",
-            &FINALIZE_PR_STATUS_ARGS,
-            r#"{"pr":7,"head_sha":"abc","state":"success","mergeable":true,"behind_base":false}"#,
-        ));
+        let runner = Arc::new(
+            automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
+                "fj",
+                &FINALIZE_PR_STATUS_ARGS,
+                r#"{"pr":7,"head_sha":"abc","state":"success","mergeable":true,"behind_base":false}"#,
+            ),
+        );
         let forge = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let res = finalize_automerge_case(&forge, &automerge_src(10), dir.path());
         assert_eq!(res, code_review_pr7(true));
@@ -16578,6 +16684,33 @@ mod tests {
                 .iter()
                 .any(|c| c.starts_with("yt issue comment MK-16 ") && c.contains("merged this PR")),
             "the merge must be announced on the issue: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_does_not_merge_a_pr_just_promoted_from_draft() {
+        // CLAUDE-651: this finalize is the one that strips the PR's `WIP: `
+        // prefix (mark_pr_ready returns `was_draft = true`), so even an
+        // all-green status read must not merge: the only CI evidence on the
+        // head SHA may be skipped draft-time runs. The PR is left at Code
+        // Review for the success/recover webhook or the reconciler.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+            "fj",
+            &FINALIZE_PR_STATUS_ARGS,
+            r#"{"pr":7,"head_sha":"abc","state":"success","mergeable":true,"behind_base":false}"#,
+        ));
+        let forge = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
+        let res = finalize_automerge_case(&forge, &automerge_src(10), dir.path());
+        assert_eq!(res, code_review_pr7(false));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains(" pr status ")),
+            "a just-promoted PR must not even read status, let alone merge: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains(" pr merge ")),
+            "a just-promoted PR must not merge at finalize: {calls:?}"
         );
     }
 
@@ -16624,7 +16757,7 @@ mod tests {
     #[test]
     fn finalize_time_status_read_is_a_ci_wait_step() {
         let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+        let runner = Arc::new(automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
             "fj",
             &FINALIZE_PR_STATUS_ARGS,
             r#"{"pr":7,"head_sha":"abc","state":"pending","mergeable":true,"behind_base":false}"#,
@@ -16670,7 +16803,7 @@ mod tests {
         // CLAUDE-549: CI still running -> Code Review, no merge; the
         // webhook and reconciler own the merge once it goes green.
         let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+        let runner = Arc::new(automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
             "fj",
             &FINALIZE_PR_STATUS_ARGS,
             r#"{"pr":7,"head_sha":"abc","state":"pending","mergeable":true,"behind_base":false}"#,
@@ -16696,7 +16829,7 @@ mod tests {
         // CLAUDE-549: failing CI -> Code Review, no merge; the CI-fix flow
         // owns the retry.
         let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+        let runner = Arc::new(automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
             "fj",
             &FINALIZE_PR_STATUS_ARGS,
             r#"{"pr":7,"head_sha":"abc","state":"failure","mergeable":true,"behind_base":false}"#,
@@ -16717,7 +16850,7 @@ mod tests {
         // the CI-capped webhook/reconciler branch update; finalize neither
         // merges it nor starts a new CI run with an update.
         let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+        let runner = Arc::new(automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
             "fj",
             &FINALIZE_PR_STATUS_ARGS,
             r#"{"pr":7,"head_sha":"abc","state":"success","mergeable":true,"behind_base":true}"#,
@@ -16739,7 +16872,7 @@ mod tests {
         // CLAUDE-549: a status read slower than the timeout -> Code Review,
         // no merge, and finalize returns without waiting the read out.
         let dir = tempfile::tempdir().unwrap();
-        let inner = Arc::new(automerge_finalize_runner(&dir.path().join(".git")).ok(
+        let inner = Arc::new(automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
             "fj",
             &FINALIZE_PR_STATUS_ARGS,
             r#"{"pr":7,"head_sha":"abc","state":"success","mergeable":true,"behind_base":false}"#,
@@ -20853,9 +20986,9 @@ mod tests {
                 push_ended_at: None,
             })
         }
-        fn mark_pr_ready(&self, _host: &str, _repo: &str, pr_number: u64) -> Result<()> {
+        fn mark_pr_ready(&self, _host: &str, _repo: &str, pr_number: u64) -> Result<bool> {
             self.ready.lock().unwrap().push(pr_number);
-            Ok(())
+            Ok(true)
         }
         fn clone_url(&self, _host: &str, _repo: &str) -> Result<String> {
             unreachable!("not exercised by this test")
