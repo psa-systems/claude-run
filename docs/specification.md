@@ -310,6 +310,13 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
 - Claude works in the local clone; the runner pushes the result (see 3.3.1). The agent may create issues in
   `write_projects` (default: the triggering issue's project), linked `relates to` / `depends on` / `is required for`,
   never as a subtask.
+- `repo_tracker_refs: false` (CLAUDE-470, default `true`) is for a public target repo: the built-in prompt's
+  commit-message step drops the `#{{key}}` line, and every push this action makes (the CLAUDE-448 checkpoint push and
+  the final push in 3.3.1) is preceded by a scan of the branch name, every commit on the branch ahead of base, and (for
+  the final push) the PR title/body, for a bare tracker key. A hit aborts the run: nothing further is pushed, no PR is
+  opened, and the issue is parked Needs Review naming the offending text and where the unpushed work is preserved. The
+  triggering issue still gets its PR link through the runner's own comment, never repo text, and the CI-fix webhook
+  still finds the owning issue through `agent_pull_requests.issue_key`.
 - Finalize runs on every path and is the only place external mutations happen. Every path first applies 3.3.1, then:
   - marker file `.claude-run-needs-review`: commits pushed, field set to needs-review, no PR, `Needs-Info` tag added (name
     configurable under `tags.needs_info`), attempt not counted.
