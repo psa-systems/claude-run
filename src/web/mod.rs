@@ -8366,6 +8366,64 @@ mod tests {
         render_summary_markdown,
     };
 
+    /// CLAUDE-548: the dark palette's tokens (`--bg`, `--accent`, etc.) are
+    /// defined with a literal value exactly once, in `color_tokens.html`;
+    /// every other page that needs them pulls them in with
+    /// `{% include "color_tokens.html" %}` instead of restating the hex
+    /// values, so the palette can't drift between pages the way the old
+    /// per-page `:root` blocks did. `landing.html` is the one page excepted:
+    /// it is the only page with its own light scheme, so it keeps its own
+    /// token block (kept in step with the shared palette by hand, not
+    /// checked here).
+    #[test]
+    fn color_tokens_are_defined_once_and_shared() {
+        const TOKEN_FILE: &str = include_str!("../../templates/color_tokens.html");
+        let includers: &[(&str, &str)] = &[
+            ("base.html", include_str!("../../templates/base.html")),
+            ("login.html", include_str!("../../templates/login.html")),
+            (
+                "login_2fa.html",
+                include_str!("../../templates/login_2fa.html"),
+            ),
+            ("setup.html", include_str!("../../templates/setup.html")),
+            (
+                "totp_setup.html",
+                include_str!("../../templates/totp_setup.html"),
+            ),
+            (
+                "totp_recovery_codes.html",
+                include_str!("../../templates/totp_recovery_codes.html"),
+            ),
+            (
+                "invite_accept.html",
+                include_str!("../../templates/invite_accept.html"),
+            ),
+        ];
+
+        let token_names: Vec<&str> = TOKEN_FILE
+            .lines()
+            .filter_map(|l| l.trim().split_once(':').map(|(name, _)| name.trim()))
+            .filter(|name| name.starts_with("--"))
+            .collect();
+        assert!(
+            !token_names.is_empty(),
+            "color_tokens.html defines no tokens"
+        );
+
+        for (path, src) in includers {
+            assert!(
+                src.contains(r#"{% include "color_tokens.html" %}"#),
+                "{path} does not include color_tokens.html"
+            );
+            for name in &token_names {
+                assert!(
+                    !src.contains(&format!("{name}:")),
+                    "{path} redefines {name} instead of including color_tokens.html"
+                );
+            }
+        }
+    }
+
     /// SPEC-7.16: the landing page's mascot is served as PNG from the
     /// binary's embedded copy.
     #[tokio::test]

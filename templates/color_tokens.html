@@ -1,0 +1,22 @@
+{# Shared color tokens: a terminal-theme-inspired dark palette (gruvbox-dark
+   derived, in the spirit of the Starship/Nushell/Zellij themes the team
+   already uses). Defined ONCE here and pulled in with
+   `{% include "color_tokens.html" %}` by every page's `:root` block
+   (base.html and the standalone pre-auth pages that render outside it), so
+   there is exactly one place that sets these hex values. #}
+--bg: #1d2021;
+--panel: #282828;
+--panel-2: #3c3836;
+--well: #15171a;
+--border: #504945;
+--fg: #ebdbb2;
+--fg-dim: #c4b6a3;
+--accent: #a8c4ba;
+--accent-ink: #0a0c10;
+--accent-2: #8ec07c;
+--ok: #b8bb26;
+--warn: #fabd2f;
+--bad: #ff8a7d;
+--pause: #e8aebe;
+--qr-bg: #fff;
+--mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;

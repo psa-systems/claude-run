@@ -51,7 +51,7 @@
 
 <form method="post" action="{{ post_url }}">
   <textarea name="yaml" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off"
-            style="width: 100%; min-height: 480px; background: #0a0c10; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 12px; font-family: var(--mono); font-size: 13px; line-height: 1.45;">{{ yaml }}</textarea>
+            style="width: 100%; min-height: 480px; background: var(--well); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 12px; font-family: var(--mono); font-size: 13px; line-height: 1.45;">{{ yaml }}</textarea>
   <div class="row-actions" style="margin-top: 12px;">
     <button class="btn" type="submit">Save</button>
     {% if let Some(n) = name %}

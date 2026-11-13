@@ -17,11 +17,11 @@
   <form hx-post="/access/check" hx-target="#access-results" hx-swap="innerHTML"
         hx-disabled-elt="find button" class="row-actions" style="align-items: center;">
     <input type="text" name="repo" placeholder="owner/name" value="{{ form.repo_value() }}"
-           style="background: #0a0c10; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px;">
+           style="background: var(--well); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px;">
     <input type="text" name="host" placeholder="forge host (optional)" value="{{ form.host_value() }}"
-           style="background: #0a0c10; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px;">
+           style="background: var(--well); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px;">
     <input type="text" name="project" placeholder="project key (e.g. CLAUDE)" value="{{ form.project_value() }}"
-           style="background: #0a0c10; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px;">
+           style="background: var(--well); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px;">
     <button class="btn" type="submit">Check</button>
   </form>
 
