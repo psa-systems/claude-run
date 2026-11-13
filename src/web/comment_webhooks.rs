@@ -1852,6 +1852,7 @@ fn serve_run(
 /// `AI Agent = Queued` last (so the `youtrack` native action only picks the issue
 /// up once it is fully formed), and reply on the Forgejo issue on EVERY outcome
 /// path (minted, create failed, queue failed).
+#[allow(clippy::too_many_arguments)]
 fn serve_mint(
     backend: &dyn Backend,
     tracker: &dyn IssueTracker,
