@@ -1856,6 +1856,12 @@ async fn process_job(
     // watcher's own outcome; every other arm never checkpoints, so this
     // stays `None` for them, which `finalize` treats as "nothing rejected".
     let mut checkpoint_rejected: Option<String> = None;
+    // CLAUDE-470: set only when the checkpoint watcher found (or failed to
+    // rule out) a bare tracker key before a push, on a `repo_tracker_refs:
+    // false` action. Distinct from `checkpoint_rejected`: this forces
+    // `finalize_with_steps` to abort to Needs Review rather than falling
+    // through to the ordinary outcome table.
+    let mut tracker_key_hit: Option<String> = None;
     // CLAUDE-603: the spans of the checkpoint pushes the watcher recorded
     // during `claude.invoke`, carved out of the derived coding/check/build steps.
     let mut checkpoint_spans: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
@@ -1984,6 +1990,8 @@ async fn process_job(
                         started_wall,
                         &recorder,
                         stage,
+                        !src.repo_tracker_refs,
+                        cancel,
                     )
                 });
                 let invoke_result = claude.invoke(
@@ -2004,6 +2012,7 @@ async fn process_job(
                     opened: None,
                     rejected: None,
                     spans: Vec::new(),
+                    tracker_key_hit: None,
                 });
                 (invoke_result, outcome)
             });
@@ -2011,6 +2020,7 @@ async fn process_job(
             claude_span = Some((stream_log.clone(), invoke_step_start, chrono::Utc::now()));
             checkpoint_rejected = checkpoint_outcome.rejected;
             checkpoint_spans = checkpoint_outcome.spans;
+            tracker_key_hit = checkpoint_outcome.tracker_key_hit;
             if resume.is_none() {
                 resume = checkpoint_outcome.opened;
             }
@@ -2368,6 +2378,7 @@ async fn process_job(
                 trigger: Some(&trigger),
             },
             checkpoint_rejected.as_deref(),
+            tracker_key_hit.as_deref(),
             review.as_ref(),
             attempts + 1,
             limits.max_attempts_per_key,
@@ -2937,6 +2948,16 @@ struct CheckpointOutcome {
     /// CLAUDE-603: the span of every checkpoint push that landed, so the
     /// caller can carve them out of the derived steps they fall inside.
     spans: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    /// CLAUDE-470: set, instead of attempting the push, when a
+    /// `repo_tracker_refs: false` action's pre-push scan found a bare
+    /// tracker key (or the scan itself failed, treated the same way,
+    /// fail-closed) in the branch name or a commit on it. Distinct from
+    /// `rejected`, which is purely informational: this field is what tells
+    /// `finalize_with_steps` to abort the run and park Needs Review instead
+    /// of falling through to the ordinary outcome table. The watcher also
+    /// cancels the run the moment this is set, so `claude` stops promptly
+    /// rather than running out the clock.
+    tracker_key_hit: Option<String>,
 }
 
 /// Tick `forge.checkpoint_push` on `interval` while `claude` is still running,
@@ -2984,16 +3005,49 @@ fn run_checkpoint_watcher(
     run_started: chrono::DateTime<chrono::Utc>,
     recorder: &tokio::sync::Mutex<crate::attempt_steps::StepRecorder<'_>>,
     stage: &str,
+    // CLAUDE-470: `!src.repo_tracker_refs` at the call site. When set, every
+    // tick scans for a bare tracker key before pushing, and the draft PR
+    // body carries no `#{{key}}` reference.
+    tracker_free: bool,
+    // CLAUDE-470: cancelled the instant a tracker-key hit (or scan failure)
+    // is found, so `claude.invoke` on the other `thread::scope` leg stops
+    // promptly instead of running out the clock after the run is already
+    // doomed to Needs Review.
+    cancel: &CancellationToken,
 ) -> CheckpointOutcome {
     use std::sync::mpsc::RecvTimeoutError;
     let host = host_only(&job.repo_host);
-    let body = checkpoint_pr_body(&job.key);
+    let body = if tracker_free {
+        checkpoint_pr_body_tracker_free()
+    } else {
+        checkpoint_pr_body(&job.key)
+    };
     let mut opened: Option<PrResume> = None;
     let mut spans = Vec::new();
     loop {
         match stop_rx.recv_timeout(interval) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
+        }
+        if tracker_free {
+            let hit = match forge.scan_tracker_refs(workdir, None) {
+                Ok(hits) if hits.is_empty() => None,
+                Ok(hits) => Some(hits.join(", ")),
+                Err(e) => Some(format!(
+                    "tracker-key scan failed ({e}); refusing to push for safety"
+                )),
+            };
+            if let Some(hit) = hit {
+                error!(key = %job.key, hit = %hit, "CLAUDE-470: tracker-key scan hit before a checkpoint push; cancelling the run and skipping the push");
+                cancel.cancel();
+                let _ = stop_rx.recv();
+                return CheckpointOutcome {
+                    opened,
+                    rejected: None,
+                    spans,
+                    tracker_key_hit: Some(hit),
+                };
+            }
         }
         // SPEC-3.15 item 6, SPEC-8.8, CLAUDE-603: stash the stored rows of this
         // job just before the push, so the push comment lists every step that
@@ -3078,6 +3132,7 @@ fn run_checkpoint_watcher(
                     opened,
                     rejected,
                     spans,
+                    tracker_key_hit: None,
                 };
             }
         }
@@ -3086,6 +3141,7 @@ fn run_checkpoint_watcher(
         opened,
         rejected: None,
         spans,
+        tracker_key_hit: None,
     }
 }
 
@@ -4793,6 +4849,11 @@ pub(crate) enum DeliveryBlockedReason {
     /// `agent_conflict_resolve_attempts` without clearing it; the webhook
     /// path drives this outcome rather than `finalize`.
     UnresolvedConflicts,
+    /// CLAUDE-470: a `repo_tracker_refs: false` action's pre-push scan found
+    /// (or could not rule out) a bare tracker key in the branch name, a
+    /// commit message, or the PR title/body; the run aborts rather than
+    /// write a tracker key into a public repo.
+    TrackerKeyLeak,
 }
 
 impl DeliveryBlockedReason {
@@ -4804,6 +4865,7 @@ impl DeliveryBlockedReason {
             DeliveryBlockedReason::ReviewModifiedWorkdir => "review-modified-workdir",
             DeliveryBlockedReason::NoCommitsAhead => "no-commits-ahead",
             DeliveryBlockedReason::UnresolvedConflicts => "unresolved-conflicts",
+            DeliveryBlockedReason::TrackerKeyLeak => "tracker-key-leak",
         }
     }
 
@@ -4827,6 +4889,9 @@ impl DeliveryBlockedReason {
             }
             DeliveryBlockedReason::UnresolvedConflicts => {
                 "Claude AI agent run DELIVERY BLOCKED: the PR has merge conflicts with its base that the runner's conflict auto-resolve attempts could not clear."
+            }
+            DeliveryBlockedReason::TrackerKeyLeak => {
+                "Claude AI agent run DELIVERY BLOCKED: a bare tracker key was found where this action's `repo_tracker_refs: false` forbids one, so nothing further was pushed and no PR was opened."
             }
         }
     }
@@ -5084,6 +5149,58 @@ fn finish_delivery_blocked(
     })
 }
 
+/// CLAUDE-470: [`delivery_blocked_comment`] for [`DeliveryBlockedReason::TrackerKeyLeak`],
+/// with `detail` (the offending key and exactly where it was found) and the
+/// work's actual location appended as two more bullets, matching
+/// [`pr_failure_comment`]'s preserve-or-safe wording.
+fn tracker_key_leak_comment(detail: &str, work: &WorkLocation) -> String {
+    let mut body = delivery_blocked_comment(DeliveryBlockedReason::TrackerKeyLeak, None);
+    let location_line = match work {
+        WorkLocation::PreservedWorkdir(p) => format!(
+            "The committed branch is PRESERVED on the daemon host at: `{}` (nothing was pushed from this run).",
+            p.display()
+        ),
+        WorkLocation::UncommittedChanges { workdir, paths } => format!(
+            "The work was never committed and is PRESERVED on the daemon host at: `{}` ({} changed path(s), uncommitted).",
+            workdir.display(),
+            paths.len()
+        ),
+        WorkLocation::RemoteBranch { branch, sha } => format!(
+            "An earlier checkpoint push already landed commits on branch `{branch}` (at `{sha}`) before this leak was found; nothing further was pushed."
+        ),
+        WorkLocation::None => "No local commits were found to preserve.".to_string(),
+    };
+    body.push_str(&format!("\n- Found: {detail}\n- {location_line}"));
+    body
+}
+
+/// CLAUDE-470: the [`Finalized::DeliveryBlocked`] exit for a `repo_tracker_refs:
+/// false` action whose pre-push scan found (or could not rule out) a bare
+/// tracker key. `detail` names the offending text and where it was found;
+/// `workdir` is queried the same way [`pr_failure_comment`]'s caller does, so
+/// the comment never contradicts whether the work was actually preserved.
+fn finish_tracker_key_blocked(
+    backend: &dyn IssueTracker,
+    src: &YoutrackSource,
+    job: &YoutrackJob,
+    detail: &str,
+    workdir: &Path,
+    public_url: Option<&str>,
+    run: crate::run_footer::CommentRun<'_>,
+) -> Result<Finalized> {
+    let work = work_location(workdir, None);
+    let body = tracker_key_leak_comment(detail, &work);
+    let body = lifecycle_footer(&body, public_url, run, &job.key, "Needs Review");
+    let label = src.states.delivery_blocked_label().to_string();
+    comment_then_field(backend, src, &job.key, &body, &label)?;
+    Ok(Finalized::DeliveryBlocked {
+        reason: DeliveryBlockedReason::TrackerKeyLeak,
+        pr_url: None,
+        pr_number: None,
+        head_branch: None,
+    })
+}
+
 /// [`finalize_with_steps`] with the step hand-off discarded, for the unit tests
 /// that do not assert on stored steps.
 #[cfg(test)]
@@ -5120,6 +5237,7 @@ fn finalize(
         resume_pr_url,
         run,
         checkpoint_push_rejected,
+        None,
         review,
         attempts_after,
         max_attempts_per_key,
@@ -5163,6 +5281,11 @@ fn finalize_with_steps(
     // fails the job; named in whichever outcome comment this call produces so
     // it is never silent.
     checkpoint_push_rejected: Option<&str>,
+    // CLAUDE-470: a bare tracker key the checkpoint watcher found (or could
+    // not rule out) before a mid-run push, on a `repo_tracker_refs: false`
+    // action. When set, this overrides every other outcome: nothing further
+    // is pushed and no PR is opened or promoted.
+    tracker_key_hit: Option<&str>,
     // CLAUDE-449: the post-success review session's verdict, or `None` when
     // no review ran (claude did not succeed, or the review step itself was
     // never reached). Only consulted in the success branch below.
@@ -5192,7 +5315,53 @@ fn finalize_with_steps(
     let skip_marker = workdir.join(SKIP_ATTEMPT_MARKER);
     let no_code = workdir.join(NO_CODE_MARKER);
 
+    // CLAUDE-470: checked before every other branch. A mid-run tracker-key
+    // hit already stopped the checkpoint watcher from pushing further; this
+    // routes the whole run to Needs Review without attempting any push or PR
+    // call here, regardless of how `claude_result` or the marker files look.
+    if let Some(hit) = tracker_key_hit {
+        return finish_tracker_key_blocked(
+            backend,
+            src,
+            job,
+            hit,
+            workdir,
+            public_url.as_deref(),
+            run,
+        );
+    }
+
+    // CLAUDE-470: on a `repo_tracker_refs: false` action, scan before every
+    // push this function itself makes (the checkpoint watcher already
+    // scanned before each of its own ticks, mid-run). `pr_text`, when
+    // given, is also scanned; the success branch below passes `None` since
+    // the PR's title/body are autofilled from the same branch and commits
+    // this already scans.
+    let scan_before_push = |pr_text: Option<(&str, &str)>| -> Option<String> {
+        if src.repo_tracker_refs {
+            return None;
+        }
+        match forge.scan_tracker_refs(workdir, pr_text) {
+            Ok(hits) if hits.is_empty() => None,
+            Ok(hits) => Some(hits.join(", ")),
+            Err(e) => Some(format!(
+                "tracker-key scan failed ({e}); refusing to push for safety"
+            )),
+        }
+    };
+
     if needs_review.exists() {
+        if let Some(hit) = scan_before_push(None) {
+            return finish_tracker_key_blocked(
+                backend,
+                src,
+                job,
+                &hit,
+                workdir,
+                public_url.as_deref(),
+                run,
+            );
+        }
         // SPEC-3.3.1: push any commits before anything else, since this path
         // opens no PR of its own and would otherwise leave them local-only.
         // A failed push overrides this outcome with Failed, never Needs
@@ -5246,6 +5415,17 @@ fn finalize_with_steps(
         backend.set_field(&job.key, &src.custom_field, &src.states.needs_review)?;
         Ok(Finalized::NeedsReview)
     } else if claude_result.ok && no_code.exists() {
+        if let Some(hit) = scan_before_push(None) {
+            return finish_tracker_key_blocked(
+                backend,
+                src,
+                job,
+                &hit,
+                workdir,
+                public_url.as_deref(),
+                run,
+            );
+        }
         // The run usually produced tracker output rather than code, with
         // nothing to push, but an attempt can still leave commits alongside
         // the marker (SPEC-3.3.1: "any commits the attempt made are
@@ -5284,6 +5464,17 @@ fn finalize_with_steps(
         info!(key = %job.key, %label, "no-code-change marker present; skipping PR");
         Ok(Finalized::NoCodeChange)
     } else if claude_result.ok {
+        if let Some(hit) = scan_before_push(None) {
+            return finish_tracker_key_blocked(
+                backend,
+                src,
+                job,
+                &hit,
+                workdir,
+                public_url.as_deref(),
+                run,
+            );
+        }
         // Success: open the PR from the agent's local commits via the resolved
         // Forge (`fj` agit+autofill for Forgejo hosts, the GitHub
         // backend for GitHub hosts), then report it. Both derive the title/body
@@ -7337,6 +7528,19 @@ fn checkpoint_pr_body(key: &str) -> String {
     .join("\n")
 }
 
+/// CLAUDE-470: [`checkpoint_pr_body`] for a `repo_tracker_refs: false`
+/// action. No `#{key}` reference: the issue is public, so the draft PR
+/// carries no tracker key, same as the tracker-free prompt's commits.
+fn checkpoint_pr_body_tracker_free() -> String {
+    [
+        "## Summary".to_string(),
+        String::new(),
+        "This draft PR was opened by the runner from an in-progress run.".to_string(),
+        "The branch holds work committed so far; the agent is still working and the PR will be marked ready when the run finishes.".to_string(),
+    ]
+    .join("\n")
+}
+
 /// PR comment explaining why a timeout-salvaged draft PR (CLAUDE-379) exists:
 /// the timeout limit, the agent's cost and summary at kill time, whether the
 /// branch tip is the runner's own WIP commit or the agent's, and a note that
@@ -7546,6 +7750,9 @@ pub(crate) fn delivery_blocked_comment(
         }
         DeliveryBlockedReason::UnresolvedConflicts => {
             "- Merge the base branch into the PR branch and resolve the conflicts by hand, or close the PR and re-queue the issue (set AI Agent = Queued) to redo the work on the current base."
+        }
+        DeliveryBlockedReason::TrackerKeyLeak => {
+            "- Remove the tracker key from the named location, then re-queue the issue (set AI Agent = Queued) to retry."
         }
     };
     lines.push(follow_up.to_string());
@@ -9157,6 +9364,10 @@ mod tests {
         /// The step list each push would carry (CLAUDE-603), rendered the way
         /// the provider sites do.
         lists: Mutex<Vec<String>>,
+        /// CLAUDE-470: what `scan_tracker_refs` reports on every call; empty
+        /// (the default) means a clean scan, so only a test exercising a
+        /// tracker-key hit needs to set this.
+        scan_hits: Mutex<Vec<String>>,
     }
 
     impl FakeCheckpointForge {
@@ -9165,7 +9376,14 @@ mod tests {
                 results: Mutex::new(results),
                 calls: Mutex::new(0),
                 lists: Mutex::new(Vec::new()),
+                scan_hits: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_scan_hits(results: Vec<Result<Option<PullRequest>>>, hits: Vec<String>) -> Self {
+            let forge = Self::new(results);
+            *forge.scan_hits.lock().unwrap() = hits;
+            forge
         }
 
         fn call_count(&self) -> u32 {
@@ -9250,6 +9468,14 @@ mod tests {
         ) -> Result<()> {
             unreachable!("run_checkpoint_watcher never calls issue_comment")
         }
+
+        fn scan_tracker_refs(
+            &self,
+            _workdir: &Path,
+            _pr: Option<(&str, &str)>,
+        ) -> Result<Vec<String>> {
+            Ok(self.scan_hits.lock().unwrap().clone())
+        }
     }
 
     fn checkpoint_pr(number: u64, branch: &str) -> PullRequest {
@@ -9299,6 +9525,7 @@ mod tests {
         let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
             &pool, 1, "act", "MK-16", 1,
         ));
+        let cancel = CancellationToken::new();
         let outcome = std::thread::scope(|scope| {
             let watcher = scope.spawn(|| {
                 run_checkpoint_watcher(
@@ -9315,6 +9542,8 @@ mod tests {
                     chrono::Utc::now(),
                     &recorder,
                     "initial",
+                    false,
+                    &cancel,
                 )
             });
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -9388,6 +9617,7 @@ mod tests {
         let wd = tempfile::tempdir().unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let pool_handle = tokio::runtime::Handle::current();
+        let cancel = CancellationToken::new();
         let outcome = std::thread::scope(|scope| {
             let watcher = scope.spawn(|| {
                 run_checkpoint_watcher(
@@ -9404,6 +9634,8 @@ mod tests {
                     t0,
                     &recorder,
                     "initial",
+                    false,
+                    &cancel,
                 )
             });
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -9470,6 +9702,7 @@ mod tests {
         let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
             &pool, 1, "act", "MK-16", 1,
         ));
+        let cancel = CancellationToken::new();
         let outcome = std::thread::scope(|scope| {
             let watcher = scope.spawn(|| {
                 run_checkpoint_watcher(
@@ -9486,6 +9719,8 @@ mod tests {
                     chrono::Utc::now(),
                     &recorder,
                     "initial",
+                    false,
+                    &cancel,
                 )
             });
             std::thread::sleep(Duration::from_millis(30));
@@ -9521,6 +9756,7 @@ mod tests {
         let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
             &pool, 1, "act", "MK-16", 1,
         ));
+        let cancel = CancellationToken::new();
         let outcome = std::thread::scope(|scope| {
             let watcher = scope.spawn(|| {
                 run_checkpoint_watcher(
@@ -9537,6 +9773,8 @@ mod tests {
                     chrono::Utc::now(),
                     &recorder,
                     "initial",
+                    false,
+                    &cancel,
                 )
             });
             // Wait for the rejecting tick (CLAUDE-462), then leave several more
@@ -9562,6 +9800,70 @@ mod tests {
             forge.call_count(),
             1,
             "a rejected push must stop further ticks for the rest of the run"
+        );
+    }
+
+    /// CLAUDE-470 acceptance criterion: a bare tracker key already present
+    /// (e.g. in a commit message) before the watcher's first tick is caught
+    /// by the pre-push scan, so the watcher never calls `checkpoint_push` at
+    /// all, cancels the run so `claude.invoke` stops promptly, and reports
+    /// the hit instead of an opened or rejected push.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_checkpoint_watcher_never_pushes_when_a_tracker_key_is_found_first() {
+        let pool = mem_pool().await;
+        let forge = FakeCheckpointForge::with_scan_hits(
+            vec![Ok(Some(checkpoint_pr(77, "fix/MK-16")))],
+            vec!["CLAUDE-470".to_string()],
+        );
+        let wd = tempfile::tempdir().unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let pool_handle = tokio::runtime::Handle::current();
+        let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
+            &pool, 1, "act", "MK-16", 1,
+        ));
+        let cancel = CancellationToken::new();
+        let outcome = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                run_checkpoint_watcher(
+                    &forge,
+                    &job(),
+                    wd.path(),
+                    &pool,
+                    &pool_handle,
+                    "act",
+                    false,
+                    watcher_test_interval(),
+                    stop_rx,
+                    1,
+                    chrono::Utc::now(),
+                    &recorder,
+                    "initial",
+                    true,
+                    &cancel,
+                )
+            });
+            // Wait for the watcher to find the hit and cancel (it then
+            // blocks draining `stop_rx`) before dropping `stop_tx`; dropping
+            // it any earlier races the watcher's first `recv_timeout` and
+            // could break the loop before the scan ever runs.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !cancel.is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(stop_tx);
+            watcher.join().unwrap()
+        });
+        assert!(outcome.opened.is_none());
+        assert!(outcome.rejected.is_none());
+        assert_eq!(outcome.tracker_key_hit.as_deref(), Some("CLAUDE-470"));
+        assert_eq!(
+            forge.call_count(),
+            0,
+            "a tracker-key hit must stop the watcher before its first push"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "a tracker-key hit must cancel the run so claude.invoke stops promptly"
         );
     }
 
@@ -12030,6 +12332,120 @@ mod tests {
         );
     }
 
+    /// CLAUDE-470 acceptance criterion: a tracker-key hit found mid-run
+    /// (passed in as `tracker_key_hit`) overrides every other outcome,
+    /// before `finalize_with_steps` even looks at the marker files or
+    /// `claude_result`: it never touches the forge (no push, no PR), posts a
+    /// comment naming the hit, and parks the issue on the delivery-blocked
+    /// label.
+    #[test]
+    fn finalize_tracker_key_hit_blocks_delivery_without_touching_the_forge() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        // A success-shaped workdir (no marker files, ok result) to prove the
+        // tracker-key-hit check runs before the ordinary branches, not just
+        // in the Needs-Review path.
+        let backend = FakeTracker::new("Working");
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let res = finalize_with_steps(
+            &backend,
+            &forge,
+            &src(),
+            &job(),
+            wd,
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            Some("CLAUDE-470 (found in commit message)"),
+            None,
+            1,
+            1000,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::TrackerKeyLeak,
+                pr_url: None,
+                pr_number: None,
+                head_branch: None,
+            }
+        );
+        let comments = backend.comments.lock().unwrap();
+        assert!(
+            comments
+                .iter()
+                .any(|c| c.contains("CLAUDE-470 (found in commit message)")),
+            "{comments:?}"
+        );
+        let set_calls = backend.set_calls.lock().unwrap();
+        assert!(
+            set_calls
+                .iter()
+                .any(|(field, value)| field == "AI Agent" && value == "Needs Review"),
+            "{set_calls:?}"
+        );
+    }
+
+    /// CLAUDE-470 acceptance criterion: on a `repo_tracker_refs: false`
+    /// action, the success branch's pre-push scan runs before
+    /// `create_pr_with_draft`; a hit there must block delivery without ever
+    /// opening a PR. `FakeCheckpointForge::create_pr` (which
+    /// `create_pr_with_draft`'s default falls back to) panics if reached, so
+    /// this also proves the guard runs first, not just that it exists.
+    #[test]
+    fn finalize_success_scan_hit_blocks_before_opening_a_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        let backend = FakeTracker::new("Working");
+        let forge = FakeCheckpointForge::with_scan_hits(vec![], vec!["CLAUDE-470".to_string()]);
+        let source = YoutrackSource {
+            repo_tracker_refs: false,
+            ..src()
+        };
+        let res = finalize_with_steps(
+            &backend,
+            &forge,
+            &source,
+            &job(),
+            wd,
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            None,
+            1,
+            1000,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::TrackerKeyLeak,
+                pr_url: None,
+                pr_number: None,
+                head_branch: None,
+            }
+        );
+        let comments = backend.comments.lock().unwrap();
+        assert!(
+            comments.iter().any(|c| c.contains("CLAUDE-470")),
+            "{comments:?}"
+        );
+    }
+
     /// The agent-signalled blocker park (CLAUDE-373) attaches the
     /// Needs-Info tag alongside the marker comment and the `AI Agent` write,
     /// in that order: comment, then tag, then field.
@@ -12756,6 +13172,7 @@ mod tests {
             false,
             None,
             test_comment_run(),
+            None,
             None,
             None,
             1,
@@ -16920,6 +17337,7 @@ mod tests {
             true,
             None,
             test_comment_run(),
+            None,
             None,
             None,
             1,
@@ -21935,7 +22353,11 @@ mod tests {
                 | DeliveryBlockedReason::NoCommitsAhead
                 // driven by the automerge conflict auto-resolve ceiling,
                 // not `finalize`; included for an exhaustive inventory
-                | DeliveryBlockedReason::UnresolvedConflicts => {
+                | DeliveryBlockedReason::UnresolvedConflicts
+                // substitutes for "push or PR create failed, other cause"
+                // when a `repo_tracker_refs: false` action's scan found a
+                // bare tracker key before a push
+                | DeliveryBlockedReason::TrackerKeyLeak => {
                     "Needs Review (configured delivery-blocked label)"
                 }
             },
