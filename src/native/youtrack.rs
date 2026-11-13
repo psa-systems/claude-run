@@ -6018,7 +6018,24 @@ fn finalize_with_steps(
             pr_strategy,
             claude_result,
             claude_timeout,
+            !src.repo_tracker_refs,
         );
+        // CLAUDE-470: a `repo_tracker_refs: false` action's salvage found (or
+        // could not rule out) a bare tracker key; nothing further was pushed
+        // or opened, so this routes to the same Needs-Review terminal state
+        // the mid-run checkpoint-watcher hit uses, instead of falling
+        // through to the ordinary timeout handling below.
+        if let Some(hit) = &salvage.tracker_key_hit {
+            return finish_tracker_key_blocked(
+                backend,
+                src,
+                job,
+                hit,
+                workdir,
+                public_url.as_deref(),
+                run,
+            );
+        }
         let current = backend
             .get_field(&job.key, &src.custom_field)
             .unwrap_or_default();
@@ -7331,6 +7348,13 @@ struct SalvageReport {
     /// apart from "agent was still editing when the timeout fired" (true -
     /// stay as TimedOut, needs human review).
     wip_commit_made: bool,
+    /// CLAUDE-470: set, instead of committing/pushing/opening a PR, when a
+    /// `repo_tracker_refs: false` action's pre-push scan found (or could not
+    /// rule out) a bare tracker key on the branch being salvaged. Mirrors
+    /// `CheckpointOutcome::tracker_key_hit`; the caller routes this straight
+    /// to [`finish_tracker_key_blocked`] instead of the ordinary timeout
+    /// handling.
+    tracker_key_hit: Option<String>,
 }
 
 /// SPEC-3.3: "timeout or cancel: the final push in 3.3.1 runs ... A draft PR
@@ -7350,6 +7374,11 @@ fn salvage_timeout_work(
     pr_strategy: crate::action::PrStrategy,
     claude_result: &ClaudeResult,
     timeout: Duration,
+    // CLAUDE-470: `!src.repo_tracker_refs` at the call site. When set, the
+    // WIP commit (if any) carries no `#{{key}}` reference, the branch is
+    // scanned for a bare tracker key before the draft PR is opened, and the
+    // draft PR body carries no `#{{key}}` reference either.
+    tracker_free: bool,
 ) -> SalvageReport {
     let work = match crate::workdir::local_only_work(workdir) {
         Ok(w) => w,
@@ -7372,14 +7401,33 @@ fn salvage_timeout_work(
     let mut report = SalvageReport::default();
     if !work.dirty.paths.is_empty() {
         report.wip_commit_made = true;
-        if let Err(e) = commit_timeout_wip(workdir, &job.key) {
+        if let Err(e) = commit_timeout_wip(workdir, &job.key, tracker_free) {
             error!(key = %job.key, error = %e, "timeout salvage: committing the uncommitted working tree failed");
             report.commit_error = Some(e);
         }
     }
 
+    if tracker_free {
+        let hit = match forge.scan_tracker_refs(workdir, None) {
+            Ok(hits) if hits.is_empty() => None,
+            Ok(hits) => Some(hits.join(", ")),
+            Err(e) => Some(format!(
+                "tracker-key scan failed ({e}); refusing to push for safety"
+            )),
+        };
+        if let Some(hit) = hit {
+            error!(key = %job.key, hit = %hit, "CLAUDE-470: tracker-key scan hit before timeout-salvage push; skipping the push/PR-create");
+            report.tracker_key_hit = Some(hit);
+            return report;
+        }
+    }
+
     let host = host_only(&job.repo_host);
-    let body = draft_pr_body(&job.key);
+    let body = if tracker_free {
+        draft_pr_body_tracker_free()
+    } else {
+        draft_pr_body(&job.key)
+    };
     match forge.create_pr_with_draft(workdir, &host, pr_strategy, true, Some(&body)) {
         Ok(pr) => {
             report.pr_url = Some(pr_url(job, &pr));
@@ -7430,7 +7478,13 @@ fn salvage_timeout_work(
 /// `provider::append_stdout_tail` rule `git_error` applies elsewhere
 /// (CLAUDE-432), because `git commit` runs the repo's `pre-commit` hook and a
 /// failing hook's report goes to stdout, not stderr.
-fn commit_timeout_wip(workdir: &Path, key: &str) -> std::result::Result<(), String> {
+fn commit_timeout_wip(
+    workdir: &Path,
+    key: &str,
+    // CLAUDE-470: on a `repo_tracker_refs: false` action, the commit body
+    // carries no `#{{key}}` reference.
+    tracker_free: bool,
+) -> std::result::Result<(), String> {
     // Bare `git` resolves through the process-wide `PATH`; serialize against
     // the CLAUDE-410 PATH-stub test's mutation/deletion window the same way
     // `comment_webhooks::git_output` does.
@@ -7450,12 +7504,19 @@ fn commit_timeout_wip(workdir: &Path, key: &str) -> std::result::Result<(), Stri
         );
         return Err(format!("`git add` failed: {detail}"));
     }
-    let message = format!(
+    let message = if tracker_free {
         "WIP: uncommitted changes at timeout\n\n\
-         The runner committed the working tree a run of {key} left uncommitted when it hit its \
-         time limit.\n\n\
-         #{key}"
-    );
+         The runner committed the working tree a run left uncommitted when it hit its time \
+         limit."
+            .to_string()
+    } else {
+        format!(
+            "WIP: uncommitted changes at timeout\n\n\
+             The runner committed the working tree a run of {key} left uncommitted when it hit its \
+             time limit.\n\n\
+             #{key}"
+        )
+    };
     let commit = Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -7505,6 +7566,22 @@ fn draft_pr_body(key: &str) -> String {
         "A re-queued run that finishes replaces this description with the agent's own.".to_string(),
         String::new(),
         format!("#{key}"),
+    ]
+    .join("\n")
+}
+
+/// CLAUDE-470: [`draft_pr_body`] for a `repo_tracker_refs: false` action. No
+/// `#{key}` reference: the issue is public, so the timeout-salvaged draft PR
+/// carries no tracker key, same as the tracker-free prompt's commits.
+fn draft_pr_body_tracker_free() -> String {
+    [
+        "## Summary".to_string(),
+        String::new(),
+        "This draft PR was opened by the runner from a run that hit its time limit."
+            .to_string(),
+        "The branch holds the work committed so far; it may be incomplete.".to_string(),
+        "The first comment on this PR has the timeout limit, the run's cost, and the agent's last summary at kill time.".to_string(),
+        "A re-queued run that finishes replaces this description with the agent's own.".to_string(),
     ]
     .join("\n")
 }
@@ -12446,6 +12523,60 @@ mod tests {
         );
     }
 
+    /// CLAUDE-470 acceptance criterion: a timed-out run's salvage path also
+    /// scans before opening its draft PR on a `repo_tracker_refs: false`
+    /// action. `FakeCheckpointForge::create_pr` panics if reached, so a hit
+    /// here proves the scan runs before `create_pr_with_draft`, not just
+    /// that it exists, and the run is parked `DeliveryBlocked{TrackerKeyLeak}`
+    /// instead of the ordinary `TimedOut` outcome.
+    #[test]
+    fn finalize_timeout_salvage_scan_hit_blocks_before_opening_a_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        repo_with_commit(wd);
+        let backend = FakeTracker::new("Working");
+        let forge = FakeCheckpointForge::with_scan_hits(vec![], vec!["CLAUDE-470".to_string()]);
+        let source = YoutrackSource {
+            repo_tracker_refs: false,
+            ..src()
+        };
+        let res = finalize_with_steps(
+            &backend,
+            &forge,
+            &source,
+            &job(),
+            wd,
+            &timed_out_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            None,
+            test_comment_run(),
+            None,
+            None,
+            None,
+            1,
+            1000,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::DeliveryBlocked {
+                reason: DeliveryBlockedReason::TrackerKeyLeak,
+                pr_url: None,
+                pr_number: None,
+                head_branch: None,
+            }
+        );
+        let comments = backend.comments.lock().unwrap();
+        assert!(
+            comments.iter().any(|c| c.contains("CLAUDE-470")),
+            "{comments:?}"
+        );
+    }
+
     /// The agent-signalled blocker park (CLAUDE-373) attaches the
     /// Needs-Info tag alongside the marker comment and the `AI Agent` write,
     /// in that order: comment, then tag, then field.
@@ -16878,7 +17009,7 @@ mod tests {
         // in isolation): `git add` fails loudly rather than panicking or
         // silently no-op'ing.
         let dir = tempfile::tempdir().unwrap();
-        let err = commit_timeout_wip(dir.path(), "MK-16").unwrap_err();
+        let err = commit_timeout_wip(dir.path(), "MK-16", false).unwrap_err();
         assert!(
             err.contains("git add"),
             "the commit-step failure must name `git add`: {err}"
@@ -16900,7 +17031,7 @@ mod tests {
             &hooks_dir.join("pre-commit"),
             "#!/bin/sh\nprintf 'pre-commit hook: lint failed\\n'\nexit 1\n",
         );
-        let err = commit_timeout_wip(dir.path(), "MK-16").unwrap_err();
+        let err = commit_timeout_wip(dir.path(), "MK-16", false).unwrap_err();
         assert!(
             err.contains("pre-commit hook: lint failed"),
             "failure text must carry the hook's stdout tail: {err}"
@@ -16918,7 +17049,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
         std::fs::write(dir.path().join("dirty.txt"), "uncommitted\n").unwrap();
-        commit_timeout_wip(dir.path(), "MK-16").unwrap();
+        commit_timeout_wip(dir.path(), "MK-16", false).unwrap();
         let out = {
             let _path_guard = crate::testutil::path_env_lock();
             Command::new("git")
@@ -16932,6 +17063,30 @@ mod tests {
         assert!(
             message.trim_end().ends_with("#MK-16"),
             "the commit body must end with the bare issue reference: {message}"
+        );
+    }
+
+    #[test]
+    fn commit_timeout_wip_tracker_free_omits_the_issue_key() {
+        // CLAUDE-470: a `repo_tracker_refs: false` action's timeout-salvage
+        // WIP commit must carry no bare tracker key anywhere in its message.
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        std::fs::write(dir.path().join("dirty.txt"), "uncommitted\n").unwrap();
+        commit_timeout_wip(dir.path(), "SF-16", true).unwrap();
+        let out = {
+            let _path_guard = crate::testutil::path_env_lock();
+            Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["log", "-1", "--format=%B"])
+                .output()
+                .unwrap()
+        };
+        let message = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !message.contains("SF-16"),
+            "a tracker-free WIP commit must not carry the issue key: {message}"
         );
     }
 
