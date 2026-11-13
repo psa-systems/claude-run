@@ -153,7 +153,7 @@
 
 <h2>In flight</h2>
 {% if let Some(err) = live.inflight_error %}
-  <div class="card" role="alert" style="border-left: 4px solid var(--error, #c0392b);"><strong>The in-flight jobs could not be read:</strong> {{ err }}</div>
+  <div class="card" role="alert" style="border-left: 4px solid var(--bad);"><strong>The in-flight jobs could not be read:</strong> {{ err }}</div>
 {% else if live.inflight.is_empty() %}
   <div class="card"><span class="dim">No jobs in flight.</span></div>
 {% else %}
@@ -178,7 +178,7 @@
 <h2>Last 7 days</h2>
 <h3>Mean attempt duration by action</h3>
 {% if let Some(err) = live.means_error %}
-  <div class="card" role="alert" style="border-left: 4px solid var(--error, #c0392b);"><strong>The mean attempt durations could not be read:</strong> {{ err }}</div>
+  <div class="card" role="alert" style="border-left: 4px solid var(--bad);"><strong>The mean attempt durations could not be read:</strong> {{ err }}</div>
 {% else if live.means.is_empty() %}
   <div class="card"><span class="dim">No completed attempts in the last 7 days.</span></div>
 {% else %}
@@ -196,7 +196,7 @@
 {% endif %}
 <h3>Time by kind</h3>
 {% if let Some(err) = live.kinds_error %}
-  <div class="card" role="alert" style="border-left: 4px solid var(--error, #c0392b);"><strong>The time-by-kind series could not be read:</strong> {{ err }}</div>
+  <div class="card" role="alert" style="border-left: 4px solid var(--bad);"><strong>The time-by-kind series could not be read:</strong> {{ err }}</div>
 {% else if live.kinds.is_empty() %}
   <div class="card"><span class="dim">No step data recorded in the last 7 days.</span></div>
 {% else %}

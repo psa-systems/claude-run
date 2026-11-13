@@ -9,18 +9,22 @@
   <title>claude-run</title>
   {# SPEC-7.16: the signed-out landing page. Static text only: nothing here
      reads instance data (no action names, runs, status or version), and the
-     page needs no JavaScript. #}
+     page needs no JavaScript.
+     This page supports both a light and a dark scheme (prefers-color-scheme),
+     which the rest of the app does not, so its tokens stay defined here
+     rather than pulled from the shared `color_tokens.html` partial; its dark
+     values are kept in step with that palette by hand. #}
   <style>
     :root {
-      --bg: #0f1115;
-      --bg-2: #13161c;
-      --panel: #181b22;
-      --border: #2a2f3a;
-      --fg: #d8dde7;
-      --fg-dim: #8b93a3;
-      --accent: #7ab7ff;
+      --bg: #1d2021;
+      --bg-2: #242625;
+      --panel: #282828;
+      --border: #504945;
+      --fg: #ebdbb2;
+      --fg-dim: #c4b6a3;
+      --accent: #a8c4ba;
       --accent-ink: #0a0c10;
-      --accent-soft: rgba(122, 183, 255, 0.14);
+      --accent-soft: rgba(168, 196, 186, 0.14);
       --shadow: rgba(0, 0, 0, 0.45);
     }
     @media (prefers-color-scheme: light) {

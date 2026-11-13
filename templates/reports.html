@@ -104,7 +104,7 @@
     {% endfor %}
     {% for p in c.five_hour_points %}
       <circle cx="{{ p.x }}" cy="{{ p.y }}" r="3"
-              style="fill: {% if p.timed_out || !p.ok %}#e05252{% else %}var(--accent){% endif %};">
+              style="fill: {% if p.timed_out || !p.ok %}var(--bad){% else %}var(--accent){% endif %};">
         <title>5h: {{ p.label }}</title>
       </circle>
     {% endfor %}
@@ -114,7 +114,7 @@
     {% endfor %}
     {% for p in c.seven_day_points %}
       <circle cx="{{ p.x }}" cy="{{ p.y }}" r="3"
-              style="fill: {% if p.timed_out || !p.ok %}#e05252{% else %}var(--fg-dim){% endif %};">
+              style="fill: {% if p.timed_out || !p.ok %}var(--bad){% else %}var(--fg-dim){% endif %};">
         <title>7d: {{ p.label }}</title>
       </circle>
     {% endfor %}
@@ -309,7 +309,7 @@
 {% endif %}
 
 <h3>Funnel</h3>
-{% if let Some(m) = funnel.mismatch %}<div class="card" role="alert" style="border-left: 4px solid var(--error, #c0392b);"><strong>Funnel mismatch:</strong> {{ m }}</div>
+{% if let Some(m) = funnel.mismatch %}<div class="card" role="alert" style="border-left: 4px solid var(--bad);"><strong>Funnel mismatch:</strong> {{ m }}</div>
   {% endif %}
 {% if funnel.attempts_with_no_step_data > 0 %}
   <div class="card"><span class="dim">No step data: {{ funnel.attempts_with_no_step_data }} attempt(s) have no recorded steps; they are counted in the funnel by outcome.</span></div>

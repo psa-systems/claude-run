@@ -41,7 +41,7 @@
             class="row-actions" style="align-items: center;"
             hx-confirm="Pause all activity? No new run, trigger, or webhook delivery will start. A claude session already running is left to finish.">
         <input type="text" name="reason" placeholder="Reason (optional)"
-               style="background: #0a0c10; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px;">
+               style="background: var(--well); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px;">
         <button class="btn" type="submit">Pause all activity</button>
       </form>
       <span class="dim">Stops the scheduler, manual triggers, webhook deliveries, and any
