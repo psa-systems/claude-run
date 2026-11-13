@@ -1622,16 +1622,17 @@ native:
             panic!("expected youtrack native config");
         };
         // Excludes audit runs (tagged `Audit-*` in the audit project), which `audit-run.yml` owns,
-        // so it differs from the site-agnostic `default_query()`. The `{{audit_project}}` placeholder
-        // resolves against `audit_project` (CLAUDE-409), AUDIT by default.
+        // and the public-repo projects (CLAUDE-470), which `youtrack-public.yml` owns, so it differs
+        // from the site-agnostic `default_query()`. The `{{audit_project}}` placeholder resolves
+        // against `audit_project` (CLAUDE-409), AUDIT by default.
         assert_eq!(
             cfg.youtrack.query,
-            "(project: -{{audit_project}} or tag: -Audit-*) and -Resolved AI Agent: Queued"
+            "(project: -{{audit_project}} or tag: -Audit-*) and project: -SF, -SFT and -Resolved AI Agent: Queued"
         );
         assert_eq!(cfg.youtrack.audit_project, "AUDIT");
         assert_eq!(
             cfg.youtrack.resolved_query(),
-            "(project: -AUDIT or tag: -Audit-*) and -Resolved AI Agent: Queued"
+            "(project: -AUDIT or tag: -Audit-*) and project: -SF, -SFT and -Resolved AI Agent: Queued"
         );
         assert_eq!(cfg.youtrack.custom_field, "AI Agent");
         // The worker runs the built-in engineering prompt, with no YAML override.
@@ -1792,9 +1793,12 @@ native:
             // Both queries name the project by the configured short name. `AUD`
             // is a legacy alias YouTrack still resolves but lists nowhere, so the
             // default case also guards against that literal creeping back in.
+            // Takes the FIRST `project: ` clause: the default query carries a
+            // second one later (the CLAUDE-470 SF/SFT exclusion) that this test
+            // does not concern itself with.
             fn project_value(q: &str) -> &str {
-                q.rsplit("project: ")
-                    .next()
+                q.split("project: ")
+                    .nth(1)
                     .expect("query names a project")
                     .split_whitespace()
                     .next()
@@ -2571,6 +2575,62 @@ native:
             "the reporting query must not select the worker's value: {}",
             r.query
         );
+    }
+
+    /// CLAUDE-470: `youtrack.yml` and `youtrack-public.yml` partition queued
+    /// issues on the project axis (SF/SFT vs everything else), the same
+    /// mechanical property `shipped_youtrack_actions_partition_audit_issues`
+    /// proves for the audit pair.
+    #[test]
+    fn shipped_youtrack_actions_partition_public_repo_projects() {
+        let worker = validate_str(
+            include_str!("../actions/youtrack.yml"),
+            "actions/youtrack.yml",
+        )
+        .unwrap()
+        .action;
+        let public = validate_str(
+            include_str!("../actions/youtrack-public.yml"),
+            "actions/youtrack-public.yml",
+        )
+        .unwrap()
+        .action;
+
+        let Some(NativeConfig::Youtrack(w)) = &worker.native else {
+            panic!("expected youtrack native config in youtrack.yml");
+        };
+        let Some(NativeConfig::Youtrack(p)) = &public.native else {
+            panic!("expected youtrack native config in youtrack-public.yml");
+        };
+
+        assert!(
+            !p.youtrack.repo_tracker_refs,
+            "the public-repo action must disable repo_tracker_refs: {}",
+            p.youtrack.query
+        );
+        assert!(
+            w.youtrack.repo_tracker_refs,
+            "the default action must keep repo_tracker_refs enabled: {}",
+            w.youtrack.query
+        );
+
+        let worker_query = w.youtrack.resolved_query();
+        let public_query = p.youtrack.resolved_query();
+
+        assert!(
+            public_query.contains("project: SF, SFT"),
+            "the public action must select SF and SFT outright: {public_query:?}"
+        );
+        assert!(
+            worker_query.contains("project: -SF, -SFT"),
+            "the default action must exclude SF and SFT, the public action's own partition: {worker_query:?}"
+        );
+        for q in [&worker_query, &public_query] {
+            assert!(
+                q.contains("-Resolved AI Agent: Queued"),
+                "both actions must pin the same base set, got {q:?}"
+            );
+        }
     }
 
     #[test]

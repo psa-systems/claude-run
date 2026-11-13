@@ -157,7 +157,12 @@ native:
     # HTTP 400 rather than returning nothing, so spelling the reporting value out would break THIS
     # action's poll until someone added that value in YouTrack. `shipped_action_queries_are_disjoint`
     # in src/action.rs is the mechanical guard on the partition.
-    query: "(project: -{{audit_project}} or tag: -Audit-*) and -Resolved AI Agent: Queued"
+    #
+    # Public-repo partition (CLAUDE-470): `actions/youtrack-public.yml` owns the `SF` and `SFT`
+    # projects outright (`project: SF, SFT and -Resolved AI Agent: Queued`), so this query excludes
+    # both the same way it excludes the audit project, keeping the two queries an exact complement
+    # on that axis too.
+    query: "(project: -{{audit_project}} or tag: -Audit-*) and project: -SF, -SFT and -Resolved AI Agent: Queued"
     custom_field: "AI Agent"
     # Short name of the audit project. Must match `audit-run.yml`'s `audit_project`; see actions/SCHEMA.md.
     audit_project: AUDIT
