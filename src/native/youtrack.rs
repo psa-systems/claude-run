@@ -4308,9 +4308,9 @@ fn run_review_session(
 /// the content still rides in the posted comment, so the replacement matters
 /// in its own right.
 fn sanitize_marker_content(raw: &str) -> String {
-    // An em-dash in prose is almost always surrounded by spaces (" X — Y "),
+    // An em-dash in prose is almost always surrounded by spaces (" X - Y "),
     // so replacing it with `-` keeps the one-space-on-each-side spacing the
-    // writer already had; a bare em-dash between words (rare, "he said—that
+    // writer already had; a bare em-dash between words (rare, "he said-that
     // it works") becomes "he said-that it works", acceptable per the global
     // CLAUDE.md "use a regular hyphen" rule.
     raw.replace('\u{2014}', "-").trim().to_string()
