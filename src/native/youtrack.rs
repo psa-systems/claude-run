@@ -6350,16 +6350,22 @@ fn merged_comment(pr_url: &str) -> String {
 /// conflict-resolution run to send (CLAUDE-547) is left at Code Review for a
 /// human.
 ///
-/// The PR's checks went green but Forgejo reports it as not
+/// The PR's checks went green but the forge reports it as not
 /// mergeable (a conflict, still being checked, or a WIP PR) - unrelated to
 /// whether it is behind its base, which is decided separately by
 /// `behind_base` before this comment is ever reached. Comments and leaves the
 /// issue at Code Review for a human to resolve.
-pub(crate) fn automerge_not_mergeable_comment(pr_url: &str) -> String {
+pub(crate) fn automerge_not_mergeable_comment(pr_url: &str, backend: BehindBaseBackend) -> String {
+    let draft = match backend {
+        BehindBaseBackend::Forgejo => "a WIP PR",
+        BehindBaseBackend::GitHub => "a draft PR",
+    };
     [
-        "This PR's checks passed, but Forgejo reports it as not mergeable (a conflict, still \
-         being checked, or a WIP PR)."
-            .to_string(),
+        format!(
+            "This PR's checks passed, but {} reports it as not mergeable (a conflict, still \
+             being checked, or {draft}).",
+            backend.display_name()
+        ),
         String::new(),
         format!("PR: {pr_url}"),
         String::new(),
@@ -6441,6 +6447,16 @@ pub(crate) fn automerge_conflict_resolving_comment(pr_url: &str, attempt: i64, c
 pub(crate) enum BehindBaseBackend {
     Forgejo,
     GitHub,
+}
+
+impl BehindBaseBackend {
+    /// The forge's own name, for any message that names it (SPEC-2.3).
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            BehindBaseBackend::Forgejo => "Forgejo",
+            BehindBaseBackend::GitHub => "GitHub",
+        }
+    }
 }
 
 /// SPEC-3.3.1: the `behind_base` missing outcome text, one form per forge.
@@ -22714,5 +22730,20 @@ mod tests {
                 "row {row:?}: {outcome:?}"
             );
         }
+    }
+
+    /// CLAUDE-656: the not-mergeable comment names the PR's own forge and its
+    /// forge's word for an unfinished PR.
+    #[test]
+    fn not_mergeable_comment_names_the_prs_own_forge() {
+        let url = "https://example.com/pr/1";
+        let gh = automerge_not_mergeable_comment(url, BehindBaseBackend::GitHub);
+        assert!(gh.contains("GitHub reports it as not mergeable"), "{gh}");
+        assert!(gh.contains("a draft PR"), "{gh}");
+        assert!(!gh.contains("Forgejo") && !gh.contains("WIP"), "{gh}");
+        let fj = automerge_not_mergeable_comment(url, BehindBaseBackend::Forgejo);
+        assert!(fj.contains("Forgejo reports it as not mergeable"), "{fj}");
+        assert!(fj.contains("a WIP PR"), "{fj}");
+        assert!(!fj.contains("GitHub"), "{fj}");
     }
 }

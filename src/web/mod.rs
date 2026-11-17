@@ -882,12 +882,7 @@ async fn synthetic_action_view(
 /// SPEC-4.3.1: sorted, de-duplicated provider display names for a
 /// synthetic listener's configured sources.
 fn provider_display_names(providers: impl Iterator<Item = webhooks::WebhookProvider>) -> String {
-    let mut names: Vec<&'static str> = providers
-        .map(|p| match p {
-            webhooks::WebhookProvider::Forgejo => "Forgejo",
-            webhooks::WebhookProvider::Github => "GitHub",
-        })
-        .collect();
+    let mut names: Vec<&'static str> = providers.map(|p| p.display_name()).collect();
     names.sort_unstable();
     names.dedup();
     names.join(", ")
