@@ -1429,7 +1429,7 @@ async fn run_instruction(
         )
         .await
         {
-            tracing::error!(repo = %cmd.repo, pr = cmd.number, error = %e, "CLAUDE-550: recording the finished conflict auto-resolve run failed");
+            tracing::error!(repo = %cmd.repo, pr = cmd.number, error = %e, "recording the finished conflict auto-resolve run failed");
         }
     }
     // `env.backend`'s `clone_url` resolves the same forge token the clone and

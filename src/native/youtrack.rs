@@ -813,8 +813,7 @@ fn stuck_working_comment(last_step: Option<&str>, at_cap: bool) -> String {
             "\n\nThis was also its last attempt under the action's attempt cap: \
              re-queueing it alone will not retry it, since the attempt counter is not \
              cleared by re-queueing or by a successful run. To retry it, raise the \
-             action's `limits.max_attempts_per_key`, or reset this key's counter once \
-             CLAUDE-238 lands.",
+             action's `limits.max_attempts_per_key`, or reset this key's counter.",
         );
     }
     body
@@ -2710,25 +2709,25 @@ async fn resolve_pr_resume(
 ) -> Result<Option<PrResume>> {
     use crate::ci_failure::store;
     let Some(rec) = store::agent_pr_for_issue(pool, &job.key).await? else {
-        warn!(key = %job.key, "CLAUDE-275: no recorded PR for this issue; starting from the default branch");
+        warn!(key = %job.key, "no recorded PR for this issue; starting from the default branch");
         forge.note(format!(
-            "CLAUDE-275: no recorded PR found for {}; starting from the default branch",
+            "no recorded PR found for {}; starting from the default branch",
             job.key
         ));
         return Ok(None);
     };
     if rec.state != "open" {
-        info!(key = %job.key, pr = rec.pr_number, state = %rec.state, "CLAUDE-275: recorded PR is already confirmed merged or closed; starting from the default branch");
+        info!(key = %job.key, pr = rec.pr_number, state = %rec.state, "recorded PR is already confirmed merged or closed; starting from the default branch");
         forge.note(format!(
-            "CLAUDE-275: recorded PR #{} for {} is already `{}`; starting from the default branch",
+            "recorded PR #{} for {} is already `{}`; starting from the default branch",
             rec.pr_number, job.key, rec.state
         ));
         return Ok(None);
     }
     if matches!(pr_strategy, crate::action::PrStrategy::Agit) {
-        warn!(key = %job.key, pr = rec.pr_number, "CLAUDE-275: recorded PR uses the AGit strategy, which has no server branch to resume; opening a new PR");
+        warn!(key = %job.key, pr = rec.pr_number, "recorded PR uses the AGit strategy, which has no server branch to resume; opening a new PR");
         forge.note(format!(
-            "CLAUDE-275: recorded PR #{} for {} uses the AGit strategy, which has no server branch to resume; opening a new PR",
+            "recorded PR #{} for {} uses the AGit strategy, which has no server branch to resume; opening a new PR",
             rec.pr_number, job.key
         ));
         return Ok(None);
@@ -2738,16 +2737,16 @@ async fn resolve_pr_resume(
     let open = match crate::blocking::in_place(|| forge.list_open_prs(&host, &repo)) {
         Ok(prs) => prs,
         Err(e) => {
-            warn!(key = %job.key, pr = rec.pr_number, error = %e, "CLAUDE-275: could not confirm the recorded PR is still open; opening a new PR as before");
+            warn!(key = %job.key, pr = rec.pr_number, error = %e, "could not confirm the recorded PR is still open; opening a new PR as before");
             forge.note(format!(
-                "CLAUDE-275: could not confirm recorded PR #{} for {} is still open ({e}); opening a new PR as before",
+                "could not confirm recorded PR #{} for {} is still open ({e}); opening a new PR as before",
                 rec.pr_number, job.key
             ));
             return Ok(None);
         }
     };
     if let Some(pr) = open.iter().find(|p| p.number as i64 == rec.pr_number) {
-        info!(key = %job.key, pr = rec.pr_number, branch = %rec.head_branch, "CLAUDE-275: resuming the recorded open PR's branch");
+        info!(key = %job.key, pr = rec.pr_number, branch = %rec.head_branch, "resuming the recorded open PR's branch");
         // Prefer the listed PR's own URL, which is correct for any
         // backend (GitHub's `/pull/<n>` vs Forgejo's `/pulls/<n>`); the
         // fallback is only for a listing that carries no `html_url`. No
@@ -2769,15 +2768,15 @@ async fn resolve_pr_resume(
     // apart from an open-PR listing alone; mark it closed so a stale "open"
     // record cannot cause another resume attempt.
     if let Err(e) = store::set_agent_pr_state(pool, rec.id, "closed", &state::now_iso()).await {
-        warn!(key = %job.key, pr = rec.pr_number, error = %e, "CLAUDE-275: failed to mark the recorded PR closed (non-fatal)");
+        warn!(key = %job.key, pr = rec.pr_number, error = %e, "failed to mark the recorded PR closed (non-fatal)");
         forge.note(format!(
-            "CLAUDE-275: recorded PR #{} for {} is no longer open but could not be marked closed in the store ({e}); it may be re-checked on a later re-queue",
+            "recorded PR #{} for {} is no longer open but could not be marked closed in the store ({e}); it may be re-checked on a later re-queue",
             rec.pr_number, job.key
         ));
     }
-    info!(key = %job.key, pr = rec.pr_number, "CLAUDE-275: recorded PR is no longer open; marked closed and starting from the default branch");
+    info!(key = %job.key, pr = rec.pr_number, "recorded PR is no longer open; marked closed and starting from the default branch");
     forge.note(format!(
-        "CLAUDE-275: recorded PR #{} for {} is no longer open (merged or closed); marked closed and starting from the default branch",
+        "recorded PR #{} for {} is no longer open (merged or closed); marked closed and starting from the default branch",
         rec.pr_number, job.key
     ));
     Ok(None)
@@ -2819,9 +2818,9 @@ async fn record_new_pr(
     )
     .await
     {
-        tracing::error!(action = %action_name, key = %job.key, pr = pr_number, error = %e, "CLAUDE-275: failed to record the agent PR in the store");
+        tracing::error!(action = %action_name, key = %job.key, pr = pr_number, error = %e, "failed to record the agent PR in the store");
         let message = format!(
-            "CLAUDE-275: recording PR #{pr_number} against `{}` in the agent_pull_requests store failed ({e}); a re-queue of this issue will not resume this PR's branch and may open a second one",
+            "recording PR #{pr_number} against `{}` in the agent_pull_requests store failed ({e}); a re-queue of this issue will not resume this PR's branch and may open a second one",
             job.repo_path
         );
         forge.note(message.clone());
@@ -2860,9 +2859,9 @@ async fn clear_salvaged_for_resume(
     use crate::ci_failure::store;
     let now = state::now_iso();
     if let Err(e) = store::clear_salvaged(pool, pr_id, &now).await {
-        tracing::error!(action = %action_name, key = %job.key, pr_id, error = %e, "CLAUDE-429: failed to clear the salvaged flag on the resumed PR; automerge stays blocked");
+        tracing::error!(action = %action_name, key = %job.key, pr_id, error = %e, "failed to clear the salvaged flag on the resumed PR; automerge stays blocked");
         let message = format!(
-            "CLAUDE-429: clearing the salvaged flag on the resumed PR in the agent_pull_requests store failed ({e}); automerge stays blocked until this is cleared by hand or another resumed run succeeds"
+            "clearing the salvaged flag on the resumed PR in the agent_pull_requests store failed ({e}); automerge stays blocked until this is cleared by hand or another resumed run succeeds"
         );
         forge.note(message.clone());
         let message = crate::run_footer::append_job(
@@ -2889,16 +2888,16 @@ async fn mark_merged_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: u6
     let row = match store::agent_pr(pool, &host, &job.repo_path, pr_number as i64).await {
         Ok(Some(row)) => row,
         Ok(None) => {
-            tracing::error!(key = %job.key, pr = pr_number, "CLAUDE-549: merged at finalize, but no agent_pull_requests row exists to mark merged");
+            tracing::error!(key = %job.key, pr = pr_number, "merged at finalize, but no agent_pull_requests row exists to mark merged");
             return;
         }
         Err(e) => {
-            tracing::error!(key = %job.key, pr = pr_number, error = %e, "CLAUDE-549: merged at finalize, but reading its agent_pull_requests row failed");
+            tracing::error!(key = %job.key, pr = pr_number, error = %e, "merged at finalize, but reading its agent_pull_requests row failed");
             return;
         }
     };
     if let Err(e) = store::set_agent_pr_state(pool, row.id, "merged", &state::now_iso()).await {
-        tracing::error!(key = %job.key, pr = pr_number, error = %e, "CLAUDE-549: merged at finalize, but marking its agent_pull_requests row merged failed");
+        tracing::error!(key = %job.key, pr = pr_number, error = %e, "merged at finalize, but marking its agent_pull_requests row merged failed");
     }
 }
 
@@ -2920,16 +2919,16 @@ async fn mark_finished_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: 
     let row = match store::agent_pr(pool, &host, &job.repo_path, pr_number as i64).await {
         Ok(Some(row)) => row,
         Ok(None) => {
-            tracing::error!(key = %job.key, pr = pr_number, "CLAUDE-630: PR promoted to ready at finalize, but no agent_pull_requests row exists to mark finished");
+            tracing::error!(key = %job.key, pr = pr_number, "PR promoted to ready at finalize, but no agent_pull_requests row exists to mark finished");
             return;
         }
         Err(e) => {
-            tracing::error!(key = %job.key, pr = pr_number, error = %e, "CLAUDE-630: PR promoted to ready at finalize, but reading its agent_pull_requests row failed");
+            tracing::error!(key = %job.key, pr = pr_number, error = %e, "PR promoted to ready at finalize, but reading its agent_pull_requests row failed");
             return;
         }
     };
     if let Err(e) = store::mark_finished(pool, row.id, &state::now_iso()).await {
-        tracing::error!(key = %job.key, pr = pr_number, error = %e, "CLAUDE-630: PR promoted to ready at finalize, but marking its agent_pull_requests row finished failed");
+        tracing::error!(key = %job.key, pr = pr_number, error = %e, "PR promoted to ready at finalize, but marking its agent_pull_requests row finished failed");
     }
 }
 
@@ -3038,7 +3037,7 @@ fn run_checkpoint_watcher(
                 )),
             };
             if let Some(hit) = hit {
-                error!(key = %job.key, hit = %hit, "CLAUDE-470: tracker-key scan hit before a checkpoint push; cancelling the run and skipping the push");
+                error!(key = %job.key, hit = %hit, "tracker-key scan hit before a checkpoint push; cancelling the run and skipping the push");
                 cancel.cancel();
                 let _ = stop_rx.recv();
                 return CheckpointOutcome {
@@ -3117,7 +3116,7 @@ fn run_checkpoint_watcher(
                                 });
                             }
                             Err(e) => {
-                                error!(key = %job.key, pr_number, error = %e, "CLAUDE-448: recording the checkpoint-opened PR failed; will retry once the run finishes");
+                                error!(key = %job.key, pr_number, error = %e, "recording the checkpoint-opened PR failed; will retry once the run finishes");
                             }
                         }
                     }
@@ -3125,7 +3124,7 @@ fn run_checkpoint_watcher(
             }
             Ok(None) => {}
             Err(e) => {
-                error!(key = %job.key, error = %e, "CLAUDE-448: checkpoint push rejected; stopping checkpointing for the rest of this run");
+                error!(key = %job.key, error = %e, "checkpoint push rejected; stopping checkpointing for the rest of this run");
                 let rejected = Some(e.to_string());
                 let _ = stop_rx.recv();
                 return CheckpointOutcome {
@@ -6489,8 +6488,8 @@ pub(crate) fn automerge_behind_base_missing_comment(
         BehindBaseBackend::Forgejo => (
             "This PR's checks passed, but the runner could not tell whether its branch is behind \
              its base.",
-            "`fj pr status` did not report `behind_base`; the runtime's fj must include FJ-99. A \
-             human needs to check and merge this PR.",
+            "`fj pr status` did not report `behind_base`; the runtime's fj does not yet support \
+             it. A human needs to check and merge this PR.",
         ),
         BehindBaseBackend::GitHub => (
             "This PR's checks passed, but GitHub has not yet computed whether its branch is \
@@ -6760,7 +6759,7 @@ fn cap_reached_comment(attempts: u32, cap: u32) -> String {
         ),
         String::new(),
         "Re-queueing it alone (AI Agent = Queued) will not retry it: the attempt counter is not cleared by re-queueing or by a successful run.".to_string(),
-        "To retry it, raise the action's `limits.max_attempts_per_key`, or reset this key's counter once CLAUDE-238 lands.".to_string(),
+        "To retry it, raise the action's `limits.max_attempts_per_key`, or reset this key's counter.".to_string(),
     ]
     .join("\n")
 }
@@ -7212,10 +7211,10 @@ fn pr_failure_comment(
         ),
         WorkLocation::RemoteBranch { branch, sha } => match recorded_pr_url {
             Some(pr_url) => format!(
-                "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before this failure, so nothing was lost. This issue already has an open PR recorded against it ({pr_url}): re-queuing it (set AI Agent = Queued) resumes that PR's branch by name (CLAUDE-275), it does not open a fresh one."
+                "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before this failure, so nothing was lost. This issue already has an open PR recorded against it ({pr_url}): re-queuing it (set AI Agent = Queued) resumes that PR's branch by name, it does not open a fresh one."
             ),
             None => format!(
-                "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before this failure, so nothing was lost. No PR was ever opened here, so nothing was recorded for this issue (CLAUDE-275): re-queuing it (set AI Agent = Queued) clones the default branch again and opens a fresh PR, it does NOT resume this branch by name. Push the same branch again from a fresh clone, or open the PR for it by hand, if this exact work should not be redone. The workdir on the daemon host is not kept, because the forge holds the same commits."
+                "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before this failure, so nothing was lost. No PR was ever opened here, so nothing was recorded for this issue: re-queuing it (set AI Agent = Queued) clones the default branch again and opens a fresh PR, it does NOT resume this branch by name. Push the same branch again from a fresh clone, or open the PR for it by hand, if this exact work should not be redone. The workdir on the daemon host is not kept, because the forge holds the same commits."
             ),
         },
         WorkLocation::None => "No local commits were found to preserve.".to_string(),
@@ -7432,7 +7431,7 @@ fn salvage_timeout_work(
             )),
         };
         if let Some(hit) = hit {
-            error!(key = %job.key, hit = %hit, "CLAUDE-470: tracker-key scan hit before timeout-salvage push; skipping the push/PR-create");
+            error!(key = %job.key, hit = %hit, "tracker-key scan hit before timeout-salvage push; skipping the push/PR-create");
             report.tracker_key_hit = Some(hit);
             return report;
         }
@@ -8103,8 +8102,12 @@ mod tests {
         let backend = CliBackend::new(Arc::new(StubRunner::new())).with_keys_path(&keys);
 
         let url = clone_url_for(&backend, &job());
+        let token = "tok-123";
+        let expected = job()
+            .clone_url
+            .replacen("https://", &format!("https://oauth2:{token}@"), 1);
         assert_eq!(
-            url, "https://oauth2:tok-123@dev.a8n.run/contoso/claude-run.git",
+            url, expected,
             "the scheme must be stripped from repo_host before the key lookup"
         );
     }
@@ -19584,8 +19587,8 @@ mod tests {
         drop(capture);
         assert!(logs.contains("ERROR"), "expected an error log: {logs}");
         assert!(
-            logs.contains("CLAUDE-429"),
-            "expected the CLAUDE-429 marker in the log: {logs}"
+            logs.contains("failed to clear the salvaged flag on the resumed PR"),
+            "expected the salvaged-flag-clear failure in the log: {logs}"
         );
 
         sqlx::query("ALTER TABLE agent_pull_requests_hidden RENAME TO agent_pull_requests")
