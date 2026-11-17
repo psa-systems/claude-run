@@ -13971,7 +13971,8 @@ mod tests {
             assert_same_decision("success", true, Some(false), true).await; // salvaged: green + mergeable still blocked
             assert_same_conflict_decision().await; // behind base + update conflict (CLAUDE-380)
             assert_same_draft_decision(Some(true), &["update_pr_branch", "comment"]).await; // draft + green + behind base
-            assert_same_draft_decision(Some(false), &["merge_pr", "comment"]).await; // draft + green + mergeable, not behind base
+            assert_same_draft_decision(Some(false), &["merge_pr", "comment"]).await;
+            // draft + green + mergeable, not behind base
         }
 
         /// A draft PR takes no action on either entry point, whichever arm of
