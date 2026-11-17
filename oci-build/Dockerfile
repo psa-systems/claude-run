@@ -99,7 +99,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # "only one connection allowed"). That is an upstream Docker 29.x defect in the
 # sidecar's dockerd, not something this image or compose.yml can avoid; see
 # docs/conventions/container.md.
-FROM dev.a8n.run/pandoras-box/opensuse-dev:v1.14.0-leap-16.0 AS runtime
+FROM dev.a8n.run/pandoras-box/opensuse-dev:v1.16.0-leap-16.0 AS runtime
 
 USER root
 
