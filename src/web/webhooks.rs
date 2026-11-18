@@ -5897,6 +5897,39 @@ async fn apply_automerge_decision(
                 )))
             }
             Some(false) => {
+                // A draft that otherwise reads green, mergeable and not
+                // behind base can never actually be merged by the forge, so
+                // this route to `complete_automerge` gets the same draft
+                // check as the `behind_base: Some(true)` and not-mergeable
+                // arms above: one `info` log and no merge, no comment. An
+                // unreported draft flag warns and proceeds as before; a PR
+                // absent from the listing is a no-op the reconciler's own
+                // stale-row retirement handles separately.
+                match pr_draft_status(&forge, host, repo, pr_number).await {
+                    Ok(Some(Some(true))) => {
+                        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR is a draft; automerge skipped");
+                        return Ok(AutomergeOutcome::NoAction(
+                            "PR is a draft; automerge skipped".to_string(),
+                        ));
+                    }
+                    Ok(Some(None)) => {
+                        warn!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR draft flag unreported by the forge; proceeding");
+                    }
+                    Ok(Some(Some(false))) => {}
+                    Ok(None) => {
+                        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR not found in open-PR listing; no action");
+                        return Ok(AutomergeOutcome::NoAction(
+                            "PR not found in open-PR listing; no action".to_string(),
+                        ));
+                    }
+                    Err(msg) => {
+                        let msg = format!("checking PR draft status failed: {msg}");
+                        error!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: {msg}");
+                        record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone())
+                            .await;
+                        return Err(msg);
+                    }
+                }
                 let backend = mint.backend.clone();
                 let forge_for_merge = forge.clone();
                 let host_owned = host.to_string();
@@ -13937,14 +13970,19 @@ mod tests {
             assert_same_decision("pending", false, Some(false), false).await; // not green
             assert_same_decision("success", true, Some(false), true).await; // salvaged: green + mergeable still blocked
             assert_same_conflict_decision().await; // behind base + update conflict (CLAUDE-380)
-            assert_same_draft_decision().await; // CLAUDE-652: draft + green + behind base
+            assert_same_draft_decision(Some(true), &["update_pr_branch", "comment"]).await; // draft + green + behind base
+            assert_same_draft_decision(Some(false), &["merge_pr", "comment"]).await;
+            // draft + green + mergeable, not behind base
         }
 
-        /// CLAUDE-652: a draft PR, green and behind base, takes no action on
-        /// either entry point: no branch update, no comment. Both paths see
-        /// the same `NoAction` outcome via the shared [`pr_draft_status`]
-        /// lookup.
-        async fn assert_same_draft_decision() {
+        /// A draft PR takes no action on either entry point, whichever arm of
+        /// `apply_automerge_decision` it reaches: no branch update, no merge,
+        /// no comment. Both paths see the same `NoAction` outcome via the
+        /// shared [`pr_draft_status`] lookup. `behind_base` picks the arm
+        /// under test (the behind-base guard vs. the merge-arm guard);
+        /// `blocked_prefixes` names the backend calls that arm would
+        /// otherwise make and that must not appear.
+        async fn assert_same_draft_decision(behind_base: Option<bool>, blocked_prefixes: &[&str]) {
             let now = "2026-09-01T00:00:00Z";
             let draft_pr = ForgePullRequest {
                 draft: Some(true),
@@ -13971,7 +14009,7 @@ mod tests {
             let backend_a = Arc::new(
                 StoreBackend::new()
                     .with_open_prs(vec![draft_pr.clone()])
-                    .with_pr_status_behind("success", true, Some(true)),
+                    .with_pr_status_behind("success", true, behind_base),
             );
             let ctx_a = ctx_for(pool_a.clone(), backend_a.clone(), dir_a.path());
             let result_a = handle_action_success_for_pr(
@@ -13989,8 +14027,8 @@ mod tests {
                 !backend_a
                     .calls()
                     .iter()
-                    .any(|c| c.starts_with("update_pr_branch") || c.starts_with("comment")),
-                "a draft PR must get no branch update and no comment: {:?}",
+                    .any(|c| blocked_prefixes.iter().any(|p| c.starts_with(p))),
+                "a draft PR must get none of {blocked_prefixes:?}: {:?}",
                 backend_a.calls()
             );
 
@@ -14014,7 +14052,7 @@ mod tests {
             let backend_b = Arc::new(
                 StoreBackend::new()
                     .with_open_prs(vec![draft_pr])
-                    .with_pr_status_behind("success", true, Some(true)),
+                    .with_pr_status_behind("success", true, behind_base),
             );
             let ctx_b = ctx_for(pool_b.clone(), backend_b.clone(), dir_b.path());
             reconcile_automerge(
