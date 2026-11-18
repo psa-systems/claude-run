@@ -31,7 +31,7 @@ jobs:
   changes:
     name: classify changed files
     # MEDIUM: only reads the diff, compiles nothing (DEV-769).
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     outputs:
       # `code`, `comments-only` or `non-code` (CLAUDE-570).
       result: ${{ steps.classify.outputs.result }}
@@ -49,7 +49,7 @@ jobs:
     # CLAUDE-370: runs on every push and PR, docs-only ones included, since
     # CLAUDE.md growth is exactly what a docs-only change can introduce.
     name: CLAUDE.md guard
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     steps:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
@@ -71,7 +71,7 @@ jobs:
     name: fmt + clippy + build + tests
     # HEAVY: compiles natively and needs the dev image's `cc` for crate build
     # scripts (CLAUDE-203, DEV-769).
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_HEAVY }}
 
     # CLAUDE-250: the runner supports SQLite and PostgreSQL through one sqlx
     # `Any` pool, so the suite runs twice: once on the default SQLite and once
@@ -248,7 +248,7 @@ jobs:
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main
 
   secrets:
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     steps:
       - name: Rename .gitconfig
         # The runner's ~/.gitconfig prevents actions/checkout from working.

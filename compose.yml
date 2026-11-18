@@ -79,10 +79,10 @@ services:
       # `image: ${RUNS_ON_RUST_BUILDER_MUSL}` work directly. The value is
       # always a `dev.a8n.run` image, never from the GitHub Container
       # Registry.
-      RUNS_ON_OPENSUSE_BASE_HEAVY: dev.a8n.run/pandoras-box/opensuse-dev:v1.16.0-leap-16.0
-      RUNS_ON_OPENSUSE_BASE_MASSIVE: dev.a8n.run/pandoras-box/opensuse-dev:v1.16.0-leap-16.0
-      RUNS_ON_OPENSUSE_BASE_LIGHT: dev.a8n.run/pandoras-box/opensuse-base:v1.13.0-leap-16.0
-      RUNS_ON_OPENSUSE_BASE_MEDIUM: dev.a8n.run/pandoras-box/opensuse-base:v1.13.0-leap-16.0
+      RUNS_ON_OPENSUSE_HEAVY: dev.a8n.run/pandoras-box/opensuse-dev:v1.16.0-leap-16.0
+      RUNS_ON_OPENSUSE_MASSIVE: dev.a8n.run/pandoras-box/opensuse-dev:v1.16.0-leap-16.0
+      RUNS_ON_OPENSUSE_LIGHT: dev.a8n.run/pandoras-box/opensuse-base:v1.13.0-leap-16.0
+      RUNS_ON_OPENSUSE_MEDIUM: dev.a8n.run/pandoras-box/opensuse-base:v1.13.0-leap-16.0
       RUNS_ON_RUST_BUILDER_MUSL: dev.a8n.run/pandoras-box/rust-builder-musl:v1.2.0-rust1.98.1-alpine
       RUNS_ON_RUST_BUILDER_GLIBC: dev.a8n.run/pandoras-box/rust-builder-glibc:v1.2.0-rust1.98.1-trixie
       RUNS_ON_RUST_BUILDER_GLIBC_WINDOWS: dev.a8n.run/pandoras-box/rust-builder-glibc-windows:v1.2.0-rust1.98.1-trixie
