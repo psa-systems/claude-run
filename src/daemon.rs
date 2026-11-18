@@ -994,7 +994,7 @@ fn rename_webhook_log_dir(paths: &Paths) {
             Ok(()) => info!(
                 from = %old.display(),
                 to = %new.display(),
-                "renamed webhook log directory to the {} name (CLAUDE-153, CLAUDE-361)",
+                "renamed webhook log directory to the {} name",
                 crate::web::webhooks::WEBHOOK_MINT_ACTION
             ),
             Err(e) => warn!(

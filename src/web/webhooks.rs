@@ -1083,7 +1083,7 @@ async fn process_event(
                         repo = %ev.repo,
                         run = ev.index_in_repo,
                         %reason,
-                        "run log permanently missing (FJ-79)"
+                        "run log permanently missing"
                     );
                     (
                         String::new(),
@@ -13778,7 +13778,10 @@ mod tests {
                 .find(|c| c.starts_with("comment MK-16"))
                 .unwrap_or_else(|| panic!("expected a comment, got {calls:?}"));
             assert!(comment.contains("fj pr status"), "{comment}");
-            assert!(comment.contains("FJ-99"), "{comment}");
+            assert!(
+                comment.contains("the runtime's fj does not yet support it"),
+                "{comment}"
+            );
             assert!(!comment.contains("gh pr view"), "{comment}");
             assert!(!comment.contains("mergeStateStatus"), "{comment}");
         }

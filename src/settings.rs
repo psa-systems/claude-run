@@ -1198,7 +1198,7 @@ pub async fn retire_email_section(pool: &DbPool) -> Result<()> {
             key = "config.email",
             smtp_host = old.smtp_host.as_deref().unwrap_or("(none)"),
             from = old.from.as_deref().unwrap_or("(none)"),
-            "retiring leftover config.email settings row (CLAUDE-428: SMTP is env-only now)"
+            "retiring leftover config.email settings row (SMTP is env-only now)"
         );
         sqlx::query(sqlx::AssertSqlSafe(
             crate::db::q(pool, "DELETE FROM settings WHERE key = ?").into_owned(),
