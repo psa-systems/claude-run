@@ -106,10 +106,10 @@ container's `$RUNS_ON_*` environment variable, never a literal image name or
 tag. Never use an image from the GitHub Container Registry for either. The
 seven names, each an image reference in this container:
 
-- `RUNS_ON_OPENSUSE_BASE_HEAVY`: opensuse-dev, large runner.
-- `RUNS_ON_OPENSUSE_BASE_MASSIVE`: opensuse-dev, huge runner.
-- `RUNS_ON_OPENSUSE_BASE_LIGHT`: opensuse-base, small runner.
-- `RUNS_ON_OPENSUSE_BASE_MEDIUM`: opensuse-base, medium runner.
+- `RUNS_ON_OPENSUSE_HEAVY`: opensuse-dev, large runner.
+- `RUNS_ON_OPENSUSE_MASSIVE`: opensuse-dev, huge runner.
+- `RUNS_ON_OPENSUSE_LIGHT`: opensuse-base, small runner.
+- `RUNS_ON_OPENSUSE_MEDIUM`: opensuse-base, medium runner.
 - `RUNS_ON_RUST_BUILDER_MUSL`: Rust builder, musl target.
 - `RUNS_ON_RUST_BUILDER_GLIBC`: Rust builder, glibc target.
 - `RUNS_ON_RUST_BUILDER_GLIBC_WINDOWS`: Rust builder, glibc Windows target.

@@ -62,6 +62,22 @@ dev_image := "dev.a8n.run/pandoras-box/rust-builder-musl:v1.2.0-rust1.98.1-alpin
 # `--bins` would skip.
 test_args := ""
 
+# docs/self-hosting.md states an issue reference inline in prose on the same
+# line as the RUNS_ON_* variable list a rename touches, so editing that list
+# re-stages the pre-existing reference and trips check-internal-names; adds
+# the common default's own entries back since this overrides rather than
+# extends.
+internal_names_exempt_paths := ".forgejo/workflows/ .gitmodules renovate.json Dockerfile* compose*.yml docs/self-hosting.md"
+
+# compose.yml carries a placeholder Postgres URI example that CI's own
+# kingfisher scan already allowlists by regex and that .noseyparker-ignore.txt
+# already exempts by path; the local commit-msg hook has no regex input for
+# kingfisher that survives this recipe's own shell quoting (a `\$` in
+# `{{ secrets_kingfisher_skip_regex }}` is unescaped by the recipe's double
+# quotes before kingfisher sees it), so exempt the same file by path instead,
+# matching the noseyparker ignore already in place for it.
+secrets_kingfisher_excludes := "compose.yml"
+
 # -- Default (override) -------------------------------------------------------
 
 # List available recipes. Must stay the FIRST recipe in this file: just resolves the default recipe by source order, and a top-level definition outranks the imported one, so whatever appears first here wins over common's `default`.

@@ -40,7 +40,7 @@ jobs:
   build-and-push:
     name: Build and push claude-run runtime image
     # HEAVY: runs `docker buildx build`, a full cargo compile of the runtime image (DEV-769).
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_HEAVY }}
     permissions:
       contents: read
       packages: write
