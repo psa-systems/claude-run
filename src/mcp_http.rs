@@ -1,6 +1,6 @@
 //! SPEC-4.5: the Streamable HTTP MCP listener (CLAUDE-442).
 //!
-//! Serves the same seven read-only tools as `claude-run mcp stdio`
+//! Serves the same eight read-only tools as `claude-run mcp stdio`
 //! (`src/mcp.rs`, CLAUDE-437) over `/mcp`, behind the `mcp-web` crate's
 //! local-account + OAuth 2.1 bearer layer, so a remote client can reach them
 //! without `docker compose exec`. `McpServer` (`src/mcp.rs`) is already
@@ -491,7 +491,7 @@ mod tests {
     /// `tools/call`, proving the listener serves real MCP traffic end to end
     /// rather than just passing the bearer check.
     #[tokio::test]
-    async fn an_authenticated_client_lists_and_calls_the_seven_tools() {
+    async fn an_authenticated_client_lists_and_calls_the_eight_tools() {
         use rmcp::model::CallToolRequestParams;
         use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
         use rmcp::transport::StreamableHttpClientTransport;
@@ -537,6 +537,7 @@ mod tests {
             vec![
                 "get_attempts",
                 "get_ci_failure",
+                "get_gate_output",
                 "get_run",
                 "get_status",
                 "get_stream_log",

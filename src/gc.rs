@@ -312,9 +312,14 @@ pub fn sweep_stream_logs(
 /// mistaken for a main attempt log missing its `-review` tag.
 fn streams_file_stem(file_name: &str) -> Option<&str> {
     let name = file_name.strip_suffix("-retry").unwrap_or(file_name);
-    ["-review.jsonl", "-review-evidence.md", ".jsonl"]
-        .iter()
-        .find_map(|suffix| name.strip_suffix(suffix))
+    [
+        "-review.jsonl",
+        "-review-evidence.md",
+        "-gate.log",
+        ".jsonl",
+    ]
+    .iter()
+    .find_map(|suffix| name.strip_suffix(suffix))
 }
 
 /// Job key encoded in a `streams/` file name recognized by [`streams_file_stem`],
@@ -2153,6 +2158,29 @@ mod tests {
         assert_eq!(stats.kept, 0);
     }
 
+    /// Acceptance criterion: the SPEC-3.3.2 gate's stored output
+    /// file is recognized by the same age-based sweep as the review-evidence
+    /// file it is named after, both swept once aged and not in flight.
+    #[test]
+    fn aged_gate_output_file_is_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("youtrack").join("streams");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gate_output = dir.join("DEMO-1-attempt-1-gate.log");
+        std::fs::write(&gate_output, b"test result::FAIL some_test").unwrap();
+        let stats = sweep_stream_logs(
+            tmp.path(),
+            &log_cfg(true),
+            SystemTime::now() + days(60),
+            &in_flight(&[]),
+        );
+        assert!(
+            !gate_output.exists(),
+            "an aged gate-output file must be swept"
+        );
+        assert_eq!(stats.deleted, 1);
+    }
+
     /// AC: the same three files are kept, regardless of age, while their
     /// `(action, job key)` pair is still in flight.
     #[test]
@@ -2645,6 +2673,11 @@ mod tests {
         assert_eq!(
             streams_file_key("CLAUDE-9-attempt-2-review-evidence.md-retry").as_deref(),
             Some("CLAUDE-9")
+        );
+        // The SPEC-3.3.2 gate's stored output.
+        assert_eq!(
+            streams_file_key("DEMO-9-attempt-2-gate.log").as_deref(),
+            Some("DEMO-9")
         );
         assert_eq!(streams_file_key("CLAUDE-9-attempt-bogus.jsonl"), None);
         assert_eq!(streams_file_key("CLAUDE-9.jsonl"), None);

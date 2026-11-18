@@ -280,6 +280,10 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             get(job_review_evidence),
         )
         .route(
+            "/runs/{id}/jobs/{key}/attempt/{attempt}/gate-output",
+            get(job_gate_output),
+        )
+        .route(
             "/sse/runs/{id}/jobs/{key}/attempt/{attempt}",
             get(job_stream_sse),
         )
@@ -410,6 +414,13 @@ struct JobOutcomeRow {
     /// the filesystem every page load for jobs that never ran a review.
     #[serde(skip)]
     has_evidence: bool,
+    /// SPEC-3.3.2: whether this attempt's failed verification
+    /// gate left an output file on disk. Not a DB column, set the same way
+    /// as `has_evidence`: checked for existence after the fetch so the
+    /// template can link it without the route touching the filesystem for
+    /// every attempt, including ones whose gate never failed.
+    #[serde(skip)]
+    has_gate_output: bool,
 }
 
 // By hand rather than derived, because `ok` / `claude_ran` /
@@ -431,6 +442,7 @@ impl sqlx::FromRow<'_, sqlx::any::AnyRow> for JobOutcomeRow {
             timed_out: crate::db::flag(row, "timed_out")?,
             summary: row.try_get("summary")?,
             has_evidence: false,
+            has_gate_output: false,
         })
     }
 }
@@ -7784,6 +7796,13 @@ async fn run_detail(
             o.attempt as u32,
         )
         .is_some();
+        o.has_gate_output = ClaudeInvoker::gate_output_path(
+            &logs_dir,
+            &run.action_name,
+            &o.job_key,
+            o.attempt as u32,
+        )
+        .is_file();
     }
 
     // Look up the action's link_template once and reuse for both planned
@@ -8030,6 +8049,52 @@ async fn job_review_evidence(
     .ok_or_else(not_found)?;
     let content = std::fs::read_to_string(&path).map_err(|e| {
         tracing::error!(path = %path.display(), error = %e, "review evidence file unreadable");
+        not_found()
+    })?;
+    let mut resp = Response::new(Body::from(content));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    Ok(resp)
+}
+
+/// SPEC-4.3.10: serves an attempt's stored SPEC-3.3.2
+/// verification-gate output (written only when the gate failed) as plain
+/// text. 404s when the run is unknown or the attempt wrote no gate-output
+/// file. Unlike [`job_review_evidence`], the served path is built from the
+/// untrusted `key` path segment rather than read back from the database, so
+/// it is canonicalized and checked against the logs directory before being
+/// read, the same symlink-escape defense the `get_stream_log` MCP tool uses.
+async fn job_gate_output(
+    State(s): State<WebState>,
+    AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
+) -> Result<Response, WebError> {
+    let action_name: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        crate::db::q(&s.api.pool, "SELECT action_name FROM runs WHERE id = ?").into_owned(),
+    ))
+    .bind(id)
+    .fetch_optional(&s.api.pool)
+    .await?;
+    let action_name = action_name.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
+    let not_found = || {
+        WebError::not_found(format!(
+            "no gate-output file for run #{id}, job {key}, attempt {attempt}"
+        ))
+    };
+    let logs_dir = s.paths.logs_dir();
+    let canon_logs_dir = std::fs::canonicalize(&logs_dir).map_err(|e| {
+        tracing::error!(path = %logs_dir.display(), error = %e, "logs directory unreadable");
+        not_found()
+    })?;
+    let path = ClaudeInvoker::gate_output_path(&logs_dir, &action_name, &key, attempt);
+    let canon_path = std::fs::canonicalize(&path).map_err(|_| not_found())?;
+    if !canon_path.starts_with(&canon_logs_dir) {
+        tracing::error!(path = %canon_path.display(), "gate-output path resolves outside the logs directory");
+        return Err(not_found());
+    }
+    let content = std::fs::read_to_string(&canon_path).map_err(|e| {
+        tracing::error!(path = %canon_path.display(), error = %e, "gate-output file unreadable");
         not_found()
     })?;
     let mut resp = Response::new(Body::from(content));
@@ -8551,6 +8616,7 @@ mod tests {
             timed_out: false,
             summary: Some("did the thing".to_string()),
             has_evidence: false,
+            has_gate_output: false,
         };
         let job_links = std::collections::BTreeMap::from([(
             "CLAUDE-108".to_string(),
@@ -8778,6 +8844,7 @@ mod tests {
             timed_out: false,
             summary: Some("analyzed".to_string()),
             has_evidence: false,
+            has_gate_output: false,
         };
         let planned = PlannedJob {
             key: "CLAUDE-222".to_string(),
@@ -8839,6 +8906,7 @@ mod tests {
             timed_out: false,
             summary: None,
             has_evidence: false,
+            has_gate_output: false,
         };
         let skip = row(1, false, false);
         let ran_err = row(2, true, false);
@@ -15361,6 +15429,137 @@ mod tests {
             let s = web_state(tmp.path()).await;
 
             let resp = job_review_evidence(State(s), AxumPath((99, "CLAUDE-1".to_string(), 1)))
+                .await
+                .unwrap_err()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    /// SPEC-4.3.10: the run-detail attempt route that serves a
+    /// failed SPEC-3.3.2 gate's stored output.
+    mod gate_output_route {
+        use super::super::{job_gate_output, WebState};
+        use crate::api::AppState;
+        use crate::cancel::RunRegistry;
+        use crate::claude::ClaudeInvoker;
+        use crate::config::Paths;
+        use axum::extract::{Path as AxumPath, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+
+        async fn web_state(tmp: &std::path::Path) -> WebState {
+            let pool = crate::db::test_pool().await;
+            let (trigger_tx, _rx) = tokio::sync::mpsc::channel(8);
+            let api = Arc::new(AppState {
+                pool: pool.clone(),
+                trigger_tx,
+                version: "test",
+                runs: Arc::new(RunRegistry::new()),
+                in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                anthropic_key: None,
+                readiness: None,
+                claude_login: None,
+                fj_data_home: tmp.join("fj-data"),
+                claude_binary: "claude".to_string(),
+                gh_binary: "gh".to_string(),
+                agent_config_dir: None,
+                settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
+                paths: Paths {
+                    config_dir: tmp.join("config"),
+                    data_dir: tmp.join("data"),
+                    state_dir: tmp.join("state"),
+                    runtime_dir: tmp.join("runtime"),
+                },
+            });
+            let paths = crate::config::Paths {
+                config_dir: tmp.join("config"),
+                data_dir: tmp.join("data"),
+                state_dir: tmp.join("state"),
+                runtime_dir: tmp.join("runtime"),
+            };
+            WebState { api, paths }
+        }
+
+        async fn seed_run(pool: &crate::db::DbPool, id: i64) {
+            sqlx::query(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    pool,
+                    "INSERT INTO runs (id, action_name, started_at, triggered_by) \
+                 VALUES (?, 'act', '2026-06-26T00:00:00+00:00', 'schedule')",
+                )
+                .into_owned(),
+            ))
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn serves_the_gate_output_file_when_present() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_run(&s.api.pool, 1).await;
+            let path = ClaudeInvoker::gate_output_path(&s.paths.logs_dir(), "act", "DEMO-1", 1);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "test result::FAIL some_test").unwrap();
+
+            let resp = job_gate_output(State(s), AxumPath((1, "DEMO-1".to_string(), 1)))
+                .await
+                .unwrap()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"test result::FAIL some_test");
+        }
+
+        #[tokio::test]
+        async fn missing_gate_output_file_is_a_404() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_run(&s.api.pool, 1).await;
+
+            let resp = job_gate_output(State(s), AxumPath((1, "DEMO-1".to_string(), 1)))
+                .await
+                .unwrap_err()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn unknown_run_is_a_404() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            let resp = job_gate_output(State(s), AxumPath((99, "DEMO-1".to_string(), 1)))
+                .await
+                .unwrap_err()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// A `key` path segment crafted to walk the gate-output file outside
+        /// the logs directory (e.g. to another attempt's log, or further up
+        /// the filesystem) is rejected as a 404 rather than served, even
+        /// though the file it resolves to exists and is readable.
+        #[tokio::test]
+        async fn path_traversal_in_the_key_segment_is_rejected() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_run(&s.api.pool, 1).await;
+            let logs = s.paths.logs_dir();
+            std::fs::create_dir_all(&logs).unwrap();
+            let secret = logs.join("escaped.log");
+            std::fs::write(&secret, "outside the streams dir").unwrap();
+            // `gate_output_path` joins `streams/{key}-attempt-{attempt}-gate.log`;
+            // a `key` of `../../escaped` walks back out of `act/streams/`.
+            let traversal_key = "../../escaped".to_string();
+
+            let resp = job_gate_output(State(s), AxumPath((1, traversal_key, 1)))
                 .await
                 .unwrap_err()
                 .into_response();

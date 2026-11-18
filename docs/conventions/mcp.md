@@ -8,7 +8,7 @@ Over `mcp stdio`, stdout is the JSON-RPC transport (`rmcp::transport::stdio()`);
 
 ## Tool set
 
-`src/mcp.rs` registers exactly seven tools through rmcp's `#[tool_router]` / `#[tool]` macros, each annotated `read_only_hint = true, destructive_hint = false`: `get_status`, `list_runs`, `get_run`, `get_attempts`, `get_stream_log`, `list_ci_failures`, `get_ci_failure`. No tool executes a write; the read logic lives in `state.rs` and `ci_failure/store.rs` alongside the other read queries those modules already expose, not duplicated ad hoc in `mcp.rs`.
+`src/mcp.rs` registers exactly eight tools through rmcp's `#[tool_router]` / `#[tool]` macros, each annotated `read_only_hint = true, destructive_hint = false`: `get_status`, `list_runs`, `get_run`, `get_attempts`, `get_stream_log`, `get_gate_output`, `list_ci_failures`, `get_ci_failure`. No tool executes a write; the read logic lives in `state.rs` and `ci_failure/store.rs` alongside the other read queries those modules already expose, not duplicated ad hoc in `mcp.rs`.
 
 `get_status`'s block assembly (`state::status_blocks`) is shared with the CLI: `claude-run status`'s daemonless path calls the same function and layers its own `daemon` / `socket_expected_at` keys on top, while the MCP tool adds `"source": "database"` instead. The two can no longer drift in content.
 
@@ -17,6 +17,8 @@ A `limit` or `tail_lines` argument above its max errors rather than clamping, so
 ## Stream log path safety
 
 `get_stream_log` canonicalizes the recorded `stream_log_path` and verifies it resolves under the canonicalized logs directory before reading it, rejecting a symlink escape the same way a write path would have to. A row with no recorded path, a path outside the logs directory, and a file the retention sweep already removed are three distinct error cases, each with its own message, none of them a bare "not found".
+
+`get_gate_output` applies the same canonicalize-and-contain check, but to a path it builds itself (`ClaudeInvoker::gate_output_path`, from `job_key` and the resolved attempt) rather than to a value read back from a DB column. There is no recorded path for this tool to trust in the first place, so the containment check is load-bearing here, not only defense-in-depth the way it is for `get_stream_log`.
 
 ## Dependency footprint
 

@@ -57,7 +57,7 @@ claude-run --version
 
 `claude-run mcp stdio` (CLAUDE-437) serves a small, read-only Model Context Protocol server over stdio: JSON-RPC frames in on stdin, JSON-RPC frames out on stdout, logs on stderr only. It is DB-direct, same as `status` or `action list`, so it needs no daemon and works identically inside the container (see [self-hosting.md](self-hosting.md#troubleshooting-mcp-server)).
 
-It exposes exactly seven tools, each read-only (no tool ever writes):
+It exposes exactly eight tools, each read-only (no tool ever writes):
 
 | Tool | Purpose |
 |---|---|
@@ -66,6 +66,7 @@ It exposes exactly seven tools, each read-only (no tool ever writes):
 | `get_run` | one run's row plus its job outcomes |
 | `get_attempts` | attempt-count history for one action/key pair |
 | `get_stream_log` | the tail of one job attempt's stream log (`tail_lines`, capped and reported as `truncated` when the log is longer) |
+| `get_gate_output` | the full stored output of one job attempt's failed SPEC-3.3.2 verification gate |
 | `list_ci_failures` | recent CI-failure records, optionally filtered by state |
 | `get_ci_failure` | one CI-failure record by id |
 
@@ -84,7 +85,7 @@ It exposes exactly seven tools, each read-only (no tool ever writes):
 
 ### Same tools, over HTTP (CLAUDE-442)
 
-The daemon can also serve those seven tools over MCP's Streamable HTTP transport at `/mcp`, for a client that is not
+The daemon can also serve those eight tools over MCP's Streamable HTTP transport at `/mcp`, for a client that is not
 running on this host. It is off by default; set `[mcp] enabled = true` (see
 [configuration.md](configuration.md#mcp-over-http-claude-442)) to turn it on. Unlike `mcp stdio`, the HTTP listener is
 gated behind its own OAuth 2.1 / local-account / TOTP web layer (the `mcp-web` crate), entirely separate from both the

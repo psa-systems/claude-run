@@ -263,6 +263,9 @@
               {% if o.has_evidence %}
                 <a href="/runs/{{ run.id }}/jobs/{{ o.job_key }}/attempt/{{ o.attempt }}/review-evidence">evidence</a>
               {% endif %}
+              {% if o.has_gate_output %}
+                <a href="/runs/{{ run.id }}/jobs/{{ o.job_key }}/attempt/{{ o.attempt }}/gate-output">gate output</a>
+              {% endif %}
             {% else %}<span class="dim">-</span>{% endif %}
           </td>
           {# Clamp the summary to two lines in the cell; the full

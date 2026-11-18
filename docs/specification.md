@@ -404,11 +404,14 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   that recipe, else `just check`, else no command at all. This runs after the final push (`SPEC-3.3.1`), so the
   commits this run produced are already on the branch before the gate's own verdict is known.
 - A non-zero exit from the chosen command is recorded as a failure, never reported as success. The command's own
-  output is redacted, bounded (`append_stdout_tail`), and attached to the run record, but it is never posted on the
-  PR or the issue; the comment names the command that failed and says the output is attached to the run. The PR the
-  push already opened stays a draft. A gate that could not even be started (the command failed to spawn) carries a
-  short cause instead of output, and that cause IS posted, fenced, since it is a reason rather than the command's
-  own output.
+  output (combined stdout and stderr, escape-stripped and redacted, capped at 1 MiB keeping the front rather than
+  the tail, unlike `append_stdout_tail`) is written to its own file beside the attempt's stream log and one
+  `error`-level `run_events` row is recorded naming it, but the output itself is never posted on the PR or the
+  issue; the comment names the command that failed and links the stored file (`SPEC-4.3.10`) instead of claiming it
+  is attached to the run record. A write failure is logged and named in the comment in place of the link, so the
+  comment never claims a link that does not work. The PR the push already opened stays a draft. A gate that could
+  not even be started (the command failed to spawn) carries a short cause instead of output, and that cause IS
+  posted, fenced, since it is a reason rather than the command's own output.
 - A report that the checks passed must name the command that actually ran (`just pre-push`, `just check`, or that
   neither recipe exists and no command ran); a report naming no command is not evidence the checks passed.
 - A file change a failing check requires is allowed in the diff and is justified in the PR body; the gate checks the
@@ -583,7 +586,8 @@ All sweeps are DB-backed settings, enabled by default flags in each section, and
 
 - Per-attempt files under `logs/<action>/streams/` older than `retention_days` (30) are deleted: the main attempt log
   (`<key>-attempt-<n>.jsonl`), the post-success review session's own log (`<key>-attempt-<n>-review.jsonl`), the
-  SPEC-3.16 item 2 evidence file (`<key>-attempt-<n>-review-evidence.md`), and each one's SPEC-3.12 item 9 `-retry`
+  SPEC-3.16 item 2 evidence file (`<key>-attempt-<n>-review-evidence.md`), the SPEC-3.3.2 gate's stored output
+  (`<key>-attempt-<n>-gate.log`, written only when the gate failed), and each one's SPEC-3.12 item 9 `-retry`
   sibling. A file whose `(action, job_key)` pair is still in flight (joined from `run_inflight_jobs` to runs that have
   not ended) is kept regardless of age, because age alone is not evidence a run has finished. A file matching none of
   those shapes is not a run's own file; it is swept on age alone without the in-flight check, and logged at `warn`
@@ -761,7 +765,7 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
    | Path | Resulting field | Required comment content |
    |---|---|---|
    | success, verification gate and review pass | `Code Review` | PR link, step list |
-   | success, gate failed | `Failed` | gate command (output attached to the run record, not posted) |
+   | success, gate failed | `Failed` | gate command, link to the stored output file (not posted) |
    | review fail marker | `Queued` below the attempt cap, else `Needs Review` | findings |
    | review fail marker, audit action, follow-up issue filed | `Code Review`, PR promoted | findings, follow-up key |
    | review fail marker, audit action, follow-up not filed | `Needs Review` | findings, the filing failure |
@@ -942,7 +946,8 @@ linked, never pasted.
    of three or more, so the text can never close the fence early), and it has every terminal escape sequence (ANSI
    colour/cursor codes) and control character other than newline and tab stripped first, since neither renders as
    Markdown text. The SPEC-3.3.2 verification gate's own `just check` / `just pre-push` output never reaches a
-   comment at all; the comment names the failed command and says the full output is attached to the run record.
+   comment at all; the comment names the failed command and links the stored output file (`SPEC-4.3.10`), or, if
+   storing it failed, names that failure instead of a broken link.
 
 ### 3.17 Peered instances (`SPEC-3.17`)
 
@@ -1263,6 +1268,11 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
   set) so a job key that looks like a tracker issue becomes a clickable link.
 - `/runs/{id}/jobs/{key}/attempt/{attempt}` resolves the attempt's on-disk stream-log path and renders it with the
   run's blocker signature, if any, rendered through the same link-template resolution.
+- `/runs/{id}/jobs/{key}/attempt/{attempt}/gate-output` serves the SPEC-3.3.2 verification gate's stored output
+  (written only when the gate failed) as plain text; it 404s an unknown run and an attempt with no stored file alike.
+  Unlike the review-evidence route, this path is built from the untrusted `key` segment rather than read back from a
+  DB-recorded column, so it canonicalizes the resolved path and checks it resolves under the logs directory before
+  reading it, the same symlink-escape defense `get_stream_log` (`SPEC-4.5`) applies to its own DB-recorded path.
 - `/sse/runs/{id}/jobs/{key}/attempt/{attempt}` is a server-sent-events feed over that same on-disk `.jsonl` log: it
   404s an unknown run, waits briefly for the file to appear on a still-running job, reports a permanently absent file
   as `stream-log-gone` on an ended run versus `no-stream-yet` on a live one, resumes from `Last-Event-ID` (or a
@@ -1486,8 +1496,8 @@ delivery that is not `issue_comment` (except `ping`) is acked and dropped before
 
 ### 4.5 MCP tools
 
-Seven read-only tools, served over stdio (`mcp stdio`) and, when enabled, Streamable HTTP at `/mcp`: `get_status`,
-`list_runs`, `get_run`, `get_attempts`, `get_stream_log`, `list_ci_failures`, `get_ci_failure`. Each is annotated
+Eight read-only tools, served over stdio (`mcp stdio`) and, when enabled, Streamable HTTP at `/mcp`: `get_status`,
+`list_runs`, `get_run`, `get_attempts`, `get_stream_log`, `get_gate_output`, `list_ci_failures`, `get_ci_failure`. Each is annotated
 `read_only_hint = true, destructive_hint = false`; none writes anything. `list_runs` / `list_ci_failures`'s `limit`
 defaults to 20, capped at 100; `get_stream_log`'s `tail_lines` defaults to 200, capped at 2000. Limits above the
 maximum are rejected, not clamped, so a caller is told its request was too large rather than silently handed a
@@ -1504,6 +1514,13 @@ and then, if still over the whole-response cap (256 KiB), trims further from the
 character boundary; the result states `total_lines`, `returned_lines` and whether either step truncated. Stream
 logs are returned unredacted (the caller already has full container access via `docker compose exec`, over stdio) or
 is otherwise relying on the authenticated bearer grant below standing in for that access, over HTTP.
+
+`get_gate_output` (`SPEC-3.3.2`, `SPEC-4.3.10`) returns the full stored output of a job attempt's failed
+verification gate, already redacted and escape-stripped at write time; an attempt whose gate never failed, or an
+unknown run/job/attempt, is an error rather than an empty result. Unlike `get_stream_log`, the path it reads is
+built directly from the `job_key` argument (`ClaudeInvoker::gate_output_path`) rather than read back from a
+DB-recorded column, so the canonicalize-and-contain check is load-bearing here rather than only defense-in-depth,
+and the same check rejects a `job_key` crafted to walk outside the logs directory.
 
 The HTTP listener (`[mcp].enabled`) wraps the same tool set behind the `mcp-web` crate's own local-account, OAuth 2.1
 and bearer layer, a separate account store from the web UI's `web_admin`/`web_accounts` (7.9): granting MCP access is

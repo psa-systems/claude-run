@@ -2334,6 +2334,25 @@ async fn process_job(
             },
         );
     };
+    // Computed unconditionally, mirroring `stream_log` above, so
+    // finalize always has somewhere to write the SPEC-3.3.2 gate's output if
+    // it fails.
+    let gate_output_path =
+        ClaudeInvoker::gate_output_path(&paths.logs_dir(), &action.name, key, attempts + 1);
+    let gate_event_sink = |message: &str| {
+        let event = state::InputEvent {
+            level: "error".to_string(),
+            context: Some(key.to_string()),
+            message: message.to_string(),
+        };
+        runtime.block_on(async {
+            if let Err(e) =
+                state::run_events_record_for_run(pool, run_id, &action.name, &[event]).await
+            {
+                error!(action = %action.name, key = %key, error = %e, "recording the gate-output run event failed");
+            }
+        });
+    };
     // CLAUDE-617: a split-only attempt that ran to a result finalizes through
     // the split path; a failed run, or one that parked itself with the
     // needs-review marker, takes the ordinary closed outcome table.
@@ -2381,6 +2400,8 @@ async fn process_job(
             review.as_ref(),
             attempts + 1,
             limits.max_attempts_per_key,
+            &gate_output_path,
+            &gate_event_sink,
             &step_sink,
         )
     });
@@ -3521,12 +3542,22 @@ fn install_hooks(workdir: &Path) -> Option<bool> {
 /// SPEC-3.3.2, CLAUDE-622: whether a gate's failure text is the command's own
 /// captured output, or a cause naming why the command could not even start.
 /// The two are rendered differently in a comment: `Output` is never posted
-/// (it is already stored with the run; a reader does not need `just check`'s
-/// full report pasted into the issue), while `Cause` (an io error from
-/// trying to spawn the command at all) is a short, non-output reason that
-/// stays visible, fenced.
+/// (it is stored with the run instead; a reader does not need
+/// `just check`'s full report pasted into the issue), while `Cause` (an io
+/// error from trying to spawn the command at all) is a short, non-output
+/// reason that stays visible, fenced.
+///
+/// `Output` carries the RAW (unredacted, not escape-stripped) stdout/stderr
+/// `run_recipe_timed` captured, and the exit code, rather than an
+/// already-bounded tail: the gate-output file needs the full text
+/// with no 40-line cut, while a caller that only wants a short log line
+/// still bounds it itself with [`provider::append_stdout_tail`].
 enum GateFailure {
-    Output(String),
+    Output {
+        stdout: String,
+        stderr: String,
+        code: Option<i32>,
+    },
     Cause(String),
 }
 
@@ -3636,8 +3667,10 @@ fn run_verification_gate(workdir: &Path) -> GateResult {
                 };
                 GateResult {
                     command: Some(recipe),
-                    failure: (!status.success()).then(|| {
-                        GateFailure::Output(provider::append_stdout_tail(&stderr, &stdout, &[]))
+                    failure: (!status.success()).then(|| GateFailure::Output {
+                        stdout,
+                        stderr,
+                        code: status.code(),
                     }),
                     timing: Some(timing),
                 }
@@ -3656,6 +3689,124 @@ fn run_verification_gate(workdir: &Path) -> GateResult {
         failure: None,
         timing: None,
     }
+}
+
+/// The most bytes [`write_gate_output`] stores; the gate's own
+/// output can run to thousands of lines (a `cargo test` report, a dprint
+/// diff) and the file is meant to be fully useful, not a token bucket, but it
+/// still needs a ceiling. Kept from the FRONT, unlike
+/// [`provider::append_stdout_tail`]'s tail: a failing check's own early lines
+/// (the em-dash guard's offending-line list, `cargo clippy`'s first error)
+/// are usually the useful ones, and a gate's stdout is naturally ordered
+/// first-failure-first.
+const GATE_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+
+/// Stderr then a `stdout` marker then stdout, each redacted and
+/// escape-stripped exactly as [`provider::append_stdout_tail`] does, but with
+/// no line/byte tail cut: the gate-output file is the one place the FULL
+/// captured text is meant to end up.
+fn full_gate_output(stderr: &str, stdout: &str) -> String {
+    let stderr = provider::strip_terminal_escapes(stderr);
+    let stdout = provider::strip_terminal_escapes(stdout.trim());
+    let stderr = crate::forge_log::redact(&stderr, &[]);
+    if stdout.is_empty() {
+        return stderr;
+    }
+    let stdout = crate::forge_log::redact(&stdout, &[]);
+    if stderr.is_empty() {
+        format!("--- stdout ---\n{stdout}")
+    } else {
+        format!("{stderr}\n--- stdout ---\n{stdout}")
+    }
+}
+
+/// Cut `text` to [`GATE_OUTPUT_MAX_BYTES`] at a UTF-8 boundary,
+/// keeping the front (see that constant's doc); when cut, the last line
+/// states how many bytes were dropped, so a reader can tell a cut file from
+/// a gate that merely did not say much.
+fn cap_gate_output(text: String) -> String {
+    if text.len() <= GATE_OUTPUT_MAX_BYTES {
+        return text;
+    }
+    let mut end = GATE_OUTPUT_MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = text.len() - end;
+    format!(
+        "{}\n... {dropped} byte(s) dropped (gate output exceeded the 1 MiB cap)",
+        &text[..end]
+    )
+}
+
+/// Write a failed gate's full output to `path` (the attempt's
+/// `-gate.log`, [`ClaudeInvoker::gate_output_path`]), redacted,
+/// escape-stripped and capped (see [`full_gate_output`], [`cap_gate_output`]),
+/// creating the `streams/` parent directory first since nothing earlier in
+/// this attempt necessarily did.
+fn write_gate_output(path: &Path, stdout: &str, stderr: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, cap_gate_output(full_gate_output(stderr, stdout)))
+}
+
+/// The gate-output page's URL, built the same
+/// `public_url`-aware-degradation way [`review_evidence_link_text`] builds
+/// the evidence-file link.
+fn gate_output_link_text(public_url: Option<&str>, run_id: i64, key: &str, attempt: u32) -> String {
+    match public_url {
+        Some(base) => {
+            let base = base.trim_end_matches('/');
+            format!("{base}/runs/{run_id}/jobs/{key}/attempt/{attempt}/gate-output")
+        }
+        None => format!(
+            "link unavailable (CLAUDE_RUN_PUBLIC_URL is not set); run {run_id}, attempt {attempt}, gate output"
+        ),
+    }
+}
+
+/// The finalize gate-failure branch's whole "store the output,
+/// then say where it went" step, factored out so it is unit-testable without
+/// a full `finalize_with_steps` call (which needs a pushed branch and an
+/// open PR to reach this point). Writes `output`'s full text to
+/// `gate_output_path` when `output` is a [`GateFailure::Output`], records
+/// one `error`-level run event naming either the resulting link or, on a
+/// write failure, the failure itself, and returns the sentence to fold into
+/// both the issue comment and the PR comment. Returns `None` for a
+/// [`GateFailure::Cause`]: the gate never ran, so there is no output to
+/// store or link.
+#[allow(clippy::too_many_arguments)]
+fn store_gate_output_and_note(
+    output: &GateFailure,
+    gate_output_path: &Path,
+    public_url: Option<&str>,
+    run_id: i64,
+    key: &str,
+    attempt: u32,
+    command: &str,
+    record_gate_event: &dyn Fn(&str),
+) -> Option<String> {
+    let GateFailure::Output { stdout, stderr, .. } = output else {
+        return None;
+    };
+    Some(match write_gate_output(gate_output_path, stdout, stderr) {
+        Ok(()) => {
+            let link = gate_output_link_text(public_url, run_id, key, attempt);
+            info!(key = %key, command, gate_output = %gate_output_path.display(), "SPEC-3.3.2 verification gate failed; full output stored");
+            record_gate_event(&format!(
+                "SPEC-3.3.2 verification gate failed (`just {command}`); full output: {link}"
+            ));
+            format!("the full output is at {link}")
+        }
+        Err(e) => {
+            error!(key = %key, command, gate_output = %gate_output_path.display(), error = %e, "storing the SPEC-3.3.2 gate output failed");
+            record_gate_event(&format!(
+                "SPEC-3.3.2 verification gate failed (`just {command}`); storing its output failed: {e}"
+            ));
+            format!("storing it failed: {e}")
+        }
+    })
 }
 
 /// The URL to clone this job's repo from.
@@ -4435,8 +4586,13 @@ impl ConflictResolver for FinalPushConflictResolver {
             // command could not even start is kept in the comment text,
             // since that is not command output.
             let detail = match failure {
-                GateFailure::Output(output) => {
-                    error!(key = %self.key, command, output = %output, "conflict-resolution merge commit failed the SPEC-3.3.2 gate");
+                GateFailure::Output {
+                    stdout,
+                    stderr,
+                    code,
+                } => {
+                    let output = provider::append_stdout_tail(&stderr, &stdout, &[]);
+                    error!(key = %self.key, command, code = ?code, output = %output, "conflict-resolution merge commit failed the SPEC-3.3.2 gate");
                     String::new()
                 }
                 GateFailure::Cause(cause) => format!(": {cause}"),
@@ -5240,6 +5396,8 @@ fn finalize(
         review,
         attempts_after,
         max_attempts_per_key,
+        &workdir.join("test-gate-output.log"),
+        &|_| {},
         &|_| {},
     )
 }
@@ -5295,6 +5453,16 @@ fn finalize_with_steps(
     // does for the ordinary attempt cap.
     attempts_after: u32,
     max_attempts_per_key: u32,
+    // Where this attempt's SPEC-3.3.2 gate output, if the gate
+    // fails, is written beside the attempt's stream log. Computed by the
+    // caller (which knows the logs dir, action name, key and attempt number)
+    // rather than here, mirroring how `stream_log` itself is passed in.
+    gate_output_path: &Path,
+    // Records one `error`-level `run_events` row for a gate
+    // failure. A plain callback, not a DB handle, since this function is
+    // deliberately synchronous; the caller supplies a closure that blocks on
+    // its own async write, mirroring `step_sink`.
+    record_gate_event: &dyn Fn(&str),
     // SPEC-3.14 item 3, CLAUDE-604: receives each `push`, `pr_create` and
     // `gate` span the moment it ends, so it is stored before the next comment.
     steps: crate::attempt_steps::StepSink<'_>,
@@ -5543,13 +5711,16 @@ fn finalize_with_steps(
                 }
                 if let Some(output) = &gate.failure {
                     let command = gate.command.unwrap_or("none");
-                    // CLAUDE-622: the command's own output never reaches the
-                    // issue or PR comment below (it is already stored with
-                    // the run); logged here so an operator reading the
-                    // daemon log still sees it.
-                    if let GateFailure::Output(raw) = output {
-                        error!(key = %job.key, command, output = %raw, "SPEC-3.3.2 verification gate failed");
-                    }
+                    let output_note = store_gate_output_and_note(
+                        output,
+                        gate_output_path,
+                        public_url.as_deref(),
+                        run.run_id,
+                        &job.key,
+                        run.attempt,
+                        command,
+                        record_gate_event,
+                    );
                     if let Some(pr_number) = pr.number {
                         if let Err(e) = post_gate_failure_on_pr(
                             forge,
@@ -5559,11 +5730,18 @@ fn finalize_with_steps(
                             &job.key,
                             command,
                             output,
+                            output_note.as_deref(),
                         ) {
                             error!(key = %job.key, pr_number, error = %e, "posting the verification gate failure on the PR failed (continuing)");
                         }
                     }
-                    let body = gate_failure_comment(claude_result, &url, command, output);
+                    let body = gate_failure_comment(
+                        claude_result,
+                        &url,
+                        command,
+                        output,
+                        output_note.as_deref(),
+                    );
                     let body = text_refresh_note(body);
                     let body = push_comment_note(body);
                     let body = append_compaction_note(&body, stream_log, &job.key);
@@ -6906,26 +7084,29 @@ fn success_comment(r: &ClaudeResult, pr_url: &str, gate_command: Option<&str>) -
 /// SPEC-3.3.2: the issue comment for a verification-gate failure. The PR
 /// already exists (pushed as a draft before the gate ran), so the comment
 /// names it and says the gate, not the agent's own work, decided this.
-/// CLAUDE-622: the command's own output is never posted here, only named;
-/// the full output is already attached to the run record. A gate that could
-/// not even start carries a [`GateFailure::Cause`] instead, a short reason
-/// rather than command output, so it is kept, fenced.
+/// The command's own output is never posted here, only linked;
+/// `output_note` (set only for [`GateFailure::Output`]) is either where the
+/// full output was stored, or, when storing it failed, why there is no link.
+/// A gate that could not even start carries a [`GateFailure::Cause`]
+/// instead, a short reason rather than command output, so it is kept, fenced.
 fn gate_failure_comment(
     r: &ClaudeResult,
     pr_url: &str,
     command: &str,
     failure: &GateFailure,
+    output_note: Option<&str>,
 ) -> String {
-    let mut lines = vec![
-        format!(
-            "Claude AI agent run completed, but the runner's own re-run of `just {command}` \
-             failed. This is recorded as a failure regardless of what the agent itself \
-             reported; the draft PR is left open with the agent's commits. The command's \
-             output is not included here; it is attached to the run record."
-        ),
-        String::new(),
-        format!("Draft PR: {pr_url}"),
-    ];
+    let mut first = format!(
+        "Claude AI agent run completed, but the runner's own re-run of `just {command}` \
+         failed. This is recorded as a failure regardless of what the agent itself \
+         reported; the draft PR is left open with the agent's commits."
+    );
+    if let Some(note) = output_note {
+        first.push_str(&format!(
+            " The command's output is not included here; {note}."
+        ));
+    }
+    let mut lines = vec![first, String::new(), format!("Draft PR: {pr_url}")];
     if let GateFailure::Cause(cause) = failure {
         lines.push(String::new());
         lines.push(format!("`just {command}` could not be run:"));
@@ -6969,10 +7150,11 @@ fn remove_scratch_file(scratch: tempfile::TempPath, what: &str) {
 
 /// Post a [`gate_failure_comment`]-shaped notice as a comment on PR
 /// `pr_number`, through a scratch file since [`Forge::pr_comment`] reads its
-/// body from disk (mirrors `post_review_findings_on_pr`). CLAUDE-622: the
-/// command's own output is never posted, only named; a [`GateFailure::Cause`]
-/// (the gate could not even start) is kept, fenced, since it is a reason,
-/// not command output.
+/// body from disk (mirrors `post_review_findings_on_pr`). The
+/// command's own output is never posted, only linked via `output_note`
+/// (see [`gate_failure_comment`]); a [`GateFailure::Cause`] (the gate could
+/// not even start) is kept, fenced, since it is a reason, not command output.
+#[allow(clippy::too_many_arguments)]
 fn post_gate_failure_on_pr(
     forge: &dyn Forge,
     host: &str,
@@ -6981,12 +7163,15 @@ fn post_gate_failure_on_pr(
     key: &str,
     command: &str,
     failure: &GateFailure,
+    output_note: Option<&str>,
 ) -> Result<()> {
     let body = match failure {
-        GateFailure::Output(_) => format!(
-            "SPEC-3.3.2 verification gate: the runner's own `just {command}` failed. The \
-             command's output is not included here; it is attached to the run record."
-        ),
+        GateFailure::Output { .. } => {
+            let note = output_note.unwrap_or("its output is not included here");
+            format!(
+                "SPEC-3.3.2 verification gate: the runner's own `just {command}` failed; {note}."
+            )
+        }
         GateFailure::Cause(cause) => format!(
             "SPEC-3.3.2 verification gate: the runner's own `just {command}` could not be \
              run:\n\n{}",
@@ -8084,6 +8269,176 @@ mod tests {
         assert_ne!(p1.to_path_buf(), p2.to_path_buf());
         assert_eq!(std::fs::read_to_string(&p1).unwrap(), "one");
         assert_eq!(std::fs::read_to_string(&p2).unwrap(), "two");
+    }
+
+    /// Acceptance criterion: the stored gate output is redacted
+    /// and escape-stripped exactly like every other forge-bound log, and
+    /// combines stderr and stdout with a clear marker between them.
+    #[test]
+    fn full_gate_output_redacts_secrets_and_strips_escapes() {
+        let stderr = "\x1b[31merror\x1b[0m: token ghp_abcdefghij0123456789ABCDEFG leaked";
+        let stdout = "test result::FAIL some_test";
+        let combined = full_gate_output(stderr, stdout);
+        assert!(
+            !combined.contains("ghp_abcdefghij0123456789ABCDEFG"),
+            "a known secret shape must never reach the stored file: {combined}"
+        );
+        assert!(
+            !combined.contains('\x1b'),
+            "terminal escapes must be stripped: {combined:?}"
+        );
+        assert!(combined.contains("error"), "{combined}");
+        assert!(combined.contains("--- stdout ---"), "{combined}");
+        assert!(
+            combined.contains("test result::FAIL some_test"),
+            "{combined}"
+        );
+    }
+
+    /// Acceptance criterion: output over the 1 MiB cap is cut
+    /// from the FRONT kept, not the tail, since a gate's own stdout reports
+    /// its first failure first.
+    #[test]
+    fn cap_gate_output_keeps_the_front_and_notes_the_drop() {
+        let text = "a".repeat(GATE_OUTPUT_MAX_BYTES + 100);
+        let capped = cap_gate_output(text);
+        assert!(capped.starts_with(&"a".repeat(100)), "front must be kept");
+        assert!(
+            capped.contains("100 byte(s) dropped"),
+            "the drop must be named: {capped}"
+        );
+        assert!(capped.len() < GATE_OUTPUT_MAX_BYTES + 100);
+    }
+
+    /// Acceptance criterion: text at or under the cap passes
+    /// through unchanged, with no dropped-bytes note appended.
+    #[test]
+    fn cap_gate_output_leaves_short_text_untouched() {
+        let text = "short gate output".to_string();
+        assert_eq!(cap_gate_output(text.clone()), text);
+    }
+
+    /// Acceptance criterion: the gate's full output is stored
+    /// beside the attempt's stream log, creating the `streams/` directory
+    /// first since nothing earlier in a claude-never-ran attempt necessarily
+    /// did.
+    #[test]
+    fn write_gate_output_creates_the_parent_dir_and_writes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("streams").join("DEMO-1-attempt-1-gate.log");
+        write_gate_output(&path, "test result::FAIL some_test", "").unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("test result::FAIL some_test"));
+    }
+
+    /// Acceptance criteria 2 and 3: a gate-output failure stores
+    /// the full output beside the attempt's stream log, records one
+    /// `error`-level run event naming the gate-output link, and returns a
+    /// comment sentence with the same link.
+    #[test]
+    fn store_gate_output_and_note_writes_the_file_and_records_an_event_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("streams").join("DEMO-1-attempt-1-gate.log");
+        let failure = GateFailure::Output {
+            stdout: "test result::FAIL some_test".into(),
+            stderr: String::new(),
+            code: Some(1),
+        };
+        let events: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let sink = |m: &str| events.lock().unwrap().push(m.to_string());
+        let note = store_gate_output_and_note(
+            &failure,
+            &path,
+            Some("https://forge.example.org"),
+            1,
+            "DEMO-1",
+            1,
+            "pre-push",
+            &sink,
+        )
+        .unwrap();
+        assert!(
+            note.contains("https://forge.example.org/runs/1/jobs/DEMO-1/attempt/1/gate-output"),
+            "{note}"
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("test result::FAIL some_test"));
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0]
+                .contains("https://forge.example.org/runs/1/jobs/DEMO-1/attempt/1/gate-output"),
+            "{events:?}"
+        );
+    }
+
+    /// Acceptance criterion 6: when the output file cannot be
+    /// written, the failure is logged and named in the returned comment
+    /// sentence rather than producing a dead link, and the run event still
+    /// records (truthfully) that storing failed.
+    #[test]
+    fn store_gate_output_and_note_names_a_write_failure_instead_of_a_dead_link() {
+        // A path whose parent is itself a plain file: `create_dir_all` on it
+        // fails, so `write_gate_output` always errs.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let path = blocker.join("DEMO-1-attempt-1-gate.log");
+        let failure = GateFailure::Output {
+            stdout: "test result::FAIL some_test".into(),
+            stderr: String::new(),
+            code: Some(1),
+        };
+        let events: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let sink = |m: &str| events.lock().unwrap().push(m.to_string());
+        let note = store_gate_output_and_note(
+            &failure,
+            &path,
+            Some("https://forge.example.org"),
+            1,
+            "DEMO-1",
+            1,
+            "pre-push",
+            &sink,
+        )
+        .unwrap();
+        assert!(
+            note.contains("storing it failed"),
+            "the comment must name the write failure rather than imply a working link: {note}"
+        );
+        assert!(!note.contains("/gate-output"), "{note}");
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].contains("storing its output failed"),
+            "{events:?}"
+        );
+    }
+
+    /// A [`GateFailure::Cause`] means the gate never ran, so there is no
+    /// output to store or link, and no run event is worth recording for it
+    /// here (the comment already carries the cause, fenced).
+    #[test]
+    fn store_gate_output_and_note_is_none_for_a_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("DEMO-1-attempt-1-gate.log");
+        let failure = GateFailure::Cause("running `just` failed: no such file".into());
+        let events: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let sink = |m: &str| events.lock().unwrap().push(m.to_string());
+        let note = store_gate_output_and_note(
+            &failure,
+            &path,
+            Some("https://forge.example.org"),
+            1,
+            "DEMO-1",
+            1,
+            "pre-push",
+            &sink,
+        );
+        assert!(note.is_none());
+        assert!(!path.exists());
+        assert!(events.lock().unwrap().is_empty());
     }
 
     /// The pre step clones the URL the FORGE resolves from its key
@@ -12461,6 +12816,8 @@ mod tests {
             None,
             1,
             1000,
+            &wd.join("gate-output.log"),
+            &|_: &str| {},
             &|_| {},
         )
         .unwrap();
@@ -12523,6 +12880,8 @@ mod tests {
             None,
             1,
             1000,
+            &wd.join("gate-output.log"),
+            &|_: &str| {},
             &|_| {},
         )
         .unwrap();
@@ -12577,6 +12936,8 @@ mod tests {
             None,
             1,
             1000,
+            &wd.join("gate-output.log"),
+            &|_: &str| {},
             &|_| {},
         )
         .unwrap();
@@ -13327,6 +13688,8 @@ mod tests {
             None,
             1,
             1000,
+            &dir.path().join("gate-output.log"),
+            &|_: &str| {},
             &sink,
         )
         .unwrap();
@@ -14470,12 +14833,19 @@ mod tests {
 
     #[test]
     fn gate_failure_comment_names_the_command_but_never_its_output() {
-        let failure = GateFailure::Output("test result::FAIL some_test\n`backtick`".into());
+        let failure = GateFailure::Output {
+            stdout: "test result::FAIL some_test\n`backtick`".into(),
+            stderr: String::new(),
+            code: Some(1),
+        };
         let body = gate_failure_comment(
             &ok_result(),
             "https://dev.a8n.run/contoso/claude-run/pulls/7",
             "pre-push",
             &failure,
+            Some(
+                "the full output is at https://forge.example.org/runs/1/jobs/DEMO-1/attempt/1/gate-output",
+            ),
         );
         assert!(
             body.contains("just pre-push"),
@@ -14486,8 +14856,8 @@ mod tests {
             "the gate's own output must never reach the comment: {body}"
         );
         assert!(
-            body.contains("attached to the run record"),
-            "the comment must say where the output actually went: {body}"
+            body.contains("/gate-output"),
+            "the comment must link to where the output actually went: {body}"
         );
     }
 
@@ -14499,6 +14869,7 @@ mod tests {
             "https://dev.a8n.run/contoso/claude-run/pulls/7",
             "pre-push",
             &failure,
+            None,
         );
         assert!(
             body.contains("could not be run"),
@@ -14579,7 +14950,11 @@ mod tests {
         let forge = CapturingForge {
             captured: std::sync::Mutex::new(None),
         };
-        let failure = GateFailure::Output("test result::FAIL some_test".into());
+        let failure = GateFailure::Output {
+            stdout: "test result::FAIL some_test".into(),
+            stderr: String::new(),
+            code: Some(1),
+        };
         post_gate_failure_on_pr(
             &forge,
             "dev.a8n.run",
@@ -14588,6 +14963,9 @@ mod tests {
             "MK-16",
             "pre-push",
             &failure,
+            Some(
+                "the full output is at https://forge.example.org/runs/1/jobs/DEMO-1/attempt/1/gate-output",
+            ),
         )
         .unwrap();
         let body = forge.captured.lock().unwrap().clone().unwrap();
@@ -14598,6 +14976,10 @@ mod tests {
         assert!(
             !body.contains("FAIL some_test"),
             "the PR comment must never carry the gate's own output: {body}"
+        );
+        assert!(
+            body.contains("/gate-output"),
+            "the PR comment must link to where the output actually went: {body}"
         );
     }
 
@@ -14615,6 +14997,7 @@ mod tests {
             "MK-16",
             "pre-push",
             &failure,
+            None,
         )
         .unwrap();
         let body = forge.captured.lock().unwrap().clone().unwrap();
@@ -17516,6 +17899,8 @@ mod tests {
             None,
             1,
             1000,
+            &dir.path().join("gate-output.log"),
+            &|_: &str| {},
             &sink,
         )
         .unwrap();
