@@ -67,6 +67,12 @@ The verdict is read from the workdir, not from the invocation's own exit code: t
 `.claude-run-review-pass` with the verdict bullets (at most 5, SPEC-3.16 item 1; a longer marker is truncated, the drop logged at `warn`) if the work looks done and the sweep
 found no violating or uncovered hit, or `.claude-run-review-fail` with its findings otherwise, and to write the full sweep to an evidence file beside the attempt's stream log (`ClaudeInvoker::review_evidence_path`; a retried review writes a `-retry` sibling). `ClaudeInvoker::review_evidence_authoritative` picks the file that backs the posted verdict, and the comment link, the run page and the `/runs/{id}/jobs/{key}/attempt/{n}/review-evidence` route all resolve through it, even when every
 written criterion is satisfied: a violating or uncovered hit the sweep finds fails the review on its own.
+Because the session has no `Edit` or `Write` tool, the prompt tells it how to write these three files, not just
+that it must: a quoted Bash heredoc of the exact form `cat > <path> <<'EOF'` ... `EOF`, naming the evidence file and
+the two marker paths as the only files it may create. A session that instead reached for `Write` found the call
+denied by the headless CLI's own tool-permission gate, and whether the run then succeeded depended on whether the
+model happened to fall back to a heredoc on its own.
+
 `run_review_session` removes any stale marker before invoking, then after a clean, non-timed-out return
 compares `git rev-parse HEAD` before and after and re-reads `workdir::uncommitted_or_stashed`, filtering out the two
 marker paths themselves (an untracked marker file is an expected write, not evidence of the session having edited the
@@ -77,6 +83,14 @@ opinion the runner can act on, only a malfunction it detected. The marker files 
 their contents have been captured into the outcome, and the captured text is run through `sanitize_marker_content` to
 replace any em-dash with `-` (CLAUDE-621); leaving them in place poisoned the SPEC-3.3.2 push gate in consumers that
 scan the whole tree for the char, and the sanitized text also rides into the posted PR / issue comments.
+
+Every `NoVerdict` cause is widened with whatever the session's terminal `result` event says about denied tool
+calls, read from `permission_denials` in `ClaudeResult::raw`: a non-empty array appends each denied call's tool name
+and target (its `file_path`, or the first 120 characters of `command`) to the cause text; a missing key or a value
+that is not an array says so explicitly, rather than reading as a clean "no denials"; a genuinely empty array adds
+nothing, since there is nothing to report. Every denied call is also logged at `warn` with the issue key and
+attempt regardless of the eventual verdict, so a review that passed only after falling back to the Bash heredoc is
+still visible.
 
 `finalize`'s `review: Option<&ReviewOutcome>` parameter decides the outcome from there: `None` or `Some(Pass(_))`
 promotes the draft via `mark_pr_ready` and folds the verdict notes into the success comment's own "## Review" section;
