@@ -4067,7 +4067,7 @@ fn default_review_prompt() -> String {
     [
         "You are reviewing a completed run of another agent session on YouTrack issue {{key}}: {{summary}}, before its pull request is promoted from draft to ready.",
         "",
-        "Working directory: {{workdir}} - the finished branch is already checked out here. You have READ-ONLY tools: no Edit, no Write. Do not modify ANY file, do not run 'git commit', 'git add', 'git checkout -b', or anything else that changes the working tree or history; a review that touches the workdir is discarded and the issue is parked for a human instead of trusting your verdict.",
+        "Working directory: {{workdir}} - the finished branch is already checked out here. You have READ-ONLY tools: no Edit, no Write. Do not modify ANY file, do not run 'git commit', 'git add', 'git checkout -b', or anything else that changes the working tree or history; a review that touches the workdir is discarded and the issue is parked for a human instead of trusting your verdict. The only exception is the three files named in steps 7, 8 and 9 below: since Edit and Write are not in your tool set, write each of them with Bash, using a quoted heredoc of this exact form: cat > <path> <<'EOF' then the content then a line with just EOF. Those three paths are the ONLY files you may create.",
         "",
         "1. Run 'yt issue inspect {{key}}' to read the description, acceptance criteria, and every comment.",
         "2. Read the diff of this branch against its base (e.g. 'git log' and 'git diff' against the merge-base) and the repository as it now stands.",
@@ -4095,7 +4095,7 @@ fn default_audit_review_prompt() -> String {
     [
         "You are reviewing a completed audit run of another agent session on YouTrack issue {{key}}: {{summary}}, before its pull request (a dated audit report and ledger rows) is promoted from draft to ready.",
         "",
-        "Working directory: {{workdir}} - the finished branch is already checked out here. You have READ-ONLY tools: no Edit, no Write. Do not modify ANY file, do not run 'git commit', 'git add', 'git checkout -b', or anything else that changes the working tree or history; a review that touches the workdir is discarded and the issue is parked for a human instead of trusting your verdict.",
+        "Working directory: {{workdir}} - the finished branch is already checked out here. You have READ-ONLY tools: no Edit, no Write. Do not modify ANY file, do not run 'git commit', 'git add', 'git checkout -b', or anything else that changes the working tree or history; a review that touches the workdir is discarded and the issue is parked for a human instead of trusting your verdict. The only exception is the three files named in steps 5, 6 and 7 below: since Edit and Write are not in your tool set, write each of them with Bash, using a quoted heredoc of this exact form: cat > <path> <<'EOF' then the content then a line with just EOF. Those three paths are the ONLY files you may create.",
         "",
         "1. Run 'yt issue inspect {{key}}' to read the description and every comment, then read the audit report this branch adds and the ledger rows it appends.",
         "2. State in one sentence the invariant the audit covers, as a contract (for example: every field one upstream commit made newly persistable is accounted for in the report).",
@@ -21031,6 +21031,43 @@ mod tests {
             prompt.contains("No headings, no tables"),
             "the marker must be told to stay to bullets, not a restated sweep, got:\n{prompt}"
         );
+    }
+
+    /// The review prompt tells the read-only session how to
+    /// write its three permitted files (a Bash heredoc), not just that it
+    /// must, since a session that reaches for `Write` finds it denied and
+    /// ends with no verdict. Covers both presets, since both repeat the
+    /// same read-only contract and marker protocol.
+    #[test]
+    fn review_prompts_instruct_a_bash_heredoc_for_the_three_permitted_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let evidence_path = scratch.path().join("evidence.md");
+        for preset in [PromptPreset::Default, PromptPreset::Audit] {
+            let prompt = build_review_prompt(preset, &job(), dir.path(), &evidence_path);
+            assert!(
+                prompt.contains("heredoc") && prompt.contains("<<'EOF'"),
+                "preset {preset:?} must instruct a quoted Bash heredoc, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains(&evidence_path.display().to_string()),
+                "preset {preset:?} must name the evidence file path, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains(&dir.path().join(REVIEW_PASS_MARKER).display().to_string())
+                    || prompt.contains(REVIEW_PASS_MARKER),
+                "preset {preset:?} must name the pass marker path, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains(&dir.path().join(REVIEW_FAIL_MARKER).display().to_string())
+                    || prompt.contains(REVIEW_FAIL_MARKER),
+                "preset {preset:?} must name the fail marker path, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains("ONLY files you may create"),
+                "preset {preset:?} must limit creation to those three paths, got:\n{prompt}"
+            );
+        }
     }
 
     /// SPEC-3.16 item 1: a marker with more findings than the cap allows is
