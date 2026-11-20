@@ -82,7 +82,7 @@ surface for that run and is logged.
 ### 2.3 Data flow
 
 ```
-tracker issue (queued) -> youtrack action -> clone -> claude session -> draft PR -> review session -> ready PR
+tracker issue (queued) -> youtrack action -> clone -> claude session -> draft PR -> verification gate -> review session -> ready PR
 forge CI failure -> webhook -> verify/replay/rate-limit -> log fetch + redact -> triage -> tracker issue
 PR comment "/claude ..." -> webhook -> authorize -> claude session -> push within caps -> reply
 ```
@@ -328,8 +328,10 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   - marker file `.claude-run-no-code-change`: field set to `states.no_code` (default: the done label), marker text posted
     as a comment, no PR. Any commits the attempt made are pushed.
   - success with commits: a draft PR is created (branch strategy `branch` by default, `agit` opt-in), then the
-    verification gate (`SPEC-3.3.2`) runs; a gate failure sets the field to failed and leaves the PR draft instead of
-    reaching the review session below. Otherwise a fresh read-only review session runs, and a pass marker
+    verification gate (`SPEC-3.3.2`) runs before any review session; a gate failure sets the field to failed, leaves
+    the PR draft, sets the PR row's `failed` flag (`SPEC-3.3.1`) and starts no review session, so none is billed.
+    Only a passing gate (or a clone with no gate command) reaches the review session below. A fresh read-only review
+    session then runs, and a pass marker
     `.claude-run-review-pass` promotes the PR to ready and sets the field to code-review. A fail marker
     `.claude-run-review-fail` or no verdict keeps the PR draft, posts the findings on the PR and the issue, and sets
     the field to queued (below the attempt cap) or needs-review. An audit action (`prompt_preset: audit`) differs on
@@ -393,6 +395,13 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   outcomes posts one comment naming the reason. The behind-base update runs only when the repo is below the
   `concurrency.max_ci_in_flight_per_repo` cap and no other PR's branch update on the repo is still in CI, and the
   same gate holds a conflict-resolution dispatch; otherwise it is deferred with no comment, and the next success event or reconciler pass asks again.
+- A `Failed` outcome blocks automerge. Every `Failed` outcome in the `SPEC-3.12` table whose issue has a recorded PR
+  (`agent_pull_requests`, 3.5.2) sets that row's `failed` flag, including a gate failure (`SPEC-3.3.2`). While the flag
+  is set, automerge takes no action on the PR on the webhook decision path or the periodic reconciler: no branch
+  update, no conflict-resolution dispatch, no merge and no comment, whatever the PR's draft, mergeable, behind-base or
+  CI state and whoever changed its draft status. Each skip is logged at `info` naming the issue key and the PR number.
+  The flag is cleared only when a later run for the issue ends in Code Review; a re-queue continues the same PR (3.3.1)
+  and does not clear it by itself. A person merging the PR by hand is unaffected.
 - Targets: `forgejo` (`base_url`, `token_ref`, `pr_strategy`) and `github` (`hosts`, `mcp_endpoint`, `token_ref`). A job
   whose repository host is `github.com` or listed in `github.hosts` uses the GitHub backend; any other host uses `fj`.
 - Prompt: `prompt` overrides; otherwise `prompt_preset` is `default` or `audit`.
@@ -402,7 +411,9 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
 - Before the runner records an attempt as successful, it re-runs the repository's own pre-push entrypoint in the
   clone itself, rather than trusting the agent's own report that checks passed: `just pre-push` when the clone has
   that recipe, else `just check`, else no command at all. This runs after the final push (`SPEC-3.3.1`), so the
-  commits this run produced are already on the branch before the gate's own verdict is known.
+  commits this run produced are already on the branch before the gate's own verdict is known. It runs before the
+  post-success review session (`SPEC-3.12` item 3), which starts only after the gate passed or no gate command
+  existed.
 - A non-zero exit from the chosen command is recorded as a failure, never reported as success. The command's own
   output (combined stdout and stderr, escape-stripped and redacted, capped at 1 MiB keeping the front rather than
   the tail, unlike `append_stdout_tail`) is written to its own file beside the attempt's stream log and one
@@ -412,6 +423,16 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   comment never claims a link that does not work. The PR the push already opened stays a draft. A gate that could
   not even be started (the command failed to spawn) carries a short cause instead of output, and that cause IS
   posted, fenced, since it is a reason rather than the command's own output.
+- Base-branch comparison. When the gate fails with command output, the runner runs the same command once in a separate
+  checkout of the base branch tip, so a failure the diff did not cause is distinguishable from one it did. The failure
+  comment states exactly one of: the base branch fails the same command (the failure may not come from the diff), the
+  base branch passes it, or the base check could not run, with the cause. The base run's output is stored in the same
+  file as the gate's own, after a section header naming the base branch, and each section is redacted,
+  escape-stripped and capped at 1 MiB keeping the front, exactly as above. The base result never converts a gate
+  failure into a success and never changes the outcome (`Failed`, `SPEC-3.12`). A base run that cannot start, or
+  whose output cannot be stored, is logged at `error` naming the issue key and is named in the comment, never read as
+  "the base branch passes". A gate that could not start runs no base check, and neither does a clone with no gate
+  command.
 - A report that the checks passed must name the command that actually ran (`just pre-push`, `just check`, or that
   neither recipe exists and no command ran); a report naming no command is not evidence the checks passed.
 - A file change a failing check requires is allowed in the diff and is justified in the PR body; the gate checks the
@@ -491,7 +512,7 @@ Hybrid: a cheap deterministic pass runs first and only the residue it cannot lab
 - `ci_failures` (one row per distinct failure, keyed on `(repo, workflow_id, job_name)`), `ci_failure_tests` (its
   failing-test fingerprint), `ci_failure_runs` (one row per sighting: commit, branch, PR number, timestamp), and
   `agent_pull_requests` (every PR the runner's own `youtrack` action opens, carrying `fix_attempts`, a `salvaged`
-  flag and a `finished` flag) replace a YouTrack full-text search for dedupe: an unindexed issue is invisible to that search, and a
+  flag, a `finished` flag and a `failed` flag) replace a YouTrack full-text search for dedupe: an unindexed issue is invisible to that search, and a
   failure every PR inherits from `main` would otherwise mint one issue per PR.
 - The fingerprint is the sorted, deduplicated `<target>::<test>` ids parsed from cargo test output (a target that
   failed to build or run at all, with no parsed test, contributes a bare `<target>` id), or `infra:<kind>` when the
@@ -765,7 +786,7 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
    | Path | Resulting field | Required comment content |
    |---|---|---|
    | success, verification gate and review pass | `Code Review` | PR link, step list |
-   | success, gate failed | `Failed` | gate command, link to the stored output file (not posted) |
+   | success, gate failed | `Failed` | gate command, link to the stored output file (not posted), the base-branch statement (`SPEC-3.3.2`) |
    | review fail marker | `Queued` below the attempt cap, else `Needs Review` | findings |
    | review fail marker, audit action, follow-up issue filed | `Code Review`, PR promoted | findings, follow-up key |
    | review fail marker, audit action, follow-up not filed | `Needs Review` | findings, the filing failure |
@@ -780,6 +801,10 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
    | split-only attempt (item 7), two or more fitting pieces | done label; each piece `Queued` | the piece keys |
    | split-only attempt (item 7), under two pieces or a piece over the timeout | `Needs Review` with `Needs-Info` | the cause |
    | hard failure | `Failed` | cause |
+
+   Every `Failed` row whose issue has a recorded PR sets that PR row's `failed` flag, which blocks automerge
+   (`SPEC-3.3.1`). The review session of an attempt runs only after the verification gate passed (`SPEC-3.3.2`); the
+   rows that name a review outcome are reached only on that path.
 
 4. **Conflict resolution.** When the final push finds a diverged remote branch (`SPEC-3.3.1`) and the merge conflicts,
    the runner does not stop at an aborted merge. It dispatches one bounded `claude` pass in the same clone that merges
@@ -905,10 +930,14 @@ is on any comment.
    | 3 | Checks 1 | check | 15:52 |  | 17:20 |
    | 4 | Checkpoint 2 |  | <-- This comment | <-- This comment | <-- This comment |
    | 5 | Checks 2 |  |  |  |  |
-   | 6 | Verdict |  |  |  |  |
-   | 7 | Final commit |  |  |  |  |
-   | 8 | PR ready |  |  |  |  |
+   | 6 | Final commit |  |  |  |  |
+   | 7 | Checks 3 | pre-push |  |  |  |
+   | 8 | Verdict |  |  |  |  |
+   | 9 | PR ready |  |  |  |  |
    ```
+
+   The runner's gate (`SPEC-3.3.2`) is the `Checks 3` row, after the final commit and before the verdict; a failed gate
+   ends the table at `Checks 3 (failed)` and then `Failed`, with no `Verdict` row.
 
 5. An unhappy path inserts its steps where they happen and numbers them in order: `Checks 1 (failed)`, `Retry 2`,
    `CI remediation 1`, `Conflict resolution`, `Review (no verdict)`, `Failed`. The table for a run that ended in
@@ -939,7 +968,9 @@ linked, never pasted.
 3. **Failure comment.** A `FAILED` comment is at most 3 bullets: the cause first, then what was or was not pushed, then
    the run link. The cause is one line from a closed set: `timed out` (with the limit and turn count), `push rejected`
    (with the one-line git error), `<command> failed` (the gate or hook command), `cancelled`, `agent error` (with its
-   one-line message). The raw stream-log path is not in the comment, since the run link reaches it.
+   one-line message). For a failed verification gate the cause line ends with the base-branch statement
+   (`SPEC-3.3.2`) and the stored-output link, kept on that one line. The raw stream-log path is not in the comment,
+   since the run link reaches it.
 4. **Over the cap.** A marker file over its bullet cap is posted truncated to the cap with a final bullet stating how
    many bullets were dropped and linking the full text; the over-length is logged at `warn` with the issue key.
    Truncation is never silent.
@@ -1274,7 +1305,7 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
 - `/runs/{id}/jobs/{key}/attempt/{attempt}` resolves the attempt's on-disk stream-log path and renders it with the
   run's blocker signature, if any, rendered through the same link-template resolution.
 - `/runs/{id}/jobs/{key}/attempt/{attempt}/gate-output` serves the SPEC-3.3.2 verification gate's stored output
-  (written only when the gate failed) as plain text; it 404s an unknown run and an attempt with no stored file alike.
+  (written only when the gate failed, with its base-branch section when one was stored) as plain text; it 404s an unknown run and an attempt with no stored file alike.
   Unlike the review-evidence route, this path is built from the untrusted `key` segment rather than read back from a
   DB-recorded column, so it canonicalizes the resolved path and checks it resolves under the logs directory before
   reading it, the same symlink-escape defense `get_stream_log` (`SPEC-4.5`) applies to its own DB-recorded path.
@@ -1451,6 +1482,10 @@ configured for a different provider, or a disabled listener returns 404. Pipelin
 - A PR whose row is `finished` (CLAUDE-630: `finalize` observed `Finalized::CodeReview`, i.e. the run that owns it
   already reported success and the PR was promoted to ready) is skipped before any status read: no behind-base
   branch update, no merge attempt, no comment, on either the webhook decision path or the periodic reconciler.
+- A PR whose row is `failed` (`SPEC-3.3.1`: `finalize` ended the run that owns it in `Failed`, a gate failure
+  included) is skipped before any status read, on both the webhook decision path and the periodic reconciler: no
+  branch update, no conflict-resolution dispatch, no merge, no comment. The skip is logged at `info` naming the
+  issue key and the PR number. This holds even when the PR is no longer a draft.
 - A PR the forge reports as a draft never has its branch updated by automerge, is never commented on by it, and is
   never merged by it, whatever its reported state, mergeable flag, or behind-base flag: a green, mergeable,
   not-behind-base draft is a no-action outcome just like a green, behind-base one, on either the webhook decision
@@ -1521,7 +1556,7 @@ logs are returned unredacted (the caller already has full container access via `
 is otherwise relying on the authenticated bearer grant below standing in for that access, over HTTP.
 
 `get_gate_output` (`SPEC-3.3.2`, `SPEC-4.3.10`) returns the full stored output of a job attempt's failed
-verification gate, already redacted and escape-stripped at write time; an attempt whose gate never failed, or an
+verification gate (and its base-branch section when one was stored), already redacted and escape-stripped at write time; an attempt whose gate never failed, or an
 unknown run/job/attempt, is an error rather than an empty result. Unlike `get_stream_log`, the path it reads is
 built directly from the `job_key` argument (`ClaudeInvoker::gate_output_path`) rather than read back from a
 DB-recorded column, so the canonicalize-and-contain check is load-bearing here rather than only defense-in-depth,
@@ -1597,7 +1632,7 @@ same schema. Pool: 16 connections, 30-second acquire timeout. Timestamps are RFC
 | `secrets` | `name` (unique), age `ciphertext`, `created_at`, `last_used_at` |
 | `api_keys` | Generated peer API keys (`SPEC-4.3.6`): `name` (unique), `key_hash` (unique, SHA-256 hex of the plaintext), `created_at`, `last_used_at` |
 | `ci_failures`, `ci_failure_tests`, `ci_failure_runs` | Failure store: repo, workflow, job, `infra_kind`, `issue_key`, `state`; unique (`failure_id`, `test_id`); run index, commit, branch, PR number |
-| `agent_pull_requests` | Recorded agent PRs: unique (`host`, `repo`, `pr_number`), `issue_key`, `head_branch`, `fix_attempts`, `state`, `salvaged`, `finished` |
+| `agent_pull_requests` | Recorded agent PRs: unique (`host`, `repo`, `pr_number`), `issue_key`, `head_branch`, `fix_attempts`, `state`, `salvaged`, `finished`, `failed` |
 | `claude_invocations` | Per-invocation cost, token and rate-limit utilization record |
 | `attempt_steps` | Timed steps of an attempt (`SPEC-3.14`): `run_id`, `job_key`, `attempt`, `seq`, `stage`, `kind`, `label`, `started_at`, `ended_at`, `ok`, `detail`; `job_outcomes` gains `stage` and `outcome` |
 | `run_summaries` | Peered-instance run highlights (`SPEC-3.17` item 9): `run_uuid` (PK), `instance_id`, `seq`, `action_name`, `job_key`, `attempt`, `outcome`, `ok`, `started_at`, `ended_at`, `duration_ms`, `cost_usd`, `timed_out`; own and replicated rows |
