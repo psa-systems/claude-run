@@ -1,4 +1,4 @@
-//! SPEC-4.5: the seven read-only MCP tools.
+//! SPEC-4.5: the eight read-only MCP tools.
 //!
 //! Read-only troubleshooting MCP server (`claude-run mcp stdio`, CLAUDE-437).
 //!
@@ -120,6 +120,18 @@ pub struct GetStreamLogArgs {
     pub tail_lines: Option<u32>,
 }
 
+/// SPEC-4.5: `get_gate_output` arguments.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetGateOutputArgs {
+    /// The `runs.id` the job ran under.
+    pub run_id: i64,
+    /// The job key whose gate output to fetch.
+    pub job_key: String,
+    /// Which attempt to fetch. Defaults to that job's latest attempt in this run.
+    #[serde(default)]
+    pub attempt: Option<u32>,
+}
+
 /// SPEC-4.5: `list_ci_failures` arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListCiFailuresArgs {
@@ -226,7 +238,8 @@ impl McpServer {
     /// SPEC-4.5: `get_run`.
     #[tool(
         description = "One run's row, its job outcomes (key, attempt, ok, claude ran/ok, cost, \
-                        timed out, duration, summary, whether a stream log is recorded), and its \
+                        timed out, duration, summary, whether a stream log is recorded, whether a \
+                        SPEC-3.3.2 verification gate failure left an output file), and its \
                         run_events (warn/error diagnostics first). Unknown run_id is an error.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
@@ -236,10 +249,20 @@ impl McpServer {
             Ok(None) => return tool_not_found(format!("no run with id {}", args.run_id)),
             Err(e) => return tool_error(e),
         };
-        let outcomes = match state::job_outcomes_for_run(&self.pool, args.run_id).await {
+        let mut outcomes = match state::job_outcomes_for_run(&self.pool, args.run_id).await {
             Ok(o) => o,
             Err(e) => return tool_error(e),
         };
+        let logs_dir = self.paths.logs_dir();
+        for o in &mut outcomes {
+            o.has_gate_output = crate::claude::ClaudeInvoker::gate_output_path(
+                &logs_dir,
+                &run.action_name,
+                &o.job_key,
+                o.attempt as u32,
+            )
+            .is_file();
+        }
         let events = match state::run_events_for_run(&self.pool, args.run_id).await {
             Ok(e) => e,
             Err(e) => return tool_error(e),
@@ -373,6 +396,103 @@ impl McpServer {
             "path": path,
             "total_lines": total_lines,
             "returned_lines": returned_lines,
+            "truncated": truncated,
+            "content": tail,
+        }))
+    }
+
+    /// SPEC-4.5: `get_gate_output`, including the
+    /// path-containment defense. Unlike [`Self::get_stream_log`], the served
+    /// path is built from `job_key` directly (via
+    /// [`crate::claude::ClaudeInvoker::gate_output_path`]) rather than read
+    /// back from a DB-recorded column, so the canonicalize + `starts_with`
+    /// check is load-bearing here, not only defense-in-depth.
+    #[tool(
+        description = "Full output of a failed SPEC-3.3.2 verification gate for one job attempt. \
+                        run_id and job_key are required; attempt defaults to that job's latest \
+                        attempt in the run. Returns an error when the job's gate never failed (no \
+                        output file was written).",
+        annotations(read_only_hint = true, destructive_hint = false)
+    )]
+    async fn get_gate_output(
+        &self,
+        Parameters(args): Parameters<GetGateOutputArgs>,
+    ) -> CallToolResult {
+        let run = match state::run_get(&self.pool, args.run_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return tool_not_found(format!("no run with id {}", args.run_id)),
+            Err(e) => return tool_error(e),
+        };
+        let recorded = match state::job_outcome_stream_log(
+            &self.pool,
+            args.run_id,
+            &args.job_key,
+            args.attempt,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return tool_error(e),
+        };
+        let attempt = match recorded {
+            None => {
+                return tool_not_found(format!(
+                    "no job outcome recorded for run {} job {:?} attempt {:?}",
+                    args.run_id, args.job_key, args.attempt
+                ))
+            }
+            Some((attempt, _)) => attempt,
+        };
+
+        let logs_dir = self.paths.logs_dir();
+        let canon_logs_dir = match std::fs::canonicalize(&logs_dir) {
+            Ok(d) => d,
+            Err(e) => return tool_error(format!("logs directory {}: {e}", logs_dir.display())),
+        };
+        let path = crate::claude::ClaudeInvoker::gate_output_path(
+            &logs_dir,
+            &run.action_name,
+            &args.job_key,
+            attempt as u32,
+        );
+        let canon_path = match std::fs::canonicalize(&path) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return tool_not_found(format!(
+                    "no gate-output file for run {} job {:?} attempt {attempt}; the gate did not \
+                     fail or the age sweep removed it",
+                    args.run_id, args.job_key
+                ))
+            }
+            Err(e) => return tool_error(format!("{}: {e}", path.display())),
+        };
+        if !canon_path.starts_with(&canon_logs_dir) {
+            return tool_error(format!(
+                "gate-output path {} resolves outside the logs directory",
+                canon_path.display()
+            ));
+        }
+
+        let content = match std::fs::read_to_string(&canon_path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return tool_not_found(format!(
+                    "no gate-output file for run {} job {:?} attempt {attempt}; the gate did not \
+                     fail or the age sweep removed it",
+                    args.run_id, args.job_key
+                ))
+            }
+            Err(e) => return tool_error(e.to_string()),
+        };
+
+        let (_, _, truncated, tail) =
+            tail_text(&content, usize::MAX, STREAM_LOG_RESPONSE_CAP_BYTES);
+
+        json_result(serde_json::json!({
+            "run_id": args.run_id,
+            "job_key": args.job_key,
+            "attempt": attempt,
+            "path": canon_path.display().to_string(),
             "truncated": truncated,
             "content": tail,
         }))
@@ -530,6 +650,7 @@ mod tests {
             "get_run",
             "get_attempts",
             "get_stream_log",
+            "get_gate_output",
             "list_ci_failures",
             "get_ci_failure",
         ] {
@@ -742,6 +863,170 @@ mod tests {
         assert!(result_text(&result).contains("not found"));
     }
 
+    #[tokio::test]
+    async fn get_gate_output_errors_on_unknown_run() {
+        let (server, _dir) = test_server().await;
+        let result = server
+            .get_gate_output(Parameters(GetGateOutputArgs {
+                run_id: 424_242,
+                job_key: "DEMO-1".to_string(),
+                attempt: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn get_gate_output_errors_when_no_outcome_is_recorded() {
+        let (server, _dir) = test_server().await;
+        let pool = server_pool(&server);
+        let run_id = state::run_begin(&pool, "youtrack", "cli").await.unwrap();
+
+        let result = server
+            .get_gate_output(Parameters(GetGateOutputArgs {
+                run_id,
+                job_key: "no-such-job".to_string(),
+                attempt: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn get_gate_output_errors_when_the_gate_never_failed() {
+        let (server, _dir) = test_server().await;
+        let pool = server_pool(&server);
+        let run_id = state::run_begin(&pool, "youtrack", "cli").await.unwrap();
+        state::job_outcome_insert(
+            &pool,
+            &state::JobOutcome {
+                run_id,
+                action_name: "youtrack",
+                job_key: "DEMO-4",
+                attempt: 1,
+                ok: true,
+                claude_ran: true,
+                claude_ok: true,
+                claude_cost_usd: 0.0,
+                attempt_counted: true,
+                summary: None,
+                stream_log_path: None,
+                duration_ms: 1,
+                timed_out: false,
+                stage: "initial",
+                outcome: "success",
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = server
+            .get_gate_output(Parameters(GetGateOutputArgs {
+                run_id,
+                job_key: "DEMO-4".to_string(),
+                attempt: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result_text(&result).contains("no gate-output file"));
+    }
+
+    #[tokio::test]
+    async fn get_gate_output_returns_the_stored_file() {
+        let (server, dir) = test_server().await;
+        let pool = server_pool(&server);
+        let run_id = state::run_begin(&pool, "youtrack", "cli").await.unwrap();
+        state::job_outcome_insert(
+            &pool,
+            &state::JobOutcome {
+                run_id,
+                action_name: "youtrack",
+                job_key: "DEMO-5",
+                attempt: 1,
+                ok: false,
+                claude_ran: true,
+                claude_ok: true,
+                claude_cost_usd: 0.0,
+                attempt_counted: true,
+                summary: None,
+                stream_log_path: None,
+                duration_ms: 1,
+                timed_out: false,
+                stage: "initial",
+                outcome: "gate_failed",
+            },
+        )
+        .await
+        .unwrap();
+        let path = crate::claude::ClaudeInvoker::gate_output_path(
+            &dir.path().join("state/logs"),
+            "youtrack",
+            "DEMO-5",
+            1,
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "test result::FAIL some_test").unwrap();
+
+        let result = server
+            .get_gate_output(Parameters(GetGateOutputArgs {
+                run_id,
+                job_key: "DEMO-5".to_string(),
+                attempt: None,
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        let value: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(value["content"], "test result::FAIL some_test");
+        assert_eq!(value["attempt"], 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_gate_output_rejects_a_symlink_escape_outside_the_logs_dir() {
+        let (server, dir) = test_server().await;
+        let pool = server_pool(&server);
+        let run_id = state::run_begin(&pool, "youtrack", "cli").await.unwrap();
+        state::job_outcome_insert(
+            &pool,
+            &state::JobOutcome {
+                run_id,
+                action_name: "youtrack",
+                job_key: "DEMO-6",
+                attempt: 1,
+                ok: false,
+                claude_ran: true,
+                claude_ok: true,
+                claude_cost_usd: 0.0,
+                attempt_counted: true,
+                summary: None,
+                stream_log_path: None,
+                duration_ms: 1,
+                timed_out: false,
+                stage: "initial",
+                outcome: "gate_failed",
+            },
+        )
+        .await
+        .unwrap();
+
+        let outside = dir.path().join("outside-secret-gate.log");
+        std::fs::write(&outside, "top secret\n").unwrap();
+        let streams_dir = dir.path().join("state/logs/youtrack/streams");
+        std::fs::create_dir_all(&streams_dir).unwrap();
+        let link = streams_dir.join("DEMO-6-attempt-1-gate.log");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let result = server
+            .get_gate_output(Parameters(GetGateOutputArgs {
+                run_id,
+                job_key: "DEMO-6".to_string(),
+                attempt: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result_text(&result).contains("outside the logs directory"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn get_stream_log_rejects_a_symlink_escape_outside_the_logs_dir() {
@@ -914,6 +1199,7 @@ mod tests {
             vec![
                 "get_attempts",
                 "get_ci_failure",
+                "get_gate_output",
                 "get_run",
                 "get_status",
                 "get_stream_log",

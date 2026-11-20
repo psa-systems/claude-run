@@ -196,7 +196,7 @@ still post, but the footer's `Run:` line says the link is unavailable instead of
 ## MCP over HTTP (CLAUDE-442)
 
 `claude-run mcp stdio` (see [usage.md](usage.md#read-only-troubleshooting-mcp-server)) is DB-direct and needs no
-daemon. The same seven read-only tools are also available from the running daemon itself, over MCP's Streamable HTTP
+daemon. The same eight read-only tools are also available from the running daemon itself, over MCP's Streamable HTTP
 transport at `/mcp`, gated behind the external `mcp-web` crate's own multi-user OAuth 2.1 / local-account / TOTP web
 layer rather than the daemon's own `[web]` auth. This listener is off by default; a deployment that never needs a
 networked MCP client can ignore this section entirely.

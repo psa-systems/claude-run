@@ -2464,6 +2464,14 @@ pub struct JobOutcomeRecord {
     pub timed_out: bool,
     pub summary: Option<String>,
     pub has_stream_log: bool,
+    /// SPEC-3.3.2: whether this attempt's failed verification
+    /// gate left an output file on disk. Not a DB column: `mcp.rs`'s
+    /// `get_run` fills this in after the fetch by checking
+    /// `ClaudeInvoker::gate_output_path` for existence, the same pattern
+    /// `has_stream_log` would use if it were filesystem-backed instead of a
+    /// recorded column.
+    #[serde(default)]
+    pub has_gate_output: bool,
 }
 
 // By hand rather than derived: `ok` / `claude_ran` / `claude_ok` / `timed_out`
@@ -2485,6 +2493,7 @@ impl sqlx::FromRow<'_, sqlx::any::AnyRow> for JobOutcomeRecord {
             has_stream_log: row
                 .try_get::<Option<String>, _>("stream_log_path")?
                 .is_some(),
+            has_gate_output: false,
         })
     }
 }

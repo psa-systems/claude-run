@@ -334,6 +334,19 @@ impl ClaudeInvoker {
             .join(format!("{key}-attempt-{attempt}-review-evidence.md"))
     }
 
+    /// The SPEC-3.3.2 verification gate's own output when it
+    /// fails, stored beside the attempt's stream log rather than only traced
+    /// to the daemon's own log, so the issue/PR comment's pointer actually
+    /// resolves to something. Named like [`Self::review_evidence_path`], but
+    /// `.log` rather than `.md` since the content is a command's raw output,
+    /// not rendered Markdown.
+    pub fn gate_output_path(logs_dir: &Path, action: &str, key: &str, attempt: u32) -> PathBuf {
+        logs_dir
+            .join(action)
+            .join("streams")
+            .join(format!("{key}-attempt-{attempt}-gate.log"))
+    }
+
     /// SPEC-3.12 item 9: the sibling path the one retried review session
     /// writes to (`<name>-retry`), so a retry never overwrites the first
     /// session's stream log or evidence file. The single source of that naming.

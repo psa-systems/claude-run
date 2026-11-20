@@ -164,7 +164,7 @@ pub struct DatabaseConfig {
 /// false` means no listener binds, no key file and no `mcp-web.db` are ever
 /// created, and `serve` behaves exactly as it did before this section existed.
 ///
-/// Serves the same seven read-only troubleshooting tools as `claude-run mcp
+/// Serves the same eight read-only troubleshooting tools as `claude-run mcp
 /// stdio` (`src/mcp.rs`, CLAUDE-437), but over Streamable HTTP behind the
 /// `mcp-web` crate's local-account + OAuth 2.1 bearer layer, so a remote
 /// client can reach them without `docker compose exec`. SPEC-4.5, SPEC-6.2.
