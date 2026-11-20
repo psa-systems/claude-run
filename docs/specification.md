@@ -926,7 +926,12 @@ linked, never pasted.
 2. **Evidence file.** The review session writes its working (the invariant, the search pattern and the classified
    hits of the sweep) to a separate evidence file in the scratch directory, not the workdir. The runner stores that
    file with the attempt's stream log and serves it on the run page (`SPEC-4.3.10`). The review prompt requires the
-   sweep to be done in full; only its posting is capped. The pass and fail marker files hold the verdict bullets alone.
+   sweep to be done in full; only its posting is capped. The pass and fail marker files hold the verdict bullets
+   alone. Since the session is granted no `Edit` or `Write` tool, the prompt tells it to write the evidence file and
+   the marker through a quoted Bash heredoc instead, and names those three paths as the only files it may create.
+   When the session instead reaches for a denied tool and ends with no verdict, the recorded cause names every tool
+   call the result event reports as denied (its tool name and target), rather than only stating that no marker was
+   written.
 3. **Failure comment.** A `FAILED` comment is at most 3 bullets: the cause first, then what was or was not pushed, then
    the run link. The cause is one line from a closed set: `timed out` (with the limit and turn count), `push rejected`
    (with the one-line git error), `<command> failed` (the gate or hook command), `cancelled`, `agent error` (with its

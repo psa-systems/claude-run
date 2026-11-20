@@ -2174,6 +2174,7 @@ async fn process_job(
                 cancel,
                 Some(spend.remaining_usd()),
                 Some(cargo_target_dir.as_path()),
+                attempts + 1,
             )
         });
         // SPEC-3.14: the `review` runner-owned step, recorded below once this
@@ -4067,7 +4068,7 @@ fn default_review_prompt() -> String {
     [
         "You are reviewing a completed run of another agent session on YouTrack issue {{key}}: {{summary}}, before its pull request is promoted from draft to ready.",
         "",
-        "Working directory: {{workdir}} - the finished branch is already checked out here. You have READ-ONLY tools: no Edit, no Write. Do not modify ANY file, do not run 'git commit', 'git add', 'git checkout -b', or anything else that changes the working tree or history; a review that touches the workdir is discarded and the issue is parked for a human instead of trusting your verdict.",
+        "Working directory: {{workdir}} - the finished branch is already checked out here. You have READ-ONLY tools: no Edit, no Write. Do not modify ANY file, do not run 'git commit', 'git add', 'git checkout -b', or anything else that changes the working tree or history; a review that touches the workdir is discarded and the issue is parked for a human instead of trusting your verdict. The only exception is the three files named in steps 7, 8 and 9 below: since Edit and Write are not in your tool set, write each of them with Bash, using a quoted heredoc of this exact form: cat > <path> <<'EOF' then the content then a line with just EOF. Those three paths are the ONLY files you may create.",
         "",
         "1. Run 'yt issue inspect {{key}}' to read the description, acceptance criteria, and every comment.",
         "2. Read the diff of this branch against its base (e.g. 'git log' and 'git diff' against the merge-base) and the repository as it now stands.",
@@ -4095,7 +4096,7 @@ fn default_audit_review_prompt() -> String {
     [
         "You are reviewing a completed audit run of another agent session on YouTrack issue {{key}}: {{summary}}, before its pull request (a dated audit report and ledger rows) is promoted from draft to ready.",
         "",
-        "Working directory: {{workdir}} - the finished branch is already checked out here. You have READ-ONLY tools: no Edit, no Write. Do not modify ANY file, do not run 'git commit', 'git add', 'git checkout -b', or anything else that changes the working tree or history; a review that touches the workdir is discarded and the issue is parked for a human instead of trusting your verdict.",
+        "Working directory: {{workdir}} - the finished branch is already checked out here. You have READ-ONLY tools: no Edit, no Write. Do not modify ANY file, do not run 'git commit', 'git add', 'git checkout -b', or anything else that changes the working tree or history; a review that touches the workdir is discarded and the issue is parked for a human instead of trusting your verdict. The only exception is the three files named in steps 5, 6 and 7 below: since Edit and Write are not in your tool set, write each of them with Bash, using a quoted heredoc of this exact form: cat > <path> <<'EOF' then the content then a line with just EOF. Those three paths are the ONLY files you may create.",
         "",
         "1. Run 'yt issue inspect {{key}}' to read the description and every comment, then read the audit report this branch adds and the ledger rows it appends.",
         "2. State in one sentence the invariant the audit covers, as a contract (for example: every field one upstream commit made newly persistable is accounted for in the report).",
@@ -4212,6 +4213,9 @@ fn run_review_session(
     // SPEC-3.10 item 3: the review session is a `claude` child spawned for
     // this same repo workdir, so it shares the repo's cache too.
     cargo_target_dir: Option<&Path>,
+    // The job's attempt number, carried only for the denied-tool-call warn
+    // log below; it plays no part in the verdict itself.
+    attempt: u32,
 ) -> (ReviewOutcome, ClaudeResult) {
     let pass_marker = workdir.join(REVIEW_PASS_MARKER);
     let fail_marker = workdir.join(REVIEW_FAIL_MARKER);
@@ -4243,9 +4247,19 @@ fn run_review_session(
         }
     };
 
+    // Logged whatever the eventual verdict, so a review that needed the
+    // Bash-heredoc fallback instead of a denied `Write`/`Edit` call is still
+    // visible even when it passed.
+    for denial in denied_review_tool_calls(&result.raw) {
+        warn!(key = %job.key, attempt, denial = %denial, "post-success review session had a tool call denied");
+    }
+
     if result.timed_out {
         return (
-            ReviewOutcome::NoVerdict("the review session timed out".to_string()),
+            ReviewOutcome::NoVerdict(describe_no_verdict_with_denials(
+                "the review session timed out",
+                &result.raw,
+            )),
             result,
         );
     }
@@ -4265,9 +4279,10 @@ fn run_review_session(
     let workdir_touched = before_sha != after_sha || dirty_beyond_markers;
     if workdir_touched {
         return (
-            ReviewOutcome::NoVerdict(
-                "the review session modified the workdir (it is read-only by contract)".to_string(),
-            ),
+            ReviewOutcome::NoVerdict(describe_no_verdict_with_denials(
+                "the review session modified the workdir (it is read-only by contract)",
+                &result.raw,
+            )),
             result,
         );
     }
@@ -4281,14 +4296,16 @@ fn run_review_session(
         (false, true) => ReviewOutcome::Fail(sanitize_marker_content(
             &std::fs::read_to_string(&fail_marker).unwrap_or_default(),
         )),
-        (true, true) => ReviewOutcome::NoVerdict(
-            "the review session wrote both the pass and fail markers".to_string(),
-        ),
-        (false, false) => {
-            ReviewOutcome::NoVerdict("the review session wrote no verdict marker".to_string())
-        }
+        (true, true) => ReviewOutcome::NoVerdict(describe_no_verdict_with_denials(
+            "the review session wrote both the pass and fail markers",
+            &result.raw,
+        )),
+        (false, false) => ReviewOutcome::NoVerdict(describe_no_verdict_with_denials(
+            "the review session wrote no verdict marker",
+            &result.raw,
+        )),
     };
-    // CLAUDE-621: strip the marker files from the workdir now the outcome is
+    // Strip the marker files from the workdir now the outcome is
     // captured. Leaving them in place poisoned the SPEC-3.3.2 push gate in
     // consumers that scan the whole tree (storefront's em-dash guard caught
     // the agent's own narrative notes). `discard_review_changes` still has
@@ -4296,6 +4313,64 @@ fn run_review_session(
     let _ = std::fs::remove_file(&pass_marker);
     let _ = std::fs::remove_file(&fail_marker);
     (outcome, result)
+}
+
+/// One denied tool call from a review session's terminal `result` event, as
+/// `<tool> <target>` (the `file_path` of the input, or the first 120
+/// characters of `command` when there is no `file_path`, or nothing when
+/// neither is present).
+fn describe_permission_denial(entry: &serde_json::Value) -> String {
+    let tool = entry
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown tool>");
+    let input = entry.get("tool_input");
+    let target = input
+        .and_then(|i| i.get("file_path"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            input
+                .and_then(|i| i.get("command"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.chars().take(120).collect::<String>())
+        });
+    match target {
+        Some(target) => format!("{tool} {target}"),
+        None => tool.to_string(),
+    }
+}
+
+/// The denied tool calls in `raw`'s `permission_denials` array, empty when
+/// the key is absent, not an array, or an empty array.
+fn denied_review_tool_calls(raw: &serde_json::Value) -> Vec<String> {
+    raw.get("permission_denials")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(describe_permission_denial).collect())
+        .unwrap_or_default()
+}
+
+/// Append a denied-tool-call summary to a `NoVerdict` cause, from the same
+/// session's terminal `result` event. A result with a non-empty
+/// `permission_denials` array names every denied call; a result where the
+/// key is absent, or present but not an array, says so explicitly rather
+/// than silently reading as "no denials" (a review that truly made no
+/// denied call reports that as a genuine empty array, not a missing key).
+fn describe_no_verdict_with_denials(cause: &str, raw: &serde_json::Value) -> String {
+    match raw.get("permission_denials") {
+        None => format!("{cause}; the result event carried no permission_denials key"),
+        Some(serde_json::Value::Array(arr)) if arr.is_empty() => cause.to_string(),
+        Some(serde_json::Value::Array(arr)) => {
+            let denials: Vec<String> = arr.iter().map(describe_permission_denial).collect();
+            let n = denials.len();
+            let noun = if n == 1 { "call" } else { "calls" };
+            format!(
+                "{cause}; {n} tool {noun} were denied: {}",
+                denials.join(", ")
+            )
+        }
+        Some(_) => format!("{cause}; the result event's permission_denials was not an array"),
+    }
 }
 
 /// CLAUDE-621: sanitize the agent's narrative notes before they are returned
@@ -4579,6 +4654,7 @@ fn run_review_session_with_retry(
     cancel: &CancellationToken,
     budget_usd: Option<f64>,
     cargo_target_dir: Option<&Path>,
+    attempt: u32,
 ) -> (ReviewOutcome, Vec<ClaudeResult>) {
     let pre_review_sha = git_head_sha(workdir);
     let (outcome, result) = run_review_session(
@@ -4593,6 +4669,7 @@ fn run_review_session_with_retry(
         cancel,
         budget_usd,
         cargo_target_dir,
+        attempt,
     );
     let first_cause = match &outcome {
         ReviewOutcome::NoVerdict(cause) if cause.contains("read-only by contract") => cause.clone(),
@@ -4617,6 +4694,7 @@ fn run_review_session_with_retry(
         cancel,
         budget_usd,
         cargo_target_dir,
+        attempt,
     );
     let combined = match second_outcome {
         ReviewOutcome::NoVerdict(second_cause) => ReviewOutcome::NoVerdict(format!(
@@ -20469,12 +20547,54 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert!(result.ok);
         assert_eq!(
             outcome,
             ReviewOutcome::Pass("checked every criterion, all good".to_string())
         );
+    }
+
+    /// A denied tool call is logged at `warn` with the issue key and attempt
+    /// even when the review still reaches a PASS verdict (for example a
+    /// session that reached for `Write` once, was denied, then fell back to
+    /// the Bash heredoc), so a passing review that needed the fallback is
+    /// still visible.
+    #[test]
+    fn run_review_session_pass_with_a_denied_call_still_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let result_with_denial = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.1,"permission_denials":[{"tool_name":"Write","tool_input":{"file_path":"/workdir/evidence.md"}}]}"#;
+        let stub = review_stub(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\necho 'checked every criterion, all good' > {}\nprintf '%s\\n' '{result_with_denial}'\nexit 0\n",
+                REVIEW_PASS_MARKER
+            ),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let logs = capture_logs(|| {
+            let _ = run_review_session(
+                &claude,
+                &action::ClaudeBlock::default(),
+                &job(),
+                PromptPreset::Default,
+                dir.path(),
+                Duration::from_secs(30),
+                &scratch.path().join("stream.jsonl"),
+                &scratch.path().join("evidence.md"),
+                &cancel,
+                None,
+                None,
+                3,
+            );
+        });
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains(&job().key), "{logs}");
+        assert!(logs.contains("Write /workdir/evidence.md"), "{logs}");
     }
 
     #[test]
@@ -20503,6 +20623,7 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert!(result.ok);
         assert_eq!(
@@ -20540,6 +20661,7 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert_eq!(outcome, ReviewOutcome::Pass("all good".to_string()));
         assert!(!dir.path().join(REVIEW_PASS_MARKER).exists());
@@ -20578,6 +20700,7 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         let text = match outcome {
             ReviewOutcome::Pass(s) => s,
@@ -20617,9 +20740,92 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert!(
             matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("no verdict marker"))
+        );
+    }
+
+    /// A no-verdict result with a non-empty `permission_denials` names every
+    /// denied call's tool and target in the cause, so a review that reached
+    /// for `Write` and was denied no longer reports only "wrote no verdict
+    /// marker" with no hint why.
+    #[test]
+    fn run_review_session_no_marker_names_denied_tool_calls_in_the_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let result_with_denials = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.1,"permission_denials":[{"tool_name":"Write","tool_input":{"file_path":"/workdir/evidence.md"}},{"tool_name":"Write","tool_input":{"file_path":"/workdir/.claude-run-review-pass"}}]}"#;
+        let stub = review_stub(
+            scratch.path(),
+            &format!("#!/bin/sh\nprintf '%s\\n' '{result_with_denials}'\nexit 0\n"),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, _) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            PromptPreset::Default,
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &cancel,
+            None,
+            None,
+            1,
+        );
+        let cause = match outcome {
+            ReviewOutcome::NoVerdict(cause) => cause,
+            other => panic!("expected NoVerdict, got {other:?}"),
+        };
+        assert!(cause.contains("no verdict marker"), "got: {cause}");
+        assert!(
+            cause.contains("2 tool calls were denied")
+                && cause.contains("Write /workdir/evidence.md")
+                && cause.contains("Write /workdir/.claude-run-review-pass"),
+            "cause must name every denied call's tool and target, got: {cause}"
+        );
+    }
+
+    /// A no-verdict result whose terminal event carries no `permission_denials`
+    /// key is stated as such in the cause, never silently read as "no
+    /// denials" (which would hide that the denial signal itself is missing).
+    #[test]
+    fn run_review_session_no_marker_with_missing_permission_denials_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let stub = review_stub(
+            scratch.path(),
+            &format!("#!/bin/sh\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n"),
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let (outcome, _) = run_review_session(
+            &claude,
+            &action::ClaudeBlock::default(),
+            &job(),
+            PromptPreset::Default,
+            dir.path(),
+            Duration::from_secs(30),
+            &scratch.path().join("stream.jsonl"),
+            &scratch.path().join("evidence.md"),
+            &cancel,
+            None,
+            None,
+            1,
+        );
+        let cause = match outcome {
+            ReviewOutcome::NoVerdict(cause) => cause,
+            other => panic!("expected NoVerdict, got {other:?}"),
+        };
+        assert!(cause.contains("no verdict marker"), "got: {cause}");
+        assert!(
+            cause.contains("no permission_denials key"),
+            "a missing permission_denials must be named, not silently treated as no denials, got: {cause}"
         );
     }
 
@@ -20649,6 +20855,7 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert!(
             matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("both the pass and fail markers"))
@@ -20679,6 +20886,7 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert!(result.timed_out);
         assert!(
@@ -20715,6 +20923,7 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert!(
             matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("read-only by contract"))
@@ -20747,6 +20956,7 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert!(
             matches!(outcome, ReviewOutcome::NoVerdict(ref cause) if cause.contains("read-only by contract"))
@@ -20788,6 +20998,7 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert_eq!(
             results.len(),
@@ -20837,6 +21048,7 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert_eq!(results.len(), 2);
         assert!(matches!(outcome, ReviewOutcome::Pass(_)));
@@ -20879,6 +21091,7 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert_eq!(results.len(), 2);
         match &outcome {
@@ -20930,6 +21143,7 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert_eq!(results.len(), 1, "no workdir violation means no retry");
         assert!(
@@ -20972,6 +21186,7 @@ mod tests {
             &cancel,
             Some(2.5),
             None,
+            1,
         );
         assert_eq!(outcome, ReviewOutcome::Pass("ok".to_string()));
         let argv = std::fs::read_to_string(&argv_path).unwrap();
@@ -21031,6 +21246,43 @@ mod tests {
             prompt.contains("No headings, no tables"),
             "the marker must be told to stay to bullets, not a restated sweep, got:\n{prompt}"
         );
+    }
+
+    /// The review prompt tells the read-only session how to
+    /// write its three permitted files (a Bash heredoc), not just that it
+    /// must, since a session that reaches for `Write` finds it denied and
+    /// ends with no verdict. Covers both presets, since both repeat the
+    /// same read-only contract and marker protocol.
+    #[test]
+    fn review_prompts_instruct_a_bash_heredoc_for_the_three_permitted_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let evidence_path = scratch.path().join("evidence.md");
+        for preset in [PromptPreset::Default, PromptPreset::Audit] {
+            let prompt = build_review_prompt(preset, &job(), dir.path(), &evidence_path);
+            assert!(
+                prompt.contains("heredoc") && prompt.contains("<<'EOF'"),
+                "preset {preset:?} must instruct a quoted Bash heredoc, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains(&evidence_path.display().to_string()),
+                "preset {preset:?} must name the evidence file path, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains(&dir.path().join(REVIEW_PASS_MARKER).display().to_string())
+                    || prompt.contains(REVIEW_PASS_MARKER),
+                "preset {preset:?} must name the pass marker path, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains(&dir.path().join(REVIEW_FAIL_MARKER).display().to_string())
+                    || prompt.contains(REVIEW_FAIL_MARKER),
+                "preset {preset:?} must name the fail marker path, got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains("ONLY files you may create"),
+                "preset {preset:?} must limit creation to those three paths, got:\n{prompt}"
+            );
+        }
     }
 
     /// SPEC-3.16 item 1: a marker with more findings than the cap allows is
@@ -21141,6 +21393,7 @@ mod tests {
             &cancel,
             None,
             None,
+            1,
         );
         assert!(result.ok);
         assert_eq!(
