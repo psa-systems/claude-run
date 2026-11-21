@@ -5396,6 +5396,19 @@ async fn apply_automerge_decision(
             "PR was opened by the runner before its run finished; automerge blocked".to_string(),
         ));
     }
+    // SPEC-3.3.1, SPEC-4.4.3: `finalize` ended the run that owns
+    // this PR in `Failed` (a gate failure included). Stop here with no
+    // comment, before any status read, whatever the PR's draft, mergeable,
+    // behind-base or CI state and whoever changed its draft status: no
+    // branch update, no conflict-resolution dispatch, no merge. The flag is
+    // cleared only once a later run for the issue ends in Code Review; a
+    // human merging the PR by hand is unaffected.
+    if row.failed {
+        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR's owning run ended Failed; automerge blocked");
+        return Ok(AutomergeOutcome::NoAction(
+            "PR's owning run ended Failed; automerge blocked".to_string(),
+        ));
+    }
     // CLAUDE-630: once `finalize` has observed `Finalized::CodeReview` for
     // this PR, the run that owns it is done: the PR was promoted to ready
     // and there is nothing left for the agent to do. Stop here with no
@@ -14379,6 +14392,77 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(row.state, "open", "never retired by automerge");
+        }
+
+        /// SPEC-3.3.1 / SPEC-4.4.3: once a PR's row is `failed`
+        /// (the run that owns it ended in `Failed`, a gate failure
+        /// included), both the webhook decision path and the reconciler
+        /// must skip it before any status read: no branch update, no merge,
+        /// no conflict dispatch, no comment, whatever the PR's draft,
+        /// mergeable, behind-base or CI state. This holds even when the PR
+        /// is no longer a draft (`with_pr_status_behind` here reports a
+        /// green, mergeable, behind-base PR, which would otherwise merge).
+        #[tokio::test]
+        async fn reconciler_never_touches_a_failed_pr() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-11-21T00:00:00Z";
+            let id = ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "DEMO-1",
+                "dev.example.org",
+                "contoso/audits",
+                559,
+                "fix/gate-failed",
+                "open",
+                false,
+                now,
+            )
+            .await
+            .unwrap();
+            ci_failure_store::mark_failed(&pool, id, now).await.unwrap();
+
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(559, "")])
+                    .with_pr_status_behind("success", true, Some(true)),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let gate = crate::concurrency::KeyGate::new();
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            let _ = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.example.org",
+                "contoso/audits",
+                559,
+                "https://dev.example.org/contoso/audits/pulls/559",
+            )
+            .await;
+
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|c| c.starts_with("update_pr_branch")),
+                "{calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|c| c.starts_with("comment")),
+                "a failed PR must get no status comment at all: {calls:?}"
+            );
+
+            let row = ci_failure_store::agent_pr(&pool, "dev.example.org", "contoso/audits", 559)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "open", "never retired by automerge");
+            assert!(row.failed, "failed flag must stay set");
         }
 
         /// CLAUDE-463: `salvaged` is set for both a timeout salvage and a
