@@ -233,6 +233,14 @@ pub struct YoutrackSource {
     /// (CLAUDE-215) used as a literal before CLAUDE-409.
     #[serde(skip_serializing_if = "is_default_audit_project")]
     pub audit_project: String,
+    /// Type that identifies a per-target audit run in the `audit` prompt
+    /// preset's S1 step, rendered as `{{audit_target_type}}`. Defaults to
+    /// `Epic`, the type `src/native/audit_prompt.rs` S1 checked before this
+    /// field existed. A deployment that reserves `Epic` for reporting sets
+    /// this to `Story` instead; the daily parent run's `Type: Task` check is
+    /// unaffected. Omitted on serialize when `Epic`.
+    #[serde(skip_serializing_if = "is_default_audit_target_type")]
+    pub audit_target_type: String,
     /// Labels of the AI Agent / State machine the handler drives.
     pub states: YoutrackStates,
     /// Full-replacement prompt override. Resolution order: this text, else the
@@ -297,6 +305,7 @@ impl Default for YoutrackSource {
             query: default_query(),
             custom_field: default_custom_field(),
             audit_project: default_audit_project(),
+            audit_target_type: default_audit_target_type(),
             states: YoutrackStates::default(),
             prompt: None,
             prompt_preset: PromptPreset::default(),
@@ -550,6 +559,14 @@ fn default_audit_project() -> String {
 
 fn is_default_audit_project(v: &str) -> bool {
     v == default_audit_project()
+}
+
+fn default_audit_target_type() -> String {
+    "Epic".to_string()
+}
+
+fn is_default_audit_target_type(v: &str) -> bool {
+    v == default_audit_target_type()
 }
 
 /// The AI Agent (and standard `State`) values the handler reads and writes.
@@ -1309,6 +1326,40 @@ native:
 
         let yaml = serde_yaml::to_string(&loaded.action).unwrap();
         assert!(yaml.contains("audit_project: AUD2"), "{yaml}");
+        let reloaded = validate_str(&yaml, "<roundtrip>").unwrap();
+        assert_eq!(reloaded.action.native, loaded.action.native);
+    }
+
+    /// An untouched `audit_target_type` stays out of the serialized YAML, so
+    /// existing action files are unchanged by the field.
+    #[test]
+    fn audit_target_type_default_is_omitted_on_serialize() {
+        let cfg = YoutrackConfig::default();
+        assert_eq!(cfg.youtrack.audit_target_type, "Epic");
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("audit_target_type"),
+            "default audit_target_type must not serialize: {yaml}"
+        );
+    }
+
+    #[test]
+    fn audit_target_type_non_default_round_trips() {
+        let raw = "\
+name: yt
+kind: youtrack
+native:
+  youtrack:
+    audit_target_type: Story
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = &loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert_eq!(cfg.youtrack.audit_target_type, "Story");
+
+        let yaml = serde_yaml::to_string(&loaded.action).unwrap();
+        assert!(yaml.contains("audit_target_type: Story"), "{yaml}");
         let reloaded = validate_str(&yaml, "<roundtrip>").unwrap();
         assert_eq!(reloaded.action.native, loaded.action.native);
     }

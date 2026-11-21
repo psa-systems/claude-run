@@ -4442,6 +4442,7 @@ fn build_prompt(
         claude_timeout,
         now,
         &write_projects(src, job),
+        &src.audit_target_type,
         resume,
     )
 }
@@ -4483,6 +4484,7 @@ fn render_prompt_template(
     claude_timeout: Duration,
     now: SystemTime,
     write_projects: &str,
+    audit_target_type: &str,
     resume: Option<&PrResume>,
 ) -> String {
     let workdir = workdir.display().to_string();
@@ -4490,7 +4492,7 @@ fn render_prompt_template(
     let deadline_utc = deadline_utc(now, claude_timeout);
     let existing_pr_url = resume.map(|r| r.pr_url.as_str()).unwrap_or("");
     let existing_branch = resume.map(|r| r.branch.as_str()).unwrap_or("");
-    let vars: [(&str, &str); 14] = [
+    let vars: [(&str, &str); 15] = [
         ("key", job.key.as_str()),
         ("summary", job.summary.as_str()),
         ("clone_url", job.clone_url.as_str()),
@@ -4501,6 +4503,7 @@ fn render_prompt_template(
         ("skip_attempt_marker", SKIP_ATTEMPT_MARKER),
         ("no_code_marker", NO_CODE_MARKER),
         ("write_projects", write_projects),
+        ("audit_target_type", audit_target_type),
         ("existing_pr_url", existing_pr_url),
         ("existing_branch", existing_branch),
         ("review_pass_marker", REVIEW_PASS_MARKER),
@@ -4615,6 +4618,7 @@ fn build_review_prompt(
         workdir,
         Duration::from_secs(0),
         SystemTime::now(),
+        "",
         "",
         None,
     )
@@ -7356,6 +7360,7 @@ fn build_split_prompt(
         claude_timeout,
         now,
         &write_projects(src, job),
+        &src.audit_target_type,
         None,
     )
 }
@@ -9061,6 +9066,7 @@ mod tests {
             Path::new("/w"),
             Duration::from_secs(3600),
             SystemTime::now(),
+            "",
             "",
             None,
         );
@@ -11936,6 +11942,7 @@ mod tests {
             "{{needs_review_marker}}",
             "{{skip_attempt_marker}}",
             "{{write_projects}}",
+            "{{audit_target_type}}",
             "{{existing_branch}}",
         ] {
             assert!(t.contains(placeholder), "audit preset lacks {placeholder}");
@@ -11978,6 +11985,40 @@ mod tests {
         );
     }
 
+    /// The default `audit_target_type` (`Epic`) renders into S1 exactly as
+    /// the preset did before the field existed.
+    #[test]
+    fn audit_preset_defaults_to_epic_in_s1() {
+        let wd = std::path::Path::new("/tmp/wd");
+        let p = build_prompt(&audit_src(), &job(), wd, hour(), SystemTime::now(), None);
+        assert!(
+            p.contains("PER-TARGET RUN: Type `Epic`"),
+            "default audit_target_type must render as Epic in S1:\n{p}"
+        );
+    }
+
+    /// A deployment that reserves `Epic` for reporting sets
+    /// `audit_target_type: Story`; S1 then names `Story`, and no remaining
+    /// line still tells the agent to look for or treat an `Epic` as the
+    /// per-target issue.
+    #[test]
+    fn audit_preset_with_story_target_type_renders_story_and_drops_epic() {
+        let src = YoutrackSource {
+            audit_target_type: "Story".to_string(),
+            ..audit_src()
+        };
+        let wd = std::path::Path::new("/tmp/wd");
+        let p = build_prompt(&src, &job(), wd, hour(), SystemTime::now(), None);
+        assert!(
+            p.contains("PER-TARGET RUN: Type `Story`"),
+            "audit_target_type: Story must render into S1:\n{p}"
+        );
+        assert!(
+            !p.contains("Epic"),
+            "no remaining line may tell the agent to look for or treat an Epic as the per-target issue:\n{p}"
+        );
+    }
+
     #[test]
     fn audit_preset_states_its_permits_and_bans() {
         let p = preset_prompt(PromptPreset::Audit);
@@ -12013,12 +12054,28 @@ mod tests {
             hour(),
             now,
             "MK",
+            "",
             None,
         );
         assert_eq!(
             p,
             "MK-16|Do the thing|https://dev.a8n.run/contoso/claude-run.git|/wd|60|2023-11-14T23:13:20Z|.claude-run-needs-review|.claude-run-skip-attempt|.claude-run-no-code-change|MK||"
         );
+    }
+
+    #[test]
+    fn render_substitutes_the_audit_target_type_placeholder() {
+        let p = render_prompt_template(
+            "Type `{{audit_target_type}}`",
+            &job(),
+            std::path::Path::new("/wd"),
+            hour(),
+            SystemTime::now(),
+            "",
+            "Story",
+            None,
+        );
+        assert_eq!(p, "Type `Story`");
     }
 
     /// CLAUDE-450: `{{deadline_utc}}` is `now + claude_timeout`, formatted as
@@ -12033,6 +12090,7 @@ mod tests {
             Duration::from_secs(5400),
             now,
             "MK",
+            "",
             None,
         );
         assert_eq!(p, "2023-11-14T23:43:20Z");
@@ -12073,6 +12131,7 @@ mod tests {
             hour(),
             SystemTime::now(),
             "MK",
+            "",
             Some(&resume),
         );
         assert_eq!(
@@ -12092,6 +12151,7 @@ mod tests {
             hour(),
             SystemTime::now(),
             "MK",
+            "",
             None,
         );
         assert_eq!(p, "MK-16 {{bogus}} {{oops");
