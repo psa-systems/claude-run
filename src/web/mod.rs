@@ -7981,9 +7981,55 @@ struct JobStreamTpl {
     href: Option<String>,
 }
 
+/// Resolution of a stream-log-shaped path (the main attempt log, the review
+/// evidence file, or the gate-output file) against the logs directory it must
+/// stay confined to. All four web routes and the `get_stream_log` /
+/// `get_gate_output` MCP tools build their served path by joining the
+/// DB-recorded, trusted `action_name` with the untrusted, URL-supplied `key`,
+/// so a `key` carrying `../` segments (or a symlink planted at the resulting
+/// name) can otherwise resolve outside the logs directory. `Missing` and
+/// `Escaped` are deliberately kept distinct: a caller that tolerates the file
+/// not existing yet (a live run still spinning up its log) treats `Missing`
+/// as normal and `Escaped` as the same 404 a real symlink escape gets.
+enum StreamLogPath {
+    Missing,
+    Escaped,
+    Found(std::path::PathBuf),
+}
+
+/// Canonicalizes `path` and checks it resolves under `logs_dir`, the same
+/// symlink-escape and path-traversal defense the `get_stream_log` MCP tool
+/// already applies (`src/mcp.rs`). See [`StreamLogPath`] for how the caller
+/// should treat each outcome. A `logs_dir` that does not exist yet (a fresh
+/// install with no run's stream log ever written) is reported as `Missing`
+/// rather than an error, the same as a missing leaf file.
+fn canonicalize_within_logs_dir(
+    logs_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<StreamLogPath> {
+    let canon_logs_dir = match std::fs::canonicalize(logs_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(StreamLogPath::Missing),
+        Err(e) => return Err(e),
+    };
+    let canon_path = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(StreamLogPath::Missing),
+        Err(e) => return Err(e),
+    };
+    if canon_path.starts_with(&canon_logs_dir) {
+        Ok(StreamLogPath::Found(canon_path))
+    } else {
+        Ok(StreamLogPath::Escaped)
+    }
+}
+
 /// SPEC-4.3.10: "The job-stream page 404s an unknown run, otherwise resolves
 /// the attempt's on-disk stream-log path and the job key's link href through
-/// the same effective-link-template resolution used elsewhere."
+/// the same effective-link-template resolution used elsewhere." The computed
+/// path is only ever displayed here, never read, but a `key` that resolves
+/// outside the logs directory (see [`canonicalize_within_logs_dir`]) still
+/// 404s rather than showing the escaped path back to the caller.
 async fn job_stream_page(
     State(s): State<WebState>,
     AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
@@ -7996,7 +8042,19 @@ async fn job_stream_page(
     .fetch_optional(&s.api.pool)
     .await?;
     let action_name = action_name.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
-    let stream = ClaudeInvoker::stream_log_path(&s.paths.logs_dir(), &action_name, &key, attempt);
+    let logs_dir = s.paths.logs_dir();
+    let stream = ClaudeInvoker::stream_log_path(&logs_dir, &action_name, &key, attempt);
+    match canonicalize_within_logs_dir(&logs_dir, &stream) {
+        Ok(StreamLogPath::Escaped) => {
+            tracing::error!(path = %stream.display(), "stream-log path resolves outside the logs directory");
+            return Err(WebError::not_found(format!("no run #{id}")));
+        }
+        Ok(StreamLogPath::Missing | StreamLogPath::Found(_)) => {}
+        Err(e) => {
+            tracing::error!(path = %logs_dir.display(), error = %e, "logs directory unreadable");
+            return Err(WebError::not_found(format!("no run #{id}")));
+        }
+    }
     let base = s.api.settings.auth_config().await.youtrack_base_url;
     let href = action_link_template(
         &s.api.pool,
@@ -8021,7 +8079,10 @@ async fn job_stream_page(
 /// SPEC-3.16 item 3: serves an attempt's post-success review evidence file
 /// (the full sweep the capped verdict marker links to) as plain text. 404s
 /// when the run is unknown or the attempt wrote no evidence file, mirroring
-/// [`job_stream_page`]'s action-name lookup.
+/// [`job_stream_page`]'s action-name lookup. The served path is built from
+/// the untrusted `key` path segment, so it is canonicalized and checked
+/// against the logs directory before being read; see
+/// [`canonicalize_within_logs_dir`].
 async fn job_review_evidence(
     State(s): State<WebState>,
     AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
@@ -8040,15 +8101,23 @@ async fn job_review_evidence(
             "no review evidence file for run #{id}, job {key}, attempt {attempt}"
         ))
     };
-    let path = ClaudeInvoker::review_evidence_authoritative(
-        &s.paths.logs_dir(),
-        &action_name,
-        &key,
-        attempt,
-    )
-    .ok_or_else(not_found)?;
-    let content = std::fs::read_to_string(&path).map_err(|e| {
-        tracing::error!(path = %path.display(), error = %e, "review evidence file unreadable");
+    let logs_dir = s.paths.logs_dir();
+    let path = ClaudeInvoker::review_evidence_authoritative(&logs_dir, &action_name, &key, attempt)
+        .ok_or_else(not_found)?;
+    let canon_path = match canonicalize_within_logs_dir(&logs_dir, &path) {
+        Ok(StreamLogPath::Found(p)) => p,
+        Ok(StreamLogPath::Missing) => return Err(not_found()),
+        Ok(StreamLogPath::Escaped) => {
+            tracing::error!(path = %path.display(), "review evidence path resolves outside the logs directory");
+            return Err(not_found());
+        }
+        Err(e) => {
+            tracing::error!(path = %logs_dir.display(), error = %e, "logs directory unreadable");
+            return Err(not_found());
+        }
+    };
+    let content = std::fs::read_to_string(&canon_path).map_err(|e| {
+        tracing::error!(path = %canon_path.display(), error = %e, "review evidence file unreadable");
         not_found()
     })?;
     let mut resp = Response::new(Body::from(content));
@@ -8083,16 +8152,19 @@ async fn job_gate_output(
         ))
     };
     let logs_dir = s.paths.logs_dir();
-    let canon_logs_dir = std::fs::canonicalize(&logs_dir).map_err(|e| {
-        tracing::error!(path = %logs_dir.display(), error = %e, "logs directory unreadable");
-        not_found()
-    })?;
     let path = ClaudeInvoker::gate_output_path(&logs_dir, &action_name, &key, attempt);
-    let canon_path = std::fs::canonicalize(&path).map_err(|_| not_found())?;
-    if !canon_path.starts_with(&canon_logs_dir) {
-        tracing::error!(path = %canon_path.display(), "gate-output path resolves outside the logs directory");
-        return Err(not_found());
-    }
+    let canon_path = match canonicalize_within_logs_dir(&logs_dir, &path) {
+        Ok(StreamLogPath::Found(p)) => p,
+        Ok(StreamLogPath::Missing) => return Err(not_found()),
+        Ok(StreamLogPath::Escaped) => {
+            tracing::error!(path = %path.display(), "gate-output path resolves outside the logs directory");
+            return Err(not_found());
+        }
+        Err(e) => {
+            tracing::error!(path = %logs_dir.display(), error = %e, "logs directory unreadable");
+            return Err(not_found());
+        }
+    };
     let content = std::fs::read_to_string(&canon_path).map_err(|e| {
         tracing::error!(path = %canon_path.display(), error = %e, "gate-output file unreadable");
         not_found()
@@ -8136,7 +8208,10 @@ fn augment_stream_line_ts(line: &str, prefs: &crate::config::PreferencesConfig) 
 /// versus `no-stream-yet` on a live one, resuming from `Last-Event-ID` (or a
 /// `lastEventId` query param on a manual reconnect) by line index, and
 /// closing with a `done` event on a `type: result` line or a matching
-/// `job_outcomes` row."
+/// `job_outcomes` row." The served path is built from the untrusted `key`
+/// path segment, so once it appears it is canonicalized and checked against
+/// the logs directory before being opened; see
+/// [`canonicalize_within_logs_dir`].
 async fn job_stream_sse(
     State(s): State<WebState>,
     AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
@@ -8159,7 +8234,8 @@ async fn job_stream_sse(
     // permanent answer (swept by the retention sweep, or never written), not
     // the "the agent has not started writing" one the wait below reports.
     let run_ended = ended_at.is_some();
-    let path = ClaudeInvoker::stream_log_path(&s.paths.logs_dir(), &action_name, &key, attempt);
+    let logs_dir = s.paths.logs_dir();
+    let path = ClaudeInvoker::stream_log_path(&logs_dir, &action_name, &key, attempt);
 
     // Snapshot the display preferences for this connection so each
     // event's `ts` is formatted server-side (chrono strftime can't run in JS),
@@ -8207,7 +8283,40 @@ async fn job_stream_sse(
             return;
         }
 
-        let file = match tokio::fs::File::open(&path).await {
+        // The path is built from the untrusted `key`, so canonicalize and
+        // check it against the logs directory before opening it, the same
+        // symlink-escape and path-traversal defense `get_stream_log` already
+        // applies (src/mcp.rs). An escape is reported as `stream-log-gone`
+        // rather than distinguished from a genuinely missing file, so a
+        // probing `key` learns nothing from the response.
+        let canon_path = match canonicalize_within_logs_dir(&logs_dir, &path) {
+            Ok(StreamLogPath::Found(p)) => p,
+            Ok(StreamLogPath::Missing) => {
+                yield Ok(Event::default().event("msg").data(
+                    serde_json::json!({"type": "system", "subtype": "stream-log-gone"}).to_string()
+                ));
+                yield Ok(Event::default().event("done").data(""));
+                return;
+            }
+            Ok(StreamLogPath::Escaped) => {
+                tracing::error!(path = %path.display(), "stream-log path resolves outside the logs directory");
+                yield Ok(Event::default().event("msg").data(
+                    serde_json::json!({"type": "system", "subtype": "stream-log-gone"}).to_string()
+                ));
+                yield Ok(Event::default().event("done").data(""));
+                return;
+            }
+            Err(e) => {
+                tracing::error!(path = %logs_dir.display(), error = %e, "logs directory unreadable");
+                yield Ok(Event::default().event("msg").data(
+                    serde_json::json!({"type": "system", "subtype": "stream-log-gone"}).to_string()
+                ));
+                yield Ok(Event::default().event("done").data(""));
+                return;
+            }
+        };
+
+        let file = match tokio::fs::File::open(&canon_path).await {
             Ok(f) => f,
             Err(e) => {
                 yield Ok(Event::default().event("msg").data(
@@ -15434,6 +15543,40 @@ mod tests {
                 .into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         }
+
+        /// A `key` path segment crafted to walk the evidence file outside
+        /// the logs directory entirely is rejected as a 404 rather than
+        /// served, even though the file it resolves to exists and is
+        /// readable. `act/streams/` must physically exist for
+        /// `canonicalize` to resolve the `..` segments at all (it walks
+        /// components left-to-right), so this test creates it, then
+        /// escapes three levels up (past `streams`, `act` and `logs`
+        /// itself) to a file sitting next to the logs directory. Mirrors
+        /// `gate_output_route::path_traversal_in_the_key_segment_is_rejected`.
+        #[tokio::test]
+        async fn path_traversal_in_the_key_segment_is_rejected() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_run(&s.api.pool, 1).await;
+            let logs = s.paths.logs_dir();
+            std::fs::create_dir_all(logs.join("act").join("streams")).unwrap();
+            // `review_evidence_path` joins
+            // `act/streams/{key}-attempt-{attempt}-review-evidence.md`; a
+            // `key` of `../../../escaped` walks back out of `streams/`,
+            // `act/` and `logs/` itself, landing beside the logs directory.
+            let secret = logs
+                .parent()
+                .unwrap()
+                .join("escaped-attempt-1-review-evidence.md");
+            std::fs::write(&secret, "outside the logs dir").unwrap();
+            let traversal_key = "../../../escaped".to_string();
+
+            let resp = job_review_evidence(State(s), AxumPath((1, traversal_key, 1)))
+                .await
+                .unwrap_err()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     /// SPEC-4.3.10: the run-detail attempt route that serves a
@@ -15564,6 +15707,231 @@ mod tests {
                 .unwrap_err()
                 .into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    /// SPEC-4.3.10: the run-detail attempt route that displays the
+    /// resolved stream-log path (and the job key's link href), never reading
+    /// the file itself.
+    mod stream_page_route {
+        use super::super::{job_stream_page, WebState};
+        use crate::api::AppState;
+        use crate::cancel::RunRegistry;
+        use crate::config::Paths;
+        use axum::extract::{Path as AxumPath, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+
+        async fn web_state(tmp: &std::path::Path) -> WebState {
+            let pool = crate::db::test_pool().await;
+            let (trigger_tx, _rx) = tokio::sync::mpsc::channel(8);
+            let api = Arc::new(AppState {
+                pool: pool.clone(),
+                trigger_tx,
+                version: "test",
+                runs: Arc::new(RunRegistry::new()),
+                in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                anthropic_key: None,
+                readiness: None,
+                claude_login: None,
+                fj_data_home: tmp.join("fj-data"),
+                claude_binary: "claude".to_string(),
+                gh_binary: "gh".to_string(),
+                agent_config_dir: None,
+                settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
+                paths: Paths {
+                    config_dir: tmp.join("config"),
+                    data_dir: tmp.join("data"),
+                    state_dir: tmp.join("state"),
+                    runtime_dir: tmp.join("runtime"),
+                },
+            });
+            let paths = crate::config::Paths {
+                config_dir: tmp.join("config"),
+                data_dir: tmp.join("data"),
+                state_dir: tmp.join("state"),
+                runtime_dir: tmp.join("runtime"),
+            };
+            WebState { api, paths }
+        }
+
+        async fn seed_run(pool: &crate::db::DbPool, id: i64) {
+            sqlx::query(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    pool,
+                    "INSERT INTO runs (id, action_name, started_at, triggered_by) \
+                 VALUES (?, 'act', '2026-06-26T00:00:00+00:00', 'schedule')",
+                )
+                .into_owned(),
+            ))
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn renders_the_page_when_the_stream_file_does_not_exist_yet() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_run(&s.api.pool, 1).await;
+
+            // A live run that has not started writing yet is not an error:
+            // the page still renders, and the SSE route reports
+            // `no-stream-yet` for the actual tail.
+            let resp = job_stream_page(State(s), AxumPath((1, "DEMO-1".to_string(), 1)))
+                .await
+                .unwrap();
+            let _ = resp;
+        }
+
+        #[tokio::test]
+        async fn unknown_run_is_a_404() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            let resp = job_stream_page(State(s), AxumPath((99, "DEMO-1".to_string(), 1)))
+                .await
+                .unwrap_err()
+                .into_response();
+            assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        }
+
+        /// A `key` path segment crafted to walk the stream-log path outside
+        /// the logs directory entirely is rejected as a 404 rather than
+        /// rendered, even though the file it resolves to exists, so the
+        /// page never discloses an escaped path back to the caller.
+        /// `act/streams/` must physically exist for `canonicalize` to
+        /// resolve the `..` segments at all (it walks components
+        /// left-to-right), so this test creates it, then escapes three
+        /// levels up (past `streams`, `act` and `logs` itself) to a file
+        /// sitting next to the logs directory.
+        #[tokio::test]
+        async fn path_traversal_in_the_key_segment_is_rejected() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_run(&s.api.pool, 1).await;
+            let logs = s.paths.logs_dir();
+            std::fs::create_dir_all(logs.join("act").join("streams")).unwrap();
+            // `stream_log_path` joins `act/streams/{key}-attempt-{attempt}.jsonl`;
+            // a `key` of `../../../escaped` walks back out of `streams/`,
+            // `act/` and `logs/` itself, landing beside the logs directory.
+            let secret = logs.parent().unwrap().join("escaped-attempt-1.jsonl");
+            std::fs::write(&secret, "outside the logs dir").unwrap();
+            let traversal_key = "../../../escaped".to_string();
+
+            let resp = job_stream_page(State(s), AxumPath((1, traversal_key, 1)))
+                .await
+                .unwrap_err()
+                .into_response();
+            assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        }
+    }
+
+    /// SPEC-4.3.10: the SSE feed that tails an attempt's stream-log file.
+    mod stream_sse_route {
+        use super::super::{job_stream_sse, WebState};
+        use crate::api::AppState;
+        use crate::cancel::RunRegistry;
+        use crate::config::Paths;
+        use axum::extract::{Path as AxumPath, Query, State};
+        use axum::response::IntoResponse;
+        use axum::response::Response;
+        use std::sync::Arc;
+
+        async fn web_state(tmp: &std::path::Path) -> WebState {
+            let pool = crate::db::test_pool().await;
+            let (trigger_tx, _rx) = tokio::sync::mpsc::channel(8);
+            let api = Arc::new(AppState {
+                pool: pool.clone(),
+                trigger_tx,
+                version: "test",
+                runs: Arc::new(RunRegistry::new()),
+                in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                anthropic_key: None,
+                readiness: None,
+                claude_login: None,
+                fj_data_home: tmp.join("fj-data"),
+                claude_binary: "claude".to_string(),
+                gh_binary: "gh".to_string(),
+                agent_config_dir: None,
+                settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
+                paths: Paths {
+                    config_dir: tmp.join("config"),
+                    data_dir: tmp.join("data"),
+                    state_dir: tmp.join("state"),
+                    runtime_dir: tmp.join("runtime"),
+                },
+            });
+            let paths = crate::config::Paths {
+                config_dir: tmp.join("config"),
+                data_dir: tmp.join("data"),
+                state_dir: tmp.join("state"),
+                runtime_dir: tmp.join("runtime"),
+            };
+            WebState { api, paths }
+        }
+
+        async fn seed_ended_run(pool: &crate::db::DbPool, id: i64) {
+            sqlx::query(sqlx::AssertSqlSafe(
+                crate::db::q(
+                    pool,
+                    "INSERT INTO runs (id, action_name, started_at, ended_at, triggered_by) \
+                 VALUES (?, 'act', '2026-06-26T00:00:00+00:00', '2026-06-26T00:01:00+00:00', 'schedule')",
+                )
+                .into_owned(),
+            ))
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        async fn body_string(resp: Response) -> String {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        /// A `key` path segment crafted to walk the stream-log path outside
+        /// the logs directory entirely reports the same `stream-log-gone`
+        /// the SSE route already uses for a genuinely missing file, never
+        /// the content of the file it resolves to outside the logs
+        /// directory. `act/streams/` must physically exist and the run must
+        /// have ended (so `path.exists()` is checked eagerly rather than
+        /// waited on) to actually exercise the canonicalize-and-reject path
+        /// rather than the ordinary "no file yet" one; the escape lands
+        /// three levels up (past `streams`, `act` and `logs` itself).
+        #[tokio::test]
+        async fn path_traversal_in_the_key_segment_reports_gone_not_the_escaped_content() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_ended_run(&s.api.pool, 1).await;
+            let logs = s.paths.logs_dir();
+            std::fs::create_dir_all(logs.join("act").join("streams")).unwrap();
+            // `stream_log_path` joins `act/streams/{key}-attempt-{attempt}.jsonl`;
+            // a `key` of `../../../escaped` walks back out of `streams/`,
+            // `act/` and `logs/` itself, landing beside the logs directory.
+            let secret = logs.parent().unwrap().join("escaped-attempt-1.jsonl");
+            std::fs::write(&secret, "SECRET CONTENT OUTSIDE LOGS DIR").unwrap();
+            let traversal_key = "../../../escaped".to_string();
+
+            let resp = job_stream_sse(
+                State(s),
+                AxumPath((1, traversal_key, 1)),
+                axum::http::HeaderMap::new(),
+                Query(std::collections::HashMap::new()),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            let body = tokio::time::timeout(std::time::Duration::from_secs(10), body_string(resp))
+                .await
+                .expect("SSE stream did not close after its done event");
+
+            assert!(body.contains("stream-log-gone"), "{body}");
+            assert!(!body.contains("SECRET CONTENT"), "{body}");
         }
     }
 }
