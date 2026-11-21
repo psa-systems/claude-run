@@ -1,27 +1,27 @@
 # CLAUDE.md
 
-This file guides Claude Code (claude.ai/code) when working with code in this repository.
+This file guides Claude Code (claude.ai/code) in this repository.
 
 # claude-run
 
-YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Forgejo PRs, ...), feed each job to `claude --print`, do something with the result. Shipped only as a Docker image around a single Rust binary (`claude-run`) that doubles as a CLI and a long-running daemon with a unix-socket API.
+YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Forgejo PRs, ...), feed each job to `claude --print`, act on the result. Shipped only as a Docker image around one Rust binary (`claude-run`), both a CLI and a long-running daemon with a unix-socket API.
 
 ## Shape
 
 - Rust binary, library + bin. `clap` derive. Subcommand tree: `claude-run {run,serve,stop,restart,trigger,cancel,pause,resume,status,action,access,secret,mcp,migrate,import,test-postgres}`.
 - Actions are YAML files under `$CLAUDE_RUN_CONFIG_DIR/actions/` (`/config/actions/` in the container). Each action's `input.command` / `filter` / `pre[]` / `prompt` / `post[]` is a nu snippet shelled out via the host's `nu` binary.
 - Runtime state in SQLite at `$CLAUDE_RUN_DATA_DIR/state.db` by default, or in PostgreSQL when the operator sets one (CLAUDE-250; see the `[database]` note below). Per-attempt stream logs at `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`, bounded by the CLAUDE-245 sweep.
-- Daemon (`claude-run serve`) owns scheduling and exposes an HTTP API over `$CLAUDE_RUN_RUNTIME_DIR/daemon.sock`. CLI subcommands delegate to the daemon when reachable, else operate directly on the DB. The socket is the CLI's control plane and nothing else:
+- Daemon (`claude-run serve`) owns scheduling and exposes an HTTP API over `$CLAUDE_RUN_RUNTIME_DIR/daemon.sock`. CLI subcommands delegate to the daemon when reachable, else operate directly on the DB. The socket is the CLI's control plane, nothing else:
   `api::router` is built twice from one `api_state`, bare-path on the socket and nested under `/api` on the TCP listener, which is what the web UI's own buttons POST to.
   `serve --no-socket` skips the bind for a deployment with no CLI operator, and the container image runs that way (`CMD ["serve", "--no-socket"]`) because the socket has no auth gate (the CLAUDE-48 token wraps only the TCP router) and otherwise sits in the agent's own container, as the same user.
-  `trigger` and `cancel` then fail naming that reason instead of "no daemon"; the DB-direct subcommands are unaffected.
+  `trigger` and `cancel` fail naming that reason instead of "no daemon"; DB-direct subcommands are unaffected.
 - Runtime tool dependencies ship in the runtime image, not in the binary: `nu`, `claude` (Claude Code CLI), `timeout` (coreutils), `yt`, `fj`, `gh`, `git`. Docker is the only supported install.
-- Forgejo: `psa-systems/claude-run`.
+- Forge: `psa-systems/claude-run`.
 
 ## Commands
 
 - `just check`: fmt + clippy + build + tests + builder-stage docker compile (the full CI gate). It starts with the CLAUDE.md guard, `just check-claude-md` (CLAUDE-370). `just pre-commit` runs only a fmt-only check inside the builder image via `docker run` (common's default `hook_layout := "pre-push"`); `just pre-push` runs the full suite (fmt, clippy, compile, tests) there.
-- CI's exact steps (`.forgejo/workflows/check.yml`): `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build --all-targets`, then `cargo test` twice: once on SQLite, once with `CLAUDE_RUN_TEST_DATABASE_URL=postgres://...` set, which switches every test fixture onto Postgres (one schema per test, `SPEC-5.6`). A DB change must pass both.
+- CI's exact steps (`.forgejo/workflows/check.yml`): `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build --all-targets`, then `cargo test` twice: once on SQLite, once with `CLAUDE_RUN_TEST_DATABASE_URL=postgres://...` set, switching every fixture to Postgres (one schema per test, `SPEC-5.6`). A DB change must pass both.
 - Single test: `cargo test <name_substring>` (e.g. `cargo test shipped_action_queries_are_disjoint`); one module: `cargo test native::youtrack::`. Unit tests live in `src/**` under `mod tests` on the library target; `tests/fixtures/` holds data only.
 - `just run <args>` = `cargo run -- <args>`.
 - Any test that execs a stub script must create it with `testutil::write_stub`, never `fs::write` + `set_permissions` (ETXTBSY race across test threads, CLAUDE-224 / CLAUDE-255).
@@ -48,6 +48,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - Governance `.env.example`, HOST_IP/PORT split and fixed ports do not apply; UI binds `127.0.0.1:7321` ([CLAUDE-37](docs/conventions/governance.md#template-env-and-ports-do-not-apply-claude-37))
 - `actions/SCHEMA.md` is the authoritative action schema; a change updates runner and doc together ([details](docs/conventions/governance.md#action-schema))
 - `docs/specification.md` is normative: code cites `SPEC-<section>`, and every attempt with commits ends with a pushed branch ([CLAUDE-485](docs/conventions/specification.md))
+- A `specification`-branch PR runs only three CI jobs ([details](docs/conventions/specification.md#the-specification-branch-flow))
 
 ### Web UI authentication
 
@@ -153,8 +154,8 @@ Cross-cutting (not a numbered phase): a container runtime (CLAUDE-37, made self-
 
 ## Working on this repo
 
-- Branch off `main` per `governance/GIT_WORKFLOW.md`. Run `just pre-push` (or rely on the installed pre-push hook) before pushing; `just install-hooks` writes both the `pre-commit` (fmt-only) and `pre-push` (full suite) stubs, so re-run it once after pulling a `common` bump to pick up the `pre-push` hook.
-- `just check` runs the same fmt + clippy + build + tests CI runs. CI also runs the CLAUDE.md guard as its own `claude-md` job.
+- Branch off `main` per `governance/GIT_WORKFLOW.md`. Run `just pre-push` (or rely on the installed hook) before pushing; `just install-hooks` writes the `pre-commit` (fmt-only) and `pre-push` (full suite) stubs; re-run it after a `common` bump to pick up the hook.
+- `just check` mirrors CI's fmt + clippy + build + tests; CI also runs the CLAUDE.md guard as `claude-md`.
 - The task runner is the shared `psa-systems/common` recipe set, vendored as the `common` submodule (`git submodule update --init` after a fresh clone).
   `justfile` configures it through variables (`pre_commit_mode := "docker"` + `dev_image` because there is no `compose.dev.yml`, `test_args := ""` so the library-target unit tests are not skipped) and overrides only `default`, `check`, and `run`. Prefer setting a common variable over shadowing a shared recipe.
   `default` is redefined locally (as the file's first recipe) because just resolves the default recipe by source order and a top-level definition outranks the imported one, so without it a bare `just` runs whichever local recipe comes first instead of common's `just --list` (CLAUDE-201).
