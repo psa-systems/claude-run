@@ -15686,21 +15686,26 @@ mod tests {
         }
 
         /// A `key` path segment crafted to walk the gate-output file outside
-        /// the logs directory (e.g. to another attempt's log, or further up
-        /// the filesystem) is rejected as a 404 rather than served, even
-        /// though the file it resolves to exists and is readable.
+        /// the logs directory entirely is rejected as a 404 rather than
+        /// served, even though the file it resolves to exists and is
+        /// readable. `act/streams/` must physically exist for
+        /// `canonicalize` to resolve the `..` segments at all (it walks
+        /// components left-to-right), so this test creates it, then
+        /// escapes three levels up (past `streams`, `act` and `logs`
+        /// itself) to a file sitting next to the logs directory.
         #[tokio::test]
         async fn path_traversal_in_the_key_segment_is_rejected() {
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
             seed_run(&s.api.pool, 1).await;
             let logs = s.paths.logs_dir();
-            std::fs::create_dir_all(&logs).unwrap();
-            let secret = logs.join("escaped.log");
-            std::fs::write(&secret, "outside the streams dir").unwrap();
-            // `gate_output_path` joins `streams/{key}-attempt-{attempt}-gate.log`;
-            // a `key` of `../../escaped` walks back out of `act/streams/`.
-            let traversal_key = "../../escaped".to_string();
+            std::fs::create_dir_all(logs.join("act").join("streams")).unwrap();
+            // `gate_output_path` joins `act/streams/{key}-attempt-{attempt}-gate.log`;
+            // a `key` of `../../../escaped` walks back out of `streams/`,
+            // `act/` and `logs/` itself, landing beside the logs directory.
+            let secret = logs.parent().unwrap().join("escaped-attempt-1-gate.log");
+            std::fs::write(&secret, "outside the logs dir").unwrap();
+            let traversal_key = "../../../escaped".to_string();
 
             let resp = job_gate_output(State(s), AxumPath((1, traversal_key, 1)))
                 .await
