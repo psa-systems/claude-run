@@ -178,7 +178,7 @@ services:
   # namespace (daemon on `tcp://127.0.0.1:2375`, healthcheck `nc -z`)."
   claude-bot-docker:
     container_name: claude-bot-docker
-    image: docker.io/docker:29.6.2-dind
+    image: docker.io/docker:29.10.0-dind
     privileged: true
     restart: unless-stopped
     # Deliberately no `depends_on: claude-bot`: this service JOINS claude-bot's
@@ -211,7 +211,7 @@ services:
   # (healthcheck `pg_isready`)."
   claude-bot-postgres:
     container_name: claude-bot-postgres
-    image: docker.io/postgres:18.4-alpine3.23
+    image: docker.io/postgres:18.7-alpine3.23
     profiles:
       - postgres
     restart: unless-stopped
