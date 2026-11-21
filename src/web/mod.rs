@@ -11371,7 +11371,8 @@ mod tests {
 
         #[test]
         fn audit_target_type_prefills_and_round_trips() {
-            let yaml = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    audit_target_type: Story\n";
+            let yaml =
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    audit_target_type: Story\n";
             let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
             let form = action_to_youtrack_form(&loaded.action).unwrap();
             assert_eq!(form.yt_audit_target_type, "Story");
