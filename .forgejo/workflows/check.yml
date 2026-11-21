@@ -17,6 +17,12 @@
 # Instead the `changes` job always runs (on the cheap base runner) and the
 # compile job's own `if:` skips it; a skipped job still posts commit status
 # `skipped`, which satisfies the required check.
+#
+# SPEC-11.7, STD-10.6: for a pull request whose head branch is
+# `specification`, `changes`, `claude-md` and `check` skip (their `if:`
+# conditions below also check `github.head_ref`), and only `specification`,
+# `spelling` and `secrets` run. The same reasoning as above applies: these
+# three stay unconditional so a skip never silently drops a required status.
 name: Check
 
 on:
@@ -29,6 +35,10 @@ on:
 
 jobs:
   changes:
+    # SPEC-11.7, STD-10.6: skipped (not absent) for a pull request whose head
+    # branch is `specification`, where only `check-specification`,
+    # `check-spelling` and `check-secrets` may run.
+    if: github.head_ref != 'specification'
     name: classify changed files
     # MEDIUM: only reads the diff, compiles nothing (DEV-769).
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
@@ -48,6 +58,8 @@ jobs:
   claude-md:
     # CLAUDE-370: runs on every push and PR, docs-only ones included, since
     # CLAUDE.md growth is exactly what a docs-only change can introduce.
+    # SPEC-11.7, STD-10.6: skipped for a `specification` head branch, same as `changes`.
+    if: github.head_ref != 'specification'
     name: CLAUDE.md guard
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     steps:
@@ -67,7 +79,9 @@ jobs:
     # CLAUDE-570: skipped for a `non-code` diff; for `comments-only` only the
     # formatting check runs (the steps below gate on `code`). The CLAUDE.md
     # guard and secrets scan run unconditionally.
-    if: needs.changes.outputs.result != 'non-code'
+    # SPEC-11.7, STD-10.6: also skipped for a `specification` head branch,
+    # same as `changes`, whose `result` output this condition already reads.
+    if: needs.changes.outputs.result != 'non-code' && github.head_ref != 'specification'
     name: fmt + clippy + build + tests
     # HEAVY: compiles natively and needs the dev image's `cc` for crate build
     # scripts (CLAUDE-203, DEV-769).
@@ -276,3 +290,37 @@ jobs:
           # still present in this branch's history even after the test
           # itself moved to an already-allowlisted shape).
           kingfisher_skip_regex: 'claude_run:(claude_run|secret|\(\$password\)|<that password>)@|^x-access-token$|oauth2:(secret|tok|tok-123|\(\$pat\))@|ghp_(secret|from_login|action)@|user:s3cr3t@'
+
+  specification:
+    # SPEC-11.6, STD-10.5: runs on every pull request to `main`, including a
+    # `specification` head branch (SPEC-11.7, STD-10.6), and is never skipped.
+    # The shared action itself owns the check (STD-3.1); this repository
+    # carries no copy of its logic.
+    name: Specification scope
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
+    steps:
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Check specification scope
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/check-specification@main
+
+  spelling:
+    # STD-9.1: runs on every pull request, with no continue-on-error and no
+    # `if:` that would skip it (STD-9.3), including a `specification` head
+    # branch (SPEC-11.7, STD-10.6). The shared action owns the check (STD-3.1).
+    name: Spell check
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
+    steps:
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Check spelling
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/check-spelling@main
+        with:
+          # STD-9.1: pinned MAJOR.MINOR.PATCH, never a range or `latest` (SPEC-8.72).
+          version: "10.5.2"
