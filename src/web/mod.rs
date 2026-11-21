@@ -7981,6 +7981,22 @@ struct JobStreamTpl {
     href: Option<String>,
 }
 
+/// Canonicalizes `path` against the canonicalized `logs_dir`, the
+/// symlink-escape defense the `get_stream_log` MCP tool and
+/// [`job_gate_output`] use, since `key` in every one of these routes is an
+/// untrusted path segment baked straight into a filesystem path. Returns
+/// `None` when `path` does not exist, cannot be canonicalized, or resolves
+/// outside `logs_dir`; callers treat all three the same way, since none of
+/// them is something to serve.
+fn canonicalize_within_logs_dir(
+    logs_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let canon_logs_dir = std::fs::canonicalize(logs_dir).ok()?;
+    let canon_path = std::fs::canonicalize(path).ok()?;
+    canon_path.starts_with(&canon_logs_dir).then_some(canon_path)
+}
+
 /// SPEC-4.3.10: "The job-stream page 404s an unknown run, otherwise resolves
 /// the attempt's on-disk stream-log path and the job key's link href through
 /// the same effective-link-template resolution used elsewhere."
@@ -7996,7 +8012,21 @@ async fn job_stream_page(
     .fetch_optional(&s.api.pool)
     .await?;
     let action_name = action_name.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
-    let stream = ClaudeInvoker::stream_log_path(&s.paths.logs_dir(), &action_name, &key, attempt);
+    let logs_dir = s.paths.logs_dir();
+    let stream = ClaudeInvoker::stream_log_path(&logs_dir, &action_name, &key, attempt);
+    // The file commonly does not exist yet (a fresh job has not started
+    // writing), which is a normal state for this page, not an escape: only
+    // reject the path when it DOES exist and resolves outside the logs
+    // directory, mirroring the content-serving routes below without 404ing
+    // the ordinary "not written yet" case.
+    if std::fs::symlink_metadata(&stream).is_ok()
+        && canonicalize_within_logs_dir(&logs_dir, &stream).is_none()
+    {
+        tracing::error!(path = %stream.display(), "stream-log path resolves outside the logs directory");
+        return Err(WebError::not_found(format!(
+            "no stream log for run #{id}, job {key}, attempt {attempt}"
+        )));
+    }
     let base = s.api.settings.auth_config().await.youtrack_base_url;
     let href = action_link_template(
         &s.api.pool,
@@ -8021,7 +8051,9 @@ async fn job_stream_page(
 /// SPEC-3.16 item 3: serves an attempt's post-success review evidence file
 /// (the full sweep the capped verdict marker links to) as plain text. 404s
 /// when the run is unknown or the attempt wrote no evidence file, mirroring
-/// [`job_stream_page`]'s action-name lookup.
+/// [`job_stream_page`]'s action-name lookup. Like [`job_gate_output`], the
+/// served path is built from the untrusted `key` path segment, so it is
+/// canonicalized and checked against the logs directory before being read.
 async fn job_review_evidence(
     State(s): State<WebState>,
     AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
@@ -8040,15 +8072,15 @@ async fn job_review_evidence(
             "no review evidence file for run #{id}, job {key}, attempt {attempt}"
         ))
     };
-    let path = ClaudeInvoker::review_evidence_authoritative(
-        &s.paths.logs_dir(),
-        &action_name,
-        &key,
-        attempt,
-    )
-    .ok_or_else(not_found)?;
-    let content = std::fs::read_to_string(&path).map_err(|e| {
-        tracing::error!(path = %path.display(), error = %e, "review evidence file unreadable");
+    let logs_dir = s.paths.logs_dir();
+    let path = ClaudeInvoker::review_evidence_authoritative(&logs_dir, &action_name, &key, attempt)
+        .ok_or_else(not_found)?;
+    let canon_path = canonicalize_within_logs_dir(&logs_dir, &path).ok_or_else(|| {
+        tracing::error!(path = %path.display(), "review evidence path resolves outside the logs directory");
+        not_found()
+    })?;
+    let content = std::fs::read_to_string(&canon_path).map_err(|e| {
+        tracing::error!(path = %canon_path.display(), error = %e, "review evidence file unreadable");
         not_found()
     })?;
     let mut resp = Response::new(Body::from(content));
@@ -8159,7 +8191,8 @@ async fn job_stream_sse(
     // permanent answer (swept by the retention sweep, or never written), not
     // the "the agent has not started writing" one the wait below reports.
     let run_ended = ended_at.is_some();
-    let path = ClaudeInvoker::stream_log_path(&s.paths.logs_dir(), &action_name, &key, attempt);
+    let logs_dir = s.paths.logs_dir();
+    let path = ClaudeInvoker::stream_log_path(&logs_dir, &action_name, &key, attempt);
 
     // Snapshot the display preferences for this connection so each
     // event's `ts` is formatted server-side (chrono strftime can't run in JS),
@@ -8207,7 +8240,22 @@ async fn job_stream_sse(
             return;
         }
 
-        let file = match tokio::fs::File::open(&path).await {
+        // Like `job_gate_output`, `path` is built from the untrusted `key`
+        // path segment, so a crafted `key` must not resolve outside the logs
+        // directory. The file is known to exist by this point (the wait
+        // above), so this both canonicalizes symlinks and checks containment,
+        // the same defense the `get_stream_log` MCP tool applies.
+        let Some(canon_path) = canonicalize_within_logs_dir(&logs_dir, &path) else {
+            tracing::error!(path = %path.display(), "stream log path resolves outside the logs directory");
+            let subtype = if run_ended { "stream-log-gone" } else { "no-stream-yet" };
+            yield Ok(Event::default().event("msg").data(
+                serde_json::json!({"type": "system", "subtype": subtype}).to_string()
+            ));
+            yield Ok(Event::default().event("done").data(""));
+            return;
+        };
+
+        let file = match tokio::fs::File::open(&canon_path).await {
             Ok(f) => f,
             Err(e) => {
                 yield Ok(Event::default().event("msg").data(
