@@ -2417,3 +2417,35 @@ never write the same registry destination.
   (run #764) where the non-durable one took minutes (run #746). Each unit-test step MUST carry a `timeout-minutes` far
   below the runner's 3 hour job limit. The non-durable server is not a timeout increase, retry or skip: `SPEC-10.1.3`
   still holds for the suite on slow storage.
+### 11.2 Specification changes (`SPEC-11.2`)
+
+This section is the claude-run form of the shared standard on specification changes (common `STD-10`): a person decides a
+requirement first, on its own branch, and implementation follows.
+
+- **SPEC-11.2**: A change that adds, alters or removes a requirement in `docs/specification.md` or `docs/standards.md`
+  MUST be made on the long-lived branch `specification` of this repository and merged to `main` before any implementing
+  change is started (`STD-10.1`).
+- **SPEC-11.3**: A commit on `specification` MUST change only `docs/specification.md` and `docs/standards.md`
+  (`STD-10.2`).
+- **SPEC-11.4**: `specification` MUST be protected so that only a person can push to it, open a pull request from it, or
+  merge one. The account the claude-run AI runner authenticates as to the forge, and every workflow, MUST NOT be able to
+  do any of these (`STD-10.3`).
+- **SPEC-11.5**: No workflow of this repository MUST trigger on a push to `specification` (`STD-10.4`).
+- **SPEC-11.6**: Every pull request to `main` MUST run the shared `check-specification` action from common, and this
+  repository MUST NOT carry its own copy of that check (`STD-10.5`, `STD-3.1`).
+- **SPEC-11.7**: For a pull request whose head branch is `specification`, the workflows of this repository MUST run
+  exactly `check-specification`, `check-spelling` (`STD-9.1`) and `check-secrets` (`STD-5.2`), and MUST skip every other
+  job, including the `changes` job's dependents in `.forgejo/workflows/check.yml`. A job is skipped, never absent
+  (`STD-10.6`).
+- **SPEC-11.8**: `specification` MUST be brought up to date by merging `main` into it with a merge commit, immediately
+  before a pull request from it is opened. The pull request MUST be merged with a merge commit, never squashed or
+  rebased, and `specification` MUST NOT be rebased or force-pushed (`STD-10.7`).
+- **SPEC-11.9**: An issue or pull request whose work changes either document MUST carry the YouTrack tag `specification`
+  or the Forgejo label `specification`, and its summary or title MUST begin with `SPEC: ` when it changes
+  `docs/specification.md` (including when it changes both documents), or `STD: ` when it changes only
+  `docs/standards.md`. An issue or pull request that changes neither document MUST NOT carry the tag, the label or either
+  prefix (`STD-10.8`).
+- **SPEC-11.10**: An implementing issue MUST be filed and queued for the AI runner only after every `SPEC-` and `STD-`
+  identifier it implements is on `main`, and MUST name each one. An implementing change that finds its requirement
+  missing or wrong MUST stop, edit neither document, and report the gap to a person, who decides it on `specification`
+  first (`STD-10.9`).
