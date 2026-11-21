@@ -2130,17 +2130,53 @@ async fn process_job(
         ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1)
     });
 
+    // ---- SPEC-3.3.2 verification gate, before the post-success review
+    // (SPEC-3.3.2) ----
+    // Opens the draft PR and runs the gate now, before the review session
+    // below, under exactly the condition the review's own `if` repeats, so
+    // a failing gate bills no review session. `finalize_with_steps` then
+    // reuses this result (`precomputed_gate`) instead of repeating the
+    // push/PR-create and gate work itself.
+    let precomputed_gate = if claude_ran
+        && split_only.is_none()
+        && claude_result.ok
+        && !workdir_path.join(NEEDS_REVIEW_MARKER).exists()
+        && !workdir_path.join(NO_CODE_MARKER).exists()
+    {
+        Some(crate::blocking::in_place(|| {
+            open_draft_pr_and_gate(
+                forge,
+                job,
+                &workdir_path,
+                pr_strategy,
+                resume.is_some(),
+                src,
+            )
+        }))
+    } else {
+        None
+    };
+    // SPEC-3.3.2: a failing gate bills no review session; a PR-open failure
+    // (tracker-key scan hit or push/PR-create error) is unrelated to the
+    // gate and still gets the review it always did.
+    let gate_failed = matches!(
+        &precomputed_gate,
+        Some(Ok(outcome)) if outcome.gate.failure.is_some()
+    );
+
     // ---- post-success review session (CLAUDE-449) ----
     // A fresh-context session that checks the completed work against the
     // issue before the PR is promoted, run only when the main session
     // succeeded with no outstanding blocker/no-code marker (a blocker or a
     // deliberate no-code run never opens a PR, so there is nothing to
-    // review). Billed exactly like the main invocation.
+    // review) and the gate above did not already fail. Billed exactly like
+    // the main invocation.
     let review = if claude_ran
         && split_only.is_none()
         && claude_result.ok
         && !workdir_path.join(NEEDS_REVIEW_MARKER).exists()
         && !workdir_path.join(NO_CODE_MARKER).exists()
+        && !gate_failed
     {
         let review_stream_log = ClaudeInvoker::review_stream_log_path(
             &paths.logs_dir(),
@@ -2403,6 +2439,7 @@ async fn process_job(
             limits.max_attempts_per_key,
             &gate_output_path,
             &gate_event_sink,
+            precomputed_gate,
             &step_sink,
         )
     });
@@ -2472,6 +2509,10 @@ async fn process_job(
                 },
             )
             .await;
+            // SPEC-3.3.1: a resumed run that finishes
+            // successfully clears a prior run's `failed` flag on this same
+            // PR, the only way the flag is ever cleared.
+            clear_failed_at_resume(pool, &action.name, job, resume.id).await;
         }
     }
     // CLAUDE-630: the run reported success and the PR was promoted to ready;
@@ -2496,6 +2537,30 @@ async fn process_job(
     }) = &finalize_res
     {
         mark_merged_at_finalize(pool, job, *pr_number).await;
+    }
+    // SPEC-3.3.1: every `Failed` outcome (the `requeued: true`
+    // push/PR-create arm reads as `Queued (push)`, not `Failed`; see
+    // `Finalized::as_str`) whose issue has a recorded PR sets that row's
+    // `failed` flag, blocking automerge until a later run for the issue
+    // ends in Code Review. A resumed job's PR is already recorded
+    // (`resume.id`); a fresh job's PR, left open as a draft by a gate
+    // failure, is recorded here for the first time.
+    if let Ok(Finalized::Failed {
+        requeued: false,
+        pr_number,
+        head_branch,
+        ..
+    }) = &finalize_res
+    {
+        mark_failed_at_finalize(
+            pool,
+            &action.name,
+            job,
+            resume.as_ref(),
+            *pr_number,
+            head_branch.as_deref(),
+        )
+        .await;
     }
     let post_failed = match &finalize_res {
         Ok(Finalized::CodeReview { pr_url, .. }) => {
@@ -2951,6 +3016,78 @@ async fn mark_finished_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: 
     };
     if let Err(e) = store::mark_finished(pool, row.id, &state::now_iso()).await {
         tracing::error!(key = %job.key, pr = pr_number, error = %e, "PR promoted to ready at finalize, but marking its agent_pull_requests row finished failed");
+    }
+}
+
+/// SPEC-3.3.1: set the `failed` flag on the `agent_pull_requests`
+/// row for a `Finalized::Failed { requeued: false, .. }` outcome, so automerge
+/// takes no action on the PR until a later run for the issue ends in Code
+/// Review. A resumed job's PR is already recorded; `resume` is consulted
+/// first so its row is marked directly by id, whatever `pr_number` says. A
+/// fresh job's PR is recorded here for the first time, the same way
+/// [`record_new_pr`] does, since only the gate-failure arm of `Failed` ever
+/// carries one (every other arm opens no PR of its own, and `pr_number` is
+/// `None`, so there is nothing to mark). A lookup or write failure is logged
+/// at `error` and otherwise ignored, the same as [`mark_finished_at_finalize`].
+async fn mark_failed_at_finalize(
+    pool: &DbPool,
+    action_name: &str,
+    job: &YoutrackJob,
+    resume: Option<&PrResume>,
+    pr_number: Option<u64>,
+    head_branch: Option<&str>,
+) {
+    use crate::ci_failure::store;
+    let now = state::now_iso();
+    if let Some(resume) = resume {
+        if let Err(e) = store::mark_failed(pool, resume.id, &now).await {
+            tracing::error!(action = %action_name, key = %job.key, pr_id = resume.id, error = %e, "marking the resumed PR's agent_pull_requests row failed");
+        }
+        return;
+    }
+    let (Some(pr_number), Some(head_branch)) = (pr_number, head_branch) else {
+        return;
+    };
+    let host = host_only(&job.repo_host);
+    if let Err(e) = store::record_agent_pr(
+        pool,
+        action_name,
+        &job.key,
+        &host,
+        &job.repo_path,
+        pr_number as i64,
+        head_branch,
+        "open",
+        false,
+        &now,
+    )
+    .await
+    {
+        tracing::error!(action = %action_name, key = %job.key, pr_number, error = %e, "recording the gate-failed PR in agent_pull_requests failed");
+        return;
+    }
+    let row = match store::agent_pr(pool, &host, &job.repo_path, pr_number as i64).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            tracing::error!(key = %job.key, pr_number, "gate-failed PR just recorded, but no agent_pull_requests row exists to mark failed");
+            return;
+        }
+        Err(e) => {
+            tracing::error!(key = %job.key, pr_number, error = %e, "gate-failed PR just recorded, but reading its agent_pull_requests row failed");
+            return;
+        }
+    };
+    if let Err(e) = store::mark_failed(pool, row.id, &now).await {
+        tracing::error!(key = %job.key, pr_number, error = %e, "gate-failed PR just recorded, but marking its agent_pull_requests row failed");
+    }
+}
+
+/// SPEC-3.3.1: the only way a PR's `failed` flag is ever
+/// cleared, a resumed run that finishes in Code Review.
+async fn clear_failed_at_resume(pool: &DbPool, action_name: &str, job: &YoutrackJob, pr_id: i64) {
+    use crate::ci_failure::store;
+    if let Err(e) = store::clear_failed(pool, pr_id, &state::now_iso()).await {
+        tracing::error!(action = %action_name, key = %job.key, pr_id, error = %e, "clearing the failed flag on the resumed PR failed; automerge stays blocked");
     }
 }
 
@@ -3692,6 +3829,168 @@ fn run_verification_gate(workdir: &Path) -> GateResult {
     }
 }
 
+/// SPEC-3.3.2 item 3: whether `command` also failed on the base branch tip,
+/// so a failure this attempt introduced can be told apart from one the base
+/// branch already carries.
+enum BaseGateResult {
+    Fails,
+    Passes,
+    CouldNotRun(String),
+}
+
+/// The result of [`run_gate_on_base_branch`]: the base branch's name, the
+/// comparison's own verdict, and (for `Fails`/`Passes`, where the recipe
+/// actually ran) its stdout/stderr to fold into the same gate-output file.
+struct BaseGateCheck {
+    base_branch: String,
+    result: BaseGateResult,
+    output: Option<(String, String)>,
+}
+
+/// SPEC-3.3.2 item 3: re-run `command` once more against the base branch
+/// tip, in a separate `git worktree` off this same clone (so the base
+/// branch's own history is used, never this attempt's branch), to tell a
+/// failure this attempt introduced apart from one the base branch already
+/// has. Only called for a [`GateFailure::Output`]; a gate that never ran
+/// (`GateFailure::Cause`) has nothing to compare.
+fn run_gate_on_base_branch(workdir: &Path, command: &str) -> BaseGateCheck {
+    let base_ref = match Command::new("git")
+        .current_dir(workdir)
+        .args(["rev-parse", "--abbrev-ref", "origin/HEAD"])
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        Ok(out) => {
+            return BaseGateCheck {
+                base_branch: String::new(),
+                result: BaseGateResult::CouldNotRun(format!(
+                    "resolving the base branch failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )),
+                output: None,
+            }
+        }
+        Err(e) => {
+            return BaseGateCheck {
+                base_branch: String::new(),
+                result: BaseGateResult::CouldNotRun(format!(
+                    "resolving the base branch failed: {e}"
+                )),
+                output: None,
+            }
+        }
+    };
+    let base_branch = base_ref
+        .strip_prefix("origin/")
+        .unwrap_or(&base_ref)
+        .to_string();
+    let tmp = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            return BaseGateCheck {
+                base_branch,
+                result: BaseGateResult::CouldNotRun(format!(
+                    "creating a temp dir for the base-branch checkout failed: {e}"
+                )),
+                output: None,
+            }
+        }
+    };
+    let add = Command::new("git")
+        .current_dir(workdir)
+        .args(["worktree", "add", "--detach"])
+        .arg(tmp.path())
+        .arg(&base_ref)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    match add {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            return BaseGateCheck {
+                base_branch,
+                result: BaseGateResult::CouldNotRun(format!(
+                    "checking out the base branch failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )),
+                output: None,
+            }
+        }
+        Err(e) => {
+            return BaseGateCheck {
+                base_branch,
+                result: BaseGateResult::CouldNotRun(format!(
+                    "checking out the base branch failed: {e}"
+                )),
+                output: None,
+            }
+        }
+    }
+    let probe = Command::new("just")
+        .current_dir(tmp.path())
+        .arg("--show")
+        .arg(command)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !matches!(probe, Ok(s) if s.success()) {
+        let _ = Command::new("git")
+            .current_dir(workdir)
+            .args(["worktree", "remove", "--force"])
+            .arg(tmp.path())
+            .status();
+        return BaseGateCheck {
+            base_branch,
+            result: BaseGateResult::CouldNotRun(format!(
+                "the base branch has no `{command}` recipe"
+            )),
+            output: None,
+        };
+    }
+    let ran = run_recipe_timed(tmp.path(), command);
+    let _ = Command::new("git")
+        .current_dir(workdir)
+        .args(["worktree", "remove", "--force"])
+        .arg(tmp.path())
+        .status();
+    match ran {
+        Ok((status, stdout, stderr, _timed)) => BaseGateCheck {
+            base_branch,
+            result: if status.success() {
+                BaseGateResult::Passes
+            } else {
+                BaseGateResult::Fails
+            },
+            output: Some((stdout, stderr)),
+        },
+        Err(e) => BaseGateCheck {
+            base_branch,
+            result: BaseGateResult::CouldNotRun(format!(
+                "running `just {command}` on the base branch failed: {e}"
+            )),
+            output: None,
+        },
+    }
+}
+
+/// SPEC-3.3.2 item 3, SPEC-3.16 item 3: exactly one of these three sentences,
+/// folded onto the same line as [`gate_failure_comment`]'s own cause.
+fn base_gate_comment_note(check: &BaseGateCheck) -> String {
+    match &check.result {
+        BaseGateResult::Fails => format!(
+            "The base branch (`{}`) fails the same check too.",
+            check.base_branch
+        ),
+        BaseGateResult::Passes => format!(
+            "The base branch (`{}`) passes the same check.",
+            check.base_branch
+        ),
+        BaseGateResult::CouldNotRun(cause) => {
+            format!("The base branch check could not be run: {cause}.")
+        }
+    }
+}
+
 /// The most bytes [`write_gate_output`] stores; the gate's own
 /// output can run to thousands of lines (a `cargo test` report, a dprint
 /// diff) and the file is meant to be fully useful, not a token bucket, but it
@@ -3745,11 +4044,28 @@ fn cap_gate_output(text: String) -> String {
 /// escape-stripped and capped (see [`full_gate_output`], [`cap_gate_output`]),
 /// creating the `streams/` parent directory first since nothing earlier in
 /// this attempt necessarily did.
-fn write_gate_output(path: &Path, stdout: &str, stderr: &str) -> std::io::Result<()> {
+/// SPEC-3.3.2 item 3: `base`, when given, is the base branch's own
+/// comparison run's name and stdout/stderr (only present for
+/// [`BaseGateResult::Fails`]/[`BaseGateResult::Passes`]); it is appended
+/// after a section header naming the base branch, in the same file, capped
+/// together with the main output rather than separately.
+fn write_gate_output(
+    path: &Path,
+    stdout: &str,
+    stderr: &str,
+    base: Option<(&str, &str, &str)>,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, cap_gate_output(full_gate_output(stderr, stdout)))
+    let mut text = full_gate_output(stderr, stdout);
+    if let Some((base_branch, base_stdout, base_stderr)) = base {
+        text.push_str(&format!(
+            "\n\n--- base branch ({base_branch}) ---\n{}",
+            full_gate_output(base_stderr, base_stdout)
+        ));
+    }
+    std::fs::write(path, cap_gate_output(text))
 }
 
 /// The gate-output page's URL, built the same
@@ -3787,27 +4103,35 @@ fn store_gate_output_and_note(
     attempt: u32,
     command: &str,
     record_gate_event: &dyn Fn(&str),
+    base_check: Option<&BaseGateCheck>,
 ) -> Option<String> {
     let GateFailure::Output { stdout, stderr, .. } = output else {
         return None;
     };
-    Some(match write_gate_output(gate_output_path, stdout, stderr) {
-        Ok(()) => {
-            let link = gate_output_link_text(public_url, run_id, key, attempt);
-            info!(key = %key, command, gate_output = %gate_output_path.display(), "SPEC-3.3.2 verification gate failed; full output stored");
-            record_gate_event(&format!(
-                "SPEC-3.3.2 verification gate failed (`just {command}`); full output: {link}"
-            ));
-            format!("the full output is at {link}")
-        }
-        Err(e) => {
-            error!(key = %key, command, gate_output = %gate_output_path.display(), error = %e, "storing the SPEC-3.3.2 gate output failed");
-            record_gate_event(&format!(
+    let base = base_check.and_then(|c| {
+        c.output
+            .as_ref()
+            .map(|(bo, be)| (c.base_branch.as_str(), bo.as_str(), be.as_str()))
+    });
+    Some(
+        match write_gate_output(gate_output_path, stdout, stderr, base) {
+            Ok(()) => {
+                let link = gate_output_link_text(public_url, run_id, key, attempt);
+                info!(key = %key, command, gate_output = %gate_output_path.display(), "SPEC-3.3.2 verification gate failed; full output stored");
+                record_gate_event(&format!(
+                    "SPEC-3.3.2 verification gate failed (`just {command}`); full output: {link}"
+                ));
+                format!("the full output is at {link}")
+            }
+            Err(e) => {
+                error!(key = %key, command, gate_output = %gate_output_path.display(), error = %e, "storing the SPEC-3.3.2 gate output failed");
+                record_gate_event(&format!(
                 "SPEC-3.3.2 verification gate failed (`just {command}`); storing its output failed: {e}"
             ));
-            format!("storing it failed: {e}")
-        }
-    })
+                format!("storing it failed: {e}")
+            }
+        },
+    )
 }
 
 /// The URL to clone this job's repo from.
@@ -5015,6 +5339,15 @@ enum Finalized {
         /// failure that has no recorded PR, is at the attempt cap, or finds
         /// the field already advanced off `Working`.
         requeued: bool,
+        /// SPEC-3.3.1: the PR a fresh (non-resumed) run opened
+        /// in this same attempt before the verification gate failed, left as
+        /// an un-promoted draft. `None` for every other `Failed` arm, since
+        /// none of them opens a PR of its own; `process_job` records it in
+        /// `agent_pull_requests` and sets its `failed` flag (a resumed run's
+        /// PR is already recorded, so that case marks `resume.id` directly
+        /// instead).
+        pr_number: Option<u64>,
+        head_branch: Option<String>,
     },
     /// Claude hit the wall-clock limit (exit 124). The work may be
     /// complete, partial, or absent, so the issue is NOT marked Failed: a
@@ -5347,6 +5680,8 @@ fn final_push_failed(
         cause: err.to_string(),
         pr_step: Some("push"),
         requeued: false,
+        pr_number: None,
+        head_branch: None,
     })
 }
 
@@ -5434,6 +5769,140 @@ fn finish_tracker_key_blocked(
     })
 }
 
+/// A scan hit or a push/PR-create failure from [`open_draft_pr_and_gate`],
+/// the same two outcomes `finalize_with_steps`'s success branch already
+/// handled inline before this was factored out.
+enum PrOpenOutcome {
+    TrackerKeyBlocked(String),
+    CreateFailed {
+        error: Box<Error>,
+        // The attempted push/PR-create call's own timing, so the caller can
+        // still record its failed `push`/`pr_create` step even though the
+        // call itself ran inside this already-returned helper.
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+/// The draft PR and SPEC-3.3.2 gate result [`open_draft_pr_and_gate`]
+/// produces once the PR is open, whether the gate passed or failed.
+struct PrGateOutcome {
+    pr: PullRequest,
+    url: String,
+    text_refresh_error: Option<String>,
+    gate: GateResult,
+}
+
+/// SPEC-3.3.2: the draft-PR-open and
+/// verification-gate portion of `finalize_with_steps`'s success branch,
+/// factored out so `process_job` can run it before billing the post-success
+/// review session, since SPEC-3.3.2 bills no review on a failing gate. Called
+/// either here, inside `finalize_with_steps` itself when no `precomputed`
+/// result was handed in (every existing caller, including every unit test),
+/// or earlier in `process_job`, whose result then arrives as `precomputed`.
+/// Steps are stashed via [`crate::attempt_steps::stash_step_spans`] rather
+/// than reported through a `StepSink` directly, since none may exist yet at
+/// the `process_job` call site; the caller drains them immediately after,
+/// mirroring how a push-time conflict resolution pass already stashes its
+/// own spans for `finalize_with_steps` to drain.
+fn open_draft_pr_and_gate(
+    forge: &dyn Forge,
+    job: &YoutrackJob,
+    workdir: &Path,
+    pr_strategy: crate::action::PrStrategy,
+    resumed: bool,
+    src: &YoutrackSource,
+) -> std::result::Result<PrGateOutcome, PrOpenOutcome> {
+    // The success-branch call of `finalize_with_steps`'s own
+    // `scan_before_push` (`pr_text: None`), made directly here since that
+    // closure is not reachable from this call site.
+    if !src.repo_tracker_refs {
+        match forge.scan_tracker_refs(workdir, None) {
+            Ok(hits) if hits.is_empty() => {}
+            Ok(hits) => return Err(PrOpenOutcome::TrackerKeyBlocked(hits.join(", "))),
+            Err(e) => {
+                return Err(PrOpenOutcome::TrackerKeyBlocked(format!(
+                    "tracker-key scan failed ({e}); refusing to push for safety"
+                )));
+            }
+        }
+    }
+    // Success: open the PR from the agent's local commits via the resolved
+    // Forge (`fj` agit+autofill for Forgejo hosts, the GitHub
+    // backend for GitHub hosts), then report it. Both derive the title/body
+    // from the commit messages, which already carry the bare #<KEY>-N
+    // reference.
+    let host = host_only(&job.repo_host);
+    // Always create/adopt as a draft, whether this is a fresh
+    // PR or a resumed run reclaiming a checkpoint-opened one, so a
+    // review session has a draft to inspect either way; the two cases
+    // converge below on whether it gets promoted to ready.
+    let open_start = chrono::Utc::now();
+    let opened = forge.create_pr_with_draft(workdir, &host, pr_strategy, true, None);
+    let open_end = chrono::Utc::now();
+    // A conflict-resolution pass that ran inside the push is stashed before
+    // it; collect it now so it drains together with this call's own spans.
+    let mut open_start = open_start;
+    let collected = std::cell::RefCell::new(Vec::new());
+    if let Some(latest) = crate::attempt_steps::drain_stashed_spans(&job.key, &|spans| {
+        collected.borrow_mut().extend(spans)
+    }) {
+        open_start = open_start.max(latest);
+    }
+    let mut collected = collected.into_inner();
+    let pr = match opened {
+        Ok(pr) => pr,
+        Err(e) => {
+            crate::attempt_steps::stash_step_spans(&job.key, collected);
+            return Err(PrOpenOutcome::CreateFailed {
+                error: Box::new(e),
+                start: open_start,
+                end: open_end,
+            });
+        }
+    };
+    // SPEC-3.14 item 3: `push` ended where the provider
+    // says; with no push time (nothing pushed, or AGit's single call)
+    // the whole call is the `pr_create` step.
+    collected.extend(pr_open_spans(open_start, open_end, &pr));
+    let url = pr_url(job, &pr);
+    // A resumed run may be adopting a draft PR a
+    // prior timed-out run salvaged; now that the run
+    // succeeded, replace the salvage's placeholder title/body
+    // with the finished tip's own text. Best-effort:
+    // a failure here does not block the success outcome, it just
+    // leaves the PR looking like a draft's text until fixed by
+    // hand, and the cause is named in both the error log and the
+    // outcome comment below so it is never silent.
+    let mut text_refresh_error = None;
+    if resumed {
+        if let Some(pr_number) = pr.number {
+            if let Err(e) = forge.refresh_pr_text(workdir, &host, &job.repo_path, pr_number) {
+                error!(key = %job.key, pr_number, error = %e, "refreshing the resumed PR's title/body failed (continuing)");
+                text_refresh_error = Some(e.to_string());
+            }
+        }
+    }
+    // SPEC-3.3.2: the commits are already pushed and the draft PR
+    // above already exists, so a failed gate still satisfies
+    // SPEC-3.3.1; this only decides whether the attempt is
+    // recorded as a success or a failure. Runs before the
+    // post-success review session: there is no point reviewing a
+    // diff whose own checks do not pass (SPEC-3.3.2).
+    let gate = run_verification_gate(workdir);
+    // SPEC-3.14 item 3: stored the moment the gate ends.
+    if let Some(t) = &gate.timing {
+        collected.extend(crate::attempt_steps::gate_spans(t));
+    }
+    crate::attempt_steps::stash_step_spans(&job.key, collected);
+    Ok(PrGateOutcome {
+        pr,
+        url,
+        text_refresh_error,
+        gate,
+    })
+}
+
 /// [`finalize_with_steps`] with the step hand-off discarded, for the unit tests
 /// that do not assert on stored steps.
 #[cfg(test)]
@@ -5476,6 +5945,7 @@ fn finalize(
         max_attempts_per_key,
         &workdir.join("test-gate-output.log"),
         &|_| {},
+        None,
         &|_| {},
     )
 }
@@ -5541,6 +6011,13 @@ fn finalize_with_steps(
     // deliberately synchronous; the caller supplies a closure that blocks on
     // its own async write, mirroring `step_sink`.
     record_gate_event: &dyn Fn(&str),
+    // SPEC-3.3.2: the success branch's
+    // [`open_draft_pr_and_gate`] result, computed earlier in `process_job`
+    // (before the post-success review session is billed) so a failing gate
+    // bills no review. `None` for every other caller, including every unit
+    // test: the success branch then computes it itself, exactly as before
+    // this was factored out.
+    precomputed: Option<std::result::Result<PrGateOutcome, PrOpenOutcome>>,
     // SPEC-3.14 item 3, CLAUDE-604: receives each `push`, `pr_create` and
     // `gate` span the moment it ends, so it is stored before the next comment.
     steps: crate::attempt_steps::StepSink<'_>,
@@ -5709,8 +6186,18 @@ fn finalize_with_steps(
         info!(key = %job.key, %label, "no-code-change marker present; skipping PR");
         Ok(Finalized::NoCodeChange)
     } else if claude_result.ok {
-        if let Some(hit) = scan_before_push(None) {
-            return finish_tracker_key_blocked(
+        // SPEC-3.3.2: computed either here (no
+        // `precomputed`, every existing caller) or earlier in `process_job`,
+        // before the post-success review session is billed, so a failing
+        // gate bills no review. Either way, its stashed steps drain into
+        // `steps` exactly once, right here.
+        let opened_and_gate = match precomputed {
+            Some(p) => p,
+            None => open_draft_pr_and_gate(forge, job, workdir, pr_strategy, resumed, src),
+        };
+        crate::attempt_steps::drain_stashed_spans(&job.key, steps);
+        match opened_and_gate {
+            Err(PrOpenOutcome::TrackerKeyBlocked(hit)) => finish_tracker_key_blocked(
                 backend,
                 src,
                 job,
@@ -5718,52 +6205,12 @@ fn finalize_with_steps(
                 workdir,
                 public_url.as_deref(),
                 run,
-            );
-        }
-        // Success: open the PR from the agent's local commits via the resolved
-        // Forge (`fj` agit+autofill for Forgejo hosts, the GitHub
-        // backend for GitHub hosts), then report it. Both derive the title/body
-        // from the commit messages, which already carry the bare #<KEY>-N
-        // reference.
-        let host = host_only(&job.repo_host);
-        // CLAUDE-449: always create/adopt as a draft, whether this is a fresh
-        // PR or a resumed run reclaiming a checkpoint-opened one, so a
-        // review session has a draft to inspect either way; the two cases
-        // converge below on whether it gets promoted to ready.
-        let open_start = chrono::Utc::now();
-        let opened = forge.create_pr_with_draft(workdir, &host, pr_strategy, true, None);
-        let open_end = chrono::Utc::now();
-        // A conflict-resolution pass and gate that ran inside the push are stored before it.
-        let mut open_start = open_start;
-        if let Some(latest) = crate::attempt_steps::drain_stashed_spans(&job.key, steps) {
-            open_start = open_start.max(latest);
-        }
-        match opened {
-            Ok(pr) => {
-                // SPEC-3.14 item 3, CLAUDE-604: `push` ended where the provider
-                // says; with no push time (nothing pushed, or AGit's single call)
-                // the whole call is the `pr_create` step.
-                steps(pr_open_spans(open_start, open_end, &pr));
-                let url = pr_url(job, &pr);
-                // A resumed run (CLAUDE-275) may be adopting a draft PR a
-                // prior timed-out run salvaged (CLAUDE-379); now that the run
-                // succeeded, replace the salvage's placeholder title/body
-                // (CLAUDE-398) with the finished tip's own text. Best-effort:
-                // a failure here does not block the success outcome, it just
-                // leaves the PR looking like a draft's text until fixed by
-                // hand, and the cause is named in both the error log and the
-                // outcome comment below so it is never silent.
-                let mut text_refresh_error = None;
-                if resumed {
-                    if let Some(pr_number) = pr.number {
-                        if let Err(e) =
-                            forge.refresh_pr_text(workdir, &host, &job.repo_path, pr_number)
-                        {
-                            error!(key = %job.key, pr_number, error = %e, "refreshing the resumed PR's title/body failed (continuing)");
-                            text_refresh_error = Some(e.to_string());
-                        }
-                    }
-                }
+            ),
+            Ok(outcome) => {
+                let pr = outcome.pr;
+                let host = host_only(&job.repo_host);
+                let url = outcome.url;
+                let text_refresh_error = outcome.text_refresh_error;
                 let text_refresh_note = |body: String| -> String {
                     match &text_refresh_error {
                         Some(e) => format!("{body}\n\nPR text could not be updated: {e}"),
@@ -5776,19 +6223,14 @@ fn finalize_with_steps(
                         None => body,
                     }
                 };
-                // SPEC-3.3.2: the commits are already pushed and the draft PR
-                // above already exists, so a failed gate still satisfies
-                // SPEC-3.3.1; this only decides whether the attempt is
-                // recorded as a success or a failure. Runs before the
-                // post-success review session below: there is no point
-                // reviewing a diff whose own checks do not pass.
-                let gate = run_verification_gate(workdir);
-                // SPEC-3.14 item 3, CLAUDE-604: stored the moment the gate ends.
-                if let Some(t) = &gate.timing {
-                    steps(crate::attempt_steps::gate_spans(t));
-                }
+                let gate = outcome.gate;
                 if let Some(output) = &gate.failure {
                     let command = gate.command.unwrap_or("none");
+                    // SPEC-3.3.2 item 3: only a command that actually ran and
+                    // failed has anything to compare; a `GateFailure::Cause`
+                    // means the gate never ran at all.
+                    let base_check = matches!(output, GateFailure::Output { .. })
+                        .then(|| run_gate_on_base_branch(workdir, command));
                     let output_note = store_gate_output_and_note(
                         output,
                         gate_output_path,
@@ -5798,6 +6240,7 @@ fn finalize_with_steps(
                         run.attempt,
                         command,
                         record_gate_event,
+                        base_check.as_ref(),
                     );
                     if let Some(pr_number) = pr.number {
                         if let Err(e) = post_gate_failure_on_pr(
@@ -5819,6 +6262,7 @@ fn finalize_with_steps(
                         command,
                         output,
                         output_note.as_deref(),
+                        base_check.as_ref(),
                     );
                     let body = text_refresh_note(body);
                     let body = push_comment_note(body);
@@ -5831,6 +6275,8 @@ fn finalize_with_steps(
                         cause: format!("SPEC-3.3.2 verification gate failed (`just {command}`)"),
                         pr_step: Some("verify"),
                         requeued: false,
+                        pr_number: pr.number,
+                        head_branch: pr.head_branch.clone(),
                     });
                 }
                 // CLAUDE-611: an audit review `Fail` files one follow-up issue
@@ -6067,13 +6513,19 @@ fn finalize_with_steps(
                     }
                 }
             }
-            Err(Error::ConflictResolutionFailed {
-                branch,
-                local_sha,
-                remote_sha,
-                files,
-                detail,
-            }) => {
+            Err(PrOpenOutcome::CreateFailed { error, .. })
+                if matches!(*error, Error::ConflictResolutionFailed { .. }) =>
+            {
+                let Error::ConflictResolutionFailed {
+                    branch,
+                    local_sha,
+                    remote_sha,
+                    files,
+                    detail,
+                } = *error
+                else {
+                    unreachable!()
+                };
                 // SPEC-3.12 item 4: distinct from the generic push/
                 // PR-create failure below. `merge_remote_branch` already
                 // aborted the merge before returning this, so the agent's
@@ -6112,7 +6564,11 @@ fn finalize_with_steps(
                 backend.set_field(&job.key, &src.custom_field, &src.states.needs_review)?;
                 Ok(Finalized::NeedsReview)
             }
-            Err(e) => {
+            Err(PrOpenOutcome::CreateFailed {
+                error: e,
+                start: open_start,
+                end: open_end,
+            }) => {
                 // The error reaches the journal here (the run loop only records
                 // `outcome: Failed`). The comment names where the work actually
                 // is (preserved workdir, or the remote branch the push already
@@ -6233,6 +6689,8 @@ fn finalize_with_steps(
                             cause: e.to_string(),
                             pr_step: Some(pr_step),
                             requeued,
+                            pr_number: None,
+                            head_branch: None,
                         })
                     }
                     _ => {
@@ -6251,6 +6709,8 @@ fn finalize_with_steps(
                             cause: e.to_string(),
                             pr_step: Some(pr_step),
                             requeued: false,
+                            pr_number: None,
+                            head_branch: None,
                         })
                     }
                 }
@@ -6434,6 +6894,8 @@ fn finalize_with_steps(
             cause,
             pr_step,
             requeued: false,
+            pr_number: None,
+            head_branch: None,
         })
     }
 }
@@ -7173,6 +7635,10 @@ fn gate_failure_comment(
     command: &str,
     failure: &GateFailure,
     output_note: Option<&str>,
+    // SPEC-3.3.2 item 3, SPEC-3.16 item 3: the base-branch comparison, kept
+    // on this same line as `output_note`/the cause. `None` for a
+    // `GateFailure::Cause`, which has nothing to compare.
+    base_check: Option<&BaseGateCheck>,
 ) -> String {
     let mut first = format!(
         "Claude AI agent run completed, but the runner's own re-run of `just {command}` \
@@ -7183,6 +7649,9 @@ fn gate_failure_comment(
         first.push_str(&format!(
             " The command's output is not included here; {note}."
         ));
+    }
+    if let Some(check) = base_check {
+        first.push_str(&format!(" {}", base_gate_comment_note(check)));
     }
     let mut lines = vec![first, String::new(), format!("Draft PR: {pr_url}")];
     if let GateFailure::Cause(cause) = failure {
@@ -8404,9 +8873,29 @@ mod tests {
     fn write_gate_output_creates_the_parent_dir_and_writes_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("streams").join("DEMO-1-attempt-1-gate.log");
-        write_gate_output(&path, "test result::FAIL some_test", "").unwrap();
+        write_gate_output(&path, "test result::FAIL some_test", "", None).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("test result::FAIL some_test"));
+    }
+
+    /// SPEC-3.3.2 item 3: the base branch's own stdout/stderr is appended to
+    /// the SAME gate-output file, after a section header naming the base
+    /// branch, rather than written to a second file.
+    #[test]
+    fn write_gate_output_appends_the_base_branch_section_to_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("DEMO-1-attempt-1-gate.log");
+        write_gate_output(
+            &path,
+            "head branch output",
+            "",
+            Some(("main", "base branch output", "")),
+        )
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("head branch output"), "{written}");
+        assert!(written.contains("--- base branch (main) ---"), "{written}");
+        assert!(written.contains("base branch output"), "{written}");
     }
 
     /// Acceptance criteria 2 and 3: a gate-output failure stores
@@ -8433,6 +8922,7 @@ mod tests {
             1,
             "pre-push",
             &sink,
+            None,
         )
         .unwrap();
         assert!(
@@ -8479,6 +8969,7 @@ mod tests {
             1,
             "pre-push",
             &sink,
+            None,
         )
         .unwrap();
         assert!(
@@ -8513,6 +9004,7 @@ mod tests {
             1,
             "pre-push",
             &sink,
+            None,
         );
         assert!(note.is_none());
         assert!(!path.exists());
@@ -8912,6 +9404,8 @@ mod tests {
                     cause: "c".into(),
                     pr_step: None,
                     requeued: false,
+                    pr_number: None,
+                    head_branch: None,
                 },
                 "Failed",
             ),
@@ -8920,6 +9414,8 @@ mod tests {
                     cause: "c".into(),
                     pr_step: Some("push"),
                     requeued: true,
+                    pr_number: None,
+                    head_branch: None,
                 },
                 "Retry 2",
             ),
@@ -12896,6 +13392,7 @@ mod tests {
             1000,
             &wd.join("gate-output.log"),
             &|_: &str| {},
+            None,
             &|_| {},
         )
         .unwrap();
@@ -12960,6 +13457,7 @@ mod tests {
             1000,
             &wd.join("gate-output.log"),
             &|_: &str| {},
+            None,
             &|_| {},
         )
         .unwrap();
@@ -13016,6 +13514,7 @@ mod tests {
             1000,
             &wd.join("gate-output.log"),
             &|_: &str| {},
+            None,
             &|_| {},
         )
         .unwrap();
@@ -13768,6 +14267,7 @@ mod tests {
             1000,
             &dir.path().join("gate-output.log"),
             &|_: &str| {},
+            None,
             &sink,
         )
         .unwrap();
@@ -13919,6 +14419,8 @@ mod tests {
                 cause: "SPEC-3.3.2 verification gate failed (`just pre-push`)".into(),
                 pr_step: Some("verify"),
                 requeued: false,
+                pr_number: Some(7),
+                head_branch: Some("feat/x".into()),
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -14924,6 +15426,7 @@ mod tests {
             Some(
                 "the full output is at https://forge.example.org/runs/1/jobs/DEMO-1/attempt/1/gate-output",
             ),
+            None,
         );
         assert!(
             body.contains("just pre-push"),
@@ -14947,6 +15450,7 @@ mod tests {
             "https://dev.a8n.run/contoso/claude-run/pulls/7",
             "pre-push",
             &failure,
+            None,
             None,
         );
         assert!(
@@ -16283,6 +16787,7 @@ mod tests {
                     ref cause,
                     pr_step: None,
                     requeued: false,
+                    ..
                 } if cause == "claude exited 1, see stream.jsonl"
             ),
             "{res:?}"
@@ -16413,6 +16918,8 @@ mod tests {
             cause: "provider CLI `git push` failed (exit 128): no upstream".to_string(),
             pr_step: Some("push"),
             requeued: false,
+            pr_number: None,
+            head_branch: None,
         });
         let (ok, summary) = record_finalize_outcome(&claude, &finalize_res, false);
         assert!(!ok, "a PR-path failure must never record ok = true");
@@ -16435,6 +16942,8 @@ mod tests {
             cause: claude.error.clone(),
             pr_step: None,
             requeued: false,
+            pr_number: None,
+            head_branch: None,
         });
         let (ok, summary) = record_finalize_outcome(&claude, &finalize_res, false);
         assert!(!ok);
@@ -17979,6 +18488,7 @@ mod tests {
             1000,
             &dir.path().join("gate-output.log"),
             &|_: &str| {},
+            None,
             &sink,
         )
         .unwrap();
@@ -19848,6 +20358,102 @@ mod tests {
             rec.state, "open",
             "finished does not change state; a finished PR is still open until a human merges it"
         );
+    }
+
+    /// SPEC-3.3.1: a fresh job's PR left open as a draft by a
+    /// gate failure has no recorded `agent_pull_requests` row yet (the
+    /// `record_new_pr` call site in `process_job` only matches `CodeReview`,
+    /// `TimedOut` and `ReviewFailed`); `mark_failed_at_finalize` records it
+    /// for the first time and sets `failed`, blocking automerge.
+    #[tokio::test]
+    async fn mark_failed_at_finalize_records_a_fresh_gate_failed_pr_and_sets_failed() {
+        let pool = mem_pool().await;
+
+        mark_failed_at_finalize(&pool, "act", &job(), None, Some(9), Some("feat/x")).await;
+
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, &job().key)
+            .await
+            .unwrap()
+            .expect("mark_failed_at_finalize inserts a row for a fresh gate failure");
+        assert_eq!(rec.pr_number, 9);
+        assert_eq!(rec.head_branch, "feat/x");
+        assert!(rec.failed);
+    }
+
+    /// SPEC-3.3.1: a resumed job's PR is already recorded, so
+    /// `mark_failed_at_finalize` marks that row by `resume.id` directly,
+    /// whatever `pr_number`/`head_branch` the `Failed` outcome itself carries
+    /// (every arm but the gate-failure one leaves them `None`).
+    #[tokio::test]
+    async fn mark_failed_at_finalize_marks_a_resumed_pr_by_id() {
+        let pool = mem_pool().await;
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let backend = CliBackend::new(Arc::new(StubRunner::new()));
+        record_new_pr(
+            &pool,
+            &forge,
+            &backend,
+            "act",
+            &job(),
+            9,
+            "feat/x",
+            false,
+            test_comment_run(),
+        )
+        .await;
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, &job().key)
+            .await
+            .unwrap()
+            .unwrap();
+        let resume = PrResume {
+            id: rec.id,
+            branch: "feat/x".to_string(),
+            pr_url: format!("{}/contoso/claude-run/pulls/9", job().repo_host),
+        };
+
+        mark_failed_at_finalize(&pool, "act", &job(), Some(&resume), None, None).await;
+
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, &job().key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rec.failed);
+    }
+
+    /// SPEC-3.3.1: the only way a PR's `failed` flag is ever
+    /// cleared, a resumed run that finishes in Code Review.
+    #[tokio::test]
+    async fn clear_failed_at_resume_clears_a_previously_failed_row() {
+        let pool = mem_pool().await;
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let backend = CliBackend::new(Arc::new(StubRunner::new()));
+        record_new_pr(
+            &pool,
+            &forge,
+            &backend,
+            "act",
+            &job(),
+            9,
+            "feat/x",
+            false,
+            test_comment_run(),
+        )
+        .await;
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, &job().key)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::ci_failure::store::mark_failed(&pool, rec.id, &state::now_iso())
+            .await
+            .unwrap();
+
+        clear_failed_at_resume(&pool, "act", &job(), rec.id).await;
+
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, &job().key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!rec.failed);
     }
 
     /// `process_job`'s `salvaged` flag follows the `finalize_res` variant: set
@@ -23235,6 +23841,8 @@ mod tests {
                     cause: "gate".into(),
                     pr_step: Some("verify"),
                     requeued: false,
+                    pr_number: Some(7),
+                    head_branch: Some("feat/x".into()),
                 },
                 "Failed",
             ),
@@ -23244,6 +23852,8 @@ mod tests {
                     cause: "push".into(),
                     pr_step: Some("push"),
                     requeued: false,
+                    pr_number: None,
+                    head_branch: None,
                 },
                 "Failed",
             ),
@@ -23253,6 +23863,8 @@ mod tests {
                     cause: "push".into(),
                     pr_step: Some("pr_create"),
                     requeued: true,
+                    pr_number: None,
+                    head_branch: None,
                 },
                 "Queued",
             ),
@@ -23262,6 +23874,8 @@ mod tests {
                     cause: "crash".into(),
                     pr_step: None,
                     requeued: false,
+                    pr_number: None,
+                    head_branch: None,
                 },
                 "Failed",
             ),

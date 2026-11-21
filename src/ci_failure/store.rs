@@ -63,6 +63,13 @@ pub struct AgentPullRequest {
     /// decision path stop touching the row once this is set: no more
     /// behind-base branch updates, no more status comments. Never cleared.
     pub finished: bool,
+    /// SPEC-3.3.1: true once `finalize` has ended the run that
+    /// owns this PR in `Failed` (a gate failure, `SPEC-3.3.2`, included).
+    /// Blocks automerge, whatever the PR's draft, mergeable, behind-base or
+    /// CI state. Cleared only when a later run for the issue ends in Code
+    /// Review (`clear_failed`); a re-queue that continues the same PR does
+    /// not clear it by itself. See `crate::db::flag`.
+    pub failed: bool,
     /// CLAUDE-550: automerge conflict auto-resolve runs dispatched for this
     /// PR, across every head commit. Capped by
     /// `webhook_comment.agent_conflict_resolve_attempts`.
@@ -106,6 +113,7 @@ fn agent_pr_from_row(row: &sqlx::any::AnyRow) -> Result<AgentPullRequest> {
         updated_at: row.try_get("updated_at")?,
         salvaged: db::flag(row, "salvaged")?,
         finished: db::flag(row, "finished")?,
+        failed: db::flag(row, "failed")?,
         conflict_resolve_attempts: row.try_get("conflict_resolve_attempts")?,
         conflict_resolve_started_at: row.try_get("conflict_resolve_started_at")?,
         conflict_files: row
@@ -665,6 +673,46 @@ pub async fn clear_salvaged(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     Ok(())
 }
 
+/// SPEC-3.3.1: set `id`'s `failed` flag. Called whenever
+/// `finalize` returns `Finalized::Failed` for a run whose issue has this
+/// recorded PR (a gate failure, `SPEC-3.3.2`, included). While set, automerge
+/// (the webhook decision path and the periodic reconciler) takes no action on
+/// the PR. Cleared only by [`clear_failed`], once a later run for the issue
+/// ends in Code Review.
+pub async fn mark_failed(pool: &DbPool, id: i64, now: &str) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "UPDATE agent_pull_requests SET failed = 1, updated_at = ? WHERE id = ?",
+        )
+        .into_owned(),
+    ))
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// SPEC-3.3.1: clear `id`'s `failed` flag. Called once
+/// `finalize` returns `Finalized::CodeReview` for the PR, fresh or resumed:
+/// the run that owns it succeeded, so the automerge block a prior `Failed`
+/// run left behind no longer applies.
+pub async fn clear_failed(pool: &DbPool, id: i64, now: &str) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "UPDATE agent_pull_requests SET failed = 0, updated_at = ? WHERE id = ?",
+        )
+        .into_owned(),
+    ))
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// SPEC-3.5.2: the agent's PR at `(host, repo, pr_number)`, the unique key a PR is
 /// addressed by regardless of which issue currently claims it.
 pub async fn agent_pr(
@@ -675,7 +723,7 @@ pub async fn agent_pr(
 ) -> Result<Option<AgentPullRequest>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, finished, created_at, updated_at, \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, finished, failed, created_at, updated_at, \
          conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
          FROM agent_pull_requests WHERE host = ? AND repo = ? AND pr_number = ?",
     ).into_owned()))
@@ -705,7 +753,7 @@ pub async fn agent_pr_for_issue(
 ) -> Result<Option<AgentPullRequest>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, finished, created_at, updated_at, \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, finished, failed, created_at, updated_at, \
          conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
          FROM agent_pull_requests WHERE issue_key = ? \
          ORDER BY CASE WHEN state = 'open' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1",
@@ -723,7 +771,7 @@ pub async fn agent_pr_for_issue(
 pub async fn open_agent_prs(pool: &DbPool) -> Result<Vec<AgentPullRequest>> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, finished, created_at, updated_at, \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, finished, failed, created_at, updated_at, \
          conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
          FROM agent_pull_requests WHERE state = 'open' ORDER BY id",
     ).into_owned()))
@@ -1364,6 +1412,53 @@ mod tests {
             .unwrap();
         assert!(finished.finished);
         assert_eq!(finished.updated_at, "2026-11-05T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn failed_flag_defaults_false_and_roundtrips_and_clears() {
+        let pool = test_pool().await;
+        let id = record_agent_pr(
+            &pool,
+            "youtrack",
+            "DEMO-1",
+            "dev.example.org",
+            "contoso/claude-run",
+            9,
+            "fix/DEMO-1",
+            "open",
+            false,
+            "2026-11-20T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let fresh = agent_pr(&pool, "dev.example.org", "contoso/claude-run", 9)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!fresh.failed, "a newly recorded row is not failed yet");
+
+        mark_failed(&pool, id, "2026-11-21T00:00:00Z")
+            .await
+            .unwrap();
+
+        let failed = agent_pr(&pool, "dev.example.org", "contoso/claude-run", 9)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(failed.failed);
+        assert_eq!(failed.updated_at, "2026-11-21T00:00:00Z");
+
+        clear_failed(&pool, id, "2026-11-22T00:00:00Z")
+            .await
+            .unwrap();
+
+        let cleared = agent_pr(&pool, "dev.example.org", "contoso/claude-run", 9)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!cleared.failed);
+        assert_eq!(cleared.updated_at, "2026-11-22T00:00:00Z");
     }
 
     /// `clear_salvaged` is the only mutator that ever flips `salvaged` to
