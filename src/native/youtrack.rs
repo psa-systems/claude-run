@@ -4477,6 +4477,7 @@ fn write_projects(src: &YoutrackSource, job: &YoutrackJob) -> String {
 /// `{{timeout_minutes}}` and `{{deadline_utc}}` both derive from `claude_timeout`
 /// and `now`, so an operator-supplied template can use either (or both) and they
 /// never disagree.
+#[allow(clippy::too_many_arguments)]
 fn render_prompt_template(
     template: &str,
     job: &YoutrackJob,
