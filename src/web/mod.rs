@@ -3980,6 +3980,10 @@ struct YoutrackEditForm {
     /// `{{audit_project}}` placeholder (CLAUDE-409). Blank falls back to the
     /// default `AUDIT`.
     yt_audit_project: String,
+    /// Type that identifies a per-target audit run
+    /// (`native.youtrack.audit_target_type`), rendered into the prompt as
+    /// `{{audit_target_type}}`. Blank falls back to the default `Epic`.
+    yt_audit_target_type: String,
     /// Optional Assignee set on the issue at pickup. Empty string
     /// maps to `None` (Assignee left untouched). A login, `me`, or `unassigned`.
     yt_assignee: String,
@@ -4118,6 +4122,7 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
         yt_query: c.youtrack.query,
         yt_custom_field: c.youtrack.custom_field,
         yt_audit_project: c.youtrack.audit_project,
+        yt_audit_target_type: c.youtrack.audit_target_type,
         yt_prompt: crate::native::youtrack::default_youtrack_prompt(),
         state_queued: c.youtrack.states.queued,
         state_working: c.youtrack.states.working,
@@ -4159,6 +4164,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         yt_query: yt.youtrack.query.clone(),
         yt_custom_field: yt.youtrack.custom_field.clone(),
         yt_audit_project: yt.youtrack.audit_project.clone(),
+        yt_audit_target_type: yt.youtrack.audit_target_type.clone(),
         yt_assignee: s(&yt.youtrack.assignee),
         yt_prompt: yt
             .youtrack
@@ -4307,6 +4313,9 @@ fn youtrack_form_to_yaml(
     }
     if let Some(p) = opt(&form.yt_audit_project) {
         youtrack.audit_project = p;
+    }
+    if let Some(t) = opt(&form.yt_audit_target_type) {
+        youtrack.audit_target_type = t;
     }
     // Blank Assignee box -> no `assignee` key (Assignee untouched);
     // any value is persisted as a literal `yt` assignee argument.
@@ -11405,6 +11414,18 @@ mod tests {
             let yaml = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    query: \"q\"\n    token_ref: yt-prod\n  forgejo:\n    base_url: https://dev.a8n.run\n";
             let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
             let form = action_to_youtrack_form(&loaded.action).unwrap();
+            let out = youtrack_form_to_yaml(empty_base(), &form).unwrap();
+            let reloaded = crate::action::validate_str(&out, "<test>").unwrap();
+            assert_eq!(reloaded.action.native, loaded.action.native);
+        }
+
+        #[test]
+        fn audit_target_type_prefills_and_round_trips() {
+            let yaml =
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    audit_target_type: Story\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let form = action_to_youtrack_form(&loaded.action).unwrap();
+            assert_eq!(form.yt_audit_target_type, "Story");
             let out = youtrack_form_to_yaml(empty_base(), &form).unwrap();
             let reloaded = crate::action::validate_str(&out, "<test>").unwrap();
             assert_eq!(reloaded.action.native, loaded.action.native);

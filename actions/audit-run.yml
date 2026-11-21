@@ -84,6 +84,8 @@ native:
     # Short name of the audit project. Edit this one field (and the matching one in youtrack.yml) to move the
     # audit/worker partition to a different project key; see actions/SCHEMA.md.
     audit_project: AUDIT
+    # Type that identifies a per-target audit run in the audit prompt preset's S1 step; left unset here, so it
+    # defaults to Epic. Set to Story if a deployment reserves Epic for something else; see actions/SCHEMA.md.
     # The built-in audit prompt (`src/native/audit_prompt.rs`). Do not add a `prompt:` key: it would override this.
     prompt_preset: audit
     # Set `write_projects` to the projects findings should file into (see actions/SCHEMA.md).

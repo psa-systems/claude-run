@@ -62,6 +62,10 @@ time (CLAUDE-409); the two action files carry this field, not the project key sp
 moving the audit project to a different short name is one field edited in each file instead of two independently
 hand-written query literals. `YoutrackSource::resolved_query` (`src/action.rs`) does the substitution.
 
+`native.youtrack.audit_target_type` (default `Epic`) names the Type that identifies a per-target audit run, rendered
+into the audit prompt preset's S1 step as `{{audit_target_type}}`. A deployment that reserves `Epic` for some other
+purpose sets this to `Story` instead; the daily parent run's own `Type: Task` check is unaffected.
+
 The split exists because the handler resolves a job's repository from the triggering issue's project VCS processor, one
 project to one repo, and an audit writes its deliverable into a **different** repo from the one it reads. Audit issues
 live in the configured audit project, whose processor points at the audits repo (e.g. `owner/audits`), so the handler clones the audits repo into the
