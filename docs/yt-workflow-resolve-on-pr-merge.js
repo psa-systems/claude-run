@@ -5,7 +5,7 @@
  */
 const entities = require('@jetbrains/youtrack-scripting-api/entities');
 
-// Project key + number, e.g. A8N-123. Tweak charset if your key allows digits/underscores.
+// Project key + number, e.g. PROJ-123. Tweak charset if your key allows digits/underscores.
 const ID = '[A-Za-z][A-Za-z0-9]*-\\d+';
 
 function collect(re, text, group, out) {
@@ -30,7 +30,7 @@ exports.rule = entities.Issue.onChange({
   guard: (ctx) => ctx.issue.pullRequests.added.isNotEmpty(),
   action: (ctx) => {
     const issue = ctx.issue;
-    const myId = issue.id; // expect readable id like 'A8N-123'; CONFIRM in log below
+    const myId = issue.id; // expect readable id like 'PROJ-123'; CONFIRM in log below
 
     let merged = false;
 
