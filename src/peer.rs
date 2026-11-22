@@ -1606,7 +1606,7 @@ pub(crate) mod testkit {
                 .await
                 .unwrap();
             for i in 0..load {
-                crate::state::run_inflight_add(&pool, run, &format!("MK-{i}"), "MK")
+                crate::state::run_inflight_add(&pool, run, &format!("MX-{i}"), "MX")
                     .await
                     .unwrap();
             }
@@ -1946,7 +1946,7 @@ mod tests {
         let run = crate::state::run_begin(&pool, "act", "scheduler")
             .await
             .unwrap();
-        crate::state::run_inflight_add(&pool, run, "MK-1", "MK")
+        crate::state::run_inflight_add(&pool, run, "MX-1", "MX")
             .await
             .unwrap();
         let resp = r.oneshot(get_state(Some("tok"))).await.unwrap();
@@ -1956,7 +1956,7 @@ mod tests {
         let d: PeerStateDoc = serde_json::from_slice(&body).unwrap();
         assert_eq!(d.load, 1);
         assert_eq!(d.in_flight[0].action, "act");
-        assert_eq!(d.in_flight[0].job_key, "MK-1");
+        assert_eq!(d.in_flight[0].job_key, "MX-1");
     }
 
     #[test]
@@ -1967,7 +1967,7 @@ mod tests {
         reg.record(
             "b",
             "me",
-            Ok(doc("them", &[("act", "MK-1")], t0)),
+            Ok(doc("them", &[("act", "MX-1")], t0)),
             t0,
             cfg.stale_after_secs,
         );
@@ -2031,7 +2031,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_poller_marks_a_stub_peer_reachable_and_a_401_peer_unknown() {
-        let good = stub_peer(doc("them", &[("act", "MK-9")], Utc::now()), StatusCode::OK).await;
+        let good = stub_peer(doc("them", &[("act", "MX-9")], Utc::now()), StatusCode::OK).await;
         let bad = stub_peer(doc("x", &[], Utc::now()), StatusCode::UNAUTHORIZED).await;
         let cfg = cfg_for(vec![peer("good", &good), peer("bad", &bad)]);
         let reg = PeerRegistry::default();
@@ -2048,7 +2048,7 @@ mod tests {
         assert!(rows[1].last_error.as_deref().unwrap().contains("401"));
         let live = reg.live_peer_in_flight(&cfg, Utc::now());
         assert_eq!(
-            live.get(&("act".to_string(), "MK-9".to_string()))
+            live.get(&("act".to_string(), "MX-9".to_string()))
                 .map(String::as_str),
             Some("good")
         );

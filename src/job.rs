@@ -805,8 +805,8 @@ mod tests {
     #[test]
     fn job_key_from_dedup_field() {
         let action = mk_action(Some("idReadable".to_string()));
-        let r = job_key(&action, &json!({"idReadable": "MK-1"}), 0);
-        assert_eq!(r, "MK-1");
+        let r = job_key(&action, &json!({"idReadable": "MX-1"}), 0);
+        assert_eq!(r, "MX-1");
     }
 
     #[test]

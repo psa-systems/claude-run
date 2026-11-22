@@ -433,8 +433,8 @@ mod tests {
 
     #[test]
     fn job_workdir_joins() {
-        let p = job_workdir(Path::new("/base"), "youtrack", "MK-16");
-        assert_eq!(p, PathBuf::from("/base/youtrack/MK-16"));
+        let p = job_workdir(Path::new("/base"), "youtrack", "MX-16");
+        assert_eq!(p, PathBuf::from("/base/youtrack/MX-16"));
     }
 
     // ---- local_only_work / cleanup_or_preserve fixtures --------

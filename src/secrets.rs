@@ -938,7 +938,7 @@ mod tests {
             fj_token: Some("fj-token".into()),
             github_token: None,
         };
-        let job_dir = tmp.path().join("creds").join("MK-16");
+        let job_dir = tmp.path().join("creds").join("MX-16");
         let cfg_path;
         let keys_path;
         {

@@ -240,16 +240,16 @@ pub trait IssueTracker: Send + Sync {
     /// returned as raw JSON objects (the shape `yt list --json` emits).
     fn list_queued(&self, query: &str) -> Result<Vec<serde_json::Value>>;
 
-    /// Read a single custom field's value as text, e.g. `("MK-16", "AI Agent")`.
+    /// Read a single custom field's value as text, e.g. `("MX-16", "AI Agent")`.
     fn get_field(&self, key: &str, field: &str) -> Result<String>;
 
-    /// Set a custom field, e.g. `("MK-16", "AI Agent", "Working")`.
+    /// Set a custom field, e.g. `("MX-16", "AI Agent", "Working")`.
     fn set_field(&self, key: &str, field: &str, value: &str) -> Result<()>;
 
-    /// Set the standard `State` field, e.g. `("MK-16", "In Progress")`.
+    /// Set the standard `State` field, e.g. `("MX-16", "In Progress")`.
     fn set_state(&self, key: &str, state: &str) -> Result<()>;
 
-    /// Set the issue Assignee, e.g. `("MK-16", "octocat")`. `login` is passed
+    /// Set the issue Assignee, e.g. `("MX-16", "octocat")`. `login` is passed
     /// straight to the backend; `me` and `unassigned` are valid values. Backs the
     /// optional assignee-on-pickup write.
     fn set_assignee(&self, key: &str, login: &str) -> Result<()>;
@@ -2243,10 +2243,10 @@ mod tests {
 
     #[test]
     fn scan_tracker_keys_finds_every_key_in_order_deduplicated() {
-        let text = "fix/PROJ-470-repo-tracker-refs mentions PROJ-470 again and also SFT-9";
+        let text = "fix/PROJ-470-repo-tracker-refs mentions PROJ-470 again and also SX-9";
         assert_eq!(
             scan_tracker_keys(text),
-            vec!["PROJ-470".to_string(), "SFT-9".to_string()]
+            vec!["PROJ-470".to_string(), "SX-9".to_string()]
         );
     }
 
