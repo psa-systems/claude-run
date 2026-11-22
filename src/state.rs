@@ -3649,9 +3649,9 @@ mod tests {
         let pool = mem_pool().await;
         for (action, key) in [
             ("act", "AUD-31"),
-            ("act", "TR-8"),
+            ("act", "TX-8"),
             ("act", "GONE-1"),
-            ("other", "MK-16"),
+            ("other", "MX-16"),
         ] {
             dependency_gate_upsert(
                 &pool,
@@ -3664,14 +3664,14 @@ mod tests {
             .unwrap();
         }
 
-        dependency_gate_retain(&pool, "act", &["AUD-31".to_string(), "TR-8".to_string()])
+        dependency_gate_retain(&pool, "act", &["AUD-31".to_string(), "TX-8".to_string()])
             .await
             .unwrap();
         assert!(dependency_gate_get(&pool, "act", "AUD-31")
             .await
             .unwrap()
             .is_some());
-        assert!(dependency_gate_get(&pool, "act", "TR-8")
+        assert!(dependency_gate_get(&pool, "act", "TX-8")
             .await
             .unwrap()
             .is_some());
@@ -3683,7 +3683,7 @@ mod tests {
             "a key the query no longer matches is pruned"
         );
         assert!(
-            dependency_gate_get(&pool, "other", "MK-16")
+            dependency_gate_get(&pool, "other", "MX-16")
                 .await
                 .unwrap()
                 .is_some(),
@@ -3696,7 +3696,7 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(dependency_gate_get(&pool, "other", "MK-16")
+        assert!(dependency_gate_get(&pool, "other", "MX-16")
             .await
             .unwrap()
             .is_some());
@@ -3711,7 +3711,7 @@ mod tests {
         let pool = mem_pool().await;
         let now = now_epoch_ms();
         // Fresh block, still inside its backoff window: not stale.
-        dependency_gate_upsert(&pool, "act", "MK-16", now + 300_000, "MK-1 (depends on)")
+        dependency_gate_upsert(&pool, "act", "MX-16", now + 300_000, "MX-1 (depends on)")
             .await
             .unwrap();
         // Blocked 2h with a re-check due 90m ago: stale AND overdue (the AUD-31
@@ -3726,7 +3726,7 @@ mod tests {
         .await
         .unwrap();
         // Blocked 26h but re-evaluated 1m ago: stale, re-check on schedule.
-        dependency_gate_upsert(&pool, "other", "TR-8", now + 240_000, "TR-7 (depends on)")
+        dependency_gate_upsert(&pool, "other", "TX-8", now + 240_000, "TX-7 (depends on)")
             .await
             .unwrap();
         sqlx::query(sqlx::AssertSqlSafe(
@@ -3749,7 +3749,7 @@ mod tests {
             .into_owned(),
         ))
         .bind(now - 93_600_000)
-        .bind("TR-8")
+        .bind("TX-8")
         .execute(&pool)
         .await
         .unwrap();
@@ -3760,7 +3760,7 @@ mod tests {
         let keys: Vec<&str> = stale.iter().map(|g| g.job_key.as_str()).collect();
         assert_eq!(
             keys,
-            vec!["TR-8", "AUD-31"],
+            vec!["TX-8", "AUD-31"],
             "only blocks past the threshold, longest-held first: {stale:?}"
         );
         assert_eq!(stale[0].action_name, "other");
@@ -3771,11 +3771,11 @@ mod tests {
         );
         assert!(
             stale[0].recheck_overdue_ms < 0,
-            "TR-8 is long-blocked but its re-check is not due yet"
+            "TX-8 is long-blocked but its re-check is not due yet"
         );
 
         // The gate deletes the row when the blockers clear; the signal goes with it.
-        dependency_gate_clear(&pool, "other", "TR-8").await.unwrap();
+        dependency_gate_clear(&pool, "other", "TX-8").await.unwrap();
         dependency_gate_clear(&pool, "act", "AUD-31").await.unwrap();
         assert!(dependency_gates_stale(&pool, now, STALE_GATE_AFTER_MS, 20)
             .await

@@ -2814,7 +2814,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--pretty=format:%b"],
-                    "Finished.\n\n#MK-16",
+                    "Finished.\n\n#MX-16",
                 )
                 .ok_prefix(
                     &format!(
@@ -4967,7 +4967,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--pretty=format:%b"],
-                    "Finished.\n\n#MK-16",
+                    "Finished.\n\n#MX-16",
                 )
                 .fail_prefix(
                     &format!(

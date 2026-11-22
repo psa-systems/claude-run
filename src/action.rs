@@ -979,8 +979,8 @@ mod tests {
     #[test]
     fn render_link_substitutes_key() {
         assert_eq!(
-            render_link("https://youtrack.example.com/issue/{key}", "MK-16"),
-            "https://youtrack.example.com/issue/MK-16"
+            render_link("https://youtrack.example.com/issue/{key}", "MX-16"),
+            "https://youtrack.example.com/issue/MX-16"
         );
     }
 
