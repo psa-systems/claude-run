@@ -8713,10 +8713,10 @@ mod tests {
         let hits = b
             .scan_tracker_refs(
                 &clone,
-                Some(("Add the widget module", "See WEBX-42 for context.")),
+                Some(("Add the widget module", "See TASK-42 for context.")),
             )
             .unwrap();
-        assert_eq!(hits, vec!["WEBX-42".to_string()]);
+        assert_eq!(hits, vec!["TASK-42".to_string()]);
     }
 
     #[test]
