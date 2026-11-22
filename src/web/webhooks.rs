@@ -7193,7 +7193,7 @@ mod tests {
             assignee: Option<&str>,
         ) -> crate::error::Result<String> {
             let mut next = self.next_key.lock().unwrap();
-            let key = format!("CLAUDE-{next}");
+            let key = format!("PROJ-{next}");
             *next += 1;
             self.calls.lock().unwrap().push(format!(
                 "create {project} {key} | {summary} | assignee={}",
@@ -10543,7 +10543,7 @@ mod tests {
             let pool = crate::db::test_pool().await;
             let now = "2026-09-01T00:00:00Z";
             let pr_number = 60 + i as i64;
-            let key = format!("CLAUDE-{}", 600 + i);
+            let key = format!("PROJ-{}", 600 + i);
             let branch = format!("fix/{key}");
             ci_failure_store::record_agent_pr(
                 &pool,

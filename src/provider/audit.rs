@@ -373,18 +373,18 @@ mod tests {
         let tracker = AuditedTracker::new(&stub, audit.clone());
 
         assert_eq!(
-            tracker.create_issue("CLAUDE", "a", "", None).unwrap(),
+            tracker.create_issue("PROJ", "a", "", None).unwrap(),
             "PROJ-1"
         );
         assert_eq!(
-            tracker.create_issue("CLAUDE", "b", "", None).unwrap(),
+            tracker.create_issue("PROJ", "b", "", None).unwrap(),
             "PROJ-2"
         );
-        let err = tracker.create_issue("CLAUDE", "c", "", None).unwrap_err();
+        let err = tracker.create_issue("PROJ", "c", "", None).unwrap_err();
 
         assert!(
             matches!(&err, Error::IssueCapReached { run, cap, project }
-                if run == "7" && *cap == 2 && project == "CLAUDE"),
+                if run == "7" && *cap == 2 && project == "PROJ"),
             "got {err:?}"
         );
         assert_eq!(
@@ -403,14 +403,14 @@ mod tests {
         let audit = IssueWriteAudit::new(Some(9), 1);
         let tracker = AuditedTracker::new(&stub, audit.clone());
 
-        tracker.create_issue("CLAUDE", "a", "", None).unwrap();
-        tracker.create_issue("CLAUDE", "b", "", None).unwrap_err();
+        tracker.create_issue("PROJ", "a", "", None).unwrap();
+        tracker.create_issue("PROJ", "b", "", None).unwrap_err();
 
         assert_eq!(audit.refused(), 1);
         let notices = audit.take_notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].contains("cap reached"), "{}", notices[0]);
-        assert!(notices[0].contains("CLAUDE"), "{}", notices[0]);
+        assert!(notices[0].contains("PROJ"), "{}", notices[0]);
         assert!(
             notices[0].contains("max_issues_per_run"),
             "the notice names the knob that raises the cap: {}",
@@ -429,9 +429,9 @@ mod tests {
         let first = AuditedTracker::new(&a, audit.clone());
         let second = AuditedTracker::new(&b, audit.clone());
 
-        first.create_issue("CLAUDE", "a", "", None).unwrap();
-        second.create_issue("CLAUDE", "b", "", None).unwrap();
-        second.create_issue("CLAUDE", "c", "", None).unwrap_err();
+        first.create_issue("PROJ", "a", "", None).unwrap();
+        second.create_issue("PROJ", "b", "", None).unwrap();
+        second.create_issue("PROJ", "c", "", None).unwrap_err();
 
         assert_eq!(audit.created(), 2);
         assert_eq!(b.calls().len(), 1);
@@ -468,7 +468,7 @@ mod tests {
         let audit = IssueWriteAudit::new(None, 0);
         let tracker = AuditedTracker::new(&stub, audit.clone());
 
-        let err = tracker.create_issue("CLAUDE", "a", "", None).unwrap_err();
+        let err = tracker.create_issue("PROJ", "a", "", None).unwrap_err();
         assert!(
             matches!(&err, Error::IssueCapReached { run, .. } if run == "none"),
             "got {err:?}"
@@ -490,7 +490,7 @@ mod tests {
                 "issue",
                 "create",
                 "--project",
-                "CLAUDE",
+                "PROJ",
                 "--summary",
                 "s",
                 "--description",
@@ -504,10 +504,10 @@ mod tests {
         let tracker = AuditedTracker::new(&backend, audit.clone());
 
         assert_eq!(
-            tracker.create_issue("CLAUDE", "s", "d", None).unwrap(),
+            tracker.create_issue("PROJ", "s", "d", None).unwrap(),
             "PROJ-1"
         );
-        assert!(tracker.create_issue("CLAUDE", "s", "d", None).is_err());
+        assert!(tracker.create_issue("PROJ", "s", "d", None).is_err());
 
         let calls = runner.calls.lock().unwrap().clone();
         assert_eq!(

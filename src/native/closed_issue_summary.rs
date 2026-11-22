@@ -523,7 +523,7 @@ mod tests {
 
     fn cfg() -> ClosedIssueSummaryConfig {
         ClosedIssueSummaryConfig {
-            projects: vec!["CLAUDE".to_string(), "DELTA".to_string()],
+            projects: vec!["PROJ".to_string(), "DELTA".to_string()],
             ..ClosedIssueSummaryConfig::default()
         }
     }
@@ -570,7 +570,7 @@ mod tests {
     fn render_report_counts_and_lists_every_configured_project() {
         let gathered = vec![
             (
-                "CLAUDE".to_string(),
+                "PROJ".to_string(),
                 vec![
                     issue("PROJ-214", "Allow the agent to author issues", "Claude Run"),
                     issue("PROJ-215", "Partition the audit query", ""),
@@ -590,12 +590,12 @@ mod tests {
             ),
             "{body}"
         );
-        assert!(body.contains("| CLAUDE | 2 |"), "{body}");
+        assert!(body.contains("| PROJ | 2 |"), "{body}");
         assert!(body.contains("| DELTA | 1 |"), "{body}");
         assert!(body.contains("| YT | 0 |"), "{body}");
         assert!(body.contains("| **Total** | **3** |"), "{body}");
 
-        assert!(body.contains("## CLAUDE (2)"), "{body}");
+        assert!(body.contains("## PROJ (2)"), "{body}");
         assert!(
             body.contains(
                 "- PROJ-214 - Allow the agent to author issues - Task / Done / Claude Run"
@@ -624,11 +624,11 @@ mod tests {
     #[test]
     fn render_report_caps_the_listing_but_never_the_count() {
         let many: Vec<ClosedIssue> = (1..=5)
-            .map(|n| issue(&format!("CLAUDE-{n}"), "x", "dev"))
+            .map(|n| issue(&format!("PROJ-{n}"), "x", "dev"))
             .collect();
-        let body = render_report(window(), &[("CLAUDE".to_string(), many)], 2);
-        assert!(body.contains("| CLAUDE | 5 |"), "{body}");
-        assert!(body.contains("## CLAUDE (5)"), "{body}");
+        let body = render_report(window(), &[("PROJ".to_string(), many)], 2);
+        assert!(body.contains("| PROJ | 5 |"), "{body}");
+        assert!(body.contains("## PROJ (5)"), "{body}");
         assert!(
             body.contains("- ... and 3 more (listing capped at 2)."),
             "{body}"
@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn project_key_splits_idreadable() {
-        assert_eq!(project_key("PROJ-218"), "CLAUDE");
+        assert_eq!(project_key("PROJ-218"), "PROJ");
         assert_eq!(project_key("A-B-7"), "A-B");
         assert_eq!(project_key("nodash"), "nodash");
     }
@@ -679,7 +679,7 @@ mod tests {
         std::env::remove_var("CLAUDE_RUN_PUBLIC_URL");
         let gathered = vec![
             (
-                "CLAUDE".to_string(),
+                "PROJ".to_string(),
                 vec![
                     issue("PROJ-214", "Author issues", "Claude Run"),
                     issue("PROJ-215", "Partition", "Claude Run"),
@@ -698,7 +698,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["list", &list_args("CLAUDE"), "--json"],
+                    &["list", &list_args("PROJ"), "--json"],
                     &rows(&[("PROJ-214", "Author issues"), ("PROJ-215", "Partition")]),
                 )
                 .ok("yt", &["list", &list_args("DELTA"), "--json"], "[]")
@@ -708,7 +708,7 @@ mod tests {
                         "issue",
                         "create",
                         "--project",
-                        "CLAUDE",
+                        "PROJ",
                         "--summary",
                         "Closed-issue summary: 2026-08-01 .. 2026-08-07",
                         "--description",
@@ -768,7 +768,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c.contains("issue create --project CLAUDE ")),
+                .any(|c| c.contains("issue create --project PROJ ")),
             "{calls:?}"
         );
     }
@@ -824,7 +824,7 @@ mod tests {
         let runner = Arc::new(
             StubRunner::new()
                 .ok("yt", &["issue", "inspect", "PROJ-100", "--json"], &inspect)
-                .ok("yt", &["list", &list_args("CLAUDE"), "--json"], "[]")
+                .ok("yt", &["list", &list_args("PROJ"), "--json"], "[]")
                 .ok("yt", &["list", &list_args("DELTA"), "--json"], "[]"),
         );
         let backend = CliBackend::new(runner.clone());
@@ -855,7 +855,7 @@ mod tests {
     fn report_run_makes_no_code_change_and_opens_no_pr() {
         let gathered = vec![
             (
-                "CLAUDE".to_string(),
+                "PROJ".to_string(),
                 vec![issue("PROJ-214", "Author issues", "Claude Run")],
             ),
             ("DELTA".to_string(), Vec::new()),
@@ -871,7 +871,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["list", &list_args("CLAUDE"), "--json"],
+                    &["list", &list_args("PROJ"), "--json"],
                     &rows(&[("PROJ-214", "Author issues")]),
                 )
                 .ok("yt", &["list", &list_args("DELTA"), "--json"], "[]")
@@ -881,7 +881,7 @@ mod tests {
                         "issue",
                         "create",
                         "--project",
-                        "CLAUDE",
+                        "PROJ",
                         "--summary",
                         "Closed-issue summary: 2026-08-01 .. 2026-08-07",
                         "--description",

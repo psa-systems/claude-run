@@ -12387,7 +12387,7 @@ mod tests {
     #[test]
     fn project_key_splits_idreadable() {
         assert_eq!(project_key("MK-16"), "MK");
-        assert_eq!(project_key("PROJ-32"), "CLAUDE");
+        assert_eq!(project_key("PROJ-32"), "PROJ");
         assert_eq!(project_key("NODASH"), "NODASH");
     }
 
