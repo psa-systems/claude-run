@@ -522,7 +522,7 @@ mod tests {
             &pool,
             "INSERT INTO agent_pull_requests \
              (action_name, issue_key, host, repo, pr_number, head_branch, state, created_at, updated_at) \
-             VALUES ('youtrack', 'CLAUDE-1', 'dev.a8n.run', 'acme/widgets', 1, 'fix/x', 'open', ?, ?)",
+             VALUES ('youtrack', 'PROJ-1', 'dev.a8n.run', 'acme/widgets', 1, 'fix/x', 'open', ?, ?)",
         ).into_owned()))
         .bind(&old)
         .bind(&old)

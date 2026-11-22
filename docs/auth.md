@@ -48,7 +48,7 @@ invite; removing the last remaining account, or removing yourself, is refused ra
 no roles yet: every account has full access.
 
 Giving an email address on the invite form sends the link by mail instead of showing it: once SMTP is configured
-through the `CLAUDE_RUN_SMTP_*` / `CLAUDE_RUN_PUBLIC_URL` environment variables (CLAUDE-428; the read-only **Email
+through the `CLAUDE_RUN_SMTP_*` / `CLAUDE_RUN_PUBLIC_URL` environment variables (the read-only **Email
 (SMTP)** card in Settings shows the effective values), the field accepts an address and the page reports "Invite sent
 to \<address\>" with no link on screen. The field is disabled, with a note pointing at that card, until SMTP is
 configured; an invalid address is refused with `400` before anything is minted. If the send itself fails (bad
@@ -106,7 +106,7 @@ up a saved login with no restart.
 `gh auth login --with-token` favors a **classic PAT** with `repo`, `read:org` and `gist`
 ([gh manual](https://cli.github.com/manual/gh_auth_login)); save a fine-grained one here with care, per that same
 manual's own caution about `--with-token`. GitHub automerge reads this login (not `github.token_ref` or a webhook
-source's `write_token_ref`). As of CLAUDE-419, `pr_status` itself no longer needs check-run access: it derives the CI
+source's `write_token_ref`). `pr_status` itself no longer needs check-run access: it derives the CI
 verdict from `gh api repos/<repo>/actions/runs` and `gh api repos/<repo>/commits/<sha>/status` instead of `gh pr view
 --json statusCheckRollup`, so a fine-grained PAT with `Pull requests: Read`, `Actions: Read` and `Commit statuses: Read`
 is enough for `pr_status`, opening PRs, and reads; it no longer needs to be a classic PAT just to satisfy `pr_status`.
@@ -115,7 +115,7 @@ already exist, because it is read on every pass.
 
 The YouTrack token needs **Update Project** permission on every project the daemon polls, not just issue read/write
 access. YouTrack only returns a GitHub-bound project's VCS integration `path` (the `owner/repo` a `yt project vcs
-list` resolves, see [Access check](usage.md#access-check-claude-216)) to a token with that permission; without it the field comes back empty and
+list` resolves, see [Access check](usage.md#access-check)) to a token with that permission; without it the field comes back empty and
 the job's clone URL loses its repo path (`https://github.com/.git`), failing deep inside `git clone` with no
 indication of the missing permission. A Forgejo/Gitea VCS integration is unaffected, since its `path` is a stored
 value rather than one gated by a live external-app connection.
@@ -144,7 +144,7 @@ defaults for everything else, including the daemon's own polling. An operator wh
 `claude auth login`, `yt auth login` and `fj auth add-key` inside the container; leaving the Auth card empty writes
 nothing and does not disturb those files.
 
-**An expired or revoked login is a second, independent not-ready state (CLAUDE-269): `login_required`, distinct from
+**An expired or revoked login is a second, independent not-ready state: `login_required`, distinct from
 the `no_credential` state above.** `.credentials.json` stays on disk when a login expires, so the credential check
 alone keeps answering ready; the runner instead notices the CLI itself saying so. Detection matches only the CLI's
 structured `error: "authentication_failed"` field, never its human-readable wording (which is reworded between
@@ -214,6 +214,6 @@ Auth (and every action `token_ref`) reads from an encrypted secrets store. Two t
 
    `auth_token_ref` is the **name** of a stored secret. It is not the token value and not the `age` public key.
 
-## MCP HTTP auth (CLAUDE-442)
+## MCP HTTP auth
 
-The troubleshooting MCP tools served over HTTP at `/mcp` (see [configuration.md](configuration.md#mcp-over-http-claude-442)) sit behind a completely different gate than everything above on this page: the external `mcp-web` crate's own OAuth 2.1 authorization server, backed by its own local accounts (TOTP is offered at `/totp/enrol` but, unlike the dashboard's accounts, not required to sign in). It does not read `[web].auth_token_ref`, does not share a session with the dashboard login, and does not use `secrets.key` or the secrets store at all; its two keys (`mcp-master.key`, `mcp-session.key`) and its account database (`mcp-web.db`) are entirely its own, documented in [docs/conventions/mcp.md](conventions/mcp.md#serving-the-same-tools-over-http-claude-442). A dashboard account and an MCP account are unrelated: creating, disabling or deleting one does nothing to the other, even for the same email address. Treat granting MCP HTTP access as its own decision, not an extension of dashboard access.
+The troubleshooting MCP tools served over HTTP at `/mcp` (see [configuration.md](configuration.md#mcp-over-http)) sit behind a completely different gate than everything above on this page: the external `mcp-web` crate's own OAuth 2.1 authorization server, backed by its own local accounts (TOTP is offered at `/totp/enrol` but, unlike the dashboard's accounts, not required to sign in). It does not read `[web].auth_token_ref`, does not share a session with the dashboard login, and does not use `secrets.key` or the secrets store at all; its two keys (`mcp-master.key`, `mcp-session.key`) and its account database (`mcp-web.db`) are entirely its own, documented in [docs/conventions/mcp.md](conventions/mcp.md#serving-the-same-tools-over-http). A dashboard account and an MCP account are unrelated: creating, disabling or deleting one does nothing to the other, even for the same email address. Treat granting MCP HTTP access as its own decision, not an extension of dashboard access.

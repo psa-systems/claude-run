@@ -1,4 +1,4 @@
--- CLAUDE-20: persist the full per-row pipeline elapsed time.
+-- Persist the full per-row pipeline elapsed time.
 --
 -- row_outcomes previously recorded only `ts` (when the outcome landed), so a
 -- per-row duration could not be derived. `duration_ms` is measured in

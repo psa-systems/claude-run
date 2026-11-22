@@ -99,7 +99,7 @@ impl Daemon {
         // Settings-page saves apply live.
         crate::settings::migrate_config_file(&pool, &self.paths).await?;
 
-        // CLAUDE-428: the SMTP transport moved from a DB-backed Settings-page
+        // The SMTP transport moved from a DB-backed Settings-page
         // section to environment variables. Retire any leftover
         // `config.email` row / secret once, then fail fast naming the
         // offending variable (never the password) rather than letting a bad
@@ -108,7 +108,7 @@ impl Daemon {
         crate::config::EmailConfig::from_env()
             .map_err(|e| anyhow::anyhow!("email configuration: {e}"))?;
 
-        // CLAUDE-446: every runner-posted comment's footer needs this to
+        // Every runner-posted comment's footer needs this to
         // build a run link. Warn once at startup rather than let the gap go
         // unnoticed until someone reads a comment that could not link back.
         if crate::config::public_url()
@@ -124,7 +124,7 @@ impl Daemon {
         let effective = crate::settings::effective(&pool, &self.on_disk).await?;
         let replay_window_secs = effective.webhook.replay_window_secs;
 
-        // CLAUDE-347: a webhook source missing a required credential
+        // A webhook source missing a required credential
         // reference (its HMAC `secret_ref` or its comment-path
         // `write_token_ref`) used to start up clean and only fail the first
         // time the comment backend needed the missing token. Enforce the
@@ -137,7 +137,7 @@ impl Daemon {
         crate::settings::validate_comment_webhook(&effective.webhook_comment)
             .map_err(|e| anyhow::anyhow!("config.webhook_comment: {e}"))?;
 
-        // CLAUDE-360: an `enabled`-unset (defaulted `false`) section with
+        // An `enabled`-unset (defaulted `false`) section with
         // pre-existing sources is the upgrade-time transition this flag adds -
         // surface it loudly rather than letting the listener go quiet with no
         // explanation.
@@ -154,7 +154,7 @@ impl Daemon {
             self.log_apply.take(),
         ));
 
-        // CLAUDE-440: a dead process may have left `run_inflight_jobs` rows for
+        // A dead process may have left `run_inflight_jobs` rows for
         // issues it moved to `AI Agent = Working` and never finished; gather
         // only ever sees `states.queued`, so those issues are invisible to every
         // future poll until something re-queues them. `reap_orphaned_runs` below
@@ -412,7 +412,7 @@ impl Daemon {
         let (comment_tx, comment_rx) =
             mpsc::channel::<crate::web::comment_webhooks::VerifiedCommentCommand>(64);
         // Cloned before the sender moves into `comment_state`: automerge's
-        // conflict auto-resolve dispatch (CLAUDE-380) needs its own handle on
+        // conflict auto-resolve dispatch needs its own handle on
         // the same channel `consume_commands` drains below.
         let automerge_comment_tx = comment_tx.clone();
         let comment_state = crate::web::comment_webhooks::CommentWebhookState::from_shared(
@@ -501,8 +501,8 @@ impl Daemon {
             tokio::spawn(bind_and_serve_tcp(tcp_bind, config_path, tcp_app))
         });
 
-        // The read-only troubleshooting MCP tools over Streamable HTTP
-        // (CLAUDE-442), gated on `[mcp].enabled`. `spawn` itself logs and
+        // The read-only troubleshooting MCP tools over Streamable HTTP,
+        // gated on `[mcp].enabled`. `spawn` itself logs and
         // returns `None` on any precondition failure (unset `public_url`, a
         // corrupt key file), so a misconfigured listener never takes down
         // the rest of this `serve` call.
@@ -703,11 +703,11 @@ impl Daemon {
         ));
 
         // Sweep unused named volumes from the sidecar's Docker daemon older
-        // than the configured window, and (SPEC-3.11, CLAUDE-516) reclaim the
+        // than the configured window, and (SPEC-3.11) reclaim the
         // rest of the sidecar's storage (stopped containers, images, build
         // cache) once the measured total exceeds `docker_gc.max_bytes`.
         // Nothing ever removed any of this, and a deployment can fill its
-        // Docker data directory this way (CLAUDE-433). Same cadence and
+        // Docker data directory this way. Same cadence and
         // live-config shape as the sweeps above; skipped while any run is in
         // flight since a run may be using the sidecar.
         let docker_gc_task = tokio::spawn(docker_gc_loop(
@@ -723,7 +723,7 @@ impl Daemon {
         // reason (nothing to probe yet).
         // Sweep the shared Cargo target cache: a repo directory over
         // `cargo_cache.max_bytes_per_repo` is deleted once no run for that
-        // repo is in flight (`SPEC-3.10` item 6, CLAUDE-512). Same cadence
+        // repo is in flight (`SPEC-3.10` item 6). Same cadence
         // and live-config shape as the sweeps above.
         let cargo_cache_gc_task = tokio::spawn(cargo_cache_gc_loop(
             self.paths.clone(),
@@ -972,7 +972,7 @@ async fn serve_tcp(listener: tokio::net::TcpListener, app: axum::Router) -> Resu
 /// webhook run logs stay reachable under the renamed action (the DB rows are
 /// migrated by migration `0013`; the log dir lives outside SQLite). The action
 /// has carried this log directory under two earlier names: `webhook-fast-path`
-/// (pre-CLAUDE-153) and `webhook-forgejo` (pre-CLAUDE-361, when the listener's
+/// and `webhook-forgejo` (the latter until the listener's
 /// route and synthetic action name stopped being Forgejo-specific).
 ///
 /// Best-effort and idempotent: it acts only when an old path exists and the new
@@ -1562,7 +1562,7 @@ impl Dispatcher {
     }
 }
 
-/// SPEC-6.3 / DEV-705 / DEV-707: resolves the run's spend ceiling and checks
+/// SPEC-6.3: resolves the run's spend ceiling and checks
 /// the daily run-count cap and daily budget for every kind before any work
 /// starts, refusing with `exit::DAILY_CAP` (4) or `exit::OVER_BUDGET` (6).
 /// SPEC-3.1: the concurrency-key admission check drops a gathered job whose
@@ -1640,7 +1640,7 @@ pub async fn run_action_inner(
         return Ok(spend.exit_code(crate::exit::OK));
     }
 
-    // The action's `env` and `secrets` (CLAUDE-478). An unknown secret stops
+    // The action's `env` and `secrets`. An unknown secret stops
     // the run here, before a job is gathered or an attempt counted.
     let snippet = match snippet.for_action(&loaded.action, pool).await? {
         Some(scoped) => Arc::new(scoped),
@@ -2019,7 +2019,7 @@ async fn docker_gc_loop(
     }
 }
 
-/// `SPEC-3.10` item 6, CLAUDE-512: resolve each in-flight `(action_name,
+/// `SPEC-3.10` item 6, resolve each in-flight `(action_name,
 /// job_key)` pair to the repo-slug of the git remote its workdir points at,
 /// which is the same slug the shared `cargo-target/<repo-slug>` directory is
 /// named for. This is blocking I/O (a `git remote get-url` subprocess per
@@ -2073,7 +2073,7 @@ fn inflight_cargo_repos(
     repos
 }
 
-/// `SPEC-3.10` item 6, CLAUDE-512: periodic sweep of the shared Cargo target
+/// `SPEC-3.10` item 6, periodic sweep of the shared Cargo target
 /// cache, on the same [`GC_TICK_SECS`] cadence as the other sweeps. A failed
 /// read of `run_inflight_jobs` is treated as "evidence unavailable" rather
 /// than skipping the sweep outright, since an unavailable-evidence pass still
@@ -2328,7 +2328,7 @@ async fn automerge_reconciler_loop(
 /// serve start may still gain one later, and a tick that cannot resolve one
 /// logs and skips rather than blocking the daemon.
 ///
-/// `concurrency.stuck_working_sweep` (CLAUDE-625) is read at the top of every
+/// `concurrency.stuck_working_sweep` is read at the top of every
 /// tick (live apply, no restart needed). `false` skips the tracker read and
 /// write entirely: a multi-instance, non-clustered deployment can disable the
 /// sweep so this instance never re-queues another instance's live run. A
@@ -2778,7 +2778,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-625: `concurrency.stuck_working_sweep == false` skips the tick
+    /// `concurrency.stuck_working_sweep == false` skips the tick
     /// entirely, no tracker read or write; flipping it to `true` reaches the
     /// sweep (here, the `yt list` read) on the very next tick.
     #[tokio::test]
@@ -2935,27 +2935,27 @@ mod tests {
         let pool = crate::db::test_pool().await;
 
         let live = state::run_begin(&pool, "youtrack", "cli").await.unwrap();
-        state::run_inflight_add(&pool, live, "CLAUDE-1", "CLAUDE")
+        state::run_inflight_add(&pool, live, "PROJ-1", "CLAUDE")
             .await
             .unwrap();
         let done = state::run_begin(&pool, "youtrack", "cli").await.unwrap();
-        state::run_inflight_add(&pool, done, "CLAUDE-2", "CLAUDE")
+        state::run_inflight_add(&pool, done, "PROJ-2", "CLAUDE")
             .await
             .unwrap();
         state::run_finish(&pool, done, 0, 1).await.unwrap();
 
         let set = inflight_stream_log_jobs(&pool).await.unwrap();
-        assert!(set.contains(&("youtrack".to_string(), "CLAUDE-1".to_string())));
+        assert!(set.contains(&("youtrack".to_string(), "PROJ-1".to_string())));
         assert!(
-            !set.contains(&("youtrack".to_string(), "CLAUDE-2".to_string())),
+            !set.contains(&("youtrack".to_string(), "PROJ-2".to_string())),
             "a finished run's job is not in flight"
         );
 
         let logs = paths.logs_dir();
         let streams = logs.join("youtrack").join("streams");
         std::fs::create_dir_all(&streams).unwrap();
-        let running = streams.join("CLAUDE-1-attempt-1.jsonl");
-        let finished = streams.join("CLAUDE-2-attempt-1.jsonl");
+        let running = streams.join("PROJ-1-attempt-1.jsonl");
+        let finished = streams.join("PROJ-2-attempt-1.jsonl");
         std::fs::write(&running, b"{}\n").unwrap();
         std::fs::write(&finished, b"{}\n").unwrap();
 
@@ -3893,7 +3893,7 @@ mod tests {
         assert!(new.join("marker.jsonl").exists());
     }
 
-    // A deployment that already went through the CLAUDE-153 rename (so its logs
+    // A deployment that already went through the rename (so its logs
     // sit at the intermediate `webhook-forgejo` name) is carried forward to the
     // current name too.
     #[test]
@@ -3992,18 +3992,18 @@ mod tests {
 
     /// A workdir with a real git remote resolves to its repo-slug; a
     /// job whose workdir was never cloned (no `.git`) is silently skipped
-    /// rather than failing the whole pass (CLAUDE-512).
+    /// rather than failing the whole pass.
     #[test]
     fn inflight_cargo_repos_resolves_cloned_workdirs_and_skips_uncloned_ones() {
         // Bare `git` resolves through the process-wide `PATH`; serialize
-        // against the CLAUDE-410 PATH-stub test's mutation/deletion window
+        // against the PATH-stub test's mutation/deletion window
         // the same way `comment_webhooks::git_output` does.
         let _path_guard = crate::testutil::path_env_lock();
 
         let tmp = tempfile::tempdir().unwrap();
         let workdirs_base = tmp.path();
 
-        let cloned = crate::workdir::job_workdir(workdirs_base, "youtrack", "CLAUDE-1");
+        let cloned = crate::workdir::job_workdir(workdirs_base, "youtrack", "PROJ-1");
         std::fs::create_dir_all(&cloned).unwrap();
         assert!(std::process::Command::new("git")
             .arg("-C")
@@ -4026,12 +4026,12 @@ mod tests {
             .unwrap()
             .success());
 
-        let uncloned = crate::workdir::job_workdir(workdirs_base, "youtrack", "CLAUDE-2");
+        let uncloned = crate::workdir::job_workdir(workdirs_base, "youtrack", "PROJ-2");
         std::fs::create_dir_all(&uncloned).unwrap();
 
         let mut pairs = std::collections::HashSet::new();
-        pairs.insert(("youtrack".to_string(), "CLAUDE-1".to_string()));
-        pairs.insert(("youtrack".to_string(), "CLAUDE-2".to_string()));
+        pairs.insert(("youtrack".to_string(), "PROJ-1".to_string()));
+        pairs.insert(("youtrack".to_string(), "PROJ-2".to_string()));
 
         let repos = inflight_cargo_repos(workdirs_base, &pairs);
         assert_eq!(repos.len(), 1);

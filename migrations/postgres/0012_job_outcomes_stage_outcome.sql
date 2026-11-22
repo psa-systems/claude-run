@@ -1,4 +1,4 @@
--- CLAUDE-601 / SPEC-3.14 items 1 and 7: see
+-- SPEC-3.14 items 1 and 7: see
 -- migrations/sqlite/0031_job_outcomes_stage_outcome.sql for the rationale.
 ALTER TABLE job_outcomes ADD COLUMN IF NOT EXISTS stage TEXT;
 ALTER TABLE job_outcomes ADD COLUMN IF NOT EXISTS outcome TEXT;

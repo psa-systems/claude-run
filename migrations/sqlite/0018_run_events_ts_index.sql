@@ -1,4 +1,4 @@
--- CLAUDE-172: index run_events(ts) so the Phase 6 retention prune seeks the
+-- Index run_events(ts) so the Phase 6 retention prune seeks the
 -- rows past the cutoff instead of scanning the whole table.
 --
 -- The daemon retention sweep (see `src/retention.rs`) deletes rows with

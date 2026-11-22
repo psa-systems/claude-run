@@ -263,7 +263,7 @@ pub struct GateTiming {
 }
 
 /// One finished runner-owned step, handed from the synchronous `finalize` to
-/// the attempt's recorder the moment it ends (SPEC-3.14 item 3, CLAUDE-604).
+/// the attempt's recorder the moment it ends (SPEC-3.14 item 3).
 #[derive(Debug, Clone)]
 pub struct StepSpan {
     pub kind: StepKind,
@@ -318,7 +318,7 @@ fn span_registry() -> &'static SpanRegistry {
 /// Stash finished steps under the job key. Only the final-push conflict
 /// resolver uses this: it runs inside a provider call with no `finalize` sink
 /// or recorder in reach, so the caller of that call drains it with
-/// [`drain_stashed_spans`] as soon as the call returns (CLAUDE-604, CLAUDE-597).
+/// [`drain_stashed_spans`] as soon as the call returns.
 pub fn stash_step_spans(key: &str, spans: Vec<StepSpan>) {
     span_registry()
         .lock()
@@ -582,7 +582,7 @@ impl<'a> StepRecorder<'a> {
     /// Delete every row stored for this recorder's attempt number. Called when
     /// the attempt starts (rows left by an earlier attempt that never counted
     /// and so reuses this number) and when it ends uncounted, because step-end
-    /// writes (CLAUDE-603) land before the attempt is known to count. A failure
+    /// writes land before the attempt is known to count. A failure
     /// is logged at `error` with the key and marks the attempt incomplete.
     pub async fn clear_attempt(&mut self) {
         let res = sqlx::query(sqlx::AssertSqlSafe(
@@ -944,7 +944,7 @@ pub fn derive_claude_steps(
 
 #[cfg(test)]
 mod tests {
-    /// CLAUDE-603: a checkpoint span inside a derived step splits it, so no
+    /// A checkpoint span inside a derived step splits it, so no
     /// instant is counted by both rows.
     #[test]
     fn carve_steps_removes_hole_spans_from_derived_steps() {
@@ -1323,7 +1323,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.14 item 3, CLAUDE-604: `push`, `pr_create` and `gate` spans are
+    /// SPEC-3.14 item 3: `push`, `pr_create` and `gate` spans are
     /// stored as they end, so the SPEC-3.15 list built for the next comment
     /// of the same attempt already includes them.
     #[tokio::test]
@@ -1437,7 +1437,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.14 item 3, CLAUDE-597: a `conflict_resolution` span stashed by the
+    /// SPEC-3.14 item 3: a `conflict_resolution` span stashed by the
     /// resolver and the gate span after it reach the sink in order, and the
     /// latest end is returned so the caller's next step starts after them.
     #[test]
@@ -1480,7 +1480,7 @@ mod tests {
         assert_eq!(drain_stashed_spans("T-DRAIN", &sink), None);
     }
 
-    /// SPEC-3.14 item 3, CLAUDE-597: the span file round-trips, a missing file
+    /// SPEC-3.14 item 3: the span file round-trips, a missing file
     /// is no spans, and a malformed line is an error, not a short list.
     #[test]
     fn step_span_file_round_trips_and_rejects_malformed_lines() {

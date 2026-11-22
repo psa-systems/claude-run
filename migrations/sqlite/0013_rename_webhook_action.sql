@@ -1,4 +1,4 @@
--- CLAUDE-153: rename the synthetic webhook action from `webhook-fast-path` to
+-- Rename the synthetic webhook action from `webhook-fast-path` to
 -- `webhook-forgejo` in the persisted state, so existing run history, caps, and
 -- any pause row stay attached to the action under its new name (the constant
 -- `WEBHOOK_MINT_ACTION` now reads `webhook-forgejo`). A clean-break rename would
@@ -8,7 +8,7 @@
 -- One UPDATE per table that keys on `action_name` and that the webhook path can
 -- write: `runs` (the history rows), `job_outcomes` (per-job records),
 -- `paused_actions` (the pause row, if the operator paused before the upgrade),
--- `attempt_counters` / `daily_ledger` (the reused DEV-335 caps ledger), and
+-- `attempt_counters` / `daily_ledger` (the reused caps ledger), and
 -- `run_events` (poll/pipeline diagnostics). On a fresh DB every UPDATE matches
 -- zero rows and is a no-op. `paused_actions.action_name` is a PRIMARY KEY, but
 -- `webhook-forgejo` cannot pre-exist this rename, so no key collision is

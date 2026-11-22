@@ -1,8 +1,8 @@
--- CLAUDE-28: set of in-flight job keys per run.
+-- Set of in-flight job keys per run.
 --
 -- The single `runs.current_job_key` marker (migration 0004 / 0006) assumed at
 -- most one job in flight at a time, which held while jobs ran strictly
--- sequentially. CLAUDE-28 runs distinct-key jobs in parallel, so a run can have
+-- sequentially. Distinct-key jobs now run in parallel, so a run can have
 -- several jobs in flight at once. This table tracks that set: a row per
 -- (run_id, job_key) currently being processed. The run-detail UI badges a
 -- planned job "running" when its key is in this set (and the run is still

@@ -29,8 +29,8 @@
 //! behavior, now enforced daemon-wide (at most one job for that action across all
 //! its overlapping runs).
 //!
-//! CLAUDE-163: acquisition order is gate-then-semaphores, and the gate is a
-//! non-blocking `try`. CLAUDE-162 originally ordered it semaphores-then-gate so a
+//! Acquisition order is gate-then-semaphores, and the gate is a
+//! non-blocking `try`. It was originally semaphores-then-gate so a
 //! held key never blocked on a permit; the side effect was permit starvation. A
 //! job that shared its concurrency key with a running sibling still grabbed a
 //! global and per-action permit and then parked on the key mutex, holding those
@@ -96,7 +96,7 @@ impl KeyGate {
         m.lock_owned().await
     }
 
-    /// CLAUDE-163: non-blocking acquire. Returns `Some(guard)` if no other holder
+    /// Non-blocking acquire. Returns `Some(guard)` if no other holder
     /// of `key` is in flight, `None` if the key is already held. Used by the
     /// [`Executor`] to gate on the key *before* taking any permit: a job whose key
     /// is busy defers instead of parking on the mutex while holding scarce
@@ -114,9 +114,9 @@ impl KeyGate {
 
 /// SPEC-2.2: advisory, scheduler-only gather marker.
 ///
-/// CLAUDE-228: a per-action marker for "this action is gathering right now".
+/// A per-action marker for "this action is gathering right now".
 ///
-/// Overlapping RUNS are deliberate (CLAUDE-162); overlapping GATHERS are not. A
+/// Overlapping RUNS are deliberate; overlapping GATHERS are not. A
 /// gather is one `yt list` over the action's whole query, and under load that
 /// call has been observed taking minutes, longer than the 60s pickup cadence.
 /// Every stacked fire then re-ran the same query, each pinning another thread
@@ -172,7 +172,7 @@ impl Drop for GatherGuard {
 /// SPEC-10: the global + per-action semaphore permits; see SPEC-6.3 for the
 /// resolved effective cap this is built from.
 ///
-/// CLAUDE-162: the daemon-wide concurrency limiter. Holds a global semaphore
+/// The daemon-wide concurrency limiter. Holds a global semaphore
 /// (total concurrent jobs across all actions) plus one semaphore per action name
 /// (concurrent jobs for that action). Shared behind an `Arc`, so the daemon hands
 /// the same limiter to every run and a cap holds across overlapping runs. The
@@ -246,7 +246,7 @@ impl Limiter {
         }
     }
 
-    /// CLAUDE-162: acquire a global then per-action permit, in that fixed order,
+    /// Acquire a global then per-action permit, in that fixed order,
     /// returning both owned permits (release together on drop). For a handler
     /// that runs a sequential per-job loop rather than the parallel [`Executor`],
     /// so its jobs are still bounded by the daemon-wide caps across overlapping
@@ -273,7 +273,7 @@ impl Limiter {
     /// SPEC-2.2: a racy, best-effort admission check; the executor's real
     /// `acquire` is the authority.
     ///
-    /// CLAUDE-162: true when a job for `action` could acquire a permit right now
+    /// True when a job for `action` could acquire a permit right now
     /// under both caps, without taking one. A best-effort admission gate the
     /// scheduler consults before starting an overlapping run so it does not pile
     /// up runs that would immediately block on a saturated cap. Racy by nature
@@ -308,7 +308,7 @@ pub struct Executor {
     /// started yet (their future is dropped unpolled); jobs already running tear
     /// down through their own clone of the token inside the job pipeline.
     pub cancel: CancellationToken,
-    /// CLAUDE-223: the run-scoped global-pause gate. Checked at the same points
+    /// The run-scoped global-pause gate. Checked at the same points
     /// as `cancel`, so a pause taken mid-run stops the NEXT job pickup instead
     /// of letting the run drain every queued job. A skipped job defers exactly
     /// like a key-contended one (`Ok(false)`): no attempt, re-gathered after
@@ -333,13 +333,13 @@ impl Executor {
             let max_parallel = self.max_parallel;
             let pause = self.pause.clone();
             handles.push(tokio::spawn(async move {
-                // CLAUDE-163: gate on the concurrency key FIRST, with a
+                // Gate on the concurrency key FIRST, with a
                 // non-blocking try, before taking any permit. A job whose key is
                 // already held by a running sibling takes no permit and defers
                 // (`Ok(false)`); it is left Queued for the next pickup gather. Only
                 // once the key is held do we take the global then per-action
                 // permit, so a permit is never held by a job merely waiting on a
-                // key (the CLAUDE-162 permit-starvation bug). Because the key is
+                // key (the permit-starvation bug). Because the key is
                 // only ever taken by this non-blocking try, no job waits on a
                 // permit while another waits on that key: no lock-order inversion,
                 // the pipeline stays deadlock-free.
@@ -352,7 +352,7 @@ impl Executor {
                 };
                 let global = limiter.global();
                 // A queued job can wait as long as the jobs ahead of it run, so
-                // a cancel must not wait for a permit (SPEC-3.7, CLAUDE-507).
+                // a cancel must not wait for a permit (SPEC-3.7).
                 let _global_permit = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Ok(false),
@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(peak.load(Ordering::SeqCst), 4);
     }
 
-    /// CLAUDE-223: a global pause stops the executor from picking up any job.
+    /// A global pause stops the executor from picking up any job.
     /// Each defers as `Ok(false)` (no work, no attempt, re-gathered after
     /// Resume) and the run's gate is left tripped, so it finishes with
     /// `exit::PAUSED` rather than `exit::OK` or `exit::CANCELLED`.
@@ -536,13 +536,13 @@ mod tests {
         let results = exec.run(items).await;
         // Never more than one same-key job in flight at a time.
         assert_eq!(key_peak.load(Ordering::SeqCst), 1);
-        // CLAUDE-163: only one same-key job runs per pass; the other two find the
+        // Only one same-key job runs per pass; the other two find the
         // key held and defer (`Ok(false)`) without taking a permit or running.
         assert_eq!(results.iter().filter(|r| matches!(r, Ok(true))).count(), 1);
         assert_eq!(results.iter().filter(|r| matches!(r, Ok(false))).count(), 2);
     }
 
-    // CLAUDE-163: a job whose concurrency key is already held takes NO permit and
+    // A job whose concurrency key is already held takes NO permit and
     // defers; only one same-key job runs per pass. With N same-key jobs and a
     // global/per-action cap of C, at most one permit is ever held on their
     // account, so the semaphore never drops below C-1 available.
@@ -588,7 +588,7 @@ mod tests {
         assert_eq!(min_global.load(Ordering::SeqCst), 4);
     }
 
-    // CLAUDE-163: an unrelated key runs immediately alongside a large same-key
+    // An unrelated key runs immediately alongside a large same-key
     // backlog. The backlog's parked siblings no longer consume permits, so a
     // second project (distinct key) is never starved behind a single serialized
     // key draining.
@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(results.iter().filter(|r| matches!(r, Ok(true))).count(), 2);
     }
 
-    // CLAUDE-163: heavy contention across a few keys with tight caps completes
+    // Heavy contention across a few keys with tight caps completes
     // without deadlock. The gate-then-permit order (non-blocking gate) introduces
     // no lock-order inversion, so the run always makes progress and terminates.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -721,7 +721,7 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
-    /// CLAUDE-507: a job queued for a permit stops as soon as its run is
+    /// A job queued for a permit stops as soon as its run is
     /// cancelled, whether it waits on the global or the per-action cap, without
     /// waiting for the job holding the permit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -763,7 +763,7 @@ mod tests {
         }
     }
 
-    // CLAUDE-162: the per-action cap holds across two OVERLAPPING runs (two
+    // The per-action cap holds across two OVERLAPPING runs (two
     // Executors sharing one Limiter), not just within a single run. With a
     // per-action cap of 2 and a generous global, six distinct-key jobs split
     // across two concurrent runs still never exceed two in flight for the action.
@@ -805,7 +805,7 @@ mod tests {
         assert_eq!(peak.load(Ordering::SeqCst), 2);
     }
 
-    // CLAUDE-162: the global cap bounds total concurrent jobs across DIFFERENT
+    // The global cap bounds total concurrent jobs across DIFFERENT
     // actions. Two actions each with a per-action cap of 4 (so neither alone
     // limits) share a global cap of 3; eight distinct-key jobs across the two
     // runs never exceed three in flight.
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(peak.load(Ordering::SeqCst), 3);
     }
 
-    // CLAUDE-162: same-key jobs stay serialized across two overlapping runs (the
+    // Same-key jobs stay serialized across two overlapping runs (the
     // daemon-wide KeyGate), so an issue queued into a second run against a repo a
     // first run is still working never runs concurrently with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -884,7 +884,7 @@ mod tests {
         assert_eq!(key_peak.load(Ordering::SeqCst), 1);
     }
 
-    // CLAUDE-162: `can_admit` reflects live permit availability and `set_global_max`
+    // `can_admit` reflects live permit availability and `set_global_max`
     // rebuilds the global cap. A fresh limiter admits; once its only global permit
     // is held, it refuses; raising the cap admits again.
     #[tokio::test]
@@ -906,7 +906,7 @@ mod tests {
         assert_eq!(limiter.global_max(), 4);
     }
 
-    // CLAUDE-228: the gather marker is per action, non-blocking, and released on
+    // The gather marker is per action, non-blocking, and released on
     // drop, including when the gather returns early with an error.
     #[test]
     fn gather_gate_marks_one_action_at_a_time() {

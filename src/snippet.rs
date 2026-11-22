@@ -48,7 +48,7 @@ pub struct SnippetOutcome {
 
 pub struct SnippetRunner {
     nu_binary: String,
-    /// Environment from the action's `env` and `secrets` blocks (CLAUDE-478).
+    /// Environment from the action's `env` and `secrets` blocks.
     /// Set on the snippet process only, so the `claude` child never sees it.
     env: Vec<(String, String)>,
     /// Values of the action's `secrets`, scrubbed from snippet output.
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(out.stdout.trim(), r#"{"id":"hello"}"#);
     }
 
-    /// CLAUDE-478: the snippet sees the action's env and secrets, a printed
+    /// The snippet sees the action's env and secrets, a printed
     /// secret comes back redacted on both streams, and it is on no file.
     #[test]
     fn action_env_reaches_the_snippet_and_secrets_are_scrubbed() {

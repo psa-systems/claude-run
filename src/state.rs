@@ -1323,7 +1323,7 @@ pub async fn cancel_orphaned_runs(pool: &DbPool) -> Result<u64> {
 /// [`run_inflight_rows_all`] before calling this: this function's own
 /// `DELETE FROM run_inflight_jobs` is unconditional and carries no tracker
 /// call, so it is the last chance to read which issue keys a dead process had
-/// moved to `Working` and never finished (CLAUDE-440). SPEC-5.2.
+/// moved to `Working` and never finished. SPEC-5.2.
 pub async fn reap_orphaned_runs(pool: &DbPool) -> Result<u64> {
     close_open_runs(pool, crate::exit::UNEXPECTED).await
 }
@@ -2241,7 +2241,6 @@ pub async fn secret_touch(pool: &DbPool, name: &str) -> Result<()> {
 
 /// Metadata for one generated peer API key. The hash is never carried in this
 /// view, so the listing the Secrets page renders can never leak a key.
-/// CLAUDE-636.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct ApiKeyMeta {
     pub name: String,
@@ -2250,7 +2249,6 @@ pub struct ApiKeyMeta {
 }
 
 /// List generated API keys (names + timestamps only), alphabetical by name.
-/// CLAUDE-636.
 pub async fn api_key_list(pool: &DbPool) -> Result<Vec<ApiKeyMeta>> {
     let rows = sqlx::query_as::<_, ApiKeyMeta>(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -2264,7 +2262,7 @@ pub async fn api_key_list(pool: &DbPool) -> Result<Vec<ApiKeyMeta>> {
     Ok(rows)
 }
 
-/// True when an API key with `name` already exists. CLAUDE-636.
+/// True when an API key with `name` already exists.
 pub async fn api_key_exists(pool: &DbPool, name: &str) -> Result<bool> {
     let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(pool, "SELECT id FROM api_keys WHERE name = ?").into_owned(),
@@ -2277,7 +2275,7 @@ pub async fn api_key_exists(pool: &DbPool, name: &str) -> Result<bool> {
 
 /// Store a newly generated API key's hash. Errors via the UNIQUE constraint
 /// when `name` is taken; callers should check [`api_key_exists`] first for a
-/// friendly message. CLAUDE-636.
+/// friendly message.
 pub async fn api_key_create(pool: &DbPool, name: &str, key_hash: &str) -> Result<()> {
     let now = now_iso();
     sqlx::query(sqlx::AssertSqlSafe(
@@ -2296,7 +2294,6 @@ pub async fn api_key_create(pool: &DbPool, name: &str, key_hash: &str) -> Result
 }
 
 /// Revoke (delete) an API key. Returns `false` when no key with `name` exists.
-/// CLAUDE-636.
 pub async fn api_key_revoke(pool: &DbPool, name: &str) -> Result<bool> {
     let res = sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(pool, "DELETE FROM api_keys WHERE name = ?").into_owned(),
@@ -2307,7 +2304,7 @@ pub async fn api_key_revoke(pool: &DbPool, name: &str) -> Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
-/// True when at least one API key is configured. CLAUDE-636.
+/// True when at least one API key is configured.
 pub async fn api_key_any_exists(pool: &DbPool) -> Result<bool> {
     let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(
         crate::db::q(pool, "SELECT id FROM api_keys LIMIT 1").into_owned(),
@@ -2320,7 +2317,7 @@ pub async fn api_key_any_exists(pool: &DbPool) -> Result<bool> {
 /// True when `key_hash` matches a stored (non-revoked, since revoke deletes
 /// the row) API key, bumping its `last_used_at` on a match. A database error
 /// is propagated rather than treated as "no match": the peer gate must answer
-/// `500`, never `401`, on a lookup failure. CLAUDE-636.
+/// `500`, never `401`, on a lookup failure.
 pub async fn api_key_touch_if_matches(pool: &DbPool, key_hash: &str) -> Result<bool> {
     let now = now_iso();
     let res = sqlx::query(sqlx::AssertSqlSafe(
@@ -2383,7 +2380,7 @@ pub async fn status_blocks(pool: &DbPool) -> Result<StatusBlocks> {
 
 /// One `runs` row, as read back for `mcp stdio`'s `list_runs` / `get_run`
 /// tools. Mirrors `RunRow` in `src/web/mod.rs` (kept private there, per
-/// CLAUDE-437's instruction not to touch that module) but is its own type:
+/// an instruction not to touch that module) but is its own type:
 /// the two surfaces render differently enough (JSON tool result vs HTML) that
 /// sharing a struct would couple them for no benefit. SPEC-4.5.
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -2690,7 +2687,7 @@ mod tests {
             "youtrack",
             &[InputEvent {
                 level: "warn".into(),
-                context: Some("CLAUDE-206".into()),
+                context: Some("PROJ-206".into()),
                 message: "open-PR lookup for `contoso/claude-run` failed (403); created anyway"
                     .into(),
             }],
@@ -2704,7 +2701,7 @@ mod tests {
             .find(|e| e.message.contains("open-PR lookup"))
             .expect("degraded-lookup event present on the action page");
         assert_eq!(degraded.run_id, Some(run));
-        assert_eq!(degraded.context.as_deref(), Some("CLAUDE-206"));
+        assert_eq!(degraded.context.as_deref(), Some("PROJ-206"));
         assert_eq!(degraded.level, "warn");
         // The poll event recorded before the run row stays unattached.
         let poll_event = read
@@ -2823,7 +2820,7 @@ mod tests {
         assert!(handler(&pool, run).await.is_err());
 
         // `Drop` cannot await, so the close is spawned; wait for it to land.
-        // CLAUDE-504: a fixed, short poll window flaked on Postgres under
+        // A fixed, short poll window flaked on Postgres under
         // heavy I/O contention, so this backs off over a much wider budget.
         let ended = crate::testutil::poll_until(std::time::Duration::from_secs(20), || {
             ended_at_of(&pool, run)
@@ -2934,7 +2931,7 @@ mod tests {
     ///
     /// `web/webhooks.rs`'s single `run_begin` call lives inside
     /// `begin_webhook_run`, the one opener both it and `web/comment_webhooks.rs`
-    /// share (CLAUDE-402); `comment_webhooks_opens_no_run_row_of_its_own` below
+    /// share; `comment_webhooks_opens_no_run_row_of_its_own` below
     /// is `web/comment_webhooks.rs`'s half of this pairing, since it has no
     /// `run_begin` call of its own to enumerate here.
     #[test]
@@ -2962,7 +2959,7 @@ mod tests {
         }
     }
 
-    /// Half of the CLAUDE-402 pairing check: `web/comment_webhooks.rs` must
+    /// Half of the pairing check: `web/comment_webhooks.rs` must
     /// open no `run_begin` row of its own; it only ever obtains one through
     /// `web/webhooks.rs::begin_webhook_run`, which
     /// `every_runner_pairs_run_begin_with_a_run_guard` above already proves is
@@ -3345,7 +3342,7 @@ mod tests {
         run_inflight_add(&pool, r2, "BETA-3", "BETA").await.unwrap();
         // A different action's in-flight concurrency key must not leak in.
         let other = run_begin(&pool, "other", "scheduler").await.unwrap();
-        run_inflight_add(&pool, other, "GAMMA-9", "GAMMA")
+        run_inflight_add(&pool, other, "OTHER-9", "OTHER")
             .await
             .unwrap();
 
@@ -3484,7 +3481,7 @@ mod tests {
             &[
                 ev("warn", Some("CLAUDE"), "probe failed"),
                 ev("error", Some("CLAUDE"), "clone failed"),
-                ev("warn", Some("GAMMA"), "probe failed"),
+                ev("warn", Some("OTHER"), "probe failed"),
                 // Neither counted nor grouped: `info` is a marker, not a signal.
                 ev("info", Some("CLAUDE"), "preflight passed"),
                 // A NULL context still accounts for its event.
@@ -3497,7 +3494,7 @@ mod tests {
             &pool,
             "other",
             "2026-08-01T00:00:05Z",
-            &[ev("error", Some("GAMMA"), "duplicate source")],
+            &[ev("error", Some("OTHER"), "duplicate source")],
         )
         .await
         .unwrap();
@@ -3525,7 +3522,7 @@ mod tests {
                     count: 2
                 },
                 RunEventCount {
-                    value: "GAMMA".into(),
+                    value: "OTHER".into(),
                     count: 2
                 },
                 RunEventCount {
@@ -3799,8 +3796,8 @@ mod tests {
         // has no YAML at all and so is absent from the map.
         for (action, key, n) in [
             ("audit", "AUD-31", 2),
-            ("youtrack", "CLAUDE-9", 3),
-            ("youtrack", "CLAUDE-8", 2),
+            ("youtrack", "PROJ-9", 3),
+            ("youtrack", "PROJ-8", 2),
             ("webhook-triage", "deadbeef", 4),
         ] {
             for _ in 0..n {
@@ -3814,7 +3811,7 @@ mod tests {
         let keys: Vec<&str> = hits.iter().map(|h| h.job_key.as_str()).collect();
         assert_eq!(
             keys,
-            vec!["deadbeef", "CLAUDE-9", "AUD-31"],
+            vec!["deadbeef", "PROJ-9", "AUD-31"],
             "capped keys only, most attempts first: {hits:?}"
         );
         assert_eq!(hits[2].action_name, "audit");
@@ -3826,7 +3823,7 @@ mod tests {
         );
         assert!(!hits[0].last_at.is_empty(), "the last attempt is dated");
         assert!(
-            !keys.contains(&"CLAUDE-8"),
+            !keys.contains(&"PROJ-8"),
             "one attempt left is not parked: {hits:?}"
         );
 
@@ -3849,7 +3846,7 @@ mod tests {
         assert_eq!(hits[0].job_key, "deadbeef");
     }
 
-    /// CLAUDE-584 / SPEC-3.13: the expected duration is the median of the last
+    /// SPEC-3.13: the expected duration is the median of the last
     /// 20 completed attempts of the action and stage, "no history" under 3.
     #[tokio::test]
     async fn expected_duration_is_the_median_of_the_last_twenty_attempts() {

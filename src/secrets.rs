@@ -458,7 +458,7 @@ impl Drop for JobCredentials {
 /// the file `0600`. Shared by the per-job credential store and the
 /// per-call Action-log store, so both stay on one schema.
 ///
-/// CLAUDE-123: the current `fj` (`forgejo-cli`) deserializes each host entry
+/// The current `fj` (`forgejo-cli`) deserializes each host entry
 /// with required `type`/`name` fields, so a `token`-only entry fails to parse
 /// (``missing field `type` ``) before `fj` ever contacts the server. The entry
 /// is built complete, cloning the operator's real store entry when present so
@@ -478,7 +478,7 @@ pub(crate) fn write_fj_keys(xdg_data_home: &Path, host: &str, token: &str) -> Re
     Ok(keys_path)
 }
 
-/// CLAUDE-209: a process-wide unique path segment, `{pid}-{seq}`. The pid alone
+/// A process-wide unique path segment, `{pid}-{seq}`. The pid alone
 /// is NOT unique: two concurrent polls in one daemon would build the same path
 /// and the first guard to drop would `remove_dir_all` the other's live files.
 // SPEC-7.2: a process-wide unique path segment for a per-job/per-call temp dir.
@@ -492,7 +492,7 @@ pub(crate) fn unique_suffix() -> String {
     )
 }
 
-/// CLAUDE-204: a throwaway `$XDG_DATA_HOME` holding a single-host `keys.json`,
+/// A throwaway `$XDG_DATA_HOME` holding a single-host `keys.json`,
 /// removed on drop so a decrypted `log_token_ref` lives only for the one `fj`
 /// call that needs it.
 pub(crate) struct TempFjKeys {
@@ -556,7 +556,7 @@ fn operator_fj_keys_path() -> PathBuf {
 
 /// Build the per-job `fj` host entry for `host`, carrying `token`.
 ///
-/// Preferred (CLAUDE-123): clone the operator's real key-store entry for `host`
+/// Preferred: clone the operator's real key-store entry for `host`
 /// from `operator_keys_path`, so whatever non-token fields the installed `fj`
 /// requires (`type`, `name`, and any future additions) carry over verbatim, and
 /// overwrite only `token` with the per-job decrypted value. This avoids
@@ -747,7 +747,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-478: an action's `secrets` resolve from the store into its
+    /// An action's `secrets` resolve from the store into its
     /// snippets' environment, redacted on the way out; an unknown one fails,
     /// naming it, before anything runs.
     #[tokio::test]
@@ -959,7 +959,7 @@ mod tests {
             let keys = std::fs::read_to_string(&keys_path).unwrap();
             assert!(keys.contains("dev.a8n.run"));
             assert!(keys.contains("fj-token"));
-            // CLAUDE-123: the host entry must deserialize under `fj`'s schema,
+            // The host entry must deserialize under `fj`'s schema,
             // which requires `type` and `name` (a `token`-only entry fails to
             // parse with `missing field \`type\``). Mirror that schema here so a
             // regression to a token-only entry fails CI.
@@ -1046,7 +1046,7 @@ mod tests {
 
     #[test]
     fn fj_host_entry_falls_back_to_complete_synthetic_entry() {
-        // CLAUDE-123: with no operator store, a complete entry is synthesized so
+        // With no operator store, a complete entry is synthesized so
         // `fj` parses it (it requires `type`/`name`, not just `token`).
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-store.json");
@@ -1067,7 +1067,7 @@ mod tests {
 
     #[test]
     fn fj_host_entry_clones_operator_template_and_swaps_token() {
-        // CLAUDE-123: when the operator store has the host, reuse its non-token
+        // When the operator store has the host, reuse its non-token
         // fields (including any beyond type/name) and substitute only the token,
         // so the operator's own token never leaks into the per-job store.
         let tmp = tempfile::tempdir().unwrap();
@@ -1121,7 +1121,7 @@ mod tests {
 
     #[test]
     fn github_token_ref_set_is_carried_env_only() {
-        // CLAUDE-50: a resolved GitHub PAT makes the set non-empty and is carried
+        // A resolved GitHub PAT makes the set non-empty and is carried
         // through to the guard for the GitHub `Forge`, with no on-disk file (it
         // travels as an env var / push-URL component only).
         let tmp = tempfile::tempdir().unwrap();
@@ -1147,7 +1147,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_ref_resolves_to_decrypted_secret() {
-        // CLAUDE-55: a `token_ref` names a secret; resolving it decrypts
+        // A `token_ref` names a secret; resolving it decrypts
         // the stored ciphertext under the loaded age key and returns the token.
         let tmp = tempfile::tempdir().unwrap();
         let key = SecretsKey::load_from_file(&write_key(tmp.path())).unwrap();

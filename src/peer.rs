@@ -37,12 +37,12 @@ const SUMMARY_PAGES_PER_TICK: usize = 20;
 /// How long a claim bypass is counted on the Status page.
 const BYPASS_WINDOW: chrono::Duration = chrono::Duration::hours(24);
 
-/// The prefix every generated peer API key starts with (CLAUDE-636).
+/// The prefix every generated peer API key starts with.
 pub const API_KEY_PREFIX: &str = "crk_";
 
 /// Generate a new peer API key: [`API_KEY_PREFIX`] followed by 64 lowercase
 /// hex characters from 32 bytes of randomness. The plaintext is never stored
-/// or logged; only [`hash_api_key`] of it is. CLAUDE-636.
+/// or logged; only [`hash_api_key`] of it is.
 pub fn generate_api_key() -> Result<String> {
     let mut b = [0u8; 32];
     getrandom::getrandom(&mut b)
@@ -52,7 +52,7 @@ pub fn generate_api_key() -> Result<String> {
 }
 
 /// Lowercase hex SHA-256 of `key`, for storage and lookup; never the
-/// plaintext itself. CLAUDE-636.
+/// plaintext itself.
 pub fn hash_api_key(key: &str) -> String {
     let mut h = Sha256::new();
     h.update(key.as_bytes());
@@ -1836,7 +1836,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// CLAUDE-636: the full flow the Secrets page's API Keys section exists
+    /// The full flow the Secrets page's API Keys section exists
     /// for. B has accounts and no `auth_token_ref` (`token: None`); A has
     /// never generated a token for B either, so the only credential in play
     /// is the key B's operator generates and A's operator pastes into a
@@ -1897,7 +1897,7 @@ mod tests {
         assert!(b_keys[0].last_used_at.is_some());
     }
 
-    /// CLAUDE-647: the daemon wraps the merged peer router in the web gate, which
+    /// The daemon wraps the merged peer router in the web gate, which
     /// never reads `api_keys`. A generated key must still reach the peer gate,
     /// and must stay refused on the rest of `/api/*`.
     #[tokio::test]

@@ -488,7 +488,7 @@ fn parent_comment(report: &str, window: Window, total: usize, projects: &[String
     )
 }
 
-/// The project short name of an `idReadable`, e.g. `CLAUDE-218` -> `CLAUDE`.
+/// The project short name of an `idReadable`, e.g. `PROJ-218` -> `PROJ`.
 fn project_key(idreadable: &str) -> String {
     idreadable
         .rsplit_once('-')
@@ -523,7 +523,7 @@ mod tests {
 
     fn cfg() -> ClosedIssueSummaryConfig {
         ClosedIssueSummaryConfig {
-            projects: vec!["CLAUDE".to_string(), "DELTA".to_string()],
+            projects: vec!["PROJ".to_string(), "DELTA".to_string()],
             ..ClosedIssueSummaryConfig::default()
         }
     }
@@ -570,14 +570,10 @@ mod tests {
     fn render_report_counts_and_lists_every_configured_project() {
         let gathered = vec![
             (
-                "CLAUDE".to_string(),
+                "PROJ".to_string(),
                 vec![
-                    issue(
-                        "CLAUDE-214",
-                        "Allow the agent to author issues",
-                        "Claude Run",
-                    ),
-                    issue("CLAUDE-215", "Partition the audit query", ""),
+                    issue("PROJ-214", "Allow the agent to author issues", "Claude Run"),
+                    issue("PROJ-215", "Partition the audit query", ""),
                 ],
             ),
             (
@@ -594,21 +590,21 @@ mod tests {
             ),
             "{body}"
         );
-        assert!(body.contains("| CLAUDE | 2 |"), "{body}");
+        assert!(body.contains("| PROJ | 2 |"), "{body}");
         assert!(body.contains("| DELTA | 1 |"), "{body}");
         assert!(body.contains("| YT | 0 |"), "{body}");
         assert!(body.contains("| **Total** | **3** |"), "{body}");
 
-        assert!(body.contains("## CLAUDE (2)"), "{body}");
+        assert!(body.contains("## PROJ (2)"), "{body}");
         assert!(
             body.contains(
-                "- CLAUDE-214 - Allow the agent to author issues - Task / Done / Claude Run"
+                "- PROJ-214 - Allow the agent to author issues - Task / Done / Claude Run"
             ),
             "{body}"
         );
         // An empty Assignee drops out rather than rendering a bare separator.
         assert!(
-            body.contains("- CLAUDE-215 - Partition the audit query - Task / Done\n"),
+            body.contains("- PROJ-215 - Partition the audit query - Task / Done\n"),
             "{body}"
         );
         assert!(body.contains("## YT (0)"), "{body}");
@@ -628,16 +624,16 @@ mod tests {
     #[test]
     fn render_report_caps_the_listing_but_never_the_count() {
         let many: Vec<ClosedIssue> = (1..=5)
-            .map(|n| issue(&format!("CLAUDE-{n}"), "x", "dev"))
+            .map(|n| issue(&format!("PROJ-{n}"), "x", "dev"))
             .collect();
-        let body = render_report(window(), &[("CLAUDE".to_string(), many)], 2);
-        assert!(body.contains("| CLAUDE | 5 |"), "{body}");
-        assert!(body.contains("## CLAUDE (5)"), "{body}");
+        let body = render_report(window(), &[("PROJ".to_string(), many)], 2);
+        assert!(body.contains("| PROJ | 5 |"), "{body}");
+        assert!(body.contains("## PROJ (5)"), "{body}");
         assert!(
             body.contains("- ... and 3 more (listing capped at 2)."),
             "{body}"
         );
-        assert!(!body.contains("CLAUDE-4"), "row 4 is past the cap: {body}");
+        assert!(!body.contains("PROJ-4"), "row 4 is past the cap: {body}");
     }
 
     #[test]
@@ -646,9 +642,9 @@ mod tests {
             "{parent}: {total} closed, {start} .. {end} ({days}d)",
             window(),
             12,
-            "CLAUDE-100",
+            "PROJ-100",
         );
-        assert_eq!(line, "CLAUDE-100: 12 closed, 2026-08-01 .. 2026-08-07 (7d)");
+        assert_eq!(line, "PROJ-100: 12 closed, 2026-08-01 .. 2026-08-07 (7d)");
     }
 
     #[test]
@@ -664,7 +660,7 @@ mod tests {
 
     #[test]
     fn project_key_splits_idreadable() {
-        assert_eq!(project_key("CLAUDE-218"), "CLAUDE");
+        assert_eq!(project_key("PROJ-218"), "PROJ");
         assert_eq!(project_key("A-B-7"), "A-B");
         assert_eq!(project_key("nodash"), "nodash");
     }
@@ -683,27 +679,27 @@ mod tests {
         std::env::remove_var("CLAUDE_RUN_PUBLIC_URL");
         let gathered = vec![
             (
-                "CLAUDE".to_string(),
+                "PROJ".to_string(),
                 vec![
-                    issue("CLAUDE-214", "Author issues", "Claude Run"),
-                    issue("CLAUDE-215", "Partition", "Claude Run"),
+                    issue("PROJ-214", "Author issues", "Claude Run"),
+                    issue("PROJ-215", "Partition", "Claude Run"),
                 ],
             ),
             ("DELTA".to_string(), Vec::new()),
         ];
         let body = render_report(window(), &gathered, 100);
-        let comment = parent_comment("CLAUDE-230", window(), 2, &cfg().projects);
+        let comment = parent_comment("PROJ-230", window(), 2, &cfg().projects);
         let runner = Arc::new(
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "inspect", "CLAUDE-100", "--json"],
+                    &["issue", "inspect", "PROJ-100", "--json"],
                     r#"{"issue":{"description":"milestone"},"comments":[]}"#,
                 )
                 .ok(
                     "yt",
-                    &["list", &list_args("CLAUDE"), "--json"],
-                    &rows(&[("CLAUDE-214", "Author issues"), ("CLAUDE-215", "Partition")]),
+                    &["list", &list_args("PROJ"), "--json"],
+                    &rows(&[("PROJ-214", "Author issues"), ("PROJ-215", "Partition")]),
                 )
                 .ok("yt", &["list", &list_args("DELTA"), "--json"], "[]")
                 .ok(
@@ -712,57 +708,57 @@ mod tests {
                         "issue",
                         "create",
                         "--project",
-                        "CLAUDE",
+                        "PROJ",
                         "--summary",
                         "Closed-issue summary: 2026-08-01 .. 2026-08-07",
                         "--description",
                         &body,
                         "--json",
                     ],
-                    r#"{"idReadable":"CLAUDE-230"}"#,
+                    r#"{"idReadable":"PROJ-230"}"#,
                 )
                 .ok(
                     "yt",
                     &[
                         "issue",
                         "link",
-                        "CLAUDE-230",
-                        "CLAUDE-100",
+                        "PROJ-230",
+                        "PROJ-100",
                         "--type",
                         "subtask of",
                     ],
                     "",
                 )
-                .ok_prefix(&format!("yt issue comment CLAUDE-100 {comment}"), ""),
+                .ok_prefix(&format!("yt issue comment PROJ-100 {comment}"), ""),
         );
         let backend = CliBackend::new(runner.clone());
 
         let filed = file_report(
             &backend,
             &cfg(),
-            "CLAUDE-100",
+            "PROJ-100",
             window(),
             1,
             &crate::run_footer::Trigger::Scheduled,
         )
         .unwrap();
-        assert_eq!(filed, Filing::Filed("CLAUDE-230".to_string()));
+        assert_eq!(filed, Filing::Filed("PROJ-230".to_string()));
 
         let calls = runner.calls.lock().unwrap().clone();
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue link CLAUDE-230 CLAUDE-100 --type subtask of"),
+                .any(|c| c == "yt issue link PROJ-230 PROJ-100 --type subtask of"),
             "the report must hang off the nominated parent: {calls:?}"
         );
-        assert!(comment.contains("as CLAUDE-230"), "{comment}");
+        assert!(comment.contains("as PROJ-230"), "{comment}");
         assert!(
             comment.contains("Report-Window: 2026-08-01..2026-08-07"),
             "{comment}"
         );
         assert!(
             calls.iter().any(
-                |c| c.starts_with(&format!("yt issue comment CLAUDE-100 {comment}"))
+                |c| c.starts_with(&format!("yt issue comment PROJ-100 {comment}"))
                     && c.contains("Run: link unavailable")
                     && c.contains("Duration: ")
             ),
@@ -772,7 +768,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c.contains("issue create --project CLAUDE ")),
+                .any(|c| c.contains("issue create --project PROJ ")),
             "{calls:?}"
         );
     }
@@ -788,7 +784,7 @@ mod tests {
         );
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
-            &["issue", "inspect", "CLAUDE-100", "--json"],
+            &["issue", "inspect", "PROJ-100", "--json"],
             &inspect,
         ));
         let backend = CliBackend::new(runner.clone());
@@ -796,7 +792,7 @@ mod tests {
         let filed = file_report(
             &backend,
             &cfg(),
-            "CLAUDE-100",
+            "PROJ-100",
             window(),
             1,
             &crate::run_footer::Trigger::Scheduled,
@@ -827,12 +823,8 @@ mod tests {
         );
         let runner = Arc::new(
             StubRunner::new()
-                .ok(
-                    "yt",
-                    &["issue", "inspect", "CLAUDE-100", "--json"],
-                    &inspect,
-                )
-                .ok("yt", &["list", &list_args("CLAUDE"), "--json"], "[]")
+                .ok("yt", &["issue", "inspect", "PROJ-100", "--json"], &inspect)
+                .ok("yt", &["list", &list_args("PROJ"), "--json"], "[]")
                 .ok("yt", &["list", &list_args("DELTA"), "--json"], "[]"),
         );
         let backend = CliBackend::new(runner.clone());
@@ -841,7 +833,7 @@ mod tests {
         assert!(file_report(
             &backend,
             &cfg(),
-            "CLAUDE-100",
+            "PROJ-100",
             window(),
             1,
             &crate::run_footer::Trigger::Scheduled
@@ -863,24 +855,24 @@ mod tests {
     fn report_run_makes_no_code_change_and_opens_no_pr() {
         let gathered = vec![
             (
-                "CLAUDE".to_string(),
-                vec![issue("CLAUDE-214", "Author issues", "Claude Run")],
+                "PROJ".to_string(),
+                vec![issue("PROJ-214", "Author issues", "Claude Run")],
             ),
             ("DELTA".to_string(), Vec::new()),
         ];
         let body = render_report(window(), &gathered, 100);
-        let comment = parent_comment("CLAUDE-230", window(), 1, &cfg().projects);
+        let comment = parent_comment("PROJ-230", window(), 1, &cfg().projects);
         let runner = Arc::new(
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "inspect", "CLAUDE-100", "--json"],
+                    &["issue", "inspect", "PROJ-100", "--json"],
                     r#"{"issue":{"description":""},"comments":[]}"#,
                 )
                 .ok(
                     "yt",
-                    &["list", &list_args("CLAUDE"), "--json"],
-                    &rows(&[("CLAUDE-214", "Author issues")]),
+                    &["list", &list_args("PROJ"), "--json"],
+                    &rows(&[("PROJ-214", "Author issues")]),
                 )
                 .ok("yt", &["list", &list_args("DELTA"), "--json"], "[]")
                 .ok(
@@ -889,34 +881,34 @@ mod tests {
                         "issue",
                         "create",
                         "--project",
-                        "CLAUDE",
+                        "PROJ",
                         "--summary",
                         "Closed-issue summary: 2026-08-01 .. 2026-08-07",
                         "--description",
                         &body,
                         "--json",
                     ],
-                    r#"{"idReadable":"CLAUDE-230"}"#,
+                    r#"{"idReadable":"PROJ-230"}"#,
                 )
                 .ok(
                     "yt",
                     &[
                         "issue",
                         "link",
-                        "CLAUDE-230",
-                        "CLAUDE-100",
+                        "PROJ-230",
+                        "PROJ-100",
                         "--type",
                         "subtask of",
                     ],
                     "",
                 )
-                .ok_prefix(&format!("yt issue comment CLAUDE-100 {comment}"), ""),
+                .ok_prefix(&format!("yt issue comment PROJ-100 {comment}"), ""),
         );
         let backend = CliBackend::new(runner.clone());
         file_report(
             &backend,
             &cfg(),
-            "CLAUDE-100",
+            "PROJ-100",
             window(),
             1,
             &crate::run_footer::Trigger::Scheduled,
@@ -963,23 +955,20 @@ mod tests {
     #[test]
     fn resolve_targets_unions_nominated_parents_with_the_query() {
         let c = ClosedIssueSummaryConfig {
-            parents: vec!["CLAUDE-100".to_string(), " ".to_string()],
+            parents: vec!["PROJ-100".to_string(), " ".to_string()],
             query: "-Resolved AI Agent: Reporting".to_string(),
             ..cfg()
         };
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
             &["list", "--query=-Resolved AI Agent: Reporting", "--json"],
-            r#"[{"idReadable":"DELTA-3"},{"idReadable":"CLAUDE-100"}]"#,
+            r#"[{"idReadable":"DELTA-3"},{"idReadable":"PROJ-100"}]"#,
         ));
         let backend = CliBackend::new(runner);
         let (targets, from_query) = resolve_targets(&backend, &c).unwrap();
-        assert_eq!(
-            targets,
-            vec!["CLAUDE-100".to_string(), "DELTA-3".to_string()]
-        );
+        assert_eq!(targets, vec!["PROJ-100".to_string(), "DELTA-3".to_string()]);
         assert!(from_query.contains("DELTA-3"));
-        assert!(from_query.contains("CLAUDE-100"));
+        assert!(from_query.contains("PROJ-100"));
     }
 
     /// An empty `query` runs no tracker query at all, so the default config
@@ -987,13 +976,13 @@ mod tests {
     #[test]
     fn resolve_targets_runs_no_query_when_it_is_empty() {
         let c = ClosedIssueSummaryConfig {
-            parents: vec!["CLAUDE-100".to_string()],
+            parents: vec!["PROJ-100".to_string()],
             ..cfg()
         };
         let runner = Arc::new(StubRunner::new());
         let backend = CliBackend::new(runner.clone());
         let (targets, from_query) = resolve_targets(&backend, &c).unwrap();
-        assert_eq!(targets, vec!["CLAUDE-100".to_string()]);
+        assert_eq!(targets, vec!["PROJ-100".to_string()]);
         assert!(from_query.is_empty());
         assert!(runner.calls.lock().unwrap().is_empty(), "no query is run");
     }
@@ -1013,7 +1002,7 @@ mod tests {
         from_query.insert("DELTA-3".to_string());
 
         advance(&backend, &c, &from_query, "DELTA-3", &c.done_label);
-        advance(&backend, &c, &from_query, "CLAUDE-100", &c.done_label);
+        advance(&backend, &c, &from_query, "PROJ-100", &c.done_label);
 
         let calls = runner.calls.lock().unwrap();
         assert_eq!(

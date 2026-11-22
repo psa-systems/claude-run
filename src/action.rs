@@ -223,14 +223,14 @@ pub struct YoutrackSource {
     /// literal placeholder `{{audit_project}}`, substituted with
     /// `audit_project` by [`YoutrackSource::resolved_query`] so the shipped
     /// audit/worker partition derives from one field instead of a literal
-    /// project key baked into two independent query strings (CLAUDE-409).
+    /// project key baked into two independent query strings.
     pub query: String,
     /// Custom field holding the AI Agent state machine.
     pub custom_field: String,
     /// Short name of the audit project, substituted into `query` wherever it
     /// contains the `{{audit_project}}` placeholder. Defaults to `AUDIT`, the
     /// project key the shipped `audit-run.yml` / `youtrack.yml` partition
-    /// (CLAUDE-215) used as a literal before CLAUDE-409.
+    /// used as a literal.
     #[serde(skip_serializing_if = "is_default_audit_project")]
     pub audit_project: String,
     /// Type that identifies a per-target audit run in the `audit` prompt
@@ -272,7 +272,7 @@ pub struct YoutrackSource {
     pub dependencies: Dependencies,
     /// Tags written alongside an AI Agent value. Today just the `Needs-Info`
     /// tag added when the agent parks an issue via
-    /// `.claude-run-needs-review` (CLAUDE-373).
+    /// `.claude-run-needs-review`.
     #[serde(skip_serializing_if = "Tags::is_default")]
     pub tags: Tags,
     /// Install the repo's own git hooks (`just install-hooks`) on the fresh
@@ -338,8 +338,8 @@ impl YoutrackSource {
     }
 
     /// `query` with every `{{audit_project}}` placeholder substituted by
-    /// `audit_project`. This is what the handler sends to `yt list`
-    /// (CLAUDE-409); `query` itself keeps the placeholder on disk so editing
+    /// `audit_project`. This is what the handler sends to `yt list`;
+    /// `query` itself keeps the placeholder on disk so editing
     /// `audit_project` alone re-derives both the audit and worker queries
     /// without hand-editing either query string.
     ///
@@ -406,7 +406,7 @@ impl std::fmt::Display for PromptSource {
 /// `claude --print` invocation, a queued issue with any unmet dependency link is
 /// left Queued (no transition to Working), consumes no attempt, and posts a
 /// blocker comment (idempotently). Blocking is by direction-resolved link `verb`
-/// (YT-40): the defaults block `depends on` (Depend INWARD, an open blocker) and
+/// The defaults block `depends on` (Depend INWARD, an open blocker) and
 /// `parent for` (Subtask OUTWARD, an open child), never `is required for` /
 /// `subtask of`.
 ///
@@ -459,7 +459,7 @@ fn default_block_on() -> Vec<String> {
     vec!["depends on".to_string(), "parent for".to_string()]
 }
 
-/// Tag names written alongside an AI Agent value (CLAUDE-373).
+/// Tag names written alongside an AI Agent value.
 ///
 /// SPEC-3.3: "field set to needs-review, no PR, `Needs-Info` tag added (name
 /// configurable under `tags.needs_info`)".
@@ -515,7 +515,7 @@ pub struct Automerge {
     pub wait_seconds: u64,
     /// Deprecated, same as `wait_seconds`.
     pub check_interval_seconds: u64,
-    /// CLAUDE-549: the most `finalize` waits for its single PR status read
+    /// The most `finalize` waits for its single PR status read
     /// before deciding whether a successful run's PR is already green and
     /// can merge in the same tick. A read that has not answered by then
     /// falls back to Code Review, leaving the merge to the webhook and the
@@ -523,7 +523,7 @@ pub struct Automerge {
     pub finalize_status_timeout_secs: u64,
 }
 
-/// CLAUDE-549: [`Automerge::finalize_status_timeout_secs`]'s default.
+/// [`Automerge::finalize_status_timeout_secs`]'s default.
 pub const DEFAULT_FINALIZE_STATUS_TIMEOUT_SECS: u64 = 10;
 
 impl Default for Automerge {
@@ -645,7 +645,7 @@ impl YoutrackStates {
         self.no_code.as_deref().unwrap_or(&self.done)
     }
 
-    /// AI Agent label for a delivery-blocked run (CLAUDE-545): the
+    /// AI Agent label for a delivery-blocked run: the
     /// configured `delivery_blocked` when set, otherwise the configured
     /// `needs_review` label so an unset config still parks the issue for a
     /// human rather than stranding it at Working.
@@ -809,7 +809,7 @@ pub struct ClosedIssueSummaryConfig {
     /// Master enable toggle. `true` (the default) runs the handler; `false` makes
     /// a run a no-op.
     pub enabled: bool,
-    /// Issues to hang each report off, nominated by id (e.g. `["CLAUDE-100"]`),
+    /// Issues to hang each report off, nominated by id (e.g. `["PROJ-100"]`),
     /// typically the milestone being reported against. Reported for on every run,
     /// subject to the idempotency marker. Empty by default.
     pub parents: Vec<String>,
@@ -882,12 +882,12 @@ pub struct Action {
     #[serde(default)]
     pub workdir_base: Option<String>,
 
-    /// `scripted` only (CLAUDE-478): plain environment variables for this
+    /// `scripted` only: plain environment variables for this
     /// action's snippets, overriding the runner's own.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 
-    /// `scripted` only (CLAUDE-478): environment variable to the name of a
+    /// `scripted` only: environment variable to the name of a
     /// secret in the store, decrypted when the run starts. The snippets get the
     /// value in their environment; the `claude` child does not.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1153,7 +1153,7 @@ post:
         );
     }
 
-    /// `limits.review_timeout_seconds: 0` is rejected at load (CLAUDE-449): a
+    /// `limits.review_timeout_seconds: 0` is rejected at load: a
     /// zero-second review session can never do anything, so it fails fast
     /// instead of silently reading as a crash/no-marker NoVerdict at run time.
     #[test]
@@ -1289,7 +1289,7 @@ native:
     }
 
     /// An untouched `audit_project` stays out of the serialized YAML, so
-    /// existing action files are unchanged by the field (CLAUDE-409).
+    /// existing action files are unchanged by the field.
     #[test]
     fn audit_project_default_is_omitted_on_serialize() {
         let cfg = YoutrackConfig::default();
@@ -1673,9 +1673,9 @@ native:
             panic!("expected youtrack native config");
         };
         // Excludes audit runs (tagged `Audit-*` in the audit project), which `audit-run.yml` owns,
-        // and the public-repo projects (CLAUDE-470), which `youtrack-public.yml` owns, so it differs
+        // and the public-repo projects, which `youtrack-public.yml` owns, so it differs
         // from the site-agnostic `default_query()`. The `{{audit_project}}` placeholder resolves
-        // against `audit_project` (CLAUDE-409), AUDIT by default.
+        // against `audit_project`, AUDIT by default.
         assert_eq!(
             cfg.youtrack.query,
             "(project: -{{audit_project}} or tag: -Audit-*) and project: -SF, -SFT and -Resolved AI Agent: Queued"
@@ -1777,7 +1777,7 @@ native:
     /// The two youtrack-kind actions partition queued issues instead of racing for
     /// them. Static half only: audit selects the audit project + `Audit-*`, the
     /// worker its exact complement. Checked for the shipped default (`AUDIT`) and
-    /// for one non-default key (CLAUDE-409), proving the partition holds by
+    /// for one non-default key, proving the partition holds by
     /// construction rather than by two independently hand-written literals.
     #[test]
     fn shipped_youtrack_actions_partition_audit_issues() {
@@ -1845,7 +1845,7 @@ native:
             // is a legacy alias YouTrack still resolves but lists nowhere, so the
             // default case also guards against that literal creeping back in.
             // Takes the FIRST `project: ` clause: the default query carries a
-            // second one later (the CLAUDE-470 SF/SFT exclusion) that this test
+            // second one later (the SF/SFT exclusion) that this test
             // does not concern itself with.
             fn project_value(q: &str) -> &str {
                 q.split("project: ")
@@ -1922,7 +1922,7 @@ native:
 name: report
 kind: closed-issue-summary
 native:
-  parents: [CLAUDE-100]
+  parents: [PROJ-100]
   projects: [CLAUDE]
   window_days: 14
   report_project: RPT
@@ -1933,7 +1933,7 @@ native:
         let Some(NativeConfig::ClosedIssueSummary(cfg)) = loaded.action.native else {
             panic!("expected closed-issue-summary native config");
         };
-        assert_eq!(cfg.parents, vec!["CLAUDE-100".to_string()]);
+        assert_eq!(cfg.parents, vec!["PROJ-100".to_string()]);
         assert_eq!(cfg.window_days, 14);
         assert_eq!(cfg.report_project.as_deref(), Some("RPT"));
         assert_eq!(cfg.link_type, "relates");
@@ -2015,7 +2015,7 @@ native:
         assert_eq!(reloaded.action.kind, action.kind);
     }
 
-    /// CLAUDE-478: `env` and `secrets` load on a scripted action, and are
+    /// `env` and `secrets` load on a scripted action, and are
     /// refused on a native kind, with a bad name, or twice for one variable.
     #[test]
     fn env_and_secrets_blocks_are_scripted_only_and_checked() {
@@ -2051,7 +2051,7 @@ native:
         );
     }
 
-    /// The example `actions/examples/release-notes.yml` (CLAUDE-474): a scripted weekly
+    /// The example `actions/examples/release-notes.yml`: a scripted weekly
     /// action, one job per ISO week that never repeats, and a claude block that
     /// can only read the releases and write the draft.
     #[test]
@@ -2082,7 +2082,7 @@ native:
 
     const BLOG_NEWSLETTER: &str = include_str!("../actions/examples/blog-newsletter.yml");
 
-    /// The example `actions/examples/blog-newsletter.yml` (CLAUDE-644): one job per
+    /// The example `actions/examples/blog-newsletter.yml`: one job per
     /// feed guid that never repeats, and a post step that drafts a summary plus link and asks
     /// for review only.
     #[test]
@@ -2110,7 +2110,7 @@ native:
         let post = action.post[0].code();
         assert!(post.contains("/api/v1/editions"), "{post}");
         assert!(post.contains("/review"), "{post}");
-        // Summary plus link only (CLAUDE-644): no image is added to the body.
+        // Summary plus link only: no image is added to the body.
         assert!(post.contains("[Read the full post]"), "{post}");
         // The only "![" allowed is the guard that rejects an image in the summary.
         for line in post.lines().filter(|l| l.contains("![")) {
@@ -2198,7 +2198,7 @@ native:
         ]
     }
 
-    /// CLAUDE-644: the first run only seeds the seen file; later runs yield each new guid
+    /// The first run only seeds the seen file; later runs yield each new guid
     /// once, oldest first, and a guid the post step recorded never comes back.
     /// Runs the real `input.command` through `nu`.
     #[test]
@@ -2292,7 +2292,7 @@ native:
         assert!(stderr.contains("drafting the oldest 5"), "{stderr}");
     }
 
-    /// CLAUDE-644: a placeholder list or a missing token stops the input before any job
+    /// A placeholder list or a missing token stops the input before any job
     /// or seen file exists.
     #[test]
     fn blog_newsletter_input_refuses_placeholders_and_a_missing_token() {
@@ -2467,7 +2467,7 @@ native:
 
     const GOOD_EDITION: &str = r#"{"subject": "", "preview_text": "What changed.", "body_md": "A short note on p1.\nIt says what p1 covers."}"#;
 
-    /// CLAUDE-644: a 201 marks the post seen and asks for review; an empty subject falls
+    /// A 201 marks the post seen and asks for review; an empty subject falls
     /// back to the title, and the link is percent-encoded.
     #[test]
     fn blog_newsletter_post_drafts_then_asks_for_review() {
@@ -2505,7 +2505,7 @@ native:
         );
     }
 
-    /// CLAUDE-644: a newsletter system without the review call keeps the draft, and the job
+    /// A newsletter system without the review call keeps the draft, and the job
     /// still counts as done.
     #[test]
     fn blog_newsletter_post_tolerates_a_missing_review_call() {
@@ -2523,7 +2523,7 @@ native:
         assert_eq!(run.seen, "p1\n");
     }
 
-    /// CLAUDE-644: a refused draft leaves the guid unseen, so a later check retries it, and
+    /// A refused draft leaves the guid unseen, so a later check retries it, and
     /// records the failed attempt.
     #[test]
     fn blog_newsletter_post_failure_leaves_the_guid_unseen() {
@@ -2539,7 +2539,7 @@ native:
         assert_eq!(run.failed, "p1\n");
     }
 
-    /// CLAUDE-644: output that breaks the summary rules posts nothing and stays unseen; a
+    /// Output that breaks the summary rules posts nothing and stays unseen; a
     /// failed claude run does the same; a deliberate skip marks the post seen.
     #[test]
     fn blog_newsletter_post_refuses_invalid_model_output() {
@@ -2628,7 +2628,7 @@ native:
         );
     }
 
-    /// CLAUDE-470: `youtrack.yml` and `youtrack-public.yml` partition queued
+    /// `youtrack.yml` and `youtrack-public.yml` partition queued
     /// issues on the project axis (SF/SFT vs everything else), the same
     /// mechanical property `shipped_youtrack_actions_partition_audit_issues`
     /// proves for the audit pair.
@@ -2806,7 +2806,7 @@ pub struct Limits {
     /// hundred. Unset falls back to
     /// [`crate::provider::DEFAULT_MAX_ISSUES_PER_RUN`]; `0` creates nothing.
     pub max_issues_per_run: Option<u32>,
-    /// Timeout for the post-success review session (CLAUDE-449): a
+    /// Timeout for the post-success review session: a
     /// fresh-context claude session that checks the completed work against
     /// the issue before finalize promotes the PR to ready. `youtrack` kind
     /// only. Unset falls back to [`crate::job::RunnerDefaults::review_timeout_seconds`]
@@ -2838,7 +2838,7 @@ pub struct Concurrency {
     /// without a code change. `workflow` is forward-looking (reserved for a
     /// future Forgejo-failed-workflow action) and unset on YouTrack jobs today.
     pub key: Vec<String>,
-    /// CLAUDE-535: the most runner PRs on one repo that may have CI pending at
+    /// The most runner PRs on one repo that may have CI pending at
     /// once. A youtrack pickup for a repo at the cap is deferred, and a
     /// behind-base branch update waits at the cap. `0` disables both gates.
     pub max_ci_in_flight_per_repo: u32,
@@ -2854,7 +2854,7 @@ impl Default for Concurrency {
     }
 }
 
-/// CLAUDE-535: [`Concurrency::max_ci_in_flight_per_repo`]'s default.
+/// [`Concurrency::max_ci_in_flight_per_repo`]'s default.
 pub const DEFAULT_MAX_CI_IN_FLIGHT_PER_REPO: u32 = 3;
 
 fn default_concurrency_key() -> Vec<String> {
@@ -3052,7 +3052,7 @@ pub fn validate_str(raw: &str, label: &str) -> Result<LoadedAction> {
 /// key is a shell-safe variable name (`A-Z0-9_`), named in at most one of the
 /// two blocks, and a `secrets` value names a non-empty secret."
 ///
-/// The `env` and `secrets` blocks (CLAUDE-478): scripted only, with shell-safe
+/// The `env` and `secrets` blocks: scripted only, with shell-safe
 /// variable names, each named once.
 fn validate_action_env(action: &Action, label: &str) -> Result<()> {
     let invalid = |field: &str, reason: String| Error::ActionInvalidField {
@@ -3125,7 +3125,7 @@ fn validate_scripted(action: &Action, label: &str) -> Result<()> {
 /// SPEC-3.1: "A native kind requires a matching `native` block." SPEC-3.3:
 /// rejects a non-humantime `dependencies.recheck_timeout` at load rather than
 /// falling back silently at gate time. SPEC-3.1's `limits.review_timeout_seconds`
-/// bullet: `Some(0)` is rejected (CLAUDE-449: a zero-second review session
+/// bullet: `Some(0)` is rejected (a zero-second review session
 /// always reads as a crash). SPEC-3.3.1: warns once on the deprecated
 /// `automerge.wait_seconds` / `check_interval_seconds` and `states.state_done`
 /// keys rather than failing to load.
@@ -3162,7 +3162,7 @@ fn validate_native(action: &Action, label: &str) -> Result<()> {
                 path: label.to_string(),
             });
         }
-        // `limits.review_timeout_seconds` (CLAUDE-449): `0` would hand the
+        // `limits.review_timeout_seconds`: `0` would hand the
         // review session no time to do anything, which always reads as a
         // crash/no-marker NoVerdict, so it fails fast at load instead.
         if action.limits.review_timeout_seconds == Some(0) {

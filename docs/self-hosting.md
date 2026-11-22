@@ -4,10 +4,10 @@
 
 Running the daemon on the host means every `claude` child it spawns inherits the operator's `$HOME`, so Claude Code
 loads the operator's interactive `~/.claude/CLAUDE.md` (which prescribes a full Git + YouTrack workflow) and contradicts
-the local-only agent contract. The container runtime (CLAUDE-37) fixes that: the whole daemon runs in a container with a
+the local-only agent contract. The container runtime fixes that: the whole daemon runs in a container with a
 clean `$HOME`, so each child inherits a slim, bot-specific user memory instead.
 
-**Host (non-container) deployments (CLAUDE-165).** When the daemon runs directly on the host it now achieves the same
+**Host (non-container) deployments.** When the daemon runs directly on the host it now achieves the same
 isolation without a clean `$HOME`: at serve start it seeds `[daemon].claude_config_dir` (default
 `<CLAUDE_RUN_CONFIG_DIR>/claude-agent-home`) with the embedded slim bot `CLAUDE.md` (the same `deploy/bot-CLAUDE.md` the
 container bakes in) and, on Linux, a symlink `<dir>/.credentials.json` to the host login at `~/.claude/.credentials.json`,
@@ -15,13 +15,13 @@ then spawns every `claude` child with `CLAUDE_CONFIG_DIR=<dir>`. That relocates 
 `CLAUDE.md` and credentials, so the child loads the bot memory instead of the operator's global `~/.claude/CLAUDE.md`
 while staying authenticated with the shared host login; `HOME` is left inherited so git/ssh keep working, and (unlike
 `--bare`) MCP servers, hooks, and skills stay enabled. If the host credential file is absent at serve start the daemon logs a
-`warn` naming the path and continues (CLAUDE-247, so a container the operator has not logged into yet still comes up);
+`warn` naming the path and continues (so a container the operator has not logged into yet still comes up);
 run `claude` once to log in, or set `ANTHROPIC_API_KEY`. A regular `.credentials.json` already in the agent config dir
 is left alone rather than replaced by the link, because in a container that file is the login itself. On macOS
 credentials live in the Keychain rather than `.credentials.json`, so the symlink step is Linux-only.
 
-**Image.** `oci-build/Dockerfile` has a `runtime` target built on `dev.a8n.run/pandoras-box/opensuse-dev:v1.16.0-leap-16.0`
-(CLAUDE-287), the org's dev image. It already carries the whole runtime toolchain: `nu`, the `claude` CLI, coreutils
+**Image.** `oci-build/Dockerfile` has a `runtime` target built on `dev.a8n.run/pandoras-box/opensuse-dev:v1.16.0-leap-16.0`,
+the org's dev image. It already carries the whole runtime toolchain: `nu`, the `claude` CLI, coreutils
 `timeout`, `git`, `yt` (youtrack-cli), `fj` (forgejo-cli), `just`, `kingfisher`, and `docker` (client, Compose, buildx).
 Tool versions come from the base image tag; moving a tool means bumping that tag, not editing a Dockerfile `RUN` block.
 The runtime stage smoke-checks every one of those tools in a single `RUN`, so a base image that loses a tool fails the
@@ -30,7 +30,7 @@ every first-party image's shared `gosu-entrypoint.sh` falls back to) with `$HOME
 the earlier `claudebot` user), which holds nothing persistent: everything the operator cares about lives on the three
 flat volumes below.
 
-**Published image (CLAUDE-88).** CI publishes the runtime image to the Forgejo OCI registry on every push to main (
+**Published image.** CI publishes the runtime image to the Forgejo OCI registry on every push to main (
 `:latest`) and every release tag (`:vX.Y.Z`), the only published artifact. The image publish runs
 in its own workflow, `.forgejo/workflows/build-image.yml`. It is published under the private `psa-systems-private` package owner, so pulling
 needs a one-time login with a Forgejo PAT that can read it:
@@ -52,13 +52,13 @@ docker compose up --detach
 `/home/claudebot/.claude/CLAUDE.md` in the image, and written into the agent's own config dir
 (`/config/claude-agent-home/CLAUDE.md`) on every serve start, which is the copy the agent actually reads. It contains only the local-only agent contract (no push, no PR; leave the feature
 branch as HEAD; the runner finalizes), the bounded tracker writes from
-[What the agent may write to the tracker](agent-writes-and-audits.md#what-the-agent-may-write-to-the-tracker-claude-214-claude-297), the em-dash ban, the
+[What the agent may write to the tracker](agent-writes-and-audits.md#what-the-agent-may-write-to-the-tracker), the em-dash ban, the
 Nushell 0.112.2 note, and the simplest-solution preference. It has no Git workflow and no lifecycle section, so the
 agent is never told to push, open PRs, or transition issue state.
 
-**compose.yml.** Consumes the published image (`image: dev.a8n.run/psa-systems-private/claude-run:latest`; the local `build:` block stays as a commented development alternative). App-prefixed names (service `claude-bot`, network `claude-bot-private`, volumes `claude-bot-config`, `claude-bot-data` and `claude-bot-state`, plus `claude-bot-postgres` which only the `postgres` profile mounts; prefix each with `dev-` for a development stack). Each tool's store is a subdirectory of one of the three roots rather than a volume of its own (CLAUDE-253); see the volume table below.
+**compose.yml.** Consumes the published image (`image: dev.a8n.run/psa-systems-private/claude-run:latest`; the local `build:` block stays as a commented development alternative). App-prefixed names (service `claude-bot`, network `claude-bot-private`, volumes `claude-bot-config`, `claude-bot-data` and `claude-bot-state`, plus `claude-bot-postgres` which only the `postgres` profile mounts; prefix each with `dev-` for a development stack). Each tool's store is a subdirectory of one of the three roots rather than a volume of its own; see the volume table below.
 
-**Self-contained by design (CLAUDE-247, image and isolation superseded by CLAUDE-287).** The container bind-mounts nothing from the host and reads no host credential. The operator logs Claude, YouTrack, Forgejo and git in INSIDE the container once; each login lands in its own subdirectory of the config or data volume (`claude-agent-home/`, `youtrack-cli/` and `git/` under `/config`, `forgejo-cli/` under `/data`, per the volume table below) and survives restarts and image upgrades. Two reasons: the runner's identity stays separate from the operator's, and the stack deploys on a host where neither `$HOME` nor the invocation directory is available to the compose file. The default stack reads no path relative to this repo at all, including the secrets key, which the daemon generates itself; the only repo-relative paths in the file are the two `secrets/` files the `postgres` profile needs. CLAUDE-287 supersedes CLAUDE-247's image decisions (the Alpine base, the per-tool downloads, `su-exec`) and ends the property that the agent has no path to anything privileged (see "Docker access" above); the no-host-mount and in-container-login properties themselves are unchanged.
+**Self-contained by design (image and isolation superseded).** The container bind-mounts nothing from the host and reads no host credential. The operator logs Claude, YouTrack, Forgejo and git in INSIDE the container once; each login lands in its own subdirectory of the config or data volume (`claude-agent-home/`, `youtrack-cli/` and `git/` under `/config`, `forgejo-cli/` under `/data`, per the volume table below) and survives restarts and image upgrades. Two reasons: the runner's identity stays separate from the operator's, and the stack deploys on a host where neither `$HOME` nor the invocation directory is available to the compose file. The default stack reads no path relative to this repo at all, including the secrets key, which the daemon generates itself; the only repo-relative paths in the file are the two `secrets/` files the `postgres` profile needs. The runtime image supersedes the earlier image decisions (the Alpine base, the per-tool downloads, `su-exec`) and ends the property that the agent has no path to anything privileged (see "Docker access" above); the no-host-mount and in-container-login properties themselves are unchanged.
 
 **Volumes.** Three, flat, named for what they hold:
 
@@ -73,7 +73,7 @@ Each tool's store is a subdirectory rather than a mount of its own, because the 
 
 `CLAUDE_CONFIG_DIR` deliberately names the same directory the daemon seeds and points its agent children at, so a `claude auth login` run through `docker compose exec` writes the credential where the agent reads it rather than into a second Claude config dir that looks fine and authenticates nothing.
 
-**CI images (CLAUDE-383).** `compose.yml` also sets seven `RUNS_ON_*` variables on `claude-bot`, one per image CI uses (`RUNS_ON_OPENSUSE_HEAVY`, `RUNS_ON_OPENSUSE_MASSIVE`, `RUNS_ON_OPENSUSE_LIGHT`, `RUNS_ON_OPENSUSE_MEDIUM`, `RUNS_ON_RUST_BUILDER_MUSL`, `RUNS_ON_RUST_BUILDER_GLIBC`, `RUNS_ON_RUST_BUILDER_GLIBC_WINDOWS`). A workflow's `runs-on: ${{ vars.RUNS_ON_* }}` resolves the same name to a runner LABEL; the container's environment variable of the same name is the pullable IMAGE that label's runner runs, so an agent session can `docker run "$RUNS_ON_RUST_BUILDER_MUSL"` or reference `${RUNS_ON_RUST_BUILDER_MUSL}` in a compose file and get the exact image CI uses, with nothing from the GitHub Container Registry involved. See `deploy/bot-CLAUDE.md`'s "CI images" section for what the agent is told.
+**CI images.** `compose.yml` also sets seven `RUNS_ON_*` variables on `claude-bot`, one per image CI uses (`RUNS_ON_OPENSUSE_HEAVY`, `RUNS_ON_OPENSUSE_MASSIVE`, `RUNS_ON_OPENSUSE_LIGHT`, `RUNS_ON_OPENSUSE_MEDIUM`, `RUNS_ON_RUST_BUILDER_MUSL`, `RUNS_ON_RUST_BUILDER_GLIBC`, `RUNS_ON_RUST_BUILDER_GLIBC_WINDOWS`). A workflow's `runs-on: ${{ vars.RUNS_ON_* }}` resolves the same name to a runner LABEL; the container's environment variable of the same name is the pullable IMAGE that label's runner runs, so an agent session can `docker run "$RUNS_ON_RUST_BUILDER_MUSL"` or reference `${RUNS_ON_RUST_BUILDER_MUSL}` in a compose file and get the exact image CI uses, with nothing from the GitHub Container Registry involved. See `deploy/bot-CLAUDE.md`'s "CI images" section for what the agent is told.
 
 **Running user.** The runtime stage stays on `USER root` (the base image's last `USER` is `dev`) so the shared,
 byte-identical `/usr/local/bin/gosu-entrypoint.sh` (CONTAINER_UID_GID.md; installed from the upstream `gosu` 1.19
@@ -81,7 +81,7 @@ release binary, since Leap packages neither `su-exec` nor `gosu`) can run its ro
 resolved uid/gid, and chown the mounted volumes, then drop to `appuser` with `gosu`. The daemon itself runs non-root.
 `catatonit` (already in the base image) is PID 1 and execs `gosu-entrypoint.sh` as its child, so any process an agent
 session leaves running when its own session exits is reaped instead of accumulating as a zombie for the life of the
-container (CLAUDE-310). Image-specific root work (config seeding, the data-dir chown) lives in hooks under
+container. Image-specific root work (config seeding, the data-dir chown) lives in hooks under
 `/etc/entrypoint.d/`, run after the remap and before the chown; `gosu-entrypoint.sh` itself is never edited per image.
 A compose `user:` pin disables the remap, hooks and chown and instead requires every `DATA_DIRS` entry to already be
 writable by that uid:gid (set `PUID`/`PGID` to override the id the image falls back to, 1001). Two consequences for
@@ -90,7 +90,7 @@ the operator:
 - `docker compose exec` lands as root unless you pass `--user appuser`. Always pass it for the login commands below, or the credentials are written root-owned and only become usable after the next restart's chown.
 - The chown skips `$CLAUDE_RUN_DATA_DIR/workdirs`, which is a tree of job git clones the runtime user created itself; walking it on every boot would be slow for no gain.
 
-**Docker access (CLAUDE-287).** Agent sessions run against a Docker-in-Docker sidecar, `claude-bot-docker`
+**Docker access.** Agent sessions run against a Docker-in-Docker sidecar, `claude-bot-docker`
 (`docker.io/docker:29.6.2-dind`, the same pin the org's Forgejo runners use), rather than the host's own daemon: a
 mounted host socket resolves bind paths against the host filesystem, where the volume in `/data/workdirs/...` does not
 exist. The sidecar shares `claude-bot`'s network namespace (`network_mode: service:claude-bot`) and listens on
@@ -110,28 +110,28 @@ docker compose exec --env DOCKER_HOST=tcp://127.0.0.1:2375 claude-bot-docker doc
 The `--env` override is required because `-H` in the sidecar's own `dockerd` command replaces its default unix socket.
 There is no `depends_on` between the two services (the sidecar joins `claude-bot`'s namespace, so the dependency would
 be a cycle); a job that runs `docker` before the sidecar's healthcheck passes simply fails with the CLI's own
-connection error in that job's log. This ends the property CLAUDE-247 established that the agent has no path to
+connection error in that job's log. This ends the property that the agent has no path to
 anything privileged: the agent now drives a privileged Docker daemon, which is root-equivalent on the host if a
-container escapes it. That trade was accepted when CLAUDE-287 was filed; the container still bind-mounts nothing from
+container escapes it. That trade was accepted; the container still bind-mounts nothing from
 the host, and logins still happen inside the container.
 
-**Known upstream limitation (CLAUDE-417).** A `docker buildx build` run against this sidecar (`just check-docker`,
+**Known upstream limitation.** A `docker buildx build` run against this sidecar (`just check-docker`,
 and so `just check`) can have its build session torn down mid-build by the sidecar's own `dockerd`, logging
 `healthcheck failed` then `healthcheck failed fatally` with `only one connection allowed`. This is an upstream Docker
 29.x defect (BuildKit's always-on session healthcheck re-dials a second connection that a session proxied over one
 hijacked TCP connection always rejects), not something fixed by any setting here; see
-[`docs/conventions/container.md`](conventions/container.md#buildkit-session-healthcheck-claude-417)
+[`docs/conventions/container.md`](conventions/container.md#buildkit-session-healthcheck)
 for the verified cause and the upstream reports.
 
 **Actions.** The `./actions` bind is gone with the other host mounts. The image bakes this repo's action YAML at `/usr/share/claude-run/actions`, and the entrypoint copies it into the config volume the first time that volume holds no `*.yml`, so a fresh container starts with the shipped action set. It never overwrites after that: an action edited in the web UI survives an image upgrade, and a changed shipped action reaches an existing deployment through the same editor (`/actions`), not by recreating the container.
 
 **No unix-socket API.** The image runs `serve --no-socket`, so the daemon binds only the TCP listener. That socket is the CLI's control plane, and this container has no CLI operator: the web UI and its `/api` routes are the whole interface, and they carry the same handlers (`/api/actions/<n>/trigger`, `/api/pause`, `/api/resume`, `/settings/<section>`). Binding it here would only leave a second copy of that control plane with no token gate on it, reachable by the `claude` agent the daemon spawns as the same user. `claude-run trigger` and `claude-run cancel` inside the container therefore fail, naming the reason rather than claiming no daemon is running; every other subcommand (`secret set`, `action list`, `status`) works as before because it goes to the database directly. Override `command: ["serve"]` in compose if a deployment really does want the socket.
 
-**Troubleshooting MCP server.** `claude-run mcp stdio` is a DB-direct subcommand like `status` or `action list`: it needs no daemon and works the same way inside this container. Point an MCP client at it with `docker compose exec --user appuser claude-bot claude-run mcp stdio`; see [docs/usage.md](usage.md#read-only-troubleshooting-mcp-server) for the tool list and an example client config. The same tools are reachable from outside the container over HTTP once `[mcp] enabled = true` is set; uncomment the `ports` mapping in `compose.yml` and the `[mcp]` block in `deploy/container-config.toml` (both ship commented, off by default), and see [docs/configuration.md](configuration.md#mcp-over-http-claude-442) for `public_url`, the key files, and `docs/conventions/mcp.md` for the OAuth auth model.
+**Troubleshooting MCP server.** `claude-run mcp stdio` is a DB-direct subcommand like `status` or `action list`: it needs no daemon and works the same way inside this container. Point an MCP client at it with `docker compose exec --user appuser claude-bot claude-run mcp stdio`; see [docs/usage.md](usage.md#read-only-troubleshooting-mcp-server) for the tool list and an example client config. The same tools are reachable from outside the container over HTTP once `[mcp] enabled = true` is set; uncomment the `ports` mapping in `compose.yml` and the `[mcp]` block in `deploy/container-config.toml` (both ship commented, off by default), and see [docs/configuration.md](configuration.md#mcp-over-http) for `public_url`, the key files, and `docs/conventions/mcp.md` for the OAuth auth model.
 
 **Web bind and first-run setup.** The image seeds a bootstrap `config.toml` (from `deploy/container-config.toml`) that binds `0.0.0.0:7321`, because a loopback bind inside a container is reachable from nothing outside it, published port or reverse proxy included. A non-loopback bind requires auth, and that credential is created in the browser: open the URL and the daemon serves `/setup`, which takes a username and a password and creates the first account. No token, no key file, no CLI. Every account after that comes from an invite minted on the Accounts page, never from `/setup` again. The seeded `config.toml` is copied only when the config volume has none, so operator edits survive restarts and image upgrades. See [Web UI / API auth](auth.md#web-ui--api-auth) for what setup is and is not (it is trust-on-first-use; bring the instance up behind the proxy).
 
-**First-run logins.** Everything is in the browser: after creating the first account, open **Settings -> Auth**, press **Sign in with Anthropic** (or store an API key), and enter the YouTrack base URL plus token, the Forgejo host plus token, and the GitHub host plus token. No restart, and no CLI. Until the Claude credential exists the scheduler runs nothing and says so on the dashboard. Git commit identity (`user.name` / `user.email` for the commits the agent makes inside a job's clone) is on the same page: leave it unset and the daemon defaults it to `claude-run <claude-run@a8n.run>`, or type your own name and email to override it, materialized to the path `GIT_CONFIG_GLOBAL` names with no `exec` step required (CLAUDE-358). The `exec` route below remains for operators who would rather the CLIs own their own config. The daemon comes up before any login exists (a missing Claude credential is a `warn`, not a startup failure), so the container is there to exec into:
+**First-run logins.** Everything is in the browser: after creating the first account, open **Settings -> Auth**, press **Sign in with Anthropic** (or store an API key), and enter the YouTrack base URL plus token, the Forgejo host plus token, and the GitHub host plus token. No restart, and no CLI. Until the Claude credential exists the scheduler runs nothing and says so on the dashboard. Git commit identity (`user.name` / `user.email` for the commits the agent makes inside a job's clone) is on the same page: leave it unset and the daemon defaults it to `claude-run <claude-run@a8n.run>`, or type your own name and email to override it, materialized to the path `GIT_CONFIG_GLOBAL` names with no `exec` step required. The `exec` route below remains for operators who would rather the CLIs own their own config. The daemon comes up before any login exists (a missing Claude credential is a `warn`, not a startup failure), so the container is there to exec into:
 
 ```nu
 docker compose up --detach
@@ -147,7 +147,7 @@ docker compose restart
 
 `claude auth login` needs the interactive TTY that `docker compose exec` provides; `claude setup-token` is the long-lived-token alternative. Verify with `claude auth status`, `yt auth list`, `fj auth list` and `gh auth status` through the same `exec --user appuser` form.
 
-To use an API key instead of an interactive Claude login, set `ANTHROPIC_API_KEY` in the service `environment:` and skip `claude auth login`. Nothing else changes: since CLAUDE-247 the daemon no longer requires a credentials file to start.
+To use an API key instead of an interactive Claude login, set `ANTHROPIC_API_KEY` in the service `environment:` and skip `claude auth login`. Nothing else changes: the daemon does not require a credentials file to start.
 
 **Secrets.** The store itself (web auth token, webhook HMACs, token refs) lives encrypted in the state store,
 `state.db` on the data volume or the `secrets` table on a PostgreSQL backend. The age identity that decrypts it needs no
@@ -192,3 +192,17 @@ bearer token for API clients stays optional and separate (`web.auth_token_ref`, 
 ```nu
 docker compose up --detach      # start the daemon from the published image
 docker compose logs --follow    # watch the scheduler
+```
+
+## Upgrading across edited migration files
+
+The runner refuses to start when a migration it already applied has a different checksum than the one the image ships ("migration N was previously applied but has been modified"). A release that edits already-applied migration files (comment-only changes, no schema change) therefore needs a one-time checksum refresh. The release that removed the tracker references from the migration files is such a release.
+
+```nu
+docker compose down                       # stop the daemon first; nothing else may touch the state store
+docker compose pull                       # fetch the new image
+docker compose run --rm --no-deps claude-bot claude-run refresh-migration-checksums
+docker compose up --detach
+```
+
+`refresh-migration-checksums` opens the configured state store (SQLite, or PostgreSQL when `[database] url` / `CLAUDE_RUN_DATABASE_URL` is set), rewrites the recorded checksum of every applied migration to the one this image ships, and prints how many rows changed. It touches no other table and runs no migration. It fails, changing nothing further, when the store records a migration version or description this image does not ship (a database from a different lineage). Running it again prints `0 row(s) changed`. A PostgreSQL deployment started with the `postgres` profile must pass the same profile, for example `docker compose --profile postgres run --rm --no-deps claude-bot claude-run refresh-migration-checksums`.

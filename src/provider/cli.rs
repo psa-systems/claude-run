@@ -25,8 +25,8 @@ struct PrSearchResponse {
     pull_requests: Vec<ForgePullRequest>,
 }
 
-/// Wait before attempts 2, 3 and 4 of a retried read-only CLI call
-/// (CLAUDE-366, CLAUDE-407): the first retry runs immediately, then 2s, then
+/// Wait before attempts 2, 3 and 4 of a retried read-only CLI call:
+/// the first retry runs immediately, then 2s, then
 /// 5s, for a worst-case added delay of 7s across four attempts total. Shared
 /// by every binary-neutral read-retry caller (`fj` and `gh` reads alike) so
 /// there is one copy of the schedule.
@@ -37,8 +37,8 @@ pub(crate) const DEFAULT_READ_RETRY_WAITS: [Duration; 3] = [
     Duration::from_secs(5),
 ];
 
-/// The known secrets to redact out of a retried git call's logged stderr
-/// (CLAUDE-396): `token_url`'s userinfo when it carries a credential, empty
+/// The known secrets to redact out of a retried git call's logged stderr:
+/// `token_url`'s userinfo when it carries a credential, empty
 /// when the call ran unauthenticated.
 fn token_url_secrets(token_url: Option<&str>) -> Vec<String> {
     token_url
@@ -58,8 +58,7 @@ fn stderr_tail(stderr: &str) -> &str {
 }
 
 /// SPEC-8.4: run a read-only CLI invocation with up to four attempts total, waiting
-/// `waits[0]` / `waits[1]` / `waits[2]` before attempts 2, 3 and 4 (CLAUDE-366,
-/// generalized beyond `fj` in CLAUDE-407). A failed attempt is a runner
+/// `waits[0]` / `waits[1]` / `waits[2]` before attempts 2, 3 and 4 (/// generalized beyond `fj`). A failed attempt is a runner
 /// `Ok(out)` with `!out.ok`: any non-zero exit is retried on the exit code
 /// alone, never by classifying `stderr`'s wording (forbidden by
 /// `tooling-gap-discipline`), because every read-only call routed through here
@@ -499,10 +498,10 @@ pub struct CliBackend {
     /// (currently: an open-PR lookup that failed and was degraded to a create).
     /// Drained by [`Forge::take_notices`] and persisted as run events.
     notices: std::sync::Mutex<Vec<String>>,
-    /// Wait schedule for a retried read-only `fj` call (CLAUDE-366). Defaults to
+    /// Wait schedule for a retried read-only `fj` call. Defaults to
     /// [`DEFAULT_READ_RETRY_WAITS`]; overridable so tests run with no delay.
     fj_read_retry_waits: [Duration; 3],
-    /// Wait schedule for a retried git network call (CLAUDE-396). Defaults to
+    /// Wait schedule for a retried git network call. Defaults to
     /// [`crate::provider::GIT_NETWORK_RETRY_WAITS`]; overridable so tests run
     /// with no delay.
     git_retry_waits: [Duration; 3],
@@ -611,7 +610,7 @@ struct ProjectListEntry {
     archived: bool,
 }
 
-/// The `links` array of `yt issue inspect --json` (YT-40). Only the
+/// The `links` array of `yt issue inspect --json`. Only the
 /// links are deserialized; the surrounding `issue` / `comments` / etc. objects
 /// are ignored.
 #[derive(Debug, Deserialize)]
@@ -646,7 +645,7 @@ struct InspectComment {
     text: String,
 }
 
-/// One `links[]` entry: the resolved `direction` / `verb` (YT-40) plus the linked
+/// One `links[]` entry: the resolved `direction` / `verb` plus the linked
 /// issues that entry connects to.
 #[derive(Debug, Deserialize)]
 struct RawLink {
@@ -699,7 +698,7 @@ impl CliBackend {
         }
     }
 
-    /// CLAUDE-549: an owned, independent copy for
+    /// An owned, independent copy for
     /// [`crate::provider::pr_status_on_thread`]: same runner, binaries, key
     /// store, child env and read-retry schedule, with its own empty notice
     /// buffer (a status read records none).
@@ -756,7 +755,7 @@ impl CliBackend {
         self
     }
 
-    /// Override the git network retry wait schedule (CLAUDE-396; tests set
+    /// Override the git network retry wait schedule (tests set
     /// this to all-zero so a retried git call runs with no delay).
     pub fn with_git_retry_waits(mut self, waits: [Duration; 3]) -> Self {
         self.git_retry_waits = waits;
@@ -773,8 +772,8 @@ impl CliBackend {
         self
     }
 
-    /// Run a read-only `fj` invocation, retried up to four attempts total
-    /// (CLAUDE-366). Never used for a write: a write must fail on its first and
+    /// Run a read-only `fj` invocation, retried up to four attempts total.
+    /// Never used for a write: a write must fail on its first and
     /// only attempt.
     fn run_fj_read(
         &self,
@@ -947,7 +946,7 @@ impl CliBackend {
     /// a collision, because the resume path for a re-queued issue clones its
     /// recorded PR branch by name and continues committing on it. Before pushing,
     /// the remote state of the branch is read (`git ls-remote`) and the remote
-    /// branch is fetched (CLAUDE-382: a resumed run's clone predates any commit
+    /// branch is fetched (a resumed run's clone predates any commit
     /// the runner pushed onto the branch while the run was working, and without
     /// the fetch `is_ancestor` fails with exit 128 rather than resolving
     /// ancestry), then reconciled WITHOUT force: absent -> push + create; local
@@ -974,10 +973,10 @@ impl CliBackend {
         draft: bool,
         body: Option<&str>,
     ) -> Result<PullRequest> {
-        // The subject guard (CLAUDE-398) runs before anything else here: a
+        // The subject guard runs before anything else here: a
         // tip whose subject is a template heading or a bare issue reference
         // must refuse before any push or PR-create call is made. The body
-        // guard (CLAUDE-623) runs alongside it, but only when `body` is
+        // guard runs alongside it, but only when `body` is
         // `None`: a caller-supplied override (the timeout-salvage draft body)
         // replaces the tip's own body outright, so the tip's `%b` is never
         // read in that case (mirroring the no-override path's own rule that
@@ -991,8 +990,8 @@ impl CliBackend {
         // workdir's `origin` remote (the form `list_open_prs` expects).
         let repo = self.origin_repo_path(workdir)?;
 
-        // The token-bearing URL for this host/repo, resolved once up front
-        // (CLAUDE-395): `origin` itself carries no credential after the
+        // The token-bearing URL for this host/repo, resolved once up front:
+        // `origin` itself carries no credential after the
         // post-clone scrub, so every network call below authenticates
         // per invocation through this instead. `None` when no credential
         // resolves; callers fall back to an unauthenticated invocation (any
@@ -1029,12 +1028,12 @@ impl CliBackend {
                 Ok(pr)
             }
             // Equal to local: nothing to push; find-or-create the PR. No push
-            // comment: nothing was written to the branch (CLAUDE-447 only
-            // requires a comment after an actual write).
+            // comment: nothing was written to the branch (a comment is only
+            // required after an actual write).
             Some(ref remote_sha) if *remote_sha == local_sha => {
                 self.find_or_create_pr(workdir, host, &repo, branch, draft, body)
             }
-            // Present and not equal. Fetch first (CLAUDE-382) so the remote
+            // Present and not equal. Fetch first so the remote
             // tip's objects exist locally: a resumed run's clone predates any
             // commit the runner pushed onto the branch while the run was
             // working, and without this `is_ancestor` fails with exit 128
@@ -1093,7 +1092,7 @@ impl CliBackend {
         }
     }
 
-    /// Post the CLAUDE-447 push comment for a write made in
+    /// Post the push comment for a write made in
     /// [`Self::create_pr_branch`] or [`Self::create_pr_agit`]. A no-op if the
     /// PR has no number (an adopted lookup can race the actual create and
     /// return an unopened placeholder; nothing here ever happens on that
@@ -1102,12 +1101,11 @@ impl CliBackend {
     /// of which git leg triggered the push, since the timeout-salvage
     /// caller's intent is what the comment should name, not the git
     /// mechanics that got the branch there. This used to be keyed off
-    /// `draft`, but CLAUDE-449 made every successful run's first PR a draft
+    /// `draft`, but every successful run's first PR is now a draft
     /// (pending its post-success review), not just a timeout salvage, so the
     /// caller now passes the salvage signal explicitly instead. The failure,
     /// if any, is recorded on `pr` rather than propagated: a failed comment
-    /// must never fail, retry, or roll back the push it reports on
-    /// (CLAUDE-366).
+    /// must never fail, retry, or roll back the push it reports on.
     /// SPEC-8.8: the shared push-comment call every runner write to a PR
     /// branch makes.
     #[allow(clippy::too_many_arguments)]
@@ -1169,7 +1167,7 @@ impl CliBackend {
             crate::push_comment::post(self, host, repo, pr_number, &scratch, &ctx);
     }
 
-    /// The bare `#<KEY>-N` issue reference (CLAUDE-398) out of `rev`'s tip
+    /// The bare `#<KEY>-N` issue reference out of `rev`'s tip
     /// commit body, for a push comment's `Issue:` line. Falls back to `rev`
     /// itself (the branch name) on a tip that carries none, or on a `git log`
     /// failure, rather than failing the push comment outright: this is a
@@ -1246,7 +1244,7 @@ impl CliBackend {
     }
 
     /// The one-line subject of a revision's tip commit (`git log -1
-    /// --format=%s`), read for the [`validate_pr_subject`] guard (CLAUDE-398).
+    /// --format=%s`), read for the [`validate_pr_subject`] guard.
     fn tip_subject(&self, workdir: &Path, rev: &str) -> Result<String> {
         let args = ["log", "-1", "--format=%s", rev];
         let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
@@ -1254,7 +1252,7 @@ impl CliBackend {
     }
 
     /// The body of a revision's tip commit (`git log -1 --format=%b`), read
-    /// for the [`crate::provider::validate_pr_body`] guard (CLAUDE-623).
+    /// for the [`crate::provider::validate_pr_body`] guard.
     fn tip_body(&self, workdir: &Path, rev: &str) -> Result<String> {
         let args = ["log", "-1", "--format=%b", rev];
         let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
@@ -1289,7 +1287,7 @@ impl CliBackend {
     /// `"<sha>\t<ref>"` line per matching head and nothing (exit 0) when the
     /// branch is absent, so no branch existence is inferred from an exit code.
     ///
-    /// Authenticated per invocation via `token_url` (CLAUDE-395): `origin`
+    /// Authenticated per invocation via `token_url`: `origin`
     /// itself carries no credential after the post-clone scrub, so this reads
     /// the remote through the inline credential helper rather than relying on
     /// a token baked into the remote URL. `None` runs unauthenticated (any
@@ -1340,17 +1338,17 @@ impl CliBackend {
         }
     }
 
-    /// Fetch `branch` from `origin` (CLAUDE-382), read-only and
+    /// Fetch `branch` from `origin`, read-only and
     /// authenticated the same way as every other git subprocess here
-    /// (`self.runner.run_in_env`, CLAUDE-252). Called before `is_ancestor`
+    /// (`self.runner.run_in_env`). Called before `is_ancestor`
     /// touches the remote tip, so the remote's objects exist in the local
     /// clone: a resumed run's clone predates any commit the runner pushed
     /// onto the branch while the run was working, and without this fetch
     /// `git merge-base` fails with exit 128 ("not a valid commit name")
     /// rather than resolving ancestry. Authenticated per invocation via
-    /// `token_url` (CLAUDE-395), same as [`Self::remote_branch_sha`].
+    /// `token_url`, same as [`Self::remote_branch_sha`].
     ///
-    /// The refspec names the tracking ref explicitly (CLAUDE-464): the
+    /// The refspec names the tracking ref explicitly: the
     /// runner's workdir is a `--single-branch` shallow clone
     /// (`shallow_clone` in `src/provider/mod.rs`), whose configured refspec
     /// covers only the cloned branch, so a bare `git fetch origin <branch>`
@@ -1380,7 +1378,7 @@ impl CliBackend {
 
     /// `MERGE_HEAD` exists only while a merge is in progress, which is
     /// exactly the state that makes `git merge --abort` meaningful; checking
-    /// it before running the abort (CLAUDE-458) is what lets
+    /// it before running the abort is what lets
     /// [`Self::merge_remote_branch`] tell a real conflict, where aborting is
     /// correct, apart from a merge that never started (a dirty tree, an
     /// unrelated history, a rejecting hook, ...), where `git merge --abort`
@@ -1415,7 +1413,7 @@ impl CliBackend {
             .collect())
     }
 
-    /// Merge `origin/<branch>` into the local branch (CLAUDE-382),
+    /// Merge `origin/<branch>` into the local branch,
     /// called only once `is_ancestor` has ruled out a plain fast-forward: the
     /// remote gained commits (typically the runner's own "branch was behind
     /// its base" update) while the local branch carries the agent's own, so
@@ -1423,7 +1421,7 @@ impl CliBackend {
     /// branch with the remote tip as an ancestor, so the caller's subsequent
     /// push stays a fast-forward; `--force` is never used anywhere in this
     /// path. A failed merge is only ever a conflict if `MERGE_HEAD` is
-    /// present (CLAUDE-458): only then is `git merge --abort` run, never
+    /// present: only then is `git merge --abort` run, never
     /// otherwise, since a merge that never started leaves nothing to abort
     /// and `git merge --abort` would fail with its own unrelated error,
     /// hiding the real cause. Either way the merge's own stderr reaches the
@@ -1527,7 +1525,7 @@ impl CliBackend {
 
         // The resolver may have left the merge mid-flight (a failed pass
         // that never concluded it) or already concluded it one way or
-        // another (CLAUDE-458: only abort a merge that is actually still in
+        // another (only abort a merge that is actually still in
         // progress).
         if self.merge_head_present(workdir)? {
             let abort_args = ["merge", "--abort"];
@@ -1571,7 +1569,7 @@ impl CliBackend {
     /// real-divergence signal the caller has already ruled out before calling.
     /// Always `--no-verify`: the runner never runs the repo's `pre-push` hook
     /// on any push of an agent's feature branch, since the SPEC-3.3.2
-    /// verification gate is the only post-agent full-suite run (CLAUDE-533).
+    /// verification gate is the only post-agent full-suite run.
     /// SPEC-8.5: a retried, per-invocation-authenticated git network call.
     fn push_branch(&self, workdir: &Path, branch: &str, token_url: Option<&str>) -> Result<()> {
         let refspec = format!("{branch}:{branch}");
@@ -1647,7 +1645,7 @@ impl CliBackend {
         };
 
         // Title/body derive from the feature branch tip, not `HEAD`. A draft
-        // open (CLAUDE-379, timeout salvage) is forced to carry fj's `WIP: `
+        // open (timeout salvage) is forced to carry fj's `WIP: `
         // title-prefix convention regardless of the tip commit's own subject,
         // so the draft status holds even when the tip is a pre-existing agent
         // commit rather than the salvage's own `WIP: ...` commit.
@@ -1656,7 +1654,7 @@ impl CliBackend {
             title = format!("WIP: {title}");
         }
 
-        // A caller-supplied body (CLAUDE-398: the timeout-salvage draft body)
+        // A caller-supplied body (the timeout-salvage draft body)
         // overrides the tip commit's own body, which for a killed run is
         // often only the bare `#<KEY>` line.
         let body = match body {
@@ -1773,8 +1771,8 @@ impl CliBackend {
     /// SPEC-8.7: validates the tip subject before AGit pushes anything;
     /// SPEC-8.8: posts the push comment on success.
     fn create_pr_agit(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
-        // The subject guard (CLAUDE-398) runs before `fj` pushes anything.
-        // The body guard (CLAUDE-623) runs alongside it.
+        // The subject guard runs before `fj` pushes anything.
+        // The body guard runs alongside it.
         let subject = self.tip_subject(workdir, "HEAD")?;
         crate::provider::validate_pr_subject(&subject, "HEAD")?;
         crate::provider::validate_pr_body(&self.tip_body(workdir, "HEAD")?, "HEAD")?;
@@ -2000,7 +1998,7 @@ impl CliBackend {
 
     /// SPEC-8.6: [`Self::checked`] for a call that ran with credentials: `secrets` are
     /// masked out of the failure text. A failure carries the tail of stdout after
-    /// stderr (CLAUDE-422), because a `pre-push` hook writes its test report there.
+    /// stderr, because a `pre-push` hook writes its test report there.
     fn checked_redacting(
         binary: &str,
         out: CmdOutput,
@@ -2079,7 +2077,7 @@ impl IssueTracker for CliBackend {
         let stdout = self.yt_ok(&["issue", "inspect", key, "--json"])?;
         let parsed: InspectLinks = Self::parse_json(&self.yt, "yt issue inspect --json", &stdout)?;
         // Flatten each `links[]` entry into one row per linked target, carrying the
-        // entry's direction/verb (YT-40) onto every target it lists.
+        // entry's direction/verb onto every target it lists.
         let mut out = Vec::new();
         for link in parsed.links {
             for issue in link.issues {
@@ -2131,7 +2129,7 @@ impl IssueTracker for CliBackend {
         Ok(parsed.raw.map(|r| r.minutes))
     }
 
-    /// CLAUDE-612: the stuck-Working sweep's owner-window check. Reads
+    /// The stuck-Working sweep's owner-window check. Reads
     /// `yt issue history --json --category CustomFieldCategory` and returns
     /// the newest entry that changed `field` to `value`, or `None` when none
     /// did. A parse failure or an unrepresentable timestamp is an error, never
@@ -2358,7 +2356,7 @@ impl Forge for CliBackend {
         }
     }
 
-    /// Draft support (CLAUDE-379) is implemented only for the branch-backed
+    /// Draft support is implemented only for the branch-backed
     /// strategy, which is the one the timeout salvage path uses (AGit produces
     /// no server branch, so it cannot be resumed and is never used there);
     /// `PrStrategy::Agit` falls back to the plain create, unprefixed, ignoring
@@ -2379,7 +2377,7 @@ impl Forge for CliBackend {
         }
     }
 
-    /// Push the current tip with hooks bypassed (CLAUDE-448), opening or
+    /// Push the current tip with hooks bypassed, opening or
     /// adopting a draft PR on the first push that lands anything new.
     /// Strategy is always branch-backed here: AGit has no server branch to
     /// push between-commit, so checkpointing only applies to the default
@@ -2457,7 +2455,7 @@ impl Forge for CliBackend {
     /// [`Self::resolve_feature_branch`] / [`Self::remote_branch_sha`] with
     /// [`Self::checkpoint_push`] for the "nothing to push" degrade. Opens no
     /// PR. Like every other runner push of the agent branch, this never runs
-    /// the repo's `pre-push` hook (CLAUDE-533): the SPEC-3.3.2 verification
+    /// the repo's `pre-push` hook: the SPEC-3.3.2 verification
     /// gate is the only post-agent full-suite run.
     fn final_push(
         &self,
@@ -2480,7 +2478,7 @@ impl Forge for CliBackend {
         Ok(Some(crate::provider::FinalPushReport { branch }))
     }
 
-    /// CLAUDE-470: see [`crate::provider::Forge::scan_tracker_refs`]. No
+    /// See [`crate::provider::Forge::scan_tracker_refs`]. No
     /// feature branch yet (the very first checkpoint tick, before any
     /// commit) means nothing to scan, same as [`Self::final_push`]
     /// degrading to `Ok(None)` in that case.
@@ -2521,11 +2519,10 @@ impl Forge for CliBackend {
         Ok(hits)
     }
 
-    /// Strip the `WIP: ` title prefix a timeout-salvaged draft PR (CLAUDE-379)
+    /// Strip the `WIP: ` title prefix a timeout-salvaged draft PR
     /// carries, when a re-queued run resumes onto it and now succeeds. A PR
     /// whose title already lacks the prefix (not a salvaged draft, or already
-    /// stripped) is left untouched; returns whether the prefix was present
-    /// (CLAUDE-651).
+    /// stripped) is left untouched; returns whether the prefix was present.
     fn mark_pr_ready(&self, host: &str, repo: &str, pr_number: u64) -> Result<bool> {
         let prs = self.list_open_prs(host, repo)?;
         let title = prs
@@ -2547,7 +2544,7 @@ impl Forge for CliBackend {
             .runner
             .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
         Self::checked(&self.fj, out, &args)?;
-        // CLAUDE-630: the one auditable record that this PR was undrafted,
+        // The one auditable record that this PR was undrafted,
         // naming the PR, the old/new draft state and the title change.
         info!(
             host, repo, pr_number, old_title = %title, new_title = %stripped,
@@ -2562,8 +2559,7 @@ impl Forge for CliBackend {
     /// untouched. Otherwise reads the resolved feature branch's current tip
     /// subject/body, runs them through
     /// [`crate::provider::validate_pr_subject`], and overwrites the PR with
-    /// `fj pr edit <id> title` then `fj pr edit <id> body` (CLAUDE-398,
-    /// CLAUDE-456: `fj` has no `--title`/`--body-file` flags on `pr edit`).
+    /// `fj pr edit <id> title` then `fj pr edit <id> body` (/// `fj` has no `--title`/`--body-file` flags on `pr edit`).
     /// A failed body edit after a successful title edit names the body step.
     /// SPEC-8.7: re-derives title/body from the branch's current tip.
     fn refresh_pr_text(
@@ -2710,7 +2706,7 @@ impl Forge for CliBackend {
             // `None`: unknown, never collapsed to `false`.
             #[serde(default)]
             behind_base: Option<bool>,
-            // Absent (an `fj` predating FJ-124) or explicit `null` parse to
+            // Absent (an older `fj` without the field) or explicit `null` parse to
             // `None`: unknown, never `false`.
             #[serde(default)]
             conflicted: Option<bool>,
@@ -2924,7 +2920,7 @@ impl Backend for CliBackend {
 pub struct FjForgeReads {
     runner: Arc<dyn CommandRunner>,
     fj: String,
-    /// Wait schedule for a retried read (CLAUDE-366); see
+    /// Wait schedule for a retried read; see
     /// [`DEFAULT_READ_RETRY_WAITS`].
     fj_read_retry_waits: [Duration; 3],
 }
@@ -2951,7 +2947,7 @@ impl FjForgeReads {
         self
     }
 
-    /// Every call this client makes is a read (CLAUDE-366): actions logs,
+    /// Every call this client makes is a read: actions logs,
     /// actions runs, and repo file fetches never change forge state.
     fn run_fj_read(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<CmdOutput> {
         run_read_retrying(
@@ -3249,7 +3245,7 @@ pub mod testutil {
         missing: Vec<String>,
         /// (binary, joined-args prefix) -> outcome, matched when no exact
         /// `responses` entry does. For a call whose args end in dynamic text
-        /// (CLAUDE-446's run-footer timestamp) that a test cannot predict
+        /// (the run-footer timestamp) that a test cannot predict
         /// exactly.
         prefix_responses: Vec<(String, CmdOutput)>,
         /// Records every (binary, args) invocation for assertions.
@@ -3379,7 +3375,7 @@ pub mod testutil {
         /// Register a failing response (non-zero exit) for any call whose
         /// `binary args...` starts with `prefix`. The `ok_prefix` counterpart
         /// for a call that must fail but whose trailing args carry dynamic
-        /// text (CLAUDE-521's randomized scratch-file names) a test cannot
+        /// text (randomized scratch-file names) a test cannot
         /// predict exactly. Checked only after an exact `ok`/`fail` match
         /// misses.
         pub fn fail_prefix(mut self, prefix: &str, exit_code: i32, stderr: &str) -> Self {
@@ -3473,39 +3469,39 @@ mod tests {
 
     /// `issue_links` flattens the `yt issue inspect --json` `links`
     /// array into one row per linked target, carrying each entry's resolved
-    /// `direction` / `verb` (YT-40) and each target's nullable `resolved`. A
+    /// `direction` / `verb` and each target's nullable `resolved`. A
     /// resolved target keeps its epoch-ms timestamp; an unresolved one (the key
     /// omitted) maps to `None`. Empty `issues` arrays contribute no rows.
     #[test]
     fn issue_links_parses_direction_verb_resolved() {
         let json = r#"{
-          "issue": {"idReadable": "CLAUDE-31"},
+          "issue": {"idReadable": "PROJ-31"},
           "links": [
             {"direction": "BOTH", "verb": "relates to", "issues": []},
             {"direction": "INWARD", "verb": "depends on",
-             "issues": [{"idReadable": "CLAUDE-30", "summary": "x"}]},
+             "issues": [{"idReadable": "PROJ-30", "summary": "x"}]},
             {"direction": "OUTWARD", "verb": "is required for",
-             "issues": [{"idReadable": "CLAUDE-32", "resolved": 1780049281523}]},
+             "issues": [{"idReadable": "PROJ-32", "resolved": 1780049281523}]},
             {"direction": "OUTWARD", "verb": "parent for",
-             "issues": [{"idReadable": "CLAUDE-40"}]}
+             "issues": [{"idReadable": "PROJ-40"}]}
           ]
         }"#;
         let b =
-            backend(StubRunner::new().ok("yt", &["issue", "inspect", "CLAUDE-31", "--json"], json));
-        let links = b.issue_links("CLAUDE-31").unwrap();
+            backend(StubRunner::new().ok("yt", &["issue", "inspect", "PROJ-31", "--json"], json));
+        let links = b.issue_links("PROJ-31").unwrap();
         assert_eq!(links.len(), 3, "empty issues array contributes no row");
 
-        let dep = links.iter().find(|l| l.target == "CLAUDE-30").unwrap();
+        let dep = links.iter().find(|l| l.target == "PROJ-30").unwrap();
         assert_eq!(dep.direction, crate::provider::LinkDirection::Inward);
         assert_eq!(dep.verb, "depends on");
         assert_eq!(dep.resolved, None, "resolved key omitted => unmet");
 
-        let req = links.iter().find(|l| l.target == "CLAUDE-32").unwrap();
+        let req = links.iter().find(|l| l.target == "PROJ-32").unwrap();
         assert_eq!(req.direction, crate::provider::LinkDirection::Outward);
         assert_eq!(req.verb, "is required for");
         assert_eq!(req.resolved, Some(1780049281523));
 
-        let child = links.iter().find(|l| l.target == "CLAUDE-40").unwrap();
+        let child = links.iter().find(|l| l.target == "PROJ-40").unwrap();
         assert_eq!(child.verb, "parent for");
         assert_eq!(child.resolved, None);
     }
@@ -3533,34 +3529,26 @@ mod tests {
             &[
                 "issue",
                 "link",
-                "CLAUDE-230",
-                "CLAUDE-100",
+                "PROJ-230",
+                "PROJ-100",
                 "--type",
                 "subtask of",
             ],
             "",
         ));
-        b.link_issue("CLAUDE-230", "subtask of", "CLAUDE-100")
-            .unwrap();
+        b.link_issue("PROJ-230", "subtask of", "PROJ-100").unwrap();
     }
 
     /// `--create` so a tag not yet present on the instance is created rather
-    /// than failing the write (CLAUDE-373).
+    /// than failing the write.
     #[test]
     fn add_tag_creates_a_missing_tag() {
         let b = backend(StubRunner::new().ok(
             "yt",
-            &[
-                "issue",
-                "tag",
-                "add",
-                "CLAUDE-373",
-                "Needs-Info",
-                "--create",
-            ],
+            &["issue", "tag", "add", "PROJ-373", "Needs-Info", "--create"],
             "",
         ));
-        b.add_tag("CLAUDE-373", "Needs-Info").unwrap();
+        b.add_tag("PROJ-373", "Needs-Info").unwrap();
     }
 
     #[test]
@@ -3607,7 +3595,7 @@ mod tests {
     }
 
     /// A captured `yt issue history --json --category CustomFieldCategory`
-    /// sample (CLAUDE-612): an `Estimation` change (a bare number, not an
+    /// sample: an `Estimation` change (a bare number, not an
     /// enum array, so it must never match), two `AI Agent` changes TO
     /// `Working` at different timestamps, and a later `AI Agent` change away
     /// from `Working`. `field_changed_at` must pick the NEWER of the two
@@ -3956,7 +3944,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "HEAD"],
-                    "work\n\n#CLAUDE-1\n",
+                    "work\n\n#PROJ-1\n",
                 ),
             "origin/main",
             &["main", "fix/x"],
@@ -4184,7 +4172,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_absent_posts_initial_push_comment() {
-        // CLAUDE-447: a brand-new branch (remote absent) posts an
+        // A brand-new branch (remote absent) posts an
         // `initial push (PR opened)` comment naming the issue key and the
         // commit range, after the push and PR create both succeed.
         let wd = tempfile::tempdir().unwrap();
@@ -4271,7 +4259,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_fast_forward_posts_resumed_run_push_comment() {
-        // CLAUDE-447: a fast-forward push onto an already-remote branch
+        // A fast-forward push onto an already-remote branch
         // posts a `resumed-run push` comment, not `initial push`.
         let wd = tempfile::tempdir().unwrap();
         let runner = with_branch_resolution(
@@ -4315,12 +4303,12 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
-                "#CLAUDE-170\n",
+                "#PROJ-170\n",
             )
             .ok(
                 "git",
                 &["log", "-1", "--format=%B", "feat/x"],
-                "#CLAUDE-170\n",
+                "#PROJ-170\n",
             )
             .ok(
                 "git",
@@ -4371,7 +4359,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_diverged_posts_merged_remote_branch_comment() {
-        // CLAUDE-447: the diverged (merge-then-push) leg posts a
+        // The diverged (merge-then-push) leg posts a
         // `merged remote branch before push` comment on the adopted PR.
         let wd = tempfile::tempdir().unwrap();
         let runner = with_branch_resolution(
@@ -4409,7 +4397,7 @@ mod tests {
         .ok(
             "git",
             &["log", "-1", "--format=%b", "feat/yotun-96"],
-            "#CLAUDE-96\n",
+            "#PROJ-96\n",
         )
         .ok("git", &["merge", "--no-edit", "origin/feat/yotun-96"], "")
         .ok(
@@ -4426,7 +4414,7 @@ mod tests {
         .ok(
             "git",
             &["log", "-1", "--format=%B", "feat/yotun-96"],
-            "feat: yotun\n\n#CLAUDE-96\n",
+            "feat: yotun\n\n#PROJ-96\n",
         )
         .ok(
             "git",
@@ -4456,7 +4444,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_draft_overrides_event_to_timeout_salvage() {
-        // CLAUDE-447: a draft create (timeout salvage, CLAUDE-379) posts a
+        // A draft create (timeout salvage) posts a
         // `timeout salvage push` comment regardless of which git leg
         // actually performed the write.
         let wd = tempfile::tempdir().unwrap();
@@ -4544,8 +4532,8 @@ mod tests {
 
     #[test]
     fn create_pr_branch_failed_push_comment_is_recorded_but_never_fails_the_create() {
-        // CLAUDE-447: a `pr_comment` failure is never allowed to fail, retry,
-        // or roll back the push/create it reports on (CLAUDE-366); it is
+        // A `pr_comment` failure is never allowed to fail, retry,
+        // or roll back the push/create it reports on; it is
         // recorded on the returned PR for the caller's own outcome comment.
         let wd = tempfile::tempdir().unwrap();
         let runner = with_branch_resolution(
@@ -4643,7 +4631,7 @@ mod tests {
 
     #[test]
     fn create_pr_with_draft_writes_the_caller_supplied_body_ignoring_the_tips_own() {
-        // The timeout-salvage caller (CLAUDE-398) passes a runner-written
+        // The timeout-salvage caller passes a runner-written
         // body; it must land in the `--body-file` scratch file verbatim, and
         // the tip commit's own body (`%b`) must never be read at all.
         let wd = tempfile::tempdir().unwrap();
@@ -4788,7 +4776,7 @@ mod tests {
 
     #[test]
     fn checkpoint_push_sequential_ticks_use_no_verify_and_open_draft_once() {
-        // CLAUDE-448: the first tick that lands new commits pushes with
+        // The first tick that lands new commits pushes with
         // `--no-verify` and opens a draft PR; a second tick with further new
         // commits pushes again with `--no-verify` but adopts the
         // already-open PR (no second `pr create`), and both ticks post their
@@ -4952,7 +4940,7 @@ mod tests {
 
     #[test]
     fn refresh_pr_text_is_a_no_op_on_a_non_draft_pr() {
-        // CLAUDE-398: a resumed-but-already-ready PR (no `WIP: ` title
+        // A resumed-but-already-ready PR (no `WIP: ` title
         // prefix) is left untouched; no `fj pr edit` call at all, and no git
         // log reads either.
         let wd = tempfile::tempdir().unwrap();
@@ -4977,7 +4965,7 @@ mod tests {
 
     #[test]
     fn refresh_pr_text_overwrites_a_draft_prs_title_and_body() {
-        // CLAUDE-398: a draft (`WIP: `-prefixed) PR gets a `title` then a
+        // A draft (`WIP: `-prefixed) PR gets a `title` then a
         // `body` `fj pr edit` call built from the resolved feature branch's
         // current tip.
         let wd = tempfile::tempdir().unwrap();
@@ -5054,7 +5042,7 @@ mod tests {
 
     #[test]
     fn refresh_pr_text_names_the_body_step_when_only_the_body_edit_fails() {
-        // CLAUDE-456: the title lands, the body edit has no canned response
+        // The title lands, the body edit has no canned response
         // and fails; the error says the title was already updated.
         let wd = tempfile::tempdir().unwrap();
         let runner = with_open_pr_search(
@@ -5072,7 +5060,7 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
-                "Done.\n\n#CLAUDE-1\n",
+                "Done.\n\n#PROJ-1\n",
             )
             .ok(
                 "fj",
@@ -5100,7 +5088,7 @@ mod tests {
 
     #[test]
     fn refresh_pr_text_refuses_a_template_heading_subject() {
-        // CLAUDE-398: the same guard `create_pr` applies at create time also
+        // The same guard `create_pr` applies at create time also
         // runs here, so a tip that regressed to a bad subject refuses rather
         // than overwriting the PR with it.
         let wd = tempfile::tempdir().unwrap();
@@ -5137,7 +5125,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_refuses_a_template_heading_subject_before_any_push() {
-        // CLAUDE-398: the branch strategy must reject a tip subject that is a
+        // The branch strategy must reject a tip subject that is a
         // template heading before pushing anything or calling `fj`.
         let wd = tempfile::tempdir().unwrap();
         let runner = with_branch_resolution(
@@ -5172,7 +5160,7 @@ mod tests {
 
     #[test]
     fn create_pr_agit_refuses_a_bare_issue_reference_subject_before_fj_runs() {
-        // CLAUDE-398: the AGit strategy must reject a tip subject that is a
+        // The AGit strategy must reject a tip subject that is a
         // bare issue reference before invoking `fj`.
         let runner = Arc::new(with_branch_resolution(
             StubRunner::new().ok("git", &["log", "-1", "--format=%s", "HEAD"], "#MK-16\n"),
@@ -5193,7 +5181,7 @@ mod tests {
         );
     }
 
-    /// Acceptance (CLAUDE-395): when a credential resolves, `ls-remote` /
+    /// Acceptance: when a credential resolves, `ls-remote` /
     /// `fetch` / `push` against `origin` are prefixed with the credential
     /// helper's `-c` arguments and NEVER carry the token itself anywhere in
     /// argv; the token is visible only in each call's own env.
@@ -5340,11 +5328,11 @@ mod tests {
         let runner = with_branch_resolution(
             StubRunner::new(),
             "origin/main",
-            &["main", "fix/CLAUDE-166-work"],
-            &[("fix/CLAUDE-166-work", "deadbeef\n")],
+            &["main", "fix/PROJ-166-work"],
+            &[("fix/PROJ-166-work", "deadbeef\n")],
         );
         // Remote branch absent, no open PR -> push + create.
-        let runner = with_remote_state(runner, "fix/CLAUDE-166-work", "deadbeef", "");
+        let runner = with_remote_state(runner, "fix/PROJ-166-work", "deadbeef", "");
         let runner = with_open_pr_search(runner, "[]")
             .ok(
                 "git",
@@ -5353,19 +5341,19 @@ mod tests {
                     "--no-verify",
                     "--set-upstream",
                     "origin",
-                    "fix/CLAUDE-166-work:fix/CLAUDE-166-work",
+                    "fix/PROJ-166-work:fix/PROJ-166-work",
                 ],
                 "",
             )
             .ok(
                 "git",
-                &["log", "-1", "--format=%s", "fix/CLAUDE-166-work"],
+                &["log", "-1", "--format=%s", "fix/PROJ-166-work"],
                 "fix: harden PR creation\n",
             )
             .ok(
                 "git",
-                &["log", "-1", "--format=%b", "fix/CLAUDE-166-work"],
-                "#CLAUDE-166\n",
+                &["log", "-1", "--format=%b", "fix/PROJ-166-work"],
+                "#PROJ-166\n",
             );
         let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
         let body_path_str = scratch
@@ -5383,7 +5371,7 @@ mod tests {
                 "--body-file",
                 body_path_str.as_str(),
                 "--head",
-                "fix/CLAUDE-166-work",
+                "fix/PROJ-166-work",
                 "--json",
             ],
             r#"{"number":51,"html_url":"https://dev.a8n.run/n/c/pulls/51"}"#,
@@ -5399,13 +5387,11 @@ mod tests {
             calls
                 .iter()
                 .any(|c| c
-                    == "git push --no-verify --set-upstream origin fix/CLAUDE-166-work:fix/CLAUDE-166-work"),
+                    == "git push --no-verify --set-upstream origin fix/PROJ-166-work:fix/PROJ-166-work"),
             "must push the feature branch by name: {calls:?}"
         );
         assert!(
-            calls
-                .iter()
-                .any(|c| c.contains("--head fix/CLAUDE-166-work")),
+            calls.iter().any(|c| c.contains("--head fix/PROJ-166-work")),
             "fj must open feature -> base with explicit --head: {calls:?}"
         );
         // The bug's signature: a HEAD push or a `main`-vs-`main` create.
@@ -5591,11 +5577,7 @@ mod tests {
         let runner = Arc::new(
             with_remote_state(runner, "feat/x", "abc", "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#CLAUDE-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -5665,11 +5647,7 @@ mod tests {
         );
         let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n")
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-            .ok(
-                "git",
-                &["log", "-1", "--format=%b", "feat/x"],
-                "#CLAUDE-1\n",
-            );
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n");
         let runner = Arc::new(with_open_pr_search(
             runner,
             r#"[{"number":88,"head_ref":"feat/x","html_url":"https://dev.a8n.run/n/c/pulls/88"}]"#,
@@ -5697,7 +5675,7 @@ mod tests {
 
     #[test]
     fn contract_adopts_existing_open_pr() {
-        // CLAUDE-469: the shared `crate::provider::contract` assertion,
+        // The shared `crate::provider::contract` assertion,
         // exercised here with a `CliBackend` double, mirrors the same
         // assertion run against `GithubForge` in `github.rs`'s own test
         // module.
@@ -5710,11 +5688,7 @@ mod tests {
         );
         let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n")
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-            .ok(
-                "git",
-                &["log", "-1", "--format=%b", "feat/x"],
-                "#CLAUDE-1\n",
-            );
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n");
         let runner = with_open_pr_search(
             runner,
             r#"[{"number":777,"head_ref":"feat/x","html_url":"https://dev.a8n.run/n/c/pulls/777"}]"#,
@@ -5730,7 +5704,7 @@ mod tests {
 
     #[test]
     fn contract_creates_when_no_open_pr() {
-        // CLAUDE-469: the other half of the shared contract, run against
+        // The other half of the shared contract, run against
         // `CliBackend`.
         let wd = tempfile::tempdir().unwrap();
         let runner = with_branch_resolution(
@@ -5770,7 +5744,7 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
-                "#CLAUDE-469\n",
+                "#PROJ-469\n",
             );
         let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
         let body_path_str = scratch
@@ -5812,7 +5786,7 @@ mod tests {
         );
         let runner = with_remote_state(runner, "feat/x", "newsha", "oldsha\trefs/heads/feat/x\n");
         let runner = with_open_pr_search(runner, "[]")
-            // CLAUDE-382: fetched before the ancestry check, so the remote
+            // Fetched before the ancestry check, so the remote
             // tip's objects (oldsha) are present locally when it runs.
             .ok(
                 "git",
@@ -5848,7 +5822,7 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
-                "#CLAUDE-170\n",
+                "#PROJ-170\n",
             );
         let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
         let body_path_str = scratch
@@ -5898,7 +5872,7 @@ mod tests {
             .expect("the ancestry check must be called");
         assert!(
             fetch_idx < ancestor_idx,
-            "CLAUDE-382: fetch must happen before `is_ancestor` touches the remote tip, \
+            "PROJ-382: fetch must happen before `is_ancestor` touches the remote tip, \
              else merge-base fails with exit 128 on a SHA the clone has never seen: {calls:?}"
         );
     }
@@ -5908,7 +5882,7 @@ mod tests {
         // The YOTUN-96 signature: the remote branch is present
         // and NOT a fast-forward of the local tip (neither is an ancestor of the
         // other). Force is banned, so the runner fetches, merges `origin/<branch>`
-        // into the local work (CLAUDE-382), pushes the resulting fast-forward,
+        // into the local work, pushes the resulting fast-forward,
         // and adopts the already-open PR for the branch via the ordinary
         // find-or-create path: it returns the PR (finalize advances to Code
         // Review, NOT Failed) and issues no `pr create` and no force.
@@ -5961,7 +5935,7 @@ mod tests {
         .ok(
             "git",
             &["log", "-1", "--format=%b", "feat/yotun-96"],
-            "#CLAUDE-96\n",
+            "#PROJ-96\n",
         );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
@@ -6044,11 +6018,7 @@ mod tests {
             )
             .ok("git", &["merge", "--abort"], "")
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-            .ok(
-                "git",
-                &["log", "-1", "--format=%b", "feat/x"],
-                "#CLAUDE-1\n",
-            );
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n");
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         match b
@@ -6085,7 +6055,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_diverged_merge_failed_before_starting_is_not_reported_as_conflict() {
-        // CLAUDE-458: the merge fails for a reason other than a conflict (a
+        // The merge fails for a reason other than a conflict (a
         // dirty tree, an unrelated history, a rejecting hook, ...), so
         // `MERGE_HEAD` is never created. `git merge --abort` must not run
         // (there is nothing to abort), and the returned error must report
@@ -6133,11 +6103,7 @@ mod tests {
                 "",
             )
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-            .ok(
-                "git",
-                &["log", "-1", "--format=%b", "feat/x"],
-                "#CLAUDE-1\n",
-            );
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n");
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         match b
@@ -6186,7 +6152,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_diverged_merge_conflict_and_failed_abort_reports_both() {
-        // CLAUDE-458: a real conflict (MERGE_HEAD present) whose abort then
+        // A real conflict (MERGE_HEAD present) whose abort then
         // ALSO fails. The returned error must carry both the original merge
         // stderr and the abort's own failure, not just one or the other.
         let wd = tempfile::tempdir().unwrap();
@@ -6236,11 +6202,7 @@ mod tests {
                 "fatal: Could not reset index",
             )
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-            .ok(
-                "git",
-                &["log", "-1", "--format=%b", "feat/x"],
-                "#CLAUDE-1\n",
-            );
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n");
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         match b
@@ -6285,10 +6247,10 @@ mod tests {
         let runner = with_branch_resolution(
             StubRunner::new(),
             "origin/main",
-            &["main", "fix/CLAUDE-206"],
-            &[("fix/CLAUDE-206", "abc123\n")],
+            &["main", "fix/PROJ-206"],
+            &[("fix/PROJ-206", "abc123\n")],
         );
-        let runner = with_remote_state(runner, "fix/CLAUDE-206", "abc123", "");
+        let runner = with_remote_state(runner, "fix/PROJ-206", "abc123", "");
         let runner = with_failed_open_pr_search(runner)
             .ok(
                 "git",
@@ -6297,19 +6259,19 @@ mod tests {
                     "--no-verify",
                     "--set-upstream",
                     "origin",
-                    "fix/CLAUDE-206:fix/CLAUDE-206",
+                    "fix/PROJ-206:fix/PROJ-206",
                 ],
                 "",
             )
             .ok(
                 "git",
-                &["log", "-1", "--format=%s", "fix/CLAUDE-206"],
+                &["log", "-1", "--format=%s", "fix/PROJ-206"],
                 "fix(pr): degrade a failed lookup\n",
             )
             .ok(
                 "git",
-                &["log", "-1", "--format=%b", "fix/CLAUDE-206"],
-                "#CLAUDE-206\n",
+                &["log", "-1", "--format=%b", "fix/PROJ-206"],
+                "#PROJ-206\n",
             );
         let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
         let body_path_str = scratch
@@ -6327,7 +6289,7 @@ mod tests {
                 "--body-file",
                 body_path_str.as_str(),
                 "--head",
-                "fix/CLAUDE-206",
+                "fix/PROJ-206",
                 "--json",
             ],
             r#"{"number":206,"html_url":"https://dev.a8n.run/n/c/pulls/206"}"#,
@@ -6362,13 +6324,13 @@ mod tests {
         let runner = with_branch_resolution(
             StubRunner::new(),
             "origin/main",
-            &["main", "fix/CLAUDE-206"],
-            &[("fix/CLAUDE-206", "abc123\n")],
+            &["main", "fix/PROJ-206"],
+            &[("fix/PROJ-206", "abc123\n")],
         );
-        let runner = with_remote_state(runner, "fix/CLAUDE-206", "abc123", "");
+        let runner = with_remote_state(runner, "fix/PROJ-206", "abc123", "");
         let runner = with_open_pr_search(
             runner,
-            r#"[{"number":207,"head_ref":"fix/CLAUDE-206","html_url":"https://dev.a8n.run/n/c/pulls/207"}]"#,
+            r#"[{"number":207,"head_ref":"fix/PROJ-206","html_url":"https://dev.a8n.run/n/c/pulls/207"}]"#,
         )
         // ... but the FIRST lookup (before the create) fails.
         .fail_once(
@@ -6384,19 +6346,19 @@ mod tests {
                 "--no-verify",
                 "--set-upstream",
                 "origin",
-                "fix/CLAUDE-206:fix/CLAUDE-206",
+                "fix/PROJ-206:fix/PROJ-206",
             ],
             "",
         )
         .ok(
             "git",
-            &["log", "-1", "--format=%s", "fix/CLAUDE-206"],
+            &["log", "-1", "--format=%s", "fix/PROJ-206"],
             "fix(pr): degrade a failed lookup\n",
         )
         .ok(
             "git",
-            &["log", "-1", "--format=%b", "fix/CLAUDE-206"],
-            "#CLAUDE-206\n",
+            &["log", "-1", "--format=%b", "fix/PROJ-206"],
+            "#PROJ-206\n",
         );
         let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
         let body_path_str = scratch
@@ -6414,12 +6376,12 @@ mod tests {
                 "--body-file",
                 body_path_str.as_str(),
                 "--head",
-                "fix/CLAUDE-206",
+                "fix/PROJ-206",
                 "--json",
             ],
             1,
             "Error: api error: pull request already exists for these targets \
-             [head_repo_id: 4, base_repo_id: 4, head_branch: fix/CLAUDE-206, base_branch: main]",
+             [head_repo_id: 4, base_repo_id: 4, head_branch: fix/PROJ-206, base_branch: main]",
         );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
@@ -6441,10 +6403,10 @@ mod tests {
         let runner = with_branch_resolution(
             StubRunner::new(),
             "origin/main",
-            &["main", "fix/CLAUDE-206"],
-            &[("fix/CLAUDE-206", "abc123\n")],
+            &["main", "fix/PROJ-206"],
+            &[("fix/PROJ-206", "abc123\n")],
         );
-        let runner = with_remote_state(runner, "fix/CLAUDE-206", "abc123", "");
+        let runner = with_remote_state(runner, "fix/PROJ-206", "abc123", "");
         let runner = with_failed_open_pr_search(runner)
             .ok(
                 "git",
@@ -6453,19 +6415,19 @@ mod tests {
                     "--no-verify",
                     "--set-upstream",
                     "origin",
-                    "fix/CLAUDE-206:fix/CLAUDE-206",
+                    "fix/PROJ-206:fix/PROJ-206",
                 ],
                 "",
             )
             .ok(
                 "git",
-                &["log", "-1", "--format=%s", "fix/CLAUDE-206"],
+                &["log", "-1", "--format=%s", "fix/PROJ-206"],
                 "fix(pr): degrade a failed lookup\n",
             )
             .ok(
                 "git",
-                &["log", "-1", "--format=%b", "fix/CLAUDE-206"],
-                "#CLAUDE-206\n",
+                &["log", "-1", "--format=%b", "fix/PROJ-206"],
+                "#PROJ-206\n",
             );
         let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
         let body_path_str = scratch
@@ -6483,7 +6445,7 @@ mod tests {
                 "--body-file",
                 body_path_str.as_str(),
                 "--head",
-                "fix/CLAUDE-206",
+                "fix/PROJ-206",
                 "--json",
             ],
             1,
@@ -6508,7 +6470,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_diverged_distinguishes_failed_lookup_from_no_pr() {
-        // CLAUDE-382: once the diverged arm merges and pushes
+        // Once the diverged arm merges and pushes
         // cleanly, it falls through to the ordinary find-or-create path, so a
         // FAILED open-PR search degrades the same way it does for any other
         // arm: assume no open PR, push is already done, and create one (with
@@ -6518,14 +6480,14 @@ mod tests {
         let runner = with_branch_resolution(
             StubRunner::new(),
             "origin/main",
-            &["main", "fix/CLAUDE-206"],
-            &[("fix/CLAUDE-206", "localsha\n")],
+            &["main", "fix/PROJ-206"],
+            &[("fix/PROJ-206", "localsha\n")],
         );
         let runner = with_remote_state(
             runner,
-            "fix/CLAUDE-206",
+            "fix/PROJ-206",
             "localsha",
-            "remotesha\trefs/heads/fix/CLAUDE-206\n",
+            "remotesha\trefs/heads/fix/PROJ-206\n",
         );
         let runner = with_failed_open_pr_search(runner)
             .ok(
@@ -6533,7 +6495,7 @@ mod tests {
                 &[
                     "fetch",
                     "origin",
-                    "refs/heads/fix/CLAUDE-206:refs/remotes/origin/fix/CLAUDE-206",
+                    "refs/heads/fix/PROJ-206:refs/remotes/origin/fix/PROJ-206",
                 ],
                 "",
             )
@@ -6543,7 +6505,7 @@ mod tests {
                 1,
                 "",
             )
-            .ok("git", &["merge", "--no-edit", "origin/fix/CLAUDE-206"], "")
+            .ok("git", &["merge", "--no-edit", "origin/fix/PROJ-206"], "")
             .ok(
                 "git",
                 &[
@@ -6551,19 +6513,19 @@ mod tests {
                     "--no-verify",
                     "--set-upstream",
                     "origin",
-                    "fix/CLAUDE-206:fix/CLAUDE-206",
+                    "fix/PROJ-206:fix/PROJ-206",
                 ],
                 "",
             )
             .ok(
                 "git",
-                &["log", "-1", "--format=%s", "fix/CLAUDE-206"],
+                &["log", "-1", "--format=%s", "fix/PROJ-206"],
                 "fix(pr): degrade a failed lookup after a merge\n",
             )
             .ok(
                 "git",
-                &["log", "-1", "--format=%b", "fix/CLAUDE-206"],
-                "#CLAUDE-206\n",
+                &["log", "-1", "--format=%b", "fix/PROJ-206"],
+                "#PROJ-206\n",
             );
         let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
         let body_path_str = scratch
@@ -6581,7 +6543,7 @@ mod tests {
                 "--body-file",
                 body_path_str.as_str(),
                 "--head",
-                "fix/CLAUDE-206",
+                "fix/PROJ-206",
                 "--json",
             ],
             r#"{"number":91,"html_url":"https://dev.a8n.run/n/c/pulls/91"}"#,
@@ -6596,7 +6558,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git merge --no-edit origin/fix/CLAUDE-206"),
+                .any(|c| c == "git merge --no-edit origin/fix/PROJ-206"),
             "diverged must merge the remote branch in: {calls:?}"
         );
         assert!(
@@ -6653,7 +6615,7 @@ mod tests {
         assert_eq!(prs[0].draft, Some(false));
     }
 
-    /// CLAUDE-652: `fj`'s own `draft: true` maps to `Some(true)`, distinct
+    /// `fj`'s own `draft: true` maps to `Some(true)`, distinct
     /// from an unreported flag.
     #[test]
     fn list_open_prs_maps_fj_draft_true() {
@@ -6753,7 +6715,7 @@ mod tests {
         assert_eq!(runner.calls.lock().unwrap().len(), 2);
     }
 
-    /// CLAUDE-464: reproduces the bug in a real `--single-branch` workdir
+    /// Reproduces the bug in a real `--single-branch` workdir
     /// exactly like the runner's own (`shallow_clone`, pinned to the
     /// *default* branch, CLAUDE.md step 3: the agent creates its feature
     /// branch locally off that clone). The pinned clone's configured
@@ -6815,7 +6777,7 @@ mod tests {
         git_in(&workdir, &["commit", "-q", "-m", "feat commit"]);
         git_in(&workdir, &["push", "-q", "origin", "feat/x:feat/x"]);
 
-        // The checkpoint watcher (CLAUDE-448) pushes another commit
+        // The checkpoint watcher pushes another commit
         // straight to the remote branch while the run keeps working;
         // modeled here as a second worktree on `origin` committing directly
         // to `feat/x` (a plain `checkout` of it in the non-bare `origin`
@@ -7255,7 +7217,7 @@ mod tests {
         assert_eq!(runner.calls.lock().unwrap().len(), 4);
     }
 
-    /// CLAUDE-422: a failed push can write a test report to stdout and git's
+    /// A failed push can write a test report to stdout and git's
     /// own banner to stderr; the failure text must carry both.
     #[test]
     fn push_branch_failure_carries_the_hook_stdout_and_the_git_stderr() {
@@ -7287,7 +7249,7 @@ mod tests {
         );
     }
 
-    /// A failure with no stdout reads exactly as it did before CLAUDE-422.
+    /// A failure with no stdout reads exactly as it did.
     #[test]
     fn a_failed_call_with_empty_stdout_keeps_its_stderr_text_unchanged() {
         let out = CmdOutput {
@@ -7564,7 +7526,7 @@ mod tests {
 
     #[test]
     fn pr_status_conflicted_true_false_null_and_absent() {
-        // FJ-124: `true`/`false` parse as given; `null` and an absent key (an
+        // `true`/`false` parse as given; `null` and an absent key (an
         // older `fj`) are unknown (`None`), never `false`.
         for (extra, want) in [
             (r#","conflicted":true"#, Some(true)),
@@ -7863,7 +7825,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "HEAD"],
-                    "work\n\n#CLAUDE-1\n",
+                    "work\n\n#PROJ-1\n",
                 ),
             "origin/main",
             &["main", "fix/x"],
@@ -8013,7 +7975,7 @@ mod tests {
         assert!(err.contains("permission"), "got {err}");
         assert!(err.contains("not visible"), "got {err}");
         // The second probe is not attempted once the first one fails, but
-        // the first one is itself retried four times (CLAUDE-366) before
+        // the first one is itself retried four times before
         // that failure is surfaced.
         assert_eq!(runner.calls.lock().unwrap().len(), 4);
     }
@@ -8102,7 +8064,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "HEAD"],
-                    "work\n\n#CLAUDE-1\n",
+                    "work\n\n#PROJ-1\n",
                 ),
             "origin/main",
             &["main", "fix/x"],
@@ -8371,7 +8333,7 @@ mod tests {
             assert_eq!(
                 runner.calls.lock().unwrap().len(),
                 4,
-                "terminal: no second page, but the first page's own call is retried up to four times (CLAUDE-366)"
+                "terminal: no second page, but the first page's own call is retried up to four times"
             );
         }
     }
@@ -8673,7 +8635,7 @@ mod tests {
         git_in(&origin, &["add", "."]);
         git_in(
             &origin,
-            &["commit", "-q", "-m", "Add the widget module\n\n#SF-123"],
+            &["commit", "-q", "-m", "Add the widget module\n\n#WEB-123"],
         );
         git_in(&origin, &["checkout", "-q", "main"]);
 
@@ -8683,7 +8645,7 @@ mod tests {
 
         let b = CliBackend::new(Arc::new(ProcessRunner::new()));
         let hits = b.scan_tracker_refs(&clone, None).unwrap();
-        assert_eq!(hits, vec!["SF-123".to_string()]);
+        assert_eq!(hits, vec!["WEB-123".to_string()]);
     }
 
     #[test]
@@ -8704,7 +8666,7 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         };
-        git_in(&origin, &["checkout", "-q", "-b", "fix/SF-9-widget"]);
+        git_in(&origin, &["checkout", "-q", "-b", "fix/WEB-9-widget"]);
         std::fs::write(origin.join("g.txt"), "y").unwrap();
         git_in(&origin, &["add", "."]);
         git_in(&origin, &["commit", "-q", "-m", "Add the widget module"]);
@@ -8712,11 +8674,11 @@ mod tests {
 
         let url = format!("file://{}", origin.display());
         let clone = tmp.path().join("clone");
-        crate::provider::shallow_clone(&url, Some("fix/SF-9-widget"), &clone, 50).unwrap();
+        crate::provider::shallow_clone(&url, Some("fix/WEB-9-widget"), &clone, 50).unwrap();
 
         let b = CliBackend::new(Arc::new(ProcessRunner::new()));
         let hits = b.scan_tracker_refs(&clone, None).unwrap();
-        assert_eq!(hits, vec!["SF-9".to_string()]);
+        assert_eq!(hits, vec!["WEB-9".to_string()]);
     }
 
     #[test]
@@ -8751,10 +8713,10 @@ mod tests {
         let hits = b
             .scan_tracker_refs(
                 &clone,
-                Some(("Add the widget module", "See SFT-42 for context.")),
+                Some(("Add the widget module", "See TASK-42 for context.")),
             )
             .unwrap();
-        assert_eq!(hits, vec!["SFT-42".to_string()]);
+        assert_eq!(hits, vec!["TASK-42".to_string()]);
     }
 
     #[test]

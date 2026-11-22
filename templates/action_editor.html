@@ -19,7 +19,7 @@
 {% endif %}
 
 {% if let Some(n) = name %}{% if !env_fields.is_empty() %}
-{#- CLAUDE-571: a scripted action's env values, without editing YAML.
+{#- A scripted action's env values, without editing YAML.
     Saving rewrites only the changed values; comments and every other
     line stay as they are. -#}
 <form method="post" action="/actions/{{ n }}/env" class="card" style="margin-bottom: 16px;">

@@ -1,4 +1,4 @@
-//! The web UI's accounts (CLAUDE-369): any number of credentials in
+//! The web UI's accounts: any number of credentials in
 //! `web_accounts`, each with its own argon2id password hash, session-signing
 //! key, and TOTP enrollment. The first account is created from the first-run
 //! setup page (`/setup`); every account after that is created by accepting an

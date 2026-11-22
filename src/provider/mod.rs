@@ -133,13 +133,13 @@ pub struct PrStatus {
     pub behind_base: Option<bool>,
     /// Whether the PR's head conflicts with its base, separate from
     /// `mergeable` (a draft PR reports `mergeable: false` conflict or not).
-    /// `None` is unknown (an `fj` predating FJ-124, or no verdict yet), never
+    /// `None` is unknown (an older `fj` without the field, or no verdict yet), never
     /// collapsed to `false`.
     #[serde(default)]
     pub conflicted: Option<bool>,
     /// The PR head commit SHA. `None` for a merged PR or an `fj` predating
     /// this field; used to bound a conflict auto-resolve dispatch to one
-    /// attempt per head commit (CLAUDE-380).
+    /// attempt per head commit.
     #[serde(default)]
     pub head_sha: Option<String>,
 }
@@ -166,7 +166,7 @@ pub struct PullRequest {
     /// has nothing to resume there.
     #[serde(default)]
     pub head_branch: Option<String>,
-    /// Set when the push-comment this PR's push (CLAUDE-447) tried to post
+    /// Set when the push-comment this PR's push tried to post
     /// on the PR itself failed; `None` on success or when nothing was
     /// pushed (the branch was already up to date). The caller folds this
     /// into its own run outcome comment (`pr_create`/success/salvage) the
@@ -182,7 +182,7 @@ pub struct PullRequest {
 }
 
 /// Direction of an issue link, mirroring the YouTrack REST `IssueLink.direction`
-/// and the `direction` field `yt issue inspect --json` emits (YT-40). `Both` is
+/// and the `direction` field `yt issue inspect --json` emits. `Both` is
 /// the undirected case (e.g. `Relates`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkDirection {
@@ -205,7 +205,7 @@ impl LinkDirection {
 }
 
 /// One directed link from an issue to a single linked target, flattened from the
-/// `links[].issues[]` shape of `yt issue inspect --json` (YT-40).
+/// `links[].issues[]` shape of `yt issue inspect --json`.
 /// Each linked issue in a `links[]` entry becomes its own row so the dependency
 /// gate can filter by `verb` (the direction-resolved relationship) and test each
 /// target's `resolved` timestamp independently.
@@ -216,7 +216,7 @@ pub struct IssueLink {
     /// Direction-resolved relationship verb, e.g. `depends on`, `parent for`,
     /// `is required for`, `subtask of`, `relates to`.
     pub verb: String,
-    /// The linked issue's `idReadable`, e.g. `YT-40`.
+    /// The linked issue's `idReadable`, e.g. `PROJ-40`.
     pub target: String,
     /// The linked issue's `resolved` epoch-ms timestamp. `None` (absent or null
     /// in the JSON) means the target is unresolved, i.e. an unmet dependency.
@@ -259,7 +259,7 @@ pub trait IssueTracker: Send + Sync {
 
     /// The issue's directed links, flattened one row per linked target, with each
     /// link's resolved `direction` / `verb` and each target's nullable `resolved`
-    /// timestamp (YT-40). Backs the pre-clone dependency gate, which
+    /// timestamp. Backs the pre-clone dependency gate, which
     /// blocks a queued issue on any unmet dependency before it is cloned or handed
     /// to claude.
     fn issue_links(&self, key: &str) -> Result<Vec<IssueLink>>;
@@ -281,7 +281,7 @@ pub trait IssueTracker: Send + Sync {
 
     /// Create a new issue in `project` (short name, e.g. `CLAUDE`) with `summary`
     /// and a Markdown `description`, optionally pre-assigning `assignee` (a login).
-    /// Returns the new issue's `idReadable` (e.g. `CLAUDE-47`). Backs the
+    /// Returns the new issue's `idReadable` (e.g. `PROJ-47`). Backs the
     /// triage-driven issue mint.
     ///
     /// A run reaches this through [`AuditedTracker`], which spends
@@ -301,8 +301,8 @@ pub trait IssueTracker: Send + Sync {
     fn attach_file(&self, key: &str, file: &std::path::Path) -> Result<()>;
 
     /// Link `key` to `target` with `link_type`, read source-first
-    /// (`("CLAUDE-99", "subtask of", "CLAUDE-1")` makes CLAUDE-99 a subtask of
-    /// CLAUDE-1). Backs hanging a filed report off its nominated parent.
+    /// (`("PROJ-99", "subtask of", "PROJ-1")` makes PROJ-99 a subtask of
+    /// PROJ-1). Backs hanging a filed report off its nominated parent.
     fn link_issue(&self, key: &str, link_type: &str, target: &str) -> Result<()> {
         let _ = (key, link_type, target);
         Err(Error::Other(anyhow::anyhow!(
@@ -324,7 +324,7 @@ pub trait IssueTracker: Send + Sync {
     /// Attach an existing tag to an issue, creating the instance-wide tag when
     /// missing (`yt issue tag add <key> <tag> --create`). Backs the
     /// `Needs-Info` tag written alongside the `Needs Review` AI Agent value
-    /// when the agent parks an issue pending a human answer (CLAUDE-373). The
+    /// when the agent parks an issue pending a human answer. The
     /// default is a no-op `Ok(())`, for a backend with no tag support.
     fn add_tag(&self, key: &str, tag: &str) -> Result<()> {
         let _ = (key, tag);
@@ -333,7 +333,7 @@ pub trait IssueTracker: Send + Sync {
 
     /// The names of the tags attached to issue `key` (`yt issue tag list
     /// --json`). Backs reading an audit Epic's `Audit-<Type>` tag so a
-    /// follow-up issue can carry it (CLAUDE-611). The default errors, so a
+    /// follow-up issue can carry it. The default errors, so a
     /// backend with no tag support is never read as "no tags".
     fn issue_tags(&self, key: &str) -> Result<Vec<String>> {
         let _ = key;
@@ -376,7 +376,7 @@ pub trait IssueTracker: Send + Sync {
     /// The time of the most recent change that set `field` to `value` on
     /// `key`, read from the issue's activity history; `None` when the
     /// history holds no such change. Backs the stuck-Working sweep's
-    /// owner-window check (CLAUDE-612): a `Working` issue set recently
+    /// owner-window check: a `Working` issue set recently
     /// enough for a run to still be legitimately alive, on ANY instance, is
     /// left alone rather than corrected. The default errors "not supported",
     /// so a backend with no history support never silently treats every
@@ -449,7 +449,7 @@ pub(crate) fn probe_denied(
 }
 
 /// The bare `#<KEY>-N` issue reference every runner-made commit body ends
-/// with (CLAUDE-398), read out of `text` for a push comment (CLAUDE-447)
+/// with, read out of `text` for a push comment
 /// that has no YouTrack job key passed in directly (the GitHub provider
 /// layer, which only sees the repo and the commit text). `None` when no such
 /// token appears.
@@ -472,7 +472,7 @@ pub fn bare_issue_key(text: &str) -> Option<String> {
         })
 }
 
-/// CLAUDE-470: find every bare tracker key (`[A-Z][A-Z0-9]*-[0-9]+`, no
+/// Find every bare tracker key (`[A-Z][A-Z0-9]*-[0-9]+`, no
 /// leading `#` required) in `text`, in the order first seen, deduplicated.
 /// Unlike [`bare_issue_key`] this has no `#` prefix requirement, so it also
 /// catches a key written into a branch name or a PR body sentence. A
@@ -528,7 +528,7 @@ pub(crate) fn scan_tracker_keys(text: &str) -> Vec<String> {
 }
 
 /// Reject a PR tip subject that is empty or a template heading/bare issue
-/// reference rather than a one-line subject (CLAUDE-398). Called before any
+/// reference rather than a one-line subject. Called before any
 /// push or PR-create call, so a bad tip opens nothing: the error names the
 /// branch and the offending subject, and reaches the issue comment through
 /// the existing PR-creation failure path in `finalize`.
@@ -551,7 +551,7 @@ pub fn validate_pr_subject(subject: &str, branch: &str) -> Result<()> {
 }
 
 /// Reject a PR tip body whose issue-reference tail is not the bare `#KEY-N`
-/// block the operator's rule requires (CLAUDE-623): a line anywhere in the
+/// block the operator's rule requires: a line anywhere in the
 /// body that is only `Closes` / `Fixes` / `Resolves` / `Refs` (any case), or
 /// that starts with one of those words (`Closes KEY-N` style), or a last
 /// block (after dropping trailing trailer lines such as `Co-Authored-By:`
@@ -628,10 +628,10 @@ pub trait Forge: Send + Sync {
     /// Like [`Self::create_pr`], but `draft` selects whether the opened PR is a
     /// draft (Forgejo: a `WIP: ` title prefix, the convention `fj pr search
     /// --json` reports through its `draft` field; GitHub: the real draft flag).
-    /// Used by the timeout salvage path (CLAUDE-379) to open a draft PR for
+    /// Used by the timeout salvage path to open a draft PR for
     /// work rescued from a timed-out run. `body`, when `Some`, is written
-    /// verbatim as the PR body instead of the tip commit's own body
-    /// (CLAUDE-398): a killed run's tip is often an agent layer commit whose
+    /// verbatim as the PR body instead of the tip commit's own body:
+    /// a killed run's tip is often an agent layer commit whose
     /// body is only the bare `#<KEY>` line, which tells a reader nothing. The
     /// title still comes from the tip subject, carrying the `WIP: ` prefix.
     /// The default ignores `draft` and `body` and falls back to
@@ -652,10 +652,10 @@ pub trait Forge: Send + Sync {
     /// Strip PR `pr_number` in `repo` on `host` of its draft status (Forgejo:
     /// remove the `WIP: ` title prefix; GitHub: `gh pr ready`). Used when a
     /// re-queued run resumes onto a draft PR a prior timed-out run salvaged
-    /// (CLAUDE-379) and now succeeds. Returns whether the PR was a draft
+    /// and now succeeds. Returns whether the PR was a draft
     /// before this call: `true` for GitHub `isDraft: true` or a Forgejo
-    /// `WIP: ` prefix that was stripped, `false` when it was already ready
-    /// (CLAUDE-651). The caller uses this to skip a finalize-time merge on a
+    /// `WIP: ` prefix that was stripped, `false` when it was already ready.
+    /// The caller uses this to skip a finalize-time merge on a
     /// PR just promoted from draft, since its only CI evidence may be
     /// skipped draft-time runs. The default errors so a backend without
     /// draft support (including every test-only stub) reports clearly rather
@@ -671,9 +671,9 @@ pub trait Forge: Send + Sync {
     /// derived from `workdir`'s current tip commit (subject and, for
     /// Forgejo, the reflowed body; GitHub's `create_pr_impl` already reads
     /// `HEAD` the same way `create_pr` does). Used when a re-queued run
-    /// (CLAUDE-275) resumes onto a draft PR a prior timed-out run salvaged
-    /// (CLAUDE-379) and now finishes: the placeholder title/body the salvage
-    /// wrote (CLAUDE-398) is replaced with the finished tip's own text,
+    /// resumes onto a draft PR a prior timed-out run salvaged
+    /// and now finishes: the placeholder title/body the salvage
+    /// wrote is replaced with the finished tip's own text,
     /// validated through [`validate_pr_subject`] first so a bad tip refuses
     /// here exactly as it would at PR-create time. The default errors so a
     /// backend without support (including every test-only stub) reports
@@ -691,7 +691,7 @@ pub trait Forge: Send + Sync {
         )))
     }
 
-    /// A periodic checkpoint push (CLAUDE-448): push `workdir`'s current
+    /// A periodic checkpoint push: push `workdir`'s current
     /// feature branch with the repo's hooks bypassed (a checkpoint push runs
     /// while the agent is still editing, so a `pre-push` hook would check a
     /// half-edited tree and compete with the agent for CPU), posting a
@@ -719,7 +719,7 @@ pub trait Forge: Send + Sync {
 
     /// Push the resolved feature branch (SPEC-3.3.1), same as every other
     /// runner push of an agent branch: the repo's `pre-push` hook is never
-    /// run (CLAUDE-533), since the SPEC-3.3.2 verification gate is the only
+    /// run, since the SPEC-3.3.2 verification gate is the only
     /// post-agent full-suite run. Opens no PR; used by the finalize paths
     /// that must never create one (needs-review, no-code-change, hard
     /// failure). Returns `Ok(None)` when there is nothing to push: no
@@ -736,7 +736,7 @@ pub trait Forge: Send + Sync {
         )))
     }
 
-    /// CLAUDE-470: scan the resolved feature branch's name, every commit
+    /// Scan the resolved feature branch's name, every commit
     /// message on it ahead of the repo's default branch, and (when `pr` is
     /// given) a PR title/body, for a bare tracker key
     /// (`[A-Z][A-Z0-9]*-[0-9]+`, see [`scan_tracker_keys`]). Called before
@@ -867,7 +867,7 @@ pub trait Forge: Send + Sync {
         )))
     }
 
-    /// CLAUDE-549: [`Self::pr_status`] bounded by `timeout`, for the single
+    /// [`Self::pr_status`] bounded by `timeout`, for the single
     /// status read `finalize` makes before deciding whether to merge a green
     /// PR in the same tick. A read that has not answered within `timeout`
     /// returns [`Error::ForgeTimeout`] so the caller falls back to Code Review
@@ -935,13 +935,13 @@ pub trait Backend: IssueTracker + Forge {
     fn name(&self) -> &'static str;
 }
 
-/// CLAUDE-549: run `probe.pr_status(host, repo, pr_number)` on a detached OS
+/// Run `probe.pr_status(host, repo, pr_number)` on a detached OS
 /// thread and wait at most `timeout` for its answer. `probe` is an owned,
 /// independent copy of the calling forge, so a read that outlives the
 /// deadline keeps running to completion on its own thread (its subprocess is
 /// never left half-read) while the caller moves on with
 /// [`Error::ForgeTimeout`]. A plain OS thread rather than a tokio task, so it
-/// holds no runtime worker either way (CLAUDE-228).
+/// holds no runtime worker either way.
 pub(crate) fn pr_status_on_thread<F: Forge + 'static>(
     probe: F,
     host: &str,
@@ -1008,7 +1008,7 @@ const GIT_CRED_PASS_ENV: &str = "CLAUDE_RUN_GIT_PASSWORD";
 /// `.git/config`. It IS inherited by anything that git child spawns for the
 /// duration of the call, though: a `pre-push` hook sees both
 /// [`GIT_CRED_USER_ENV`] / [`GIT_CRED_PASS_ENV`] and the `-c` pair re-exported
-/// as `GIT_CONFIG_PARAMETERS` (CLAUDE-426), so a hook's own test suite must not
+/// as `GIT_CONFIG_PARAMETERS`, so a hook's own test suite must not
 /// assume a clean ambient git environment (see `testutil::clear_ambient_git_env`).
 /// SPEC-8.5: per-invocation credential helper; the token lives only in the
 /// child process's own environment, never in argv or `.git/config`.
@@ -1099,8 +1099,8 @@ pub(crate) fn authed_git_command(
 }
 
 /// Serializes every test (across modules) that mutates the process-wide
-/// `GIT_ALLOW_PROTOCOL` env var to drive a `git remote-ext` retry fixture
-/// (CLAUDE-396), so two such tests running on different threads never clobber
+/// `GIT_ALLOW_PROTOCOL` env var to drive a `git remote-ext` retry fixture,
+/// so two such tests running on different threads never clobber
 /// each other's setting mid-test (mirrors `secrets::key_file_env_lock`).
 #[cfg(test)]
 pub(crate) fn git_allow_protocol_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1109,7 +1109,7 @@ pub(crate) fn git_allow_protocol_test_lock() -> std::sync::MutexGuard<'static, (
 }
 
 /// Serializes every test that prepends a stub `git` to the process-wide
-/// `PATH` (CLAUDE-410) so two such tests, or a `PATH` read racing a write,
+/// `PATH` so two such tests, or a `PATH` read racing a write,
 /// never interleave; `std::env::set_var`/`var` on `PATH` are documented as
 /// unsound under concurrent access from other threads.
 #[cfg(test)]
@@ -1118,7 +1118,7 @@ pub(crate) fn git_stub_path_test_lock() -> crate::testutil::PathEnvGuard {
 }
 
 /// Serializes every test that sets the process-wide `GIT_TRACE` env var to
-/// capture the real argv a git subprocess actually received (CLAUDE-410),
+/// capture the real argv a git subprocess actually received,
 /// mirroring [`git_allow_protocol_test_lock`]. `std::env::set_var`/`remove_var`
 /// are documented as unsound under concurrent access from other threads, so
 /// two such tests must never hold `GIT_TRACE` at once.
@@ -1128,7 +1128,7 @@ pub(crate) fn git_trace_test_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The create_pr "adopt-first" contract (CLAUDE-469): shared, backend-agnostic
+/// The create_pr "adopt-first" contract: shared, backend-agnostic
 /// assertions exercised by BOTH `cli::CliBackend` and `github::GithubForge`'s
 /// own test suites, so a regression in either backend's adopt-or-create path
 /// fails against the same two assertions rather than two independently
@@ -1164,8 +1164,8 @@ pub(crate) mod contract {
     }
 
     /// No open PR exists for the branch: `create_pr` must still succeed by
-    /// creating one, exactly as it did before CLAUDE-469 introduced the
-    /// lookup. `created_pr_number` is the number the backend's double has
+    /// creating one, exactly as it did before the
+    /// lookup existed. `created_pr_number` is the number the backend's double has
     /// stubbed its create call to return.
     pub(crate) fn assert_creates_when_no_open_pr(
         forge: &dyn Forge,
@@ -1235,7 +1235,7 @@ fn scrub_workdir_credentials(url: &str, workdir: &std::path::Path) -> Result<()>
 /// URL carries any.
 fn scrub_remote_origin_url(url: &str, workdir: &std::path::Path) -> Result<()> {
     // Bare `git` resolves through the process-wide `PATH`; serialize against
-    // the CLAUDE-410 PATH-stub test's mutation/deletion window the same way
+    // the PATH-stub test's mutation/deletion window the same way
     // `comment_webhooks::git_output` does.
     #[cfg(test)]
     let _path_guard = crate::testutil::path_env_lock();
@@ -1275,7 +1275,7 @@ fn scrub_remote_origin_url(url: &str, workdir: &std::path::Path) -> Result<()> {
 /// when `.gitmodules` carries a relative URL, resolved against the
 /// token-bearing `origin`).
 fn scrub_submodule_config_urls(url: &str, workdir: &std::path::Path) -> Result<()> {
-    // See `scrub_remote_origin_url`: serialize against the CLAUDE-410
+    // See `scrub_remote_origin_url`: serialize against the
     // PATH-stub test's mutation/deletion window.
     #[cfg(test)]
     let _path_guard = crate::testutil::path_env_lock();
@@ -1355,9 +1355,9 @@ fn recurse_into_submodules(url: &str, workdir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Wait before attempts 2, 3 and 4 of a retried git network call
-/// (CLAUDE-396): the same four-attempts-total / `[0s, 2s, 5s]` schedule as
-/// CLAUDE-366's read-only `fj` retry (`run_fj_read_retrying`), for a
+/// Wait before attempts 2, 3 and 4 of a retried git network call:
+/// the same four-attempts-total / `[0s, 2s, 5s]` schedule as
+/// the read-only `fj` retry (`run_fj_read_retrying`), for a
 /// worst-case added delay of 7s across four attempts total.
 pub const GIT_NETWORK_RETRY_WAITS: [Duration; 3] = [
     Duration::from_secs(0),
@@ -1404,14 +1404,14 @@ impl GitAttemptOutput for cli::CmdOutput {
     }
 }
 
-/// SPEC-8.5: run a git network call (CLAUDE-396) with up to four attempts total,
+/// SPEC-8.5: run a git network call with up to four attempts total,
 /// waiting `waits[0]` / `waits[1]` / `waits[2]` before attempts 2, 3 and 4,
-/// with the same semantics as CLAUDE-366's `run_fj_read_retrying`: a failed
+/// with the same semantics as `run_fj_read_retrying`: a failed
 /// attempt is a completed process with a non-zero exit, retried on the exit
 /// status alone, never by classifying `stderr`'s wording; a spawn error
 /// (`attempt` returning `Err`) is never retried, since it cannot be
 /// transient the way a completed process can; the wait is spent through
-/// [`crate::blocking::in_place`] (CLAUDE-228). `op` names the git subcommand
+/// [`crate::blocking::in_place`]. `op` names the git subcommand
 /// for the log line only. `url_secrets` are the token-bearing URL's known
 /// secrets (see [`url_secrets`]): git echoes a token-bearing URL in its own
 /// messages, so the logged stderr tail goes through
@@ -1468,7 +1468,7 @@ pub fn retry_git_network<O: GitAttemptOutput>(
 ///
 /// `--single-branch --branch <branch>` (or, unpinned, `--single-branch` on
 /// whatever the remote's default is) configures `remote.origin.fetch` to
-/// cover only that one branch (CLAUDE-464): a later `git fetch origin
+/// cover only that one branch: a later `git fetch origin
 /// <other-branch>` naming any other ref by its bare name does not match that
 /// refspec and writes `FETCH_HEAD` only, creating no
 /// `refs/remotes/origin/<other-branch>`. `CliBackend::fetch_branch`
@@ -1486,9 +1486,9 @@ pub fn shallow_clone(
 
 /// Fetch `head` and `base` with their full history into a shallow clone, so
 /// the merge base of the two branches is present for a conflict-resolution
-/// merge (CLAUDE-547). Both land in an explicit `refs/remotes/origin/<branch>`,
-/// as a single-branch clone's refspec would otherwise write `FETCH_HEAD` only
-/// (CLAUDE-464). `--depth` at git's maximum works on a shallow and on an
+/// merge. Both land in an explicit `refs/remotes/origin/<branch>`,
+/// as a single-branch clone's refspec would otherwise write `FETCH_HEAD` only.
+/// `--depth` at git's maximum works on a shallow and on an
 /// already complete clone, where `--unshallow` would fail.
 pub fn deepen_for_merge(
     url: &str,
@@ -1586,8 +1586,8 @@ fn shallow_clone_retrying(
 /// oldest `v*` tag is older than that window ends up with a clone that has
 /// NO tags at all. A repo guard that reads tags (a release-window check, a
 /// changelog, `git describe`) then fails in the runner's clone while passing
-/// on a developer's full clone, a false negative that blocks every push
-/// (CLAUDE-484). `--tags` fetches every tag unconditionally, overwriting any
+/// on a developer's full clone, a false negative that blocks every push.
+/// `--tags` fetches every tag unconditionally, overwriting any
 /// that the clone itself already carried. An explicit `refs/tags/*:refs/tags/*`
 /// refspec was tried first and rejected: combined with `--depth`, git exits 1
 /// with no stderr at all on a remote with zero tags (verified against git
@@ -1665,7 +1665,7 @@ fn init_submodules_retrying(
 /// `origin/HEAD`, so a pinned clone ends up with the same base refs as a
 /// default-branch clone.
 /// SPEC-8.5: restore real `origin/HEAD` tracking refs after a pinned shallow
-/// clone (CLAUDE-464).
+/// clone.
 fn restore_default_branch_refs_retrying(
     url: &str,
     pinned: &str,
@@ -1759,17 +1759,17 @@ pub fn git_error(context: &str, out: &std::process::Output, url: Option<&str>) -
     ))
 }
 
-/// The most stdout lines a failed call's error text carries (CLAUDE-422).
+/// The most stdout lines a failed call's error text carries.
 const STDOUT_TAIL_MAX_LINES: usize = 40;
 
-/// The most stdout bytes a failed call's error text carries (CLAUDE-422).
+/// The most stdout bytes a failed call's error text carries.
 const STDOUT_TAIL_MAX_BYTES: usize = 4000;
 
-/// Append a bounded, redacted tail of a failed call's `stdout` to its error text
-/// (CLAUDE-422). A `pre-push` hook writes its test report to stdout, which git
+/// Append a bounded, redacted tail of a failed call's `stdout` to its error text.
+/// A `pre-push` hook writes its test report to stdout, which git
 /// does not fold into stderr, so a stderr-only message names no failing test.
 /// `stderr` and `stdout` are both run through [`strip_terminal_escapes`]
-/// first (CLAUDE-622), so `just`'s ANSI colour/cursor codes and other control
+/// first, so `just`'s ANSI colour/cursor codes and other control
 /// bytes never reach the bound, the stored tail, or a comment; the bound is
 /// then applied to the already-stripped text so it counts visible
 /// characters, not escape bytes. The tail is the last
@@ -1778,7 +1778,7 @@ const STDOUT_TAIL_MAX_BYTES: usize = 4000;
 /// the cut is never half-shown. Empty stdout returns `stderr` unchanged
 /// (still stripped).
 /// SPEC-8.6: append a bounded, redacted, escape-stripped stdout tail to a
-/// failed call's error text (CLAUDE-422, CLAUDE-622).
+/// failed call's error text.
 pub(crate) fn append_stdout_tail(stderr: &str, stdout: &str, secrets: &[String]) -> String {
     let stderr = strip_terminal_escapes(stderr);
     let stdout = strip_terminal_escapes(stdout.trim());
@@ -1802,7 +1802,7 @@ pub(crate) fn append_stdout_tail(stderr: &str, stdout: &str, secrets: &[String])
 }
 
 /// SPEC-8.6: strip terminal escape sequences and raw control bytes from
-/// captured command text (CLAUDE-622), so `just` and the tools it runs never
+/// captured command text, so `just` and the tools it runs never
 /// leave ANSI colour/cursor codes or other control characters in a stored
 /// tail or a comment. Removes every ESC (`0x1B`)-introduced sequence: CSI
 /// (`ESC [ ... <final byte 0x40-0x7E>`), OSC (`ESC ] ... ` terminated by BEL
@@ -1873,7 +1873,7 @@ fn longest_backtick_run(text: &str) -> usize {
 /// SPEC-8.6: fence `text` (optionally tagged `lang`) in a Markdown code
 /// block, choosing a backtick run strictly longer than any run already
 /// inside `text` (at least 3) so untrusted captured command text can never
-/// close the fence early and spill out of the block (CLAUDE-622).
+/// close the fence early and spill out of the block.
 pub(crate) fn fenced_block(lang: &str, text: &str) -> String {
     let fence = "`".repeat((longest_backtick_run(text) + 1).max(3));
     format!("{fence}{lang}\n{text}\n{fence}")
@@ -2069,10 +2069,10 @@ mod tests {
     use cli::testutil::StubRunner;
 
     /// Zero-delay retry schedule so a test that exercises a failing git
-    /// network call does not actually wait out CLAUDE-396's real schedule.
+    /// network call does not actually wait out the real schedule.
     const NO_WAIT: [Duration; 3] = [Duration::ZERO, Duration::ZERO, Duration::ZERO];
 
-    /// Acceptance (CLAUDE-410): a resolvable token-bearing URL puts the
+    /// Acceptance: a resolvable token-bearing URL puts the
     /// credential ONLY in the built [`std::process::Command`]'s environment,
     /// never in its args, and the args are exactly the clearing `-c
     /// credential.helper=` pair, with no userinfo anywhere in them.
@@ -2155,13 +2155,13 @@ mod tests {
 
     #[test]
     fn validate_pr_body_accepts_a_valid_body() {
-        let body = "Summary of the change.\n\nMore detail.\n\n#CLAUDE-1";
+        let body = "Summary of the change.\n\nMore detail.\n\n#PROJ-1";
         validate_pr_body(body, "feat/x").unwrap();
     }
 
     #[test]
     fn validate_pr_body_rejects_closes_then_the_id() {
-        let body = "Summary of the change.\n\nCloses\n#CLAUDE-1";
+        let body = "Summary of the change.\n\nCloses\n#PROJ-1";
         let err = validate_pr_body(body, "feat/x").unwrap_err().to_string();
         assert!(err.contains("Closes"), "{err}");
     }
@@ -2169,43 +2169,43 @@ mod tests {
     #[test]
     fn validate_pr_body_accepts_an_attribution_trailer_below_the_id() {
         let body =
-            "Summary of the change.\n\n#CLAUDE-1\n\nCo-Authored-By: Claude <noreply@anthropic.com>";
+            "Summary of the change.\n\n#PROJ-1\n\nCo-Authored-By: Claude <noreply@anthropic.com>";
         validate_pr_body(body, "feat/x").unwrap();
     }
 
     #[test]
     fn validate_pr_body_rejects_a_trailer_on_the_line_above_the_id() {
-        // CLAUDE-638: the trailer and the id form one block, so the last
+        // The trailer and the id form one block, so the last
         // block is not all bare references.
         let body =
-            "Summary of the change.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n#CLAUDE-1";
+            "Summary of the change.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n#PROJ-1";
         let err = validate_pr_body(body, "feat/x").unwrap_err().to_string();
         assert!(err.contains("Co-Authored-By: Claude"), "{err}");
     }
 
     #[test]
     fn validate_pr_body_rejects_text_after_the_id() {
-        let body = "Summary of the change.\n\n#CLAUDE-1 and also #CLAUDE-2";
+        let body = "Summary of the change.\n\n#PROJ-1 and also #PROJ-2";
         let err = validate_pr_body(body, "feat/x").unwrap_err().to_string();
-        assert!(err.contains("#CLAUDE-1 and also #CLAUDE-2"), "{err}");
+        assert!(err.contains("#PROJ-1 and also #PROJ-2"), "{err}");
     }
 
     #[test]
     fn validate_pr_body_accepts_several_ids_one_per_line() {
-        let body = "Summary of the change.\n\n#CLAUDE-1\n#CLAUDE-2";
+        let body = "Summary of the change.\n\n#PROJ-1\n#PROJ-2";
         validate_pr_body(body, "feat/x").unwrap();
     }
 
     #[test]
     fn bare_issue_key_finds_trailing_reference() {
-        let body = "Add the push-comment module.\n\nSome body text.\n\n#CLAUDE-447";
-        assert_eq!(bare_issue_key(body), Some("CLAUDE-447".to_string()));
+        let body = "Add the push-comment module.\n\nSome body text.\n\n#PROJ-447";
+        assert_eq!(bare_issue_key(body), Some("PROJ-447".to_string()));
     }
 
     #[test]
     fn bare_issue_key_finds_reference_among_other_tokens() {
-        let body = "See #NOTAKEY and also #CLAUDE-447 for details.";
-        assert_eq!(bare_issue_key(body), Some("CLAUDE-447".to_string()));
+        let body = "See #NOTAKEY and also #PROJ-447 for details.";
+        assert_eq!(bare_issue_key(body), Some("PROJ-447".to_string()));
     }
 
     #[test]
@@ -2215,7 +2215,7 @@ mod tests {
 
     #[test]
     fn bare_issue_key_rejects_lowercase_letters() {
-        assert_eq!(bare_issue_key("#claude-447"), None);
+        assert_eq!(bare_issue_key("#proj-447"), None);
     }
 
     #[test]
@@ -2238,15 +2238,15 @@ mod tests {
 
     #[test]
     fn scan_tracker_keys_matches_without_a_hash_prefix() {
-        assert_eq!(scan_tracker_keys("(SF-1)"), vec!["SF-1".to_string()]);
+        assert_eq!(scan_tracker_keys("(WEB-1)"), vec!["WEB-1".to_string()]);
     }
 
     #[test]
     fn scan_tracker_keys_finds_every_key_in_order_deduplicated() {
-        let text = "fix/CLAUDE-470-repo-tracker-refs mentions CLAUDE-470 again and also SFT-9";
+        let text = "fix/PROJ-470-repo-tracker-refs mentions PROJ-470 again and also SFT-9";
         assert_eq!(
             scan_tracker_keys(text),
-            vec!["CLAUDE-470".to_string(), "SFT-9".to_string()]
+            vec!["PROJ-470".to_string(), "SFT-9".to_string()]
         );
     }
 
@@ -2255,7 +2255,7 @@ mod tests {
         // A digit or letter glued to either side means the candidate is part
         // of a larger token, not a standalone key, so it is rejected.
         assert_eq!(
-            scan_tracker_keys("v1CLAUDE-470 CLAUDE-4700x"),
+            scan_tracker_keys("v1PROJ-470 PROJ-4700x"),
             Vec::<String>::new()
         );
     }
@@ -2412,7 +2412,7 @@ mod tests {
         assert!(text.contains("failures:"), "{text}");
     }
 
-    /// CLAUDE-622: a CSI sequence (`just`'s ANSI colour codes) is stripped
+    /// A CSI sequence (`just`'s ANSI colour codes) is stripped
     /// from both the stdout tail and the stderr it is appended to.
     #[test]
     fn append_stdout_tail_strips_csi_escapes() {
@@ -2423,7 +2423,7 @@ mod tests {
         assert!(text.contains("error"), "{text}");
     }
 
-    /// CLAUDE-622: an OSC sequence (a terminal title/hyperlink escape) is
+    /// An OSC sequence (a terminal title/hyperlink escape) is
     /// stripped whether terminated by BEL or by `ESC \`.
     #[test]
     fn append_stdout_tail_strips_osc_escapes() {
@@ -2433,7 +2433,7 @@ mod tests {
         assert_eq!(strip_terminal_escapes(st), "before  after\n");
     }
 
-    /// CLAUDE-622: a bare control byte (not part of any escape sequence) is
+    /// A bare control byte (not part of any escape sequence) is
     /// dropped, while newline and tab survive.
     #[test]
     fn append_stdout_tail_strips_bare_control_bytes() {
@@ -2445,7 +2445,7 @@ mod tests {
         assert!(text.contains("line\ttwo"), "{text}");
     }
 
-    /// CLAUDE-622: escapes are stripped before the byte/line bound is
+    /// Escapes are stripped before the byte/line bound is
     /// applied, so a CSI sequence straddling what would otherwise be the
     /// cut point never leaves a dangling half-escape in the tail.
     #[test]
@@ -2458,7 +2458,7 @@ mod tests {
         assert!(tail.ends_with("TAIL"), "{tail}");
     }
 
-    /// CLAUDE-622: the fence is longer than any backtick run already inside
+    /// The fence is longer than any backtick run already inside
     /// the text, so the text can never close it early.
     #[test]
     fn fenced_block_picks_a_fence_longer_than_any_backtick_run_in_the_text() {
@@ -2478,7 +2478,7 @@ mod tests {
         assert!(block.ends_with("\n```"), "{block}");
     }
 
-    /// CLAUDE-422: a failing `pre-push` hook's report is on git's stdout.
+    /// A failing `pre-push` hook's report is on git's stdout.
     #[test]
     fn git_error_carries_the_stdout_tail_after_the_stderr_tail() {
         use std::os::unix::process::ExitStatusExt;
@@ -2627,7 +2627,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-547: a depth-1 clone of the head branch has no merge base with
+    /// A depth-1 clone of the head branch has no merge base with
     /// the base branch; after `deepen_for_merge` both tips and their merge
     /// base are present.
     #[test]
@@ -2691,7 +2691,7 @@ mod tests {
         );
     }
 
-    // ---- tags survive a shallow clone (CLAUDE-484) -------------
+    // ---- tags survive a shallow clone -------------
 
     /// A real origin repo (over `file://`) with `tag_count` commits on
     /// `main`, each tagged `v1`..`v<tag_count>` in order, so the earliest
@@ -2738,7 +2738,7 @@ mod tests {
             .collect()
     }
 
-    /// Before the CLAUDE-484 fix, a shallow clone at a depth shorter than the
+    /// Before the fix, a shallow clone at a depth shorter than the
     /// tagged history carried none of the tags older than that window; this
     /// fails against `shallow_clone_retrying` with the fetch-tags step
     /// removed, and passes with it in place.
@@ -2746,7 +2746,7 @@ mod tests {
     fn shallow_clone_fetches_tags_older_than_the_depth_window() {
         // This test and its helpers resolve `git` off `PATH`; without the
         // lock, a concurrent test that temporarily prepends a stub `git` to
-        // the process-wide `PATH` (CLAUDE-410) can interleave its own
+        // the process-wide `PATH` can interleave its own
         // mutation into these calls, intermittently pointing them at a stub
         // binary that no longer exists (observed in CI as ENOENT on a
         // `/tmp/.tmpXXXX/bin/git` path).
@@ -2915,8 +2915,7 @@ mod tests {
     /// commit ahead of `main` so a clone pinned to `feat` exercises
     /// `restore_default_branch_refs_retrying`'s `ls-remote` AND its `fetch`
     /// step (reached only when the pinned branch differs from the remote's
-    /// default), on top of the submodule checkout, all from one fixture
-    /// (CLAUDE-410).
+    /// default), on top of the submodule checkout, all from one fixture.
     fn origin_with_default_branch_and_submodule(base: &std::path::Path) -> String {
         let url = origin_with_submodule(base);
         let origin = base.join("origin");
@@ -2941,7 +2940,7 @@ mod tests {
         url
     }
 
-    /// Acceptance (CLAUDE-410): a pinned-branch clone of a repo with a
+    /// Acceptance: a pinned-branch clone of a repo with a
     /// submodule - which exercises `clone`, `ls-remote`, `fetch` AND
     /// `submodule update`, every git-network call site this issue covers
     /// except the comment webhook's push - never puts the clone URL's
@@ -2956,12 +2955,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare_url = origin_with_default_branch_and_submodule(tmp.path());
         let path = bare_url.strip_prefix("file://").unwrap();
-        let token = "CLAUDE-410-secret-token";
+        let token = "PROJ-410-secret-token";
         let url = format!("file://user:{token}@{path}");
         let clone = tmp.path().join("clone");
         let trace_file = tmp.path().join("git-trace.log");
 
-        // PATH lock first: production code reached below takes it too (CLAUDE-536).
+        // PATH lock first: production code reached below takes it too.
         let _path_guard = git_stub_path_test_lock();
         let _guard = git_trace_test_lock();
         std::env::set_var("GIT_TRACE", &trace_file);
@@ -3015,8 +3014,8 @@ mod tests {
     /// `CLAUDE_RUN_GIT_*` env var it sees to `env_log`, then `exec`s the real
     /// `git` with the same argv and environment, so every OTHER thread's
     /// concurrent real git calls behave identically (only gaining an
-    /// unrelated log line) while this test's own calls are also recorded
-    /// (CLAUDE-410). Caller holds [`git_stub_path_test_lock`] and restores
+    /// unrelated log line) while this test's own calls are also recorded.
+    /// Caller holds [`git_stub_path_test_lock`] and restores
     /// `PATH` itself; this only prepends.
     fn install_forwarding_git_stub_on_path(
         bin_dir: &std::path::Path,
@@ -3040,7 +3039,7 @@ mod tests {
         std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
     }
 
-    /// Acceptance (CLAUDE-410): a stub `git` on `PATH` (forwarding to the real
+    /// Acceptance: a stub `git` on `PATH` (forwarding to the real
     /// binary so the clone still succeeds) records the argv AND environment
     /// of every real git invocation a pinned clone of a repo with a
     /// submodule makes (clone, ls-remote, fetch, submodule update): the
@@ -3052,7 +3051,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bare_url = origin_with_default_branch_and_submodule(tmp.path());
         let path = bare_url.strip_prefix("file://").unwrap();
-        let token = "CLAUDE-410-stub-secret-token";
+        let token = "PROJ-410-stub-secret-token";
         let url = format!("file://user:{token}@{path}");
         let clone = tmp.path().join("clone");
 
@@ -3081,7 +3080,7 @@ mod tests {
         );
     }
 
-    /// `init_submodules_retrying` retries a transient failure (CLAUDE-396) via
+    /// `init_submodules_retrying` retries a transient failure via
     /// a `git remote-ext` helper script that fails the first invocation and
     /// forwards to `git-upload-pack` on the second, exercising the real
     /// production function (not a stand-in closure) end to end.
@@ -3141,7 +3140,7 @@ mod tests {
         // widening it, so `file` (used by other tests' local-path remotes
         // running concurrently) must stay listed alongside `ext`; the lock
         // keeps this test's set/remove pair from racing another thread's.
-        // PATH lock first: production code reached below takes it too (CLAUDE-536).
+        // PATH lock first: production code reached below takes it too.
         let _path_guard = git_stub_path_test_lock();
         let _guard = git_allow_protocol_test_lock();
         std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
@@ -3161,7 +3160,7 @@ mod tests {
     }
 
     /// `restore_default_branch_refs_retrying` retries a transient `ls-remote`
-    /// failure (CLAUDE-396) via a `git remote-ext` helper script, exercising
+    /// failure via a `git remote-ext` helper script, exercising
     /// the real production function end to end.
     #[test]
     fn restore_default_branch_refs_ls_remote_retries_once_and_succeeds_on_second_attempt() {
@@ -3170,7 +3169,7 @@ mod tests {
         std::fs::create_dir_all(&origin).unwrap();
         {
             // Serialize this fixture's bare `git` spawns against the
-            // CLAUDE-410 PATH-stub test's mutation/deletion window; dropped
+            // PATH-stub test's mutation/deletion window; dropped
             // before `restore_default_branch_refs_retrying` runs below, which
             // takes the same lock itself.
             let _path_guard = crate::testutil::path_env_lock();
@@ -3232,7 +3231,7 @@ mod tests {
         // `GIT_ALLOW_PROTOCOL` replaces git's default allowlist rather than
         // widening it, so `file` stays listed alongside `ext`; the lock keeps
         // this test's set/remove pair from racing another thread's.
-        // PATH lock first: production code reached below takes it too (CLAUDE-536).
+        // PATH lock first: production code reached below takes it too.
         let _path_guard = git_stub_path_test_lock();
         let _guard = git_allow_protocol_test_lock();
         std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
@@ -3252,7 +3251,7 @@ mod tests {
 
     /// `restore_default_branch_refs_retrying`'s `fetch` step (reached only
     /// when the pinned branch differs from the remote's default) retries a
-    /// transient failure (CLAUDE-396) via a `git remote-ext` wrapper placed
+    /// transient failure via a `git remote-ext` wrapper placed
     /// on the clone's own `origin` remote, exercising the real production
     /// function end to end; the `url` argument stays the plain `file://`
     /// origin so the preceding `ls-remote` succeeds on its first attempt and
@@ -3531,7 +3530,7 @@ mod tests {
         }
         // A pre-existing `config.lock` makes `git remote set-url` fail with
         // "Unable to create ... File exists", with no permission bit involved
-        // (CLAUDE-255 bars `set_mode` from a test; this needs none).
+        // (tests may not call `set_mode`; this needs none).
         let lock = clone.join(".git").join("config.lock");
         std::fs::write(&lock, b"").unwrap();
         let result = scrub_workdir_credentials(&url, &clone);
@@ -3646,7 +3645,7 @@ mod tests {
         }
     }
 
-    // ---- CLAUDE-396: git network retries ----------------------------------
+    // ---- git network retries ----------------------------------
 
     #[derive(Clone, Debug)]
     struct FakeOut {
@@ -3905,7 +3904,7 @@ mod tests {
         found
     }
 
-    /// Mechanical guard (CLAUDE-469 acceptance criterion 7): every real
+    /// Mechanical guard: every real
     /// `Forge` backend that can open a PR must be exercised by the shared
     /// [`contract`] assertions (today: `CliBackend`, `GithubForge`); every
     /// OTHER `impl Forge for <Type>` must be a named, test-only stub whose
@@ -3946,7 +3945,7 @@ mod tests {
         assert!(
             unaccounted.is_empty(),
             "new `impl Forge for {unaccounted:?}` found with no adopt-first contract coverage \
-             and no allowlist entry (CLAUDE-469): add a `contract::assert_adopts_existing_open_pr` \
+             and no allowlist entry: add a `contract::assert_adopts_existing_open_pr` \
              test and list it in CONTRACT_COVERED, or, if its `create_pr` never really opens a PR \
              (a test-only stub), list it in TEST_ONLY_ALLOWLIST"
         );

@@ -160,7 +160,7 @@ enum Cmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Read-only troubleshooting MCP server subcommands (CLAUDE-437).
+    /// Read-only troubleshooting MCP server subcommands.
     #[command(subcommand)]
     Mcp(McpCmd),
     /// Import legacy `~/.local/share/claude-run/state/*.json` files into SQLite.
@@ -168,6 +168,10 @@ enum Cmd {
         #[arg(long)]
         from: Option<String>,
     },
+    /// Update the migration checksums recorded in the state store to match
+    /// this build. Run once, with the daemon stopped, after an upgrade that
+    /// edited already-applied migration files.
+    RefreshMigrationChecksums,
     /// Copy an existing SQLite state store into the configured database.
     /// The target is whatever `[database] url` /
     /// `CLAUDE_RUN_DATABASE_URL` resolves to, so the import and the daemon
@@ -428,7 +432,7 @@ fn log_server_started() {
 /// `apply_config_log_filter` swap in `[daemon].log_filter` once the config is
 /// loaded, without a second (illegal) `set_global_default`.
 ///
-/// `to_stderr` is true only for `mcp stdio` (CLAUDE-437): that transport's
+/// `to_stderr` is true only for `mcp stdio`: that transport's
 /// stdout must carry nothing but MCP JSON-RPC frames, so every other
 /// subcommand keeps logging to stdout as before and only this one is routed
 /// to stderr. Decided by [`argv_is_mcp_stdio`] because this runs before clap
@@ -582,6 +586,11 @@ async fn real_main(
                 daily_rows = report.daily_rows,
                 "legacy state imported"
             );
+            Ok(exit::OK)
+        }
+        Cmd::RefreshMigrationChecksums => {
+            let changed = db::refresh_migration_checksums(&db_target).await?;
+            println!("migration checksums updated: {changed} row(s) changed");
             Ok(exit::OK)
         }
         Cmd::Import {
@@ -1003,12 +1012,12 @@ async fn daemonless_status(
 ) -> claude_run::error::Result<serde_json::Value> {
     // The same blocks `/status` carries, assembled once in the library
     // (`state::status_blocks`) so the daemon's `/status` route and this
-    // daemonless path can never drift apart (CLAUDE-437 also builds
-    // `get_status`'s MCP tool output from this function).
+    // daemonless path can never drift apart (the `get_status` MCP tool output
+    // is built from this function too).
     let b = state::status_blocks(pool).await?;
     // Never guess "not running" from the missing socket alone: it is the
     // pidfile lock's liveness and the `serve --no-socket` marker that decide
-    // it (CLAUDE-438).
+    // it.
     let presence = daemon::daemon_presence(paths);
     let (daemon_field, socket_expected_at) = match &presence {
         daemon::DaemonPresence::RunningNoSocket => (
@@ -1712,14 +1721,14 @@ mod tests {
 
         // No action index row, so the key is measured against the default cap.
         for _ in 0..3 {
-            state::attempts_increment(&pool, "youtrack", "CLAUDE-9")
+            state::attempts_increment(&pool, "youtrack", "PROJ-9")
                 .await
                 .unwrap();
         }
         let report = daemonless_status(&pool, &paths, &sock).await.unwrap();
         let hits = report["attempt_cap_hits"].as_array().unwrap();
         assert_eq!(hits.len(), 1, "{report:#}");
-        assert_eq!(hits[0]["job_key"], "CLAUDE-9");
+        assert_eq!(hits[0]["job_key"], "PROJ-9");
         assert_eq!(hits[0]["action_name"], "youtrack");
         assert_eq!(hits[0]["count"], 3);
         assert_eq!(hits[0]["cap"], 3);

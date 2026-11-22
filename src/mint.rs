@@ -828,7 +828,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 searches: HashMap::new(),
-                new_key: "CLAUDE-99".to_string(),
+                new_key: "PROJ-99".to_string(),
                 vcs_responses: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
             }
@@ -1254,7 +1254,7 @@ mod tests {
         assert_eq!(
             out,
             MintOutcome::Created {
-                key: "CLAUDE-99".to_string(),
+                key: "PROJ-99".to_string(),
                 project: "FJ".to_string(),
                 bucket: TriageBucket::CodeFix,
                 source: RouteSource::Override,
@@ -1266,13 +1266,13 @@ mod tests {
             "{calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c == "set_state CLAUDE-99 To do"),
+            calls.iter().any(|c| c == "set_state PROJ-99 To do"),
             "{calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+                .any(|c| c == "set_field PROJ-99 AI Agent Queued"),
             "{calls:?}"
         );
         // No human assignee on a code-fix issue.
@@ -1296,7 +1296,7 @@ mod tests {
         assert_eq!(
             out,
             MintOutcome::Created {
-                key: "CLAUDE-99".to_string(),
+                key: "PROJ-99".to_string(),
                 project: "CLAUDE".to_string(),
                 bucket: TriageBucket::HumanAction,
                 source: RouteSource::Fallback,
@@ -1308,7 +1308,7 @@ mod tests {
             "{calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c == "set_state CLAUDE-99 To do"),
+            calls.iter().any(|c| c == "set_state PROJ-99 To do"),
             "{calls:?}"
         );
         // Bucket 2 never queues for the fix bot.
@@ -1334,7 +1334,7 @@ mod tests {
             tracker
                 .calls()
                 .iter()
-                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+                .any(|c| c == "set_field PROJ-99 AI Agent Queued"),
             "{:?}",
             tracker.calls()
         );
@@ -1373,7 +1373,7 @@ mod tests {
             tracker
                 .calls()
                 .iter()
-                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+                .any(|c| c == "set_field PROJ-99 AI Agent Queued"),
             "{:?}",
             tracker.calls()
         );
@@ -1449,7 +1449,7 @@ mod tests {
             tracker
                 .calls()
                 .iter()
-                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+                .any(|c| c == "set_field PROJ-99 AI Agent Queued"),
             "{:?}",
             tracker.calls()
         );
@@ -1469,7 +1469,7 @@ mod tests {
             tracker
                 .calls()
                 .iter()
-                .any(|c| c == "attach CLAUDE-99 /tmp/redacted.log"),
+                .any(|c| c == "attach PROJ-99 /tmp/redacted.log"),
             "{:?}",
             tracker.calls()
         );
@@ -1629,7 +1629,7 @@ mod tests {
         assert_eq!(s, s.to_ascii_lowercase(), "lowercased: {s}");
     }
 
-    /// CLAUDE-608 acceptance criterion: two logs whose first diagnostic line
+    /// Acceptance criterion: two logs whose first diagnostic line
     /// differs only in the panicking thread's name and id yield the same
     /// signature, so which test thread panics first (random) never splits
     /// one root cause across issues.
@@ -1646,7 +1646,7 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// CLAUDE-608: the BuildKit progress prefix on a `thread '...' panicked`
+    /// The BuildKit progress prefix on a `thread '...' panicked`
     /// line is stripped before the signature is derived, so a buildx-built
     /// log signs identically to the same log outside a buildx build.
     #[test]
@@ -1839,7 +1839,7 @@ mod tests {
         assert_eq!(
             out,
             MintOutcome::Created {
-                key: "CLAUDE-99".to_string(),
+                key: "PROJ-99".to_string(),
                 project: "FJ".to_string(),
                 bucket: TriageBucket::AutoFix,
                 source: RouteSource::Override,
@@ -1850,7 +1850,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+                .any(|c| c == "set_field PROJ-99 AI Agent Queued"),
             "{calls:?}"
         );
     }

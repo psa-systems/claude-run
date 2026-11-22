@@ -29,7 +29,7 @@
 //!                       no PR
 //!              success  -> Forge::create_pr_with_draft (always draft), then a
 //!                          fresh-context, read-only review session checks the
-//!                          work against the issue (CLAUDE-449): pass -> PR
+//!                          work against the issue: pass -> PR
 //!                          promoted to ready, AI Agent=Code Review; fail/no
 //!                          verdict -> PR stays draft, findings posted on the
 //!                          PR and the issue, AI Agent=Queued (below the
@@ -90,14 +90,14 @@ const SKIP_ATTEMPT_MARKER: &str = ".claude-run-skip-attempt";
 /// hatch for a code task the agent could not finish: that stays
 /// [`NEEDS_REVIEW_MARKER`].
 const NO_CODE_MARKER: &str = ".claude-run-no-code-change";
-/// How often the checkpoint-push watcher (CLAUDE-448) ticks while `claude` is
+/// How often the checkpoint-push watcher ticks while `claude` is
 /// still running.
 const CHECKPOINT_PUSH_INTERVAL: Duration = Duration::from_secs(60);
-/// The post-success review session (CLAUDE-449) writes this to verdict the
+/// The post-success review session writes this to verdict the
 /// completed work as acceptable; its contents (if any) are folded into the
 /// success comment under a `## Review` heading.
 const REVIEW_PASS_MARKER: &str = ".claude-run-review-pass";
-/// The post-success review session (CLAUDE-449) writes this to verdict the
+/// The post-success review session writes this to verdict the
 /// completed work as NOT yet acceptable; its contents are the findings posted
 /// on the PR and the issue instead of promoting the PR to ready.
 const REVIEW_FAIL_MARKER: &str = ".claude-run-review-fail";
@@ -637,11 +637,11 @@ pub(crate) fn credentialed_backend(
     backend
 }
 
-/// Comment posted on an issue this restart reconcile re-queues (CLAUDE-440).
+/// Comment posted on an issue this restart reconcile re-queues.
 const RESTART_REQUEUE_COMMENT: &str =
     "The runner restarted while this issue was being worked; the attempt was not completed and it has been re-queued.";
 
-/// Startup reconcile for CLAUDE-440: a daemon that stops or dies mid-job
+/// Startup reconcile for a daemon that stops or dies mid-job
 /// leaves its issues on `AI Agent = Working` forever, because `run_pre` is the
 /// only place that ever sets `states.working`, and nothing but the (now-dead)
 /// process was ever going to move it on. `serve` startup calls this BEFORE
@@ -800,7 +800,7 @@ pub(crate) const STUCK_WORKING_SWEEP_CONTEXT: &str = "stuck-working-sweep";
 /// the one action a human can take; `at_cap` adds the same action line
 /// [`cap_reached_comment`] uses for the pickup-time attempt-cap park, since
 /// this is that same park reached from the sweep instead of pickup. No
-/// `Needs-Info` tag is added for either park: CLAUDE-373 (`actions/SCHEMA.md`)
+/// `Needs-Info` tag is added for either park: `actions/SCHEMA.md`
 /// documents that the attempt-cap park never writes it.
 fn stuck_working_comment(last_step: Option<&str>, at_cap: bool) -> String {
     let step = last_step.unwrap_or("no recorded step");
@@ -830,7 +830,7 @@ fn stuck_working_comment(last_step: Option<&str>, at_cap: bool) -> String {
 /// among that action's currently open runs. A key with a live in-flight row
 /// is backed by a real run and is left untouched.
 ///
-/// CLAUDE-612: `run_inflight_jobs` only knows runs of the daemon doing the
+/// `run_inflight_jobs` only knows runs of the daemon doing the
 /// sweep, so a key with no local in-flight row may still be a live run on a
 /// DIFFERENT instance. Before correcting such a key, [`IssueTracker::field_changed_at`]
 /// is read for the most recent change to `Working`; a change newer than the
@@ -846,7 +846,7 @@ fn stuck_working_comment(last_step: Option<&str>, at_cap: bool) -> String {
 /// so the dashboard can list the correction. Writes go through
 /// [`provider::AuditedTracker`] with no run id, exactly like the webhook
 /// mint path's own run-less writes: every write is still journaled and
-/// capped (CLAUDE-234) even though this correction belongs to no run.
+/// capped even though this correction belongs to no run.
 ///
 /// Never aborts on one action's or one key's failure: a tracker read
 /// failure is logged at `error` and that action's issues are left for the
@@ -902,7 +902,7 @@ pub async fn reconcile_stuck_working_with_peers(
         let action_name = &loaded.action.name;
         let limits = job::effective_limits(&defaults, &loaded);
         let max_attempts_per_key = limits.max_attempts_per_key;
-        // CLAUDE-612: a `Working` change newer than this is left alone, since
+        // A `Working` change newer than this is left alone, since
         // a run of this action may legitimately still be running (on this
         // daemon or another instance). 600s grace on top of the action's own
         // timeout; revise if validation shows a legitimate run overrunning it
@@ -1018,7 +1018,7 @@ pub async fn reconcile_stuck_working_with_peers(
                 }
             }
 
-            // CLAUDE-612: a `Working` change too recent to have timed out may
+            // A `Working` change too recent to have timed out may
             // be a live run owned by a different daemon instance, which this
             // daemon's own `run_inflight_jobs` table (checked above) cannot
             // see. Leave it alone until the window passes; a genuine stranded
@@ -1510,7 +1510,7 @@ async fn process_job(
             crate::attempt_steps::stage_for_attempt(attempts + 1)
         }
     };
-    // CLAUDE-556: a scheduler pickup is the AI Agent = Queued pickup; any
+    // A scheduler pickup is the AI Agent = Queued pickup; any
     // other origin (`bypass_backoff`) is an operator-initiated run.
     let trigger = if bypass_backoff {
         crate::run_footer::Trigger::Manual {
@@ -1623,7 +1623,7 @@ async fn process_job(
         }
     }
 
-    // ---- estimate vs session timeout (SPEC-3.12 item 7, CLAUDE-617) ----
+    // ---- estimate vs session timeout (SPEC-3.12 item 7) ----
     // An issue whose Estimation exceeds the session timeout is not refused and
     // never coded: it runs as a split-only attempt whose one job is to file
     // PR-sized pieces. The children it already has are read first, so the
@@ -1654,7 +1654,7 @@ async fn process_job(
         }
     }
 
-    // ---- CI in-flight cap (CLAUDE-535) ----
+    // ---- CI in-flight cap ----
     // One slow CI runner serves every runner PR on a repo, so a pickup waits while
     // `max_ci_in_flight_per_repo` of the repo's other runner PRs still have CI
     // pending. Like the dependency gate it leaves the issue Queued, consumes no
@@ -1688,10 +1688,10 @@ async fn process_job(
     // A DB lookup (async) plus, when a record is found, a live confirmation
     // against the forge (sync, so wrapped). Any failure here just means a fresh
     // pickup; it never fails the job.
-    // `mut`: a checkpoint push that opens its own draft PR mid-run (CLAUDE-448)
+    // `mut`: a checkpoint push that opens its own draft PR mid-run
     // synthesizes a `PrResume` here, right after `claude.invoke` returns, so
     // the resumed-run success promotion below (`refresh_pr_text` +
-    // `mark_pr_ready`, `salvaged` cleared per CLAUDE-429) applies to it too,
+    // `mark_pr_ready`, `salvaged` cleared) applies to it too,
     // and the post-finalize bookkeeping routes to the update/clear branch
     // instead of colliding on `agent_pull_requests`'s `UNIQUE(host, repo,
     // pr_number)`. Every other read of `resume` below happens before
@@ -1785,7 +1785,7 @@ async fn process_job(
     // SPEC-3.14: the `clone` runner-owned step, timed by `run_pre` around the
     // `clone_repo` call alone (not the field writes before it, which fall into
     // `unaccounted` honestly); the hook install after it is its own step.
-    // CLAUDE-603: runner-owned steps are written when they end, through this
+    // Runner-owned steps are written when they end, through this
     // one recorder, so the rows exist when a push comment renders the SPEC-3.15
     // list. Rows an earlier uncounted attempt left under this attempt number
     // are dropped first, and an uncounted attempt drops its own at the end.
@@ -1813,7 +1813,7 @@ async fn process_job(
         )
     });
 
-    // SPEC-3.14 / CLAUDE-603: the `clone` row, written the moment the clone ends.
+    // SPEC-3.14: the `clone` row, written the moment the clone ends.
     if let Some((clone_start, clone_end, clone_ok)) = clone_timing {
         recorder
             .lock()
@@ -1855,13 +1855,13 @@ async fn process_job(
     // watcher's own outcome; every other arm never checkpoints, so this
     // stays `None` for them, which `finalize` treats as "nothing rejected".
     let mut checkpoint_rejected: Option<String> = None;
-    // CLAUDE-470: set only when the checkpoint watcher found (or failed to
+    // Set only when the checkpoint watcher found (or failed to
     // rule out) a bare tracker key before a push, on a `repo_tracker_refs:
     // false` action. Distinct from `checkpoint_rejected`: this forces
     // `finalize_with_steps` to abort to Needs Review rather than falling
     // through to the ordinary outcome table.
     let mut tracker_key_hit: Option<String> = None;
-    // CLAUDE-603: the spans of the checkpoint pushes the watcher recorded
+    // The spans of the checkpoint pushes the watcher recorded
     // during `claude.invoke`, carved out of the derived coding/check/build steps.
     let mut checkpoint_spans: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
         Vec::new();
@@ -1962,7 +1962,7 @@ async fn process_job(
                 cargo_target_dir = %cargo_target_dir.display(),
                 "invoking claude"
             );
-            // ---- checkpoint-push watcher (CLAUDE-448) ----
+            // ---- checkpoint-push watcher ----
             // Ticks `forge.checkpoint_push` on its own OS thread for as long
             // as `claude.invoke` (below) runs; `stop_tx` is dropped the
             // instant `invoke` returns, which wakes the watcher immediately
@@ -2164,7 +2164,7 @@ async fn process_job(
         Some(Ok(outcome)) if outcome.gate.failure.is_some()
     );
 
-    // ---- post-success review session (CLAUDE-449) ----
+    // ---- post-success review session ----
     // A fresh-context session that checks the completed work against the
     // issue before the PR is promoted, run only when the main session
     // succeeded with no outstanding blocker/no-code marker (a blocker or a
@@ -2217,7 +2217,7 @@ async fn process_job(
         // attempt is known to count.
         let review_end = chrono::Utc::now();
         let review_ok = matches!(outcome, ReviewOutcome::Pass(_));
-        // CLAUDE-603: the `review` row, written the moment the review ends.
+        // The `review` row, written the moment the review ends.
         recorder
             .lock()
             .await
@@ -2274,7 +2274,7 @@ async fn process_job(
     // ---- finalize (the native "post"): every external mutation lives here ----
     // Synchronous. Finalize no longer polls CI (that
     // wait is now driven by a webhook event), so it returns promptly.
-    // CLAUDE-466 / CLAUDE-467: `resume` already reflects any PR recorded for
+    // `resume` already reflects any PR recorded for
     // this issue, whether from a re-queue or a checkpoint push opened one
     // mid-run, so a PR-step failure comment can say truthfully whether a
     // re-queue resumes that PR's branch.
@@ -2282,7 +2282,7 @@ async fn process_job(
     // of earlier attempts plus this attempt's steps derived so far (they are
     // written to `attempt_steps` right after `finalize` returns). Handed over
     // through a keyed stash because `finalize` is synchronous with no pool.
-    // CLAUDE-604: `finalize` then reports each `push`, `pr_create` and `gate`
+    // `finalize` then reports each `push`, `pr_create` and `gate`
     // span as it ends; the sink below stores it and extends the stashed list.
     let (list_rows, list_incomplete) = {
         let (mut rows, mut incomplete) = match crate::progress_list::load_rows(
@@ -2314,7 +2314,7 @@ async fn process_job(
                 ok,
             });
         };
-        // CLAUDE-603: the clone, checkpoint and review rows are already stored
+        // The clone, checkpoint and review rows are already stored
         // and loaded above; only the derived steps are still to add.
         if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
             match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
@@ -2390,7 +2390,7 @@ async fn process_job(
             }
         });
     };
-    // CLAUDE-617: a split-only attempt that ran to a result finalizes through
+    // A split-only attempt that ran to a result finalizes through
     // the split path; a failed run, or one that parked itself with the
     // needs-review marker, takes the ordinary closed outcome table.
     let split_finalize =
@@ -2490,7 +2490,7 @@ async fn process_job(
         }
     } else if let Some(resume) = resume.as_ref() {
         // A resumed run that finishes successfully clears the salvaged flag
-        // (CLAUDE-429) a prior timeout left on this PR. A resumed run that
+        // a prior timeout left on this PR. A resumed run that
         // times out again, or that fails, leaves the flag set.
         if matches!(&finalize_res, Ok(Finalized::CodeReview { .. })) {
             clear_salvaged_for_resume(
@@ -2515,7 +2515,7 @@ async fn process_job(
             clear_failed_at_resume(pool, &action.name, job, resume.id).await;
         }
     }
-    // CLAUDE-630: the run reported success and the PR was promoted to ready;
+    // The run reported success and the PR was promoted to ready;
     // mark the row finished so the reconciler and the Action-Run webhook
     // decision path stop re-syncing it, fresh or resumed alike, whether or
     // not finalize also merged it in the same tick below.
@@ -2526,7 +2526,7 @@ async fn process_job(
     {
         mark_finished_at_finalize(pool, job, *pr_number).await;
     }
-    // CLAUDE-549: a PR `finalize` merged in the same tick is recorded as
+    // A PR `finalize` merged in the same tick is recorded as
     // merged right here, after the row above exists, so neither the webhook
     // nor the reconciler walks it again (and the reconciler never retires it
     // as `closed` once the forge stops listing it open).
@@ -2618,8 +2618,8 @@ async fn process_job(
     // SPEC-3.14: record the rest of this attempt's steps (the claude
     // invocation's derived coding/check/build steps and the verification
     // gates; the clone, checkpoint and review rows were written when each
-    // ended, CLAUDE-603; the push, pr_create and gate rows likewise,
-    // CLAUDE-604), only for an attempt that counts. An uncounted
+    // ended; the push, pr_create and gate rows likewise),
+    // only for an attempt that counts. An uncounted
     // attempt drops the rows it already wrote.
     if skip_attempt {
         recorder.lock().await.clear_attempt().await;
@@ -2743,7 +2743,7 @@ async fn process_job(
 /// An open recorded PR this job continues rather than reopening.
 struct PrResume {
     /// The `agent_pull_requests` row id, so a successful resumed run can
-    /// clear its `salvaged` flag (CLAUDE-429) without a second lookup.
+    /// clear its `salvaged` flag without a second lookup.
     id: i64,
     /// The PR's server head branch, cloned instead of the default branch.
     branch: String,
@@ -2751,7 +2751,7 @@ struct PrResume {
     pr_url: String,
 }
 
-/// CLAUDE-535: `Some(pending)` when the job's repo already has `cap` other
+/// `Some(pending)` when the job's repo already has `cap` other
 /// runner PRs with CI pending (the job's own PR does not count), else `None`.
 /// A store read failure is an `Err`; a failed per-PR status lookup is logged by
 /// [`crate::ci_gate::pending_ci`] and not counted.
@@ -2923,12 +2923,12 @@ async fn record_new_pr(
     }
 }
 
-/// Clear the `salvaged` flag (CLAUDE-429) a prior timeout left on a resumed
+/// Clear the `salvaged` flag a prior timeout left on a resumed
 /// PR's `agent_pull_requests` row, once the resumed run finishes
 /// successfully. Called from `process_job` right after `finalize` returns
 /// `Finalized::CodeReview` for a resumed job, at the same point `finalize`'s
 /// own resumed-success branch already strips the draft status and refreshes
-/// the PR text (CLAUDE-275 / CLAUDE-398). Best-effort, mirroring
+/// the PR text. Best-effort, mirroring
 /// `record_new_pr`: a failed clear is logged at `error`, surfaced as a
 /// `run_events` row via [`Forge::note`], and named in a follow-up issue
 /// comment, but never fails the job - the flag simply stays set, which keeps
@@ -2963,12 +2963,12 @@ async fn clear_salvaged_for_resume(
     }
 }
 
-/// CLAUDE-549: set the `agent_pull_requests` row for a PR `finalize` just
+/// Set the `agent_pull_requests` row for a PR `finalize` just
 /// merged to `merged`. The row is looked up by `(host, repo, pr_number)`, so
 /// one path covers a fresh PR (recorded moments ago by [`record_new_pr`]) and
 /// a resumed or checkpoint-opened one alike. A lookup or write failure, or a
 /// missing row, is logged at `error`: the merge itself already landed, and the
-/// forge's `pull_request` merged delivery (CLAUDE-277) can still record it.
+/// forge's `pull_request` merged delivery can still record it.
 async fn mark_merged_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: u64) {
     use crate::ci_failure::store;
     let host = host_only(&job.repo_host);
@@ -2988,7 +2988,7 @@ async fn mark_merged_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: u6
     }
 }
 
-/// CLAUDE-630: set the `agent_pull_requests` row for a PR `finalize` just
+/// Set the `agent_pull_requests` row for a PR `finalize` just
 /// reported `Finalized::CodeReview` for as `finished`: the run succeeded and
 /// the PR was promoted to ready, so there is nothing left for the agent to
 /// do here. Looked up by `(host, repo, pr_number)`, covering a fresh PR
@@ -3091,22 +3091,22 @@ async fn clear_failed_at_resume(pool: &DbPool, action_name: &str, job: &Youtrack
     }
 }
 
-/// What the periodic checkpoint-push watcher (CLAUDE-448) produced over the
+/// What the periodic checkpoint-push watcher produced over the
 /// course of one `claude.invoke` call: a freshly opened-and-recorded draft PR
 /// (when the run was not already resuming one of its own), and/or the reason
 /// a checkpoint push was rejected, if any. Neither field ever fails the job:
 /// `rejected` is only ever named in the outcome comment (`finalize`'s
 /// `checkpoint_push_rejected` parameter), and `opened` is only ever used to
 /// promote the run through the same resumed-run success path
-/// (`refresh_pr_text` and `mark_pr_ready`, `salvaged` cleared per CLAUDE-429)
-/// an actual CLAUDE-275 resume already takes.
+/// (`refresh_pr_text` and `mark_pr_ready`, `salvaged` cleared)
+/// an actual resume already takes.
 struct CheckpointOutcome {
     opened: Option<PrResume>,
     rejected: Option<String>,
-    /// CLAUDE-603: the span of every checkpoint push that landed, so the
+    /// The span of every checkpoint push that landed, so the
     /// caller can carve them out of the derived steps they fall inside.
     spans: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
-    /// CLAUDE-470: set, instead of attempting the push, when a
+    /// Set, instead of attempting the push, when a
     /// `repo_tracker_refs: false` action's pre-push scan found a bare
     /// tracker key (or the scan itself failed, treated the same way,
     /// fail-closed) in the branch name or a commit on it. Distinct from
@@ -3126,11 +3126,11 @@ struct CheckpointOutcome {
 /// `forge` / `job` / `workdir` are borrowed from `process_job`'s stack, not
 /// `'static`; `pool_handle` is the caller's captured `tokio::runtime::Handle`,
 /// which lets this non-tokio thread make the one DB write a freshly opened PR
-/// needs (the reverse of CLAUDE-228's `blocking::in_place`, which only covers
+/// needs (the reverse of `blocking::in_place`, which only covers
 /// async-to-sync).
 ///
 /// Skips the DB write, and never populates `opened`, when `already_resuming`
-/// is set: the run already has its own `PrResume` from an actual CLAUDE-275
+/// is set: the run already has its own `PrResume` from an actual
 /// resume, so a checkpoint-adopted PR here is that SAME row, and a second
 /// insert would collide on `agent_pull_requests`'s `UNIQUE(host, repo,
 /// pr_number)`.
@@ -3147,7 +3147,7 @@ struct CheckpointOutcome {
 /// still exits promptly when `claude` finishes.
 /// SPEC-3.3.1: "the checkpoint push (every 60 seconds while `claude` runs) is
 /// the backstop if the runner dies first." Runs off a plain OS thread, not a
-/// tokio task (`docs/conventions/claude-runtime.md#checkpoint-push-watcher-runs-off-a-plain-os-thread-not-a-tokio-task-claude-448`).
+/// tokio task (`docs/conventions/claude-runtime.md#checkpoint-push-watcher-runs-off-a-plain-os-thread-not-a-tokio-task`).
 #[allow(clippy::too_many_arguments)]
 fn run_checkpoint_watcher(
     forge: &dyn Forge,
@@ -3163,11 +3163,11 @@ fn run_checkpoint_watcher(
     run_started: chrono::DateTime<chrono::Utc>,
     recorder: &tokio::sync::Mutex<crate::attempt_steps::StepRecorder<'_>>,
     stage: &str,
-    // CLAUDE-470: `!src.repo_tracker_refs` at the call site. When set, every
+    // `!src.repo_tracker_refs` at the call site. When set, every
     // tick scans for a bare tracker key before pushing, and the draft PR
     // body carries no `#{{key}}` reference.
     tracker_free: bool,
-    // CLAUDE-470: cancelled the instant a tracker-key hit (or scan failure)
+    // Cancelled the instant a tracker-key hit (or scan failure)
     // is found, so `claude.invoke` on the other `thread::scope` leg stops
     // promptly instead of running out the clock after the run is already
     // doomed to Needs Review.
@@ -3207,7 +3207,7 @@ fn run_checkpoint_watcher(
                 };
             }
         }
-        // SPEC-3.15 item 6, SPEC-8.8, CLAUDE-603: stash the stored rows of this
+        // SPEC-3.15 item 6, SPEC-8.8: stash the stored rows of this
         // job just before the push, so the push comment lists every step that
         // ended before it and marks its own `Checkpoint N` line.
         crate::progress_list::stash_context(
@@ -3230,7 +3230,7 @@ fn run_checkpoint_watcher(
         crate::progress_list::clear_context(&job.key);
         match pushed {
             Ok(Some(pr)) => {
-                // SPEC-3.14 / CLAUDE-603: the `checkpoint` row, written the
+                // SPEC-3.14: the `checkpoint` row, written the
                 // moment the push ends, so the next checkpoint's comment lists it.
                 let push_end = chrono::Utc::now();
                 pool_handle.block_on(async {
@@ -3328,7 +3328,7 @@ enum GateDecision {
 /// Pure: the unmet blockers among `links`, per the `block_on` verbs. A link
 /// blocks iff its direction-resolved `verb` is listed in `block_on` and its
 /// target is unresolved (`resolved` is `None`). Direction is already baked into
-/// the verb by YT-40 (`depends on` = Depend INWARD, `parent for` = Subtask
+/// the verb (`depends on` = Depend INWARD, `parent for` = Subtask
 /// OUTWARD, etc.), so matching the verb resolves direction exactly. With
 /// `own_project` set (`block_cross_project: false`), a target in any other
 /// project never blocks. The result is sorted and de-duplicated so its signature
@@ -3677,7 +3677,7 @@ fn install_hooks(workdir: &Path) -> Option<bool> {
     }
 }
 
-/// SPEC-3.3.2, CLAUDE-622: whether a gate's failure text is the command's own
+/// SPEC-3.3.2: whether a gate's failure text is the command's own
 /// captured output, or a cause naming why the command could not even start.
 /// The two are rendered differently in a comment: `Output` is never posted
 /// (it is stored with the run instead; a reader does not need
@@ -3711,7 +3711,7 @@ struct GateResult {
     command: Option<&'static str>,
     failure: Option<GateFailure>,
     /// SPEC-3.14: when the recipe ran, its timing and timed stage spans, for
-    /// the caller to hand to the step sink (CLAUDE-604).
+    /// the caller to hand to the step sink.
     timing: Option<crate::attempt_steps::GateTiming>,
 }
 
@@ -4325,7 +4325,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
     .join("\n")
 }
 
-/// CLAUDE-470: [`default_youtrack_prompt`] for a `repo_tracker_refs: false`
+/// [`default_youtrack_prompt`] for a `repo_tracker_refs: false`
 /// action, whose target repo is public. Identical except for the two steps
 /// that otherwise put the tracker key into repo text: step 4's commit
 /// message (no bare `#{{key}}` reference, and an explicit ban on any
@@ -4415,7 +4415,7 @@ pub(crate) fn preset_prompt(p: PromptPreset) -> String {
 pub(crate) fn prompt_template(src: &YoutrackSource) -> String {
     match &src.prompt {
         Some(p) => p.clone(),
-        // CLAUDE-470: an explicit `prompt` override always wins, regardless
+        // An explicit `prompt` override always wins, regardless
         // of `repo_tracker_refs`.
         None if !src.repo_tracker_refs => default_youtrack_prompt_tracker_free(),
         None => preset_prompt(src.prompt_preset),
@@ -4539,7 +4539,7 @@ fn render_prompt_template(
     out
 }
 
-/// The built-in review-session prompt (CLAUDE-449): a fresh-context claude
+/// The built-in review-session prompt: a fresh-context claude
 /// session, invoked with no Edit or Write tool, that checks the completed
 /// work against the issue before `finalize` promotes the PR to ready. Shares
 /// [`render_prompt_template`]'s placeholders.
@@ -4566,7 +4566,7 @@ fn default_review_prompt() -> String {
     .join("\n")
 }
 
-/// CLAUDE-611: the review-session prompt for an audit action. Same read-only
+/// The review-session prompt for an audit action. Same read-only
 /// contract, marker protocol and evidence file as [`default_review_prompt`],
 /// but the subject is an audit report, not a code change, and each uncovered
 /// hit is written as a `file:line - what is missing` line, which `finalize`
@@ -4625,7 +4625,7 @@ fn build_review_prompt(
     )
 }
 
-/// The post-success review session's verdict (CLAUDE-449).
+/// The post-success review session's verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReviewOutcome {
     /// The review session wrote [`REVIEW_PASS_MARKER`]; its contents are the
@@ -4648,7 +4648,7 @@ enum ReviewOutcome {
 /// cannot tell", which the caller folds into a conservative `NoVerdict`.
 fn git_head_sha(workdir: &Path) -> Option<String> {
     // Bare `git` resolves through the process-wide `PATH`; serialize against
-    // the CLAUDE-410 PATH-stub test's mutation/deletion window the same way
+    // the PATH-stub test's mutation/deletion window the same way
     // `comment_webhooks::git_output` does.
     #[cfg(test)]
     let _path_guard = crate::testutil::path_env_lock();
@@ -4679,7 +4679,7 @@ fn run_review_session(
     claude: &ClaudeInvoker,
     claude_cfg: &action::ClaudeBlock,
     job: &YoutrackJob,
-    // CLAUDE-611: selects the audit review prompt for an audit action.
+    // Selects the audit review prompt for an audit action.
     preset: PromptPreset,
     workdir: &Path,
     timeout: Duration,
@@ -4853,7 +4853,7 @@ fn describe_no_verdict_with_denials(cause: &str, raw: &serde_json::Value) -> Str
     }
 }
 
-/// CLAUDE-621: sanitize the agent's narrative notes before they are returned
+/// Sanitize the agent's narrative notes before they are returned
 /// to the runner (they end up in the PR comment, the issue comment, and the
 /// attempt record). The agent writes em-dashes in its own prose, which both
 /// violates the fleet-wide rule and tripped storefront's
@@ -4871,7 +4871,7 @@ fn sanitize_marker_content(raw: &str) -> String {
 }
 
 /// SPEC-3.12 item 4: the instruction for the bounded conflict-resolution
-/// pass, modeled on CLAUDE-550's `CONFLICT_RESOLVE_INSTRUCTION`
+/// pass, modeled on `CONFLICT_RESOLVE_INSTRUCTION`
 /// (`src/web/comment_webhooks.rs`) but for the opposite merge direction:
 /// here the local branch's own work is merging in a newer copy of itself
 /// that the remote already carries (typically the runner's own periodic
@@ -4983,7 +4983,7 @@ impl ConflictResolver for FinalPushConflictResolver {
         }
         if let Some(failure) = gate.failure {
             let command = gate.command.unwrap_or("none");
-            // CLAUDE-622: the command's own output is never surfaced in the
+            // The command's own output is never surfaced in the
             // issue/PR comment this error eventually reaches (it is already
             // stored with the run); it is still logged here so an operator
             // reading the daemon log sees it. Only a cause naming why the
@@ -5297,7 +5297,7 @@ enum Finalized {
     /// text is commented, AI Agent=`states.no_code` (default the `done` label),
     /// State untouched.
     NoCodeChange,
-    /// CLAUDE-617: a split-only attempt filed `pieces` (two or more), the
+    /// A split-only attempt filed `pieces` (two or more), the
     /// runner queued them and set the issue's Type to Story. No PR;
     /// AI Agent=`states.no_code` (default the `done` label). A split that
     /// fails its checks is `NeedsReview`, not this.
@@ -5313,19 +5313,19 @@ enum Finalized {
         /// backend did not report it (e.g. AGit has no server branch).
         pr_number: Option<u64>,
         head_branch: Option<String>,
-        /// CLAUDE-549: `true` when the PR's CI was already green (and the
+        /// `true` when the PR's CI was already green (and the
         /// branch current and mergeable) at finalize time, so `finalize`
         /// merged it in the same tick instead of leaving it for the webhook
         /// or the reconciler. AI Agent still reads Code Review either way
-        /// (CLAUDE-327: a YouTrack workflow resolves the issue on merge);
+        /// (a YouTrack workflow resolves the issue on merge);
         /// `process_job` marks the `agent_pull_requests` row merged.
         merged: bool,
     },
     /// Hard failure (claude error, pre failure, or PR-create failure);
     /// AI Agent=Failed, no PR (or a failed PR).
     Failed {
-        /// The same redacted cause text the issue comment carries
-        /// (CLAUDE-425), so `process_job` can fold it into the run's own
+        /// The same redacted cause text the issue comment carries,
+        /// so `process_job` can fold it into the run's own
         /// recorded Summary and outcome instead of leaving them read as a
         /// clean success.
         cause: String,
@@ -5336,7 +5336,7 @@ enum Finalized {
         /// `None` for the claude-crash/pre-failure arm, whose cause is
         /// already inside that same stream log.
         pr_step: Option<&'static str>,
-        /// CLAUDE-467: `true` when a push or PR-create failure re-queued
+        /// `true` when a push or PR-create failure re-queued
         /// the issue onto its recorded open PR instead of parking it at a
         /// terminal Failed (below `max_attempts_per_key`, with a recorded
         /// PR, and the field still `Working` at requeue time). Always
@@ -5359,7 +5359,7 @@ enum Finalized {
     /// timeout-specific comment is posted and the AI Agent field is advanced to
     /// Needs Review only when still Working (a human/agent-advanced state is left
     /// untouched). Any local work (uncommitted changes and/or local commits) is
-    /// salvaged as a draft PR (CLAUDE-379) before the comment is composed, so
+    /// salvaged as a draft PR before the comment is composed, so
     /// `pr_number`/`head_branch` carry the salvaged PR's identity exactly like
     /// [`Finalized::CodeReview`] does (`None` when there was nothing to salvage
     /// or salvaging failed).
@@ -5367,7 +5367,7 @@ enum Finalized {
         pr_number: Option<u64>,
         head_branch: Option<String>,
     },
-    /// The post-success review session (CLAUDE-449) found problems, or gave
+    /// The post-success review session found problems, or gave
     /// no usable verdict; the PR it opened/adopted stays a draft, and AI
     /// Agent goes to Queued (below the attempt cap, review findings only -
     /// never for a `NoVerdict`) or Needs Review (at the cap, or always for a
@@ -5415,12 +5415,12 @@ pub(crate) enum DeliveryBlockedReason {
     /// A successful agent run reached the PR-open step with no commits
     /// ahead of the base branch, so there is nothing to open a PR from.
     NoCommitsAhead,
-    /// CLAUDE-550: the PR has a real merge conflict with its base and the
-    /// automerge conflict auto-resolve (CLAUDE-380) used every one of its
+    /// The PR has a real merge conflict with its base and the
+    /// automerge conflict auto-resolve used every one of its
     /// `agent_conflict_resolve_attempts` without clearing it; the webhook
     /// path drives this outcome rather than `finalize`.
     UnresolvedConflicts,
-    /// CLAUDE-470: a `repo_tracker_refs: false` action's pre-push scan found
+    /// A `repo_tracker_refs: false` action's pre-push scan found
     /// (or could not rule out) a bare tracker key in the branch name, a
     /// commit message, or the PR title/body; the run aborts rather than
     /// write a tracker key into a public repo.
@@ -5554,8 +5554,8 @@ fn attempt_outcome_of(finalize_res: &Result<Finalized>) -> crate::attempt_steps:
     }
 }
 
-/// Fold a `finalize` outcome into the run's own recorded `ok` and `summary`
-/// (CLAUDE-425). `Finalized::Failed` is `Ok` from `finalize`'s own
+/// Fold a `finalize` outcome into the run's own recorded `ok` and `summary`.
+/// `Finalized::Failed` is `Ok` from `finalize`'s own
 /// perspective (a clean state transition, just an unhappy one), so
 /// `post_failed` (set only when `finalize` itself returns `Err`) never
 /// catches it; without this, a run whose post-agent PR path failed after a
@@ -5594,7 +5594,7 @@ fn record_finalize_outcome(
 /// those paths never call [`Forge::create_pr_with_draft`], which is the only
 /// other place a push happens, so without this call any commits the agent
 /// made would end the run local-only. Like every other runner push of the
-/// agent branch, this never runs the repo's `pre-push` hook (CLAUDE-533). A
+/// agent branch, this never runs the repo's `pre-push` hook. A
 /// failed push is itself an error: per SPEC-3.3.1 ("a failed final push is a
 /// failure ... never reported as success"), the caller must turn whichever
 /// outcome it was about to report into a failure instead.
@@ -5636,7 +5636,7 @@ fn final_push(
     let start = chrono::Utc::now();
     let pushed = forge.final_push(workdir, &host);
     let end = chrono::Utc::now();
-    // SPEC-3.14 item 3, CLAUDE-604: a conflict-resolution pass and gate that ran inside
+    // SPEC-3.14 item 3: a conflict-resolution pass and gate that ran inside
     // the push is stored first and the `push` row starts after it, so the rows
     // never overlap.
     let mut push_start = start;
@@ -5690,7 +5690,7 @@ fn final_push_failed(
     })
 }
 
-/// CLAUDE-545: shared write-and-return path for every delivery-blocked
+/// Shared write-and-return path for every delivery-blocked
 /// blocker. Composes the short outcome comment (`delivery_blocked_comment`),
 /// appends the SPEC-3.9 run footer, posts the comment best-effort, then
 /// sets AI Agent to the configured `delivery_blocked` label (falling back
@@ -5722,7 +5722,7 @@ fn finish_delivery_blocked(
     })
 }
 
-/// CLAUDE-470: [`delivery_blocked_comment`] for [`DeliveryBlockedReason::TrackerKeyLeak`],
+/// [`delivery_blocked_comment`] for [`DeliveryBlockedReason::TrackerKeyLeak`],
 /// with `detail` (the offending key and exactly where it was found) and the
 /// work's actual location appended as two more bullets, matching
 /// [`pr_failure_comment`]'s preserve-or-safe wording.
@@ -5747,7 +5747,7 @@ fn tracker_key_leak_comment(detail: &str, work: &WorkLocation) -> String {
     body
 }
 
-/// CLAUDE-470: the [`Finalized::DeliveryBlocked`] exit for a `repo_tracker_refs:
+/// The [`Finalized::DeliveryBlocked`] exit for a `repo_tracker_refs:
 /// false` action whose pre-push scan found (or could not rule out) a bare
 /// tracker key. `detail` names the offending text and where it was found;
 /// `workdir` is queried the same way [`pr_failure_comment`]'s caller does, so
@@ -5979,24 +5979,24 @@ fn finalize_with_steps(
     stream_log: Option<&Path>,
     claude_timeout: Duration,
     resumed: bool,
-    // CLAUDE-467 / CLAUDE-466: this issue's recorded open PR URL at finalize
-    // time (a CLAUDE-275 resume, or one the checkpoint-push watcher adopted
+    // This issue's recorded open PR URL at finalize
+    // time (a resume, or one the checkpoint-push watcher adopted
     // mid-run), if any. Consulted in the push/PR-create failure arm below,
     // both to decide whether a re-queue resumes a real PR instead of parking
     // at a terminal Failed, and to say so truthfully in the failure comment.
     resume_pr_url: Option<&str>,
     run: crate::run_footer::CommentRun<'_>,
-    // CLAUDE-448: the reason the periodic checkpoint-push watcher stopped
+    // The reason the periodic checkpoint-push watcher stopped
     // checkpointing partway through this run (a rejected push), if any. Never
     // fails the job; named in whichever outcome comment this call produces so
     // it is never silent.
     checkpoint_push_rejected: Option<&str>,
-    // CLAUDE-470: a bare tracker key the checkpoint watcher found (or could
+    // A bare tracker key the checkpoint watcher found (or could
     // not rule out) before a mid-run push, on a `repo_tracker_refs: false`
     // action. When set, this overrides every other outcome: nothing further
     // is pushed and no PR is opened or promoted.
     tracker_key_hit: Option<&str>,
-    // CLAUDE-449: the post-success review session's verdict, or `None` when
+    // The post-success review session's verdict, or `None` when
     // no review ran (claude did not succeed, or the review step itself was
     // never reached). Only consulted in the success branch below.
     review: Option<&ReviewOutcome>,
@@ -6023,12 +6023,12 @@ fn finalize_with_steps(
     // test: the success branch then computes it itself, exactly as before
     // this was factored out.
     precomputed: Option<std::result::Result<PrGateOutcome, PrOpenOutcome>>,
-    // SPEC-3.14 item 3, CLAUDE-604: receives each `push`, `pr_create` and
+    // SPEC-3.14 item 3: receives each `push`, `pr_create` and
     // `gate` span the moment it ends, so it is stored before the next comment.
     steps: crate::attempt_steps::StepSink<'_>,
 ) -> Result<Finalized> {
     let public_url = crate::run_footer::resolved_public_url();
-    // CLAUDE-448: appended to whichever outcome body this call produces, right
+    // Appended to whichever outcome body this call produces, right
     // before the run footer, so a rejected checkpoint push is never silent.
     let note_checkpoint_rejection = |body: String| -> String {
         match checkpoint_push_rejected {
@@ -6042,7 +6042,7 @@ fn finalize_with_steps(
     let skip_marker = workdir.join(SKIP_ATTEMPT_MARKER);
     let no_code = workdir.join(NO_CODE_MARKER);
 
-    // CLAUDE-470: checked before every other branch. A mid-run tracker-key
+    // Checked before every other branch. A mid-run tracker-key
     // hit already stopped the checkpoint watcher from pushing further; this
     // routes the whole run to Needs Review without attempting any push or PR
     // call here, regardless of how `claude_result` or the marker files look.
@@ -6058,7 +6058,7 @@ fn finalize_with_steps(
         );
     }
 
-    // CLAUDE-470: on a `repo_tracker_refs: false` action, scan before every
+    // On a `repo_tracker_refs: false` action, scan before every
     // push this function itself makes (the checkpoint watcher already
     // scanned before each of its own ticks, mid-run). `pr_text`, when
     // given, is also scanned; the success branch below passes `None` since
@@ -6095,7 +6095,7 @@ fn finalize_with_steps(
         // Review: SPEC-3.3.1 forbids reporting a failed push as anything
         // else.
         if let Err(e) = final_push(forge, job, workdir, steps) {
-            // CLAUDE-545: when the checkpoint watcher's own push was
+            // When the checkpoint watcher's own push was
             // already rejected earlier AND this final push now also
             // fails, the pattern is a repo-level rejection the runner
             // cannot clear on its own. Route to the delivery-blocked
@@ -6162,7 +6162,7 @@ fn finalize_with_steps(
         // alone, so the issue stays In Progress until a human closes it. A
         // failed push overrides this outcome with Failed, per SPEC-3.3.1.
         if let Err(e) = final_push(forge, job, workdir, steps) {
-            // CLAUDE-545: see the equivalent branch above.
+            // See the equivalent branch above.
             if checkpoint_push_rejected.is_some() {
                 return finish_delivery_blocked(
                     backend,
@@ -6284,7 +6284,7 @@ fn finalize_with_steps(
                         head_branch: pr.head_branch.clone(),
                     });
                 }
-                // CLAUDE-611: an audit review `Fail` files one follow-up issue
+                // An audit review `Fail` files one follow-up issue
                 // and then takes the pass path below (the report is additive
                 // and accurate for what it covers); any filing failure keeps
                 // the draft-and-park disposition and names the cause.
@@ -6325,7 +6325,7 @@ fn finalize_with_steps(
                         // Best-effort: a failed promotion does not block the
                         // success outcome, but it is logged and named in the
                         // comment so a PR left as a draft is never silent.
-                        // `was_draft` (CLAUDE-651) is `true` when this call
+                        // `was_draft` is `true` when this call
                         // just promoted the PR from draft; that disqualifies
                         // it from the finalize-time merge below, since its
                         // only CI evidence on the head SHA may be skipped
@@ -6377,13 +6377,13 @@ fn finalize_with_steps(
                             "PR ready",
                         );
                         comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
-                        // Finalize never waits for CI (CLAUDE-278). It makes
-                        // one bounded status read (CLAUDE-549): a PR that is
+                        // Finalize never waits for CI. It makes
+                        // one bounded status read: a PR that is
                         // already green, current and mergeable merges now;
                         // anything else stays at Code Review and the
                         // `success`/`recover` Action-run webhook (see
                         // `crate::web::webhooks`) or the reconciler merges it
-                        // later. CLAUDE-651: a PR this same finalize promoted
+                        // later. A PR this same finalize promoted
                         // from draft is never merged here, even green,
                         // because its head SHA may carry nothing but skipped
                         // draft-time runs; it is left at Code Review for the
@@ -6434,7 +6434,7 @@ fn finalize_with_steps(
                                 error!(key = %job.key, pr_number, error = %e, "posting review findings on the PR failed (continuing)");
                             }
                         }
-                        // CLAUDE-545: a review session that modified the
+                        // A review session that modified the
                         // read-only workdir (SPEC: review workdir is
                         // read-only by contract) gets its own terminal
                         // state so the dashboard can tell it apart from an
@@ -6459,7 +6459,7 @@ fn finalize_with_steps(
                         // workdir), not a reviewer opinion on the work, so it
                         // always parks for a human rather than feeding the
                         // ordinary attempt-cap-based requeue.
-                        // CLAUDE-611: a failed follow-up filing parks for a
+                        // A failed follow-up filing parks for a
                         // human rather than re-queueing, so a retry cannot
                         // file a second follow-up beside a half-filed one.
                         let followup_failure = match &followup {
@@ -6581,7 +6581,7 @@ fn finalize_with_steps(
                 warn!(key = %job.key, error = %e, "PR creation failed; finalizing as Failed");
                 let token_url = clone_url_for(forge, job);
                 let location = work_location(workdir, Some(&token_url));
-                // CLAUDE-545: PR-create failed with a clean working tree
+                // PR-create failed with a clean working tree
                 // and no commits ahead of the base, i.e. the agent reached
                 // its stop condition with no code change. This is
                 // delivery-blocked (no PR to open), not a hard failure of
@@ -6607,7 +6607,7 @@ fn finalize_with_steps(
                     WorkLocation::RemoteBranch { .. } => "pr_create",
                     _ => "push",
                 };
-                // SPEC-3.14 item 3, CLAUDE-604: the failed step is stored with
+                // SPEC-3.14 item 3: the failed step is stored with
                 // `ok = false` over the whole call.
                 steps(vec![crate::attempt_steps::StepSpan {
                     kind: if pr_step == "push" {
@@ -6621,7 +6621,7 @@ fn finalize_with_steps(
                     ok: false,
                     detail: None,
                 }]);
-                // CLAUDE-467: a push or PR-create failure after the work is
+                // A push or PR-create failure after the work is
                 // already safe (or recorded against an open PR) is not a
                 // hard failure of the work itself, so re-queue below the
                 // attempt cap when this issue has a recorded PR to resume.
@@ -6725,7 +6725,7 @@ fn finalize_with_steps(
         // Timeout (exit 124). Ambiguous outcome: the agent may have
         // finished the work yet a lingering background task held the process
         // open past the limit. Do NOT mark Failed. Salvage any local work
-        // (CLAUDE-379) as a draft PR before composing the comment, so a human
+        // as a draft PR before composing the comment, so a human
         // or a re-queue has something to pick back up from rather than
         // losing it, then advance AI Agent to Needs Review only when it is
         // still Working; if a human/agent already moved it on (Done, Code
@@ -6740,7 +6740,7 @@ fn finalize_with_steps(
             claude_timeout,
             !src.repo_tracker_refs,
         );
-        // CLAUDE-470: a `repo_tracker_refs: false` action's salvage found (or
+        // A `repo_tracker_refs: false` action's salvage found (or
         // could not rule out) a bare tracker key; nothing further was pushed
         // or opened, so this routes to the same Needs-Review terminal state
         // the mid-run checkpoint-watcher hit uses, instead of falling
@@ -6760,7 +6760,7 @@ fn finalize_with_steps(
             .get_field(&job.key, &src.custom_field)
             .unwrap_or_default();
         let is_working = current.trim() == src.states.working;
-        // CLAUDE-545: a timeout that found no local work to salvage has
+        // A timeout that found no local work to salvage has
         // nothing for a human to pick up (no branch, no PR), so it ends in
         // the explicit DeliveryBlocked terminal state rather than TimedOut
         // + Needs Review. The human-override guard is preserved: when a
@@ -6790,7 +6790,7 @@ fn finalize_with_steps(
                 head_branch: None,
             });
         }
-        // CLAUDE-553: the agent committed all its work BEFORE the timeout
+        // The agent committed all its work BEFORE the timeout
         // fired (no WIP commit was needed, salvage had no step errors, and
         // a PR was opened from existing commits). The wall-clock most
         // likely ran out while the agent was running its own check after
@@ -6933,7 +6933,7 @@ fn append_compaction_note(body: &str, stream_log: Option<&Path>, key: &str) -> S
     }
 }
 
-/// CLAUDE-549: SPEC-3.3.1's finalize-time merge. After a successful run's PR
+/// SPEC-3.3.1's finalize-time merge. After a successful run's PR
 /// is promoted from draft, make ONE status read bounded by
 /// `automerge.finalize_status_timeout_secs` and merge the PR right away when
 /// its checks are already `success`, its branch is not behind base and the
@@ -6943,8 +6943,8 @@ fn append_compaction_note(body: &str, stream_log: Option<&Path>, key: &str) -> S
 /// for the webhook and the reconciler, which own the pending, red,
 /// behind-base and not-mergeable cases (and their comments). In particular a
 /// behind-base PR is never branch-updated here, so this path never starts a
-/// new CI run and never takes a `max_ci_in_flight_per_repo` slot
-/// (CLAUDE-535); merging a green PR only ever frees one.
+/// new CI run and never takes a `max_ci_in_flight_per_repo` slot;
+/// merging a green PR only ever frees one.
 ///
 /// Returns `true` only when the merge landed. A merge failure is logged at
 /// `error` and returns `false`: the next webhook or reconciler pass retries
@@ -6968,7 +6968,7 @@ fn automerge_at_finalize(
     let timeout = Duration::from_secs(automerge.finalize_status_timeout_secs);
     let read_start = chrono::Utc::now();
     let read = forge.pr_status_within(host, repo, pr_number, timeout);
-    // SPEC-3.14 item 3: the one bounded CI status read (CLAUDE-549) is the
+    // SPEC-3.14 item 3: the one bounded CI status read is the
     // attempt's `ci_wait` step; a failed or timed-out read closes it `ok = false`.
     steps(vec![crate::attempt_steps::StepSpan {
         kind: crate::attempt_steps::StepKind::CiWait,
@@ -7069,7 +7069,7 @@ fn merged_comment(pr_url: &str) -> String {
 }
 
 /// SPEC-3.3.1: a green PR the forge reports not mergeable that has no
-/// conflict-resolution run to send (CLAUDE-547) is left at Code Review for a
+/// conflict-resolution run to send is left at Code Review for a
 /// human.
 ///
 /// The PR's checks went green but the forge reports it as not
@@ -7141,7 +7141,7 @@ pub(crate) fn automerge_update_failed_comment(pr_url: &str, error: &str) -> Stri
 ///
 /// The branch is behind its base and updating it failed because of a merge
 /// conflict; the runner dispatched a `/claude` conflict-resolution run
-/// instead of leaving it to a human (CLAUDE-380). Posted in place of
+/// instead of leaving it to a human. Posted in place of
 /// [`automerge_update_failed_comment`] on the first attempt per PR head
 /// commit; a second failure for the SAME head commit falls back to that
 /// comment instead, since the auto-resolve attempt already ran and did not
@@ -7194,14 +7194,14 @@ pub(crate) fn behind_base_missing_outcome(backend: BehindBaseBackend) -> String 
     }
 }
 
-/// SPEC-3.3.1: "on Forgejo this means the runtime's `fj` predates FJ-99 and a
+/// SPEC-3.3.1: "on Forgejo this means the runtime's `fj` is too old to report it and a
 /// human must act; on GitHub, `mergeStateStatus` is still `UNKNOWN`
 /// (computed lazily after a push) and the reconciler re-checks on its next
 /// pass."
 ///
 /// The forge reported no `behind_base`, so automerge cannot tell whether the
 /// branch is up to date and takes no merge action. Forgejo: the runtime's `fj`
-/// predates FJ-99, a human must act. GitHub: `mergeStateStatus` is still
+/// is too old to report it, a human must act. GitHub: `mergeStateStatus` is still
 /// `UNKNOWN` (computed lazily), a transient state the reconciler re-checks.
 pub(crate) fn automerge_behind_base_missing_comment(
     pr_url: &str,
@@ -7238,7 +7238,7 @@ pub(crate) fn automerge_behind_base_missing_comment(
 /// The merge itself was refused by Forgejo (for example a
 /// protected base blocking an outdated branch with a 405). Left at Code
 /// Review for a human to resolve; `error` carries Forgejo's own refusal
-/// reason when `fj` reports one (FJ-99).
+/// reason when `fj` reports one.
 pub(crate) fn automerge_merge_failed_comment(pr_url: &str, error: &str) -> String {
     [
         "This PR's checks passed, but the runner could not merge it.".to_string(),
@@ -7262,10 +7262,10 @@ pub(crate) fn automerge_merge_failed_comment(pr_url: &str, error: &str) -> Strin
 /// independently and a failure of either logs at `error` naming the key and
 /// the cause.
 ///
-/// SPEC-3.12 item 6 audit (CLAUDE-582): [`cap_reached_comment`] already names
+/// SPEC-3.12 item 6 audit: [`cap_reached_comment`] already names
 /// the one action a human can take (raise the cap or reset the counter), so
 /// this site satisfies the "states one action" half of item 6. It does not
-/// write the `Needs-Info` tag; that is CLAUDE-373's documented carve-out
+/// write the `Needs-Info` tag; that is the documented carve-out
 /// (`actions/SCHEMA.md`: "the attempt-cap park... never write[s] this tag"),
 /// not an oversight this issue should change.
 #[allow(clippy::too_many_arguments)]
@@ -7297,7 +7297,7 @@ fn report_cap_reached(
     }
 }
 
-/// CLAUDE-617: the issues `key` is already the parent of (the `parent for`
+/// The issues `key` is already the parent of (the `parent for`
 /// rows of its links). A split-only attempt reads this before it starts and
 /// again at finalize, so the pieces it filed are the difference.
 fn split_children(backend: &dyn IssueTracker, key: &str) -> Result<Vec<String>> {
@@ -7309,7 +7309,7 @@ fn split_children(backend: &dyn IssueTracker, key: &str) -> Result<Vec<String>> 
         .collect())
 }
 
-/// CLAUDE-617: the split-only prompt. It is built-in and ignores a `prompt`
+/// The split-only prompt. It is built-in and ignores a `prompt`
 /// override or preset, because the attempt has one fixed job and the runner's
 /// finalize depends on its exact outputs.
 fn split_youtrack_prompt() -> String {
@@ -7366,7 +7366,7 @@ fn build_split_prompt(
     )
 }
 
-/// CLAUDE-617: the runner-side end of a split-only attempt, through the run's
+/// The runner-side end of a split-only attempt, through the run's
 /// audited tracker. The pieces are the issue's `parent for` children that did
 /// not exist before the attempt. At least two, each with an Estimation that
 /// fits the session timeout, are required: otherwise nothing is queued and the
@@ -7673,7 +7673,7 @@ fn gate_failure_comment(
     lines.join("\n")
 }
 
-/// CLAUDE-521: write `body` to a scratch file under `std::env::temp_dir()`
+/// Write `body` to a scratch file under `std::env::temp_dir()`
 /// for a `Forge` call that reads its comment/PR body from disk, named
 /// uniquely per call (not just per `prefix`) via `tempfile`'s atomic
 /// create-with-random-suffix. Two concurrent callers racing on the same
@@ -7690,7 +7690,7 @@ fn scratch_file(prefix: &str, body: &str) -> Result<tempfile::TempPath> {
 }
 
 /// Remove a [`scratch_file`] path, logging anything but a benign
-/// already-gone file, exactly like the pre-CLAUDE-521 `remove_file` calls
+/// already-gone file, exactly like the earlier `remove_file` calls
 /// this replaces.
 fn remove_scratch_file(scratch: tempfile::TempPath, what: &str) {
     let path = scratch.to_path_buf();
@@ -7796,12 +7796,12 @@ fn review_findings_comment(
     body
 }
 
-/// CLAUDE-611: the summary prefix the runner writes on an audit review
+/// The summary prefix the runner writes on an audit review
 /// follow-up issue and reads back as the loop guard: a follow-up's own review
 /// failure must not file another follow-up.
 const AUDIT_FOLLOWUP_SUMMARY_PREFIX: &str = "Audit review follow-up: ";
 
-/// What filing an audit review follow-up came to (CLAUDE-611).
+/// What filing an audit review follow-up came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AuditFollowup {
     /// Not an audit run, or the run is itself a follow-up (the loop guard):
@@ -7814,14 +7814,14 @@ enum AuditFollowup {
     Failed { key: Option<String>, cause: String },
 }
 
-/// CLAUDE-611: the follow-up issue's Markdown body for `epic`.
+/// The follow-up issue's Markdown body for `epic`.
 fn audit_followup_description(epic: &str, pr_url: &str, findings: &str) -> String {
     format!(
         "## Background\n\nThe post-success review of the audit run for {epic} found hits its report does not cover. The report PR ({pr_url}) was promoted because it is additive and accurate for what it covers; the uncovered hits are filed here.\n\n## Review findings\n\n{findings}\n\n## Task\n\nFile the real finding issues for every uncovered hit above per the audit filing procedure (`prompts/_filing.md` in the audits repository), then update the audit report so it covers them."
     )
 }
 
-/// CLAUDE-611: file the ONE follow-up issue for an audit review `Fail`
+/// File the ONE follow-up issue for an audit review `Fail`
 /// through `backend` (the run-scoped `AuditedTracker`, so the issue-write cap
 /// and attribution apply). Created in the Epic's own project, tagged with the
 /// Epic's `Audit-<Type>` tag so the existing routing picks it up, related to
@@ -7910,7 +7910,7 @@ fn post_review_findings_on_pr(
     result
 }
 
-// CLAUDE-466: `pr_step` is `"push"` or `"pr_create"`, the step `finalize`
+// `pr_step` is `"push"` or `"pr_create"`, the step `finalize`
 // determined actually failed, so the cause bullet never blames PR creation
 // for a push failure. `recorded_pr_url`, when set, is the PR
 // `agent_pull_requests` already has recorded for this issue (a prior resume
@@ -7967,7 +7967,7 @@ fn pr_failure_comment(
         }
     };
     let mut body = crate::run_footer::failure_comment(&cause, &location_line);
-    // CLAUDE-622: `err` can carry `append_stdout_tail` text (e.g. `git_error`'s
+    // `err` can carry `append_stdout_tail` text (e.g. `git_error`'s
     // redacted stderr/stdout tail), so it is fenced rather than pasted
     // inline into the collapsed detail block.
     let detail = [
@@ -8010,7 +8010,7 @@ fn conflict_resolution_failed_comment(
         String::new(),
         "Conflict-resolution pass failure:".to_string(),
         String::new(),
-        // CLAUDE-622: `detail` can carry `append_stdout_tail` text (the
+        // `detail` can carry `append_stdout_tail` text (the
         // SPEC-3.3.2 gate's cause, or a merge's own captured stderr), so it
         // is fenced rather than pasted inline.
         provider::fenced_block("", detail),
@@ -8031,7 +8031,7 @@ fn conflict_resolution_failed_comment(
     body
 }
 
-/// Issue comment for a push/PR-create failure (CLAUDE-467) that re-queues
+/// Issue comment for a push/PR-create failure that re-queues
 /// below `max_attempts_per_key` onto this issue's recorded open PR, rather
 /// than parking it at a terminal Failed: names the step that actually
 /// failed, the cause, the PR it will resume, and the attempt count.
@@ -8050,7 +8050,7 @@ fn push_failure_requeue_comment(
     let mut body = [
         format!("Claude AI agent run completed {step_line}:"),
         String::new(),
-        // CLAUDE-622: `err` can carry `append_stdout_tail` text, so it is
+        // `err` can carry `append_stdout_tail` text, so it is
         // fenced rather than pasted inline.
         provider::fenced_block("", &err.to_string()),
         String::new(),
@@ -8069,8 +8069,8 @@ fn push_failure_requeue_comment(
     body
 }
 
-/// Outcome of attempting to salvage a timed-out run's local work as a draft PR
-/// (CLAUDE-379), so a human or a re-queue has something to pick back up from
+/// Outcome of attempting to salvage a timed-out run's local work as a draft PR,
+/// so a human or a re-queue has something to pick back up from
 /// rather than losing work a timeout killed mid-flight. Every failure point
 /// (reading git state, committing, opening the PR, commenting on it) is
 /// recorded separately, never swallowed into one generic "salvage failed", so
@@ -8092,7 +8092,7 @@ struct SalvageReport {
     pr: Option<PullRequest>,
     /// `pr_url(job, &pr)` computed at salvage time, for the issue comment.
     pr_url: Option<String>,
-    /// CLAUDE-553: `true` when `commit_timeout_wip` was called because the
+    /// `true` when `commit_timeout_wip` was called because the
     /// workdir had tracked-or-untracked changes the agent had not committed
     /// yet, `false` when every salvaged commit came from the agent's own
     /// `git commit` invocations before the timeout fired. The timeout
@@ -8101,7 +8101,7 @@ struct SalvageReport {
     /// apart from "agent was still editing when the timeout fired" (true -
     /// stay as TimedOut, needs human review).
     wip_commit_made: bool,
-    /// CLAUDE-470: set, instead of committing/pushing/opening a PR, when a
+    /// Set, instead of committing/pushing/opening a PR, when a
     /// `repo_tracker_refs: false` action's pre-push scan found (or could not
     /// rule out) a bare tracker key on the branch being salvaged. Mirrors
     /// `CheckpointOutcome::tracker_key_hit`; the caller routes this straight
@@ -8113,8 +8113,8 @@ struct SalvageReport {
 /// SPEC-3.3: "timeout or cancel: the final push in 3.3.1 runs ... A draft PR
 /// is opened and the issue lands in needs-review."
 ///
-/// Commit, push, and open a draft PR from a timed-out run's local work
-/// (CLAUDE-379). Reuses [`workdir::local_only_work`], the exact query the
+/// Commit, push, and open a draft PR from a timed-out run's local work.
+/// Reuses [`workdir::local_only_work`], the exact query the
 /// cleanup/preserve decision runs, so "is there anything to salvage" can
 /// never disagree with "should the workdir be preserved". Every step that can
 /// fail independently (reading git state, the WIP commit, the push/PR-create,
@@ -8127,7 +8127,7 @@ fn salvage_timeout_work(
     pr_strategy: crate::action::PrStrategy,
     claude_result: &ClaudeResult,
     timeout: Duration,
-    // CLAUDE-470: `!src.repo_tracker_refs` at the call site. When set, the
+    // `!src.repo_tracker_refs` at the call site. When set, the
     // WIP commit (if any) carries no `#{{key}}` reference, the branch is
     // scanned for a bare tracker key before the draft PR is opened, and the
     // draft PR body carries no `#{{key}}` reference either.
@@ -8220,26 +8220,26 @@ fn salvage_timeout_work(
 }
 
 /// Commit the dirty working tree of a timed-out run as a single `WIP:
-/// uncommitted changes at timeout` commit (CLAUDE-379), so it travels with
+/// uncommitted changes at timeout` commit, so it travels with
 /// whatever branch a draft PR gets opened from rather than being lost once
 /// the workdir is garbage-collected. `.claude-run-*` marker files are
 /// excluded by pathspec (operator/runner state, never agent work); gitignored
 /// files are never staged by a bare `git add -A` to begin with. The commit
-/// body ends with the bare `#<KEY>` reference (CLAUDE-398), the requirement
-/// CLAUDE-379 specified but the code never wrote. A failed `git add` or `git
+/// body ends with the bare `#<KEY>` reference, the requirement
+/// the spec required but the code never wrote. A failed `git add` or `git
 /// commit` reports a stdout tail after its stderr, the same
-/// `provider::append_stdout_tail` rule `git_error` applies elsewhere
-/// (CLAUDE-432), because `git commit` runs the repo's `pre-commit` hook and a
+/// `provider::append_stdout_tail` rule `git_error` applies elsewhere,
+/// because `git commit` runs the repo's `pre-commit` hook and a
 /// failing hook's report goes to stdout, not stderr.
 fn commit_timeout_wip(
     workdir: &Path,
     key: &str,
-    // CLAUDE-470: on a `repo_tracker_refs: false` action, the commit body
+    // On a `repo_tracker_refs: false` action, the commit body
     // carries no `#{{key}}` reference.
     tracker_free: bool,
 ) -> std::result::Result<(), String> {
     // Bare `git` resolves through the process-wide `PATH`; serialize against
-    // the CLAUDE-410 PATH-stub test's mutation/deletion window the same way
+    // the PATH-stub test's mutation/deletion window the same way
     // `comment_webhooks::git_output` does.
     #[cfg(test)]
     let _path_guard = crate::testutil::path_env_lock();
@@ -8301,7 +8301,7 @@ fn timeout_cost_line(r: &ClaudeResult) -> String {
     }
 }
 
-/// Runner-written PR body for a timeout-salvaged draft PR (CLAUDE-398): the
+/// Runner-written PR body for a timeout-salvaged draft PR: the
 /// tip commit's own body is either an agent commit whose body is just the
 /// bare issue reference or a runner WIP commit with no useful body, so the
 /// draft PR body is written here instead of derived from `git log`. A
@@ -8323,7 +8323,7 @@ fn draft_pr_body(key: &str) -> String {
     .join("\n")
 }
 
-/// CLAUDE-470: [`draft_pr_body`] for a `repo_tracker_refs: false` action. No
+/// [`draft_pr_body`] for a `repo_tracker_refs: false` action. No
 /// `#{key}` reference: the issue is public, so the timeout-salvaged draft PR
 /// carries no tracker key, same as the tracker-free prompt's commits.
 fn draft_pr_body_tracker_free() -> String {
@@ -8340,8 +8340,8 @@ fn draft_pr_body_tracker_free() -> String {
 }
 
 /// Runner-written PR body for a draft PR opened mid-run by the checkpoint-push
-/// watcher (CLAUDE-448): the tip commit at checkpoint time is agent work in
-/// progress, not a finished change, so (mirroring `draft_pr_body`'s CLAUDE-398
+/// watcher: the tip commit at checkpoint time is agent work in
+/// progress, not a finished change, so (mirroring `draft_pr_body`'s
 /// shape) the draft body is written here instead of derived from `git log`. A
 /// successful run that finishes replaces this description via the same
 /// resumed-refresh path `finalize` already uses for a timeout salvage. No
@@ -8358,7 +8358,7 @@ fn checkpoint_pr_body(key: &str) -> String {
     .join("\n")
 }
 
-/// CLAUDE-470: [`checkpoint_pr_body`] for a `repo_tracker_refs: false`
+/// [`checkpoint_pr_body`] for a `repo_tracker_refs: false`
 /// action. No `#{key}` reference: the issue is public, so the draft PR
 /// carries no tracker key, same as the tracker-free prompt's commits.
 fn checkpoint_pr_body_tracker_free() -> String {
@@ -8371,7 +8371,7 @@ fn checkpoint_pr_body_tracker_free() -> String {
     .join("\n")
 }
 
-/// PR comment explaining why a timeout-salvaged draft PR (CLAUDE-379) exists:
+/// PR comment explaining why a timeout-salvaged draft PR exists:
 /// the timeout limit, the agent's cost and summary at kill time, whether the
 /// branch tip is the runner's own WIP commit or the agent's, and a note that
 /// re-queuing resumes on this branch rather than opening a second PR.
@@ -8397,7 +8397,7 @@ fn timeout_salvage_pr_comment(
         r.summary.clone(),
     ]
     .join("\n");
-    // CLAUDE-622: `commit_error` carries `append_stdout_tail` text (a failed
+    // `commit_error` carries `append_stdout_tail` text (a failed
     // `git add`/`git commit`'s stdout tail, which can include a pre-commit
     // hook's own report), so it is fenced rather than pasted inline.
     if let Some(e) = commit_error {
@@ -8430,7 +8430,7 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
     } else {
         let mut parts = Vec::new();
         if salvage.commit_error.is_some() {
-            // CLAUDE-622: the detail (`append_stdout_tail` text) moves to a
+            // The detail (`append_stdout_tail` text) moves to a
             // fenced block below the bullet list rather than inline, since a
             // multi-line fence inside a single bullet line would break.
             parts.push("Committing the uncommitted working tree failed (see below).".to_string());
@@ -8549,7 +8549,7 @@ pub(crate) fn redact_stream_log_path(message: &str) -> String {
     message.to_string()
 }
 
-/// Delivery-blocked issue comment (CLAUDE-545). One-line outcome naming
+/// Delivery-blocked issue comment. One-line outcome naming
 /// the blocker, up to four action bullets (which PR to look at if any,
 /// what a human should do, and the machine-readable reason slug).
 /// Short by design: the long detail already lives in the run log.
@@ -8666,7 +8666,7 @@ pub(crate) fn has_local_only_work(workdir: &Path) -> bool {
 /// per-job callers that have a forge token in scope.
 ///
 /// Same check as [`has_local_only_work`], authenticating the `ls-remote
-/// origin` network call with `token_url` (CLAUDE-395) rather than relying on
+/// origin` network call with `token_url` rather than relying on
 /// a credential embedded in `origin`'s URL, which the post-clone scrub now
 /// strips. Used by the per-job callers, which have a forge token in scope;
 /// `crate::gc`'s context-free age-based sweep keeps calling
@@ -8798,7 +8798,7 @@ mod tests {
         crate::testutil::capture_logs(f).1
     }
 
-    /// CLAUDE-521: two concurrent scratch-file writers racing on the exact
+    /// Two concurrent scratch-file writers racing on the exact
     /// same logical key (here, a fixed prefix standing in for an issue key
     /// or PR number) must never land on the same path. Before the fix,
     /// `scratch_file` built a fixed `<prefix>.md` name, so both threads
@@ -9385,7 +9385,7 @@ mod tests {
         assert_eq!(state::attempts_get(&pool, "yt", "MK-16").await.unwrap(), 0);
     }
 
-    /// CLAUDE-587 / SPEC-3.15 item 5: every `Finalized` variant maps to its
+    /// SPEC-3.15 item 5: every `Finalized` variant maps to its
     /// own step-list line, and a lifecycle comment ends its list with that
     /// line marked, before the run footer.
     #[test]
@@ -9485,7 +9485,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-584 / SPEC-3.13: the pickup posts the start notice, naming the
+    /// SPEC-3.13: the pickup posts the start notice, naming the
     /// attempt, stage, timeout and expected duration, before it clones: the
     /// clone fails here, and the notice is still the first comment.
     #[tokio::test]
@@ -9554,7 +9554,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-535 fixture: a forge whose PRs report the CI state listed in
+    /// Fixture: a forge whose PRs report the CI state listed in
     /// `states`; a PR not listed has no canned response, so its lookup fails.
     fn ci_forge(states: &[(u64, &str)]) -> CliBackend {
         let mut runner = StubRunner::new();
@@ -9688,7 +9688,7 @@ mod tests {
         (outcome, tracker)
     }
 
-    /// CLAUDE-535: a pickup for a repo at its CI cap leaves the issue Queued,
+    /// A pickup for a repo at its CI cap leaves the issue Queued,
     /// writes nothing and spends no attempt.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_job_defers_when_the_repo_is_at_its_ci_cap() {
@@ -9709,7 +9709,7 @@ mod tests {
         assert_eq!(state::attempts_get(&pool, "yt", "MK-16").await.unwrap(), 0);
     }
 
-    /// CLAUDE-535: below the cap, and with the cap at 0, the pickup is not
+    /// Below the cap, and with the cap at 0, the pickup is not
     /// deferred. The cancelled token then stops the job at the next checkpoint
     /// (`Filtered`), before any clone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9798,7 +9798,7 @@ mod tests {
         (outcome, tracker)
     }
 
-    /// SPEC-3.12 item 7 (CLAUDE-617): an issue whose `Estimation` exceeds the
+    /// SPEC-3.12 item 7: an issue whose `Estimation` exceeds the
     /// action's session timeout is no longer parked at pickup. It proceeds as a
     /// split-only attempt (here: past the gate to the cancel checkpoint), with
     /// no Needs Review write, no comment and no Needs-Info tag from the gate.
@@ -9816,7 +9816,7 @@ mod tests {
         assert!(tracker.tags.lock().unwrap().is_empty());
     }
 
-    /// CLAUDE-617: a tracker keyed by issue, for [`finalize_split`]: canned
+    /// A tracker keyed by issue, for [`finalize_split`]: canned
     /// children before and after, canned Estimations, and every write recorded
     /// as `(key, field, value)`.
     #[derive(Default)]
@@ -9936,7 +9936,7 @@ mod tests {
         )
     }
 
-    /// CLAUDE-617: two new pieces that fit become queued, the issue becomes a
+    /// Two new pieces that fit become queued, the issue becomes a
     /// Story and leaves Queued on the no-code state, and the comment lists
     /// the pieces. A child that existed before the attempt is not a piece.
     #[test]
@@ -9974,7 +9974,7 @@ mod tests {
         assert!(t.tags.lock().unwrap().is_empty());
     }
 
-    /// CLAUDE-617 / SPEC-3.12 item 6: fewer than two new pieces ends in Needs
+    /// SPEC-3.12 item 6: fewer than two new pieces ends in Needs
     /// Review with Needs-Info and a comment naming the cause; nothing queued.
     #[test]
     fn finalize_split_with_fewer_than_two_pieces_parks_needs_review() {
@@ -9992,7 +9992,7 @@ mod tests {
         assert!(t.comments.lock().unwrap()[0].1.contains("at least two"));
     }
 
-    /// CLAUDE-617: a piece still over the timeout (or with no Estimation)
+    /// A piece still over the timeout (or with no Estimation)
     /// parks the issue and queues nothing, naming the piece.
     #[test]
     fn finalize_split_with_an_oversized_piece_queues_nothing() {
@@ -10013,7 +10013,7 @@ mod tests {
         assert!(!body.contains("MK-20 ("), "{body}");
     }
 
-    /// CLAUDE-617: a children read that failed before the attempt can never
+    /// A children read that failed before the attempt can never
     /// read as "no pieces existed"; the split ends in Needs Review naming it.
     #[test]
     fn finalize_split_unreadable_children_park_with_the_cause() {
@@ -10023,7 +10023,7 @@ mod tests {
         assert!(t.comments.lock().unwrap()[0].1.contains("links failed"));
     }
 
-    /// CLAUDE-617: a failed runner write is returned, never read as a split.
+    /// A failed runner write is returned, never read as a split.
     #[test]
     fn finalize_split_write_failure_is_an_error() {
         let mut t = split_tracker(
@@ -10038,7 +10038,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-617: the split prompt demands PR-sized pieces with full specs,
+    /// The split prompt demands PR-sized pieces with full specs,
     /// fitting Estimations and the `subtask of` link, and still forbids
     /// setting `AI Agent`.
     #[test]
@@ -10280,7 +10280,7 @@ mod tests {
         );
         // The attempt-cap park also lands on Needs Review, but it is a
         // different code path from the agent-signalled blocker and never
-        // writes the Needs-Info tag (CLAUDE-373). No `tag add` response is
+        // writes the Needs-Info tag. No `tag add` response is
         // stubbed above, so a call to it would have failed `process_job`'s
         // `unwrap()` before reaching this assertion.
         assert!(!calls.iter().any(|c| c.contains("tag add")), "{calls:?}");
@@ -10393,10 +10393,10 @@ mod tests {
     struct FakeCheckpointForge {
         results: Mutex<Vec<Result<Option<PullRequest>>>>,
         calls: Mutex<u32>,
-        /// The step list each push would carry (CLAUDE-603), rendered the way
+        /// The step list each push would carry, rendered the way
         /// the provider sites do.
         lists: Mutex<Vec<String>>,
-        /// CLAUDE-470: what `scan_tracker_refs` reports on every call; empty
+        /// What `scan_tracker_refs` reports on every call; empty
         /// (the default) means a clean scan, so only a test exercising a
         /// tracker-key hit needs to set this.
         scan_hits: Mutex<Vec<String>>,
@@ -10538,7 +10538,7 @@ mod tests {
     // query, which deadlocks instead of completing.
     //
     // The main thread polls `forge.call_count()` instead of sleeping a fixed
-    // duration before dropping `stop_tx` (CLAUDE-462): a fixed sleep assumes
+    // duration before dropping `stop_tx`: a fixed sleep assumes
     // the watcher thread gets scheduled promptly enough to tick twice in the
     // window, which is not guaranteed under CPU contention from the rest of
     // the suite running in parallel. `checkpoint_push` clamps to the last
@@ -10611,7 +10611,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-603 / SPEC-3.15 item 6, SPEC-8.8: each checkpoint push comment
+    /// SPEC-3.15 item 6, SPEC-8.8: each checkpoint push comment
     /// is rendered from rows stored before that push. The clone row exists
     /// first, the first checkpoint's own row is written when its push ends,
     /// and the second comment lists it and marks `Checkpoint 2`.
@@ -10809,7 +10809,7 @@ mod tests {
                     &cancel,
                 )
             });
-            // Wait for the rejecting tick (CLAUDE-462), then leave several more
+            // Wait for the rejecting tick, then leave several more
             // intervals in which a still-ticking watcher would be caught.
             let deadline = Instant::now() + Duration::from_secs(10);
             while forge.call_count() < 1 && Instant::now() < deadline {
@@ -10835,7 +10835,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-470 acceptance criterion: a bare tracker key already present
+    /// Acceptance criterion: a bare tracker key already present
     /// (e.g. in a commit message) before the watcher's first tick is caught
     /// by the pre-push scan, so the watcher never calls `checkpoint_push` at
     /// all, cancels the run so `claude.invoke` stops promptly, and reports
@@ -10845,7 +10845,7 @@ mod tests {
         let pool = mem_pool().await;
         let forge = FakeCheckpointForge::with_scan_hits(
             vec![Ok(Some(checkpoint_pr(77, "fix/MK-16")))],
-            vec!["CLAUDE-470".to_string()],
+            vec!["PROJ-470".to_string()],
         );
         let wd = tempfile::tempdir().unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
@@ -10887,7 +10887,7 @@ mod tests {
         });
         assert!(outcome.opened.is_none());
         assert!(outcome.rejected.is_none());
-        assert_eq!(outcome.tracker_key_hit.as_deref(), Some("CLAUDE-470"));
+        assert_eq!(outcome.tracker_key_hit.as_deref(), Some("PROJ-470"));
         assert_eq!(
             forge.call_count(),
             0,
@@ -11232,7 +11232,7 @@ mod tests {
         assert!(!body.contains("<details>"), "{body}");
     }
 
-    /// CLAUDE-372: a killed run's stream tail holds a `thinking` block with a
+    /// A killed run's stream tail holds a `thinking` block with a
     /// `signature`. `failure_comment` and `timeout_comment` render whatever
     /// `friendly_failure_summary` produced, so neither body may carry it.
     #[test]
@@ -11301,7 +11301,7 @@ mod tests {
         assert!(body.contains("agent error"), "{body}");
     }
 
-    /// CLAUDE-622: a failed WIP commit's `append_stdout_tail` detail (which
+    /// A failed WIP commit's `append_stdout_tail` detail (which
     /// can itself contain backticks, e.g. from a pre-commit hook's own
     /// report) must be fenced past any backtick run already inside it,
     /// never pasted inline into the bullet list.
@@ -11327,7 +11327,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-622: the same fencing applies to the timeout-salvage draft
+    /// The same fencing applies to the timeout-salvage draft
     /// PR's own comment, which carries the same `commit_error` detail.
     #[test]
     fn timeout_salvage_pr_comment_fences_the_commit_error_past_its_own_backticks() {
@@ -11351,7 +11351,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-447: a failed `timeout salvage push` comment post never fails
+    /// A failed `timeout salvage push` comment post never fails
     /// the draft PR the timeout salvaged, but the YouTrack timeout comment
     /// names it, right alongside (and never confused with) a failed
     /// timeout-explanation comment.
@@ -11383,7 +11383,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-546: the timeout comment leads with a one-line outcome, lists
+    /// The timeout comment leads with a one-line outcome, lists
     /// the cause, salvage and follow-up as bullets, and moves the kill-time
     /// ambiguity paragraph and agent summary under a collapsed `<details>`
     /// block so a reviewer sees the outcome first.
@@ -11521,7 +11521,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-546: the failure comment leads with a one-line outcome and
+    /// The failure comment leads with a one-line outcome and
     /// SPEC-3.16.3: the pre-step failure body is capped at 2 bullets here
     /// (cause, pushed), leading with the cause.
     #[test]
@@ -11552,7 +11552,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-545: the delivery-blocked comment leads with the reason's
+    /// The delivery-blocked comment leads with the reason's
     /// one-line outcome, names the PR when one is available (and says so
     /// when one is not), and ends with a machine-readable `Reason:` slug
     /// so the dashboard filter can match on it.
@@ -11583,7 +11583,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-545: when a PR URL is available the comment names it in
+    /// When a PR URL is available the comment names it in
     /// place of the "no PR" bullet, so a reviewer has a direct link to
     /// whatever work the blocker left behind.
     #[test]
@@ -11652,7 +11652,7 @@ mod tests {
 
     #[test]
     fn default_prompt_puts_the_attribution_trailer_below_the_issue_reference() {
-        // CLAUDE-638: a trailer on the line above the reference merges into
+        // A trailer on the line above the reference merges into
         // the reference block, which `validate_pr_body` refuses.
         let p = default_youtrack_prompt();
         assert!(
@@ -11719,7 +11719,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-377: the agent must know its wall-clock budget, checkpoint its
+    /// The agent must know its wall-clock budget, checkpoint its
     /// work with per-layer commits carrying the bare issue reference, and
     /// follow the four test-discipline rules rather than re-running the full
     /// suite after every change.
@@ -11772,7 +11772,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-367: an issue can be edited after pickup, so the default prompt
+    /// An issue can be edited after pickup, so the default prompt
     /// must re-read it after the check suite goes green and before the final
     /// commit, and the closing summary must report whether anything changed.
     #[test]
@@ -11805,7 +11805,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-398 criterion 1: the final commit's SUBJECT (what `git log -1
+    /// the final commit's SUBJECT (what `git log -1
     /// --format=%s` prints) is the PR title, and it must be a one-line
     /// imperative summary, never a Markdown heading like `## Summary`
     /// mistaken for the subject (the original defect this issue fixes).
@@ -12079,7 +12079,7 @@ mod tests {
         assert_eq!(p, "Type `Story`");
     }
 
-    /// CLAUDE-450: `{{deadline_utc}}` is `now + claude_timeout`, formatted as
+    /// `{{deadline_utc}}` is `now + claude_timeout`, formatted as
     /// RFC 3339 UTC to the second, via an injected clock rather than a live one.
     #[test]
     fn render_deadline_utc_is_now_plus_timeout_to_the_second() {
@@ -12122,7 +12122,7 @@ mod tests {
         let t = "{{existing_pr_url}}|{{existing_branch}}";
         let resume = PrResume {
             id: 1,
-            branch: "fix/CLAUDE-275".into(),
+            branch: "fix/PROJ-275".into(),
             pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
         };
         let p = render_prompt_template(
@@ -12137,7 +12137,7 @@ mod tests {
         );
         assert_eq!(
             p,
-            "https://dev.a8n.run/contoso/claude-run/pulls/7|fix/CLAUDE-275"
+            "https://dev.a8n.run/contoso/claude-run/pulls/7|fix/PROJ-275"
         );
     }
 
@@ -12245,7 +12245,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-450 criterion 2: the default prompt (not just a custom
+    /// the default prompt (not just a custom
     /// template) substitutes `{{deadline_utc}}` with the invocation time plus
     /// the timeout, to the second, via an injected clock rather than a live
     /// one.
@@ -12266,7 +12266,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-450: a run never ends voluntarily while an acceptance criterion
+    /// A run never ends voluntarily while an acceptance criterion
     /// lacks evidence. For an issue judged too large there are exactly two
     /// paths: the "Task too large" blocker before any code change, or working
     /// until every criterion has evidence or the run is killed. The old size
@@ -12316,7 +12316,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-454: a gap/deferred/descoped-piece follow-up must never be filed
+    /// A gap/deferred/descoped-piece follow-up must never be filed
     /// as a subtask of the triggering issue (that makes the work issue a
     /// parent, so closing the follow-up auto-closes it and the dependency gate
     /// can block the parent on its own child), the prompt must rule out a
@@ -12387,7 +12387,7 @@ mod tests {
     #[test]
     fn project_key_splits_idreadable() {
         assert_eq!(project_key("MK-16"), "MK");
-        assert_eq!(project_key("CLAUDE-32"), "CLAUDE");
+        assert_eq!(project_key("PROJ-32"), "PROJ");
         assert_eq!(project_key("NODASH"), "NODASH");
     }
 
@@ -13304,7 +13304,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-545: when the checkpoint watcher's own push was rejected
+    /// When the checkpoint watcher's own push was rejected
     /// earlier AND the final push now also fails, the pattern is a
     /// repo-level rejection the runner cannot clear on its own. The
     /// terminal state is DeliveryBlocked{PushRejected}, not generic
@@ -13378,7 +13378,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-448: a rejected checkpoint push must never fail the job, but it
+    /// A rejected checkpoint push must never fail the job, but it
     /// must be named in whichever outcome comment the run produces; proven
     /// here on the Needs-Review path and relied on to hold for every other
     /// `finalize` branch via the shared `note_checkpoint_rejection` closure.
@@ -13418,7 +13418,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-470 acceptance criterion: a tracker-key hit found mid-run
+    /// Acceptance criterion: a tracker-key hit found mid-run
     /// (passed in as `tracker_key_hit`) overrides every other outcome,
     /// before `finalize_with_steps` even looks at the marker files or
     /// `claude_result`: it never touches the forge (no push, no PR), posts a
@@ -13447,7 +13447,7 @@ mod tests {
             None,
             test_comment_run(),
             None,
-            Some("CLAUDE-470 (found in commit message)"),
+            Some("PROJ-470 (found in commit message)"),
             None,
             1,
             1000,
@@ -13470,7 +13470,7 @@ mod tests {
         assert!(
             comments
                 .iter()
-                .any(|c| c.contains("CLAUDE-470 (found in commit message)")),
+                .any(|c| c.contains("PROJ-470 (found in commit message)")),
             "{comments:?}"
         );
         let set_calls = backend.set_calls.lock().unwrap();
@@ -13482,7 +13482,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-470 acceptance criterion: on a `repo_tracker_refs: false`
+    /// Acceptance criterion: on a `repo_tracker_refs: false`
     /// action, the success branch's pre-push scan runs before
     /// `create_pr_with_draft`; a hit there must block delivery without ever
     /// opening a PR. `FakeCheckpointForge::create_pr` (which
@@ -13493,7 +13493,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wd = dir.path();
         let backend = FakeTracker::new("Working");
-        let forge = FakeCheckpointForge::with_scan_hits(vec![], vec!["CLAUDE-470".to_string()]);
+        let forge = FakeCheckpointForge::with_scan_hits(vec![], vec!["PROJ-470".to_string()]);
         let source = YoutrackSource {
             repo_tracker_refs: false,
             ..src()
@@ -13533,12 +13533,12 @@ mod tests {
         );
         let comments = backend.comments.lock().unwrap();
         assert!(
-            comments.iter().any(|c| c.contains("CLAUDE-470")),
+            comments.iter().any(|c| c.contains("PROJ-470")),
             "{comments:?}"
         );
     }
 
-    /// CLAUDE-470 acceptance criterion: a timed-out run's salvage path also
+    /// Acceptance criterion: a timed-out run's salvage path also
     /// scans before opening its draft PR on a `repo_tracker_refs: false`
     /// action. `FakeCheckpointForge::create_pr` panics if reached, so a hit
     /// here proves the scan runs before `create_pr_with_draft`, not just
@@ -13550,7 +13550,7 @@ mod tests {
         let wd = dir.path();
         repo_with_commit(wd);
         let backend = FakeTracker::new("Working");
-        let forge = FakeCheckpointForge::with_scan_hits(vec![], vec!["CLAUDE-470".to_string()]);
+        let forge = FakeCheckpointForge::with_scan_hits(vec![], vec!["PROJ-470".to_string()]);
         let source = YoutrackSource {
             repo_tracker_refs: false,
             ..src()
@@ -13590,12 +13590,12 @@ mod tests {
         );
         let comments = backend.comments.lock().unwrap();
         assert!(
-            comments.iter().any(|c| c.contains("CLAUDE-470")),
+            comments.iter().any(|c| c.contains("PROJ-470")),
             "{comments:?}"
         );
     }
 
-    /// The agent-signalled blocker park (CLAUDE-373) attaches the
+    /// The agent-signalled blocker park attaches the
     /// Needs-Info tag alongside the marker comment and the `AI Agent` write,
     /// in that order: comment, then tag, then field.
     #[test]
@@ -13824,7 +13824,7 @@ mod tests {
             !calls.iter().any(|c| c.contains("AI Agent Failed")),
             "a deliberate no-code run must not be Failed: {calls:?}"
         );
-        // A no-code completion never writes the Needs-Info tag (CLAUDE-373).
+        // A no-code completion never writes the Needs-Info tag.
         assert!(!calls.iter().any(|c| c.contains("tag add")), "{calls:?}");
     }
 
@@ -14196,7 +14196,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.14 item 3, CLAUDE-604: the success path hands its `push`,
+    /// SPEC-3.14 item 3: the success path hands its `push`,
     /// `pr_create` and `gate` spans to the step sink in order, each before the
     /// outcome comment is posted.
     #[test]
@@ -14365,7 +14365,7 @@ mod tests {
             .join(".claude-run-pr-body.md")
             .to_string_lossy()
             .to_string();
-        // CLAUDE-521: the scratch file carries a random suffix now, so the
+        // The scratch file carries a random suffix now, so the
         // stub can only match a prefix up to the fixed part of the name.
         let gate_comment_prefix = format!(
             "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {}",
@@ -14566,11 +14566,7 @@ mod tests {
                 )
                 .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#CLAUDE-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .ok(
                     "git",
                     &["remote", "get-url", "origin"],
@@ -14703,7 +14699,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-447: a failed push-comment post never fails the PR create or
+    /// A failed push-comment post never fails the PR create or
     /// the Code Review outcome it reports on, but the YouTrack success
     /// comment names it.
     #[test]
@@ -14876,7 +14872,7 @@ mod tests {
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok("git", &["log", "-1", "--format=%s", "HEAD"], "feat: x\n")
-                .ok("git", &["log", "-1", "--format=%b", "HEAD"], "#CLAUDE-1\n")
+                .ok("git", &["log", "-1", "--format=%b", "HEAD"], "#PROJ-1\n")
                 .ok(
                     "yt",
                     &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
@@ -14979,7 +14975,7 @@ mod tests {
     }
 
     fn repo_with_commit(dir: &Path) {
-        // CLAUDE-558: configure a local bare `origin` so that
+        // Configure a local bare `origin` so that
         // `workdir::local_only_work` (called from `work_location` in the
         // finalize failure arm) can run `ls-remote origin` without failing
         // and spinning through the 4-attempt / 0+2+5s retry schedule. The
@@ -15283,10 +15279,10 @@ mod tests {
         );
     }
 
-    /// CLAUDE-622: `err`'s text can itself carry backticks (e.g. a quoted
+    /// `err`'s text can itself carry backticks (e.g. a quoted
     /// command in a `git`/`fj` error), so the fence wrapping it in the
     /// collapsed detail must be longer than any backtick run already there.
-    /// CLAUDE-622: a conflict-resolution pass's own failure detail can carry
+    /// A conflict-resolution pass's own failure detail can carry
     /// backticks (e.g. a quoted command from the SPEC-3.3.2 gate's cause),
     /// so the fence wrapping it must be longer than any run already there.
     #[test]
@@ -15309,7 +15305,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-622: a push/PR-create requeue's error text can itself carry
+    /// A push/PR-create requeue's error text can itself carry
     /// backticks, so the fence wrapping it must be longer than any run
     /// already there.
     #[test]
@@ -15656,7 +15652,7 @@ mod tests {
 
     #[test]
     fn pr_failure_comment_with_a_recorded_pr_says_requeue_resumes_it() {
-        // CLAUDE-466 / PMCP-9 shape: the checkpoint watcher already opened and
+        // Shape: the checkpoint watcher already opened and
         // recorded a draft PR, then the final push failed on a divergence
         // merge. The comment must point at that recorded PR, never claim no
         // PR was ever opened.
@@ -15774,7 +15770,7 @@ mod tests {
         let clone = origin_and_single_branch_clone(base.path());
         git_in(
             &clone,
-            &["checkout", "-b", "feat/CLAUDE-269-login-required-gate"],
+            &["checkout", "-b", "feat/PROJ-269-login-required-gate"],
         );
         std::fs::write(clone.join("f.txt"), "edited but never committed").unwrap();
 
@@ -15804,7 +15800,7 @@ mod tests {
         // A reachable local branch but an unreachable remote: the live-remote
         // query fails and the guard preserves rather than risk a wrong delete.
         // `repo_with_commit` configures a working local bare origin for the
-        // common fixture path (CLAUDE-558); this test overrides it to the
+        // common fixture path; this test overrides it to the
         // nonexistent URL that drives the ls-remote failure specifically.
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
@@ -15930,11 +15926,7 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#CLAUDE-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -16005,7 +15997,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-467 criterion 1: a push failure with a recorded open PR and
+    /// a push failure with a recorded open PR and
     /// attempts below the cap re-queues onto that PR instead of parking at
     /// a terminal Failed.
     #[test]
@@ -16033,11 +16025,7 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#CLAUDE-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -16114,7 +16102,7 @@ mod tests {
         assert!(comment.contains("no upstream"), "{comment}");
     }
 
-    /// CLAUDE-467 criterion 2: the same push failure at the attempt cap
+    /// the same push failure at the attempt cap
     /// parks at a terminal Failed instead of requeuing.
     #[test]
     fn finalize_push_failure_with_recorded_pr_at_cap_sets_failed() {
@@ -16141,11 +16129,7 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#CLAUDE-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -16208,7 +16192,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-467 a failed AI Agent re-read is not read as "advanced":
+    /// A failed AI Agent re-read is not read as "advanced":
     /// it is logged and the issue parks at Failed, never left stuck at Working.
     #[test]
     fn finalize_push_failure_requeue_field_read_failure_sets_failed() {
@@ -16235,11 +16219,7 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#CLAUDE-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -16308,7 +16288,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-467 criterion 3: the same push failure with no recorded PR
+    /// the same push failure with no recorded PR
     /// keeps today's terminal Failed.
     #[test]
     fn finalize_push_failure_with_no_recorded_pr_sets_failed() {
@@ -16335,11 +16315,7 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#CLAUDE-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -16402,7 +16378,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-467 criterion 4: a push failure with a recorded PR and
+    /// a push failure with a recorded PR and
     /// attempts below the cap, but the AI Agent field already advanced off
     /// Working (a concurrent human/agent edit) by requeue time, leaves the
     /// field untouched rather than stomping it back to Queued.
@@ -16431,11 +16407,7 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#CLAUDE-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -16701,7 +16673,7 @@ mod tests {
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok("git", &["log", "-1", "--format=%s", "HEAD"], "feat: x\n")
-                .ok("git", &["log", "-1", "--format=%b", "HEAD"], "#CLAUDE-1\n")
+                .ok("git", &["log", "-1", "--format=%b", "HEAD"], "#PROJ-1\n")
                 .ok(
                     "yt",
                     &[
@@ -16746,7 +16718,7 @@ mod tests {
 
     #[test]
     fn finalize_pr_create_failure_with_no_commits_ahead_is_delivery_blocked() {
-        // CLAUDE-545: AGit's `fj pr create -aA` fails with "no commits to
+        // AGit's `fj pr create -aA` fails with "no commits to
         // push" when the agent's run ended with a clean working tree and
         // no commits ahead of the base. That is delivery-blocked (nothing
         // to open a PR from), not a hard push/PR-create failure of the
@@ -16968,7 +16940,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-425 acceptance criterion: a push or PR-create failure after a
+    /// Acceptance criterion: a push or PR-create failure after a
     /// successful agent run must record `ok = false` and a Summary that
     /// leads with the failure text, not a Summary that reads like a clean
     /// success while the issue is marked Failed.
@@ -17048,7 +17020,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-425: a PR-path failure appends one `runner_error` record to the
+    /// A PR-path failure appends one `runner_error` record to the
     /// attempt's stream log naming the step and cause, and every existing
     /// reader (here `count_compact_boundaries`, which selects events by
     /// `type`/`subtype` rather than line position) still succeeds on a log
@@ -17080,7 +17052,7 @@ mod tests {
 
     #[test]
     fn finalize_timeout_sets_needs_review_when_still_working() {
-        // CLAUDE-545: a timeout with no local work to salvage ends in the
+        // A timeout with no local work to salvage ends in the
         // DeliveryBlocked{TimeoutNothingMergeable} terminal state. With no
         // configured `delivery_blocked` label, the AI Agent write still
         // lands on Needs Review (the default fallback); the issue is
@@ -17144,13 +17116,13 @@ mod tests {
         );
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
         // The Needs-Info tag is reserved for the agent-signalled Needs
-        // Review path (CLAUDE-373); delivery-blocked never writes it.
+        // Review path; delivery-blocked never writes it.
         assert!(!calls.iter().any(|c| c.contains("tag add")), "{calls:?}");
     }
 
     #[test]
     fn finalize_timeout_leaves_field_when_already_advanced() {
-        // CLAUDE-545: a timeout with no salvageable work still produces
+        // A timeout with no salvageable work still produces
         // the DeliveryBlocked outcome, but the human-override guard is
         // preserved: when AI Agent has already moved off Working (e.g. a
         // human set Done), the field is left untouched - only the comment
@@ -17202,7 +17174,7 @@ mod tests {
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
     }
 
-    /// CLAUDE-545: a configured `delivery_blocked` label on
+    /// A configured `delivery_blocked` label on
     /// `YoutrackStates` routes the AI Agent write to it instead of to the
     /// default Needs Review fallback.
     #[test]
@@ -17267,7 +17239,7 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-379: salvage timed-out work as a draft PR -----------------
+    // ---- salvage timed-out work as a draft PR -----------------
 
     /// A single-branch clone of `origin` with one tracked file modified in the
     /// working tree but never staged or committed: the real git state
@@ -17300,7 +17272,7 @@ mod tests {
         clone
     }
 
-    /// CLAUDE-553: like [`dirty_single_branch_clone`] but the change was
+    /// Like [`dirty_single_branch_clone`] but the change was
     /// committed on a feature branch (no dirty tree): the agent's work is
     /// done and ready to push, matching the "timeout fired during the
     /// agent's own check after committing" scenario.
@@ -17330,7 +17302,7 @@ mod tests {
         clone
     }
 
-    /// CLAUDE-553: the agent committed all its work before the wall-clock
+    /// The agent committed all its work before the wall-clock
     /// timeout fired (no WIP commit needed, the salvage opens a PR from
     /// the agent's own commits). The run is treated as a successful
     /// delivery: the draft PR is promoted to ready, AI Agent lands on
@@ -17497,7 +17469,7 @@ mod tests {
         // commit, pushed, opened as a draft (`WIP: `-prefixed title) PR, and
         // the PR gets a comment explaining the timeout. The issue still lands
         // on Needs Review and the TimedOut outcome carries the PR so
-        // `record_new_pr` can store it exactly like a successful run (CLAUDE-275).
+        // `record_new_pr` can store it exactly like a successful run.
         let base = tempfile::tempdir().unwrap();
         let clone = dirty_single_branch_clone(base.path());
         let git_dir = clone.join(".git");
@@ -17506,7 +17478,7 @@ mod tests {
             .join(".claude-run-pr-body.md")
             .to_string_lossy()
             .to_string();
-        // CLAUDE-521: the scratch file carries a random suffix now, so the
+        // The scratch file carries a random suffix now, so the
         // stub and the later assertion can only match a prefix.
         let comment_prefix = format!(
             "fj --host dev.a8n.run pr comment contoso/claude-run#9 --body-file {}",
@@ -17665,7 +17637,7 @@ mod tests {
         // Same shape as the test above, but the tip is the runner's own
         // `WIP: uncommitted changes at timeout` commit rather than a
         // pre-existing agent commit. Either way the draft PR body is the
-        // runner-written one (CLAUDE-398), never derived from `git log`.
+        // runner-written one, never derived from `git log`.
         let base = tempfile::tempdir().unwrap();
         let clone = dirty_single_branch_clone(base.path());
         let git_dir = clone.join(".git");
@@ -17674,7 +17646,7 @@ mod tests {
             .join(".claude-run-pr-body.md")
             .to_string_lossy()
             .to_string();
-        // CLAUDE-521: the scratch file carries a random suffix now, so the
+        // The scratch file carries a random suffix now, so the
         // stub can only match a prefix up to the fixed part of the name.
         let comment_prefix = format!(
             "fj --host dev.a8n.run pr comment contoso/claude-run#9 --body-file {}",
@@ -17923,7 +17895,7 @@ mod tests {
             .join(".claude-run-pr-body.md")
             .to_string_lossy()
             .to_string();
-        // CLAUDE-521: the scratch file carries a random suffix now, so the
+        // The scratch file carries a random suffix now, so the
         // stub can only match a prefix up to the fixed part of the name.
         let comment_prefix = format!(
             "fj --host dev.a8n.run pr comment contoso/claude-run#9 --body-file {}",
@@ -18068,7 +18040,7 @@ mod tests {
 
     #[test]
     fn commit_timeout_wip_names_the_pre_commit_hook_stdout_tail() {
-        // CLAUDE-432: `git commit` runs the repo's `pre-commit` hook, which
+        // `git commit` runs the repo's `pre-commit` hook, which
         // writes its report to stdout, not stderr; a stderr-only failure text
         // named no cause. Both the hook's stdout and git's own stderr must
         // appear in the failure text.
@@ -18094,7 +18066,7 @@ mod tests {
 
     #[test]
     fn commit_timeout_wip_body_ends_with_the_bare_issue_reference() {
-        // CLAUDE-398 / CLAUDE-379: the salvage WIP commit's body must end
+        // The salvage WIP commit's body must end
         // with the bare `#<KEY>` reference.
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
@@ -18118,12 +18090,12 @@ mod tests {
 
     #[test]
     fn commit_timeout_wip_tracker_free_omits_the_issue_key() {
-        // CLAUDE-470: a `repo_tracker_refs: false` action's timeout-salvage
+        // A `repo_tracker_refs: false` action's timeout-salvage
         // WIP commit must carry no bare tracker key anywhere in its message.
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
         std::fs::write(dir.path().join("dirty.txt"), "uncommitted\n").unwrap();
-        commit_timeout_wip(dir.path(), "SF-16", true).unwrap();
+        commit_timeout_wip(dir.path(), "WEB-16", true).unwrap();
         let out = {
             let _path_guard = crate::testutil::path_env_lock();
             Command::new("git")
@@ -18135,12 +18107,12 @@ mod tests {
         };
         let message = String::from_utf8_lossy(&out.stdout);
         assert!(
-            !message.contains("SF-16"),
+            !message.contains("WEB-16"),
             "a tracker-free WIP commit must not carry the issue key: {message}"
         );
     }
 
-    /// CLAUDE-549: the `fj pr status` args the finalize-time automerge read
+    /// The `fj pr status` args the finalize-time automerge read
     /// issues for PR #7.
     const FINALIZE_PR_STATUS_ARGS: [&str; 6] = [
         "--host",
@@ -18151,11 +18123,11 @@ mod tests {
         "--json",
     ];
 
-    /// CLAUDE-549: the `fj pr merge` call the finalize-time automerge makes.
+    /// The `fj pr merge` call the finalize-time automerge makes.
     const FINALIZE_PR_MERGE_CALL: &str =
         "fj --host dev.a8n.run pr merge contoso/claude-run#7 --method merge --delete";
 
-    /// CLAUDE-549 fixture: a resumed run's successful finalize up to and
+    /// Fixture: a resumed run's successful finalize up to and
     /// including `mark_pr_ready` on PR #7 (the same git/fj/yt stubs as
     /// `finalize_resumed_success_strips_the_draft_prefix_via_mark_pr_ready`),
     /// plus `fj pr merge` and any `yt` issue comment. The caller adds the
@@ -18261,7 +18233,7 @@ mod tests {
             .ok_prefix("yt issue comment MK-16 ", "")
     }
 
-    /// CLAUDE-651: same fixture as [`automerge_finalize_runner`], but the PR
+    /// Same fixture as [`automerge_finalize_runner`], but the PR
     /// was already ready (no `WIP: ` prefix) before this finalize, so
     /// `mark_pr_ready` is a no-op (`was_draft = false`) rather than a
     /// promotion. Used to show a PR that did not just come out of draft
@@ -18370,7 +18342,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-549: an automerge-enabled source with the given finalize
+    /// An automerge-enabled source with the given finalize
     /// status timeout.
     fn automerge_src(timeout_secs: u64) -> YoutrackSource {
         let mut s = src();
@@ -18379,7 +18351,7 @@ mod tests {
         s
     }
 
-    /// CLAUDE-549: run the resumed-success finalize against `forge` and
+    /// Run the resumed-success finalize against `forge` and
     /// `src`, with no review session (a pass).
     fn finalize_automerge_case(
         forge: &CliBackend,
@@ -18418,8 +18390,8 @@ mod tests {
 
     #[test]
     fn finalize_merges_a_pr_whose_ci_is_already_green() {
-        // CLAUDE-549: green, current and mergeable at finalize time, and the
-        // PR was already ready before this finalize (CLAUDE-651: not just
+        // Green, current and mergeable at finalize time, and the
+        // PR was already ready before this finalize (not just
         // promoted from draft) -> the PR merges in the same tick and the
         // outcome reads Merged.
         let dir = tempfile::tempdir().unwrap();
@@ -18449,7 +18421,7 @@ mod tests {
 
     #[test]
     fn finalize_does_not_merge_a_pr_just_promoted_from_draft() {
-        // CLAUDE-651: this finalize is the one that strips the PR's `WIP: `
+        // This finalize is the one that strips the PR's `WIP: `
         // prefix (mark_pr_ready returns `was_draft = true`), so even an
         // all-green status read must not merge: the only CI evidence on the
         // head SHA may be skipped draft-time runs. The PR is left at Code
@@ -18474,7 +18446,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.14 item 3, CLAUDE-597: the Postgres steps a `test-postgres`
+    /// SPEC-3.14 item 3: the Postgres steps a `test-postgres`
     /// process reported are read back, and become holes in the derived steps.
     #[test]
     fn child_postgres_steps_reads_the_span_file_and_returns_holes() {
@@ -18512,7 +18484,7 @@ mod tests {
         assert_eq!(holes, vec![(at(0), at(3)), (at(3), at(8))]);
     }
 
-    /// SPEC-3.14 item 3, CLAUDE-597: the finalize-time bounded status read is
+    /// SPEC-3.14 item 3: the finalize-time bounded status read is
     /// stored as a `ci_wait` step, `ok` when the read answered.
     #[test]
     fn finalize_time_status_read_is_a_ci_wait_step() {
@@ -18564,7 +18536,7 @@ mod tests {
 
     #[test]
     fn finalize_leaves_a_pending_pr_at_code_review() {
-        // CLAUDE-549: CI still running -> Code Review, no merge; the
+        // CI still running -> Code Review, no merge; the
         // webhook and reconciler own the merge once it goes green.
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
@@ -18590,7 +18562,7 @@ mod tests {
 
     #[test]
     fn finalize_leaves_a_red_pr_at_code_review() {
-        // CLAUDE-549: failing CI -> Code Review, no merge; the CI-fix flow
+        // Failing CI -> Code Review, no merge; the CI-fix flow
         // owns the retry.
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
@@ -18610,7 +18582,7 @@ mod tests {
 
     #[test]
     fn finalize_never_branch_updates_a_green_behind_base_pr() {
-        // CLAUDE-549 / CLAUDE-535: a green PR behind its base is left for
+        // A green PR behind its base is left for
         // the CI-capped webhook/reconciler branch update; finalize neither
         // merges it nor starts a new CI run with an update.
         let dir = tempfile::tempdir().unwrap();
@@ -18633,7 +18605,7 @@ mod tests {
 
     #[test]
     fn finalize_falls_back_to_code_review_when_the_status_read_times_out() {
-        // CLAUDE-549: a status read slower than the timeout -> Code Review,
+        // A status read slower than the timeout -> Code Review,
         // no merge, and finalize returns without waiting the read out.
         let dir = tempfile::tempdir().unwrap();
         let inner = Arc::new(automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
@@ -18664,7 +18636,7 @@ mod tests {
 
     #[test]
     fn finalize_makes_no_status_read_when_automerge_is_off() {
-        // CLAUDE-549: automerge disabled (the default) or a zero timeout
+        // Automerge disabled (the default) or a zero timeout
         // keeps today's behavior exactly: no status read, no merge.
         for src in [src(), automerge_src(0)] {
             let dir = tempfile::tempdir().unwrap();
@@ -18684,7 +18656,7 @@ mod tests {
 
     #[test]
     fn finalize_resumed_success_strips_the_draft_prefix_via_mark_pr_ready() {
-        // CLAUDE-379 criterion 5: a resumed run that finishes successfully
+        // a resumed run that finishes successfully
         // must clear the draft/`WIP: ` status the timeout salvage left behind.
         let dir = tempfile::tempdir().unwrap();
         let git_dir = dir.path().join(".git");
@@ -18865,7 +18837,7 @@ mod tests {
 
     #[test]
     fn finalize_resumed_success_surfaces_a_refresh_failure_in_the_success_comment() {
-        // CLAUDE-398 criterion 8: `refresh_pr_text` is best-effort (it must
+        // `refresh_pr_text` is best-effort (it must
         // never block the success outcome), but its failure is never silent:
         // it is logged AND named in the success comment. Omitting the
         // title/body edit stubs makes the refresh fail with
@@ -19021,7 +18993,7 @@ mod tests {
 
     #[test]
     fn finalize_resumed_success_on_a_moved_remote_branch_still_strips_the_draft_prefix() {
-        // CLAUDE-382 criterion 7: the resumed run's clone predates a commit the
+        // the resumed run's clone predates a commit the
         // runner itself pushed onto the branch while the run was working (e.g.
         // a "branch was behind its base" update), so the remote tip has moved
         // and neither SHA is an ancestor of the other. The runner fetches,
@@ -19211,7 +19183,7 @@ mod tests {
 
     #[test]
     fn default_prompt_tells_a_resumed_run_to_read_the_prs_comments() {
-        // CLAUDE-379 criterion 5: a re-queue's rendered prompt must direct the
+        // a re-queue's rendered prompt must direct the
         // agent to the PR's own comments, not just the issue's, since a
         // timed-out run's salvage note (what it committed, why) lives there.
         let p = default_youtrack_prompt();
@@ -19223,7 +19195,7 @@ mod tests {
 
     #[test]
     fn default_prompt_tells_a_resumed_run_to_read_and_fix_review_findings() {
-        // CLAUDE-449: a re-queue reached via a failed review session must be
+        // A re-queue reached via a failed review session must be
         // told that its PR's comments may carry findings that kept the PR a
         // draft, not just a timed-out run's salvage note.
         let p = default_youtrack_prompt();
@@ -19235,7 +19207,7 @@ mod tests {
 
     #[test]
     fn default_prompt_forbids_history_rewriting_on_the_feature_branch() {
-        // CLAUDE-465: the checkpoint-push watcher (CLAUDE-448) publishes the
+        // The checkpoint-push watcher publishes the
         // agent's commits every 60 seconds, so a `reset`/`--amend`/`rebase`/
         // force push to fix a mistake orphans an already-pushed checkpoint
         // instead of just making a new commit on top.
@@ -19283,7 +19255,7 @@ mod tests {
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok("git", &["log", "-1", "--format=%s", "HEAD"], "feat: x\n")
-                .ok("git", &["log", "-1", "--format=%b", "HEAD"], "#CLAUDE-1\n")
+                .ok("git", &["log", "-1", "--format=%b", "HEAD"], "#PROJ-1\n")
                 .ok(
                     "yt",
                     &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
@@ -19408,22 +19380,22 @@ mod tests {
     fn unmet_blockers_honors_direction_and_resolved() {
         let block_on = crate::action::Dependencies::default().block_on;
         let links = vec![
-            link(LinkDirection::Inward, "depends on", "YT-40", None), // BLOCK: open blocker
-            link(LinkDirection::Outward, "parent for", "CLAUDE-9", None), // BLOCK: open child
-            link(LinkDirection::Outward, "is required for", "CLAUDE-1", None), // reverse Depend
-            link(LinkDirection::Inward, "subtask of", "CLAUDE-2", None), // reverse Subtask
-            link(LinkDirection::Inward, "depends on", "CLAUDE-3", Some(123)), // met (resolved)
+            link(LinkDirection::Inward, "depends on", "TASK-40", None), // BLOCK: open blocker
+            link(LinkDirection::Outward, "parent for", "PROJ-9", None), // BLOCK: open child
+            link(LinkDirection::Outward, "is required for", "PROJ-1", None), // reverse Depend
+            link(LinkDirection::Inward, "subtask of", "PROJ-2", None),  // reverse Subtask
+            link(LinkDirection::Inward, "depends on", "PROJ-3", Some(123)), // met (resolved)
         ];
         let blockers = unmet_blockers(&links, &block_on, None);
         let ids: Vec<&str> = blockers.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["CLAUDE-9", "YT-40"],
+            vec!["PROJ-9", "TASK-40"],
             "only unmet blocking verbs, sorted"
         );
         assert_eq!(
             blocker_signature(&blockers),
-            "CLAUDE-9 (parent for); YT-40 (depends on)"
+            "PROJ-9 (parent for); TASK-40 (depends on)"
         );
     }
 
@@ -19485,9 +19457,9 @@ mod tests {
     #[tokio::test]
     async fn dependency_gate_blocks_comments_then_backs_off() {
         let pool = mem_pool().await;
-        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"YT-40","summary":"x"}]}]}"#;
+        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"TASK-40","summary":"x"}]}]}"#;
         let body = blocked_comment(&[Blocker {
-            id: "YT-40".into(),
+            id: "TASK-40".into(),
             verb: "depends on".into(),
         }]);
         let runner = Arc::new(
@@ -19521,7 +19493,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(st.signature, "YT-40 (depends on)");
+        assert_eq!(st.signature, "TASK-40 (depends on)");
         assert!(st.blocked_until_ms > state::now_epoch_ms());
 
         // Second eval within the backoff window: no read, no comment.
@@ -19530,7 +19502,7 @@ mod tests {
             .unwrap();
         match d2 {
             GateDecision::Blocked { blockers } => {
-                assert_eq!(blockers, vec!["YT-40 (depends on)".to_string()]);
+                assert_eq!(blockers, vec!["TASK-40 (depends on)".to_string()]);
             }
             _ => panic!("still blocked within backoff"),
         }
@@ -19644,7 +19616,7 @@ mod tests {
     #[tokio::test]
     async fn dependency_gate_met_proceeds_and_clears_state() {
         let pool = mem_pool().await;
-        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"YT-40","resolved":123}]}]}"#;
+        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"TASK-40","resolved":123}]}]}"#;
         let runner =
             Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
@@ -19655,7 +19627,7 @@ mod tests {
             "act",
             "MK-16",
             state::now_epoch_ms() - 1000,
-            "YT-40 (depends on)",
+            "TASK-40 (depends on)",
         )
         .await
         .unwrap();
@@ -19682,7 +19654,7 @@ mod tests {
     async fn dependency_gate_bypass_reads_live_and_proceeds_when_resolved() {
         let pool = mem_pool().await;
         // Live links now show the blocker resolved.
-        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"YT-40","resolved":123}]}]}"#;
+        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"TASK-40","resolved":123}]}]}"#;
         let runner =
             Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
@@ -19693,7 +19665,7 @@ mod tests {
             "act",
             "MK-16",
             state::now_epoch_ms() + 60_000,
-            "YT-40 (depends on)",
+            "TASK-40 (depends on)",
         )
         .await
         .unwrap();
@@ -19729,13 +19701,13 @@ mod tests {
     #[tokio::test]
     async fn dependency_gate_bypass_reads_live_but_still_blocks_when_open() {
         let pool = mem_pool().await;
-        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"YT-40","summary":"x"}]}]}"#;
+        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"TASK-40","summary":"x"}]}]}"#;
         let runner =
             Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
         let seeded_until = state::now_epoch_ms() + 60_000;
-        state::dependency_gate_upsert(&pool, "act", "MK-16", seeded_until, "YT-40 (depends on)")
+        state::dependency_gate_upsert(&pool, "act", "MK-16", seeded_until, "TASK-40 (depends on)")
             .await
             .unwrap();
 
@@ -19744,7 +19716,7 @@ mod tests {
             .unwrap();
         match d {
             GateDecision::Blocked { blockers } => {
-                assert_eq!(blockers, vec!["YT-40 (depends on)".to_string()]);
+                assert_eq!(blockers, vec!["TASK-40 (depends on)".to_string()]);
             }
             _ => panic!("still blocked on the open dependency"),
         }
@@ -19773,7 +19745,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(st.signature, "YT-40 (depends on)");
+        assert_eq!(st.signature, "TASK-40 (depends on)");
         assert!(
             st.blocked_until_ms > state::now_epoch_ms(),
             "still-blocked issue re-arms the backoff window"
@@ -19794,7 +19766,7 @@ mod tests {
             "act",
             "MK-16",
             state::now_epoch_ms() + 60_000,
-            "YT-40 (depends on)",
+            "TASK-40 (depends on)",
         )
         .await
         .unwrap();
@@ -19804,7 +19776,7 @@ mod tests {
             .unwrap();
         match d {
             GateDecision::Blocked { blockers } => {
-                assert_eq!(blockers, vec!["YT-40 (depends on)".to_string()]);
+                assert_eq!(blockers, vec!["TASK-40 (depends on)".to_string()]);
             }
             _ => panic!("scheduler replays the cached blocked decision"),
         }
@@ -20031,12 +20003,12 @@ mod tests {
         );
     }
 
-    /// CLAUDE-472 reproduction: an issue that accumulated an earlier, now
+    /// Reproduction: an issue that accumulated an earlier, now
     /// `closed` PR (e.g. #24, superseded) before a checkpoint push opened its
     /// current PR (#75) must still resume #75 on re-queue, even though the
     /// older row's `updated_at` is now the newest of the two (a human closed
-    /// #24 well after #75 was recorded, mirroring the real CLAUDE-469 timeline
-    /// this issue was filed from). Before the CLAUDE-472 fix to
+    /// #24 well after #75 was recorded, mirroring the real
+    /// timeline this was found in). Before the fix to
     /// `agent_pr_for_issue`'s ordering, this returned `None` and the caller
     /// opened a second PR for an issue that still had one open.
     #[tokio::test]
@@ -20206,7 +20178,7 @@ mod tests {
         assert!(notices[0].contains("AGit"), "{}", notices[0]);
     }
 
-    /// CLAUDE-472: an issue with no recorded PR at all (the common case: a
+    /// An issue with no recorded PR at all (the common case: a
     /// first-ever run) emits an operator-visible notice naming the issue key
     /// instead of returning `None` silently.
     #[tokio::test]
@@ -20224,8 +20196,8 @@ mod tests {
         assert!(notices[0].contains("no recorded PR"), "{}", notices[0]);
     }
 
-    /// CLAUDE-472: a recorded row already confirmed `merged`/`closed`
-    /// (CLAUDE-275's own earlier confirmation) still emits a notice naming the
+    /// A recorded row already confirmed `merged`/`closed`
+    /// (an earlier confirmation) still emits a notice naming the
     /// issue key and PR number on a later re-queue, instead of silently
     /// falling through to a fresh pickup with no operator-visible trace.
     #[tokio::test]
@@ -20263,7 +20235,7 @@ mod tests {
         assert!(notices[0].contains("merged"), "{}", notices[0]);
     }
 
-    /// CLAUDE-472: a failed open-PR lookup (the forge call itself erroring)
+    /// A failed open-PR lookup (the forge call itself erroring)
     /// still emits a notice naming the issue key, PR number, and error,
     /// instead of silently falling through to a fresh pickup.
     #[tokio::test]
@@ -20345,7 +20317,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-549: a PR merged at finalize has its freshly recorded row set
+    /// A PR merged at finalize has its freshly recorded row set
     /// to `merged`, so the reconciler never walks it or retires it `closed`.
     #[tokio::test]
     async fn mark_merged_at_finalize_sets_the_recorded_row_merged() {
@@ -20381,7 +20353,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-630: a PR promoted to ready at finalize (`Finalized::CodeReview`)
+    /// A PR promoted to ready at finalize (`Finalized::CodeReview`)
     /// has its row marked `finished`, so the automerge reconciler and the
     /// Action-Run webhook decision path stop re-syncing it.
     #[tokio::test]
@@ -20518,7 +20490,7 @@ mod tests {
     }
 
     /// `process_job`'s `salvaged` flag follows the `finalize_res` variant: set
-    /// for `Finalized::TimedOut`, clear for `Finalized::CodeReview` (CLAUDE-429).
+    /// for `Finalized::TimedOut`, clear for `Finalized::CodeReview`.
     #[tokio::test]
     async fn record_new_pr_flags_salvaged_for_a_timed_out_outcome() {
         let pool = mem_pool().await;
@@ -20549,7 +20521,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-472 ACC #4: a checkpoint push mid-run (CLAUDE-448) records its
+    /// a checkpoint push mid-run records its
     /// PR as `open` directly from `run_checkpoint_watcher`, independently of
     /// `finalize`. In `process_job`, every post-finalize `agent_pull_requests`
     /// write (`record_new_pr`, `clear_salvaged_for_resume`) is gated on
@@ -20623,7 +20595,7 @@ mod tests {
 
     /// A resumed run that finishes successfully clears a prior timeout's
     /// `salvaged` flag, which is exactly what unblocks the next automerge
-    /// decision (CLAUDE-429); `apply_automerge_decision`'s own tests already
+    /// decision; `apply_automerge_decision`'s own tests already
     /// show an unflagged, green, mergeable PR proceeds to merge.
     #[tokio::test]
     async fn clear_salvaged_for_resume_clears_the_flag_on_success() {
@@ -20670,7 +20642,7 @@ mod tests {
 
     /// A failed clear (simulated by hiding the table the way
     /// `webhook_finish_run_finish_failure_is_logged_and_retried` in
-    /// `web/webhooks.rs` does) is logged at `error` naming CLAUDE-429 and the
+    /// `web/webhooks.rs` does) is logged at `error` naming the
     /// PR id, and leaves the flag set once the table is back: automerge stays
     /// blocked rather than silently retrying.
     #[tokio::test]
@@ -20782,7 +20754,7 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-440: startup reconcile of stranded `run_inflight_jobs` rows ----
+    // ---- startup reconcile of stranded `run_inflight_jobs` rows ----
 
     /// A minimal, valid `kind: youtrack` action file on disk (default
     /// `custom_field` "AI Agent", default `states`), named by `name`.
@@ -21171,7 +21143,7 @@ mod tests {
                 && c.contains("limits.max_attempts_per_key")),
             "{calls:?}"
         );
-        // CLAUDE-373 (`actions/SCHEMA.md`): the attempt-cap park never writes
+        // Per `actions/SCHEMA.md`: the attempt-cap park never writes
         // the Needs-Info tag, whether reached at pickup or from this sweep.
         assert!(!calls.iter().any(|c| c.contains("tag add")), "{calls:?}");
     }
@@ -21240,14 +21212,14 @@ mod tests {
 
     /// A single `yt issue history --json` entry changing `AI Agent` to
     /// `Working` at `timestamp_ms`, in the shape `CliBackend::field_changed_at`
-    /// parses (CLAUDE-612).
+    /// parses.
     fn working_history_json(timestamp_ms: i64) -> String {
         format!(
             r#"[{{"timestamp":{timestamp_ms},"field":{{"name":"AI Agent"}},"added":[{{"name":"Working"}}]}}]"#
         )
     }
 
-    /// CLAUDE-612: a `Working` issue with no local in-flight row, but whose
+    /// A `Working` issue with no local in-flight row, but whose
     /// latest change to `Working` is only 10 minutes old (inside the default
     /// action's 600s timeout + 600s grace = 1200s window), is left alone: no
     /// write, no `run_events` row. A different runner instance may still own
@@ -21305,7 +21277,7 @@ mod tests {
         assert!(events.is_empty(), "{events:?}");
     }
 
-    /// CLAUDE-612: the same shape, but the latest change to `Working` is
+    /// The same shape, but the latest change to `Working` is
     /// older than the window (25 minutes, past the default 1200s window), so
     /// the issue is corrected to `Queued` as it would have been before this
     /// change.
@@ -21366,7 +21338,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-614: a `Working` issue a reachable peer lists in flight is left
+    /// A `Working` issue a reachable peer lists in flight is left
     /// alone (no history read, no write), even past the owner window.
     #[tokio::test]
     async fn reconcile_stuck_working_leaves_a_peer_listed_issue_alone() {
@@ -21397,7 +21369,7 @@ mod tests {
         assert!(!calls.iter().any(|c| c.contains("history")), "{calls:?}");
     }
 
-    /// CLAUDE-614: an issue in no peer's list (the peer lists a different key)
+    /// An issue in no peer's list (the peer lists a different key)
     /// is corrected exactly as before.
     #[tokio::test]
     async fn reconcile_stuck_working_still_corrects_an_issue_no_peer_lists() {
@@ -21458,7 +21430,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-612: a `field_changed_at` read failure leaves the issue on
+    /// A `field_changed_at` read failure leaves the issue on
     /// `Working` (no write) and is retried next tick, exactly like the other
     /// read failures in this loop.
     #[tokio::test]
@@ -21506,7 +21478,7 @@ mod tests {
         assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
     }
 
-    /// CLAUDE-612: no recorded change to `Working` at all (`field_changed_at`
+    /// No recorded change to `Working` at all (`field_changed_at`
     /// returns `None`, e.g. the issue was created directly in that state) is
     /// corrected exactly as before the owner-window change.
     #[tokio::test]
@@ -21563,7 +21535,7 @@ mod tests {
         );
     }
 
-    // --- CLAUDE-449: the post-success review session ---
+    // --- the post-success review session ---
 
     const REVIEW_RESULT_OK: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.1}"#;
 
@@ -21684,7 +21656,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-621: both marker files are removed from the workdir after the
+    /// Both marker files are removed from the workdir after the
     /// outcome is captured, so a subsequent push gate scanning the tree
     /// cannot trip on their content.
     #[test]
@@ -21720,7 +21692,7 @@ mod tests {
         assert!(!dir.path().join(REVIEW_FAIL_MARKER).exists());
     }
 
-    /// CLAUDE-621: em-dashes in agent-written narrative are replaced before
+    /// Em-dashes in agent-written narrative are replaced before
     /// they ride the outcome into PR / issue comments. The raw file content
     /// may still have them while the file briefly exists, but every consumer
     /// of the marker reads through `sanitize_marker_content`.
@@ -21730,7 +21702,7 @@ mod tests {
         repo_with_commit(dir.path());
         let scratch = tempfile::tempdir().unwrap();
         // The agent's narrative uses an em-dash in a bullet, exactly like
-        // the SF-815 / SF-789 / SF-800 failures.
+        // earlier real failures.
         let stub = review_stub(
             scratch.path(),
             &format!(
@@ -21764,7 +21736,7 @@ mod tests {
         );
         assert!(text.contains("file.rs:42 - checked"), "got: {text:?}");
         // Also sanity-check a bare, no-space em-dash is still replaced
-        // (common in the SF-815-style narrative).
+        // (common in agent narratives).
         let bare = sanitize_marker_content("line1\u{2014}line2");
         assert_eq!(bare, "line1-line2");
     }
@@ -22015,7 +21987,7 @@ mod tests {
         );
     }
 
-    // --- CLAUDE-580 / SPEC-3.12 item 9: discard-and-retry-once ---
+    // --- SPEC-3.12 item 9: discard-and-retry-once ---
 
     #[test]
     fn run_review_session_with_retry_discards_a_modified_tracked_file_then_promotes_on_pass() {
@@ -22257,7 +22229,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-471: `build_review_prompt` resolves every `{{...}}` placeholder
+    /// `build_review_prompt` resolves every `{{...}}` placeholder
     /// it uses and still names both marker files and the read-only
     /// constraint (asserted on resolved values, never on the sweep
     /// instruction's own wording - that would certify prose).
@@ -22415,7 +22387,7 @@ mod tests {
         assert!(matches!(no_verdict, ReviewOutcome::NoVerdict(ref t) if t == "no marker written"));
     }
 
-    /// CLAUDE-471 criterion: a fail marker written alongside all-satisfied
+    /// Criterion: a fail marker written alongside all-satisfied
     /// criteria (the sweep is the only thing finding a problem) still yields
     /// `ReviewOutcome::Fail` and the existing fail routing - no new routing
     /// is needed for the new fail reason.
@@ -22457,7 +22429,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-449 criterion: a review pass promotes the draft PR to ready and
+    /// Criterion: a review pass promotes the draft PR to ready and
     /// folds the verdict notes into the success comment's "## Review" section.
     #[test]
     fn finalize_review_pass_promotes_pr_and_names_review_in_the_success_comment() {
@@ -22606,7 +22578,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-456: a failed promotion (no canned `pr edit` response) is logged
+    /// A failed promotion (no canned `pr edit` response) is logged
     /// and named in the success comment; the issue still reaches Code Review.
     #[test]
     fn finalize_names_a_failed_draft_promotion_in_the_success_comment() {
@@ -22736,7 +22708,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-449 criterion: a review fail below the attempt cap leaves the
+    /// Criterion: a review fail below the attempt cap leaves the
     /// PR a draft, posts the findings on the PR and the issue, and requeues
     /// (AI Agent=Queued) rather than failing the run outright.
     #[test]
@@ -22894,7 +22866,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-611: tracker fake that records every write in order.
+    /// Tracker fake that records every write in order.
     #[derive(Default)]
     struct AuditFake {
         tags: Vec<String>,
@@ -22999,7 +22971,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-611: forge fake that opens PR 7 and records promotions and
+    /// Forge fake that opens PR 7 and records promotions and
     /// PR comments.
     #[derive(Default)]
     struct ReviewForge {
@@ -23098,7 +23070,7 @@ mod tests {
         .unwrap()
     }
 
-    /// CLAUDE-611: an audit review Fail files one tagged, linked, queued
+    /// An audit review Fail files one tagged, linked, queued
     /// follow-up, promotes the PR, posts the findings on the PR and the issue,
     /// and moves the Epic to Code Review instead of re-queueing it.
     #[test]
@@ -23164,7 +23136,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-611 loop guard: a follow-up's own review Fail files nothing
+    /// Loop guard: a follow-up's own review Fail files nothing
     /// and keeps the draft-and-requeue disposition.
     #[test]
     fn audit_review_fail_on_a_followup_files_no_further_followup() {
@@ -23188,7 +23160,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-611: a non-audit action's review Fail is unchanged.
+    /// A non-audit action's review Fail is unchanged.
     #[test]
     fn non_audit_review_fail_is_unchanged() {
         let tracker = AuditFake::epic();
@@ -23204,7 +23176,7 @@ mod tests {
         assert_eq!(forge.pr_comments.lock().unwrap().len(), 1);
     }
 
-    /// CLAUDE-611: an Epic with no `Audit-<Type>` tag cannot be followed up;
+    /// An Epic with no `Audit-<Type>` tag cannot be followed up;
     /// the cause is named, nothing is created, and the issue parks.
     #[test]
     fn audit_review_fail_without_an_audit_tag_parks_and_names_the_cause() {
@@ -23237,7 +23209,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-611: the follow-up goes through `AuditedTracker`, so the run's
+    /// The follow-up goes through `AuditedTracker`, so the run's
     /// issue-creation cap applies and a refusal is surfaced, not swallowed.
     #[test]
     fn audit_followup_is_capped_by_the_audited_tracker() {
@@ -23265,7 +23237,7 @@ mod tests {
         assert!(comment.contains("could not be filed"), "{comment}");
     }
 
-    /// CLAUDE-611: a follow-up created but not finished (tag write failed) is
+    /// A follow-up created but not finished (tag write failed) is
     /// never queued, is named in the comment, and the Epic parks.
     #[test]
     fn audit_followup_partial_failure_is_not_queued_and_is_named() {
@@ -23301,7 +23273,7 @@ mod tests {
         assert!(forge.ready.lock().unwrap().is_empty());
     }
 
-    /// CLAUDE-611: the audit review prompt keeps the read-only contract and
+    /// The audit review prompt keeps the read-only contract and
     /// marker protocol, and asks for `file:line - what is missing` lines.
     #[test]
     fn audit_review_prompt_is_read_only_and_names_markers_and_evidence() {
@@ -23332,7 +23304,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-449 criterion: the same review fail AT the attempt cap parks
+    /// Criterion: the same review fail AT the attempt cap parks
     /// the issue at Needs Review instead of requeueing it forever.
     #[test]
     fn finalize_review_fail_at_cap_parks_at_needs_review() {
@@ -23471,7 +23443,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-449 criterion: a `NoVerdict` (no marker, both markers, timeout,
+    /// Criterion: a `NoVerdict` (no marker, both markers, timeout,
     /// or a workdir-touching review) always parks at Needs Review, even
     /// below the attempt cap, since there is no reviewer opinion to act on.
     #[test]
@@ -23618,7 +23590,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-545: a NoVerdict whose cause string names the "read-only by
+    /// A NoVerdict whose cause string names the "read-only by
     /// contract" invariant is the review-modified-workdir case and ends
     /// in the DeliveryBlocked{ReviewModifiedWorkdir} terminal state, not
     /// the generic ReviewFailed used by other NoVerdict causes. Keeps the
@@ -23779,7 +23751,7 @@ mod tests {
     /// `DeliveryBlockedReason`, without extending this match is a compile
     /// error, so a finalize path can never ship uncovered by this table.
     ///
-    /// `DeliveryBlocked` (CLAUDE-545) is a refinement layered on top of the
+    /// `DeliveryBlocked` is a refinement layered on top of the
     /// item 3 table after it was written: each reason substitutes for the
     /// table row it replaces (named per-arm below) with an operator
     /// label that falls back to `Needs Review`, and carries its own single
@@ -23793,11 +23765,11 @@ mod tests {
             Finalized::NeedsReview => "Needs Review",
             // row: "marker `.claude-run-no-code-change`"
             Finalized::NoCodeChange => "done label",
-            // row: "split-only attempt, pieces queued" (CLAUDE-617)
+            // row: "split-only attempt, pieces queued"
             Finalized::Split { .. } => "done label",
             // row: "success, verification gate and review pass"
-            // (CLAUDE-549's `merged` flag never changes the field itself;
-            // CLAUDE-327: a YouTrack workflow resolves the issue on merge)
+            // (the `merged` flag never changes the field itself;
+            // A YouTrack workflow resolves the issue on merge)
             Finalized::CodeReview { .. } => "Code Review",
             // row: "success, gate failed" (pr_step = "verify")
             // row: "push or PR create failed, other cause", at the cap
@@ -23807,7 +23779,7 @@ mod tests {
             } => "Failed",
             // row: "push or PR create failed, other cause", below the cap
             Finalized::Failed { requeued: true, .. } => "Queued",
-            // row: "timeout or cancel with commits" (CLAUDE-379 salvage)
+            // row: "timeout or cancel with commits" (salvage)
             Finalized::TimedOut { .. } => "Needs Review",
             // row: "review fail marker", below the cap
             Finalized::ReviewFailed { requeued: true, .. } => "Queued",
@@ -24048,7 +24020,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-656: the not-mergeable comment names the PR's own forge and its
+    /// The not-mergeable comment names the PR's own forge and its
     /// forge's word for an unfinished PR.
     #[test]
     fn not_mergeable_comment_names_the_prs_own_forge() {

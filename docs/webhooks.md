@@ -2,9 +2,9 @@
 
 ## Webhook (Forgejo or GitHub)
 
-**CLAUDE-361: the route carries an explicit `{provider}` segment.** The CI-failure listener now lives at
+**the route carries an explicit `{provider}` segment.** The CI-failure listener now lives at
 `POST /webhooks/{provider}/triage/<source>` and the comment listener at `POST /webhooks/{provider}/comment/<source>`,
-with `{provider}` naming the sending forge: `forgejo` or `github` (CLAUDE-362 adds `github`). Each source's own
+with `{provider}` naming the sending forge: `forgejo` or `github`. Each source's own
 `provider` config field, not the URL, is authoritative - a request against `/webhooks/github/<segment>` for a source
 configured `provider: forgejo` 404s the same way an unconfigured source does. This replaces the earlier
 `/webhooks/forgejo/<source>` and `/webhooks/forgejo-comment/<source>` paths, and the synthetic action names moved with
@@ -17,13 +17,13 @@ automatically at the next `serve` start.
 The daemon turns a Forgejo `action_run_failure` delivery into a triaged YouTrack issue in seconds. The pipeline is
 `POST /webhooks/forgejo/triage/<source>` (HMAC-verified, replay-protected, rate-limited) -> internal-route log fetch +
 redaction -> hybrid triage -> issue mint, all inside the running daemon. The webhook is the only path that turns a CI
-failure into an issue: nothing has polled for CI failures since CLAUDE-279 retired the scheduled CI-failure actions,
+failure into an issue: nothing polls for CI failures now that the scheduled CI-failure actions are retired,
 so a delivery the daemon never processes (daemon down, hook misconfigured, or dropped while paused) is not picked up
 later.
 
-**CLAUDE-273: dedupe is a database lookup by failing-test overlap, not a YouTrack search.** Before triage runs, the
-webhook consumer fingerprints the redacted log (`ci_failure::fingerprint`, the same cargo-test-output parser CLAUDE-272
-introduced for the `ci_failure` store) into a set of `<target>::<test>` ids, or a single infra/signature id when nothing
+**dedupe is a database lookup by failing-test overlap, not a YouTrack search.** Before triage runs, the
+webhook consumer fingerprints the redacted log (`ci_failure::fingerprint`, the same cargo-test-output parser the
+`ci_failure` store uses) into a set of `<target>::<test>` ids, or a single infra/signature id when nothing
 cargo-shaped parses, and looks it up in `ci_failures` by `(repo, workflow_id, job_name)` overlap:
 
 - **A hit on an `open` row** attaches this run (`attach_run`, `add_tests` for any new failing test, a comment naming the
@@ -43,12 +43,12 @@ for a duplicate or a resolved issue: dedupe is entirely the caller's job now. Th
 falling back to `hash(repo, branch, workflow_id, job_name)` with no derivable signature), because the legacy-adoption
 lookup above still reads it.
 
-**CLAUDE-274: a new failure gets one tool-using analysis at ingest, on a bounded worker pool.** A failure the store does
+**a new failure gets one tool-using analysis at ingest, on a bounded worker pool.** A failure the store does
 not already track (the `none` / `pr_only` case above) is analyzed by `AnalysisClassifier`: one `claude` session with
 `Read,Grep,Bash` over the COMPLETE redacted log and the failing workflow YAML, in its own
 `webhook-logs/analysis/<owner>_<repo>-run<N>/` working directory (removed once the session ends), timeout
 `config.webhook.analysis_timeout_secs` (default 600s). This replaces the old split between a tool-less classifier at
-ingest (bounded to a 48 KiB copy of the log) and a separate scheduled deep-analysis action (retired in CLAUDE-279) that
+ingest (bounded to a 48 KiB copy of the log) and a separate scheduled deep-analysis action (retired) that
 ran later over the full log with no way to route the failure: the analysis and the routing decision now come from the
 same session.
 The prompt ends with a fenced JSON verdict, `{"verdict": "code_defect" | "needs_human" | "flaky" | "infra", ...}`,
@@ -63,7 +63,7 @@ loop) or an unbounded number starting together. The store lookup, analysis, and 
 under a `concurrency::KeyGate` keyed on `(repo, workflow_id, job_name)`: a second failure of the same job waits for the
 first's gate to release, then matches its store row and attaches instead of starting a second analysis.
 
-**CLAUDE-264: a host condition keys without the branch, for the `Dedupe-Key:` marker and the legacy lookup alike.** The
+**a host condition keys without the branch, for the `Dedupe-Key:` marker and the legacy lookup alike.** The
 collapse key normally folds in `branch`, which is right for a code failure (two unrelated bugs on two branches must
 not merge, and the auto-fix route needs one branch to deliver onto) and wrong for a failure that is a property of the
 RUNNER. A full disk is identical on every branch and fixable on none of them, so keying on it would mint (or search
@@ -78,16 +78,16 @@ deliberately conservative kinds, each requiring an unambiguous phrase: `disk-ful
 handling) never matches, whether that test passed or failed; only text the runner or toolchain itself emitted as a
 diagnostic counts. An over-broad pattern would merge unrelated code failures across branches, so an undetected
 condition is the preferred failure mode. The `ci_failure` store dedupes an infra failure the same way as a code failure
-now (by its `infra:<kind>` fingerprint id, CLAUDE-272's `fingerprint::fingerprint`), so the branch-agnostic collapse
+now (by its `infra:<kind>` fingerprint id, `fingerprint::fingerprint`), so the branch-agnostic collapse
 described here matters mainly to the legacy-adoption fallback, not to the primary path.
 
-Routing changes only for `runner-unavailable` (CLAUDE-266): `triage_rules` runs the detector before its transient scan and
+Routing changes only for `runner-unavailable`: `triage_rules` runs the detector before its transient scan and
 routes that kind to `human_action` with no LLM call, so an unreachable registry mints one grouped, human-assigned issue
 instead of vanishing as transient. `could not resolve host` is no longer a transient signature; a bare `connection reset`
 with no registry on the line stays transient. Every other infra failure is still classified and assigned the same way,
 because reclaiming disk is a human action.
 
-The listener is multi-source (CLAUDE-87): each `<source>` is a `[webhook.sources.<source>]` config block with its own
+The listener is multi-source: each `<source>` is a `[webhook.sources.<source>]` config block with its own
 HMAC secret and allow-list, served at its own URL path. One Forgejo org webhook per source means a leaked org secret
 authenticates only that org's allow-listed payloads, and each source has its own rate-limit bucket so one org's failure
 storm cannot rate-starve another's deliveries. The replay window is shared across sources (the `X-Forgejo-Delivery` id
@@ -99,26 +99,26 @@ mints an issue and sets `AI Agent = Queued` so the runner opens the fix PR; a fa
 e.g. a main-branch / tag / release / missing-secret failure) mints a human-assigned issue with no PR; a transient /
 infra / flaky failure (`transient`) mints nothing, except a `runner-unavailable` infra failure, which is `human_action`. The reused per-key + daily caps throttle a storm of failures; the daily cap is `config.webhook.max_runs_per_day` (default 20, at least 1), editable on the Settings page and applied to the next event with no restart.
 
-**CLAUDE-208: a stopped run is not a broken one.** Forgejo fires `action_run_failure` for every non-success done status, and it reports run-level `failure` for a run whose jobs were merely CANCELLED, which is what a newer push to the same ref produces when it supersedes an in-flight run. The run-level status alone therefore cannot tell a broken build from a stopped one, so the consumer reads the per-job statuses that come back with the log: when no job failed and every job ended `cancelled` or `skipped`, the delivery is acked and the run closed with a summary naming those statuses, with no triage and no issue. Any other status set (including an all-`success` run under a run-level `failure`) still triages and mints, and a job list that did not resolve at all (a rejected log token, a pruned run) fails open and mints as before.
+**a stopped run is not a broken one.** Forgejo fires `action_run_failure` for every non-success done status, and it reports run-level `failure` for a run whose jobs were merely CANCELLED, which is what a newer push to the same ref produces when it supersedes an in-flight run. The run-level status alone therefore cannot tell a broken build from a stopped one, so the consumer reads the per-job statuses that come back with the log: when no job failed and every job ended `cancelled` or `skipped`, the delivery is acked and the run closed with a summary naming those statuses, with no triage and no issue. Any other status set (including an all-`success` run under a run-level `failure`) still triages and mints, and a job list that did not resolve at all (a rejected log token, a pruned run) fails open and mints as before.
 
-**CLAUDE-276: a failure on an open PR routes by who opened the PR, not by matching a bot login.** Before triage runs,
+**a failure on an open PR routes by who opened the PR, not by matching a bot login.** Before triage runs,
 the consumer resolves whether the failing commit itself is the head of some open PR (`resolve_open_pr`, listing the
 repo's open PRs and matching by `head_sha`); a lookup failure is never read as "no PR" - it fails the run (`ok =
-false`) with an `error` log, and nothing is minted or commented, because the old CLAUDE-149 `resolve_has_open_pr`
+false`) with an `error` log, and nothing is minted or commented, because the old `resolve_has_open_pr`
 degrading a forge error to "no PR" is exactly the kind of silent miss this issue closes. `None` (no open PR at all,
 e.g. a push to `main`) runs the ordinary store-match / triage / mint pipeline below unchanged. `Some(pr)` routes by
 whether `agent_pull_requests` has an `open` row for `(host, repo, pr.number)`:
 
 - **The agent's own PR** (an `open` `agent_pull_requests` row): below `config.webhook.agent_pr_fix_attempts` (default
   3), the run comments the recorded issue with the run link, the failing tests, and the analysis, bumps
-  `fix_attempts`, and sets `AI Agent = Queued` so the runner picks the SAME issue back up on the SAME branch (CLAUDE-275)
+  `fix_attempts`, and sets `AI Agent = Queued` so the runner picks the SAME issue back up on the SAME branch
   instead of a second issue ever being filed for it. At the ceiling, the issue is flagged `AI Agent = Needs Review`
   instead, with a comment listing every fix attempt's run and every distinct failing-test set seen on the PR. A
-  failure whose fingerprint repeats the immediately preceding attempt's unchanged (CLAUDE-371, the loop-breaker) also
+  failure whose fingerprint repeats the immediately preceding attempt's unchanged (the loop-breaker) also
   flags `Needs Review` instead of re-queueing, naming the decision needed (fix the recurring failure by hand, or
   re-queue once it no longer reproduces). Both of these `Needs Review` writes are the `SPEC-3.12` item 3 "CI
   remediation ceiling reached" table row, so both also tag `Needs-Info` (`mint.needs_info_tag`, default
-  `Needs-Info`). One exception (CLAUDE-551): when this failure's tests overlap none of the earlier attempts' on the
+  `Needs-Info`). One exception: when this failure's tests overlap none of the earlier attempts' on the
   PR (the agent fixed what it was asked to and a different test tripped), it gets one more attempt, up to
   `config.webhook.agent_pr_fix_attempts_hard_cap` (default 6). Each re-queue logs a `run_events` row on
   `webhook-triage` saying whether it was a normal or an extended attempt. Either way: no PR comment, no new issue - the failure
@@ -129,7 +129,7 @@ whether `agent_pull_requests` has an `open` row for `(host, repo, pr.number)`:
   gets a PR comment naming the issue ("This failure is already tracked in \<KEY\>; it is not caused by this PR.") and
   the run attached, with no analysis (the failure is already fully triaged); sharing a failing test with a `pr_only`
   failure whose sightings now span two distinct branches means the failure belongs to `main`, not either PR, so an
-  issue is minted for real (triage + `mint::mint`, DEV-335 caps applied and advanced exactly like a fresh mint) and
+  issue is minted for real (triage + `mint::mint`, caps applied and advanced exactly like a fresh mint) and
   both PRs get a comment linking it; anything else (no store match at all) runs the analysis and comments it on the PR
   - always - then records a `pr_only` row (branch, PR number) with no issue yet, so a second branch hitting the same
   failure is what promotes it.
@@ -140,15 +140,15 @@ do. A source with none configured is a hard failure the moment a PR comment is n
 a `run_events` row naming the source, and the run finishes `ok = false` - it is never silently skipped.
 
 `mint::mint` itself no longer applies a bot-loop or open-PR guard of its own (the old `SkippedBotLoop` /
-`MintOutcome::SkippedOpenPr`, CLAUDE-149's `is_bot_loop`): the caller now decides open-PR routing, including the
+`MintOutcome::SkippedOpenPr`, and `is_bot_loop`): the caller now decides open-PR routing, including the
 agent's-own-PR case, before `mint` is ever reached. `config.mint.bot_logins` is unchanged and still used by the
 `/claude` PR-comment listener's own, separate bot-login check.
 
-**CLAUDE-360: the listener has its own `enabled` switch.** `config.webhook.enabled` defaults `false`; while off, `POST /webhooks/forgejo/triage/<source>` 404s every request regardless of `sources` (logged as `"webhook rejected: disabled"`, distinct from an unknown-source 404), ahead of any source lookup. A Settings save that sets it `true` is rejected unless `sources` is non-empty and every source carries `secret_ref`, naming every offending source, so "enabled" can never mean "accepting requests with no real authentication configured behind it." At `serve` start, a stored document with `sources` already configured but `enabled` unset (the state an upgrade from a version with no such flag deserializes to) logs one `warn` naming the section.
+**the listener has its own `enabled` switch.** `config.webhook.enabled` defaults `false`; while off, `POST /webhooks/forgejo/triage/<source>` 404s every request regardless of `sources` (logged as `"webhook rejected: disabled"`, distinct from an unknown-source 404), ahead of any source lookup. A Settings save that sets it `true` is rejected unless `sources` is non-empty and every source carries `secret_ref`, naming every offending source, so "enabled" can never mean "accepting requests with no real authentication configured behind it." At `serve` start, a stored document with `sources` already configured but `enabled` unset (the state an upgrade from a version with no such flag deserializes to) logs one `warn` naming the section.
 
-**CLAUDE-153/CLAUDE-273: the webhook is a configurable action.** It is named `webhook-triage` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings decides only whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) gets `AI Agent = Queued`. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check still creates an issue but with no `AI Agent` write, so no fixup PR is queued and the failure stays reported on the original PR for its author to fix in place (a `human_action` failure is unaffected either way); with it on, the corrective-fixup behavior above applies. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-triage` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/triage/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. A dropped delivery is not recovered after Resume. CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
+**The webhook is a configurable action.** It is named `webhook-triage` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings decides only whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) gets `AI Agent = Queued`. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check still creates an issue but with no `AI Agent` write, so no fixup PR is queued and the failure stays reported on the original PR for its author to fix in place (a `human_action` failure is unaffected either way); with it on, the corrective-fixup behavior above applies. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-triage` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/triage/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. A dropped delivery is not recovered after Resume. The GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
 
-A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an explicit `repo_project_map` override, then
+A minted issue is routed to a YouTrack project in this order: an explicit `repo_project_map` override, then
 the project whose **enabled VCS integration** claims the failing repo, then `fallback_project`. The VCS lookup is the
 primary mechanism: the repo-to-project binding already lives in YouTrack (each project's enabled `GiteaChangesProcessor`
 carries the forge `serverUrl` + `path`), so adding a repo to a project's VCS settings is the only step needed for
@@ -161,12 +161,12 @@ rather than disabling routing. The mint journal line names the routing source (`
 wrong destination is diagnosable.
 
 The webhook sources and the mint routing are edited on the **Settings** page (the `Webhook sources` and `Issue minting`
-sections, formerly `[webhook]` and `[mint]` in `config.toml`; CLAUDE-101), or over the API. Adding / editing a source (
-allow-list, rate limit, `secret_ref`, `log_token_ref`, `write_token_ref`) and the webhook `auto_fix` toggle (CLAUDE-153)
-take effect live, as do `agent_pr_fix_attempts` (CLAUDE-276, default 3) and `agent_pr_fix_attempts_hard_cap` (CLAUDE-551, default 6), applying to the next event; `replay_window_secs`
+sections, formerly `[webhook]` and `[mint]` in `config.toml`), or over the API. Adding / editing a source (
+allow-list, rate limit, `secret_ref`, `log_token_ref`, `write_token_ref`) and the webhook `auto_fix` toggle
+take effect live, as do `agent_pr_fix_attempts` (default 3) and `agent_pr_fix_attempts_hard_cap` (default 6), applying to the next event; `replay_window_secs`
 applies on restart. A mint edit is honored by the next event.
 
-### Resolving a CI-failure issue on merge (CLAUDE-277, CLAUDE-327)
+### Resolving a CI-failure issue on merge
 
 `POST /webhooks/forgejo/triage/<source>` accepts Forgejo `pull_request` deliveries, dispatched by the delivery's event-type
 header (`X-Forgejo-Event`, mirroring Gitea's `X-Gitea-Event`; a deployment must confirm this against its own Forgejo's
@@ -193,53 +193,53 @@ attach or a duplicate comment on an issue that is actually done.
 alongside the Action-run events it already sends, so the `agent_pull_requests` bookkeeping stays current. Every project
 the runner works must also have the YouTrack workflow attached, or an issue there stays open after its PR merges.
 
-### Event-driven automerge (CLAUDE-126, CLAUDE-278)
+### Event-driven automerge
 
 A `youtrack` action with `automerge.enabled: true` opts a successful run into merging its own PR once CI passes, instead
-of leaving it at Code Review for a human. Before CLAUDE-278, that wait was a blocking poll inside `finalize`: it held a
+of leaving it at Code Review for a human. Previously, that wait was a blocking poll inside `finalize`: it held a
 job slot for up to `automerge.wait_seconds` (1800s in the shipped action), and a suite slower than that budget - as
-happened for billing-service's ~25-minute integration suite (GAMMA-1174) - timed out with the PR left at Code Review and
+happened for billing-service's ~25-minute integration suite - timed out with the PR left at Code Review and
 nothing watching it afterward.
 
 `finalize` no longer waits for CI at all: a successful run opens the PR and stops at Code Review immediately, whether or
-not automerge is enabled. The one exception (CLAUDE-549) is a single status read, bounded by
+not automerge is enabled. The one exception is a single status read, bounded by
 `automerge.finalize_status_timeout_secs`, right after the PR is promoted: a PR whose CI is already green, whose branch
 is current and which is mergeable merges in that same tick. Otherwise the merge happens later, normally driven by a `success` or `recover` Action-run
 webhook event on `POST /webhooks/forgejo/triage/<source>` - the same endpoint the CI-failure listener uses, dispatched on the
 payload's `action` field rather than dropped as "non-failure" the way it used to be - and, as a backstop for a webhook
 that is missed, dropped, or delivered before the PR's `agent_pull_requests` row exists, by a reconciler pass on the
-daemon's own tick (CLAUDE-328, see below). Both entry points make the same decision through one shared function,
+daemon's own tick (see below). Both entry points make the same decision through one shared function,
 `apply_automerge_decision`. On a webhook event, the daemon:
 
 1. Finds the open PR (if any) whose head matches the run's commit.
-2. Looks it up in the `agent_pull_requests` store (CLAUDE-275); a PR the runner did not open, or one no longer marked
+2. Looks it up in the `agent_pull_requests` store; a PR the runner did not open, or one no longer marked
    `open` there, is left alone.
 3. Loads that PR's own action from disk to check `automerge.enabled`; if it is not (or the action no longer exists),
    nothing happens.
-4. Reads the PR's combined CI status (`fj pr status --json`, CLAUDE-309: including its `behind_base` field), and
+4. Reads the PR's combined CI status (`fj pr status --json`, including its `behind_base` field), and
    dispatches on `behind_base` first, because Forgejo's `mergeable` never reflects whether the branch is behind its
    base - the two are unrelated:
-   - **`behind_base` missing** (an `fj` predating FJ-99): takes no merge action, comments that the runtime's `fj` needs
+   - **`behind_base` missing** (an `fj` without `behind_base` support): takes no merge action, comments that the runtime's `fj` needs
      upgrading, and fails the run so the gap is visible rather than silently never automerging.
-   - **`behind_base: true`:** runs `fj pr update <repo>#<n> --style merge` (`Forge::update_pr_branch`, CLAUDE-309) to
+   - **`behind_base: true`:** runs `fj pr update <repo>#<n> --style merge` (`Forge::update_pr_branch`) to
      merge the base into the branch, instead of racing into Forgejo's 405 refusal to merge a behind-base PR. A
      successful update comments that the branch was updated and leaves the issue at Code Review; updating a branch
      retriggers CI, and the next `success` event tries again. A failed update (e.g. a real conflict) comments the
-     failure and fails the run. Before updating, the runner checks the action's `concurrency.max_ci_in_flight_per_repo`
-     (CLAUDE-535): it waits, with no comment and no update, while another PR's branch update on the repo is still in CI
+     failure and fails the run. Before updating, the runner checks the action's `concurrency.max_ci_in_flight_per_repo`:
+it waits, with no comment and no update, while another PR's branch update on the repo is still in CI
      or the repo's other runner PRs with CI pending are at the cap, so one merge to the base does not retrigger full CI
      on every open agent PR at once.
    - **`behind_base: false` and not mergeable** (a real conflict, still-checking, or a WIP PR): dispatches a
-     conflict-resolution run (CLAUDE-547) through the same CI cap as a branch update, and comments that the runner is
+     conflict-resolution run through the same CI cap as a branch update, and comments that the runner is
      resolving it. A WIP PR is skipped. With no run to send (no comment source covering the repo, a failed send), it
      comments that the PR is not mergeable, naming its own forge (Forgejo or GitHub), and leaves the issue at Code Review.
-   - **Checks failed and not mergeable** (CLAUDE-547): a non-WIP PR gets the same resolution run; with none to send,
+   - **Checks failed and not mergeable**: a non-WIP PR gets the same resolution run; with none to send,
      no action.
-   - **Conflict-resolution bound** (CLAUDE-550): resolution runs share one per-PR budget,
+   - **Conflict-resolution bound**: resolution runs share one per-PR budget,
      `webhook_comment.agent_conflict_resolve_attempts` (default 2, Settings), one run at a time. A spent budget on a
      PR that still conflicts parks the issue delivery-blocked (`unresolved-conflicts`) with the stuck files named.
    - **`behind_base: false` and mergeable:** merges it as a merge-commit and posts a "runner merged" comment; it makes
-     no `State` or `AI Agent` write (CLAUDE-327: the YouTrack workflow resolves the issue once it sees the merge, not
+     no `State` or `AI Agent` write (the YouTrack workflow resolves the issue once it sees the merge, not
      the runner). A merge failure here (Forgejo refusing for a reason `mergeable` did not predict) comments the failure
      and fails the run.
    - **Anything else** (checks not `success`): no action. There is no budget to exhaust and nothing to time out - a
@@ -249,18 +249,18 @@ Because the wait is event-driven, no job slot, timeout, or `check_interval_secon
 `automerge.wait_seconds` and `automerge.check_interval_seconds` are deprecated (parsed, for a still-loading action file,
 but otherwise ignored - one deprecation warning is logged per action at load if either is set away from its default).
 
-**Reconciler backstop (CLAUDE-328):** the webhook is the low-latency path, not the only one. Every
+**Reconciler backstop:** the webhook is the low-latency path, not the only one. Every
 `AUTOMERGE_RECONCILE_TICK_SECS` (300s) the daemon lists every `open` row in `agent_pull_requests`, skips any whose
 action is not a `youtrack` action or has automerge disabled, and runs the same `apply_automerge_decision` a webhook
 event would run - so a PR still merges within one tick even if its `success` event was never delivered, was dropped, or
 arrived before the PR's row was recorded. The reconciler is idempotent: a PR that is not yet green is left exactly where the
 webhook path would have left it, and a PR that `pr_status` reports as `merged` (or that the runner just merged) has its
-row marked `merged` so later ticks skip it (CLAUDE-331). Each tick also lists the forge's open PRs once per repo and
+row marked `merged` so later ticks skip it. Each tick also lists the forge's open PRs once per repo and
 marks a row `closed` when its PR is no longer listed (a PR closed without merge, for which `fj pr status` fails), so it is
-not asked about again (CLAUDE-334); a failed listing leaves that repo's rows `open` and is logged at `error`. The daemon's reconciler loop tracks, in memory, how many consecutive passes each `(host, repo)` listing has failed; the first later pass where that pair's listing succeeds logs at `info` and writes an `info` `run_events` row reading `automerge reconciler: list_open_prs for <repo> recovered after <n> failed pass(es)`, so a cleared fault is as visible as the fault itself (CLAUDE-365). The tracking is in-memory only, so a daemon restart never reports a false recovery for a failure that predates it. Every fault this pass or the webhook path can hit while a
+not asked about again; a failed listing leaves that repo's rows `open` and is logged at `error`. The daemon's reconciler loop tracks, in memory, how many consecutive passes each `(host, repo)` listing has failed; the first later pass where that pair's listing succeeds logs at `info` and writes an `info` `run_events` row reading `automerge reconciler: list_open_prs for <repo> recovered after <n> failed pass(es)`, so a cleared fault is as visible as the fault itself. The tracking is in-memory only, so a daemon restart never reports a false recovery for a failure that predates it. Every fault this pass or the webhook path can hit while a
 recorded, automerge-enabled PR is involved (a forge-host lookup failure, a `list_open_prs` failure, a failed action
 load, a failed `pr_status` call, a failed merge or branch update) is logged at `error`, written to `run_events`, and
-posted as a PR comment naming the failure, rather than left as a silent `warn`. A `pr_status` failure that repeats with an identical message for the same PR (for example `no commits in pr`) is still logged and recorded on every tick, but commented on the issue only once (CLAUDE-333); a changed message comments again.
+posted as a PR comment naming the failure, rather than left as a silent `warn`. A `pr_status` failure that repeats with an identical message for the same PR (for example `no commits in pr`) is still logged and recorded on every tick, but commented on the issue only once; a changed message comments again.
 
 **Operator setup:** each Forgejo webhook pointed at `/webhooks/forgejo/triage/<source>` should still send Action Run
 **Success** and **Recover** events, in addition to Failure, for any org running a `youtrack` action with automerge
@@ -268,7 +268,7 @@ enabled (see the migration note above), so a green PR merges within seconds rath
 reconciler tick. Without them, the reconciler is what keeps a PR opened by such an action from sitting at Code Review
 forever; automerge itself does not depend on the webhook.
 
-### Auto-fix for mechanically-fixable failures (CLAUDE-104)
+### Auto-fix for mechanically-fixable failures
 
 Some CI failures are verification-only and have a known, judgement-free fix. The canonical case is `cargo fmt --check`:
 the fix is `cargo fmt --all`. The general case is any failure of a configured checks workflow (default `check.yml`),
@@ -284,15 +284,15 @@ failing step). A match short-circuits to the `auto_fix` triage bucket, which rou
 queued issue, `AI Agent=Queued`, no human assignee) and never reaches the classifier prompt that would label it
 `human_action`. The minted issue's summary (`Auto-fix: cargo fmt on <repo> (run #N, <sha>)`) and description name the
 concrete problem, the fix command, and the delivery instruction: commit on a fresh `chore/<kind>-<short-sha>` branch
-and open a PR against `main` via the configured PR strategy (CLAUDE-103), never a direct push to main. In practice this
-mint only happens on a push with no open PR (a direct push to `main`, or a protected branch): CLAUDE-276's open-PR
+and open a PR against `main` via the configured PR strategy, never a direct push to main. In practice this
+mint only happens on a push with no open PR (a direct push to `main`, or a protected branch): the open-PR
 routing (above) decides everything before triage even runs when the failing commit IS on an open PR, so an auto-fix
 verdict there reaches a PR comment (as this issue's analysis) rather than a fresh mint - the agent's own PR is re-queued
 onto its existing issue instead, and a human's PR is left to its author with the fix described in the comment. Repeats
-of the same failure group by the CLAUDE-273 `ci_failure` store's failing-test overlap, not the commit SHA, so an
+of the same failure group by the `ci_failure` store's failing-test overlap, not the commit SHA, so an
 auto-fix failure that recurs on a later commit attaches to the same open issue instead of minting a sibling.
 
-### Cross-project closed-issue summaries (CLAUDE-218)
+### Cross-project closed-issue summaries
 
 The same runner can be used as a reporting tool rather than as an issue worker. The `closed-issue-summary` native action
 (`kind: closed-issue-summary`, `src/native/closed_issue_summary.rs`) answers "what did we close this week, across these
@@ -303,7 +303,7 @@ as a new issue, and links it to a nominated parent (typically the milestone bein
 It changes no code and opens no pull request. The run clones no repository and starts no agent session, so there is no
 forge call and no git call on any path, and the only writes are the tracker's: one `issue create`, one `issue link`, and
 one marker comment on the parent. That contract is why it is a separate action rather than a second job taught to
-`actions/youtrack.yml`, following the audit split of CLAUDE-215.
+`actions/youtrack.yml`, following the audit split.
 
 Parents come from `parents` (nominated by id, never field-written) unioned with whatever the optional `query` selects. A
 `query` must select an `AI Agent` value that `actions/youtrack.yml` does not, or the two actions race for the same
@@ -316,7 +316,7 @@ window.
 Configure it in `actions/closed-issue-summary.yml` (`parents` nominates the milestone, `projects` names what to count,
 `window_days` sets the window). See `actions/SCHEMA.md` (`kind: closed-issue-summary`).
 
-### Migration from the single-source listener (CLAUDE-87)
+### Migration from the single-source listener
 
 This is a **breaking config change**: the old top-level `webhook.secret_ref` / `webhook.allowed_repos` /
 `webhook.rate_limit_per_min` keys are gone, and `[webhook.sources.*]` is the only shape. A config still carrying an old
@@ -329,8 +329,8 @@ migration signal. To switch from the single SITE-level system webhook to one ORG
 2. In Forgejo, on each org's Settings -> Webhooks, add a **Forgejo** webhook with URL
    `https://<daemon-host>/webhooks/forgejo/triage/<source>`, Secret set to that org's stored value, and the Action Run Failure
    event selected. If any `youtrack` action in this org has `automerge.enabled: true`, also select Action Run Success
-   and Action Run Recover (CLAUDE-278: that is the low-latency trigger for merging once CI goes green - see
-   "Event-driven automerge" below; the CLAUDE-328 reconciler backstop merges within one tick either way, but the
+   and Action Run Recover (that is the low-latency trigger for merging once CI goes green - see
+   "Event-driven automerge" below; the reconciler backstop merges within one tick either way, but the
    webhook avoids that wait); otherwise leave them unselected so `success` / `recover` deliveries stay off the wire
    entirely (any that do arrive are acked and dropped, same as before).
 3. Replace the old `[webhook]` block in `config.toml` with the sources shape above and restart the daemon. It refuses to
@@ -339,7 +339,7 @@ migration signal. To switch from the single SITE-level system webhook to one ORG
 5. Verify: one failing run per org produces a `verified action_run_failure received` log line carrying the right`source`
    field. The old shared secret can be deleted after a burn-in period.
 
-### GitHub setup (CLAUDE-362)
+### GitHub setup
 
 A source's `provider` field, not the URL, decides which signature scheme and event names the listener expects; set
 `provider: github` on the source and point the URL at `https://<daemon-host>/webhooks/github/triage/<source>` instead
@@ -365,9 +365,9 @@ and one Pause switch, each keyed by its own `sources.<name>` entry.
    carrying the right `source` field.
 
 Fetching a GitHub-hosted run's own log (the text the triage classifier reads) goes over `gh`/the GitHub API for a
-`github.com` host; see the `GitHub log fetch (CLAUDE-363)` note in `actions/SCHEMA.md`.
+`github.com` host; see the `GitHub log fetch` note in `actions/SCHEMA.md`.
 
-## Peered instances (CLAUDE-615)
+## Peered instances
 
 With `peers.enabled` and at least one peer configured, an event delivered to this instance and to a peer (two targets
 of one forge hook) is processed by exactly one of them. After the pause and login gates and before dispatch, the

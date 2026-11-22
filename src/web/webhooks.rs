@@ -3,7 +3,7 @@
 //! `POST /webhooks/{provider}/triage/{source}` routes on the daemon's TCP app
 //! receive Action-run webhook deliveries. `{provider}` names the sending forge
 //! ([`WebhookProvider`]; `forgejo` and `github` are both implemented,
-//! CLAUDE-362 adding `github`). Each `{source}`
+//! with `github` added later). Each `{source}`
 //! names a configured [`crate::config::WebhookSource`] with its own HMAC
 //! secret, allow-list, and rate-limit bucket; the replay store is shared
 //! across sources (delivery ids are globally unique). The per-request
@@ -78,7 +78,7 @@ use crate::triage::{self, FailureClassifier, TriageInput};
 /// (per-key attempt counter + daily run ledger in [`crate::state`]), so the
 /// event-driven mint throttles on the same accounting shape as the scheduled
 /// actions instead of re-deriving its own. Renamed from the former
-/// `webhook-fast-path`, then from `webhook-forgejo` (CLAUDE-361, when the
+/// `webhook-fast-path`, then from `webhook-forgejo` (when the
 /// listener's route and name stopped being Forgejo-specific); a startup data
 /// migration (migration `0013` plus the log-dir rename in [`crate::daemon`])
 /// carries existing history across each rename.
@@ -863,7 +863,7 @@ pub struct MintContext {
     /// can exercise a PR-comment routing decision against a canned `fj`
     /// response with no real subprocess or network call.
     pub pr_comment_runner: Arc<dyn CommandRunner>,
-    /// Dispatch handle for the automerge conflict auto-resolve (CLAUDE-380):
+    /// Dispatch handle for the automerge conflict auto-resolve:
     /// the comment listener's command channel plus its live config, used to
     /// resolve which source covers `repo` and send a synthetic
     /// `/claude`-equivalent command on a conflict `update_pr_branch` failure.
@@ -871,7 +871,7 @@ pub struct MintContext {
     /// comment listener unconfigured) keeps today's "needs a human" comment
     /// behavior exactly.
     pub comment_dispatch: Option<CommentDispatch>,
-    /// CLAUDE-535: per `(host, repo)`, the PR whose behind-base branch update is
+    /// Per `(host, repo)`, the PR whose behind-base branch update is
     /// still in CI. In memory only: a restart losing it costs at most one
     /// extra update. Shared by the webhook trigger and the reconciler.
     pub ci_update_holders: Arc<crate::ci_gate::UpdateHolders>,
@@ -991,7 +991,7 @@ async fn process_event(
         // as its own `Copy` value for the bookkeeping calls below; `run` itself
         // (carrying the `RunGuard`) is threaded to whichever `finish_webhook_run`
         // call below actually closes the row, so a panic between here and there
-        // still closes it as `exit::UNEXPECTED` on drop (CLAUDE-402).
+        // still closes it as `exit::UNEXPECTED` on drop.
         let job_key = format!("{}#{}", ev.repo, ev.index_in_repo);
         let run = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
         let run_id = run.as_ref().map(|(id, _)| *id);
@@ -1338,7 +1338,7 @@ async fn source_log_token(
 /// strand the event consumer. The guard must be finished (or simply dropped)
 /// by the caller; a panic or early return between here and that point still
 /// closes the row as [`crate::exit::UNEXPECTED`] instead of leaving it open
-/// until the next daemon start (CLAUDE-402).
+/// until the next daemon start.
 ///
 /// `action` is a parameter so the comment listener records its runs
 /// through this same accounting rather than a forked copy.
@@ -1383,7 +1383,7 @@ pub(crate) async fn begin_webhook_run(
 /// carrying the human-readable `summary` (triage bucket + mint result, plus the
 /// redacted-log artifact path when present) and finalizes the run through its
 /// [`state::RunGuard`], so a failure here still leaves the row closed by the
-/// guard's `Drop` retry (CLAUDE-402) rather than open forever. `spend` is
+/// guard's `Drop` retry rather than open forever. `spend` is
 /// this delivery's own ledger: `None` for a path that never reached
 /// triage (nothing to bill), `Some` for every path that did, so `claude_ran` /
 /// `claude_ok` / `claude_cost_usd` reflect what the classification actually
@@ -2287,7 +2287,7 @@ fn write_and_post_pr_comment(
 
 /// Run triage (for its analysis text and bucket) and post the analysis as a
 /// PR comment through `env`'s write-scoped backend. Returns the analysis
-/// text and the triage bucket (SPEC-4.3.15 / CLAUDE-598), so a `pr_only` row
+/// text and the triage bucket (SPEC-4.3.15), so a `pr_only` row
 /// (no issue minted, hence no [`DecideOutcome::Mint`]) can still persist the
 /// bucket this triage computed.
 #[allow(clippy::too_many_arguments)]
@@ -2498,7 +2498,7 @@ async fn route_agent_pr_failure(
         }
     };
 
-    // CLAUDE-371: compare this attempt's fingerprint with the immediately
+    // Compare this attempt's fingerprint with the immediately
     // previous attempt's on the same PR before deciding whether to re-queue.
     // An empty fingerprint never counts as "same as before" (a genuinely
     // unparseable log would otherwise look identical to every other
@@ -2559,7 +2559,7 @@ async fn route_agent_pr_failure(
         // SPEC-3.12 item 3, "CI remediation ceiling reached" row, and item 6:
         // the comment names the one action (inspect and either fix by hand or
         // re-queue once resolved) instead of only stating that the loop was
-        // stopped (CLAUDE-582).
+        // stopped.
         let body = format!(
             "CI failed the same way as the previous attempt on this PR (branch `{branch}`); stopping the fix-attempt loop instead of re-queueing.\n- Repeated failing tests: {tests_display}\n- This run: {}\n- Previous run: {previous_link}\n- Inspect the repeated failure and fix it by hand, then re-queue the issue (set AI Agent = Queued) once it is resolved.",
             ev.html_url
@@ -2587,7 +2587,7 @@ async fn route_agent_pr_failure(
         let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
             backend.comment(&key, &body)?;
             // SPEC-3.12 item 3: this row's field value is "Needs Review with
-            // Needs-Info" (CLAUDE-582); best-effort, matching
+            // Needs-Info"; best-effort, matching
             // `report_cap_reached`'s independent-writes shape.
             let needs_info_tag = mint_cfg.needs_info_tag.trim();
             if !needs_info_tag.is_empty() {
@@ -2620,7 +2620,7 @@ async fn route_agent_pr_failure(
         };
     }
 
-    // CLAUDE-551: at the normal cap, a failure whose tests overlap none of
+    // At the normal cap, a failure whose tests overlap none of
     // the earlier attempts' on this PR (the agent fixed what it was asked to
     // and a different test tripped) gets one more attempt, up to the hard
     // cap. With no earlier fingerprint to compare against, or no test ids
@@ -2785,13 +2785,13 @@ async fn route_agent_pr_failure(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        // CLAUDE-545: the CI-fix attempt ceiling is a delivery-blocked
+        // The CI-fix attempt ceiling is a delivery-blocked
         // terminal state. The AI Agent label stays at Needs Review here
         // (MintConfig has no per-action YoutrackStates, so there is no
         // delivery-blocked label to route to from this path), but the
         // comment follows the delivery-blocked shape so the issue reads
         // the same way as the finalize-path blockers.
-        // CLAUDE-551: every distinct failing-test set seen on this PR, so the
+        // Every distinct failing-test set seen on this PR, so the
         // reader sees whether the agent kept tripping the same thing or a
         // new one each time.
         let mut signatures: Vec<String> = Vec::new();
@@ -2853,7 +2853,7 @@ async fn route_agent_pr_failure(
         let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
             backend.comment(&key, &body)?;
             // SPEC-3.12 item 3: this row's field value is "Needs Review with
-            // Needs-Info" (CLAUDE-582); best-effort, matching
+            // Needs-Info"; best-effort, matching
             // `report_cap_reached`'s independent-writes shape.
             let needs_info_tag = mint_cfg.needs_info_tag.trim();
             if !needs_info_tag.is_empty() {
@@ -4826,8 +4826,8 @@ async fn handle_action_success_for_pr(
 /// (`fj`) unchanged. Token is always `None`: `GithubForge` falls back to the
 /// daemon's stored `gh` login when constructed with no token,
 /// matching the per-job path's own behavior when an action sets no
-/// `github.token_ref`. Shared by the automerge webhook/reconciler and, since
-/// CLAUDE-406, the CI-failure triage path's own open-PR lookups
+/// `github.token_ref`. Shared by the automerge webhook/reconciler and
+/// the CI-failure triage path's own open-PR lookups
 /// ([`forge_for_event`]): every `list_open_prs` caller in this module needs
 /// the same `github.com` vs `fj` routing, so this stays the one helper rather
 /// than growing a second copy.
@@ -4850,7 +4850,7 @@ fn resolve_forge(
 
 /// Record this tick's automerge outcome (or fault) for `repo#pr_number` as a
 /// `run_events` row, keyed with the same `PR {repo}#{pr_number}: ` prefix
-/// [CLAUDE-333] used for the `pr_status` failure, so the previous tick's
+/// the `pr_status` failure uses, so the previous tick's
 /// outcome for this PR can be found regardless of which of the five sites
 /// produced it (`pr_status` failure, behind_base missing, branch-update
 /// failure, not-mergeable, merge failure), and post `body` to the issue only
@@ -4867,7 +4867,7 @@ struct AutomergePr<'a> {
     issue_key: &'a str,
 }
 
-/// CLAUDE-655: message heads (after the `PR <repo>#<n>: ` prefix) of the rows
+/// Message heads (after the `PR <repo>#<n>: ` prefix) of the rows
 /// `dispatch_conflict_auto_resolve` writes. They share the prefix but are not
 /// an automerge outcome, so the once-per-outcome comment dedupe must not read
 /// one as the "previous" outcome.
@@ -4920,7 +4920,7 @@ async fn record_automerge_outcome_and_comment_once(
 /// `hash(repo, pr_number, head_sha, attempt)`, forced negative so it never
 /// collides with a real (positive) Forgejo comment id in the dedupe / attempt
 /// key [`crate::web::comment_webhooks::command_key`] both routes share.
-/// `attempt` (CLAUDE-550) is the PR's 1-based resolve attempt, so a second
+/// `attempt` is the PR's 1-based resolve attempt, so a second
 /// attempt on an unchanged head commit (the first one pushed nothing) gets
 /// its own key instead of being refused as a redelivery. Clearing the
 /// digest's top bit before negating keeps the result in `i64`'s range
@@ -4946,9 +4946,9 @@ fn synthetic_conflict_comment_id(repo: &str, pr_number: u64, head_sha: &str, att
 /// SPEC-4.4.3: on an automerge conflict (`update_pr_branch` failure), dispatches a synthetic `/claude`-equivalent command to the comment listener instead of leaving a "needs a human" comment, when a [`MintContext::comment_dispatch`] handle is configured.
 /// On a conflict `update_pr_branch` failure, dispatch the same
 /// conflict-resolution run a human's `/claude merge from main and resolve any
-/// merge conflicts` PR comment would start (CLAUDE-380), when the forge error
+/// merge conflicts` PR comment would start, when the forge error
 /// says it is a conflict. See [`dispatch_conflict_auto_resolve`] for the
-/// per-PR bound (CLAUDE-550); a non-conflict error is
+/// per-PR bound; a non-conflict error is
 /// [`ConflictDispatch::Skipped`] and keeps the human comment.
 #[allow(clippy::too_many_arguments)]
 async fn try_dispatch_conflict_auto_resolve(
@@ -4968,8 +4968,7 @@ async fn try_dispatch_conflict_auto_resolve(
     dispatch_conflict_auto_resolve(mint, pool, host, repo, pr_number, pr_url, row, head_sha).await
 }
 
-/// What [`dispatch_conflict_auto_resolve`] did (CLAUDE-547, bounded per PR by
-/// CLAUDE-550).
+/// What [`dispatch_conflict_auto_resolve`] did (bounded per PR).
 #[derive(Debug, PartialEq, Eq)]
 enum ConflictDispatch {
     /// A resolve run was sent: attempt `attempt` of `cap` for this PR.
@@ -4987,14 +4986,14 @@ enum ConflictDispatch {
     Skipped,
 }
 
-/// CLAUDE-550: how long past the comment listener's own `claude` timeout a
+/// How long past the comment listener's own `claude` timeout a
 /// dispatched conflict auto-resolve run still counts as in flight. Covers the
 /// clone, the decision gate and the push around the session; a stamp older
 /// than timeout plus this margin belongs to a run that was dropped (busy
 /// thread, daily cap, a daemon restart) and no longer blocks the next attempt.
 const CONFLICT_RESOLVE_IN_FLIGHT_MARGIN_SECS: i64 = 900;
 
-/// CLAUDE-550: whether `started_at` (an RFC 3339 `now_iso` stamp) is still
+/// Whether `started_at` (an RFC 3339 `now_iso` stamp) is still
 /// within `window_secs` of now. An unparseable stamp is treated as stale so a
 /// bad value can never block auto-resolve forever.
 fn conflict_resolve_in_flight(started_at: Option<&str>, window_secs: i64) -> bool {
@@ -5008,7 +5007,7 @@ fn conflict_resolve_in_flight(started_at: Option<&str>, window_secs: i64) -> boo
 }
 
 /// The dispatch half of [`try_dispatch_conflict_auto_resolve`], for a caller
-/// that already knows the PR conflicts. CLAUDE-550 bounds it per PR rather
+/// that already knows the PR conflicts. It is bounded per PR rather
 /// than per head commit: at most
 /// `webhook_comment.agent_conflict_resolve_attempts` runs across the PR's
 /// life (counted on `row.conflict_resolve_attempts`), never two at once (an
@@ -5151,11 +5150,11 @@ enum ConflictRoute {
     Dispatched { attempt: i64, cap: u32 },
     /// This attempt's command key was already used.
     AlreadyAttempted,
-    /// CLAUDE-550: an earlier resolution run is still in flight.
+    /// An earlier resolution run is still in flight.
     InFlight,
-    /// CLAUDE-550: every attempt is spent; park the PR delivery-blocked.
+    /// Every attempt is spent; park the PR delivery-blocked.
     CapReached { attempts: i64, cap: u32 },
-    /// The CLAUDE-535 per-repo cap defers the push; the next pass asks again.
+    /// The per-repo cap defers the push; the next pass asks again.
     Deferred(String),
     /// Not a PR this routes: no conflict verdict, or a WIP/draft Forgejo PR
     /// that `fj` does not report as conflicted.
@@ -5164,7 +5163,7 @@ enum ConflictRoute {
     Skipped,
 }
 
-/// Look up one PR's draft flag in its repo's open-PR listing (CLAUDE-652),
+/// Look up one PR's draft flag in its repo's open-PR listing,
 /// the single draft definition shared by [`route_conflicting_pr`] and
 /// [`apply_automerge_decision`]. `Ok(None)` means the PR is absent from the
 /// listing; `Ok(Some(draft))` carries the forge's own `draft` flag, itself
@@ -5190,11 +5189,10 @@ async fn pr_draft_status(
     Ok(prs.iter().find(|p| p.number == pr_number).map(|p| p.draft))
 }
 
-/// CLAUDE-547: send one conflict-resolution run for a runner PR that reports
-/// `mergeable: false`, whatever its CI state, through the CLAUDE-535 per-repo
+/// Send one conflict-resolution run for a runner PR that reports
+/// `mergeable: false`, whatever its CI state, through the per-repo
 /// push cap. A Forgejo WIP/draft PR reports `mergeable: false` without
-/// conflicting, so it is routed only when `fj` reports `conflicted: true`
-/// (CLAUDE-572).
+/// conflicting, so it is routed only when `fj` reports `conflicted: true`.
 #[allow(clippy::too_many_arguments)]
 async fn route_conflicting_pr(
     mint: &MintContext,
@@ -5279,7 +5277,7 @@ async fn route_conflicting_pr(
 
 /// The outcome of one [`apply_automerge_decision`] call, typed so neither
 /// caller has to match on the summary text to tell a no-op pass from one that
-/// changed something (CLAUDE-397): [`reconcile_automerge`] opens a `runs` row
+/// changed something: [`reconcile_automerge`] opens a `runs` row
 /// only for [`AutomergeOutcome::Acted`] and `Err`, never for
 /// [`AutomergeOutcome::NoAction`], while [`handle_action_success_for_pr`] (the
 /// webhook delivery path) still records a row for both, since a delivery is a
@@ -5409,7 +5407,7 @@ async fn apply_automerge_decision(
             "PR's owning run ended Failed; automerge blocked".to_string(),
         ));
     }
-    // CLAUDE-630: once `finalize` has observed `Finalized::CodeReview` for
+    // Once `finalize` has observed `Finalized::CodeReview` for
     // this PR, the run that owns it is done: the PR was promoted to ready
     // and there is nothing left for the agent to do. Stop here with no
     // comment, so a finished PR does not keep accruing behind-base branch
@@ -5472,7 +5470,7 @@ async fn apply_automerge_decision(
         }
     };
 
-    // CLAUDE-595: the automerge state match below only routes a conflict when
+    // The automerge state match below only routes a conflict when
     // CI is already success or failure. A stale PR whose CI is still pending,
     // or a PR on an action with automerge disabled, never reaches that branch
     // and the conflict sits forever. When `conflicted: true`, run the same
@@ -5565,7 +5563,7 @@ async fn apply_automerge_decision(
             // `mergeable` alone cannot tell whether the branch is
             // behind base (Forgejo's `mergeable` ignores that entirely), so an
             // forge that does not report `behind_base` takes no merge action
-            // rather than guessing: `fj` predating FJ-99, or GitHub's lazily
+            // rather than guessing: an older `fj` without it, or GitHub's lazily
             // computed `mergeStateStatus` still `UNKNOWN`.
             None => {
                 let backend = if is_github_host(host, &github_cfg.hosts) {
@@ -5601,7 +5599,7 @@ async fn apply_automerge_decision(
                 Err(msg)
             }
             Some(true) => {
-                // CLAUDE-652: a draft the runner does not own mid-run (a
+                // A draft the runner does not own mid-run (a
                 // failed-review leftover) is never acted on here: no branch
                 // update, no comment of any kind, just one `info` log. A
                 // non-draft, `mergeable: true` PR never reports `behind_base`
@@ -5635,7 +5633,7 @@ async fn apply_automerge_decision(
                         return Err(msg);
                     }
                 }
-                // CLAUDE-535: bring the branch current only when CI capacity
+                // Bring the branch current only when CI capacity
                 // allows, so one merge to base does not retrigger full CI on
                 // every open agent PR at once. A wait takes no action and posts
                 // no comment; the next webhook or reconciler pass asks again.
@@ -5786,7 +5784,7 @@ async fn apply_automerge_decision(
                 }
             }
             Some(false) if status.mergeable != Some(true) => {
-                // CLAUDE-655: a draft with no conflict verdict (for example one
+                // A draft with no conflict verdict (for example one
                 // a no-verdict review left behind) reports `mergeable: false`
                 // and can never merge, so it gets no comment on any pass.
                 if status.conflicted != Some(true) {
@@ -6063,8 +6061,8 @@ async fn apply_automerge_decision(
     }
 }
 
-/// CLAUDE-550: the conflict auto-resolve cap is spent and the PR still
-/// conflicts with its base. Posts the CLAUDE-545 delivery-blocked comment
+/// The conflict auto-resolve cap is spent and the PR still
+/// conflicts with its base. Posts the delivery-blocked comment
 /// (`UnresolvedConflicts`), naming the files the last attempt could not
 /// resolve, and moves AI Agent to the action's `delivery_blocked` label
 /// (Needs Review when none is set), both once per unchanged outcome through
@@ -6123,8 +6121,8 @@ async fn park_unresolved_conflicts(
     )))
 }
 
-/// CLAUDE-550: the delivery-blocked comment for a PR whose conflicts the
-/// auto-resolve attempts could not clear: the CLAUDE-545 shape, then the
+/// The delivery-blocked comment for a PR whose conflicts the
+/// auto-resolve attempts could not clear: the shape, then the
 /// attempt count and the unresolved files (or a note that the last attempt
 /// reported none).
 fn unresolved_conflicts_comment(pr_url: &str, files: &[String], attempts: i64, cap: u32) -> String {
@@ -6329,7 +6327,7 @@ async fn list_open_pr_numbers(
     None
 }
 
-/// CLAUDE-556: the footer trigger for a comment a CI-failure webhook run posts.
+/// The footer trigger for a comment a CI-failure webhook run posts.
 fn ci_failure_trigger(index_in_repo: i64) -> crate::run_footer::Trigger {
     crate::run_footer::Trigger::WebhookEvent {
         source: format!("CI failure run #{index_in_repo}"),
@@ -6371,8 +6369,8 @@ async fn post_issue_comment(
     }
 }
 
-/// SPEC-4.4.3: posts the push-comment this run's branch write requires (CLAUDE-447), naming the event, issue, state and SHA range.
-/// Post the CLAUDE-447 `branch updated from base` PR comment after
+/// SPEC-4.4.3: posts the push-comment this run's branch write requires, naming the event, issue, state and SHA range.
+/// Post the `branch updated from base` PR comment after
 /// [`Forge::update_pr_branch`] succeeds. This is a server-side forge
 /// operation with no local clone to run `git log` against, so the new SHA
 /// and commit subjects are always [`crate::push_comment::CommitSubjects::Unavailable`];
@@ -6416,7 +6414,7 @@ async fn post_branch_updated_push_comment(
             progress: Some(&progress),
         };
         // A directory scoped to this one call, not the bare shared
-        // `std::env::temp_dir()` (CLAUDE-519): `push_comment::post` names its
+        // `std::env::temp_dir()`: `push_comment::post` names its
         // scratch file deterministically from `pr_number` and the event, so
         // two concurrent calls sharing a directory for the same PR (routing
         // decisions on the same PR racing, or just parallel tests driving
@@ -6954,7 +6952,7 @@ mod tests {
                 "create {project} assignee={}",
                 assignee.unwrap_or("-")
             ));
-            Ok("CLAUDE-99".to_string())
+            Ok("PROJ-99".to_string())
         }
         fn attach_file(&self, _key: &str, _file: &Path) -> crate::error::Result<()> {
             Ok(())
@@ -6982,7 +6980,7 @@ mod tests {
         /// tests. `None` (the default) errors, matching every pre-existing test
         /// that never reaches the automerge path.
         pr_status: StdMutex<Option<crate::provider::PrStatus>>,
-        /// Per-PR `pr_status` overrides (CLAUDE-535), consulted before `pr_status`.
+        /// Per-PR `pr_status` overrides, consulted before `pr_status`.
         pr_status_by_pr: StdMutex<std::collections::HashMap<u64, crate::provider::PrStatus>>,
         /// When set, `update_pr_branch` fails with this message.
         update_pr_branch_error: StdMutex<Option<String>>,
@@ -7049,7 +7047,7 @@ mod tests {
             self.with_pr_status_full(state, Some(mergeable), behind_base, None)
         }
         /// Full control over every [`crate::provider::PrStatus`] field,
-        /// including `head_sha` (CLAUDE-380's conflict-dispatch dedupe key).
+        /// including `head_sha` (the conflict-dispatch dedupe key).
         fn with_pr_status_full(
             self,
             state: &str,
@@ -7195,7 +7193,7 @@ mod tests {
             assignee: Option<&str>,
         ) -> crate::error::Result<String> {
             let mut next = self.next_key.lock().unwrap();
-            let key = format!("CLAUDE-{next}");
+            let key = format!("PROJ-{next}");
             *next += 1;
             self.calls.lock().unwrap().push(format!(
                 "create {project} {key} | {summary} | assignee={}",
@@ -7374,7 +7372,7 @@ mod tests {
     }
 
     /// Like [`failing_test_log`], carrying every id in `test_ids` as a failing
-    /// test on the same target (CLAUDE-371: used to exercise the
+    /// test on the same target (used to exercise the
     /// shrinking-set / different-set fingerprint comparisons, which need more
     /// than one failing test per attempt).
     fn failing_tests_log(target: &str, test_ids: &[&str], branch: &str) -> String {
@@ -7389,7 +7387,7 @@ mod tests {
 
     /// A log on `branch` whose only line is a formatter diff, so
     /// [`fingerprint::fingerprint`] parses an empty id set from it
-    /// (CLAUDE-371: the empty/unparseable-fingerprint fallback case). It is
+    /// (the empty/unparseable-fingerprint fallback case). It is
     /// still a code diagnostic, so it is not a SPEC-3.12 item 8
     /// `no-diagnostic` infrastructure failure.
     fn unparseable_log(branch: &str) -> String {
@@ -7759,7 +7757,7 @@ mod tests {
     struct SlowClassifier {
         delay: Duration,
         /// Hold each call until this many overlap, so a test of overlap does not
-        /// depend on the second call starting within `delay` (CLAUDE-507). A
+        /// depend on the second call starting within `delay`. A
         /// deadline keeps a real failure a failed assertion, not a hang.
         hold_for_peak: usize,
         live: std::sync::atomic::AtomicUsize,
@@ -7984,7 +7982,7 @@ mod tests {
             "ci.yml",
             "test",
             None,
-            Some("CLAUDE-40"),
+            Some("PROJ-40"),
             "resolved",
             None,
             now,
@@ -8025,7 +8023,7 @@ mod tests {
         )
         .await;
         assert!(result.ok, "{}", result.text);
-        assert!(result.text.contains("CLAUDE-40"), "{}", result.text);
+        assert!(result.text.contains("PROJ-40"), "{}", result.text);
 
         let calls = backend.calls();
         assert!(
@@ -8033,25 +8031,25 @@ mod tests {
             "no new issue: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c == "set_state CLAUDE-40 To do"),
+            calls.iter().any(|c| c == "set_state PROJ-40 To do"),
             "{calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c.starts_with("comment CLAUDE-40 | Regression")),
+                .any(|c| c.starts_with("comment PROJ-40 | Regression")),
             "{calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c.starts_with("comment CLAUDE-40 | Regression") && c.contains("Run: ")),
+                .any(|c| c.starts_with("comment PROJ-40 | Regression") && c.contains("Run: ")),
             "the regression comment carries the run footer: {calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c == "set_field CLAUDE-40 AI Agent Queued"),
+                .any(|c| c == "set_field PROJ-40 AI Agent Queued"),
             "AI Agent set exactly as a fresh code_fix issue would be: {calls:?}"
         );
 
@@ -8075,7 +8073,7 @@ mod tests {
             "ci.yml",
             "test",
             None,
-            Some("CLAUDE-41"),
+            Some("PROJ-41"),
             "open",
             None,
             now,
@@ -8110,17 +8108,17 @@ mod tests {
         assert!(result.ok, "{}", result.text);
         let calls = backend.calls();
         assert!(
-            calls.iter().any(|c| c == "get_field CLAUDE-41 State"),
+            calls.iter().any(|c| c == "get_field PROJ-41 State"),
             "{calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c.starts_with("comment CLAUDE-41 |")),
+            calls.iter().any(|c| c.starts_with("comment PROJ-41 |")),
             "attached with a comment: {calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c.starts_with("comment CLAUDE-41 |") && c.contains("Run: ")),
+                .any(|c| c.starts_with("comment PROJ-41 |") && c.contains("Run: ")),
             "the attach comment carries the run footer: {calls:?}"
         );
         assert!(
@@ -8149,7 +8147,7 @@ mod tests {
             "ci.yml",
             "test",
             None,
-            Some("CLAUDE-42"),
+            Some("PROJ-42"),
             "open",
             None,
             now,
@@ -8184,17 +8182,17 @@ mod tests {
         assert!(result.ok, "{}", result.text);
         let calls = backend.calls();
         assert!(
-            calls.iter().any(|c| c == "get_field CLAUDE-42 State"),
+            calls.iter().any(|c| c == "get_field PROJ-42 State"),
             "{calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c.starts_with("comment CLAUDE-42 | Regression")),
+                .any(|c| c.starts_with("comment PROJ-42 | Regression")),
             "{calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c.starts_with("set_state CLAUDE-42")),
+            calls.iter().any(|c| c.starts_with("set_state PROJ-42")),
             "regression reopen writes State: {calls:?}"
         );
 
@@ -8217,7 +8215,7 @@ mod tests {
             "ci.yml",
             "test",
             None,
-            Some("CLAUDE-43"),
+            Some("PROJ-43"),
             "open",
             None,
             now,
@@ -8282,7 +8280,7 @@ mod tests {
             "ci.yml",
             "test",
             None,
-            Some("CLAUDE-50"),
+            Some("PROJ-50"),
             "open",
             None,
             now,
@@ -8331,7 +8329,7 @@ mod tests {
         // An open legacy issue found by the
         // marker search, with no store row, is adopted and not duplicated.
         let pool = crate::db::test_pool().await;
-        let backend = Arc::new(StoreBackend::new().with_legacy_match("CLAUDE-70"));
+        let backend = Arc::new(StoreBackend::new().with_legacy_match("PROJ-70"));
         let counting = Arc::new(CountingClassifier::new());
         let classifier: Arc<dyn FailureClassifier> = counting.clone();
         let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
@@ -8358,7 +8356,7 @@ mod tests {
         )
         .await;
         assert!(result.ok, "{}", result.text);
-        assert!(result.text.contains("CLAUDE-70"), "{}", result.text);
+        assert!(result.text.contains("PROJ-70"), "{}", result.text);
         let calls = backend.calls();
         assert!(
             !calls.iter().any(|c| c.starts_with("create")),
@@ -8378,7 +8376,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(m.issue_key, Some("CLAUDE-70".to_string()));
+        assert_eq!(m.issue_key, Some("PROJ-70".to_string()));
         assert_eq!(m.state, "open");
     }
 
@@ -8570,7 +8568,7 @@ mod tests {
         assert_eq!(
             out,
             MintOutcome::Created {
-                key: "CLAUDE-99".to_string(),
+                key: "PROJ-99".to_string(),
                 project: "FJ".to_string(),
                 bucket: TriageBucket::CodeFix,
                 source: crate::mint::RouteSource::Override,
@@ -8585,7 +8583,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+                .any(|c| c == "set_field PROJ-99 AI Agent Queued"),
             "{calls:?}"
         );
     }
@@ -8683,7 +8681,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+                .any(|c| c == "set_field PROJ-99 AI Agent Queued"),
             "{calls:?}"
         );
     }
@@ -8724,7 +8722,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+                .any(|c| c == "set_field PROJ-99 AI Agent Queued"),
             "{calls:?}"
         );
     }
@@ -9487,7 +9485,7 @@ mod tests {
         assert!(summary.contains("log="), "artifact reference: {summary}");
     }
 
-    // ---- CLAUDE-402: webhook runs close even when the handler panics ------
+    // ---- webhook runs close even when the handler panics ------
 
     /// The regression this issue fixes: a panic inside the webhook-triage
     /// pipeline, after `begin_webhook_run` opened the row, used to leave it
@@ -9523,7 +9521,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        // Wait on the outcome, not a short budget (CLAUDE-507).
+        // Wait on the outcome, not a short budget.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut ended: Option<String> = None;
         while std::time::Instant::now() < deadline {
@@ -9584,7 +9582,7 @@ mod tests {
             &pool,
             Some((run_id, guard)),
             "job-1",
-            "forced failure for CLAUDE-402",
+            "forced failure for PROJ-402",
             true,
             None,
             None,
@@ -9609,7 +9607,7 @@ mod tests {
         drop(parked);
 
         // Wait on the outcome, not a short budget: on a busy runner the retry can
-        // take far longer than it does locally (CLAUDE-507).
+        // take far longer than it does locally.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut ended: Option<String> = None;
         while std::time::Instant::now() < deadline {
@@ -9710,12 +9708,12 @@ mod tests {
     fn mint_summary_describes_each_outcome() {
         assert_eq!(
             mint_summary(&MintOutcome::Created {
-                key: "CLAUDE-99".to_string(),
+                key: "PROJ-99".to_string(),
                 project: "FJ".to_string(),
                 bucket: crate::triage::TriageBucket::CodeFix,
                 source: crate::mint::RouteSource::Override,
             }),
-            "minted CLAUDE-99 in FJ"
+            "minted PROJ-99 in FJ"
         );
         assert!(mint_summary(&MintOutcome::SkippedTransient).contains("transient"));
         assert!(mint_summary(&MintOutcome::SkippedDailyCap).contains("daily run cap"));
@@ -9831,11 +9829,11 @@ mod tests {
         ci_failure_store::record_agent_pr(
             &pool,
             "youtrack",
-            "CLAUDE-40",
+            "PROJ-40",
             "dev.a8n.run",
             "acme/widgets",
             17,
-            "fix/CLAUDE-40",
+            "fix/PROJ-40",
             "open",
             false,
             now,
@@ -9847,7 +9845,7 @@ mod tests {
         let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
         let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
         let ev = store_event(7102);
-        let log = failing_test_log("mod_a", "test_one", "fix/CLAUDE-40");
+        let log = failing_test_log("mod_a", "test_one", "fix/PROJ-40");
         let result = triage_and_mint(
             &ctx,
             None,
@@ -9871,19 +9869,19 @@ mod tests {
             "no new issue: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c.starts_with("comment CLAUDE-40")),
+            calls.iter().any(|c| c.starts_with("comment PROJ-40")),
             "{calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c.starts_with("comment CLAUDE-40") && c.contains("Run: ")),
+                .any(|c| c.starts_with("comment PROJ-40") && c.contains("Run: ")),
             "the requeue comment carries the run footer: {calls:?}"
         );
-        // CLAUDE-587 / SPEC-3.15 item 5: the remediation comment carries the
+        // SPEC-3.15 item 5: the remediation comment carries the
         // step list with its own `CI remediation N` line marked, before the footer.
         assert!(
-            calls.iter().any(|c| c.starts_with("comment CLAUDE-40")
+            calls.iter().any(|c| c.starts_with("comment PROJ-40")
                 && c.contains(
                     "| 1 | CI remediation 1 |  | <-- This comment | <-- This comment | <-- This comment |"
                 )
@@ -9893,7 +9891,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "set_field CLAUDE-40 AI Agent Queued"),
+                .any(|c| c == "set_field PROJ-40 AI Agent Queued"),
             "{calls:?}"
         );
 
@@ -9914,11 +9912,11 @@ mod tests {
         let agent_pr_id = ci_failure_store::record_agent_pr(
             &pool,
             "youtrack",
-            "CLAUDE-41",
+            "PROJ-41",
             "dev.a8n.run",
             "acme/widgets",
             18,
-            "fix/CLAUDE-41",
+            "fix/PROJ-41",
             "open",
             false,
             now,
@@ -9935,7 +9933,7 @@ mod tests {
         let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
         let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
         let ev = store_event(7103);
-        let log = failing_test_log("mod_a", "test_one", "fix/CLAUDE-41");
+        let log = failing_test_log("mod_a", "test_one", "fix/PROJ-41");
         let result = triage_and_mint(
             &ctx,
             None,
@@ -9957,23 +9955,23 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "set_field CLAUDE-41 AI Agent Needs Review"),
+                .any(|c| c == "set_field PROJ-41 AI Agent Needs Review"),
             "{calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c.starts_with("comment CLAUDE-41") && c.contains("7103")),
+                .any(|c| c.starts_with("comment PROJ-41") && c.contains("7103")),
             "the comment names this attempt's run: {calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c.starts_with("comment CLAUDE-41") && c.contains("Run: ")),
+                .any(|c| c.starts_with("comment PROJ-41") && c.contains("Run: ")),
             "the ceiling comment carries the run footer: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c == "add_tag CLAUDE-41 Needs-Info"),
+            calls.iter().any(|c| c == "add_tag PROJ-41 Needs-Info"),
             "SPEC-3.12 item 3: the CI-remediation-ceiling row is `Needs Review` with `Needs-Info`: {calls:?}"
         );
 
@@ -9987,7 +9985,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-551: one CI failure on the agent's PR #30 (issue CLAUDE-551),
+    /// One CI failure on the agent's PR #30 (issue PROJ-551),
     /// failing `tests`, through the real dispatch; returns the summary and
     /// the tracker calls it made.
     async fn agent_attempt(
@@ -10004,7 +10002,7 @@ mod tests {
             &ctx,
             None,
             &store_event(index),
-            failing_tests_log("mod_a", tests, "fix/CLAUDE-551"),
+            failing_tests_log("mod_a", tests, "fix/PROJ-551"),
             true,
             None,
             None,
@@ -10023,11 +10021,11 @@ mod tests {
         ci_failure_store::record_agent_pr(
             pool,
             "youtrack",
-            "CLAUDE-551",
+            "PROJ-551",
             "dev.a8n.run",
             "acme/widgets",
             30,
-            "fix/CLAUDE-551",
+            "fix/PROJ-551",
             "open",
             false,
             "2026-11-05T00:00:00Z",
@@ -10057,18 +10055,18 @@ mod tests {
     fn requeued(calls: &[String]) -> bool {
         calls
             .iter()
-            .any(|c| c == "set_field CLAUDE-551 AI Agent Queued")
+            .any(|c| c == "set_field PROJ-551 AI Agent Queued")
     }
 
     fn parked(calls: &[String]) -> bool {
         calls
             .iter()
-            .any(|c| c == "set_field CLAUDE-551 AI Agent Needs Review")
+            .any(|c| c == "set_field PROJ-551 AI Agent Needs Review")
     }
 
     #[tokio::test]
     async fn a_new_failure_at_the_cap_gets_extra_attempts_up_to_the_hard_cap() {
-        // CLAUDE-551: normal cap 1, hard cap 3. Each attempt trips a test no
+        // Normal cap 1, hard cap 3. Each attempt trips a test no
         // earlier attempt failed, so attempts 2 and 3 are extended; the
         // fourth hits the hard cap and parks, naming every failing-test set.
         let pool = crate::db::test_pool().await;
@@ -10086,7 +10084,7 @@ mod tests {
             assert!(
                 calls
                     .iter()
-                    .any(|c| c.starts_with("comment CLAUDE-551") && c.contains("An extra attempt")),
+                    .any(|c| c.starts_with("comment PROJ-551") && c.contains("An extra attempt")),
                 "{calls:?}"
             );
             assert_eq!(
@@ -10103,7 +10101,7 @@ mod tests {
         );
         let comment = calls
             .iter()
-            .find(|c| c.starts_with("comment CLAUDE-551"))
+            .find(|c| c.starts_with("comment PROJ-551"))
             .unwrap();
         assert!(
             comment.contains("agent_pr_fix_attempts_hard_cap"),
@@ -10121,8 +10119,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_overlapping_failure_at_the_cap_parks_as_before() {
-        // CLAUDE-551: a failure sharing a test with an earlier attempt (not
-        // identical, so not CLAUDE-371's repeat) is the same root: it parks at
+        // A failure sharing a test with an earlier attempt (not
+        // identical, so not an exact repeat) is the same root: it parks at
         // the normal cap with no extra attempt.
         let pool = crate::db::test_pool().await;
         agent_pr_551(&pool).await;
@@ -10138,7 +10136,7 @@ mod tests {
         );
         let comment = calls
             .iter()
-            .find(|c| c.starts_with("comment CLAUDE-551"))
+            .find(|c| c.starts_with("comment PROJ-551"))
             .unwrap();
         assert!(comment.contains("overlaps an earlier one"), "{comment}");
         assert_eq!(events_matching(&pool, "extended fix attempt").await, 0);
@@ -10153,7 +10151,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_pr_repeated_failure_stops_the_loop_without_requeue() {
-        // CLAUDE-371: two consecutive attempts failing the exact same test
+        // Two consecutive attempts failing the exact same test
         // set stop the loop - no re-queue, one comment naming the repeated
         // tests and both runs, `AI Agent = Needs Review` - well under the
         // fix-attempt ceiling.
@@ -10162,11 +10160,11 @@ mod tests {
         ci_failure_store::record_agent_pr(
             &pool,
             "youtrack",
-            "CLAUDE-50",
+            "PROJ-50",
             "dev.a8n.run",
             "acme/widgets",
             20,
-            "fix/CLAUDE-50",
+            "fix/PROJ-50",
             "open",
             false,
             now,
@@ -10182,7 +10180,7 @@ mod tests {
             &ctx,
             None,
             &store_event(7200),
-            failing_test_log("mod_a", "test_one", "fix/CLAUDE-50"),
+            failing_test_log("mod_a", "test_one", "fix/PROJ-50"),
             true,
             None,
             None,
@@ -10201,7 +10199,7 @@ mod tests {
             &ctx,
             None,
             &store_event(7201),
-            failing_test_log("mod_a", "test_one", "fix/CLAUDE-50"),
+            failing_test_log("mod_a", "test_one", "fix/PROJ-50"),
             true,
             None,
             None,
@@ -10219,7 +10217,7 @@ mod tests {
         assert_eq!(
             calls
                 .iter()
-                .filter(|c| c.starts_with("set_field CLAUDE-50 AI Agent Queued"))
+                .filter(|c| c.starts_with("set_field PROJ-50 AI Agent Queued"))
                 .count(),
             1,
             "only the first attempt re-queues: {calls:?}"
@@ -10227,13 +10225,13 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "set_field CLAUDE-50 AI Agent Needs Review"),
+                .any(|c| c == "set_field PROJ-50 AI Agent Needs Review"),
             "{calls:?}"
         );
         let repeat_comment = calls
             .iter()
             .find(|c| {
-                c.starts_with("comment CLAUDE-50") && c.contains("stopping the fix-attempt loop")
+                c.starts_with("comment PROJ-50") && c.contains("stopping the fix-attempt loop")
             })
             .unwrap_or_else(|| panic!("expected a stop comment: {calls:?}"));
         assert!(
@@ -10253,7 +10251,7 @@ mod tests {
             "SPEC-3.12 item 6: the comment names the one action: {repeat_comment}"
         );
         assert!(
-            calls.iter().any(|c| c == "add_tag CLAUDE-50 Needs-Info"),
+            calls.iter().any(|c| c == "add_tag PROJ-50 Needs-Info"),
             "SPEC-3.12 item 3: the loop-breaker row is `Needs Review` with `Needs-Info`: {calls:?}"
         );
 
@@ -10269,18 +10267,18 @@ mod tests {
 
     #[tokio::test]
     async fn agent_pr_shrinking_failure_set_is_requeued() {
-        // CLAUDE-371: a strict subset of the previous attempt's failing tests
+        // A strict subset of the previous attempt's failing tests
         // is progress, not a cycle, so it is re-queued as before.
         let pool = crate::db::test_pool().await;
         let now = "2026-09-01T00:00:00Z";
         ci_failure_store::record_agent_pr(
             &pool,
             "youtrack",
-            "CLAUDE-51",
+            "PROJ-51",
             "dev.a8n.run",
             "acme/widgets",
             21,
-            "fix/CLAUDE-51",
+            "fix/PROJ-51",
             "open",
             false,
             now,
@@ -10296,7 +10294,7 @@ mod tests {
             &ctx,
             None,
             &store_event(7210),
-            failing_tests_log("mod_a", &["test_one", "test_two"], "fix/CLAUDE-51"),
+            failing_tests_log("mod_a", &["test_one", "test_two"], "fix/PROJ-51"),
             true,
             None,
             None,
@@ -10315,7 +10313,7 @@ mod tests {
             &ctx,
             None,
             &store_event(7211),
-            failing_tests_log("mod_a", &["test_one"], "fix/CLAUDE-51"),
+            failing_tests_log("mod_a", &["test_one"], "fix/PROJ-51"),
             true,
             None,
             None,
@@ -10333,7 +10331,7 @@ mod tests {
         assert_eq!(
             calls
                 .iter()
-                .filter(|c| c.starts_with("set_field CLAUDE-51 AI Agent Queued"))
+                .filter(|c| c.starts_with("set_field PROJ-51 AI Agent Queued"))
                 .count(),
             2,
             "shrinking sets keep re-queueing: {calls:?}"
@@ -10341,7 +10339,7 @@ mod tests {
         assert!(
             !calls
                 .iter()
-                .any(|c| c == "set_field CLAUDE-51 AI Agent Needs Review"),
+                .any(|c| c == "set_field PROJ-51 AI Agent Needs Review"),
             "{calls:?}"
         );
 
@@ -10354,18 +10352,18 @@ mod tests {
 
     #[tokio::test]
     async fn agent_pr_different_failure_set_is_requeued() {
-        // CLAUDE-371: a different, non-subset failing set is a new problem,
+        // A different, non-subset failing set is a new problem,
         // not a repeat, so it is re-queued as before.
         let pool = crate::db::test_pool().await;
         let now = "2026-09-01T00:00:00Z";
         ci_failure_store::record_agent_pr(
             &pool,
             "youtrack",
-            "CLAUDE-52",
+            "PROJ-52",
             "dev.a8n.run",
             "acme/widgets",
             22,
-            "fix/CLAUDE-52",
+            "fix/PROJ-52",
             "open",
             false,
             now,
@@ -10381,7 +10379,7 @@ mod tests {
             &ctx,
             None,
             &store_event(7220),
-            failing_test_log("mod_a", "test_one", "fix/CLAUDE-52"),
+            failing_test_log("mod_a", "test_one", "fix/PROJ-52"),
             true,
             None,
             None,
@@ -10400,7 +10398,7 @@ mod tests {
             &ctx,
             None,
             &store_event(7221),
-            failing_test_log("mod_b", "test_two", "fix/CLAUDE-52"),
+            failing_test_log("mod_b", "test_two", "fix/PROJ-52"),
             true,
             None,
             None,
@@ -10418,7 +10416,7 @@ mod tests {
         assert_eq!(
             calls
                 .iter()
-                .filter(|c| c.starts_with("set_field CLAUDE-52 AI Agent Queued"))
+                .filter(|c| c.starts_with("set_field PROJ-52 AI Agent Queued"))
                 .count(),
             2,
             "a different failing set keeps re-queueing: {calls:?}"
@@ -10426,14 +10424,14 @@ mod tests {
         assert!(
             !calls
                 .iter()
-                .any(|c| c == "set_field CLAUDE-52 AI Agent Needs Review"),
+                .any(|c| c == "set_field PROJ-52 AI Agent Needs Review"),
             "{calls:?}"
         );
     }
 
     #[tokio::test]
     async fn agent_pr_empty_fingerprint_falls_back_to_cap_behavior() {
-        // CLAUDE-371: an empty/unparseable fingerprint never counts as "same
+        // An empty/unparseable fingerprint never counts as "same
         // as before", so two consecutive unparseable failures still just
         // re-queue under the ordinary attempt cap instead of falsely
         // stopping the loop.
@@ -10442,11 +10440,11 @@ mod tests {
         ci_failure_store::record_agent_pr(
             &pool,
             "youtrack",
-            "CLAUDE-53",
+            "PROJ-53",
             "dev.a8n.run",
             "acme/widgets",
             23,
-            "fix/CLAUDE-53",
+            "fix/PROJ-53",
             "open",
             false,
             now,
@@ -10462,7 +10460,7 @@ mod tests {
             &ctx,
             None,
             &store_event(7230),
-            unparseable_log("fix/CLAUDE-53"),
+            unparseable_log("fix/PROJ-53"),
             true,
             None,
             None,
@@ -10481,7 +10479,7 @@ mod tests {
             &ctx,
             None,
             &store_event(7231),
-            unparseable_log("fix/CLAUDE-53"),
+            unparseable_log("fix/PROJ-53"),
             true,
             None,
             None,
@@ -10499,7 +10497,7 @@ mod tests {
         assert_eq!(
             calls
                 .iter()
-                .filter(|c| c.starts_with("set_field CLAUDE-53 AI Agent Queued"))
+                .filter(|c| c.starts_with("set_field PROJ-53 AI Agent Queued"))
                 .count(),
             2,
             "an unparseable fingerprint never matches a previous one: {calls:?}"
@@ -10507,7 +10505,7 @@ mod tests {
         assert!(
             !calls
                 .iter()
-                .any(|c| c == "set_field CLAUDE-53 AI Agent Needs Review"),
+                .any(|c| c == "set_field PROJ-53 AI Agent Needs Review"),
             "{calls:?}"
         );
 
@@ -10518,7 +10516,7 @@ mod tests {
         assert_eq!(record.fix_attempts, 2);
     }
 
-    /// CLAUDE-579 / SPEC-3.12 item 8: one log per infrastructure signature on
+    /// SPEC-3.12 item 8: one log per infrastructure signature on
     /// an agent PR spends no fix attempt, starts no remediation run and stores
     /// the kind on the failure row.
     #[tokio::test]
@@ -10545,7 +10543,7 @@ mod tests {
             let pool = crate::db::test_pool().await;
             let now = "2026-09-01T00:00:00Z";
             let pr_number = 60 + i as i64;
-            let key = format!("CLAUDE-{}", 600 + i);
+            let key = format!("PROJ-{}", 600 + i);
             let branch = format!("fix/{key}");
             ci_failure_store::record_agent_pr(
                 &pool,
@@ -10714,7 +10712,7 @@ mod tests {
             "ci.yml",
             "test",
             None,
-            Some("CLAUDE-42"),
+            Some("PROJ-42"),
             "open",
             None,
             now,
@@ -10787,7 +10785,7 @@ mod tests {
             runner.calls.lock().unwrap()
         );
         let body = std::fs::read_to_string(&body_file).unwrap();
-        assert!(body.contains("CLAUDE-42"), "{body}");
+        assert!(body.contains("PROJ-42"), "{body}");
     }
 
     /// On a human PR, an `open` store row
@@ -10803,7 +10801,7 @@ mod tests {
             "ci.yml",
             "test",
             None,
-            Some("CLAUDE-44"),
+            Some("PROJ-44"),
             "open",
             None,
             now,
@@ -10844,17 +10842,17 @@ mod tests {
         assert_eq!(counting.call_count(), 1, "the reopen triages");
         let calls = backend.calls();
         assert!(
-            calls.iter().any(|c| c == "get_field CLAUDE-44 State"),
+            calls.iter().any(|c| c == "get_field PROJ-44 State"),
             "{calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c.starts_with("comment CLAUDE-44 | Regression")),
+                .any(|c| c.starts_with("comment PROJ-44 | Regression")),
             "{calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c.starts_with("set_state CLAUDE-44")),
+            calls.iter().any(|c| c.starts_with("set_state PROJ-44")),
             "regression reopen writes State: {calls:?}"
         );
 
@@ -10877,7 +10875,7 @@ mod tests {
             "ci.yml",
             "test",
             None,
-            Some("CLAUDE-45"),
+            Some("PROJ-45"),
             "open",
             None,
             now,
@@ -11121,11 +11119,11 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "youtrack",
-                "CLAUDE-50",
+                "PROJ-50",
                 "dev.a8n.run",
                 "acme/widgets",
                 99,
-                "fix/CLAUDE-50",
+                "fix/PROJ-50",
                 "open",
                 false,
                 now,
@@ -11166,11 +11164,11 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "youtrack",
-                "CLAUDE-50",
+                "PROJ-50",
                 "dev.a8n.run",
                 "acme/widgets",
                 99,
-                "fix/CLAUDE-50",
+                "fix/PROJ-50",
                 "open",
                 false,
                 "2026-09-01T00:00:00Z",
@@ -11228,11 +11226,11 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "youtrack",
-                "CLAUDE-53",
+                "PROJ-53",
                 "dev.a8n.run",
                 "acme/widgets",
                 102,
-                "fix/CLAUDE-53",
+                "fix/PROJ-53",
                 "open",
                 false,
                 now,
@@ -11736,7 +11734,7 @@ mod tests {
             assert!(rx.try_recv().is_err());
         }
 
-        /// CLAUDE-389's sweep: the CI-failure listener's GitHub arm already
+        /// The CI-failure listener's GitHub arm already
         /// acks-and-drops any non-`workflow_run` event, so a `ping` delivery
         /// (sent on webhook creation / "Redeliver") never 400s here either.
         /// No code change needed; this just confirms it by test.
@@ -11806,7 +11804,7 @@ mod tests {
         }
 
         // Router-level: the new route accepts a valid delivery and the old,
-        // pre-CLAUDE-361 route no longer exists at all.
+        // previous route no longer exists at all.
         #[tokio::test]
         async fn router_serves_new_route_and_404s_the_old_one() {
             let _env = crate::secrets::key_file_env_lock().await;
@@ -11842,13 +11840,13 @@ mod tests {
             assert_eq!(
                 resp_old.status(),
                 StatusCode::NOT_FOUND,
-                "the pre-CLAUDE-361 route no longer exists"
+                "the pre-PROJ-361 route no longer exists"
             );
         }
 
         #[tokio::test]
         async fn disabled_listener_404s_even_with_a_configured_source() {
-            // CLAUDE-360: `enabled: false` 404s every request regardless of
+            // `enabled: false` 404s every request regardless of
             // whether the source is fully configured (a valid signature),
             // ahead of the source lookup.
             let _env = crate::secrets::key_file_env_lock().await;
@@ -13023,7 +13021,7 @@ mod tests {
         async fn automerge_disabled_action_changes_nothing() {
             // Acceptance criterion 3 (part 2): a recorded agent PR whose
             // action has automerge disabled posts no issue comment and makes
-            // no forge write. After CLAUDE-595 the stale-PR sweep runs even
+            // no forge write. The stale-PR sweep runs even
             // when automerge is disabled, so `pr_status` IS read (one call),
             // but no dispatch, comment, merge or branch update happens as
             // long as the PR is not conflicted.
@@ -13178,7 +13176,7 @@ mod tests {
             assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
         }
 
-        /// CLAUDE-535: an agent PR row on the shared test repo.
+        /// An agent PR row on the shared test repo.
         async fn record_open_pr(pool: &DbPool, issue: &str, pr: i64) {
             ci_failure_store::record_agent_pr(
                 pool,
@@ -13211,7 +13209,7 @@ mod tests {
 
         #[tokio::test]
         async fn behind_base_update_is_deferred_while_the_repo_is_at_the_ci_cap() {
-            // CLAUDE-535: with two other runner PRs pending and a cap of 2, a green
+            // With two other runner PRs pending and a cap of 2, a green
             // behind-base PR is neither updated nor commented on.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
@@ -13250,7 +13248,7 @@ mod tests {
 
         #[tokio::test]
         async fn second_branch_update_waits_for_the_holders_ci_then_goes() {
-            // CLAUDE-535: after PR 7's branch is updated it holds the repo's update
+            // After PR 7's branch is updated it holds the repo's update
             // slot; PR 8 waits while PR 7's CI is pending and updates once it is not.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
@@ -13373,12 +13371,12 @@ mod tests {
             );
             assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
             assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
-            // CLAUDE-447: the branch-updated-from-base push comment landed on
+            // The branch-updated-from-base push comment landed on
             // the PR itself, naming the event and the issue.
             assert!(calls.iter().any(|c| c == "pr_comment 7"), "{calls:?}");
             let pr_comments = backend.pr_comments();
             assert_eq!(pr_comments.len(), 1, "{pr_comments:?}");
-            // `{:?}` rather than `{}`: an empty recorded body (the CLAUDE-519
+            // `{:?}` rather than `{}`: an empty recorded body (the
             // scratch-file race) prints as `""` instead of a blank, otherwise
             // indistinguishable, failure message.
             assert!(
@@ -13389,7 +13387,7 @@ mod tests {
             assert!(pr_comments[0].contains("MK-16"), "{:?}", pr_comments[0]);
         }
 
-        /// CLAUDE-652: a draft PR, green and behind base, gets no branch
+        /// A draft PR, green and behind base, gets no branch
         /// update, no issue comment, and no push comment: automerge takes
         /// no action on a draft the runner does not own mid-run.
         #[tokio::test]
@@ -13455,7 +13453,7 @@ mod tests {
             );
         }
 
-        /// CLAUDE-655: a green draft PR with no conflict verdict (what a
+        /// A green draft PR with no conflict verdict (what a
         /// no-verdict review leaves behind) reports `mergeable: false`; no
         /// pass comments on it.
         #[tokio::test]
@@ -13509,7 +13507,7 @@ mod tests {
             );
         }
 
-        /// CLAUDE-655: a conflict-dispatch row between two passes must not
+        /// A conflict-dispatch row between two passes must not
         /// make the unchanged not-mergeable outcome comment again.
         #[tokio::test]
         async fn not_mergeable_comments_once_despite_conflict_dispatch_rows() {
@@ -13565,7 +13563,7 @@ mod tests {
             assert_eq!(comments, 1, "{:?}", backend.calls());
         }
 
-        /// CLAUDE-519: two concurrent branch-updated-from-base push comments
+        /// Two concurrent branch-updated-from-base push comments
         /// for the same PR number (two routing decisions racing, or just
         /// parallel test threads sharing the fixture PR number 7) must not
         /// corrupt each other's recorded body: before the fix, both shared
@@ -13613,7 +13611,7 @@ mod tests {
         }
 
         /// A failed push-comment post never fails the branch update it
-        /// reports on (CLAUDE-447): the run still succeeds, but its own
+        /// reports on: the run still succeeds, but its own
         /// outcome names the failure.
         #[tokio::test]
         async fn behind_base_update_push_comment_failure_is_named_but_does_not_fail_the_run() {
@@ -13985,7 +13983,7 @@ mod tests {
             assert_same_decision("success", false, Some(false), false).await; // green + not mergeable
             assert_same_decision("pending", false, Some(false), false).await; // not green
             assert_same_decision("success", true, Some(false), true).await; // salvaged: green + mergeable still blocked
-            assert_same_conflict_decision().await; // behind base + update conflict (CLAUDE-380)
+            assert_same_conflict_decision().await; // behind base + update conflict
             assert_same_draft_decision(Some(true), &["update_pr_branch", "comment"]).await; // draft + green + behind base
             assert_same_draft_decision(Some(false), &["merge_pr", "comment"]).await;
             // draft + green + mergeable, not behind base
@@ -14086,7 +14084,7 @@ mod tests {
             );
         }
 
-        /// The CLAUDE-380 conflict-dispatch decision shape: behind base, and
+        /// The conflict-dispatch decision shape: behind base, and
         /// `update_pr_branch` fails with a conflict. With no comment-webhook
         /// dispatch wired (same as every other case in this test, and every
         /// `ctx_for` here), both entry points fall back to the same human
@@ -14247,9 +14245,9 @@ mod tests {
             .await;
 
             // The reconciler lists open PRs for the (host, repo) group, and
-            // after CLAUDE-595 it reads this PR's `pr_status` so the
+            // it reads this PR's `pr_status` so the
             // stale-PR conflict sweep can see whether it is conflicted. It
-            // is not, so no further forge call is made; the CLAUDE-652 draft
+            // is not, so no further forge call is made; the draft
             // check lives inside the `behind_base == Some(true)` branch,
             // which this automerge-disabled PR never reaches.
             assert_eq!(
@@ -14263,7 +14261,7 @@ mod tests {
             );
         }
 
-        /// A green, mergeable, not-behind-base PR flagged `salvaged` (CLAUDE-429)
+        /// A green, mergeable, not-behind-base PR flagged `salvaged`
         /// is never merged however many ticks pass: no `merge_pr`,
         /// `update_pr_branch` or conflict-dispatch call, `NoAction`, a
         /// `run_events` row every pass, and the issue comment posted only once.
@@ -14333,7 +14331,7 @@ mod tests {
             assert_eq!(row.state, "open", "never retired by automerge");
         }
 
-        /// CLAUDE-630: once a PR's row is `finished` (the run that owns it
+        /// Once a PR's row is `finished` (the run that owns it
         /// already reported success and the PR was promoted to ready), the
         /// reconciler must not touch it at all: no branch update, no merge,
         /// and - unlike the still-mid-run `salvaged` case above - no comment
@@ -14347,7 +14345,7 @@ mod tests {
             let id = ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "CLAUDE-630",
+                "PROJ-630",
                 "dev.a8n.run",
                 "contoso/audits",
                 558,
@@ -14465,7 +14463,7 @@ mod tests {
             assert!(row.failed, "failed flag must stay set");
         }
 
-        /// CLAUDE-463: `salvaged` is set for both a timeout salvage and a
+        /// `salvaged` is set for both a timeout salvage and a
         /// checkpoint-opened draft PR, so the automerge-blocked message must
         /// not claim a timeout happened: it did not for the latter case.
         /// Covers the issue comment, the `run_events` message and the
@@ -14607,7 +14605,7 @@ mod tests {
                 .state
         }
 
-        /// CLAUDE-397: count of `runs` rows for `WEBHOOK_MINT_ACTION`, used to
+        /// Count of `runs` rows for `WEBHOOK_MINT_ACTION`, used to
         /// assert a no-action reconciler pass opens zero of them and an
         /// acted/failed pass opens exactly one.
         async fn webhook_triage_runs_count(pool: &DbPool) -> i64 {
@@ -15434,7 +15432,7 @@ mod tests {
             }
 
             /// The args and green JSON `pr_status` uses for the two
-            /// fine-grained-PAT-friendly CI reads (CLAUDE-419) on an open PR
+            /// fine-grained-PAT-friendly CI reads on an open PR
             /// with head SHA `abc123`.
             fn gh_pr_runs_args(repo: &str) -> Vec<String> {
                 vec![
@@ -15453,7 +15451,7 @@ mod tests {
             const GH_PR_COMMIT_STATUS_JSON_EMPTY: &str = r#"{"statuses":[]}"#;
 
             /// `gh pr list`'s JSON for PR 42, open and not a draft: the
-            /// CLAUDE-652 draft lookup `apply_automerge_decision` makes
+            /// The draft lookup `apply_automerge_decision` makes
             /// before reading `pr_status`.
             const GH_OPEN_PRS_JSON: &str = r#"[{"number":42,"title":"fix","headRefOid":"abc123","headRefName":"fix/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42","isDraft":false}]"#;
 
@@ -15572,7 +15570,7 @@ mod tests {
             async fn behind_base_unknown_on_github_blames_gh_not_fj() {
                 // GitHub reports `mergeStateStatus: UNKNOWN` while it computes
                 // mergeability lazily; the outcome and comment must name `gh`
-                // and the re-check, never `fj` / FJ-99.
+                // and the re-check, never `fj`.
                 let pool = crate::db::test_pool().await;
                 let dir = tempfile::tempdir().unwrap();
                 write_youtrack_action(dir.path(), "yt", true);
@@ -15622,7 +15620,6 @@ mod tests {
                 assert!(err.contains("mergeStateStatus: UNKNOWN"), "{err}");
                 assert!(err.contains("re-check"), "{err}");
                 assert!(!err.contains("fj"), "{err}");
-                assert!(!err.contains("FJ-99"), "{err}");
 
                 let calls = backend.calls();
                 let comment = calls
@@ -15633,7 +15630,6 @@ mod tests {
                 assert!(comment.contains("mergeStateStatus: UNKNOWN"), "{comment}");
                 assert!(comment.contains("re-check"), "{comment}");
                 assert!(!comment.contains("fj"), "{comment}");
-                assert!(!comment.contains("FJ-99"), "{comment}");
 
                 let events = state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 50)
                     .await
@@ -15728,7 +15724,7 @@ mod tests {
 
             #[tokio::test]
             async fn reconciler_run_link_uses_pull_not_pulls_for_a_github_host() {
-                // CLAUDE-420: the reconciler's own run link (`agent_pr_url`)
+                // The reconciler's own run link (`agent_pr_url`)
                 // must follow GitHub's `/pull/<n>` shape for a `github.com`
                 // row, not Forgejo's `/pulls/<n>`.
                 let pool = crate::db::test_pool().await;
@@ -15812,7 +15808,7 @@ mod tests {
             }
         }
 
-        // CLAUDE-397: a reconciler pass whose decision is a no-action creates
+        // A reconciler pass whose decision is a no-action creates
         // zero `runs` rows, for every no-action shape; an acted or failed
         // decision still creates exactly one, with the same summary as before.
         mod no_op_run_rows {
@@ -16090,7 +16086,7 @@ mod tests {
         }
     }
 
-    // CLAUDE-406: the triage path's own open-PR lookups (the routing
+    // The triage path's own open-PR lookups (the routing
     // decision in `resolve_open_pr` and the advisory `has_open_pr` signal in
     // `resolve_has_open_pr`) must route a `github.com` failure through
     // `GithubForge`, never `mint.backend` (`fj`, which 410s against GitHub's
@@ -16124,11 +16120,11 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "youtrack",
-                "CLAUDE-40",
+                "PROJ-40",
                 "github.com",
                 "octo/widget",
                 42,
-                "fix/CLAUDE-40",
+                "fix/PROJ-40",
                 "open",
                 false,
                 now,
@@ -16140,7 +16136,7 @@ mod tests {
             let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().ok(
                 "gh",
                 &gh_list_open_prs_args("octo/widget"),
-                r#"[{"number":42,"title":"fix","headRefOid":"commit-9201","headRefName":"fix/CLAUDE-40","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#,
+                r#"[{"number":42,"title":"fix","headRefOid":"commit-9201","headRefName":"fix/PROJ-40","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#,
             ));
             let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
             let dir = tempfile::tempdir().unwrap();
@@ -16152,7 +16148,7 @@ mod tests {
                 runner.clone(),
             );
             let ev = github_store_event(9201, "octo/widget");
-            let log = failing_test_log("mod_a", "test_one", "fix/CLAUDE-40");
+            let log = failing_test_log("mod_a", "test_one", "fix/PROJ-40");
 
             let result = triage_and_mint(
                 &ctx,
@@ -16178,13 +16174,13 @@ mod tests {
                 "fj must never be consulted for a GitHub host: {calls:?}"
             );
             assert!(
-                calls.iter().any(|c| c.starts_with("comment CLAUDE-40")),
+                calls.iter().any(|c| c.starts_with("comment PROJ-40")),
                 "the agent's own PR re-queues its issue: {calls:?}"
             );
             assert!(
                 calls
                     .iter()
-                    .any(|c| c == "set_field CLAUDE-40 AI Agent Queued"),
+                    .any(|c| c == "set_field PROJ-40 AI Agent Queued"),
                 "{calls:?}"
             );
             assert!(
@@ -16363,7 +16359,7 @@ mod tests {
         }
     }
 
-    /// Acceptance criteria 1, 2, 4, 5 for CLAUDE-380: a conflict
+    /// Acceptance criteria 1, 2, 4, 5 for a conflict
     /// `update_pr_branch` failure dispatches the same `/claude` conflict-resolve
     /// run a human's PR comment would trigger, at most once per
     /// `(repo, pr_number, head_sha)`.
@@ -16436,7 +16432,7 @@ mod tests {
                 .unwrap()
         }
 
-        /// CLAUDE-550: one attempt is dispatched, a tick while it is in
+        /// One attempt is dispatched, a tick while it is in
         /// flight sends nothing and says nothing, and once it finishes a
         /// second attempt goes out even on the same head commit (the first
         /// one pushed nothing).
@@ -16517,7 +16513,7 @@ mod tests {
             assert_eq!(row7(&pool).await.conflict_resolve_attempts, 2);
         }
 
-        /// CLAUDE-550: with every attempt spent and the conflict still there,
+        /// With every attempt spent and the conflict still there,
         /// the PR is parked delivery-blocked once, naming the stuck files, and
         /// later passes neither dispatch, comment nor write the field again.
         #[tokio::test]
@@ -16605,7 +16601,7 @@ mod tests {
             }
         }
 
-        /// CLAUDE-547: a red, non-draft PR that conflicts with base gets one
+        /// A red, non-draft PR that conflicts with base gets one
         /// resolution run per head commit; a second tick for the same head
         /// sends nothing.
         #[tokio::test]
@@ -16646,7 +16642,7 @@ mod tests {
             );
         }
 
-        /// CLAUDE-547: a green PR Forgejo reports as not mergeable gets a
+        /// A green PR Forgejo reports as not mergeable gets a
         /// resolution run on its first attempt instead of the human comment.
         #[tokio::test]
         async fn green_not_mergeable_pr_dispatches_instead_of_the_human_comment() {
@@ -16678,7 +16674,7 @@ mod tests {
             );
         }
 
-        /// CLAUDE-547: with no resolution run to send (here, no wired sender)
+        /// With no resolution run to send (here, no wired sender)
         /// the green not-mergeable PR keeps the human comment.
         #[tokio::test]
         async fn green_not_mergeable_pr_without_a_sender_keeps_the_human_comment() {
@@ -16708,7 +16704,7 @@ mod tests {
             );
         }
 
-        /// CLAUDE-572: a Forgejo WIP PR whose `conflicted` is `false` or
+        /// A Forgejo WIP PR whose `conflicted` is `false` or
         /// unknown is never dispatched: `mergeable: false` alone is WIP.
         #[tokio::test]
         async fn clean_or_unknown_wip_pr_is_not_dispatched() {
@@ -16737,7 +16733,7 @@ mod tests {
             }
         }
 
-        /// CLAUDE-572: a Forgejo WIP PR that `fj` reports as conflicted gets
+        /// A Forgejo WIP PR that `fj` reports as conflicted gets
         /// exactly one resolution run per head commit.
         #[tokio::test]
         async fn conflicted_wip_pr_dispatches_once_per_head_commit() {
@@ -16777,7 +16773,7 @@ mod tests {
             );
         }
 
-        /// CLAUDE-547 / CLAUDE-535: a dispatch waits while another runner PR's
+        /// A dispatch waits while another runner PR's
         /// CI-triggering push is still pending on the repo.
         #[tokio::test]
         async fn dispatch_respects_the_per_repo_ci_cap() {
@@ -16805,7 +16801,7 @@ mod tests {
             );
         }
 
-        /// CLAUDE-550: a stamp from a run that never finished (dropped, or
+        /// A stamp from a run that never finished (dropped, or
         /// the daemon restarted) stops blocking once it is older than the
         /// listener's timeout plus the margin.
         #[test]
@@ -16958,7 +16954,7 @@ mod tests {
                 comments[0].contains("A human needs to resolve this"),
                 "{comments:?}"
             );
-            // CLAUDE-550: a send that never reached the listener spends no
+            // A send that never reached the listener spends no
             // attempt and leaves no in-flight stamp.
             let row = row7(&pool).await;
             assert_eq!(row.conflict_resolve_attempts, 0);
@@ -17003,7 +16999,7 @@ mod tests {
             );
         }
 
-        /// CLAUDE-595: a conflicted PR on an action with automerge disabled
+        /// A conflicted PR on an action with automerge disabled
         /// still gets one resolve run per head commit. Without this sweep,
         /// `apply_automerge_decision` early-returned on
         /// `!automerge.enabled` and nothing noticed the stale PR.
@@ -17030,7 +17026,7 @@ mod tests {
             assert_eq!(row7(&pool).await.conflict_resolve_attempts, 1);
         }
 
-        /// CLAUDE-595: a conflicted PR whose CI is still pending (neither
+        /// A conflicted PR whose CI is still pending (neither
         /// `success` nor `failure`) gets one resolve run. The existing
         /// automerge state match only routes on `success` / `failure`, so
         /// `pending` would otherwise fall through to `NoAction`.
@@ -17056,7 +17052,7 @@ mod tests {
             assert_eq!(row7(&pool).await.conflict_resolve_attempts, 1);
         }
 
-        /// CLAUDE-595: with automerge enabled AND CI already success AND
+        /// With automerge enabled AND CI already success AND
         /// mergeable false, the existing state-match path handles the
         /// conflict. The new sweep must NOT also dispatch, so the PR
         /// receives exactly one resolve run per head commit, not two.
@@ -17085,7 +17081,7 @@ mod tests {
             assert_eq!(row7(&pool).await.conflict_resolve_attempts, 1);
         }
 
-        /// CLAUDE-595: a salvaged PR (opened before its run finished) is
+        /// A salvaged PR (opened before its run finished) is
         /// never swept, because dispatching a resolve run on top of an
         /// unfinished run would race.
         #[tokio::test]

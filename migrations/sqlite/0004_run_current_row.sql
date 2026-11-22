@@ -1,4 +1,4 @@
--- CLAUDE-14: persist the row a run is currently executing.
+-- Persist the row a run is currently executing.
 --
 -- Rows are processed strictly sequentially (one `claude --print` at a time), so
 -- at most one row is ever in flight. The web UI previously inferred "running"

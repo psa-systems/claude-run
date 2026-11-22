@@ -1,5 +1,5 @@
 ---
-# Cross-project closed-issue summary (CLAUDE-218).
+# Cross-project closed-issue summary.
 #
 # Native action (`kind: closed-issue-summary`) routing to the built-in Rust
 # handler in `src/native/closed_issue_summary.rs`. This file is config only and
@@ -8,7 +8,7 @@
 #
 # This is the automation used as a REPORTING tool rather than as an issue worker,
 # which is why it is its own action rather than a second job taught to
-# `youtrack.yml` (same reasoning as the audit split in CLAUDE-215): the contract
+# `youtrack.yml` (same reasoning as the audit split): the contract
 # differs on every axis. It reads many projects, writes an issue, and touches no
 # code.
 #   targets -> the `parents` listed below, unioned with whatever `query` selects

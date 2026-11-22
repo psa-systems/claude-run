@@ -1,4 +1,4 @@
--- SPEC-3.17 item 7 / CLAUDE-615: one row per webhook event this instance has
+-- SPEC-3.17 item 7 : one row per webhook event this instance has
 -- claimed or granted to a peer. `holder_id` is the instance that processes the
 -- event. Pruned after 24 hours by `claimed_at` (SPEC-3.8.4).
 CREATE TABLE peer_claims (

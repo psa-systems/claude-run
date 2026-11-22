@@ -1,7 +1,7 @@
-//! SMTP transport for invite-by-email (CLAUDE-394).
+//! SMTP transport for invite-by-email.
 //!
 //! [`Mailer`] is built fresh from [`crate::config::EmailConfig::from_env`] on
-//! every send (CLAUDE-428: the SMTP transport is environment-variable-only, no
+//! every send (the SMTP transport is environment-variable-only, no
 //! Settings-page form), so a changed environment applies on the next daemon
 //! restart. It is deliberately not `Debug`: it holds the plaintext SMTP
 //! credential for the lifetime of one send.

@@ -54,7 +54,7 @@ fn strip_database_url_env(command: &mut Command) {
 
 /// Strip the SMTP password out of the `claude` child's environment, same
 /// reasoning and the same hygiene-not-boundary caveat as
-/// [`strip_database_url_env`] (CLAUDE-428): the daemon's own environment
+/// [`strip_database_url_env`]: the daemon's own environment
 /// carries `CLAUDE_RUN_SMTP_PASSWORD(_FILE)`, and `Command` otherwise
 /// inherits it unchanged.
 fn strip_smtp_password_env(command: &mut Command) {
@@ -307,7 +307,7 @@ impl ClaudeInvoker {
             .join(format!("{key}-attempt-{attempt}.jsonl"))
     }
 
-    /// Stream log for the post-success review session (CLAUDE-449): its own
+    /// Stream log for the post-success review session: its own
     /// file, never the main attempt's, so a review failure's trace does not
     /// overwrite the agent session's own log.
     pub fn review_stream_log_path(
@@ -1294,14 +1294,14 @@ pub(crate) fn count_compact_boundaries(stream_log: &Path) -> std::io::Result<usi
 
 /// Append one runner-written record to the end of a stream log, naming a
 /// post-agent failure that happened after the agent session's own relay
-/// already closed the file (CLAUDE-425): a push or PR-create failure in
+/// already closed the file: a push or PR-create failure in
 /// `finalize`. `step` is `"push"` or `"pr_create"`. Opened in append mode so
 /// it never disturbs what the relay already wrote. Every existing reader
 /// (`count_compact_boundaries`, `parse_final_result`, the web log viewer)
 /// selects events by `type`/`subtype` rather than by line position, so an
 /// unrecognized `"type":"runner_error"` trailing line is silently skipped by
 /// all of them. Returns the write's `io::Result` rather than swallowing it,
-/// matching the CLAUDE-233 convention for every other writer of this file;
+/// matching the convention for every other writer of this file;
 /// the caller logs a failure and continues, since the run's outcome is
 /// already decided by the time this runs.
 ///
@@ -1801,7 +1801,7 @@ mod tests {
                 // The budget and threshold are generous (and far apart) so a
                 // scheduler-starved CI host cannot push a genuinely prompt exit
                 // past the threshold while the orphan bug would still block for
-                // the full budget (CLAUDE-542, SPEC-10.1.4 slow-IO class).
+                // the full budget (SPEC-10.1.4 slow-IO class).
                 Duration::from_secs(60),
                 dir.path(),
                 &log,
@@ -2235,7 +2235,7 @@ mod tests {
                 // Generous budget: these tests assert on the captured argv, not
                 // on timing, so a scheduler-starved CI host must not let the
                 // stub hit the budget and report a timeout instead of success
-                // (CLAUDE-542, SPEC-10.1.4 slow-IO class).
+                // (SPEC-10.1.4 slow-IO class).
                 Duration::from_secs(120),
                 dir,
                 &dir.join("stream.jsonl"),
@@ -2364,7 +2364,7 @@ mod tests {
     }
 
     /// `strip_smtp_password_env` must mark both SMTP password variables
-    /// removed (CLAUDE-428), while leaving everything else untouched.
+    /// removed, while leaving everything else untouched.
     #[test]
     fn strip_smtp_password_env_removes_both_smtp_password_vars() {
         let mut command = Command::new("true");
@@ -2710,8 +2710,7 @@ mod tests {
     }
 
     /// A `thinking` block with a `signature` never reaches the summary,
-    /// but the last tool used still does: this is the fixture from
-    /// CLAUDE-372, a run killed before any text landed.
+    /// but the last tool used still does: a run killed before any text landed.
     #[test]
     fn friendly_summary_no_final_message_drops_thinking_and_signature_but_names_last_tool() {
         let dir = tempfile::tempdir().unwrap();
@@ -3206,7 +3205,7 @@ mod tests {
     fn read_failure_is_transient_and_names_the_runner_as_the_cause() {
         let result = read_failure_result(
             "stream did not contain valid UTF-8 (os error 22)",
-            Path::new("/logs/YouTrack/streams/CLAUDE-256-attempt-1.jsonl"),
+            Path::new("/logs/YouTrack/streams/PROJ-256-attempt-1.jsonl"),
             0,
         );
         assert!(!result.ok, "the run did not succeed");
@@ -3217,7 +3216,7 @@ mod tests {
         assert!(!result.timed_out, "exit 0 is not a timeout");
         assert!(
             result.error.contains("valid UTF-8")
-                && result.error.contains("CLAUDE-256-attempt-1.jsonl"),
+                && result.error.contains("PROJ-256-attempt-1.jsonl"),
             "the cause and the log are named, got: {}",
             result.error
         );

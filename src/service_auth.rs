@@ -398,7 +398,7 @@ fn write_yt_config(path: &Path, base_url: &str, token: &str) -> Result<()> {
 /// Write the `[user]` git config block `GIT_CONFIG_GLOBAL` names, 0600 like
 /// [`write_yt_config`]'s output. With a Forgejo host, also scope `fj auth
 /// git-credential` to that host so the agent's plain `git` authenticates from
-/// `keys.json` (CLAUDE-411). The file never holds a token.
+/// `keys.json`. The file never holds a token.
 // SPEC-7.3: the Forgejo credential stanza is scoped to one host, and a host
 // value that could break out of the config quoting is refused.
 fn write_git_config(
@@ -646,7 +646,7 @@ mod tests {
     }
 
     /// With a Forgejo host the stanza follows the `[user]` block, the file stays
-    /// 0600, and a host change rewrites it on the next materialize (CLAUDE-411).
+    /// 0600, and a host change rewrites it on the next materialize.
     #[tokio::test]
     async fn forgejo_host_writes_the_credential_stanza_and_a_new_host_rewrites_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -723,7 +723,7 @@ mod tests {
         // Reads the process-wide `PATH` below to build the child's env; held
         // for the whole body per `testutil::path_env_lock`'s contract so no
         // other test's concurrent `PATH` mutation can hand this test a torn
-        // or wrong value (CLAUDE-461).
+        // or wrong value.
         let _path_guard = crate::testutil::path_env_lock();
 
         let tmp = tempfile::tempdir().unwrap();

@@ -7,11 +7,11 @@
 # integration, clone it into the job's workdir, and have Claude work the issue end-to-end per the YouTrack and Git
 # workflows in CLAUDE.md.
 #
-# Native action (CLAUDE-33): `kind: youtrack` routes to the built-in Rust handler in `src/native/youtrack.rs` instead of
+# Native action: `kind: youtrack` routes to the built-in Rust handler in `src/native/youtrack.rs` instead of
 # the generic nu-snippet pipeline. The handler owns gather / filter / pre / prompt / claude / finalize in typed Rust;
 # this file is config only and carries no script-bearing fields (input.command / filter / pre / prompt / post).
 #
-# Auth (CLAUDE-26): the `yt` / `fj` CLIs are host-configured by default. To give this action its own credentials, set
+# Auth: the `yt` / `fj` CLIs are host-configured by default. To give this action its own credentials, set
 # `token_ref` under the native blocks to the name of an encrypted secret (managed under /secrets in the web UI;
 # encrypted at rest with the age key file named by CLAUDE_RUN_SECRETS_KEY_FILE). The runner decrypts it at run time and
 # injects it into the CLIs per job; no raw token is ever written to this file. With no `token_ref`, host credentials are
@@ -24,40 +24,40 @@
 #                   draft; the code needs human review (finalize step)
 #   Needs Review -> claude couldn't proceed and parked the job by writing .claude-run-needs-review; the issue needs
 #                   human input (finalize step) - the attempt counter is NOT incremented. A timeout also lands here
-#                   even when a checkpoint push (below) already salvaged the work into a draft PR - CLAUDE-453 tracks
-#                   auto-requeuing a timeout back to Queued instead, as a deliberately descoped follow-up of CLAUDE-448.
+#                   even when a checkpoint push (below) already salvaged the work into a draft PR - auto-requeuing
+#                   a timeout back to Queued instead is a deliberately descoped follow-up.
 #                   The post-success review session (below) also lands here when it gave no usable verdict, and when
 #                   a real fail verdict's attempt count has reached max_attempts_per_key
 #   Failed       -> claude or a step had a hard failure (finalize step). A push or PR-create failure after a
-#                   successful run is the one exception (CLAUDE-467): when this issue has a recorded open PR (a
-#                   CLAUDE-275 resume, or one the checkpoint-push watcher above adopted mid-run) and the attempt
+#                   successful run is the one exception: when this issue has a recorded open PR (a
+#                   resume, or one the checkpoint-push watcher above adopted mid-run) and the attempt
 #                   count is below max_attempts_per_key, it requeues to Queued instead, with a comment naming the
 #                   cause and that PR, so the next run resumes it rather than opening a new one; the re-read before
 #                   the revert checks the field is still Working first, same as the Working-to-Queued reverts
 #                   described below. With no recorded PR, or at the cap, it still lands here at Failed.
 #   Done         -> a run that deliberately produced tracker output rather than code and wrote
-#                   .claude-run-no-code-change; no PR is opened and State is left alone (CLAUDE-214, label configurable
+#                   .claude-run-no-code-change; no PR is opened and State is left alone (label configurable
 #                   as native.youtrack.states.no_code)
 #
-# Checkpoint pushes (CLAUDE-448): while claude is running, the runner pushes the feature branch's current commits
+# Checkpoint pushes: while claude is running, the runner pushes the feature branch's current commits
 # every 60 seconds with hooks skipped (--no-verify, same as every other runner push of the agent branch including
-# the final push a successful run makes, CLAUDE-533), so a killed or timed-out run still leaves its work reachable
+# the final push a successful run makes), so a killed or timed-out run still leaves its work reachable
 # on the forge. The first successful
-# checkpoint push opens a draft PR (salvaged=true, same CLAUDE-398/CLAUDE-379 body shape as a timeout salvage: a
-# bare issue-reference tail, no linking word) and every push after that posts a `checkpoint push` PR comment
-# (CLAUDE-447). A run that resolves normally afterwards promotes that draft PR exactly like a resumed run does
-# (CLAUDE-429): refresh_pr_text + mark_pr_ready, salvaged cleared. If a checkpoint push is ever rejected by the forge
+# checkpoint push opens a draft PR (salvaged=true, same body shape as a timeout salvage: a
+# bare issue-reference tail, no linking word) and every push after that posts a `checkpoint push` PR comment.
+# A run that resolves normally afterwards promotes that draft PR exactly like a resumed run does:
+# refresh_pr_text + mark_pr_ready, salvaged cleared. If a checkpoint push is ever rejected by the forge
 # (for example a force-pushed or deleted branch), the watcher logs it, stops checkpointing for the rest of the run,
 # never fails the job over it, and the rejection is named in whichever outcome comment finalize posts. The default
-# branch is never checkpoint-pushed. Only the Forgejo (`fj`) backend implements checkpoint_push today; CLAUDE-452
-# tracks the GitHub backend as a deliberately descoped follow-up. Because `salvaged` does not distinguish a
-# checkpoint push from a real timeout, the salvaged-PR automerge-blocked message (CLAUDE-463) is cause-neutral:
+# branch is never checkpoint-pushed. Only the Forgejo (`fj`) backend implements checkpoint_push today; the GitHub
+# backend is a deliberately descoped follow-up. Because `salvaged` does not distinguish a
+# checkpoint push from a real timeout, the salvaged-PR automerge-blocked message is cause-neutral:
 # it says the PR was opened before its run finished, never that a timeout happened.
 #
-# Post-success review session (CLAUDE-449): a successful run's PR is always opened as a draft first. Before promoting
+# Post-success review session: a successful run's PR is always opened as a draft first. Before promoting
 # it, the runner spends a second, separate-context claude invocation reviewing the same workdir read-only
 # (allowed_tools forced to Read,Glob,Grep,Bash regardless of this file's own claude.allowed_tools; its own timeout,
-# limits.review_timeout_seconds below; the run's remaining spend ceiling). Before the verdict (CLAUDE-471), the
+# limits.review_timeout_seconds below; the run's remaining spend ceiling). Before the verdict, the
 # reviewer independently states the invariant the issue's Goal establishes, derives a search pattern for the SHAPE of
 # code that invariant governs (independent of the files the diff touched), sweeps the WHOLE repository with
 # Glob/Grep, and classifies every hit as compliant, not-applicable, or violating - so a diff that satisfies every
@@ -67,10 +67,10 @@
 # the PR a draft, posts the findings on the PR and the issue, counts the attempt, and requeues to Queued below
 # max_attempts_per_key or parks at Needs Review at the cap - either way the built-in prompt's resume step (below)
 # tells the agent to read the PR's comments and fix what the review found. (An audit action, audit-run.yml, instead
-# files a follow-up issue and promotes the PR, CLAUDE-611.) No marker, both markers, a timeout, or the
+# files a follow-up issue and promotes the PR.) No marker, both markers, a timeout, or the
 # review session touching the workdir all collapse to no usable verdict, which always parks at Needs Review instead.
 #
-# Working can also revert to Queued (CLAUDE-439), with a comment naming the reason and no attempt counted: a transient
+# Working can also revert to Queued, with a comment naming the reason and no attempt counted: a transient
 # claude result (an authentication failure, or a rate-limit / usage-limit signal) after the pre step already wrote
 # Working; or a global pause / the Claude login needing renewal tripping the run after the pre step but before claude
 # started. Either way the re-read before the revert checks the field is still Working first, so a concurrent manual
@@ -80,12 +80,11 @@
 #
 # The agent does ONLY local engineering work on code (read issue, branch, change, commit locally, run the repo's
 # checks): no git push and no PR. Since the checkpoint-push watcher above publishes the agent's commits while it is
-# still running (CLAUDE-465), the agent is told never to rewrite that branch's history (no reset, --amend, rebase,
+# still running, the agent is told never to rewrite that branch's history (no reset, --amend, rebase,
 # filter-branch, or force push) to fix a mistake; a new commit on top is the only way, so a checkpoint already on the
-# remote is never orphaned. Since CLAUDE-214 it may also make bounded tracker writes, in two cases (CLAUDE-297
-# split these): a gap, deferred item, or descoped piece of the triggering issue is filed in
+# remote is never orphaned. It may also make bounded tracker writes, in two cases: a gap, deferred item, or descoped piece of the triggering issue is filed in
 # native.youtrack.write_projects (defaulting to the triggering issue's own project) and linked relates to (or depends
-# on / is required for when one genuinely blocks the other), never subtask of, the triggering issue (CLAUDE-454:
+# on / is required for when one genuinely blocks the other), never subtask of, the triggering issue (
 # subtask of is reserved for linking under an epic or milestone root, since making a work issue the parent lets
 # closing the follow-up auto-close it and lets the dependency gate block the parent on its own child); a bug found
 # outside the triggering issue's scope is filed in the project whose VCS integration binds the buggy repo (falling
@@ -93,7 +92,7 @@
 # whose only purpose is to verify, once the triggering issue's own PR exists, that infrastructure or configuration
 # outside the PR took effect, or one that can only start once that PR is open or merged; the agent also checks for a
 # link cycle before creating either link and skips the link if one would result.
-# One bounded exception to the subtask of rule (CLAUDE-617): an issue whose Estimation exceeds the session timeout
+# One bounded exception to the subtask of rule: an issue whose Estimation exceeds the session timeout
 # runs a split-only attempt with its own built-in prompt, and only there every piece the agent files is linked
 # subtask of the oversized issue, which becomes the grouping parent of its pieces. The runner then sets that issue's
 # Type to Story, queues the pieces that fit the timeout and moves the issue to states.no_code; a split with under two
@@ -129,7 +128,7 @@ claude:
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
   permission_mode: acceptEdits
 
-# CLAUDE-28: run independent issues in parallel. Each issue's project/repo forms the concurrency key (workflow is unset
+# Run independent issues in parallel. Each issue's project/repo forms the concurrency key (workflow is unset
 # today), so issues in different repos run concurrently while issues in the same repo serialize (they would otherwise
 # collide on the clone dir, branch, and PR). max_parallel caps how many distinct repos run at once; keep it at or below
 # the host's spare core count, since each running issue holds a thread for its Claude invocation. Set to 1 to restore
@@ -144,12 +143,12 @@ native:
     # --query value the handler passes to `yt list`, sent as `--query=<value>` so a query starting with `-` is not
     # mistaken for a flag.
     #
-    # Audit partition (CLAUDE-215): the exact complement of `audit-run.yml`'s `project: {{audit_project}} tag: Audit-*`
+    # Audit partition: the exact complement of `audit-run.yml`'s `project: {{audit_project}} tag: Audit-*`
     # (tag routing is in its header). Negate values, not keys (`-project:` is a parse error); a `(...)` group needs an
-    # explicit `and`. `{{audit_project}}` is substituted with `audit_project` below (default `AUDIT`, CLAUDE-409); it
+    # explicit `and`. `{{audit_project}}` is substituted with `audit_project` below (default `AUDIT`); it
     # must be set to the SAME value as `audit-run.yml`'s so the two queries stay an exact complement.
     #
-    # The reporting action (`closed-issue-summary.yml`, CLAUDE-218) is partitioned off the same way
+    # The reporting action (`closed-issue-summary.yml`) is partitioned off the same way
     # but on the `AI Agent` axis rather than the project axis: this query pins the single value
     # `Queued`, and a reporting parent carries a DIFFERENT `AI Agent` value, so one issue can never
     # match both actions (the field holds one value at a time). No negation is written here on
@@ -158,7 +157,7 @@ native:
     # action's poll until someone added that value in YouTrack. `shipped_action_queries_are_disjoint`
     # in src/action.rs is the mechanical guard on the partition.
     #
-    # Public-repo partition (CLAUDE-470): `actions/youtrack-public.yml` owns the `SF` and `SFT`
+    # Public-repo partition: `actions/youtrack-public.yml` owns the `SF` and `SFT`
     # projects outright (`project: SF, SFT and -Resolved AI Agent: Queued`), so this query excludes
     # both the same way it excludes the audit project, keeping the two queries an exact complement
     # on that axis too.
@@ -166,12 +165,12 @@ native:
     custom_field: "AI Agent"
     # Short name of the audit project. Must match `audit-run.yml`'s `audit_project`; see actions/SCHEMA.md.
     audit_project: AUDIT
-    # base_url / token_ref (CLAUDE-26): omitted here, so the host-configured yt CLI is used. To inject a token, set
+    # base_url / token_ref: omitted here, so the host-configured yt CLI is used. To inject a token, set
     # base_url plus token_ref: <secret-name>.
     # states: defaults to Queued / Working / Code Review / Needs Review / Failed and State=In Progress; override here
     #         only if the project renames these AI Agent values.
   forgejo: {}
-    # base_url / token_ref (CLAUDE-26): omitted, so the host fj credentials are used and the forge host derives from
+    # base_url / token_ref: omitted, so the host fj credentials are used and the forge host derives from
     # each issue's resolved VCS integration.
 
 output:

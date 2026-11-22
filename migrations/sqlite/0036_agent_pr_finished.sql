@@ -1,4 +1,4 @@
--- CLAUDE-630: once a run's own completion criteria are met (`Finalized::CodeReview`,
+-- Once a run's own completion criteria are met (`Finalized::CodeReview`,
 -- success with the PR promoted to ready), the agent has nothing left to do on this
 -- PR. Persist that on the row so the automerge reconciler and the Action-Run
 -- webhook decision path (`apply_automerge_decision`) stop re-syncing it (no more

@@ -135,7 +135,7 @@ pub struct OnDiskConfig {
     /// Which database backend holds the runtime state. Bootstrap,
     /// not a DB-backed setting: it has to be known before the DB is open.
     pub database: DatabaseConfig,
-    /// Remote MCP listener settings (CLAUDE-442): bind, public URL, admin
+    /// Remote MCP listener settings: bind, public URL, admin
     /// bootstrap email, extra allowed `Host` values. Bootstrap, like `web` and
     /// `webhook`: the daemon needs it before it binds the listener.
     pub mcp: McpConfig,
@@ -159,13 +159,13 @@ pub struct DatabaseConfig {
     pub url: Option<String>,
 }
 
-/// Remote MCP listener config (CLAUDE-442). Lives in `config.toml` because the
+/// Remote MCP listener config. Lives in `config.toml` because the
 /// daemon needs it before it binds the listener. Off by default: `enabled =
 /// false` means no listener binds, no key file and no `mcp-web.db` are ever
 /// created, and `serve` behaves exactly as it did before this section existed.
 ///
 /// Serves the same eight read-only troubleshooting tools as `claude-run mcp
-/// stdio` (`src/mcp.rs`, CLAUDE-437), but over Streamable HTTP behind the
+/// stdio` (`src/mcp.rs`), but over Streamable HTTP behind the
 /// `mcp-web` crate's local-account + OAuth 2.1 bearer layer, so a remote
 /// client can reach them without `docker compose exec`. SPEC-4.5, SPEC-6.2.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -260,7 +260,7 @@ impl Default for WebConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebhookConfig {
-    /// CLAUDE-360: master on/off switch for the listener, defaulting `false`.
+    /// Master on/off switch for the listener, defaulting `false`.
     /// While `false`, `/webhooks/forgejo/<source>` 404s every request
     /// regardless of `sources`, with its own log line distinct from an
     /// unknown-source rejection. A save that sets this `true` is rejected
@@ -310,7 +310,7 @@ pub struct WebhookConfig {
     /// flagged `Needs Review` instead. Matched against
     /// `agent_pull_requests.fix_attempts`. Default 3.
     pub agent_pr_fix_attempts: u32,
-    /// CLAUDE-551: at `agent_pr_fix_attempts`, a failure whose failing tests
+    /// At `agent_pr_fix_attempts`, a failure whose failing tests
     /// overlap none of the earlier attempts' on the same PR (the agent fixed
     /// what it was asked to and a different test tripped) gets one more
     /// attempt, up to this many in all. A failure overlapping an earlier one
@@ -424,7 +424,7 @@ pub struct WebhookSource {
     /// PAT that authorizes commenting on this source's pull requests
     /// (routing a CI failure on an open PR back to its issue, or onto the
     /// human author's PR). Reaches `fj` the same way `log_token_ref` does: a
-    /// temp single-host `keys.json` carrying only this one secret. CLAUDE-347:
+    /// temp single-host `keys.json` carrying only this one secret.
     /// required on every source of an `enabled` listener, same as
     /// `secret_ref` - unset fails `/settings` save and `serve` startup,
     /// naming this source, rather than only surfacing when the comment
@@ -434,7 +434,7 @@ pub struct WebhookSource {
     /// path segment (`/webhooks/<provider>/triage/<source>`) the request
     /// must arrive on. `#[serde(default)]` so every source stored before this
     /// field existed deserializes as [`WebhookProvider::Forgejo`], which was
-    /// the only behavior before CLAUDE-361 split the route on provider.
+    /// the only behavior before the route was split on provider.
     #[serde(default)]
     pub provider: WebhookProvider,
 }
@@ -466,7 +466,7 @@ impl Default for WebhookSource {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommentWebhookConfig {
-    /// CLAUDE-360: master on/off switch for the listener, mirroring
+    /// Master on/off switch for the listener, mirroring
     /// [`WebhookConfig::enabled`] (same default, same save-time secret-presence
     /// requirement in `src/settings.rs::validate_comment_webhook`, same startup
     /// warning when `sources` is non-empty but this is `false`).
@@ -488,12 +488,12 @@ pub struct CommentWebhookConfig {
     /// one. Must be at least 1 (validated in `src/settings.rs`); default 20.
     pub max_runs_per_day: u32,
     /// Per-run `claude` session timeout in seconds for the `/claude` comment
-    /// listener, read live per command (CLAUDE-364, mirroring
+    /// listener, read live per command (mirroring
     /// `WebhookConfig::analysis_timeout_secs`) instead of the daemon-wide
     /// `RunnerDefaults::claude_timeout_seconds`. Must be at least 1 (validated
     /// in `src/settings.rs`); default 600 matches the prior hard-coded value.
     pub claude_timeout_seconds: u32,
-    /// CLAUDE-550: how many automerge conflict auto-resolve runs (CLAUDE-380)
+    /// How many automerge conflict auto-resolve runs
     /// one agent PR gets, across head commits, before the runner stops
     /// dispatching and parks its issue as delivery-blocked
     /// (`UnresolvedConflicts`), naming the files the last attempt could not
@@ -564,7 +564,7 @@ pub struct CommentWebhookSource {
     /// Name of the secret holding a PAT with WRITE scope. It authorizes
     /// the commenter's permission read, the PR replies, and the branch push, and
     /// reaches `fj` in a temp single-host `keys.json` carrying that one secret.
-    /// CLAUDE-347: required on every source of an `enabled` listener, same as
+    /// Required on every source of an `enabled` listener, same as
     /// `secret_ref` - unset fails `/settings` save and `serve` startup,
     /// naming this source, rather than discovering it when a delivery is
     /// refused.
@@ -672,7 +672,7 @@ pub struct MintConfig {
     /// Tag added alongside the `Needs Review` write when the agent's own PR
     /// hits the CI-fix attempt ceiling (the loop-breaker or the hard-cap
     /// park in [`crate::web::webhooks::route_agent_pr_failure`]), mirroring
-    /// `tags.needs_info` on the `youtrack` action (CLAUDE-373). An empty
+    /// `tags.needs_info` on the `youtrack` action. An empty
     /// value disables the tag write. SPEC-3.12 item 3: "CI remediation
     /// ceiling reached | `Needs Review` with `Needs-Info`".
     pub needs_info_tag: String,
@@ -906,10 +906,10 @@ impl Default for DbRetentionConfig {
 /// ([`crate::gc::sweep_docker_volumes`]) and the SPEC-3.11 ceiling reclaim
 /// ([`crate::gc::reclaim_docker_storage`]) both run on the same GC tick,
 /// reading this section off the shared handle so a Settings save applies on
-/// the next pass. CLAUDE-433: nothing removed unreferenced named volumes
+/// the next pass. Nothing removed unreferenced named volumes
 /// before; one deployment held 139 named volumes totalling about 206 GB, 138
 /// of them referenced by no container, and the sidecar's data directory filled
-/// to 100%. CLAUDE-516 (SPEC-3.11) extends the bound to the sidecar's images,
+/// to 100%. SPEC-3.11 extends the bound to the sidecar's images,
 /// stopped containers and build cache, which were still unmeasured and
 /// unbounded. SPEC-6.3.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -949,7 +949,7 @@ impl Default for DockerGcConfig {
 /// (`<data dir>/cache/cargo-target/<repo-slug>`, `SPEC-3.10`). A DB-backed
 /// runtime setting (settings key `config.cargo_cache`, editable on the web
 /// Settings page), reading this section off the shared handle so a Settings
-/// save applies on the next sweep. CLAUDE-512: nothing bounded these
+/// save applies on the next sweep. Nothing bounded these
 /// directories before; they grow as each repo's dependencies change and
 /// nothing ever reclaims them. SPEC-6.3.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1198,8 +1198,8 @@ pub struct AuthConfig {
     pub git_author_email: Option<String>,
 }
 
-/// Name the SMTP password secret used to be stored under, before CLAUDE-428
-/// moved the SMTP transport to environment variables. Kept only so the
+/// Name the SMTP password secret used to be stored under, before the
+/// move of the SMTP transport to environment variables. Kept only so the
 /// startup retirement in `src/settings.rs` can delete a leftover secret by
 /// this name; no code writes it anymore. SPEC-7.1.
 pub const SMTP_PASSWORD_SECRET: &str = "email-smtp-password";
@@ -1217,7 +1217,7 @@ pub enum SmtpEncryption {
     None,
 }
 
-/// The SMTP transport invite-by-email sends through (CLAUDE-428): resolved
+/// The SMTP transport invite-by-email sends through: resolved
 /// once at daemon start from environment variables, never DB-backed. Not
 /// `Debug` (the password would otherwise be printable); see
 /// [`EmailConfig::password`].
@@ -1309,7 +1309,7 @@ impl EmailConfig {
 }
 
 /// Resolve `CLAUDE_RUN_PUBLIC_URL` from an environment lookup, independent of
-/// email/SMTP configuration (CLAUDE-446): the run-link footer on every
+/// email/SMTP configuration: the run-link footer on every
 /// runner-posted comment needs this value even on an instance with no SMTP
 /// configured, or whose SMTP configuration is otherwise broken, so it is not
 /// read through [`EmailConfig`]. Same validation as before: an absolute
@@ -1645,7 +1645,7 @@ mod tests {
         assert!(cfg.github_token_ref.is_none());
     }
 
-    /// The `[update]` self-update section was removed (CLAUDE-400); a leftover
+    /// The `[update]` self-update section was removed; a leftover
     /// table must fail the parse naming `update`, never be silently ignored.
     #[test]
     fn removed_update_table_is_rejected_by_name() {
@@ -1757,7 +1757,7 @@ mod tests {
         assert!(parsed.webhook.sources.is_empty());
     }
 
-    // ---- MCP HTTP listener config (CLAUDE-442) -----------------
+    // ---- MCP HTTP listener config -----------------
 
     #[test]
     fn mcp_config_defaults_to_disabled() {
@@ -1838,7 +1838,7 @@ mod tests {
         assert!(err.to_string().contains("secret"));
     }
 
-    /// CLAUDE-347: a source whose `provider` names a forge we do not support
+    /// A source whose `provider` names a forge we do not support
     /// is an "unknown source type" from the webhook config's point of view -
     /// closed-enum deserialization catches it at config load, naming the
     /// unrecognized value, rather than letting it default to a provider the
@@ -2125,7 +2125,7 @@ mod tests {
         assert_eq!(cfg.password(), Some("hunter2"));
     }
 
-    /// CLAUDE-446: `public_url` must be available for the comment-footer link
+    /// `public_url` must be available for the comment-footer link
     /// builder with no SMTP settings present at all.
     #[test]
     fn public_url_from_env_is_available_with_no_smtp_settings() {

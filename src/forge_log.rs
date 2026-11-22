@@ -88,7 +88,7 @@ pub struct JobLog {
     pub log: String,
     /// What `fj` says about this log: `available`, `missing` (gone for
     /// good, so re-asking can never help) or `unavailable` (it could not be read
-    /// this time). Empty from an `fj` predating FJ-79, which is why it defaults:
+    /// this time). Empty from an older `fj` without per-job state, which is why it defaults:
     /// its absence means "nothing known", never "gone".
     #[serde(default)]
     pub log_state: String,
@@ -101,9 +101,9 @@ pub struct JobLog {
 pub const LOG_STATE_MISSING: &str = "missing";
 
 /// SPEC-3.5: `Some(reason)` when `fj` reports EVERY job's log as permanently
-/// missing (the FJ-79 signal), so the run has no log to analyze and never will.
+/// missing (the signal), so the run has no log to analyze and never will.
 /// `None` when any job carries a log, when the run has no jobs, or when the `fj`
-/// that answered predates FJ-79 and says nothing about the state: this may only
+/// that answered is older and says nothing about the state: this may only
 /// ever turn a readable log into a missing one, never the reverse.
 pub fn logs_permanently_missing(jobs: &[JobLog]) -> Option<String> {
     if jobs.is_empty() || !jobs.iter().all(|j| j.log_state == LOG_STATE_MISSING) {
@@ -784,8 +784,8 @@ pub fn resolve_failing_job(jobs: &[JobLog]) -> Option<&JobLog> {
 /// Every job of a run whose status denotes a failure, in run order. Unlike
 /// [`resolve_failing_job`] (which always returns exactly one job, falling back
 /// to the first), this is empty when nothing failed, and carries every failing
-/// job of a run where several checks failed independently (CLAUDE-344).
-/// SPEC-3.5: every failing job, used by the CLAUDE-344 CI-diagnostic context.
+/// job of a run where several checks failed independently.
+/// SPEC-3.5: every failing job, used by the CI-diagnostic context.
 pub fn failing_jobs(jobs: &[JobLog]) -> Vec<&JobLog> {
     jobs.iter()
         .filter(|j| is_failure_status(&j.status))
@@ -802,7 +802,7 @@ fn is_failure_status(s: &str) -> bool {
 
 /// SPEC-3.6: the last `n` lines of `text` (fewer if it has fewer), joined back
 /// with `\n`. Bounds how much of a failing job's log is carried into a fix
-/// request's context (CLAUDE-344): the whole log is setup and teardown noise
+/// request's context: the whole log is setup and teardown noise
 /// around a comparatively short error, so only the tail is included.
 pub fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -812,7 +812,7 @@ pub fn tail_lines(text: &str, n: usize) -> String {
 
 /// SPEC-3.6: lines of a failing job's log carried into a fix request's
 /// CI-diagnostic context ([`ci_failure_context_for_branch`]). Assumed to bound
-/// the error region adequately (CLAUDE-344); revisit if validation shows
+/// the error region adequately; revisit if validation shows
 /// otherwise.
 pub const CI_FAILURE_CONTEXT_TAIL_LINES: usize = 200;
 
@@ -824,7 +824,7 @@ const CI_FAILURE_RUN_PROBE_LIMIT: usize = 5;
 
 /// Resolve `branch`'s most recent failing check run and format each of its
 /// failing jobs' tailed error output into one CI-diagnostic block, clearly
-/// delimited as data rather than instruction (CLAUDE-344, the slash-Claude fix
+/// delimited as data rather than instruction (the slash-Claude fix
 /// request). `None` when nothing cleanly resolves: the runs list is
 /// unavailable, none of the branch's recent runs failed, or the run that did
 /// carries no failing job. Callers proceed without CI context on `None`, per
@@ -1309,7 +1309,7 @@ mod tests {
         assert!(parse_run_logs("not json").is_err());
     }
 
-    /// An `fj` predating FJ-79 emits no `log_state`, and its
+    /// An older `fj` without per-job state emits no `log_state`, and its
     /// output parses exactly as before, with nothing known about the state.
     #[test]
     fn parse_run_logs_still_reads_a_pre_fj79_document() {
@@ -1325,7 +1325,7 @@ mod tests {
         );
     }
 
-    /// The per-job state FJ-79 added is parsed, so a log that is
+    /// The per-job log state is parsed, so a log that is
     /// gone for good is distinguishable from a job that printed nothing. The
     /// document is the shape `fj actions logs --format json` emits: `log_state`
     /// is one of `available` / `missing` / `unavailable`, with `log_reason` null
@@ -1699,10 +1699,10 @@ mod tests {
 
     #[test]
     fn parse_branch_reads_the_checkout_ref() {
-        let log = "Run actions/checkout\nGITHUB_REF=refs/heads/feat/CLAUDE-190\nGITHUB_SHA=abc\n";
+        let log = "Run actions/checkout\nGITHUB_REF=refs/heads/feat/PROJ-190\nGITHUB_SHA=abc\n";
         assert_eq!(
             parse_branch_from_log(log),
-            Some("feat/CLAUDE-190".to_string())
+            Some("feat/PROJ-190".to_string())
         );
     }
 
@@ -1935,7 +1935,7 @@ mod tests {
         assert!(!v.stopped());
     }
 
-    // ---- CI-failure context for a fix request (CLAUDE-344) ----------------
+    // ---- CI-failure context for a fix request ----------------
 
     #[test]
     fn tail_lines_keeps_only_the_last_n() {

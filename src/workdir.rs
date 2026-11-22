@@ -103,7 +103,7 @@ impl std::fmt::Display for WorkCheckError {
 
 fn git_out(workdir: &Path, args: &[&str]) -> Option<String> {
     // Bare `git` resolves through the process-wide `PATH`; serialize against
-    // the CLAUDE-410 PATH-stub test's mutation/deletion window the same way
+    // the PATH-stub test's mutation/deletion window the same way
     // `comment_webhooks::git_output` does.
     #[cfg(test)]
     let _path_guard = crate::testutil::path_env_lock();
@@ -124,8 +124,8 @@ fn git_required(workdir: &Path, args: &[&str]) -> Result<String, WorkCheckError>
 
 /// Like [`git_required`], but for the one network call in this module
 /// (`ls-remote origin`): authenticates per invocation via `token_url`
-/// (CLAUDE-395) instead of relying on a credential embedded in `origin`'s
-/// URL, and retries a failed attempt (CLAUDE-396) via
+/// instead of relying on a credential embedded in `origin`'s
+/// URL, and retries a failed attempt via
 /// [`crate::provider::retry_git_network`].
 fn authed_git_required(
     workdir: &Path,
@@ -191,18 +191,18 @@ pub fn uncommitted_or_stashed(workdir: &Path) -> Result<DirtyState, WorkCheckErr
 /// stashes. A git or network failure is an `Err`; callers log it and
 /// preserve.
 ///
-/// This replaces the CLAUDE-193 `branch_tips` SHA-membership check (a local
+/// This replaces the `branch_tips` SHA-membership check (a local
 /// tip counted as "on the remote" if its SHA appeared under ANY advertised
 /// ref, so a brand-new branch left at `main`'s tip read as pushed) with an
 /// exact `refs/heads/<name>` lookup, and adds the dirty-tree / stash half the
 /// old check never asked about at all.
 ///
 /// No credential: callers with no forge token in scope (the GC sweep,
-/// scripted actions) use this and get the pre-CLAUDE-395 behaviour, an
+/// scripted actions) use this and get the unauthenticated behaviour, an
 /// unauthenticated `ls-remote origin`. Callers that do have one (native
 /// YouTrack job cleanup, the comment webhook) should call
 /// [`local_only_work_with_token`] instead, since `origin` itself no longer
-/// carries the token after CLAUDE-395's post-clone scrub.
+/// carries the token after the post-clone scrub.
 ///
 /// SPEC-3.2.9: "a local branch tip the remote does not have under that same
 /// branch name (excluding a tip that merely equals the remote default
@@ -213,7 +213,7 @@ pub fn local_only_work(workdir: &Path) -> Result<LocalWork, WorkCheckError> {
 }
 
 /// Same check as [`local_only_work`], but the `ls-remote origin` network call
-/// authenticates per invocation with `token_url` (CLAUDE-395) via
+/// authenticates per invocation with `token_url` via
 /// [`crate::provider::authed_git_output`], never by writing the token into
 /// `origin`'s URL. `token_url` is only ever read for its userinfo; a `None`
 /// falls back to the prior unauthenticated call.
@@ -306,7 +306,7 @@ pub fn local_only_work_with_token(
 /// preserved. `git clean -fdX` deletes only ignored files and directories; a
 /// failure is logged and tolerated (the directory is still preserved).
 fn prune_ignored_artifacts(workdir: &Path) {
-    // See `git_out`: serialize against the CLAUDE-410 PATH-stub test's
+    // See `git_out`: serialize against the PATH-stub test's
     // mutation/deletion window.
     #[cfg(test)]
     let _path_guard = crate::testutil::path_env_lock();
@@ -353,8 +353,8 @@ pub fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
 }
 
 /// Same guarded delete as [`cleanup_or_preserve`], but the `local_only_work`
-/// check authenticates its `ls-remote origin` call with `token_url`
-/// (CLAUDE-395). Callers with a forge token in scope (native YouTrack job
+/// check authenticates its `ls-remote origin` call with `token_url`.
+/// Callers with a forge token in scope (native YouTrack job
 /// cleanup, the comment webhook) should call this instead, since `origin`
 /// carries no credential after the post-clone scrub.
 ///
@@ -595,10 +595,7 @@ mod tests {
         // its own, so deleting it loses nothing.
         let base = tempfile::tempdir().unwrap();
         let clone = origin_and_single_branch_clone(base.path());
-        git_in(
-            &clone,
-            &["checkout", "-b", "feat/CLAUDE-269-login-required"],
-        );
+        git_in(&clone, &["checkout", "-b", "feat/PROJ-269-login-required"]);
 
         let work = local_only_work(&clone).unwrap();
         assert!(
@@ -632,7 +629,7 @@ mod tests {
     }
 
     /// The `ls-remote --symref origin` network call retries a transient
-    /// failure (CLAUDE-396) via a `git remote-ext` helper script that fails
+    /// failure via a `git remote-ext` helper script that fails
     /// the first invocation and forwards to `git-upload-pack` on the second,
     /// so this exercises the real retry path end to end rather than a stub.
     #[test]
@@ -683,7 +680,7 @@ mod tests {
         // widening it, so `file` (used by other tests' local-path remotes
         // running concurrently) must stay listed alongside `ext`; the lock
         // keeps this test's set/remove pair from racing another thread's.
-        // PATH lock first: production code reached below takes it too (CLAUDE-536).
+        // PATH lock first: production code reached below takes it too.
         let _path_guard = crate::provider::git_stub_path_test_lock();
         let _guard = crate::provider::git_allow_protocol_test_lock();
         std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");

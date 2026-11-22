@@ -1,5 +1,4 @@
-//! The Environment form on a scripted action's edit page (CLAUDE-571,
-//! SPEC-4.3.3): change the values of the action's `env` block without
+//! The Environment form on a scripted action's edit page (//! SPEC-4.3.3): change the values of the action's `env` block without
 //! editing YAML.
 //!
 //! The file is the operator's, comments included (the shipped examples

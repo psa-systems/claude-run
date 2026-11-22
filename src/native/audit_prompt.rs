@@ -94,7 +94,7 @@ pub(crate) fn default_audit_prompt() -> String {
 mod tests {
     use super::default_audit_prompt;
 
-    /// CLAUDE-304: an earlier audit run filed 9 issues whose citations did not exist
+    /// An earlier audit run filed 9 issues whose citations did not exist
     /// because a compacted run rebuilt finding write-ups from a summary
     /// instead of re-reading them. The prompt must order report-before-filing,
     /// require each issue body to come from the on-disk report with its first
@@ -138,7 +138,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-367: the issue can be edited after pickup, so both run shapes
+    /// The issue can be edited after pickup, so both run shapes
     /// must re-read it immediately before they file or link their outputs.
     #[test]
     fn prompt_re_reads_the_issue_before_filing_and_before_write_back() {

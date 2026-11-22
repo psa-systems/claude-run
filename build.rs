@@ -1,7 +1,7 @@
 //! SPEC-2.1: "`build.rs` embeds the 12-character git SHA and the UTC build
 //! date ... or a local probe, else `unknown`." Bake build metadata into the
 //! binary so two `0.1.0` artifacts built from different commits are
-//! distinguishable (see CLAUDE-2).
+//! distinguishable.
 //!
 //! Emits two compile-time env vars consumed by `claude_run::VERSION`:
 //!   - `CLAUDE_RUN_GIT_SHA`   : short (12-char) commit hash

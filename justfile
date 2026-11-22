@@ -91,7 +91,7 @@ default:
 [group: 'check']
 check: check-claude-md check-fmt check-clippy check-build test check-docker
 
-# Guard CLAUDE.md: 20,000-byte cap, 400-character lines, resolvable docs/ links (CLAUDE-370). Runs its self-test first.
+# Guard CLAUDE.md: 20,000-byte cap, 400-character lines, resolvable docs/ links. Runs its self-test first.
 [group: 'check']
 check-claude-md:
     nu scripts/check-claude-md.nu --self-test
@@ -109,7 +109,7 @@ run *args:
 watch:
     cargo watch --clear
 
-# Run the test suite against a fresh, throwaway, non-durable Postgres (CLAUDE-404).
+# Run the test suite against a fresh, throwaway, non-durable Postgres.
 [group: 'dev']
 test-postgres:
     cargo run -- test-postgres -- cargo test

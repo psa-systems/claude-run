@@ -1,7 +1,7 @@
 //! `claude-run test-postgres`: a throwaway, non-durable Postgres for an agent
-//! session's own Postgres-backed test runs (CLAUDE-404).
+//! session's own Postgres-backed test runs.
 //!
-//! CLAUDE-403 stopped a `claude` child from reaching the runner's live
+//! A `claude` child must never reach the runner's live
 //! database. This subcommand is the replacement: it starts a private
 //! `postgres` container in the Docker-in-Docker sidecar every agent session
 //! already has, disables durability (fsync/synchronous_commit/full_page_writes
@@ -29,7 +29,7 @@ use crate::error::{Error, Result};
 pub const DEFAULT_IMAGE: &str = "docker.io/postgres:18.4-alpine3.23";
 /// SPEC-6.6.
 pub const LABEL_KEY: &str = "claude-run.test-postgres";
-/// SPEC-6.6, CLAUDE-573: the owning process's pid namespace. A pid means
+/// SPEC-6.6: the owning process's pid namespace. A pid means
 /// something only inside its own namespace, and every CI job is a container
 /// with its own, on one shared Docker daemon.
 pub const LABEL_PIDNS_KEY: &str = "claude-run.test-postgres.pidns";
@@ -50,7 +50,7 @@ pub struct Opts {
     pub image: Option<String>,
     pub init_sql: Vec<PathBuf>,
     /// Join this Docker network instead of publishing a loopback port, for a
-    /// caller that is itself a container on that network (CI, CLAUDE-541).
+    /// caller that is itself a container on that network (CI).
     pub network: Option<String>,
 }
 
@@ -186,7 +186,7 @@ pub fn docker_run_args(
         "-e".into(),
         format!("POSTGRES_PASSWORD={password}"),
         image.into(),
-        // CLAUDE-540: the Postgres test leg runs many fixtures in parallel,
+        // The Postgres test leg runs many fixtures in parallel,
         // each with its own small pool, plus the clone/cleanup connections;
         // 100 (the default) is too few once that parallelism is raised. A
         // throwaway server can afford the headroom. Server flags follow the
@@ -280,7 +280,7 @@ fn pid_is_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-/// SPEC-6.6, CLAUDE-573: whether `entry` is an orphan this run may stop. A
+/// SPEC-6.6: whether `entry` is an orphan this run may stop. A
 /// container from this pid namespace is one when its owning pid is dead. Any
 /// other one, from another namespace (another CI job's container on the same
 /// Docker daemon) or from before the namespace label, is judged by age alone:
@@ -407,7 +407,7 @@ fn wait_pg_ready(name: &str) -> Result<()> {
 /// command will. `psql` inside the container answering says nothing about
 /// whether the command can reach the server: when this process runs in a
 /// container of its own (a CI job), the loopback a published port sits on is
-/// the Docker host's, not ours (CLAUDE-541). Failing here, within seconds and
+/// the Docker host's, not ours. Failing here, within seconds and
 /// with the cause named, beats every test timing out on its pool. SPEC-6.6.
 fn wait_reachable(host: &str, port: u16) -> Result<()> {
     let deadline = Instant::now() + REACH_TIMEOUT;
@@ -867,7 +867,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-573: run #867 stopped run #863's live Postgres because its pid
+    /// Run #867 stopped run #863's live Postgres because its pid
     /// was dead in #867's namespace. Only this namespace's containers are
     /// judged by pid; any other only by age.
     #[test]
@@ -938,7 +938,7 @@ mod tests {
         assert!(!pid_is_alive(pid));
     }
 
-    /// End-to-end against a stub `docker` on PATH (CLAUDE-224: written with
+    /// End-to-end against a stub `docker` on PATH (written with
     /// `testutil::write_stub`, never `fs::write` + `set_permissions`). The stub
     /// logs every invocation's argv (space-joined) to `log_path` and answers
     /// just enough to drive `run()` through start, readiness, durability,
@@ -994,7 +994,7 @@ exit 0
         let _ = std::fs::read_to_string(&log_path);
     }
 
-    /// SPEC-3.14 item 3, CLAUDE-597: with the runner's span file set, a run
+    /// SPEC-3.14 item 3: with the runner's span file set, a run
     /// reports `postgres_start` then `postgres_healthy`, back to back and ok.
     #[test]
     fn run_reports_postgres_start_and_healthy_spans_to_the_runners_file() {

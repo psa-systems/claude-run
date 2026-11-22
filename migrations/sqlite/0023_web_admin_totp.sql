@@ -1,4 +1,4 @@
--- Mandatory TOTP 2FA for the web UI's single administrator (CLAUDE-368).
+-- Mandatory TOTP 2FA for the web UI's single administrator.
 --
 -- `totp_secret` holds the RFC 6238 secret (base32) encrypted with the same
 -- age key that protects the `secrets` table (`crate::secrets::SecretsKey`),

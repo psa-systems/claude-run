@@ -1,8 +1,8 @@
--- CLAUDE-250: the whole schema in one migration, for a PostgreSQL backend.
+-- The whole schema in one migration, for a PostgreSQL backend.
 --
 -- This is the end state of the twenty SQLite migrations in `../sqlite/`, not a
 -- replay of them: a Postgres database is new by definition here (copying an
--- existing `state.db` across is CLAUDE-251), so nothing is renamed, altered or
+-- existing `state.db` across is `claude-run import`), so nothing is renamed, altered or
 -- backfilled. Table names, column names and index names match the SQLite chain
 -- exactly, because every query in `src/` is shared between the two backends.
 --

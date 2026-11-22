@@ -1,4 +1,4 @@
--- Multiple web accounts with invites (CLAUDE-369), replacing the single-row
+-- Multiple web accounts with invites, replacing the single-row
 -- `web_admin` credential with a real account table. There are no roles yet:
 -- every account has full admin rights, but `created_by` and the shape here
 -- leave room for a role column later without a further migration.

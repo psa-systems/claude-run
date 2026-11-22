@@ -6,8 +6,8 @@
 //! create an executable stub it is about to run. `cargo test` runs the suite on
 //! many threads: any writable descriptor this process holds on the stub can be
 //! inherited by a child another thread forks, and the later `execve` of the
-//! stub then fails with `ETXTBSY` ("Text file busy"). That is CLAUDE-224 in
-//! `claude.rs` and CLAUDE-255 in `claude_login.rs`, the same defect twice, so
+//! stub then fails with `ETXTBSY` ("Text file busy"). That happened in
+//! `claude.rs` and in `claude_login.rs`, the same defect twice, so
 //! the helper lives in one place and every site uses it.
 
 use std::io::Write;
@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 ///
 /// Re-entrant on one thread: a test holds it for its whole body and then calls
 /// production code that takes it again under `cfg(test)`, which a plain
-/// `std::sync::Mutex` turns into a permanent self-deadlock (CLAUDE-536). Take
+/// `std::sync::Mutex` turns into a permanent self-deadlock. Take
 /// it BEFORE any other test lock (`git_allow_protocol_test_lock`,
 /// `git_trace_test_lock`) so two locks are never acquired in opposite orders.
 pub fn path_env_lock() -> PathEnvGuard {
@@ -60,8 +60,8 @@ impl Drop for PathEnvGuard {
 ///
 /// A `git push` run with `-c credential.helper=...` and the runner's own
 /// `CLAUDE_RUN_GIT_USERNAME` / `CLAUDE_RUN_GIT_PASSWORD` exported passes both
-/// to `GIT_CONFIG_PARAMETERS` and the two variables down to any hook it spawns
-/// (CLAUDE-426): a hook's own `cargo test` therefore inherits them from the
+/// to `GIT_CONFIG_PARAMETERS` and the two variables down to any hook it spawns:
+/// a hook's own `cargo test` therefore inherits them from the
 /// process environment unless a test clears them first. Only a test that
 /// invokes git's credential subsystem (`git credential fill`, or a transport
 /// that needs to authenticate) is actually reachable through them, but
@@ -192,7 +192,7 @@ exit "$code"
 /// exponentially between attempts (starting at 5ms, capped at 200ms) instead
 /// of spinning at a fixed interval.
 ///
-/// CLAUDE-504: a `RunGuard`'s `Drop` cannot await its own close, so it spawns
+/// A `RunGuard`'s `Drop` cannot await its own close, so it spawns
 /// the write and a test has to poll for it to land. A fixed, short interval
 /// polled across a fixed, short total window (1s at 10ms) flaked on the
 /// Postgres backend under the heavy I/O contention a full `cargo test` run
@@ -250,7 +250,7 @@ pub fn write_stub(path: &Path, body: &str) {
 
 #[cfg(test)]
 mod tests {
-    /// CLAUDE-536: the guard is re-entrant on one thread (nested production
+    /// The guard is re-entrant on one thread (nested production
     /// takes no longer self-deadlock) and still excludes other threads.
     #[test]
     fn path_env_lock_is_reentrant_and_still_excludes_other_threads() {
@@ -280,7 +280,7 @@ mod tests {
 
     use super::*;
 
-    /// CLAUDE-224 guard: hammer write-then-exec while sibling threads fork, the
+    /// Guard: hammer write-then-exec while sibling threads fork, the
     /// exact shape that failed CI run #1008. An in-process write reproduces
     /// `ETXTBSY` within a few dozen iterations here; with [`write_stub`] the
     /// descriptor never enters our table, so the exec cannot fail that way.
@@ -330,7 +330,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-255 guard: the fix is only durable if a later test cannot quietly
+    /// Guard: the fix is only durable if a later test cannot quietly
     /// go back to `fs::write` plus an in-process `chmod +x`. Scan the
     /// `#[cfg(test)]` half of every source file for a mode literal carrying an
     /// exec bit and fail on any hit.
@@ -395,8 +395,8 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "a test setting an exec bit from inside this process re-introduces the ETXTBSY race \
-             (CLAUDE-255); write the stub with `crate::testutil::write_stub` instead: {offenders:#?}"
+            "a test setting an exec bit from inside this process re-introduces the ETXTBSY race; \
+             write the stub with `crate::testutil::write_stub` instead: {offenders:#?}"
         );
     }
 
@@ -444,7 +444,7 @@ impl Write for ThreadLogWriter {
 }
 
 /// Install, once per test binary, the global subscriber every log capture
-/// reads through (CLAUDE-569). A subscriber set per test with
+/// reads through. A subscriber set per test with
 /// `set_default`/`with_default` made `tracing` rebuild its per-callsite
 /// interest cache each time one was created or dropped; with dozens of test
 /// threads doing that at once, a log site could stay cached as disabled

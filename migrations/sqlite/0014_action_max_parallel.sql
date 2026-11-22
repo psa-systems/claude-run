@@ -1,4 +1,4 @@
--- CLAUDE-162: cache each action's configured `concurrency.max_parallel` in the
+-- Cache each action's configured `concurrency.max_parallel` in the
 -- action index.
 --
 -- The scheduler resolves the daemon-wide auto default for `max_parallel_global`

@@ -3,24 +3,24 @@
 # Docker-in-Docker sidecar sharing the app's network namespace ..., and an
 # optional PostgreSQL service behind the `postgres` profile .... No host bind
 # mount is used. No port is published by default." claude-run daemon,
-# containerized (CLAUDE-37, CLAUDE-247, CLAUDE-287).
+# containerized.
 #
 # The whole daemon runs in this container, so every `claude` child it spawns
 # inherits the container's clean $HOME and loads only the slim bot CLAUDE.md
 # baked into the image (deploy/bot-CLAUDE.md), never the operator's interactive
 # ~/.claude/CLAUDE.md.
 #
-# CLAUDE-247: the container is self-contained. It bind-mounts NOTHING from the
+# The container is self-contained. It bind-mounts NOTHING from the
 # host and reads no host credential. The operator creates the web administrator
 # at /setup and logs Claude, YouTrack, Forgejo and git in from the Settings ->
 # Auth page (see docs/self-hosting.md). That keeps the runner's
 # identity separate from the operator's and lets the stack deploy on a host
 # where neither $HOME nor the invocation directory is available.
 #
-# CLAUDE-253: three flat volumes, /config /data /state. Nothing persists under
+# Three flat volumes, /config /data /state. Nothing persists under
 # $HOME, and no path here needs to know about XDG.
 #
-# CLAUDE-287: the runtime image is built on `opensuse-dev`, which carries
+# The runtime image is built on `opensuse-dev`, which carries
 # Docker, so the daemon's `claude-bot-docker` sidecar below (Docker-in-Docker,
 # loopback only) gives every `claude` session it spawns a Docker it can use.
 # Still no host bind mount: the sidecar's Docker state lives on its own named
@@ -36,7 +36,7 @@ name: claude-bot
 services:
   claude-bot:
     container_name: claude-bot
-    # CLAUDE-88: published by .forgejo/workflows/build-image.yml on every main
+    # Published by .forgejo/workflows/build-image.yml on every main
     # push (`latest`) and release tag (`vX.Y.Z`). Pin a version tag in
     # production. Pulling needs `docker login dev.a8n.run` with a PAT that can
     # read the psa-systems-private packages. For local development, comment `image:` and uncomment
@@ -49,21 +49,21 @@ services:
     restart: unless-stopped
     networks:
       claude-bot-private:
-    # CLAUDE-443: no `user:` here. The image starts as root so the shared
+    # No `user:` here. The image starts as root so the shared
     # gosu-entrypoint.sh (governance/CONTAINER_UID_GID.md) can run its root
     # hooks and chown the volumes, then drops to appuser with gosu. A `user:`
     # override would disable the remap and chown, requiring every data dir to
     # already be writable by that uid:gid.
     environment:
-      # CLAUDE-253: the image already sets every path (three flat roots plus the
+      # The image already sets every path (three flat roots plus the
       # tool stores under them), so nothing here has to restate them. Override
       # one only to move a store somewhere unusual.
       #
-      # CLAUDE-249: the secrets key lives at /config/secrets.key, generated on
+      # The secrets key lives at /config/secrets.key, generated on
       # first start. Set CLAUDE_RUN_SECRETS_KEY_FILE only to supply your own,
       # e.g. from a secret store; the value is a PATH, never key material.
       CLAUDE_RUN_LOG: info
-      # CLAUDE-287: the Docker-in-Docker sidecar below shares this service's
+      # The Docker-in-Docker sidecar below shares this service's
       # network namespace, so its loopback-only daemon is reachable here.
       # `claude` sessions the daemon spawns inherit this, since nothing in
       # src/ calls env_clear or env_remove.
@@ -72,7 +72,7 @@ services:
       # the CI workflows resolve through `${{ vars.RUNS_ON_* }}` into the app
       # service as environment variables, so a `claude` session the daemon
       # spawns ... builds against the identical images CI uses instead of a
-      # guessed tag." (CLAUDE-383). In a workflow the same name is a Forgejo
+      # guessed tag.". In a workflow the same name is a Forgejo
       # Actions variable that resolves to a RUNNER LABEL; here the value is
       # the pullable IMAGE REFERENCE the label's runner advertises, so
       # `docker run "$RUNS_ON_RUST_BUILDER_MUSL"` and a compose
@@ -86,14 +86,14 @@ services:
       RUNS_ON_RUST_BUILDER_MUSL: dev.a8n.run/pandoras-box/rust-builder-musl:v1.2.0-rust1.98.1-alpine
       RUNS_ON_RUST_BUILDER_GLIBC: dev.a8n.run/pandoras-box/rust-builder-glibc:v1.2.0-rust1.98.1-trixie
       RUNS_ON_RUST_BUILDER_GLIBC_WINDOWS: dev.a8n.run/pandoras-box/rust-builder-glibc-windows:v1.2.0-rust1.98.1-trixie
-      # CLAUDE-250: uncomment together with the `claude-run-database-url` secret
+      # Uncomment together with the `claude-run-database-url` secret
       # below to put the runner state on the `postgres` profile's server instead
       # of the SQLite file on claude-bot-data. Unset means SQLite, which is what
       # this file does by default. The URL travels as a file, not as an
       # environment value, because it carries the password.
       # CLAUDE_RUN_DATABASE_URL_FILE: /run/secrets/claude-run-database-url
       #
-      # CLAUDE-428: SMTP is env-only, no Settings-page form. Uncomment these
+      # SMTP is env-only, no Settings-page form. Uncomment these
       # together with the `claude-run-smtp-password` secret below to let an
       # invite on the Accounts page be emailed instead of shown as a
       # one-time link. The password travels as a file, like the database
@@ -105,13 +105,13 @@ services:
       # CLAUDE_RUN_SMTP_PASSWORD_FILE: /run/secrets/claude-run-smtp-password
       # CLAUDE_RUN_SMTP_FROM: claude-run@example.com
       # CLAUDE_RUN_PUBLIC_URL: https://claude-run.example.com
-    # CLAUDE-250: uncomment with the variable above; the daemon reads the URL
+    # Uncomment with the variable above; the daemon reads the URL
     # from the file this mounts.
-    # CLAUDE-428: uncomment alongside the SMTP variables above.
+    # Uncomment alongside the SMTP variables above.
     # secrets:
     #   - claude-run-database-url
     #   - claude-run-smtp-password
-    # CLAUDE-250: `required: false` so this stays a no-op without
+    # `required: false` so this stays a no-op without
     # `--profile postgres`: the plain stack is SQLite-only and must not wait on
     # a service that was never started.
     depends_on:
@@ -119,7 +119,7 @@ services:
         condition: service_healthy
         required: false
     volumes:
-      # CLAUDE-253: three mounts, not seven. Each tool's store is a
+      # Three mounts, not seven. Each tool's store is a
       # subdirectory of one of these rather than a mount point of its own,
       # because the image points every tool at them by environment variable.
       #
@@ -144,7 +144,7 @@ services:
     # no socket). Ephemeral per container so nothing stale survives a restart.
     tmpfs:
       - /run/claude-run
-    # CLAUDE-442: the troubleshooting MCP listener is off by default
+    # The troubleshooting MCP listener is off by default
     # ([mcp].enabled = false until set otherwise in config.toml), so no port is
     # published here either. Uncomment this once [mcp] is enabled in
     # deploy/container-config.toml (or the mounted config.toml); it only
@@ -153,15 +153,15 @@ services:
     # ports:
     #   - "7322:7322"
 
-  # CLAUDE-287: Docker-in-Docker sidecar, so `claude` sessions the daemon spawns
+  # Docker-in-Docker sidecar, so `claude` sessions the daemon spawns
   # can run `docker`, `docker compose` and `docker buildx` (this repo's own
   # `just check`/`just pre-commit` need it). Follows the Forgejo runners'
   # pattern: a
   # privileged dind daemon sharing its owner's network namespace, listening on
   # loopback only, with no TLS because nothing outside that namespace can reach
   # it. The agent drives a privileged daemon, which is root-equivalent on the
-  # host if a container escapes it; that trade was accepted when CLAUDE-287 was
-  # filed. No host bind mount: `/data` is the same named volume claude-bot
+  # host if a container escapes it; that trade was accepted deliberately.
+  # No host bind mount: `/data` is the same named volume claude-bot
   # mounts at the same path, which is what makes `docker run --volume
   # $PWD:...` from inside a job workdir resolve (both containers agree on
   # what `/data/workdirs/...` means); through the host's own socket it would
@@ -169,7 +169,7 @@ services:
   # exist. `/var/lib/docker` is a separate named volume rather than anonymous,
   # so its growth is visible and prunable.
   #
-  # CLAUDE-417: a `docker buildx build` through this daemon (e.g. `just
+  # A `docker buildx build` through this daemon (e.g. `just
   # check-docker`) can have its build session killed mid-build by this
   # dockerd's own BuildKit session healthcheck ("healthcheck failed fatally",
   # "only one connection allowed"). That is an upstream Docker 29.x defect, not
@@ -202,11 +202,11 @@ services:
       start_period: 5s
       start_interval: 1s
 
-  # CLAUDE-250: the optional PostgreSQL state store. Behind a profile, so a plain
+  # The optional PostgreSQL state store. Behind a profile, so a plain
   # `docker compose up` starts exactly the service set it started before this
   # existed; `docker compose --profile postgres up` adds the database. The first
   # start on this backend is a fresh instance: carry an existing state.db over
-  # with `claude-run import` (CLAUDE-251) before starting the daemon on it.
+  # with `claude-run import` before starting the daemon on it.
   # SPEC-9: "an optional PostgreSQL service behind the `postgres` profile
   # (healthcheck `pg_isready`)."
   claude-bot-postgres:
@@ -247,15 +247,15 @@ volumes:
     name: claude-bot-data
   claude-bot-state:
     name: claude-bot-state
-  # CLAUDE-287: /var/lib/docker for the Docker-in-Docker sidecar. Named rather
+  # /var/lib/docker for the Docker-in-Docker sidecar. Named rather
   # than anonymous so its growth is visible and prunable.
   claude-bot-docker:
     name: claude-bot-docker
-  # CLAUDE-250: only mounted by the profiled claude-bot-postgres service.
+  # Only mounted by the profiled claude-bot-postgres service.
   claude-bot-postgres:
     name: claude-bot-postgres
 
-# CLAUDE-250: the two files the `postgres` profile needs. Create them before
+# The two files the `postgres` profile needs. Create them before
 # `docker compose --profile postgres up`:
 #   mkdir secrets; chmod 700 secrets
 #   openssl rand -base64 32 | save secrets/postgres-password.txt
@@ -263,7 +263,7 @@ volumes:
 # The daemon reads the URL only when CLAUDE_RUN_DATABASE_URL_FILE above is
 # uncommented; without it the stack stays on SQLite even with the profile on.
 #
-# CLAUDE-428: claude-run-smtp-password is read only when
+# Claude-run-smtp-password is read only when
 # CLAUDE_RUN_SMTP_PASSWORD_FILE above is uncommented:
 #   echo -n 'the SMTP password' | save secrets/smtp-password.txt
 secrets:

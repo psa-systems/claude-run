@@ -21,7 +21,7 @@ port = 7321
 
 # SPEC-9: "The MCP listener is off; when enabled it binds `0.0.0.0:7322`."
 # [mcp]
-# Off by default (CLAUDE-442): the troubleshooting MCP tools are read-only but
+# Off by default: the troubleshooting MCP tools are read-only but
 # still worth gating behind an explicit opt-in. Uncomment to serve them over
 # Streamable HTTP at /mcp, behind mcp-web's own OAuth 2.1 / local-account /
 # TOTP web layer. 0.0.0.0, matching [web] above, since a loopback bind inside

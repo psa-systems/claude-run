@@ -1,4 +1,4 @@
-//! CLAUDE-535: bound the runner's own CI load on one repo.
+//! Bound the runner's own CI load on one repo.
 //!
 //! Two gates share one question, "how many runner PRs on this repo have CI
 //! pending right now":

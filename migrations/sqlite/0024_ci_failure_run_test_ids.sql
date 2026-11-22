@@ -1,4 +1,4 @@
--- CLAUDE-371: record each sighting's own failing-id fingerprint, not just the
+-- Record each sighting's own failing-id fingerprint, not just the
 -- failure's aggregate set in `ci_failure_tests`, so `route_agent_pr_failure`
 -- can compare an agent PR's latest attempt against its immediately previous
 -- one and stop re-queueing a cycle instead of burning every attempt on it.

@@ -1,10 +1,10 @@
--- CLAUDE-163: record each in-flight job's concurrency key alongside its issue key.
+-- Record each in-flight job's concurrency key alongside its issue key.
 --
 -- The admission dedup (native youtrack + scripted paths) previously dropped
 -- gathered jobs whose ISSUE key was already in flight. Because the youtrack
 -- concurrency key is the project, a run happily gathered a second same-project
 -- issue while that project was already in flight; every one of those siblings
--- then piled onto the KeyGate and (pre-CLAUDE-163) held a permit while parked,
+-- then piled onto the KeyGate and held a permit while parked,
 -- starving other projects and actions. Deduping by CONCURRENCY key instead needs
 -- the in-flight concurrency key, so this column carries it next to `job_key`.
 --

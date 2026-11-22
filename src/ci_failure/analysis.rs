@@ -20,12 +20,12 @@ pub(crate) struct AnalysisInputs {
     pub(crate) log_path: PathBuf,
     /// Path to the failing workflow YAML, or `None` if it could not be fetched.
     pub(crate) workflow_path: Option<PathBuf>,
-    /// CLAUDE-236: the run's forge-reported start / stop times, or `None` when
+    /// The run's forge-reported start / stop times, or `None` when
     /// they could not be read (the prompt then says the timing is unavailable).
     pub(crate) timing: Option<forge_log::RunTiming>,
 }
 
-/// CLAUDE-189: coordinates identifying one failed run, whether parsed from an
+/// Coordinates identifying one failed run, whether parsed from an
 /// issue's `## Failure` block or derived directly from a [`crate::triage::TriageInput`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunCoordinates {
@@ -64,8 +64,8 @@ pub(crate) fn cap_comment(text: &str, max_bytes: usize) -> String {
 /// mapping log position to workflow step order, state the root-cause diagnostic
 /// or, when the log carries none, classify on the run's timing whether the job
 /// stopped emitting output and was killed or the run ended with no diagnostic,
-/// and give remediation. CLAUDE-236: the stored log is never truncated by this
-/// tool, so the prompt never offers truncation as an explanation. CLAUDE-274:
+/// and give remediation. The stored log is never truncated by this
+/// tool, so the prompt never offers truncation as an explanation.
 /// ends with a fenced JSON verdict so the at-ingest classifier can route the
 /// failure from the same session; the scheduled action ignores the trailing
 /// JSON and posts the whole reply as the comment.
@@ -83,7 +83,7 @@ pub(crate) fn build_prompt(inputs: &AnalysisInputs, coords: &RunCoordinates) -> 
         None => "The failing workflow YAML could not be fetched; analyze the log alone and say so."
             .to_string(),
     };
-    // CLAUDE-236: the run's own start / stop times are the evidence that tells a
+    // The run's own start / stop times are the evidence that tells a
     // job killed after going silent from a capture that lost data.
     let timing_line = match &inputs.timing {
         Some(t) => format!(

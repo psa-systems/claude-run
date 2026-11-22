@@ -1151,7 +1151,7 @@ struct CreateInviteForm {
 /// POST `/settings/accounts/invite`: mint a single-use invite. With `email`
 /// blank, shows its link once (unchanged). With `email` set, emails the link
 /// instead and does not display it, unless the send fails, in which case the
-/// link is shown once as a fallback. See CLAUDE-394.
+/// link is shown once as a fallback.
 async fn create_invite_submit(
     State(gate): State<TokenGate>,
     Extension(account): Extension<Account>,
@@ -1289,7 +1289,7 @@ async fn create_invite_submit(
 }
 
 // SPEC-7.11: resolves the SMTP transport config invite-by-email sends through.
-/// Resolve the SMTP transport config from the environment (CLAUDE-428).
+/// Resolve the SMTP transport config from the environment.
 /// Warns and falls back to unconfigured on a bad environment rather than
 /// failing the request: the daemon's own startup validation
 /// (`src/daemon.rs`) is where a bad `CLAUDE_RUN_SMTP_*` / `CLAUDE_RUN_PUBLIC_URL`
@@ -2638,8 +2638,7 @@ mod tests {
     }
 
     // One test rather than two, because the SMTP inputs are process-wide
-    // environment variables and `cargo test` runs in parallel (CLAUDE-428,
-    // same reasoning as `database_url_precedence_is_file_then_env_then_config`
+    // environment variables and `cargo test` runs in parallel (// same reasoning as `database_url_precedence_is_file_then_env_then_config`
     // in `config.rs`).
     #[tokio::test]
     async fn create_invite_by_email_follows_the_smtp_environment() {

@@ -3,7 +3,7 @@
 # https://github.com/harrydowning/vscode-yaml-embedded-languages
 # https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
 
-# One newsletter draft per new blog post, for a person to approve: an example to adapt (CLAUDE-644).
+# One newsletter draft per new blog post, for a person to approve: an example to adapt.
 #
 # Not installed by default: `actions/examples/` is not seeded into a new install. To use it, paste this file into the
 # web UI (New action, raw YAML), replace the placeholders in `env` and store the token on the Secrets page. The run

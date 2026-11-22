@@ -1,5 +1,5 @@
 {# SPEC-3.10 items 9 and 10, pushed by GET /sse/status/storage's `cargo-cache`
-   event (CLAUDE-637): the shared Cargo target directories, one row per repo,
+   event: the shared Cargo target directories, one row per repo,
    each with its size, last-used time and whether a run for that repo is in
    flight. Delete and Delete all post to the cargo-cache routes, mirrored
    under /api the way the Pause form posts to /api/pause, and confirm with

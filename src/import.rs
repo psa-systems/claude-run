@@ -360,7 +360,7 @@ async fn copy_table(
         .await?;
     let mut copied = 0i64;
     for row in &rows {
-        // CLAUDE-436: the Any driver types a NULL f64 bind as Postgres
+        // The Any driver types a NULL f64 bind as Postgres
         // float4, and sqlx caches a prepared statement's parameter types per
         // connection, so a NULL in a nullable REAL column on one row and a
         // real value in the same column on a later row of the same table
@@ -581,7 +581,7 @@ mod tests {
             .bind("interval").bind("30m").bind("2026-09-01T00:00:00Z").bind(2i64)
             .execute(pool).await.unwrap();
         sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO attempt_counters (action_name, job_key, count, last_at) VALUES (?, ?, ?, ?)")))
-            .bind("youtrack").bind("CLAUDE-1").bind(3i64).bind("2026-09-01T00:00:00Z")
+            .bind("youtrack").bind("PROJ-1").bind(3i64).bind("2026-09-01T00:00:00Z")
             .execute(pool).await.unwrap();
         sqlx::query(sqlx::AssertSqlSafe(q(
             "INSERT INTO daily_ledger (action_name, date, run_count, cost_usd) VALUES (?, ?, ?, ?)",
@@ -594,7 +594,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO dependency_gate (action_name, job_key, blocked_until, signature, updated_at, blocked_since) VALUES (?, ?, ?, ?, ?, ?)")))
-            .bind("youtrack").bind("CLAUDE-2").bind(1_700_000_000_000i64).bind("sig")
+            .bind("youtrack").bind("PROJ-2").bind(1_700_000_000_000i64).bind("sig")
             .bind("2026-09-01T00:00:00Z").bind(1_600_000_000_000i64)
             .execute(pool).await.unwrap();
         sqlx::query(sqlx::AssertSqlSafe(q(
@@ -686,11 +686,11 @@ mod tests {
             .bind("youtrack").bind("2026-09-01T00:00:00Z").bind(None::<String>).bind(None::<i64>).bind(1i64).bind("cli")
             .fetch_one(pool).await.unwrap();
         sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO job_outcomes (run_id, action_name, job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, summary, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")))
-            .bind(run_id).bind("youtrack").bind("CLAUDE-1").bind(1i64).bind("2026-09-01T00:00:00Z")
+            .bind(run_id).bind("youtrack").bind("PROJ-1").bind(1i64).bind("2026-09-01T00:00:00Z")
             .bind(1i64).bind(1i64).bind(1i64).bind(0.5f64).bind("done").bind(1234i64)
             .execute(pool).await.unwrap();
         sqlx::query(sqlx::AssertSqlSafe(q("INSERT INTO attempt_steps (run_id, action_name, job_key, attempt, seq, stage, kind, label, started_at, ended_at, ok, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")))
-            .bind(run_id).bind("youtrack").bind("CLAUDE-1").bind(1i64).bind(1i64).bind("initial")
+            .bind(run_id).bind("youtrack").bind("PROJ-1").bind(1i64).bind(1i64).bind("initial")
             .bind("clone").bind("clone").bind("2026-09-01T00:00:00Z").bind("2026-09-01T00:00:10Z")
             .bind(1i64).bind(None::<String>)
             .execute(pool).await.unwrap();
@@ -701,7 +701,7 @@ mod tests {
             "INSERT INTO run_inflight_jobs (run_id, job_key, concurrency_key) VALUES (?, ?, ?)",
         )))
         .bind(run_id)
-        .bind("CLAUDE-1")
+        .bind("PROJ-1")
         .bind("repo:claude-run")
         .execute(pool)
         .await
@@ -714,7 +714,7 @@ mod tests {
         .bind("checks.yml")
         .bind("test")
         .bind(None::<String>)
-        .bind("CLAUDE-1")
+        .bind("PROJ-1")
         .bind("open")
         .bind("2026-09-01T00:00:00Z")
         .bind("2026-09-01T00:00:00Z")
@@ -748,11 +748,11 @@ mod tests {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )))
         .bind("youtrack")
-        .bind("CLAUDE-1")
+        .bind("PROJ-1")
         .bind("dev.a8n.run")
         .bind("contoso/claude-run")
         .bind(17i64)
-        .bind("fix/CLAUDE-1")
+        .bind("fix/PROJ-1")
         .bind(0i64)
         .bind("open")
         .bind("2026-09-01T00:00:00Z")
@@ -771,7 +771,7 @@ mod tests {
         )))
         .bind("2026-09-01T00:00:00Z")
         .bind("youtrack")
-        .bind("CLAUDE-1")
+        .bind("PROJ-1")
         .bind(run_id)
         .bind(0i64)
         .bind(0i64)
@@ -789,7 +789,7 @@ mod tests {
         .bind(None::<String>)
         .bind(0i64)
         .bind(None::<String>)
-        .bind("/logs/youtrack/streams/CLAUDE-1-attempt-1.jsonl")
+        .bind("/logs/youtrack/streams/PROJ-1-attempt-1.jsonl")
         .execute(pool)
         .await
         .unwrap();
@@ -812,7 +812,7 @@ mod tests {
         .bind("instance-a")
         .bind(1i64)
         .bind("youtrack")
-        .bind("CLAUDE-1")
+        .bind("PROJ-1")
         .bind(1i64)
         .bind("success")
         .bind(1i64)
@@ -937,7 +937,7 @@ mod tests {
         for sql in [
             "INSERT INTO runs (id, action_name, started_at) VALUES (5000, 'youtrack', '2026-09-01T00:00:00Z')",
             "INSERT INTO job_outcomes (id, run_id, action_name, job_key, attempt, ts, ok, claude_ran, claude_ok) \
-             VALUES (5000, 5000, 'youtrack', 'CLAUDE-9', 1, '2026-09-01T00:00:00Z', 1, 1, 1)",
+             VALUES (5000, 5000, 'youtrack', 'PROJ-9', 1, '2026-09-01T00:00:00Z', 1, 1, 1)",
             "INSERT INTO run_events (id, run_id, action_name, ts, level, message) \
              VALUES (5000, 5000, 'youtrack', '2026-09-01T00:00:00Z', 'info', 'seeded')",
             "INSERT INTO secrets (id, name, ciphertext, created_at) \
@@ -949,7 +949,7 @@ mod tests {
              VALUES (5000, 5000, 1, 'abc123', 'main', '2026-09-01T00:00:00Z')",
             "INSERT INTO agent_pull_requests \
              (id, action_name, issue_key, host, repo, pr_number, head_branch, state, created_at, updated_at) \
-             VALUES (5000, 'youtrack', 'CLAUDE-9', 'dev.a8n.run', 'contoso/claude-run', 99, \
+             VALUES (5000, 'youtrack', 'PROJ-9', 'dev.a8n.run', 'contoso/claude-run', 99, \
              'fix/other', 'open', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
         ] {
             sqlx::query(sql).execute(&pool).await.unwrap();
@@ -982,7 +982,7 @@ mod tests {
         ).into_owned()))
         .bind(run_id)
         .bind("youtrack")
-        .bind("CLAUDE-9")
+        .bind("PROJ-9")
         .bind(2i64)
         .bind("2026-09-02T00:00:00Z")
         .bind(1i64)
@@ -1070,11 +1070,11 @@ mod tests {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         ).into_owned()))
         .bind("youtrack")
-        .bind("CLAUDE-2")
+        .bind("PROJ-2")
         .bind("dev.a8n.run")
         .bind("contoso/claude-run")
         .bind(100i64)
-        .bind("fix/CLAUDE-2")
+        .bind("fix/PROJ-2")
         .bind("open")
         .bind("2026-09-02T00:00:00Z")
         .bind("2026-09-02T00:00:00Z")

@@ -11,7 +11,7 @@
 # - dry-run: a workflow_dispatch. The caller builds and prints but mutates nothing.
 #
 # Deriving the mode from the trigger is what removes the twin-publish race
-# (governance GOV-13 / claude-run CLAUDE-122). The release commit is
+# The release commit is
 # simultaneously a push to `main` AND the `v*` tag push, so both workflow
 # events fire. With `git describe` as the source of truth, both runs resolved
 # the identical `[vX.Y.Z, latest]` set and raced to write the same destination

@@ -1,4 +1,4 @@
-# Example action: a newsletter draft for each new blog post (CLAUDE-644)
+# Example action: a newsletter draft for each new blog post
 
 `actions/examples/blog-newsletter.yml` turns each new blog post into a newsletter email that a person approves. It reads the blog's newsletter feed, and for each post it has not handled before it has Claude write a short summary of the post, checks it, creates it as a **draft** with `POST <NEWSLETTER_URL>/api/v1/editions`, and then asks for review with `POST <NEWSLETTER_URL>/api/v1/editions/{id}/review`, so the newsletter's administrators are told a draft is waiting. It never sends or schedules: an administrator approves and sends it in the newsletter system.
 
@@ -72,7 +72,7 @@ Each feed item is one job keyed on its `guid` (`dedup_key: guid`), oldest first,
 
 The post step adds the guid to `.seen` only once the newsletter system answered `201` to the draft request, or when Claude skipped the post on purpose. Before anything else, a job's `filter` re-reads `.seen` and `.dropped` and skips a post already there without counting an attempt.
 
-Why the filter is needed: the daemon can start a check while an earlier run's job is still in its post step. Runs of an action overlap (SPEC-2.2, CLAUDE-162): this one is due 15 minutes after the last run started, and a manual trigger starts one at any time. Two runs never work the same post at once: the later run drops a gathered post whose job is in flight, and a post's key is held by one job at a time. But the later run reads the feed and `.seen` before that check, so when the earlier job finishes in between, the later run would draft the post again; with up to 3 attempts per post, the attempt cap would not stop it. The filter runs once the job holds the post's key, after the earlier job's post step is done, and sees the guid in `.seen`.
+Why the filter is needed: the daemon can start a check while an earlier run's job is still in its post step. Runs of an action overlap (SPEC-2.2): this one is due 15 minutes after the last run started, and a manual trigger starts one at any time. Two runs never work the same post at once: the later run drops a gathered post whose job is in flight, and a post's key is held by one job at a time. But the later run reads the feed and `.seen` before that check, so when the earlier job finishes in between, the later run would draft the post again; with up to 3 attempts per post, the attempt cap would not stop it. The filter runs once the job holds the post's key, after the earlier job's post step is done, and sees the guid in `.seen`.
 
 ### Retries
 

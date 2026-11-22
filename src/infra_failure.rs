@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn a_passing_test_named_after_a_detector_phrase_does_not_match() {
-        // CLAUDE-459: this repo's own `disk_full_is_detected_from_enospc...`
+        // This repo's own `disk_full_is_detected_from_enospc...`
         // test prints exactly this line on every passing run.
         assert!(detect(
             "test infra_failure::tests::disk_full_is_detected_from_enospc_and_from_a_capacity_guard ... ok\n"

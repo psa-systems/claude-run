@@ -69,10 +69,9 @@ pub enum Section {
     /// editor, because the values are secrets typed into password fields; the
     /// document stored here holds only URLs and secret NAMES.
     Auth,
-    /// Docker sidecar named-volume GC retention window (CLAUDE-433).
+    /// Docker sidecar named-volume GC retention window.
     DockerGc,
-    /// Per-repo shared Cargo target directory size ceiling (CLAUDE-512,
-    /// `SPEC-3.10` item 6).
+    /// Per-repo shared Cargo target directory size ceiling (/// `SPEC-3.10` item 6).
     CargoCache,
     /// Optional peering between instances (`SPEC-3.17` item 3).
     Peers,
@@ -813,7 +812,7 @@ pub struct LiveSettings {
     docker_gc: Arc<RwLock<DockerGcConfig>>,
     /// Per-repo shared Cargo target directory size ceiling, read by the
     /// sweeper on each tick so a Settings save applies on the next sweep.
-    /// CLAUDE-512, `SPEC-3.10` item 6.
+    /// `SPEC-3.10` item 6.
     cargo_cache: Arc<RwLock<CargoCacheConfig>>,
     /// Peering config, read by the poller each tick and by the peer API.
     peers: Arc<RwLock<PeersConfig>>,
@@ -944,7 +943,7 @@ impl LiveSettings {
 
     /// Shared handle to the live Cargo cache ceiling config, read by the
     /// sweeper on each tick so a Settings save applies on the next sweep.
-    /// CLAUDE-512, `SPEC-3.10` item 6.
+    /// `SPEC-3.10` item 6.
     pub fn cargo_cache_handle(&self) -> Arc<RwLock<CargoCacheConfig>> {
         self.cargo_cache.clone()
     }
@@ -1148,10 +1147,10 @@ fn comment_rate_map(cfg: &CommentWebhookConfig) -> HashMap<String, Mutex<RateLim
 /// `agent_pr_fix_attempts` must be at least 1 - a `0` would flag
 /// the agent's own PR `Needs Review` on its very first failure, never giving
 /// it a chance to fix its own regression.
-/// CLAUDE-360: `enabled: true` is rejected unless every configured source
+/// `enabled: true` is rejected unless every configured source
 /// carries a `secret_ref`, and at least one source is configured, so
 /// "enabled" can never mean "accepting requests with no real authentication
-/// configured behind it." CLAUDE-347: the same rejection applies to
+/// configured behind it." the same rejection applies to
 /// `write_token_ref`, so a source missing the PAT the comment path needs is
 /// caught here, at startup, naming the source and the field, instead of only
 /// surfacing when [`crate::web::webhooks::build_pr_comment_backend`] (or its
@@ -1177,7 +1176,7 @@ pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> 
 }
 
 /// Delete a leftover `config.email` settings row and its `email-smtp-password`
-/// secret, left behind by CLAUDE-428 moving the SMTP transport to environment
+/// secret, left behind when the SMTP transport moved to environment
 /// variables. Run once at every daemon start (see `src/daemon.rs`), before
 /// `migrate_config_file`. Logs one warning naming the key and the retired
 /// document's host/from (never the password) when a row is actually found; a
@@ -1213,7 +1212,7 @@ pub async fn retire_email_section(pool: &DbPool) -> Result<()> {
 
 /// Shared by [`validate_webhook`] and [`validate_comment_webhook`]: a listener
 /// being enabled requires at least one source and every source to carry both
-/// `secret_ref` (CLAUDE-360) and `write_token_ref` (CLAUDE-347), naming every
+/// `secret_ref` and `write_token_ref`, naming every
 /// offending source key and its missing field(s) in one error. This is a
 /// presence check only: it tells a missing reference from a configured one,
 /// but not a configured one from an unauthorized token, since the scopes on a
@@ -1245,7 +1244,7 @@ where
 }
 
 /// Lets [`validate_enabled_sources`] read the required credential references
-/// off either source type with no duplicated body. CLAUDE-347: declares the
+/// off either source type with no duplicated body. Declares the
 /// required-reference set per webhook source type in one place, so a type
 /// added later that forgets to implement this trait fails to compile rather
 /// than silently skipping validation.
@@ -1301,7 +1300,7 @@ pub fn validate_comment_webhook(cfg: &CommentWebhookConfig) -> std::result::Resu
     if cfg.claude_timeout_seconds < 1 {
         return Err("claude_timeout_seconds must be >= 1".to_string());
     }
-    // CLAUDE-550: `0` would park every conflicting agent PR without one
+    // `0` would park every conflicting agent PR without one
     // resolve attempt.
     if cfg.agent_conflict_resolve_attempts < 1 {
         return Err("agent_conflict_resolve_attempts must be >= 1".to_string());
@@ -1319,7 +1318,7 @@ pub fn validate_comment_webhook(cfg: &CommentWebhookConfig) -> std::result::Resu
     Ok(())
 }
 
-/// CLAUDE-360: the webhook / webhook_comment sections whose `sources` are
+/// The webhook / webhook_comment sections whose `sources` are
 /// non-empty but `enabled` is `false`, in the order `["webhook",
 /// "webhook_comment"]` filtered to what applies. This is the upgrade-time
 /// transition (a stored document with no `enabled` key deserializes to the
@@ -2233,7 +2232,7 @@ mod tests {
         let live = LiveSettings::new(pool.clone(), eff_default(), None);
 
         // Default is auto (0) + 60s + sweep enabled, and is exposed on the
-        // shared handle. A stored document without the key (CLAUDE-625) also
+        // shared handle. A stored document without the key also
         // reads as enabled: `#[serde(default)]` on the struct fills it in.
         let handle = live.concurrency_handle();
         assert_eq!(handle.read().await.max_parallel_global, 0);
@@ -2329,7 +2328,7 @@ mod tests {
         assert!(err.to_string().contains("log_filter"), "{err}");
     }
 
-    // ---- CLAUDE-360: enabled requires configured, secret-bearing sources ---
+    // ---- enabled requires configured, secret-bearing sources ---
 
     #[test]
     fn webhook_enabled_with_no_sources_is_rejected() {
@@ -2360,7 +2359,7 @@ mod tests {
         assert!(err.contains("secret_ref"), "{err}");
     }
 
-    /// CLAUDE-347: this is the exact gap the issue reports - a source with an
+    /// This is the exact gap the issue reports - a source with an
     /// HMAC secret but no comment-path PAT used to start up clean and only
     /// fail the first time the comment backend needed `write_token_ref`.
     #[test]
@@ -2433,7 +2432,7 @@ mod tests {
         assert!(err.contains("missing secret_ref"), "{err}");
     }
 
-    /// CLAUDE-347: the comment-webhook equivalent of the gap the issue
+    /// The comment-webhook equivalent of the gap the issue
     /// reports - `write_token_ref` is the only credential this listener needs
     /// to act (it pushes branches and replies), so missing it must be caught
     /// here rather than at the first refused delivery.
