@@ -3618,7 +3618,7 @@ fn run_pre(
 ///
 /// Install the repo's git hooks on a fresh clone so a
 /// commit or push that fails the repo's local checks is blocked locally instead of only
-/// being caught by CI (the gap that produced A8N-69). Detects a `just
+/// being caught by CI. Detects a `just
 /// install-hooks` recipe and, when present, runs it; the recipe is idempotent
 /// (it rewrites `.git/hooks/pre-commit` and, under the shared task runner's
 /// default `hook_layout`, `.git/hooks/pre-push` too), so running it on every
