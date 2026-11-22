@@ -3456,7 +3456,7 @@ mod tests {
 
     #[test]
     fn list_queued_parses_json_array() {
-        let json = r#"[{"idReadable":"MK-16","summary":"x"},{"idReadable":"MK-17"}]"#;
+        let json = r#"[{"idReadable":"MX-16","summary":"x"},{"idReadable":"MX-17"}]"#;
         let b = backend(StubRunner::new().ok(
             "yt",
             &["list", "--query=AI Agent: Queued", "--json"],
@@ -3464,7 +3464,7 @@ mod tests {
         ));
         let issues = b.list_queued("AI Agent: Queued").unwrap();
         assert_eq!(issues.len(), 2);
-        assert_eq!(issues[0]["idReadable"], "MK-16");
+        assert_eq!(issues[0]["idReadable"], "MX-16");
     }
 
     /// `issue_links` flattens the `yt issue inspect --json` `links`
@@ -3568,30 +3568,30 @@ mod tests {
     fn get_field_trims_stdout() {
         let b = backend(StubRunner::new().ok(
             "yt",
-            &["issue", "get-field", "MK-16", "AI Agent"],
+            &["issue", "get-field", "MX-16", "AI Agent"],
             "Queued\n",
         ));
-        assert_eq!(b.get_field("MK-16", "AI Agent").unwrap(), "Queued");
+        assert_eq!(b.get_field("MX-16", "AI Agent").unwrap(), "Queued");
     }
 
     #[test]
     fn get_estimation_minutes_parses_raw_minutes() {
         let b = backend(StubRunner::new().ok(
             "yt",
-            &["issue", "get-field", "MK-16", "Estimation", "--json"],
+            &["issue", "get-field", "MX-16", "Estimation", "--json"],
             r#"{"field":"Estimation","value":"2h","type":"PeriodValue","raw":{"presentation":"2h","minutes":120,"$type":"PeriodValue"}}"#,
         ));
-        assert_eq!(b.get_estimation_minutes("MK-16").unwrap(), Some(120));
+        assert_eq!(b.get_estimation_minutes("MX-16").unwrap(), Some(120));
     }
 
     #[test]
     fn get_estimation_minutes_is_none_when_unset() {
         let b = backend(StubRunner::new().ok(
             "yt",
-            &["issue", "get-field", "MK-16", "Estimation", "--json"],
+            &["issue", "get-field", "MX-16", "Estimation", "--json"],
             r#"{"field":"Estimation","value":null,"type":"","raw":null}"#,
         ));
-        assert_eq!(b.get_estimation_minutes("MK-16").unwrap(), None);
+        assert_eq!(b.get_estimation_minutes("MX-16").unwrap(), None);
     }
 
     /// A captured `yt issue history --json --category CustomFieldCategory`
@@ -3638,7 +3638,7 @@ mod tests {
             &[
                 "issue",
                 "history",
-                "MK-16",
+                "MX-16",
                 "--json",
                 "--category",
                 "CustomFieldCategory",
@@ -3646,7 +3646,7 @@ mod tests {
             HISTORY_SAMPLE,
         ));
         let got = b
-            .field_changed_at("MK-16", "AI Agent", "Working")
+            .field_changed_at("MX-16", "AI Agent", "Working")
             .unwrap()
             .expect("a matching entry exists");
         assert_eq!(
@@ -3663,7 +3663,7 @@ mod tests {
             &[
                 "issue",
                 "history",
-                "MK-16",
+                "MX-16",
                 "--json",
                 "--category",
                 "CustomFieldCategory",
@@ -3671,7 +3671,7 @@ mod tests {
             HISTORY_SAMPLE,
         ));
         assert_eq!(
-            b.field_changed_at("MK-16", "AI Agent", "Needs Review")
+            b.field_changed_at("MX-16", "AI Agent", "Needs Review")
                 .unwrap(),
             None
         );
@@ -3681,11 +3681,11 @@ mod tests {
     fn nonzero_exit_is_typed_cli_failure() {
         let b = backend(StubRunner::new().fail(
             "yt",
-            &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+            &["issue", "set-field", "MX-16", "AI Agent", "Working"],
             2,
             "boom",
         ));
-        match b.set_field("MK-16", "AI Agent", "Working").unwrap_err() {
+        match b.set_field("MX-16", "AI Agent", "Working").unwrap_err() {
             Error::CliFailed {
                 binary,
                 exit_code,
@@ -3703,7 +3703,7 @@ mod tests {
     #[test]
     fn missing_binary_is_typed_not_found() {
         let b = backend(StubRunner::new().missing("yt"));
-        match b.get_field("MK-16", "State").unwrap_err() {
+        match b.get_field("MX-16", "State").unwrap_err() {
             Error::CliNotFound { binary } => assert_eq!(binary, "yt"),
             other => panic!("expected CliNotFound, got {other:?}"),
         }
@@ -3714,10 +3714,10 @@ mod tests {
         let json = r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-run"}]"#;
         let b = backend(StubRunner::new().ok(
             "yt",
-            &["project", "vcs", "list", "MK", "--enabled-only", "--json"],
+            &["project", "vcs", "list", "MX", "--enabled-only", "--json"],
             json,
         ));
-        let repo = b.resolve_vcs("MK").unwrap();
+        let repo = b.resolve_vcs("MX").unwrap();
         assert_eq!(repo.repo_host, "https://dev.a8n.run");
         assert_eq!(repo.repo_path, "contoso/claude-run");
         assert_eq!(repo.clone_url, "https://dev.a8n.run/contoso/claude-run.git");
@@ -3727,11 +3727,11 @@ mod tests {
     fn resolve_vcs_empty_is_no_integration() {
         let b = backend(StubRunner::new().ok(
             "yt",
-            &["project", "vcs", "list", "MK", "--enabled-only", "--json"],
+            &["project", "vcs", "list", "MX", "--enabled-only", "--json"],
             "[]",
         ));
-        match b.resolve_vcs("MK").unwrap_err() {
-            Error::NoVcsIntegration(key) => assert_eq!(key, "MK"),
+        match b.resolve_vcs("MX").unwrap_err() {
+            Error::NoVcsIntegration(key) => assert_eq!(key, "MX"),
             other => panic!("expected NoVcsIntegration, got {other:?}"),
         }
     }
@@ -3784,11 +3784,11 @@ mod tests {
         let json = r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-run"}]"#;
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
-            &["project", "vcs", "list", "MK", "--enabled-only", "--json"],
+            &["project", "vcs", "list", "MX", "--enabled-only", "--json"],
             json,
         ));
         let b = CliBackend::new(runner.clone());
-        b.resolve_vcs("MK").unwrap();
+        b.resolve_vcs("MX").unwrap();
         let calls = runner.calls.lock().unwrap();
         assert!(
             !calls.iter().any(|c| c == "yt user me"),
@@ -4120,7 +4120,7 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
-                "Body of the commit.\n\n#MK-16\n",
+                "Body of the commit.\n\n#MX-16\n",
             );
         let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
         let body_path = scratch.join(".claude-run-pr-body.md");
@@ -4203,12 +4203,12 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
-                "Body of the commit.\n\n#MK-16\n",
+                "Body of the commit.\n\n#MX-16\n",
             )
             .ok(
                 "git",
                 &["log", "-1", "--format=%B", "feat/x"],
-                "feat(x): do the thing\n\nBody of the commit.\n\n#MK-16\n",
+                "feat(x): do the thing\n\nBody of the commit.\n\n#MX-16\n",
             )
             .ok(
                 "git",
@@ -4475,7 +4475,7 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%B", "feat/x"],
-                "WIP: feat(x): do the thing\n\n#MK-16\n",
+                "WIP: feat(x): do the thing\n\n#MX-16\n",
             )
             .ok(
                 "git",
@@ -4516,7 +4516,7 @@ mod tests {
                 "dev.a8n.run",
                 PrStrategy::Branch,
                 true,
-                Some("salvage body\n\n#MK-16\n"),
+                Some("salvage body\n\n#MX-16\n"),
             )
             .unwrap();
         assert_eq!(pr.number, Some(77));
@@ -4563,12 +4563,12 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
-                "Body of the commit.\n\n#MK-16\n",
+                "Body of the commit.\n\n#MX-16\n",
             )
             .ok(
                 "git",
                 &["log", "-1", "--format=%B", "feat/x"],
-                "feat(x): do the thing\n\nBody of the commit.\n\n#MK-16\n",
+                "feat(x): do the thing\n\nBody of the commit.\n\n#MX-16\n",
             )
             .ok(
                 "git",
@@ -4691,13 +4691,13 @@ mod tests {
                 "dev.a8n.run",
                 PrStrategy::Branch,
                 true,
-                Some("## Summary\n\nRunner-written.\n\n#MK-16"),
+                Some("## Summary\n\nRunner-written.\n\n#MX-16"),
             )
             .unwrap();
         assert_eq!(pr.number, Some(77));
         assert_eq!(
             captured.lock().unwrap().as_deref(),
-            Some("## Summary\n\nRunner-written.\n\n#MK-16"),
+            Some("## Summary\n\nRunner-written.\n\n#MX-16"),
             "the caller-supplied body must land in the --body-file scratch file verbatim"
         );
         let calls = runner_calls.inner.calls.lock().unwrap();
@@ -4721,8 +4721,8 @@ mod tests {
             .checkpoint_push(
                 wd.path(),
                 "dev.a8n.run",
-                Some("## Summary\n\n#MK-16"),
-                "MK-16",
+                Some("## Summary\n\n#MX-16"),
+                "MX-16",
                 None,
                 None,
             )
@@ -4754,8 +4754,8 @@ mod tests {
             .checkpoint_push(
                 wd.path(),
                 "dev.a8n.run",
-                Some("## Summary\n\n#MK-16"),
-                "MK-16",
+                Some("## Summary\n\n#MX-16"),
+                "MX-16",
                 None,
                 None,
             )
@@ -4830,7 +4830,7 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%B", "feat/x"],
-                "feat(x): wip\n\n#MK-16\n",
+                "feat(x): wip\n\n#MX-16\n",
             )
             .ok(
                 "git",
@@ -4848,8 +4848,8 @@ mod tests {
             .checkpoint_push(
                 wd.path(),
                 "dev.a8n.run",
-                Some("## Summary\n\n#MK-16"),
-                "MK-16",
+                Some("## Summary\n\n#MX-16"),
+                "MX-16",
                 None,
                 None,
             )
@@ -4887,7 +4887,7 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%B", "feat/x"],
-                "feat(x): more wip\n\n#MK-16\n",
+                "feat(x): more wip\n\n#MX-16\n",
             )
             .ok(
                 "git",
@@ -4904,8 +4904,8 @@ mod tests {
             .checkpoint_push(
                 wd.path(),
                 "dev.a8n.run",
-                Some("## Summary\n\n#MK-16"),
-                "MK-16",
+                Some("## Summary\n\n#MX-16"),
+                "MX-16",
                 None,
                 None,
             )
@@ -4988,7 +4988,7 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
-                "Finished.\n\n#MK-16\n",
+                "Finished.\n\n#MX-16\n",
             );
         let runner = runner
             .ok(
@@ -5013,7 +5013,7 @@ mod tests {
                     "edit",
                     "contoso/claude-run#7",
                     "body",
-                    "Finished.\n\n#MK-16",
+                    "Finished.\n\n#MX-16",
                 ],
                 "",
             );
@@ -5163,7 +5163,7 @@ mod tests {
         // The AGit strategy must reject a tip subject that is a
         // bare issue reference before invoking `fj`.
         let runner = Arc::new(with_branch_resolution(
-            StubRunner::new().ok("git", &["log", "-1", "--format=%s", "HEAD"], "#MK-16\n"),
+            StubRunner::new().ok("git", &["log", "-1", "--format=%s", "HEAD"], "#MX-16\n"),
             "origin/main",
             &["main", "fix/x"],
             &[("fix/x", "aaa\n")],
@@ -5173,7 +5173,7 @@ mod tests {
             .create_pr(Path::new("/tmp/wd"), "dev.a8n.run", PrStrategy::Agit)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("#MK-16"), "{err}");
+        assert!(err.contains("#MX-16"), "{err}");
         let calls = runner.calls.lock().unwrap();
         assert!(
             !calls.iter().any(|c| c.starts_with("fj ")),
@@ -5247,7 +5247,7 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
-                "Body of the commit.\n\n#MK-16\n",
+                "Body of the commit.\n\n#MX-16\n",
             );
         let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
         let body_path = scratch.join(".claude-run-pr-body.md");
@@ -5879,7 +5879,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_adopts_open_pr_when_diverged() {
-        // The YOTUN-96 signature: the remote branch is present
+        // The signature of a remote branch that is present
         // and NOT a fast-forward of the local tip (neither is an ancestor of the
         // other). Force is banned, so the runner fetches, merges `origin/<branch>`
         // into the local work, pushes the resulting fast-forward,
@@ -6818,7 +6818,7 @@ mod tests {
             &["worktree", "remove", origin_feat.to_str().unwrap()],
         );
 
-        // The agent rewrites its own local history (the PMCP-9 incident),
+        // The agent rewrites its own local history (an observed incident),
         // diverging from the checkpoint commit it never fetched.
         git_in(
             &workdir,
@@ -7813,7 +7813,7 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    &["issue", "get-field", "MX-16", "AI Agent"],
                     "Queued\n",
                 )
                 .ok(
@@ -7841,7 +7841,7 @@ mod tests {
                 "/tmp/creds".to_string(),
             )]);
 
-        backend.get_field("MK-16", "AI Agent").unwrap();
+        backend.get_field("MX-16", "AI Agent").unwrap();
         backend
             .create_pr(Path::new("/tmp/x"), "dev.a8n.run", PrStrategy::Agit)
             .unwrap();
@@ -8010,7 +8010,7 @@ mod tests {
                 &["log", "-1", "--format=%s", "feat/x"],
                 "feat(x): do the thing\n",
             )
-            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#MK-16\n");
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#MX-16\n");
         let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
         let body_path = scratch.join(".claude-run-pr-body.md");
         let body_path_str = body_path.to_string_lossy().to_string();
@@ -8871,7 +8871,7 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
-                "Wrapped line one\nwrapped line two.\n\n#MK-16\n",
+                "Wrapped line one\nwrapped line two.\n\n#MX-16\n",
             );
         let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
         let body_path = scratch.join(".claude-run-pr-body.md");
@@ -8905,7 +8905,7 @@ mod tests {
         assert_eq!(pr.number, Some(77));
         assert_eq!(
             captured.lock().unwrap().as_deref(),
-            Some("Wrapped line one wrapped line two.\n\n#MK-16")
+            Some("Wrapped line one wrapped line two.\n\n#MX-16")
         );
     }
 }

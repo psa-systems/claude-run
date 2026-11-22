@@ -239,7 +239,7 @@ placeholder (or an unterminated `{{`) is left literal and logged at warn:
 
 | Placeholder              | Substituted with                                                              |
 |--------------------------|-------------------------------------------------------------------------------|
-| `{{key}}`                | Issue id (`idReadable`, e.g. `MK-16`).                                         |
+| `{{key}}`                | Issue id (`idReadable`, e.g. `MX-16`).                                         |
 | `{{summary}}`            | Issue summary.                                                                 |
 | `{{clone_url}}`          | Full clone URL of the resolved repo.                                          |
 | `{{workdir}}`            | Absolute path of the per-job working directory (the repo is cloned here).     |

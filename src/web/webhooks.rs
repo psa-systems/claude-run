@@ -12865,7 +12865,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -12897,13 +12897,13 @@ mod tests {
             let calls = backend.calls();
             assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
             assert!(
-                calls.iter().any(|c| c.starts_with("comment MK-16")),
+                calls.iter().any(|c| c.starts_with("comment MX-16")),
                 "{calls:?}"
             );
             assert!(
                 calls
                     .iter()
-                    .any(|c| c.starts_with("comment MK-16") && c.contains("Run: ")),
+                    .any(|c| c.starts_with("comment MX-16") && c.contains("Run: ")),
                 "the merge comment carries the run footer: {calls:?}"
             );
             assert!(
@@ -12928,7 +12928,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13032,7 +13032,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13069,7 +13069,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13103,7 +13103,7 @@ mod tests {
             assert!(result.contains("marked merged"), "{result}");
             let calls = backend.calls();
             assert!(
-                !calls.iter().any(|c| c.starts_with("comment MK-16")
+                !calls.iter().any(|c| c.starts_with("comment MX-16")
                     || c.starts_with("merge_pr")
                     || c.starts_with("update_pr_branch")),
                 "{calls:?}"
@@ -13128,7 +13128,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13159,13 +13159,13 @@ mod tests {
             assert!(result.contains("not mergeable"), "{result}");
             let calls = backend.calls();
             assert!(
-                calls.iter().any(|c| c.starts_with("comment MK-16")),
+                calls.iter().any(|c| c.starts_with("comment MX-16")),
                 "{calls:?}"
             );
             assert!(
                 calls
                     .iter()
-                    .any(|c| c.starts_with("comment MK-16") && c.contains("Run: ")),
+                    .any(|c| c.starts_with("comment MX-16") && c.contains("Run: ")),
                 "the not-mergeable comment carries the run footer: {calls:?}"
             );
             assert!(
@@ -13219,7 +13219,7 @@ mod tests {
                 "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\nconcurrency:\n  max_ci_in_flight_per_repo: 2\n",
             )
             .unwrap();
-            for (issue, pr) in [("MK-16", 7), ("MK-17", 8), ("MK-18", 9)] {
+            for (issue, pr) in [("MX-16", 7), ("MX-17", 8), ("MX-18", 9)] {
                 record_open_pr(&pool, issue, pr).await;
             }
             let backend = Arc::new(
@@ -13253,8 +13253,8 @@ mod tests {
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
-            record_open_pr(&pool, "MK-16", 7).await;
-            record_open_pr(&pool, "MK-17", 8).await;
+            record_open_pr(&pool, "MX-16", 7).await;
+            record_open_pr(&pool, "MX-17", 8).await;
             let backend = Arc::new(
                 StoreBackend::new()
                     .with_open_prs(vec![pr(7, ""), pr(8, "")])
@@ -13303,8 +13303,8 @@ mod tests {
                 "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\nconcurrency:\n  max_ci_in_flight_per_repo: 0\n",
             )
             .unwrap();
-            record_open_pr(&pool, "MK-16", 7).await;
-            record_open_pr(&pool, "MK-17", 8).await;
+            record_open_pr(&pool, "MX-16", 7).await;
+            record_open_pr(&pool, "MX-17", 8).await;
             let backend = Arc::new(
                 StoreBackend::new()
                     .with_open_prs(vec![pr(7, "")])
@@ -13330,7 +13330,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13366,7 +13366,7 @@ mod tests {
                 "{calls:?}"
             );
             assert!(
-                calls.iter().any(|c| c.starts_with("comment MK-16")),
+                calls.iter().any(|c| c.starts_with("comment MX-16")),
                 "{calls:?}"
             );
             assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
@@ -13384,7 +13384,7 @@ mod tests {
                 "{:?}",
                 pr_comments[0]
             );
-            assert!(pr_comments[0].contains("MK-16"), "{:?}", pr_comments[0]);
+            assert!(pr_comments[0].contains("MX-16"), "{:?}", pr_comments[0]);
         }
 
         /// A draft PR, green and behind base, gets no branch
@@ -13399,7 +13399,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13464,7 +13464,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13517,7 +13517,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13558,7 +13558,7 @@ mod tests {
             let comments = backend
                 .calls()
                 .iter()
-                .filter(|c| c.starts_with("comment MK-16"))
+                .filter(|c| c.starts_with("comment MX-16"))
                 .count();
             assert_eq!(comments, 1, "{:?}", backend.calls());
         }
@@ -13583,7 +13583,7 @@ mod tests {
                     "dev.a8n.run",
                     "contoso/claude-run",
                     7,
-                    "MK-16",
+                    "MX-16",
                     Some("aaaaaaaaaaaaaaaa"),
                 ),
                 post_branch_updated_push_comment(
@@ -13592,7 +13592,7 @@ mod tests {
                     "dev.a8n.run",
                     "contoso/claude-run",
                     7,
-                    "MK-17",
+                    "MX-17",
                     Some("bbbbbbbbbbbbbbbb"),
                 ),
             );
@@ -13601,12 +13601,12 @@ mod tests {
             let pr_comments = backend.pr_comments();
             assert_eq!(pr_comments.len(), 2, "{pr_comments:?}");
             assert!(
-                pr_comments.iter().any(|c| c.contains("MK-16")),
-                "lost or corrupted MK-16 body: {pr_comments:?}"
+                pr_comments.iter().any(|c| c.contains("MX-16")),
+                "lost or corrupted MX-16 body: {pr_comments:?}"
             );
             assert!(
-                pr_comments.iter().any(|c| c.contains("MK-17")),
-                "lost or corrupted MK-17 body: {pr_comments:?}"
+                pr_comments.iter().any(|c| c.contains("MX-17")),
+                "lost or corrupted MX-17 body: {pr_comments:?}"
             );
         }
 
@@ -13622,7 +13622,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13680,7 +13680,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13723,7 +13723,7 @@ mod tests {
             );
             let comment = calls
                 .iter()
-                .find(|c| c.starts_with("comment MK-16"))
+                .find(|c| c.starts_with("comment MX-16"))
                 .unwrap_or_else(|| panic!("expected a comment, got {calls:?}"));
             assert!(
                 comment.contains("unable to fast-forward: not up to date"),
@@ -13744,7 +13744,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13786,7 +13786,7 @@ mod tests {
             );
             let comment = calls
                 .iter()
-                .find(|c| c.starts_with("comment MK-16"))
+                .find(|c| c.starts_with("comment MX-16"))
                 .unwrap_or_else(|| panic!("expected a comment, got {calls:?}"));
             assert!(comment.contains("fj pr status"), "{comment}");
             assert!(
@@ -13808,7 +13808,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13841,7 +13841,7 @@ mod tests {
             assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
             let comment = calls
                 .iter()
-                .find(|c| c.starts_with("comment MK-16"))
+                .find(|c| c.starts_with("comment MX-16"))
                 .unwrap_or_else(|| panic!("expected a comment, got {calls:?}"));
             assert!(comment.contains("not allowed to merge"), "{comment}");
             assert!(
@@ -13911,7 +13911,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool_a,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -13944,7 +13944,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool_b,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -14009,7 +14009,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool_a,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -14052,7 +14052,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool_b,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -14098,7 +14098,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool_a,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -14132,7 +14132,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool_b,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -14176,7 +14176,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -14218,7 +14218,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -14275,7 +14275,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -14308,7 +14308,7 @@ mod tests {
             );
             let comments = calls
                 .iter()
-                .filter(|c| c.starts_with("comment MK-16"))
+                .filter(|c| c.starts_with("comment MX-16"))
                 .count();
             assert_eq!(
                 comments, 1,
@@ -14477,7 +14477,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -14520,7 +14520,7 @@ mod tests {
             let calls = backend.calls();
             let comment = calls
                 .iter()
-                .find(|c| c.starts_with("comment MK-16"))
+                .find(|c| c.starts_with("comment MX-16"))
                 .unwrap_or_else(|| panic!("no comment posted: {calls:?}"));
             assert!(
                 !comment.to_lowercase().contains("timed out")
@@ -14551,7 +14551,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -14584,7 +14584,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -14872,7 +14872,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -14920,7 +14920,7 @@ mod tests {
             let comments = |b: &StoreBackend| {
                 b.calls()
                     .iter()
-                    .filter(|c| c.starts_with("comment MK-16"))
+                    .filter(|c| c.starts_with("comment MX-16"))
                     .count()
             };
             let events = || async {
@@ -14971,7 +14971,7 @@ mod tests {
             let comments = |b: &StoreBackend| {
                 b.calls()
                     .iter()
-                    .filter(|c| c.starts_with("comment MK-16"))
+                    .filter(|c| c.starts_with("comment MX-16"))
                     .count()
             };
             let events = || async {
@@ -15006,7 +15006,7 @@ mod tests {
             let comments = |b: &StoreBackend| {
                 b.calls()
                     .iter()
-                    .filter(|c| c.starts_with("comment MK-16"))
+                    .filter(|c| c.starts_with("comment MX-16"))
                     .count()
             };
             let events = || async {
@@ -15040,7 +15040,7 @@ mod tests {
             let comments = |b: &StoreBackend| {
                 b.calls()
                     .iter()
-                    .filter(|c| c.starts_with("comment MK-16"))
+                    .filter(|c| c.starts_with("comment MX-16"))
                     .count()
             };
             let events = || async {
@@ -15075,7 +15075,7 @@ mod tests {
             let comments = |b: &StoreBackend| {
                 b.calls()
                     .iter()
-                    .filter(|c| c.starts_with("comment MK-16"))
+                    .filter(|c| c.starts_with("comment MX-16"))
                     .count()
             };
             let events = || async {
@@ -15102,7 +15102,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-17",
+                "MX-17",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 8,
@@ -15127,7 +15127,7 @@ mod tests {
             assert_eq!(
                 calls
                     .iter()
-                    .filter(|c| c.starts_with("comment MK-16"))
+                    .filter(|c| c.starts_with("comment MX-16"))
                     .count(),
                 1,
                 "{calls:?}"
@@ -15135,7 +15135,7 @@ mod tests {
             assert_eq!(
                 calls
                     .iter()
-                    .filter(|c| c.starts_with("comment MK-17"))
+                    .filter(|c| c.starts_with("comment MX-17"))
                     .count(),
                 1,
                 "{calls:?}"
@@ -15162,7 +15162,7 @@ mod tests {
             let comments = |b: &StoreBackend| {
                 b.calls()
                     .iter()
-                    .filter(|c| c.starts_with("comment MK-16"))
+                    .filter(|c| c.starts_with("comment MX-16"))
                     .count()
             };
 
@@ -15195,7 +15195,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "does-not-exist",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -15224,7 +15224,7 @@ mod tests {
             let comment = backend
                 .calls()
                 .into_iter()
-                .find(|c| c.starts_with("comment MK-16"))
+                .find(|c| c.starts_with("comment MX-16"))
                 .unwrap_or_else(|| panic!("expected an issue comment, got {:?}", backend.calls()));
             assert!(comment.contains("automerge status"), "{comment}");
 
@@ -15250,7 +15250,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -15283,7 +15283,7 @@ mod tests {
             let comment = backend
                 .calls()
                 .into_iter()
-                .find(|c| c.starts_with("comment MK-16"))
+                .find(|c| c.starts_with("comment MX-16"))
                 .unwrap_or_else(|| panic!("expected an issue comment, got {:?}", backend.calls()));
             assert!(comment.contains("automerge status"), "{comment}");
 
@@ -15307,7 +15307,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -15339,7 +15339,7 @@ mod tests {
             let comment = backend
                 .calls()
                 .into_iter()
-                .find(|c| c.starts_with("comment MK-16"))
+                .find(|c| c.starts_with("comment MX-16"))
                 .unwrap_or_else(|| panic!("expected an issue comment, got {:?}", backend.calls()));
             assert!(comment.contains("automerge status"), "{comment}");
 
@@ -15459,7 +15459,7 @@ mod tests {
                 ci_failure_store::record_agent_pr(
                     pool,
                     "yt",
-                    "MK-16",
+                    "MX-16",
                     "github.com",
                     "octo/widget",
                     42,
@@ -15624,7 +15624,7 @@ mod tests {
                 let calls = backend.calls();
                 let comment = calls
                     .iter()
-                    .find(|c| c.starts_with("comment MK-16"))
+                    .find(|c| c.starts_with("comment MX-16"))
                     .unwrap_or_else(|| panic!("expected a comment, got {calls:?}"));
                 assert!(comment.contains("gh pr view"), "{comment}");
                 assert!(comment.contains("mergeStateStatus: UNKNOWN"), "{comment}");
@@ -15876,7 +15876,7 @@ mod tests {
                 ci_failure_store::record_agent_pr(
                     &pool,
                     "reporting",
-                    "MK-16",
+                    "MX-16",
                     "dev.a8n.run",
                     "contoso/claude-run",
                     7,
@@ -15968,7 +15968,7 @@ mod tests {
                 assert_eq!(ok, 1);
                 assert_eq!(
                     summary,
-                    "merged PR #7; issue MK-16 left for the YouTrack workflow to resolve"
+                    "merged PR #7; issue MX-16 left for the YouTrack workflow to resolve"
                 );
             }
 
@@ -16404,7 +16404,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
@@ -16421,7 +16421,7 @@ mod tests {
             backend
                 .calls()
                 .into_iter()
-                .filter(|c| c.starts_with("comment MK-16"))
+                .filter(|c| c.starts_with("comment MX-16"))
                 .collect()
         }
 
@@ -16571,11 +16571,11 @@ mod tests {
             let field_writes = backend
                 .calls()
                 .into_iter()
-                .filter(|c| c.starts_with("set_field MK-16"))
+                .filter(|c| c.starts_with("set_field MX-16"))
                 .collect::<Vec<_>>();
             assert_eq!(
                 field_writes,
-                vec!["set_field MK-16 AI Agent Needs Review".to_string()],
+                vec!["set_field MX-16 AI Agent Needs Review".to_string()],
                 "AI Agent moves to the delivery-blocked label (Needs Review by default) once"
             );
         }
@@ -16665,7 +16665,7 @@ mod tests {
             let comments = backend
                 .calls()
                 .into_iter()
-                .filter(|c| c.starts_with("comment MK-16"))
+                .filter(|c| c.starts_with("comment MX-16"))
                 .collect::<Vec<_>>();
             assert_eq!(comments.len(), 1, "{comments:?}");
             assert!(
@@ -16695,7 +16695,7 @@ mod tests {
             let comments = backend
                 .calls()
                 .into_iter()
-                .filter(|c| c.starts_with("comment MK-16"))
+                .filter(|c| c.starts_with("comment MX-16"))
                 .collect::<Vec<_>>();
             assert_eq!(comments.len(), 1, "{comments:?}");
             assert!(
@@ -16845,7 +16845,7 @@ mod tests {
             let comments = backend
                 .calls()
                 .into_iter()
-                .filter(|c| c.starts_with("comment MK-16"))
+                .filter(|c| c.starts_with("comment MX-16"))
                 .collect::<Vec<_>>();
             assert_eq!(comments.len(), 1);
             assert!(
@@ -16902,7 +16902,7 @@ mod tests {
             let comments = backend
                 .calls()
                 .into_iter()
-                .filter(|c| c.starts_with("comment MK-16"))
+                .filter(|c| c.starts_with("comment MX-16"))
                 .collect::<Vec<_>>();
             assert_eq!(comments.len(), 1);
             assert!(
@@ -16947,7 +16947,7 @@ mod tests {
             let comments = backend
                 .calls()
                 .into_iter()
-                .filter(|c| c.starts_with("comment MK-16"))
+                .filter(|c| c.starts_with("comment MX-16"))
                 .collect::<Vec<_>>();
             assert_eq!(comments.len(), 1);
             assert!(
@@ -16990,7 +16990,7 @@ mod tests {
             let comments = backend
                 .calls()
                 .into_iter()
-                .filter(|c| c.starts_with("comment MK-16"))
+                .filter(|c| c.starts_with("comment MX-16"))
                 .collect::<Vec<_>>();
             assert_eq!(comments.len(), 1);
             assert!(
@@ -17092,7 +17092,7 @@ mod tests {
             ci_failure_store::record_agent_pr(
                 &pool,
                 "yt",
-                "MK-16",
+                "MX-16",
                 "dev.a8n.run",
                 "contoso/claude-run",
                 7,
