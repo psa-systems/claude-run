@@ -1,4 +1,4 @@
--- CLAUDE-225: record when a dependency-gate row FIRST blocked its issue.
+-- Record when a dependency-gate row FIRST blocked its issue.
 --
 -- `blocked_until` is re-armed on every re-evaluation and `updated_at` moves with
 -- it, so neither says how long an issue has been held. The row lives for exactly

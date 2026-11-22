@@ -1,10 +1,10 @@
--- CLAUDE-315: one row per `claude` invocation, so plan usage (rate-limit
+-- One row per `claude` invocation, so plan usage (rate-limit
 -- utilization, retries) is queryable history rather than only a log line.
 -- Every rate-limit column is nullable: an invocation whose CLI predates the
 -- `rate_limit_event` stream event, or that made no API call reporting one,
 -- leaves them all NULL rather than a fabricated zero. `job_key` and `run_id`
--- are nullable because a classification invocation (CLAUDE-274's at-ingest
--- triage) has neither: it belongs to no scheduled job and opens no run row.
+-- are nullable because a classification invocation (the at-ingest
+-- triage pass) has neither: it belongs to no scheduled job and opens no run row.
 
 CREATE TABLE IF NOT EXISTS claude_invocations (
     id                        INTEGER PRIMARY KEY AUTOINCREMENT,

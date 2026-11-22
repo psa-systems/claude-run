@@ -8,30 +8,30 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 
 ## Shape
 
-- Rust binary, library + bin. `clap` derive. Subcommand tree: `claude-run {run,serve,stop,restart,trigger,cancel,pause,resume,status,action,access,secret,mcp,migrate,import,test-postgres}`.
+- Rust binary, library + bin. `clap` derive. Subcommand tree: `claude-run {run,serve,stop,restart,trigger,cancel,pause,resume,status,action,access,secret,mcp,migrate,import,refresh-migration-checksums,test-postgres}`.
 - Actions are YAML files under `$CLAUDE_RUN_CONFIG_DIR/actions/` (`/config/actions/` in the container). Each action's `input.command` / `filter` / `pre[]` / `prompt` / `post[]` is a nu snippet shelled out via the host's `nu` binary.
-- Runtime state in SQLite at `$CLAUDE_RUN_DATA_DIR/state.db` by default, or in PostgreSQL when the operator sets one (CLAUDE-250; see the `[database]` note below). Per-attempt stream logs at `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`, bounded by the CLAUDE-245 sweep.
+- Runtime state in SQLite at `$CLAUDE_RUN_DATA_DIR/state.db` by default, or in PostgreSQL when the operator sets one (see the `[database]` note below). Per-attempt stream logs at `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`, bounded by the sweep.
 - Daemon (`claude-run serve`) owns scheduling and exposes an HTTP API over `$CLAUDE_RUN_RUNTIME_DIR/daemon.sock`. CLI subcommands delegate to the daemon when reachable, else operate directly on the DB. The socket is the CLI's control plane, nothing else:
   `api::router` is built twice from one `api_state`, bare-path on the socket and nested under `/api` on the TCP listener, which is what the web UI's own buttons POST to.
-  `serve --no-socket` skips the bind for a deployment with no CLI operator, and the container image runs that way (`CMD ["serve", "--no-socket"]`) because the socket has no auth gate (the CLAUDE-48 token wraps only the TCP router) and otherwise sits in the agent's own container, as the same user.
+  `serve --no-socket` skips the bind for a deployment with no CLI operator, and the container image runs that way (`CMD ["serve", "--no-socket"]`) because the socket has no auth gate (the token wraps only the TCP router) and otherwise sits in the agent's own container, as the same user.
   `trigger` and `cancel` fail naming that reason instead of "no daemon"; DB-direct subcommands are unaffected.
 - Runtime tool dependencies ship in the runtime image, not in the binary: `nu`, `claude` (Claude Code CLI), `timeout` (coreutils), `yt`, `fj`, `gh`, `git`. Docker is the only supported install.
 - Forge: `psa-systems/claude-run`.
 
 ## Commands
 
-- `just check`: fmt + clippy + build + tests + builder-stage docker compile (the full CI gate). It starts with the CLAUDE.md guard, `just check-claude-md` (CLAUDE-370). `just pre-commit` runs only a fmt-only check inside the builder image via `docker run` (common's default `hook_layout := "pre-push"`); `just pre-push` runs the full suite (fmt, clippy, compile, tests) there.
+- `just check`: fmt + clippy + build + tests + builder-stage docker compile (the full CI gate). It starts with the CLAUDE.md guard, `just check-claude-md`. `just pre-commit` runs only a fmt-only check inside the builder image via `docker run` (common's default `hook_layout := "pre-push"`); `just pre-push` runs the full suite (fmt, clippy, compile, tests) there.
 - CI's exact steps (`.forgejo/workflows/check.yml`): `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build --all-targets`, then `cargo test` twice: once on SQLite, once with `CLAUDE_RUN_TEST_DATABASE_URL=postgres://...` set, switching every fixture to Postgres (one schema per test, `SPEC-5.6`). A DB change must pass both.
 - Single test: `cargo test <name_substring>` (e.g. `cargo test shipped_action_queries_are_disjoint`); one module: `cargo test native::youtrack::`. Unit tests live in `src/**` under `mod tests` on the library target; `tests/fixtures/` holds data only.
 - `just run <args>` = `cargo run -- <args>`.
-- Any test that execs a stub script must create it with `testutil::write_stub`, never `fs::write` + `set_permissions` (ETXTBSY race across test threads, CLAUDE-224 / CLAUDE-255).
+- Any test that execs a stub script must create it with `testutil::write_stub`, never `fs::write` + `set_permissions` (ETXTBSY race across test threads).
 
 ## Code map
 
 - Entry: `src/bin/claude-run.rs` (clap) -> `client.rs` (talk to the daemon socket) or direct DB ops. `daemon.rs` hosts `serve`: `scheduler.rs` ticks, `Dispatcher::execute` runs an action via `run_action_inner`.
 - Two action kinds (`ActionKind` in `action.rs`): `scripted` runs the generic nu pipeline in `job.rs` (`snippet.rs` execs `nu`, `claude.rs` execs `claude`); native kinds route through `native::handler_for` to a Rust handler in `src/native/` (`youtrack`, `closed_issue_summary`) that owns its whole run.
   Adding a native kind means a new `ActionKind` variant, a handler, a `handler_for` arm, and usually a structured editor in `web/native_forms.rs` + `templates/*_editor.html`.
-- Native handlers reach YouTrack / Forgejo / GitHub only through the `provider` traits (`IssueTracker`, `Forge`); `provider/cli.rs` shells out to `yt` / `fj`, `provider/github.rs` covers GitHub, and `provider/audit.rs` wraps the tracker to cap and attribute a run's issue writes (CLAUDE-234). No raw REST in handlers.
+- Native handlers reach YouTrack / Forgejo / GitHub only through the `provider` traits (`IssueTracker`, `Forge`); `provider/cli.rs` shells out to `yt` / `fj`, `provider/github.rs` covers GitHub, and `provider/audit.rs` wraps the tracker to cap and attribute a run's issue writes. No raw REST in handlers.
 - Web: `web/mod.rs` (axum + askama templates from `templates/`, compiled into the binary) mounts `api::router` under `/api` plus the two webhook listeners. `settings.rs` owns DB-backed runtime config; `config.rs` holds the serde schema and bootstrap file.
 - DB: `db.rs` holds the pool and two embedded migrators, `migrations/sqlite/` and `migrations/postgres/`. Every schema change needs a matching migration in BOTH directories. Queries are runtime `sqlx::query` (no compile-time macros, no offline `.sqlx` data).
 - Shipped actions in `actions/*.yml` are `include_str!`'d by `action.rs` tests, so editing one can break a unit test.
@@ -44,95 +44,95 @@ Each line names one rule and links its full text. A new convention adds one inde
 ### Governance and build
 
 - Governance lives at `niceguyit/governance`; only claude-run deviations are recorded here ([details](docs/conventions/governance.md#governance-source-of-truth))
-- Builder: rust-builder-musl. Runtime image: FROM opensuse-dev, slim bot CLAUDE.md ([CLAUDE-37, CLAUDE-287, CLAUDE-94](docs/conventions/governance.md#runtime-images-claude-37-claude-287-claude-94))
-- Governance `.env.example`, HOST_IP/PORT split and fixed ports do not apply; UI binds `127.0.0.1:7321` ([CLAUDE-37](docs/conventions/governance.md#template-env-and-ports-do-not-apply-claude-37))
+- Builder: rust-builder-musl. Runtime image: FROM opensuse-dev, slim bot CLAUDE.md ([details](docs/conventions/governance.md#runtime-images))
+- Governance `.env.example`, HOST_IP/PORT split and fixed ports do not apply; UI binds `127.0.0.1:7321` ([details](docs/conventions/governance.md#template-env-and-ports-do-not-apply))
 - `actions/SCHEMA.md` is the authoritative action schema; a change updates runner and doc together ([details](docs/conventions/governance.md#action-schema))
-- `docs/specification.md` is normative: code cites `SPEC-<section>`, and every attempt with commits ends with a pushed branch ([CLAUDE-485](docs/conventions/specification.md))
+- `docs/specification.md` is normative: code cites `SPEC-<section>`, and every attempt with commits ends with a pushed branch ([details](docs/conventions/specification.md))
 - A `specification`-branch PR runs only three CI jobs ([details](docs/conventions/specification.md#the-specification-branch-flow))
 
 ### Web UI authentication
 
 - An exposed instance with no credential serves only `/setup`, which writes the argon2id admin ([details](docs/conventions/web-auth.md#setup-bootstrap))
-- TOTP is mandatory for every `web_admin`/`web_accounts` row: recovery codes, replay guard, pending-2FA cookie ([CLAUDE-368](docs/conventions/web-auth.md#mandatory-totp-claude-368))
-- An invite's email goes through `src/mailer.rs`; its link is built from `public_url`, never the `Host` header ([CLAUDE-394](docs/conventions/web-auth.md#invite-by-email-claude-394))
-- Secrets page API keys authenticate peer calls; a lookup error is `500`, never `401` ([CLAUDE-636](docs/conventions/web-auth.md#peer-api-keys-claude-636))
+- TOTP is mandatory for every `web_admin`/`web_accounts` row: recovery codes, replay guard, pending-2FA cookie ([details](docs/conventions/web-auth.md#mandatory-totp))
+- An invite's email goes through `src/mailer.rs`; its link is built from `public_url`, never the `Host` header ([details](docs/conventions/web-auth.md#invite-by-email))
+- Secrets page API keys authenticate peer calls; a lookup error is `500`, never `401` ([details](docs/conventions/web-auth.md#peer-api-keys))
 
 ### Credentials and logins
 
-- Nothing runs without a Claude credential; `ReadinessGate` also trips on an expired login ([CLAUDE-269](docs/conventions/credentials.md#readiness-gate-claude-269))
+- Nothing runs without a Claude credential; `ReadinessGate` also trips on an expired login ([details](docs/conventions/credentials.md#readiness-gate))
 - `claude auth login` is brokered from the Settings Auth card (`src/claude_login.rs`) ([details](docs/conventions/credentials.md#brokered-claude-login))
-- Daemon holds its own yt/fj/gh/API-key logins; runner owns `secrets.key` in the config dir ([CLAUDE-307](docs/conventions/credentials.md#service-logins-and-secrets-key-claude-307))
+- Daemon holds its own yt/fj/gh/API-key logins; runner owns `secrets.key` in the config dir ([details](docs/conventions/credentials.md#service-logins-and-secrets-key))
 
 ### Forge and git
 
-- Every `git` subprocess authenticates from the forge key store; failures carry redacted stderr ([CLAUDE-252](docs/conventions/forge.md#git-authentication-and-errors-claude-252))
-- Read-only `fj` and `gh` calls retry up to 4 attempts on non-zero exit; writes never retry ([CLAUDE-366, CLAUDE-407](docs/conventions/forge.md#read-only-fj-retries-claude-366))
-- Every git network call, including push, retries up to 4 attempts; the AGit `fj pr create -aA` path stays excluded ([CLAUDE-396](docs/conventions/forge.md#git-network-retries-claude-396))
-- Every runner write to a PR branch posts one `push_comment` naming the event, issue, state, and SHA range ([CLAUDE-447](docs/conventions/forge.md#push-comments-on-every-pr-branch-write-claude-447))
+- Every `git` subprocess authenticates from the forge key store; failures carry redacted stderr ([details](docs/conventions/forge.md#git-authentication-and-errors))
+- Read-only `fj` and `gh` calls retry up to 4 attempts on non-zero exit; writes never retry ([details](docs/conventions/forge.md#read-only-fj-retries))
+- Every git network call, including push, retries up to 4 attempts; the AGit `fj pr create -aA` path stays excluded ([details](docs/conventions/forge.md#git-network-retries))
+- Every runner write to a PR branch posts one `push_comment` naming the event, issue, state, and SHA range ([details](docs/conventions/forge.md#push-comments-on-every-pr-branch-write))
 
 ### Container runtime
 
-- Container layout is flat: `/config`, `/data`, `/state`, tmpfs `/run/claude-run` ([CLAUDE-253](docs/conventions/container.md#flat-container-layout-claude-253))
-- No host bind mounts: logins live inside the container; catatonit is PID 1 ([CLAUDE-247, CLAUDE-287, CLAUDE-310](docs/conventions/container.md#container-identity-claude-247-claude-287-claude-310))
-- `test-postgres` runs a throwaway, non-durable Postgres in the Docker sidecar for agent test runs ([CLAUDE-404](docs/conventions/test-postgres.md#throwaway-test-postgres-claude-404))
-- A sidecar `buildx` session can die to an upstream dockerd bug; no setting here fixes it ([CLAUDE-417](docs/conventions/container.md#buildkit-session-healthcheck-claude-417))
+- Container layout is flat: `/config`, `/data`, `/state`, tmpfs `/run/claude-run` ([details](docs/conventions/container.md#flat-container-layout))
+- No host bind mounts: logins live inside the container; catatonit is PID 1 ([details](docs/conventions/container.md#container-identity))
+- `test-postgres` runs a throwaway, non-durable Postgres in the Docker sidecar for agent test runs ([details](docs/conventions/test-postgres.md#throwaway-test-postgres))
+- A sidecar `buildx` session can die to an upstream dockerd bug; no setting here fixes it ([details](docs/conventions/container.md#buildkit-session-healthcheck))
 
 ### Actions
 
-- `closed-issue-summary` is a reporting action; shipped action queries stay disjoint ([CLAUDE-218, CLAUDE-215](docs/conventions/actions.md#reporting-actions-claude-218-claude-215))
-- Every YouTrack write goes through run-scoped `AuditedTracker`, which caps and attributes it ([CLAUDE-234](docs/conventions/actions.md#audited-youtrack-writes-claude-234))
-- Every runner-posted comment carries a run/timing footer, appended at the call site, not in `IssueTracker` ([CLAUDE-446](docs/conventions/actions.md#run-comment-footer-claude-446))
-- `claude-run mcp stdio` and an opt-in HTTP listener serve the same read-only MCP tools; HTTP sits behind its own OAuth/TOTP gate ([CLAUDE-437, CLAUDE-442](docs/conventions/mcp.md))
+- `closed-issue-summary` is a reporting action; shipped action queries stay disjoint ([details](docs/conventions/actions.md#reporting-actions))
+- Every YouTrack write goes through run-scoped `AuditedTracker`, which caps and attributes it ([details](docs/conventions/actions.md#audited-youtrack-writes))
+- Every runner-posted comment carries a run/timing footer, appended at the call site, not in `IssueTracker` ([details](docs/conventions/actions.md#run-comment-footer))
+- `claude-run mcp stdio` and an opt-in HTTP listener serve the same read-only MCP tools; HTTP sits behind its own OAuth/TOTP gate ([details](docs/conventions/mcp.md))
 
 ### State store and config
 
-- SQLite or Postgres via one `AnyPool` and `db::q`; a schema change adds a migration in BOTH dirs ([CLAUDE-250](docs/conventions/state.md#state-store-backend-claude-250))
-- Switching backends carries the data over with `claude-run import` ([CLAUDE-251](docs/conventions/state.md#backend-import-claude-251))
-- `config.toml` holds only bootstrap keys; runtime settings are DB-backed and edited in the UI ([CLAUDE-101](docs/conventions/state.md#bootstrap-vs-runtime-config-claude-101))
-- Global pause is one DB flag honored at EVERY entry point ([CLAUDE-223](docs/conventions/state.md#global-pause-claude-223))
-- A periodic sweep corrects any `Working` issue with no live run ([CLAUDE-577](docs/conventions/state.md#stuck-working-sweep-claude-577))
+- SQLite or Postgres via one `AnyPool` and `db::q`; a schema change adds a migration in BOTH dirs ([details](docs/conventions/state.md#state-store-backend))
+- Switching backends carries the data over with `claude-run import` ([details](docs/conventions/state.md#backend-import))
+- `config.toml` holds only bootstrap keys; runtime settings are DB-backed and edited in the UI ([details](docs/conventions/state.md#bootstrap-vs-runtime-config))
+- Global pause is one DB flag honored at EVERY entry point ([details](docs/conventions/state.md#global-pause))
+- A periodic sweep corrects any `Working` issue with no live run ([details](docs/conventions/state.md#stuck-working-sweep))
 
 ### CI failures and webhooks
 
-- The CI-failure store: `ci_failures`, its tests and runs, and `agent_pull_requests` ([CLAUDE-272](docs/conventions/ci-failures.md#ci-failure-store-claude-272))
-- A re-queued issue continues its own open PR branch instead of opening a second PR ([CLAUDE-275](docs/conventions/ci-failures.md#re-queued-issues-continue-their-pr-claude-275))
-- CI-failure dedupe uses failing-test overlap in the store, never a `yt` search ([CLAUDE-273](docs/conventions/ci-failures.md#failing-test-dedupe-claude-273))
-- The CI webhook runs one `claude` analysis pass over the full redacted log ([CLAUDE-274](docs/conventions/ci-failures.md#single-analysis-pass-claude-274))
-- A CI failure on an open PR routes by who opened the PR ([CLAUDE-276](docs/conventions/ci-failures.md#route-by-pr-opener-claude-276))
-- Two separate webhook listeners, each with its own DB-backed daily run cap ([CLAUDE-323, CLAUDE-364](docs/conventions/ci-failures.md#webhook-listeners-and-run-caps-claude-323-claude-364))
-- A checkpoint push opens a draft PR mid-run, before any timeout ([CLAUDE-448](docs/conventions/ci-failures.md#checkpoint-pushes-open-a-draft-pr-before-any-timeout-claude-448))
+- The CI-failure store: `ci_failures`, its tests and runs, and `agent_pull_requests` ([details](docs/conventions/ci-failures.md#ci-failure-store))
+- A re-queued issue continues its own open PR branch instead of opening a second PR ([details](docs/conventions/ci-failures.md#re-queued-issues-continue-their-pr))
+- CI-failure dedupe uses failing-test overlap in the store, never a `yt` search ([details](docs/conventions/ci-failures.md#failing-test-dedupe))
+- The CI webhook runs one `claude` analysis pass over the full redacted log ([details](docs/conventions/ci-failures.md#single-analysis-pass))
+- A CI failure on an open PR routes by who opened the PR ([details](docs/conventions/ci-failures.md#route-by-pr-opener))
+- Two separate webhook listeners, each with its own DB-backed daily run cap ([details](docs/conventions/ci-failures.md#webhook-listeners-and-run-caps))
+- A checkpoint push opens a draft PR mid-run, before any timeout ([details](docs/conventions/ci-failures.md#checkpoint-pushes-open-a-draft-pr-before-any-timeout))
 
 ### Merge and automerge
 
-- `pull_request` webhook deliveries record a merged or closed agent PR ([CLAUDE-277](docs/conventions/merge.md#pr-merge-deliveries-claude-277))
-- `finalize` never waits for CI; automerge is driven by Action Run webhook events ([CLAUDE-278](docs/conventions/merge.md#event-driven-automerge-claude-278))
-- `finalize` makes one bounded status read and merges a PR whose CI is already green in the same tick ([CLAUDE-549](docs/conventions/merge.md#finalize-time-merge-of-an-already-green-pr-claude-549))
-- A reconciler backstops webhook automerge so no green PR sits unwatched ([CLAUDE-328](docs/conventions/merge.md#automerge-reconciler-claude-328))
-- `PrStatus.behind_base` separates a behind-base PR from a real conflict ([CLAUDE-309, FJ-99](docs/conventions/merge.md#behind-base-prs-claude-309-fj-99))
-- Conflict auto-resolve runs are capped per PR, one at a time; a spent cap parks the issue delivery-blocked ([CLAUDE-550](docs/conventions/merge.md#bounded-conflict-auto-resolve-claude-550))
-- At most `max_ci_in_flight_per_repo` runner PRs per repo have CI pending: pickups defer, branch updates wait ([CLAUDE-535](docs/conventions/merge.md#ci-in-flight-cap-claude-535))
-- The runner writes no `State` on merge; a YouTrack workflow resolves the issue ([CLAUDE-327](docs/conventions/merge.md#state-on-merge-is-a-youtrack-workflow-claude-327))
-- A checkpoint-opened PR is `salvaged` from the moment it is opened, not only after a timeout ([CLAUDE-448](docs/conventions/merge.md#salvaged-prs-block-automerge-claude-429))
+- `pull_request` webhook deliveries record a merged or closed agent PR ([details](docs/conventions/merge.md#pr-merge-deliveries))
+- `finalize` never waits for CI; automerge is driven by Action Run webhook events ([details](docs/conventions/merge.md#event-driven-automerge))
+- `finalize` makes one bounded status read and merges a PR whose CI is already green in the same tick ([details](docs/conventions/merge.md#finalize-time-merge-of-an-already-green-pr))
+- A reconciler backstops webhook automerge so no green PR sits unwatched ([details](docs/conventions/merge.md#automerge-reconciler))
+- `PrStatus.behind_base` separates a behind-base PR from a real conflict ([details](docs/conventions/merge.md#behind-base-prs))
+- Conflict auto-resolve runs are capped per PR, one at a time; a spent cap parks the issue delivery-blocked ([details](docs/conventions/merge.md#bounded-conflict-auto-resolve))
+- At most `max_ci_in_flight_per_repo` runner PRs per repo have CI pending: pickups defer, branch updates wait ([details](docs/conventions/merge.md#ci-in-flight-cap))
+- The runner writes no `State` on merge; a YouTrack workflow resolves the issue ([details](docs/conventions/merge.md#state-on-merge-is-a-youtrack-workflow))
+- A checkpoint-opened PR is `salvaged` from the moment it is opened, not only after a timeout ([details](docs/conventions/merge.md#salvaged-prs-block-automerge))
 
 ### Claude invocation and runtime
 
-- Every sync subprocess or sleep reached from async code runs through `blocking::in_place` ([CLAUDE-228](docs/conventions/claude-runtime.md#no-blocking-on-tokio-workers-claude-228))
-- Every run resolves a spend ceiling first, bills one ledger, and exits `OVER_BUDGET` (6) ([DEV-705, DEV-707](docs/conventions/claude-runtime.md#per-run-spend-budget-dev-705-dev-707))
-- Every `claude` invocation records its plan rate-limit reading and `api_retry` counts ([CLAUDE-315](docs/conventions/claude-runtime.md#plan-rate-limit-readings-claude-315))
-- `claude.autocompact` defaults to 200000 so spend stays linear in tool calls ([DEV-706](docs/conventions/claude-runtime.md#bounded-context-dev-706))
-- The stream-log relay reports its own I/O failures instead of truncating silently ([CLAUDE-233](docs/conventions/claude-runtime.md#stream-log-write-failures-claude-233))
-- Stream-log readers return `io::Result`; an unreadable log finalizes as transient ([CLAUDE-256](docs/conventions/claude-runtime.md#stream-log-read-failures-claude-256))
-- No `claude` child can leave work running past its own turn ([CLAUDE-280](docs/conventions/claude-runtime.md#no-background-work-claude-280))
-- The checkpoint-push watcher runs on a plain OS thread, not a tokio task ([CLAUDE-448](docs/conventions/claude-runtime.md#checkpoint-push-watcher-runs-off-a-plain-os-thread-not-a-tokio-task-claude-448))
-- A successful run's PR opens as a draft and gets a read-only review session before promotion ([CLAUDE-449](docs/conventions/claude-runtime.md#post-success-review-session-runs-with-no-edit-or-write-claude-449))
+- Every sync subprocess or sleep reached from async code runs through `blocking::in_place` ([details](docs/conventions/claude-runtime.md#no-blocking-on-tokio-workers))
+- Every run resolves a spend ceiling first, bills one ledger, and exits `OVER_BUDGET` (6) ([details](docs/conventions/claude-runtime.md#per-run-spend-budget))
+- Every `claude` invocation records its plan rate-limit reading and `api_retry` counts ([details](docs/conventions/claude-runtime.md#plan-rate-limit-readings))
+- `claude.autocompact` defaults to 200000 so spend stays linear in tool calls ([details](docs/conventions/claude-runtime.md#bounded-context))
+- The stream-log relay reports its own I/O failures instead of truncating silently ([details](docs/conventions/claude-runtime.md#stream-log-write-failures))
+- Stream-log readers return `io::Result`; an unreadable log finalizes as transient ([details](docs/conventions/claude-runtime.md#stream-log-read-failures))
+- No `claude` child can leave work running past its own turn ([details](docs/conventions/claude-runtime.md#no-background-work))
+- The checkpoint-push watcher runs on a plain OS thread, not a tokio task ([details](docs/conventions/claude-runtime.md#checkpoint-push-watcher-runs-off-a-plain-os-thread-not-a-tokio-task))
+- A successful run's PR opens as a draft and gets a read-only review session before promotion ([details](docs/conventions/claude-runtime.md#post-success-review-session-runs-with-no-edit-or-write))
 
 ### Log and state retention
 
-- `logs/` stream logs are bounded by their own age sweep ([CLAUDE-245](docs/conventions/retention.md#stream-log-sweep-claude-245))
-- `daemon.log`, `output.file` and `usage.jsonl` are bounded by SIZE on the same tick ([CLAUDE-257, CLAUDE-268](docs/conventions/retention.md#size-bounded-log-files-claude-257-claude-268))
-- `snippets/` and `webhook-logs/` are bounded by AGE on the same tick ([CLAUDE-262](docs/conventions/retention.md#snippet-and-webhook-log-sweeps-claude-262))
-- Over `docker_gc.max_bytes`, storage is reclaimed in a fixed order until under it; a run in flight skips the pass ([CLAUDE-516](docs/conventions/retention.md#docker-storage-ceiling-reclaim-spec-311-claude-516))
-- A repo's shared Cargo target cache over `cargo_cache.max_bytes_per_repo` is deleted once no run for that repo is in flight ([CLAUDE-512](docs/conventions/retention.md#per-repo-cargo-target-cache-ceiling-spec-310-item-6-claude-512))
+- `logs/` stream logs are bounded by their own age sweep ([details](docs/conventions/retention.md#stream-log-sweep))
+- `daemon.log`, `output.file` and `usage.jsonl` are bounded by SIZE on the same tick ([details](docs/conventions/retention.md#size-bounded-log-files))
+- `snippets/` and `webhook-logs/` are bounded by AGE on the same tick ([details](docs/conventions/retention.md#snippet-and-webhook-log-sweeps))
+- Over `docker_gc.max_bytes`, storage is reclaimed in a fixed order until under it; a run in flight skips the pass ([details](docs/conventions/retention.md#docker-storage-ceiling-reclaim-spec-311))
+- A repo's shared Cargo target cache over `cargo_cache.max_bytes_per_repo` is deleted once no run for that repo is in flight ([details](docs/conventions/retention.md#per-repo-cargo-target-cache-ceiling-spec-310-item-6))
 
 ## Phases
 
@@ -143,14 +143,14 @@ The Rust port is complete: all six phases are merged. The table is kept because 
 | 1     | `run` / `migrate`, all core modules, SQLite-backed state             | merged                          |
 | 2     | `serve [--detach]`, scheduler, unix-socket API, lock, pause-in-DB    | merged                          |
 | 3     | Web UI (axum templates + HTMX + SSE), TCP listener, log streaming    | merged                          |
-| 4     | Action edit / import / export through the API                        | merged (CLAUDE-7)               |
-| 5     | Token auth for non-loopback binds                                    | merged (CLAUDE-48)              |
-| 6     | Retention policy enforcement on the unbounded history tables, polish | merged (CLAUDE-172, CLAUDE-175) |
+| 4     | Action edit / import / export through the API                        | merged               |
+| 5     | Token auth for non-loopback binds                                    | merged              |
+| 6     | Retention policy enforcement on the unbounded history tables, polish | merged |
 
-Two unrelated numbering schemes both say "Phase N", and a bare `grep 'Phase 3'` returns hits from both. The roadmap phases in this table are one (e.g. `src/web/mod.rs` "Phase 3" = Web UI, `src/auth.rs` "Phase 5" = token auth). The separate native-actions epic (CLAUDE-30..CLAUDE-34, tracked under CLAUDE-25) is the other;
-its comments carry the "native-action" qualifier (e.g. `src/native/youtrack.rs` "Phase 3 of the native-action epic" = CLAUDE-32, which is NOT roadmap Phase 3). Tell them apart by that qualifier and the CLAUDE-30..34 / CLAUDE-25 range; a bare "Phase N" refers to this table.
+Two unrelated numbering schemes both say "Phase N", and a bare `grep 'Phase 3'` returns hits from both. The roadmap phases in this table are one (e.g. `src/web/mod.rs` "Phase 3" = Web UI, `src/auth.rs` "Phase 5" = token auth). The separate native-actions epic is the other;
+its comments carry the "native-action" qualifier (e.g. `src/native/youtrack.rs` "Phase 3 of the native-action epic" is NOT roadmap Phase 3). Tell them apart by that qualifier; a bare "Phase N" refers to this table.
 
-Cross-cutting (not a numbered phase): a container runtime (CLAUDE-37, made self-contained in CLAUDE-247) runs the daemon and its spawned `claude` children in an isolated `$HOME` with a slim bot CLAUDE.md and its own logins. See `oci-build/Dockerfile` (`runtime` target), `oci-build/entrypoint.sh`, `compose.yml`, and `deploy/bot-CLAUDE.md`.
+Cross-cutting (not a numbered phase): a container runtime (made self-contained) runs the daemon and its spawned `claude` children in an isolated `$HOME` with a slim bot CLAUDE.md and its own logins. See `oci-build/Dockerfile` (`runtime` target), `oci-build/entrypoint.sh`, `compose.yml`, and `deploy/bot-CLAUDE.md`.
 
 ## Working on this repo
 
@@ -158,8 +158,8 @@ Cross-cutting (not a numbered phase): a container runtime (CLAUDE-37, made self-
 - `just check` mirrors CI's fmt + clippy + build + tests; CI also runs the CLAUDE.md guard as `claude-md`.
 - The task runner is the shared `psa-systems/common` recipe set, vendored as the `common` submodule (`git submodule update --init` after a fresh clone).
   `justfile` configures it through variables (`pre_commit_mode := "docker"` + `dev_image` because there is no `compose.dev.yml`, `test_args := ""` so the library-target unit tests are not skipped) and overrides only `default`, `check`, and `run`. Prefer setting a common variable over shadowing a shared recipe.
-  `default` is redefined locally (as the file's first recipe) because just resolves the default recipe by source order and a top-level definition outranks the imported one, so without it a bare `just` runs whichever local recipe comes first instead of common's `just --list` (CLAUDE-201).
-  CI keeps its own `.forgejo/workflows/check.yml` rather than calling common's reusable one, which hardcodes `cargo test --bins`; making that configurable is tracked in #PC-6. It deviates from governance `CI.md` ("Check runs on every push / PR"):
-  the workflow still runs on every push and PR to `main`, but common's shared `classify-diff` action (a leading `changes` job and an `if:`, not a workflow-level `paths-ignore`) skips the compile job for a docs-only PR and everything but `cargo fmt --check` for a comment-only one (CLAUDE-570).
+  `default` is redefined locally (as the file's first recipe) because just resolves the default recipe by source order and a top-level definition outranks the imported one, so without it a bare `just` runs whichever local recipe comes first instead of common's `just --list`.
+  CI keeps its own `.forgejo/workflows/check.yml` rather than calling common's reusable one, which hardcodes `cargo test --bins`; making that configurable is a limitation of `common`'s reusable workflow. It deviates from governance `CI.md` ("Check runs on every push / PR"):
+  the workflow still runs on every push and PR to `main`, but common's shared `classify-diff` action (a leading `changes` job and an `if:`, not a workflow-level `paths-ignore`) skips the compile job for a docs-only PR and everything but `cargo fmt --check` for a comment-only one.
 - Daemon smoke-test pattern: `CLAUDE_RUN_*_DIR=/tmp/...` env vars + a stub `claude` on `PATH` (see `src/bin/claude-run.rs`).
 - The legacy `scripts/claude-run.nu` is gone; the Rust binary is the only runner.

@@ -3,11 +3,11 @@
 # https://github.com/harrydowning/vscode-yaml-embedded-languages
 # https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
 
-# Scheduled repository audits that file their findings (CLAUDE-214, CLAUDE-295).
+# Scheduled repository audits that file their findings.
 #
 # Same native handler as `youtrack.yml` (`kind: youtrack`, `src/native/youtrack.rs`); this file differs in which issues
 # it picks up, which built-in prompt the agent gets, which projects it may create issues in, one dependency-gate setting,
-# and automerge. Audit issues live in the `audit_project` project (`AUDIT` by default, CLAUDE-409), whose VCS processor
+# and automerge. Audit issues live in the `audit_project` project (`AUDIT` by default), whose VCS processor
 # points at the audits repo (e.g. `owner/audits`), so the handler clones the AUDITS repo into the job workdir and
 # finalize opens the pull request there. The repository being audited is cloned read-only by the agent, outside the
 # workdir, and is never written to.
@@ -18,7 +18,7 @@
 # prints `"prompt_source": "builtin:audit"` while the preset is in effect.
 #
 # The audit preset permits the tracker writes an audit needs and the engineering prompt forbids: filing the findings
-# into the projects in `write_projects` (CLAUDE-295), the `## Result` block on the run's own issue, one summary
+# into the projects in `write_projects`, the `## Result` block on the run's own issue, one summary
 # comment per target on the parent, and (daily parent run only) the standing table on the anchor issue in the audit
 # project. Every finding issue the run files gets `AI Agent = Queued` as its last write, so the `youtrack` action works it; that value,
 # on issues the run created, is the only `AI Agent` write the agent may make. The 20-issue per-target cap is a prompt
@@ -26,7 +26,7 @@
 # procedure itself (dedup, grouping, priority, tags, links) lives in the audits repo, `prompts/_filing.md`.
 #
 # `AI Agent` and `State` on the triggering issue remain the runner's alone, so the state machine in `youtrack.yml`'s
-# header applies here, except for the post-success review (CLAUDE-611): the audit preset gets its own review prompt, and
+# header applies here, except for the post-success review: the audit preset gets its own review prompt, and
 # a review `Fail` does not leave the PR a draft. The runner files one follow-up issue in the audit project (same
 # `Audit-<Type>` tag, `relates to` the Epic, queued, summary prefix `Audit review follow-up: ` as the loop guard),
 # promotes the PR, and sets the Epic to Code Review, so the report merges and the Epic and the daily parent resolve. If
@@ -35,19 +35,19 @@
 # Tag routing: the YouTrack workflow that files a day's audit tags the daily parent and every per-target Epic
 # `Audit-<Type>`, and that tag is what routes them here. This query selects `project: {{audit_project}} tag: Audit-*`;
 # `youtrack.yml` selects the exact complement, `(project: -{{audit_project}} or tag: -Audit-*)`, so exactly one action
-# matches any queued issue (CLAUDE-215). `audit_project` (default `AUDIT`, CLAUDE-409) is the one field both files
+# matches any queued issue. `audit_project` (default `AUDIT`) is the one field both files
 # substitute into their `query`; changing it in both files moves the whole partition to a different project key without
 # touching the literal query text. An issue in the audit project with no `Audit-*` tag is ordinary engineering work on
 # the audits repo and goes to `youtrack.yml`.
 #
-# The dependency gate (CLAUDE-161) is left on, which is what makes the daily parent wait: the workflow files one parent
+# The dependency gate is left on, which is what makes the daily parent wait: the workflow files one parent
 # plus one Epic per target and queues all of them, and `parent for` blocks the parent until every Epic resolves.
 # `block_cross_project: false` stops an Epic from waiting on its own findings: they are its subtasks but live in the
 # other projects, so a retried Epic would otherwise stay blocked until every finding was worked.
 #
 # Automerge is on: an audit pull request only adds dated files to the audits repo, and it has to merge for its Epic to
 # resolve, which is what releases the gated daily parent (whose run reads the per-target reports on the default branch).
-# The merge is event-driven (CLAUDE-278), so the webhook backing this action must send Action Run Success and Recover.
+# The merge is event-driven, so the webhook backing this action must send Action Run Success and Recover.
 
 name: audit-run
 
@@ -78,7 +78,7 @@ native:
   youtrack:
     # Audit runs only: the audit project AND an `Audit-<Type>` tag (see the header). YouTrack rejects
     # `-project: {{audit_project}}` with a parse error, so wherever a clause is negated (in youtrack.yml) the negation
-    # goes on the value. `{{audit_project}}` is substituted with `audit_project` below (default `AUDIT`, CLAUDE-409).
+    # goes on the value. `{{audit_project}}` is substituted with `audit_project` below (default `AUDIT`).
     query: "-Resolved AI Agent: Queued project: {{audit_project}} tag: Audit-*"
     custom_field: "AI Agent"
     # Short name of the audit project. Edit this one field (and the matching one in youtrack.yml) to move the

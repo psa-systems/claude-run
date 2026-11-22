@@ -1,9 +1,9 @@
 //! SPEC-8.8: the PR comment posted after every runner push or branch update to
-//! a PR branch (CLAUDE-447), so the PR's own timeline explains how the branch
+//! a PR branch, so the PR's own timeline explains how the branch
 //! reached its current state, not just the title/body `refresh_pr_text`
 //! rewrites on a resumed run.
 //!
-//! The body reuses the CLAUDE-446 run footer ([`crate::run_footer`], SPEC-3.9).
+//! The body reuses the run footer ([`crate::run_footer`], SPEC-3.9).
 //! A failed [`crate::provider::Forge::pr_comment`] call never fails, retries,
 //! or rolls back the push it is reporting on (writes are never retried,
 //! SPEC-8.4): [`post`] logs it at `error` and returns a human-readable
@@ -19,9 +19,9 @@ use crate::provider::Forge;
 pub const MAX_COMMIT_LINES: usize = 20;
 
 /// SPEC-8.8: which runner-owned write to a PR branch this comment reports on
-/// (CLAUDE-447's enumerated table, plus CLAUDE-448's `CheckpointPush`: one of
+/// (the enumerated table, plus `CheckpointPush`: one of
 /// the periodic WIP pushes a checkpoint watcher makes while the agent is
-/// still running, hooks disabled, CLAUDE-448 step 1/2).
+/// still running, hooks disabled).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushEvent {
     InitialPush,
@@ -31,7 +31,7 @@ pub enum PushEvent {
     MergedRemoteBranchBeforePush,
     BranchUpdatedFromBase,
     CheckpointPush,
-    /// CLAUDE-550: an automerge conflict auto-resolve run (CLAUDE-380)
+    /// An automerge conflict auto-resolve run
     /// pushed its merge of the base branch.
     ConflictResolvePush,
 }
@@ -241,7 +241,7 @@ mod tests {
     fn ctx<'a>(event: PushEvent, subjects: CommitSubjects) -> PushCommentContext<'a> {
         PushCommentContext {
             event,
-            issue_key: "CLAUDE-447",
+            issue_key: "PROJ-447",
             draft: false,
             old_sha: Some("0123456789abcdef"),
             new_sha: Some("fedcba9876543210"),
@@ -358,7 +358,7 @@ mod tests {
             PushEvent::InitialPush,
             CommitSubjects::Listed(vec!["Add thing".into(), "Fix other thing".into()]),
         ));
-        assert!(body.contains("Issue: CLAUDE-447"));
+        assert!(body.contains("Issue: PROJ-447"));
         assert!(body.contains("PR state: ready"));
         assert!(body.contains("Range: 0123456789ab..fedcba987654"));
         assert!(body.contains("- Add thing"));
@@ -385,9 +385,9 @@ mod tests {
             PushEvent::CheckpointPush,
             CommitSubjects::Listed(vec!["fix something that also closes #OTHER-999".into()]),
         );
-        c.issue_key = "DMARC-165";
+        c.issue_key = "PROJ-165";
         let body = build_body(&c);
-        assert!(body.contains("Issue: DMARC-165"), "{body}");
+        assert!(body.contains("Issue: PROJ-165"), "{body}");
         assert!(
             !body.contains("Issue: OTHER-999"),
             "the Issue: line must not derive from commit subjects: {body}"

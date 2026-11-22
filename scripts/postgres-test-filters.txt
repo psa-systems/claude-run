@@ -1,4 +1,4 @@
-# CLAUDE-540: the test files that touch a DB pool.
+# The test files that touch a DB pool.
 #
 # The Postgres CI leg (.forgejo/workflows/check.yml, "Unit tests (PostgreSQL)")
 # re-runs only the tests matched here, so pure-logic tests - which execute no

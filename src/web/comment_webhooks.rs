@@ -92,7 +92,7 @@ use super::webhooks::{
 /// Synthetic action name the comment listener records its runs and caps
 /// under, alongside `webhook-triage`. Reserved: an on-disk YAML claiming it is
 /// refused at scan, and trigger / edit / export / delete are rejected for it.
-/// Renamed from `webhook-forgejo-comment` (CLAUDE-361, when the listener's
+/// Renamed from `webhook-forgejo-comment` (when the listener's
 /// route and name stopped being Forgejo-specific).
 pub const WEBHOOK_COMMENT_ACTION: &str = "webhook-comment";
 
@@ -116,11 +116,11 @@ const COMMIT_MSG_FILE: &str = ".claude-run-commit-msg";
 /// returns.
 const INSTRUCTION_FILE: &str = ".claude-run-instruction.md";
 
-/// CLAUDE-550: the instruction a synthetic automerge conflict auto-resolve
-/// command (CLAUDE-380) carries. Narrow on purpose: resolve the conflicts,
+/// The instruction a synthetic automerge conflict auto-resolve
+/// command carries. Narrow on purpose: resolve the conflicts,
 /// check once, conclude the merge, and change nothing else.
 pub const CONFLICT_RESOLVE_INSTRUCTION: &str = "Merge the PR's base branch into this PR's branch and resolve every merge conflict, keeping the intent of both sides. Change nothing that is not needed to resolve a conflict. Run the project's build and test gate once, fix only what the merge broke, then conclude the merge with a commit. If a conflict cannot be resolved safely, leave it unresolved and say which files in your summary.";
-/// File the resolved CI-failure context is written to (CLAUDE-344), in the
+/// File the resolved CI-failure context is written to, in the
 /// checkout's git-directory scratch space, never its work tree, so git can
 /// never track, stage, or commit it. Only created when a failing check run
 /// resolves for the PR's head branch; the prompt tells the agent to read it
@@ -229,7 +229,7 @@ pub struct VerifiedCommentCommand {
     /// The thread's title, carried into a minted issue's summary.
     pub title: String,
     /// True for a command the runner dispatched itself (the automerge
-    /// conflict auto-resolve, CLAUDE-380) rather than a human's comment.
+    /// conflict auto-resolve) rather than a human's comment.
     /// Skips only the commenter permission check and its denial reply; every
     /// other gate (readiness, `KeyGate`, `admit`, daily cap, decision gate)
     /// still applies.
@@ -769,7 +769,7 @@ fn access_rank(permission: &str) -> Option<u8> {
 }
 
 /// Whether a command's authorization still requires the live commenter
-/// permission check. A synthetic command (CLAUDE-380's automerge conflict
+/// permission check. A synthetic command (the automerge conflict
 /// auto-resolve dispatch) skips only this gate; readiness, `KeyGate`,
 /// `admit`, the daily cap, and the decision gate all run unchanged for it.
 fn requires_permission_check(cmd: &VerifiedCommentCommand) -> bool {
@@ -889,7 +889,7 @@ pub async fn consume_commands(
 /// already authenticated by the source's write token.
 struct ServeEnv {
     backend: Box<dyn Backend>,
-    /// Reads the PR head branch's CI check runs and logs (CLAUDE-344), so a fix
+    /// Reads the PR head branch's CI check runs and logs, so a fix
     /// request can carry the most recent failing check's error output. Built
     /// from the same write token as `backend`: it already has at least read
     /// access to the repo's Actions logs.
@@ -1285,7 +1285,7 @@ async fn run_instruction(
     // SPEC-3.13: admitted, so post the start notice before any clone or
     // mint work starts (`begin_webhook_run` below, which is the earliest
     // this attempt opens a run row). A synthetic command has no asker to
-    // tell and is left with CLAUDE-552's pre-existing no-op.
+    // tell and is left with the pre-existing no-op.
     if !cmd.synthetic {
         let trigger = crate::run_footer::Trigger::UserCommand {
             login: cmd.author.clone(),
@@ -1312,7 +1312,7 @@ async fn run_instruction(
     // `run` carries the `RunGuard` through to `finish_comment_run` below, so a
     // panic in `serve_run` / `serve_mint` (reached via `block_in_place`) still
     // closes the row as `exit::UNEXPECTED` on drop instead of leaving it open
-    // forever (CLAUDE-402). `run_id` is split out as its own `Copy` value for
+    // forever. `run_id` is split out as its own `Copy` value for
     // the bookkeeping uses in between.
     let run = begin_webhook_run(&ctx.pool, WEBHOOK_COMMENT_ACTION, key, &cmd.html_url).await;
     let run_id = run.as_ref().map(|(id, _)| *id);
@@ -1413,7 +1413,7 @@ async fn run_instruction(
         }
     }
     finish_comment_run(&ctx.pool, run, key, &outcome, &stream_log, &spend).await;
-    // CLAUDE-550: a finished conflict auto-resolve run clears the PR's
+    // A finished conflict auto-resolve run clears the PR's
     // in-flight stamp and records what it left unresolved, so the next
     // automerge pass can dispatch the next attempt or, at the cap, name the
     // stuck files. A write failure only delays the next attempt until the
@@ -1434,7 +1434,7 @@ async fn run_instruction(
     }
     // `env.backend`'s `clone_url` resolves the same forge token the clone and
     // push already used; `origin` itself carries none after the post-clone
-    // scrub (CLAUDE-395), so the preserve-or-delete check's `ls-remote`
+    // scrub, so the preserve-or-delete check's `ls-remote`
     // authenticates per invocation instead.
     let token_url = env.backend.clone_url(&cmd.host, &cmd.repo).ok();
     crate::workdir::cleanup_or_preserve_with_token(
@@ -1461,7 +1461,7 @@ struct RunOutcome {
     /// once a YouTrack issue was created, so a flood of plain-issue commands is
     /// bounded by the same daily cap even though no agent ran.
     counts_run: bool,
-    /// CLAUDE-550: the paths the decision gate refused to push as still
+    /// The paths the decision gate refused to push as still
     /// conflicted (`Decision::UnresolvedConflicts`); empty otherwise. Recorded
     /// on the agent PR row after a synthetic conflict auto-resolve run.
     unresolved_conflicts: Vec<String>,
@@ -1496,7 +1496,7 @@ impl RunOutcome {
 #[allow(clippy::too_many_arguments)]
 fn serve_run(
     backend: &dyn Backend,
-    // Reads the PR head branch's CI check runs and logs (CLAUDE-344), so a fix
+    // Reads the PR head branch's CI check runs and logs, so a fix
     // request can carry the most recent failing check's error output.
     // Best-effort: any failure to resolve it leaves the request to proceed as
     // it did before this existed.
@@ -1544,7 +1544,7 @@ fn serve_run(
         // SPEC-4.4.5: no outcome is silent. Mirrors the branch-resolve fault
         // above. `post_reply` re-attempts `create_dir_all(workdir)` and
         // logs-and-skips on its own failure, so a hard fault still exits
-        // cleanly, but a transient one now reaches the thread (CLAUDE-646).
+        // cleanly, but a transient one now reaches the thread.
         let body = error_comment("creating the comment workdir failed.", &e.to_string());
         post_reply(backend, cmd, workdir, body);
         warn!(error = %e, "creating the comment workdir failed");
@@ -1560,7 +1560,7 @@ fn serve_run(
         .and_then(|url| {
             clone_branch(&url, &branch, workdir).map_err(|e| format!("git clone: {e}"))?;
             // A runner-dispatched conflict run merges the base in, which needs
-            // the merge base, and the depth-50 clone may not reach it (CLAUDE-547).
+            // the merge base, and the depth-50 clone may not reach it.
             if cmd.synthetic {
                 crate::provider::deepen_for_merge(&url, workdir, &branch, &base)
                     .map_err(|e| format!("fetching full history for the merge: {e}"))?;
@@ -1614,8 +1614,7 @@ fn serve_run(
                         )
                     } else {
                         // Best-effort: a fix request with no resolvable failing
-                        // run proceeds exactly as it did before this existed
-                        // (CLAUDE-344).
+                        // run proceeds exactly as it did before this existed.
                         let ci_failure_path = crate::forge_log::ci_failure_context_for_branch(
                             fj,
                             &cmd.host,
@@ -2173,7 +2172,7 @@ fn git_dir_scratch(workdir: &FsPath) -> crate::error::Result<PathBuf> {
 /// reason via [`crate::provider::git_error`].
 fn git_output(workdir: &FsPath, args: &[&str]) -> crate::error::Result<String> {
     // Bare `git` resolves through the process-wide `PATH`. A concurrent test
-    // that prepends a stub `git` to `PATH` (CLAUDE-410, `provider::mod::tests`)
+    // that prepends a stub `git` to `PATH` (`provider::mod::tests`)
     // can otherwise race this call: it forks while the stub dir is still on
     // `PATH` and still exists, but that test's `tempfile::TempDir` can drop
     // (deleting the stub) before the delayed exec actually runs under CI load,
@@ -2229,7 +2228,7 @@ fn run_decision_gate(
     if !paths.is_empty() {
         return Ok(Decision::UnresolvedConflicts { paths });
     }
-    // CLAUDE-550: a conflict auto-resolve run that `git add`ed a file with its
+    // A conflict auto-resolve run that `git add`ed a file with its
     // markers still in it clears the unmerged state above without resolving
     // anything. Checked only for the synthetic resolve command, whose whole
     // job is a merge; a human's instruction may legitimately touch text that
@@ -2293,7 +2292,7 @@ fn run_decision_gate(
     ))
 }
 
-/// CLAUDE-550: the distinct paths `git diff --check <cloned_head>` reports a
+/// The distinct paths `git diff --check <cloned_head>` reports a
 /// `leftover conflict marker` in (work tree and index against the cloned
 /// head). `--check` exits non-zero for any whitespace problem too, so the
 /// exit code is ignored and only the marker lines are read; a git that could
@@ -2357,7 +2356,7 @@ fn numstat_files_and_lines(stdout: &str, files: &mut std::collections::HashSet<S
 }
 
 /// SPEC-4.4.5: "A `Push` decision pushes the PR's own head branch, then
-/// posts a CLAUDE-447 push comment naming the issue key (parsed from the
+/// posts a push comment naming the issue key (parsed from the
 /// pushed tip's commit body) and the commit range; a failure to post that
 /// comment is a note, not a fault, since the push itself already succeeded."
 /// Push the PR branch. Push-only: committing the leftovers now
@@ -2421,9 +2420,9 @@ fn push_side_branch_if_needed(
     }
 }
 
-/// Post the CLAUDE-447 `comment-webhook fix push` comment after [`push_fix`]
+/// Post the `comment-webhook fix push` comment after [`push_fix`]
 /// succeeds. The issue key is read out of the pushed tip's commit body
-/// (CLAUDE-398's bare `#<KEY>-N` reference) rather than threaded through
+/// (its bare `#<KEY>-N` reference) rather than threaded through
 /// `VerifiedCommentCommand`, which carries no YouTrack key at all (it
 /// addresses a forge PR, not a tracker issue); `repo#number` stands in when
 /// the tip carries none. `cloned_head` is the clone's tip BEFORE the decision
@@ -2451,7 +2450,7 @@ fn post_fix_push_comment(
         Err(_) => crate::push_comment::CommitSubjects::Unavailable,
     };
     let public_url = crate::run_footer::resolved_public_url();
-    // CLAUDE-550: a synthetic command is the automerge conflict
+    // A synthetic command is the automerge conflict
     // auto-resolve, the only runner-dispatched command today.
     let event = if cmd.synthetic {
         crate::push_comment::PushEvent::ConflictResolvePush
@@ -2527,7 +2526,7 @@ fn git_in(workdir: &FsPath, args: &[&str]) -> crate::error::Result<()> {
 }
 
 /// Kept separate from [`git_in`] so the token-bearing URL never reaches an error.
-/// Retried on a failed attempt (CLAUDE-396) via
+/// Retried on a failed attempt via
 /// [`crate::provider::retry_git_network`].
 fn git_push(workdir: &FsPath, url: &str, branch: &str) -> crate::error::Result<()> {
     let secrets = crate::provider::url_secrets(url);
@@ -2598,7 +2597,7 @@ fn post_reply(backend: &dyn Backend, cmd: &VerifiedCommentCommand, dir: &FsPath,
 
 // ---- reply bodies ----------------------------------------------------------
 
-/// CLAUDE-552: every reply opens with a one-word verdict, so the asker sees
+/// Every reply opens with a one-word verdict, so the asker sees
 /// the answer before the explanation; [`addressed`] puts `@<asker>` in front
 /// of it.
 fn with_verdict(verdict: &str, body: String) -> String {
@@ -2630,7 +2629,7 @@ fn with_run_footer(cmd: &VerifiedCommentCommand, body: String) -> String {
     )
 }
 
-/// CLAUDE-552: `body` addressed to the commenter, so they are notified and
+/// `body` addressed to the commenter, so they are notified and
 /// see whom it answers. A synthetic command (the runner's own dispatch) has
 /// no human to mention and is left as it is.
 pub fn addressed(cmd: &VerifiedCommentCommand, body: String) -> String {
@@ -2828,7 +2827,7 @@ pub fn cap_comment() -> String {
 
 /// Reply for a fault before the agent could run. `cause` is the underlying
 /// error text (it can carry captured command output), so it is fenced and
-/// never pasted raw (CLAUDE-622, SPEC-3.16).
+/// never pasted raw (SPEC-3.16).
 pub fn error_comment(summary: &str, cause: &str) -> String {
     with_verdict(
         "Blocked.",
@@ -2854,7 +2853,7 @@ pub fn outcome_comment(
     push_comment_failure: Option<&str>,
     too_big_push: Option<&TooBigPush>,
 ) -> String {
-    // CLAUDE-552: Done when a commit reached the PR, No when Claude decided
+    // Done when a commit reached the PR, No when Claude decided
     // or was held to make no change here, Blocked when something stopped it.
     let verdict = match decision {
         Decision::Push { .. } if push_err.is_none() => "Done.",
@@ -2984,12 +2983,12 @@ fn first_line(s: &str) -> String {
 
 /// SPEC-4.4.5: "A served comment command, like every other job, records one
 /// `job_outcomes` row and finalizes through `RunGuard` so a failed finalize
-/// still closes the row as unexpected on drop (CLAUDE-402), rather than
+/// still closes the row as unexpected on drop, rather than
 /// leaving a run open forever."
 /// Close a comment run: one `job_outcomes` row carrying the decision summary and
 /// the stream-log link, then finalize the run through its [`state::RunGuard`],
 /// so a failed finalize still leaves the row closed by the guard's `Drop`
-/// retry (CLAUDE-402) instead of open forever.
+/// retry instead of open forever.
 async fn finish_comment_run(
     pool: &DbPool,
     run: Option<(i64, state::RunGuard)>,
@@ -3066,7 +3065,7 @@ mod tests {
         crate::db::test_pool().await
     }
 
-    // ---- CLAUDE-402: webhook-comment runs close even when the handler panics
+    // ---- webhook-comment runs close even when the handler panics
 
     /// The regression this issue fixes, for the comment listener: a panic
     /// inside the pipeline (reached via `block_in_place` around `serve_run` /
@@ -3102,7 +3101,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        // CLAUDE-504: a fixed, short poll window flaked on Postgres under
+        // A fixed, short poll window flaked on Postgres under
         // heavy I/O contention, so this backs off over a much wider budget.
         let ended: Option<String> =
             crate::testutil::poll_until(std::time::Duration::from_secs(20), || async {
@@ -3880,7 +3879,7 @@ mod tests {
         cmd
     }
 
-    /// CLAUDE-550: a conflict auto-resolve run that staged a file with its
+    /// A conflict auto-resolve run that staged a file with its
     /// conflict markers still in it is refused as unresolved, naming the
     /// file, and nothing is committed.
     #[test]
@@ -3910,7 +3909,7 @@ mod tests {
         assert_eq!(git_output(dir, &["rev-parse", "HEAD"]).unwrap(), before);
     }
 
-    /// CLAUDE-550: a conflict auto-resolve run that really resolved the
+    /// A conflict auto-resolve run that really resolved the
     /// conflict (disjoint edits kept from both sides) is pushed.
     #[test]
     fn a_resolve_run_that_resolved_the_conflict_is_push() {
@@ -4134,7 +4133,7 @@ mod tests {
         assert_eq!(unmerged, "a.txt");
     }
 
-    /// CLAUDE-552: the verdict a body opens with.
+    /// The verdict a body opens with.
     fn verdict_of(body: &str) -> &str {
         body.lines().next().unwrap_or("")
     }
@@ -4157,9 +4156,9 @@ mod tests {
         let failed = ClaudeResult::synthesized("claude exited 1", "tail");
         let allowed = vec!["write".to_string()];
         let cases: Vec<(String, &str)> = vec![
-            (minted_comment("CLAUDE-1", "CLAUDE"), "**Done.**"),
+            (minted_comment("PROJ-1", "CLAUDE"), "**Done.**"),
             (
-                mint_not_queued_comment("CLAUDE-1", "AI Agent", "Queued", "boom"),
+                mint_not_queued_comment("PROJ-1", "AI Agent", "Queued", "boom"),
                 "**Blocked.**",
             ),
             (
@@ -4281,7 +4280,7 @@ mod tests {
         assert_eq!(addressed(&cmd, cap_comment()), cap_comment());
     }
 
-    /// CLAUDE-602 / SPEC-3.9: a rejection reply carries the run footer, with
+    /// SPEC-3.9: a rejection reply carries the run footer, with
     /// the explicit no-run-id line, and still opens with the asker's mention.
     #[test]
     fn rejection_replies_carry_the_run_footer() {
@@ -4537,7 +4536,7 @@ mod tests {
         assert!(!with_hint.contains("SIGKILL"), "{with_hint}");
     }
 
-    /// CLAUDE-372: a killed run's stream tail holds a `thinking` block with a
+    /// A killed run's stream tail holds a `thinking` block with a
     /// `signature`. `outcome_comment` renders whatever `friendly_failure_summary`
     /// produced, so the rendered body must never carry that signature.
     #[test]
@@ -4584,12 +4583,12 @@ mod tests {
     /// the minted key, so a failed queue write never reads as a lost request.
     #[test]
     fn the_mint_route_replies_on_every_outcome() {
-        let minted = minted_comment("CLAUDE-99", "CLAUDE");
-        assert!(minted.contains("CLAUDE-99"), "{minted}");
+        let minted = minted_comment("PROJ-99", "CLAUDE");
+        assert!(minted.contains("PROJ-99"), "{minted}");
         assert!(minted.contains("`CLAUDE` project"), "{minted}");
 
-        let stuck = mint_not_queued_comment("CLAUDE-99", "AI Agent", "Queued", "yt exited 1");
-        assert!(stuck.contains("CLAUDE-99"), "{stuck}");
+        let stuck = mint_not_queued_comment("PROJ-99", "AI Agent", "Queued", "yt exited 1");
+        assert!(stuck.contains("PROJ-99"), "{stuck}");
         assert!(stuck.contains("queueing it FAILED"), "{stuck}");
         assert!(
             stuck.contains("AI Agent") && stuck.contains("Queued"),
@@ -4612,7 +4611,7 @@ mod tests {
         assert!(busy_comment(true).contains("this pull request"));
     }
 
-    /// CLAUDE-622: captured command text in a comment is fenced with a fence
+    /// Captured command text in a comment is fenced with a fence
     /// the text cannot close, at every builder that embeds it.
     #[test]
     fn comment_builders_fence_embedded_command_text() {
@@ -4621,7 +4620,7 @@ mod tests {
         let ok = ClaudeResult::synthesized("s", "d");
         let bodies = [
             error_comment("failed.", text),
-            mint_not_queued_comment("CLAUDE-1", "AI Agent", "Queued", text),
+            mint_not_queued_comment("PROJ-1", "AI Agent", "Queued", text),
             outcome_comment(
                 &Decision::Push { files: 1, lines: 2 },
                 &ok,
@@ -4750,7 +4749,7 @@ mod tests {
         .expect("accepted")
     }
 
-    /// CLAUDE-656: the minted issue names the forge the source is configured
+    /// The minted issue names the forge the source is configured
     /// for, never a fixed "Forgejo".
     #[test]
     fn the_minted_issue_names_the_sources_own_forge() {
@@ -4822,12 +4821,12 @@ mod tests {
                         &description,
                         "--json",
                     ],
-                    r#"{"idReadable":"CLAUDE-99"}"#,
+                    r#"{"idReadable":"PROJ-99"}"#,
                 )
-                .ok("yt", &["issue", "set-state", "CLAUDE-99", "To do"], "")
+                .ok("yt", &["issue", "set-state", "PROJ-99", "To do"], "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "CLAUDE-99", "AI Agent", "Queued"],
+                    &["issue", "set-field", "PROJ-99", "AI Agent", "Queued"],
                     "",
                 )
                 .ok(
@@ -4860,7 +4859,7 @@ mod tests {
         );
 
         assert!(outcome.ok, "{}", outcome.summary);
-        assert!(outcome.summary.contains("CLAUDE-99"), "{}", outcome.summary);
+        assert!(outcome.summary.contains("PROJ-99"), "{}", outcome.summary);
         assert!(
             !outcome.claude_ran,
             "the mint route starts no agent session"
@@ -4879,8 +4878,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing call {needle}: {calls:?}"))
         };
         let created = idx("yt issue create --project CLAUDE");
-        let queued = idx("yt issue set-field CLAUDE-99 AI Agent Queued");
-        assert!(idx("yt issue set-state CLAUDE-99 To do") > created);
+        let queued = idx("yt issue set-field PROJ-99 AI Agent Queued");
+        assert!(idx("yt issue set-state PROJ-99 To do") > created);
         assert!(
             queued > created,
             "AI Agent is written last, on a fully-formed issue: {calls:?}"
@@ -4892,7 +4891,7 @@ mod tests {
             "a plain issue must never be replied to as a PR: {calls:?}"
         );
         let reply = std::fs::read_to_string(&body_file).unwrap();
-        assert!(reply.contains("CLAUDE-99"), "{reply}");
+        assert!(reply.contains("PROJ-99"), "{reply}");
     }
 
     /// A failed `create_issue` still replies (every failure path replies) and
@@ -4997,7 +4996,7 @@ mod tests {
         assert_eq!(admit(0, 4, &d, 5), Admission::Run);
     }
 
-    /// A synthetic command (CLAUDE-380's automerge conflict auto-resolve
+    /// A synthetic command (the automerge conflict auto-resolve
     /// dispatch) skips only the commenter permission check; every other
     /// gate (`admit`, readiness, `KeyGate`, the daily cap) is untouched by
     /// `cmd.synthetic` and runs exactly as it does for a human comment.
@@ -5880,13 +5879,13 @@ mod tests {
         assert_eq!(
             resp_old.status(),
             StatusCode::NOT_FOUND,
-            "the pre-CLAUDE-361 route no longer exists"
+            "the pre-PROJ-361 route no longer exists"
         );
     }
 
     #[tokio::test]
     async fn disabled_listener_404s_even_with_a_configured_source() {
-        // CLAUDE-360: `enabled: false` 404s every request regardless of
+        // `enabled: false` 404s every request regardless of
         // whether the source is fully configured (a valid signature), ahead
         // of the source lookup.
         let _env = crate::secrets::key_file_env_lock().await;
@@ -6122,7 +6121,7 @@ mod tests {
         );
     }
 
-    // ---- GitHub non-issue_comment event filtering (CLAUDE-389) ------------
+    // ---- GitHub non-issue_comment event filtering ------------
 
     fn github_headers_with_event(
         signature: Option<&str>,
@@ -6318,7 +6317,7 @@ mod tests {
         );
     }
 
-    /// `git_push` retries a transient failure (CLAUDE-396) via a
+    /// `git_push` retries a transient failure via a
     /// `git remote-ext` helper script that fails the first invocation and
     /// forwards to `git-receive-pack` on the second, exercising the real
     /// retry path end to end rather than a stub.
@@ -6369,7 +6368,7 @@ mod tests {
         // widening it, so `file` (used by other tests' local-path remotes
         // running concurrently) must stay listed alongside `ext`; the lock
         // keeps this test's set/remove pair from racing another thread's.
-        // PATH lock first: production code reached below takes it too (CLAUDE-536).
+        // PATH lock first: production code reached below takes it too.
         let _path_guard = crate::provider::git_stub_path_test_lock();
         let _guard = crate::provider::git_allow_protocol_test_lock();
         std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
@@ -6384,7 +6383,7 @@ mod tests {
         );
     }
 
-    /// Acceptance (CLAUDE-410): `git_push` never puts the clone URL's
+    /// Acceptance: `git_push` never puts the clone URL's
     /// credential in the real git subprocess's argv, checked by tracing the
     /// actual argv git received (`GIT_TRACE`), not just this crate's own
     /// `Command` construction. `file://user:<token>@<path>` round-trips
@@ -6414,11 +6413,11 @@ mod tests {
         git_in(&workdir, &["add", "f"]).unwrap();
         git_in(&workdir, &["commit", "-q", "-m", "x"]).unwrap();
 
-        let token = "CLAUDE-410-push-secret-token";
+        let token = "PROJ-410-push-secret-token";
         let url = format!("file://user:{token}@{}", bare.display());
         let trace_file = tmp.path().join("git-trace.log");
 
-        // PATH lock first: production code reached below takes it too (CLAUDE-536).
+        // PATH lock first: production code reached below takes it too.
         let _path_guard = crate::provider::git_stub_path_test_lock();
         let _guard = crate::provider::git_trace_test_lock();
         std::env::set_var("GIT_TRACE", &trace_file);
@@ -6437,7 +6436,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-447: a successful fix push posts the `comment-webhook fix push`
+    /// A successful fix push posts the `comment-webhook fix push`
     /// event, the issue key read off the tip commit's bare `#<KEY>-N`
     /// reference, the PR's ready state, and the commit range.
     #[test]
@@ -6448,7 +6447,7 @@ mod tests {
         let cloned_head = git_output(dir, &["rev-parse", "HEAD"]).unwrap();
         std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
         git_in(dir, &["add", "a.txt"]).unwrap();
-        git_in(dir, &["commit", "-q", "-m", "fix the thing\n\n#CLAUDE-447"]).unwrap();
+        git_in(dir, &["commit", "-q", "-m", "fix the thing\n\n#PROJ-447"]).unwrap();
 
         let scratch = git_dir_scratch(dir).unwrap();
         let body_arg = scratch

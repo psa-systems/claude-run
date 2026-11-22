@@ -60,7 +60,7 @@ pub fn pr_web_url(host: &str, repo: &str, pr_number: i64, extra: &[String]) -> S
     format!("https://{host}/{repo}/{segment}/{pr_number}")
 }
 
-/// CLAUDE-521: write `body` to a scratch file under `std::env::temp_dir()`
+/// Write `body` to a scratch file under `std::env::temp_dir()`
 /// for a `gh` call that reads its PR body from disk, named uniquely per call
 /// (not just per `prefix`) via `tempfile`'s atomic create-with-random-suffix.
 /// Two concurrent callers racing on the same logical key (a PR number)
@@ -77,7 +77,7 @@ fn scratch_file(prefix: &str, body: &str) -> Result<tempfile::TempPath> {
 }
 
 /// Remove a [`scratch_file`] path, logging anything but a benign
-/// already-gone file, exactly like the pre-CLAUDE-521 `remove_file` calls
+/// already-gone file, exactly like the earlier `remove_file` calls
 /// this replaces.
 fn remove_scratch_file(scratch: tempfile::TempPath, what: &str) {
     let path = scratch.to_path_buf();
@@ -266,15 +266,15 @@ pub struct GithubForge {
     /// Lazy `gh auth token` fallback result, cached after the first lookup.
     /// Only consulted when `token` is `None`.
     resolved_token: std::sync::Mutex<Option<std::result::Result<String, String>>>,
-    /// Wait schedule for a retried git network call (CLAUDE-396). Defaults to
+    /// Wait schedule for a retried git network call. Defaults to
     /// [`crate::provider::GIT_NETWORK_RETRY_WAITS`]; overridable so tests run
     /// with no delay.
     git_retry_waits: [std::time::Duration; 3],
-    /// Wait schedule for a retried read-only `gh` call (CLAUDE-407, parity
-    /// with the `fj` read retry of CLAUDE-366). Defaults to
+    /// Wait schedule for a retried read-only `gh` call (parity
+    /// with the `fj` read retry). Defaults to
     /// [`DEFAULT_READ_RETRY_WAITS`]; overridable so tests run with no delay.
     gh_read_retry_waits: [std::time::Duration; 3],
-    /// Operator-visible notices accumulated while serving the job (CLAUDE-469:
+/// Operator-visible notices accumulated while serving the job (
     /// a degraded open-PR lookup), mirroring `CliBackend::notices`. Drained by
     /// [`Forge::take_notices`] and persisted as run events.
     notices: std::sync::Mutex<Vec<String>>,
@@ -308,7 +308,7 @@ impl GithubForge {
         }
     }
 
-    /// CLAUDE-549: an owned, independent copy for
+    /// An owned, independent copy for
     /// [`crate::provider::pr_status_on_thread`]: same runner, transport,
     /// token, binaries and retry schedules. The cached `gh auth token`
     /// fallback is carried over; the notice buffer starts empty (a status
@@ -340,14 +340,14 @@ impl GithubForge {
         self
     }
 
-    /// Override the git network retry wait schedule (CLAUDE-396; tests set
+    /// Override the git network retry wait schedule (tests set
     /// this to all-zero so a retried push runs with no delay).
     pub fn with_git_retry_waits(mut self, waits: [std::time::Duration; 3]) -> Self {
         self.git_retry_waits = waits;
         self
     }
 
-    /// Override the `gh` read-retry wait schedule (CLAUDE-407; tests set this
+    /// Override the `gh` read-retry wait schedule (tests set this
     /// to all-zero so a retried read runs with no delay).
     pub fn with_gh_read_retry_waits(mut self, waits: [std::time::Duration; 3]) -> Self {
         self.gh_read_retry_waits = waits;
@@ -355,7 +355,7 @@ impl GithubForge {
     }
 
     /// SPEC-8.4: run a read-only `gh` invocation, retried up to four attempts total
-    /// (CLAUDE-407, parity with the `fj` read retry of CLAUDE-366). Never used
+    /// (parity with the `fj` read retry). Never used
     /// for a write: a write must fail on its first and only attempt.
     fn run_gh_read(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<CmdOutput> {
         run_read_retrying(
@@ -424,12 +424,12 @@ impl GithubForge {
     /// Push the working branch to the GitHub remote. With a resolvable token
     /// (the action's own, or the daemon's `gh` login), push to `origin`
     /// authenticated per invocation through the credential-helper mechanism
-    /// (CLAUDE-395: `origin`'s own URL carries no credential after the
+    /// (`origin`'s own URL carries no credential after the
     /// post-clone scrub, and the token must never appear in argv); otherwise
     /// fall back to an unauthenticated push against `origin` (host git auth),
     /// warning with both misses named rather than failing silently. Always
     /// `--no-verify`: the runner never runs the repo's `pre-push` hook on any
-    /// push of an agent's feature branch (CLAUDE-533).
+    /// push of an agent's feature branch.
     /// SPEC-8.5: pushes authenticated per invocation via the credential-helper mechanism.
     fn push(&self, workdir: &Path, host: &str, repo: &str, branch: &str) -> Result<()> {
         let refspec = format!("HEAD:{branch}");
@@ -475,7 +475,7 @@ impl GithubForge {
     }
 
     /// Open the PR via the MCP `create_pull_request` tool. `draft` sets the
-    /// real GitHub draft flag (CLAUDE-379 timeout salvage), not a title
+    /// real GitHub draft flag (timeout salvage), not a title
     /// convention.
     fn open_via_mcp(
         &self,
@@ -536,7 +536,7 @@ impl GithubForge {
     }
 
     /// Open the PR via `gh pr create`, parsing the printed PR URL. `draft`
-    /// passes the real `--draft` flag (CLAUDE-379 timeout salvage).
+    /// passes the real `--draft` flag (timeout salvage).
     fn open_via_gh(
         &self,
         workdir: &Path,
@@ -572,8 +572,8 @@ impl GithubForge {
 
     /// SPEC-8.7, SPEC-8.10: shared body for [`Forge::create_pr`] / [`Forge::create_pr_with_draft`],
     /// validating the tip subject and degrading an open-PR lookup failure to a create.
-    /// `body_override`, when `Some` (the timeout-salvage draft body,
-    /// CLAUDE-398), is written verbatim instead of the tip commit's own body.
+    /// `body_override`, when `Some` (the timeout-salvage draft body),
+    /// is written verbatim instead of the tip commit's own body.
     fn create_pr_impl(
         &self,
         workdir: &Path,
@@ -611,8 +611,8 @@ impl GithubForge {
         let base = self.detect_base(workdir);
         let title = self.git(workdir, &["log", "-1", "--pretty=format:%s"])?;
 
-        // The subject guard (CLAUDE-398) runs before any push. The body
-        // guard (CLAUDE-623) runs alongside it, but only when `body_override`
+        // The subject guard runs before any push. The body
+        // guard runs alongside it, but only when `body_override`
         // is `None`: an override (the timeout-salvage draft body) replaces
         // the tip's own body outright, so the tip's `%b` is never read in
         // that case.
@@ -626,14 +626,14 @@ impl GithubForge {
             }
         };
 
-        // The push comment (CLAUDE-447) names the triggering issue; this
+        // The push comment names the triggering issue; this
         // layer has no job key passed in directly, so it is read back out of
-        // the bare `#<KEY>-N` reference every runner commit body carries
-        // (CLAUDE-398). Falls back to the branch name on a commit that
+        // the bare `#<KEY>-N` reference every runner commit body carries.
+        // Falls back to the branch name on a commit that
         // somehow carries none (never expected in practice).
         let issue_key = crate::provider::bare_issue_key(&body).unwrap_or_else(|| branch.clone());
 
-        // The remote tip before the push (CLAUDE-447), `None` for a branch
+        // The remote tip before the push, `None` for a branch
         // GitHub has never seen; read-only, so a transient failure here just
         // degrades the push comment's range to "none" rather than blocking
         // the push itself.
@@ -664,7 +664,7 @@ impl GithubForge {
         });
 
         // Adopt an already-open PR for `branch` instead of creating a second
-        // one (CLAUDE-469), mirroring `CliBackend::find_or_create_pr`. A
+        // one, mirroring `CliBackend::find_or_create_pr`. A
         // FAILED lookup is not fatal: it degrades to "unknown, assume none"
         // with a warn plus an operator-visible notice, and the create below
         // still runs. The degraded path can race a PR that already exists, so
@@ -821,7 +821,7 @@ impl GithubForge {
         ));
     }
 
-    /// SPEC-8.10: resolve a PR-create failure against the open-PR lookup (CLAUDE-469),
+    /// SPEC-8.10: resolve a PR-create failure against the open-PR lookup,
     /// mirroring `CliBackend::find_or_create_pr`'s already-exists retry: a
     /// create rejected because a PR for this head already exists retries the
     /// lookup exactly once and adopts the result, posting the push comment
@@ -871,7 +871,7 @@ impl GithubForge {
         ))
     }
 
-    /// SPEC-8.8: post the CLAUDE-447 push comment for `create_pr_impl`'s push, folding
+    /// SPEC-8.8: post the push comment for `create_pr_impl`'s push, folding
     /// a failure into `pr.push_comment_failure` for the caller's own outcome
     /// comment rather than failing the PR create that already succeeded.
     #[allow(clippy::too_many_arguments)]
@@ -929,7 +929,7 @@ impl Forge for GithubForge {
         self.create_pr_impl(workdir, host, false, None)
     }
 
-    /// `draft` sets GitHub's real draft flag (CLAUDE-379 timeout salvage);
+    /// `draft` sets GitHub's real draft flag (timeout salvage);
     /// `_strategy` is ignored for the same reason [`Self::create_pr`] ignores
     /// it (GitHub PRs are always branch-backed).
     fn create_pr_with_draft(
@@ -943,8 +943,8 @@ impl Forge for GithubForge {
         self.create_pr_impl(workdir, host, draft, body)
     }
 
-    /// Drain the notices accumulated by a degraded open-PR lookup
-    /// (CLAUDE-469). Mirrors `CliBackend::take_notices`.
+    /// Drain the notices accumulated by a degraded open-PR lookup.
+    /// Mirrors `CliBackend::take_notices`.
     fn take_notices(&self) -> Vec<String> {
         std::mem::take(&mut *self.notices.lock().unwrap())
     }
@@ -954,10 +954,10 @@ impl Forge for GithubForge {
     }
 
     /// `gh pr ready <number> --repo <repo>` clears the draft flag a
-    /// timeout-salvaged PR (CLAUDE-379) opened with, when a re-queued run
+    /// timeout-salvaged PR opened with, when a re-queued run
     /// resumes onto it and now succeeds. A no-op (exit 0, "is already ready
     /// for review") on a PR that was never a draft. Returns whether the PR
-    /// was a draft before this call (CLAUDE-651): the caller uses this to
+    /// was a draft before this call: the caller uses this to
     /// decide whether a finalize-time merge is safe (a PR just promoted from
     /// draft may have only skipped, draft-time CI runs on its head SHA; see
     /// `latest_runs_per_workflow` and `run_verdict`). A failed or
@@ -1008,7 +1008,7 @@ impl Forge for GithubForge {
                 stderr: out.stderr.trim().to_string(),
             });
         }
-        // CLAUDE-630: the one auditable record that this PR was undrafted,
+        // The one auditable record that this PR was undrafted,
         // naming the PR and the old/new draft state.
         tracing::info!(
             repo,
@@ -1024,7 +1024,7 @@ impl Forge for GithubForge {
     /// PR is left untouched. Otherwise reads `HEAD`'s current subject/body
     /// (the same read `create_pr_impl` does), validates the subject, and
     /// SPEC-8.7: overwrites the PR with `gh pr edit <number> --repo <repo> --title
-    /// <title> --body-file <path>` (CLAUDE-398).
+    /// <title> --body-file <path>`.
     fn refresh_pr_text(
         &self,
         workdir: &Path,
@@ -1107,7 +1107,7 @@ impl Forge for GithubForge {
     /// AGit equivalent, so `HEAD` is always the feature branch; "nothing to
     /// push" degrades to `Ok(None)` when it carries no commit the base
     /// lacks. Like every other push here, the repo's `pre-push` hook is
-    /// never run (CLAUDE-533).
+    /// never run.
     fn final_push(
         &self,
         workdir: &Path,
@@ -1291,7 +1291,7 @@ impl Forge for GithubForge {
     /// value, never a default: silently guessing a CI verdict is worse than
     /// failing loudly. Only the latest run per workflow on the head SHA
     /// counts (`latest_runs_per_workflow`), and a latest run concluded
-    /// `skipped` is `pending`, not `success` (SPEC-8.11, CLAUDE-651): a repo
+    /// `skipped` is `pending`, not `success` (SPEC-8.11): a repo
     /// whose required checks gate on `if: !draft` leaves exactly this shape
     /// on the head SHA for as long as the PR stays a draft.
     fn pr_status(&self, _host: &str, repo: &str, pr_number: u64) -> Result<super::PrStatus> {
@@ -1462,7 +1462,7 @@ impl Forge for GithubForge {
     /// "never rewrites the agent's branch". A merge-conflict failure's `gh`
     /// stderr is carried through unmodified in [`Error::CliFailed`], which is
     /// what lets [`crate::web::webhooks::try_dispatch_conflict_auto_resolve`]
-    /// key on "conflict" in the error text (CLAUDE-380).
+    /// key on "conflict" in the error text.
     fn update_pr_branch(&self, _host: &str, repo: &str, pr_number: u64) -> Result<()> {
         let envs: Vec<(&str, &str)> = match &self.token {
             Some(t) => vec![("GH_TOKEN", t.as_str())],
@@ -1803,7 +1803,7 @@ struct GhWorkflowRunsDoc {
 
 /// One entry of `workflow_runs`. REST reports `status` and `conclusion` in
 /// lowercase, unlike the GraphQL rollup's uppercase enums. `workflow_id` and
-/// `run_number` identify the latest run per workflow (CLAUDE-651:
+/// `run_number` identify the latest run per workflow (
 /// `latest_runs_per_workflow` below); `created_at` breaks a `run_number` tie.
 #[derive(Debug, Default, serde::Deserialize)]
 struct GhWorkflowRun {
@@ -1839,8 +1839,8 @@ enum CheckVerdict {
 }
 
 /// Resolve one workflow run to a [`CheckVerdict`], or an error naming an
-/// unrecognised `conclusion` value. `skipped` is `Pending`, never `Success`
-/// (CLAUDE-651): a skipped run (for example a draft-only job-level `if`)
+/// unrecognised `conclusion` value. `skipped` is `Pending`, never `Success`:
+/// a skipped run (for example a draft-only job-level `if`)
 /// verified nothing. [`latest_runs_per_workflow`] is what makes this safe to
 /// call directly: it has already dropped every run but the latest per
 /// workflow, so a draft-time `skipped` run superseded by a real run never
@@ -1863,7 +1863,7 @@ fn run_verdict(run: &GhWorkflowRun) -> Result<CheckVerdict> {
 
 /// Collapse `runs` to the latest run per `workflow_id`: highest `run_number`,
 /// then latest `created_at` on a tie. Older runs of the same workflow are
-/// dropped so a superseded draft-time run (CLAUDE-651) can neither pass nor
+/// dropped so a superseded draft-time run can neither pass nor
 /// fail the verdict. A run missing `workflow_id` or `run_number` is an error
 /// naming the field, never defaulted: silently keeping or dropping it would
 /// hide a real GitHub API response shape this code does not understand.
@@ -2013,8 +2013,8 @@ impl GhPrEntry {
 pub struct GhForgeReads {
     runner: Arc<dyn CommandRunner>,
     gh: String,
-    /// Wait schedule for a retried read-only `gh` call (CLAUDE-407, parity
-    /// with the `fj` read retry of CLAUDE-366). Defaults to
+    /// Wait schedule for a retried read-only `gh` call (parity
+    /// with the `fj` read retry). Defaults to
     /// [`DEFAULT_READ_RETRY_WAITS`]; overridable so tests run with no delay.
     gh_read_retry_waits: [std::time::Duration; 3],
 }
@@ -2043,7 +2043,7 @@ impl GhForgeReads {
         self
     }
 
-    /// Override the `gh` read-retry wait schedule (CLAUDE-407; tests set this
+    /// Override the `gh` read-retry wait schedule (tests set this
     /// to all-zero so a retried read runs with no delay).
     pub fn with_gh_read_retry_waits(mut self, waits: [std::time::Duration; 3]) -> Self {
         self.gh_read_retry_waits = waits;
@@ -2064,8 +2064,8 @@ impl GhForgeReads {
     }
 
     /// `gh api --hostname <host> <endpoint> [extra...]`, GET by default.
-    /// Retried up to four attempts total (CLAUDE-407, parity with the `fj`
-    /// read retry of CLAUDE-366): every call through here is a read (run
+    /// Retried up to four attempts total (parity with the `fj`
+    /// read retry): every call through here is a read (run
     /// logs, run listing, run timing, repo file fetches).
     fn api_get(
         &self,
@@ -2438,7 +2438,7 @@ mod tests {
     use crate::provider::cli::testutil::StubRunner;
     use std::sync::{Arc, Mutex};
 
-    /// CLAUDE-521: two concurrent scratch-file writers racing on the exact
+    /// Two concurrent scratch-file writers racing on the exact
     /// same logical key (here, a fixed prefix standing in for a PR number)
     /// must never land on the same path. Before the fix, `scratch_file`
     /// built a fixed `<prefix>.md` name, so both threads wrote, and one
@@ -2470,7 +2470,7 @@ mod tests {
         init_ok: bool,
         result: Value,
         /// When set, `call_tool` errors with this message instead of
-        /// returning `result` (CLAUDE-469: simulates GitHub's REST 422
+        /// returning `result` (simulates GitHub's REST 422
         /// "already exists" on `create_pull_request`).
         fail_call: Option<String>,
         pub calls: Mutex<Vec<String>>,
@@ -2524,7 +2524,7 @@ mod tests {
 
     /// Register the git interrogation + push every `create_pr` issues.
     /// `push_remote == "origin"` registers the no-credential fallback shape
-    /// (CLAUDE-395: plain `push origin <refspec>`); anything else is treated
+    /// (plain `push origin <refspec>`); anything else is treated
     /// as "a credential resolved", registering the credential-helper-prefixed
     /// authenticated shape instead (the token itself never appears in argv
     /// any more, so `push_remote`'s exact URL text only selects which shape
@@ -2561,16 +2561,15 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--pretty=format:%b"],
-                "body text\n\n#CLAUDE-1\n",
+                "body text\n\n#PROJ-1\n",
             )
             .ok("git", &push_args, "")
     }
 
     const NO_WAIT: [std::time::Duration; 3] = [std::time::Duration::ZERO; 3];
 
-    /// CLAUDE-423: `GithubForge::push`'s failure must carry a hook's
-    /// stdout tail, exactly as `CliBackend::push_branch` does for Forgejo
-    /// (CLAUDE-422).
+    /// `GithubForge::push`'s failure must carry a hook's
+    /// stdout tail, exactly as `CliBackend::push_branch` does for Forgejo.
     #[test]
     fn push_failure_carries_the_hook_stdout_and_the_git_stderr() {
         let mut full = crate::provider::credential_helper_args().to_vec();
@@ -2602,7 +2601,7 @@ mod tests {
         );
     }
 
-    /// A failure with no stdout reads exactly as it did before CLAUDE-423.
+    /// A failure with no stdout reads exactly as it did.
     #[test]
     fn push_failure_with_empty_stdout_keeps_its_stderr_text_unchanged() {
         let mut full = crate::provider::credential_helper_args().to_vec();
@@ -2658,7 +2657,7 @@ mod tests {
         assert_eq!(push_calls, 2, "{calls:?}");
     }
 
-    /// CLAUDE-486 (SPEC-3.3.1): `GithubForge::final_push` pushes HEAD when it
+    /// SPEC-3.3.1: `GithubForge::final_push` pushes HEAD when it
     /// is ahead of the detected base.
     #[test]
     fn final_push_pushes_ahead_commits() {
@@ -2717,7 +2716,7 @@ mod tests {
 
     #[test]
     fn create_pr_refuses_a_template_heading_subject_before_any_push() {
-        // CLAUDE-398: GitHub's create path must reject a tip subject that is
+        // GitHub's create path must reject a tip subject that is
         // a template heading before pushing.
         let runner = Arc::new(
             with_git(
@@ -2752,7 +2751,7 @@ mod tests {
 
     #[test]
     fn refresh_pr_text_is_a_no_op_when_not_a_real_draft() {
-        // CLAUDE-398: a resumed-but-already-ready PR (isDraft: false) is left
+        // A resumed-but-already-ready PR (isDraft: false) is left
         // untouched; no git reads, no `gh pr edit`.
         let runner = Arc::new(StubRunner::new().ok(
             "gh",
@@ -2789,7 +2788,7 @@ mod tests {
 
     #[test]
     fn refresh_pr_text_overwrites_a_draft_prs_title_and_body() {
-        // CLAUDE-398: a real GitHub draft (isDraft: true) gets its title and
+        // A real GitHub draft (isDraft: true) gets its title and
         // body overwritten from HEAD's current tip in one combined edit.
         let runner = Arc::new(
             StubRunner::new()
@@ -2847,7 +2846,7 @@ mod tests {
 
     #[test]
     fn refresh_pr_text_refuses_a_template_heading_subject() {
-        // CLAUDE-398: the same subject guard `create_pr` applies also runs
+        // The same subject guard `create_pr` applies also runs
         // here, so a HEAD that regressed to a bad subject refuses rather
         // than overwriting the PR with it.
         let runner = Arc::new(
@@ -3022,8 +3021,8 @@ mod tests {
             assert!(!call.contains("ghp_from_login"), "{call}");
         }
         // PR creation itself never consulted `gh`; the only other `gh` calls
-        // are the CLAUDE-469 open-PR lookup (empty, so no adoption) and the
-        // CLAUDE-447 push comment posted after the push succeeded.
+        // are the open-PR lookup (empty, so no adoption) and the
+        // push comment posted after the push succeeded.
         assert!(
             !calls.iter().any(|c| c.starts_with("gh ")
                 && c != "gh auth token --hostname github.com"
@@ -3063,7 +3062,7 @@ mod tests {
                         "--title",
                         "feat: x",
                         "--body",
-                        "body text\n\n#CLAUDE-1",
+                        "body text\n\n#PROJ-1",
                     ],
                     "https://github.com/octo/widget/pull/5\n",
                 ),
@@ -3093,7 +3092,7 @@ mod tests {
 
     #[test]
     fn create_pr_marks_resumed_run_push_when_remote_already_has_the_branch() {
-        // CLAUDE-447: a non-empty `ls-remote` before the push means this
+        // A non-empty `ls-remote` before the push means this
         // branch was pushed before, so the event is `resumed-run push`, not
         // `initial push (PR opened)`.
         let body_arg = std::env::temp_dir()
@@ -3126,7 +3125,7 @@ mod tests {
                         "--title",
                         "feat: x",
                         "--body",
-                        "body text\n\n#CLAUDE-1",
+                        "body text\n\n#PROJ-1",
                     ],
                     "https://github.com/octo/widget/pull/5\n",
                 )
@@ -3169,7 +3168,7 @@ mod tests {
 
     #[test]
     fn create_pr_with_draft_posts_timeout_salvage_push_comment() {
-        // CLAUDE-447: `draft` always overrides the event to `timeout
+        // `draft` always overrides the event to `timeout
         // salvage push`, regardless of whether the remote already had the
         // branch.
         let body_arg = std::env::temp_dir()
@@ -3364,7 +3363,7 @@ mod tests {
     #[test]
     fn create_pr_pushes_with_token_to_authenticated_url() {
         // A token routes the push through the credential helper, never a
-        // token-bearing URL in argv (CLAUDE-395).
+        // token-bearing URL in argv.
         let push_remote = "https://x-access-token:ghp_secret@github.com/octo/widget.git";
         let runner = Arc::new(with_git(StubRunner::new(), "feat/x", push_remote));
         let transport = Arc::new(StubTransport::new(
@@ -3405,7 +3404,7 @@ mod tests {
     }
 
     /// `gh pr create`'s args for the standard `with_git` fixture (branch
-    /// `feat/x`, base `main`, title `feat: x`, body `body text\n\n#CLAUDE-1`).
+    /// `feat/x`, base `main`, title `feat: x`, body `body text\n\n#PROJ-1`).
     fn create_args() -> Vec<&'static str> {
         vec![
             "pr",
@@ -3417,7 +3416,7 @@ mod tests {
             "--title",
             "feat: x",
             "--body",
-            "body text\n\n#CLAUDE-1",
+            "body text\n\n#PROJ-1",
         ]
     }
 
@@ -3533,7 +3532,7 @@ mod tests {
     #[test]
     fn create_pr_creates_when_no_open_pr_exists() {
         // (c) No existing open PR for `feat/x`: the create path runs
-        // unchanged, exactly as it did before CLAUDE-469.
+        // unchanged, exactly as it did.
         let runner = Arc::new(
             with_git(StubRunner::new(), "feat/x", "origin")
                 .ok("gh", &list_open_prs_args("octo/widget"), "[]")
@@ -3568,7 +3567,7 @@ mod tests {
 
     #[test]
     fn contract_adopts_existing_open_pr() {
-        // CLAUDE-469: the shared `crate::provider::contract` assertion,
+        // The shared `crate::provider::contract` assertion,
         // exercised here with a `GithubForge` double, mirrors the same
         // assertion run against `CliBackend` in `cli.rs`'s own test module.
         let open_pr = r#"[{"number":777,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/777"}]"#;
@@ -3610,7 +3609,7 @@ mod tests {
 
     #[test]
     fn contract_creates_when_no_open_pr() {
-        // CLAUDE-469: the other half of the shared contract, run against
+        // The other half of the shared contract, run against
         // `GithubForge`.
         let runner = Arc::new(
             with_git(StubRunner::new(), "feat/x", "origin")
@@ -3935,7 +3934,7 @@ mod tests {
         assert_eq!(prs[0].draft, None);
     }
 
-    /// CLAUDE-652: `isDraft` maps to `ForgePullRequest::draft`, distinct from
+    /// `isDraft` maps to `ForgePullRequest::draft`, distinct from
     /// an unreported flag.
     #[test]
     fn list_open_prs_maps_is_draft_to_draft() {
@@ -4304,7 +4303,7 @@ mod tests {
         assert!(err.contains("weird"), "got {err}");
     }
 
-    // ---- CLAUDE-651: skipped draft-time runs never pass a PR -------------
+    // ---- skipped draft-time runs never pass a PR -------------
 
     #[test]
     fn pr_status_only_skipped_draft_time_runs_give_pending_never_success() {
@@ -4513,7 +4512,7 @@ mod tests {
         assert!(err.to_lowercase().contains("conflict"), "got {err}");
     }
 
-    // ---- CLAUDE-407: gh read-retry parity ----------------------------------
+    // ---- gh read-retry parity ----------------------------------
 
     #[test]
     fn identity_retries_once_and_succeeds_on_second_attempt() {
@@ -4709,7 +4708,7 @@ mod tests {
         assert_eq!(runner.calls.lock().unwrap().len(), 2);
     }
 
-    /// No `gh` write is retried (CLAUDE-407): a write that fails runs exactly
+    /// No `gh` write is retried: a write that fails runs exactly
     /// once, unlike the reads above.
     #[test]
     fn gh_writes_run_exactly_once_on_failure() {
@@ -4774,7 +4773,7 @@ mod tests {
             .pr_comment("github.com", "octo/widget", 42, Path::new("/tmp/b.md"))
             .is_err());
 
-        // CLAUDE-630/CLAUDE-651: mark_pr_ready reads the prior draft state
+        // Mark_pr_ready reads the prior draft state
         // before the write; the isDraft read here is unstubbed and fails, so
         // mark_pr_ready errors there and never reaches the `gh pr ready`
         // write. One read call for mark_pr_ready plus the three other
@@ -4782,7 +4781,7 @@ mod tests {
         assert_eq!(runner.calls.lock().unwrap().len(), 4);
     }
 
-    // ---- CLAUDE-651: mark_pr_ready's return value and pre-read error -----
+    // ---- mark_pr_ready's return value and pre-read error -----
 
     #[test]
     fn mark_pr_ready_returns_true_when_the_pr_was_a_draft() {
@@ -4894,7 +4893,7 @@ mod tests {
         );
     }
 
-    /// `gh pr create` is a write (CLAUDE-407): a failed open runs exactly
+    /// `gh pr create` is a write: a failed open runs exactly
     /// once, never retried, since retrying risks a duplicate PR.
     #[test]
     fn open_via_gh_runs_exactly_once_on_failure() {
@@ -4940,7 +4939,7 @@ mod tests {
         assert_eq!(gh_calls, 1);
     }
 
-    /// The `gh pr edit` half of `refresh_pr_text` is a write (CLAUDE-407): a
+    /// The `gh pr edit` half of `refresh_pr_text` is a write: a
     /// failed edit runs exactly once, never retried.
     #[test]
     fn refresh_pr_text_edit_runs_exactly_once_on_failure() {
@@ -5000,7 +4999,7 @@ mod tests {
         assert_eq!(edit_calls, 1);
     }
 
-    // ---- CLAUDE-407: GhForgeReads read-retry parity ------------------------
+    // ---- GhForgeReads read-retry parity ------------------------
 
     #[test]
     fn gh_forge_reads_api_get_retries_once_and_succeeds_on_second_attempt() {

@@ -771,7 +771,7 @@ pub async fn claude_usage(
     })
 }
 
-/// CLAUDE-601 / SPEC-3.14 items 1 and 7: attempts counted by `(stage,
+/// SPEC-3.14 items 1 and 7: attempts counted by `(stage,
 /// outcome)` straight from `job_outcomes`, so "succeeded on the first try" is
 /// a query and not a re-derivation from `attempt_steps`.
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -834,7 +834,7 @@ pub struct CheckLabelDuration {
     pub count: i64,
 }
 
-/// SPEC-4.3.14 "where the time goes": CLAUDE-575's own two series (time by
+/// SPEC-4.3.14 "where the time goes": the two series (time by
 /// `kind`, and the `check` breakdown by `label`), plus the count of attempts
 /// in the window with no `attempt_steps` rows at all. That count is reported
 /// as its own figure, never folded into the series as a zero (an attempt with
@@ -875,7 +875,7 @@ async fn attempt_step_rows(
     Ok(q.fetch_all(pool).await?)
 }
 
-/// SPEC-4.3.14: time-by-kind + checks series for CLAUDE-575's own AC, plus the
+/// SPEC-4.3.14: time-by-kind + checks series, plus the
 /// "no step data" count (older attempts recorded before this feature shipped,
 /// or an attempt whose step writes all failed, never shown as zero).
 pub async fn step_timing(
@@ -1747,7 +1747,7 @@ mod tests {
         .unwrap();
     }
 
-    /// CLAUDE-590: the funnel buckets sum to the issue count, and a seeded
+    /// The funnel buckets sum to the issue count, and a seeded
     /// unrecognised outcome shows the mismatch banner text.
     #[tokio::test]
     async fn funnel_buckets_sum_to_the_issue_count_and_a_mismatch_is_named() {
@@ -1851,7 +1851,7 @@ mod tests {
         assert_eq!((stale.in_progress, stale.never_finished), (0, 1));
     }
 
-    /// CLAUDE-590: each cause lands in its bucket and `other` stays its own.
+    /// Each cause lands in its bucket and `other` stays its own.
     #[tokio::test]
     async fn each_failure_cause_lands_in_its_own_bucket() {
         let pool = mem_pool().await;
@@ -1895,7 +1895,7 @@ mod tests {
         assert_eq!(report.other_attempts[0].job_key, "C-7");
     }
 
-    /// CLAUDE-591: stage statistics and the Postgres series, including a
+    /// Stage statistics and the Postgres series, including a
     /// never-healthy start with its cause, from seeded steps.
     #[tokio::test]
     async fn stage_and_postgres_statistics_come_from_seeded_steps() {
@@ -1990,7 +1990,7 @@ mod tests {
         assert_eq!(pg.last_failure_cause.as_deref(), Some("connection refused"));
     }
 
-    /// CLAUDE-591: an attempt recorded before step data existed is counted in
+    /// An attempt recorded before step data existed is counted in
     /// the visible "no step data" figure on both series.
     #[tokio::test]
     async fn pre_instrumentation_attempts_show_in_the_no_step_data_figure() {
@@ -2134,7 +2134,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-601: "succeeded on the first try" is a query on `job_outcomes`.
+    /// "succeeded on the first try" is a query on `job_outcomes`.
     #[tokio::test]
     async fn attempts_by_outcome_counts_first_try_successes() {
         let pool = mem_pool().await;

@@ -6,15 +6,15 @@ The image sets each root with its env var; [self-hosting.md](self-hosting.md) ma
 
 | Container path      | Env var                  | What                                                                                            |
 |---------------------|--------------------------|-------------------------------------------------------------------------------------------------|
-| `/config`           | `CLAUDE_RUN_CONFIG_DIR`  | `config.toml`, `actions/*.yml`, `secrets.key`, `mcp-master.key`, `mcp-session.key` (CLAUDE-442)  |
-| `/data`             | `CLAUDE_RUN_DATA_DIR`    | `state.db` (SQLite backend only; see "State store backend"), `workdirs/`, `mcp-web.db` (CLAUDE-442) |
+| `/config`           | `CLAUDE_RUN_CONFIG_DIR`  | `config.toml`, `actions/*.yml`, `secrets.key`, `mcp-master.key`, `mcp-session.key`  |
+| `/data`             | `CLAUDE_RUN_DATA_DIR`    | `state.db` (SQLite backend only; see "State store backend"), `workdirs/`, `mcp-web.db` |
 | `/state`            | `CLAUDE_RUN_STATE_DIR`   | `logs/daemon.log`, `logs/<action>/<output.file>`, `logs/<action>/streams/<key>-attempt-<n>.jsonl`, `snippets/`, `webhook-logs/` |
 | `/run/claude-run`   | `CLAUDE_RUN_RUNTIME_DIR` | `daemon.pid`, `locks/<action>.lock` (no `daemon.sock`: the image runs `serve --no-socket`)      |
 
 `workdir_base` (action YAML field or `CLAUDE_RUN_WORKDIR_BASE` env) overrides where per-job workdirs live; defaults to
 `$CLAUDE_RUN_DATA_DIR/workdirs` (`/data/workdirs` in the container). Supports `~`, `$VAR`, `${VAR}` expansion.
 
-## State store backend: SQLite or PostgreSQL (CLAUDE-250)
+## State store backend: SQLite or PostgreSQL
 
 Runtime state (runs, job outcomes, caps, settings, the encrypted secrets store) lives in SQLite at
 `<CLAUDE_RUN_DATA_DIR>/state.db` by default. A deployment that already runs a database server can point the daemon at
@@ -43,7 +43,7 @@ exposure is acceptable.
 
 The daemon's own `claude` children never see either variable: `src/claude.rs` strips `CLAUDE_RUN_DATABASE_URL` and
 `CLAUDE_RUN_DATABASE_URL_FILE` from every spawned agent's environment, so an agent session cannot read the live
-database URL by inspecting its own environment (CLAUDE-403). That is hygiene, not the enforcement boundary: the real
+database URL by inspecting its own environment. That is hygiene, not the enforcement boundary: the real
 guard is in `src/db.rs`, which refuses to build a test fixture against any database that already has its own
 `public._sqlx_migrations`, naming the database in the error.
 
@@ -72,11 +72,11 @@ on `/setup` again. Move the data first with `claude-run import`.
 **Adding a table.** `migrations/sqlite/` is a chain (each file byte-identical once shipped, so an existing `state.db`
 matches its recorded checksums); `migrations/postgres/0001_init.sql` is a squash of that chain's end state, spelled per
 the type mapping at the top of that file. A schema change is therefore a new incremental file in EACH directory (e.g.
-`migrations/sqlite/0021_ci_failures.sql` and `migrations/postgres/0002_ci_failures.sql` for CLAUDE-272's CI-failure
+`migrations/sqlite/0021_ci_failures.sql` and `migrations/postgres/0002_ci_failures.sql` for the CI-failure
 store), with the same end schema on both sides, never an edit to an existing file. `db::tests::the_two_migration_sets_end_on_the_same_schema`
 is what catches the two directories drifting apart.
 
-### Importing an existing SQLite store (CLAUDE-251)
+### Importing an existing SQLite store
 
 `claude-run import` copies every table out of a SQLite state store and into the database the configuration resolves to,
 so a switched backend keeps the same history, the same attempt and daily caps, the same settings documents, the same
@@ -125,14 +125,14 @@ docker compose --profile postgres run --rm claude-bot import
 docker compose --profile postgres up --detach
 ```
 
-## Settings: bootstrap file vs the Settings page (CLAUDE-101)
+## Settings: bootstrap file vs the Settings page
 
 Configuration splits in two. `config.toml` is the **bootstrap** file: only what the daemon must know before it can open
-the DB and bind the listener, namely `[database]` (CLAUDE-250: which state store to open, see
-[State store backend](#state-store-backend-sqlite-or-postgresql-claude-250)), `[web]` (bind / port / `auth_token_ref` /
-login), `[mcp]` (CLAUDE-442: the troubleshooting MCP tools over HTTP, see
-[MCP over HTTP](#mcp-over-http-claude-442)) and `[daemon]` binary overrides (
-`nu_binary`, `claude_binary`) plus `[daemon].claude_config_dir` (CLAUDE-165: where the spawned agent reads its
+the DB and bind the listener, namely `[database]` (which state store to open, see
+[State store backend](#state-store-backend-sqlite-or-postgresql)), `[web]` (bind / port / `auth_token_ref` /
+login), `[mcp]` (the troubleshooting MCP tools over HTTP, see
+[MCP over HTTP](#mcp-over-http)) and `[daemon]` binary overrides (
+`nu_binary`, `claude_binary`) plus `[daemon].claude_config_dir` (where the spawned agent reads its
 user-level `CLAUDE.md` / credentials from; defaults to `<CLAUDE_RUN_CONFIG_DIR>/claude-agent-home`, seeded at serve
 start with the slim bot `CLAUDE.md`, and with a symlink to the host `~/.claude/.credentials.json` when the host has
 one). Everything runtime-tunable, namely issue minting (`[mint]`), the webhook sources (`[webhook]`), and the log filter (`[daemon].log_filter`), now lives in the database
@@ -149,11 +149,11 @@ section (and field) carries an apply badge: `live` for the log filter and webhoo
 secret refs, adding a source), `next event` for mint, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
 `GET` / `PUT /api/settings/{mint,webhook,webhook_comment,log_filter,workdir_gc,stream_log_gc,preferences,concurrency,db_retention,docker_gc,peers,claude}`.
-The `webhook_comment` (CLAUDE-220), `workdir_gc` (CLAUDE-106), `stream_log_gc` (CLAUDE-245), `preferences` (CLAUDE-154),
-`concurrency` (CLAUDE-162), `db_retention` (CLAUDE-175), `docker_gc` (CLAUDE-433: `enabled`, `volume_retention_days`, default 3,
-rejects values below 1), and `claude` (CLAUDE-239 `model`, CLAUDE-259 `effort`: the instance-wide `--model` and
+The `webhook_comment`, `workdir_gc`, `stream_log_gc`, `preferences`,
+`concurrency`, `db_retention`, `docker_gc` (`enabled`, `volume_retention_days`, default 3,
+rejects values below 1), and `claude` (`model`, `effort`: the instance-wide `--model` and
 `--effort` defaults an action inherits when it pins neither in its own `claude:` block, each one null by default, which passes no flag and leaves
-the `claude` CLI's own default in force), and `peers` (CLAUDE-614: optional peering, disabled by default; see `SPEC-3.17`) sections are DB-only from birth (never `config.toml` keys), so
+the `claude` CLI's own default in force), and `peers` (optional peering, disabled by default; see `SPEC-3.17`) sections are DB-only from birth (never `config.toml` keys), so
 they are not part of the one-time import below; each simply defaults until edited. `webhook_comment` is additionally rejected by the file parser:
 a `config.toml` declaring `[webhook_comment]` fails to start with serde's unknown-field error naming the section, so
 there is no way to end up with two sources of truth for it.
@@ -162,10 +162,10 @@ there is no way to end up with two sources of truth for it.
 present in `config.toml` into the database and logs a warning naming each one and telling you to remove it from the
 file. After that, remove the migrated sections from `config.toml`: a later start that finds a section in **both** the
 file and the database refuses to run, naming the section, so there is never silent drift between two sources of truth (
-the same breaking-migration signal CLAUDE-87 used). A `config.toml` with no moved sections starts cleanly with the
+the same breaking-migration signal as before). A `config.toml` with no moved sections starts cleanly with the
 database as the only source.
 
-## Email (SMTP) (CLAUDE-428)
+## Email (SMTP)
 
 The SMTP transport an invite is mailed over is environment-only: there is no Settings-page form and no
 `PUT /api/settings/email`. The daemon resolves it fresh from the environment at the point of use (daemon start, an
@@ -179,11 +179,11 @@ page offers emailing an invite instead of showing its link; a username with no p
 `public_url`, is a validation error. The daemon validates the environment once at serve start and refuses to start on
 a bad value, naming the offending variable and its value, but never the password. The Settings page shows the
 effective non-secret values in a read-only grid, with the password shown only as "set" / "not set". A leftover
-DB-backed `config.email` row from before CLAUDE-428 is retired automatically on the first start after upgrading: the
+DB-backed `config.email` row from an earlier version is retired automatically on the first start after upgrading: the
 daemon logs one warning naming the key and the old host/from (never the password) and deletes both the row and its
 `email-smtp-password` secret.
 
-## Run comment footer (CLAUDE-446)
+## Run comment footer
 
 `CLAUDE_RUN_PUBLIC_URL` is resolved independently of the rest of the SMTP configuration above (`public_url_from_env`
 in `src/config.rs`), so it is available for the run-comment footer even when SMTP is unset or misconfigured. Every
@@ -193,7 +193,7 @@ link under this base URL), its start/finish time, and its duration, so a reader 
 one click. The daemon logs one `warn` at `serve` startup naming `CLAUDE_RUN_PUBLIC_URL` when it is unset: comments
 still post, but the footer's `Run:` line says the link is unavailable instead of linking back.
 
-## MCP over HTTP (CLAUDE-442)
+## MCP over HTTP
 
 `claude-run mcp stdio` (see [usage.md](usage.md#read-only-troubleshooting-mcp-server)) is DB-direct and needs no
 daemon. The same eight read-only tools are also available from the running daemon itself, over MCP's Streamable HTTP

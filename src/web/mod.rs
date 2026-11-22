@@ -115,7 +115,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             get(native_forms::closed_issue_summary_new_page)
                 .post(native_forms::closed_issue_summary_create),
         )
-        // CLAUDE-650: a GET of a POST-only path that can render a full page
+        // A GET of a POST-only path that can render a full page
         // redirects there instead of 405ing when the browser re-requests the
         // URL left in its address bar (reload, history nav, session restore).
         .route(
@@ -132,8 +132,8 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             "/actions/{name}/edit",
             get(action_edit_page).post(action_edit_save),
         )
-        // CLAUDE-571: a scripted action's `env` values, from a form.
-        // CLAUDE-650: a GET redirects to the edit page the form lives on
+        // A scripted action's `env` values, from a form.
+        // A GET redirects to the edit page the form lives on
         // (`action_env_save`'s own error path re-renders that same page).
         .route(
             "/actions/{name}/env",
@@ -151,7 +151,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         // every action, undeduplicated and filterable; `?action=` narrows it.
         .route("/logs", get(logs))
         .route("/secrets", get(secrets_page).post(secret_create))
-        // CLAUDE-650: each of these can render the full Secrets page on
+        // Each of these can render the full Secrets page on
         // error (or, for generate, on success), so a GET redirects there
         // instead of 405ing.
         .route(
@@ -176,7 +176,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         // identity probe already run.
         .route("/access", get(access_page))
         .route("/access/check", post(access_check))
-        // CLAUDE-650: `secret_check` renders the full Access page, so a GET
+        // `secret_check` renders the full Access page, so a GET
         // redirects to `/access` (without the pre-run probe) instead of
         // 405ing.
         .route(
@@ -187,7 +187,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         // one section (re-rendering inline serde errors on rejection). Behind the
         // same auth gate as every other TCP route.
         .route("/settings", get(settings_page))
-        // CLAUDE-650: each of these can re-render the full Settings page
+        // Each of these can re-render the full Settings page
         // inline on error, so a GET redirects to `/settings` instead of
         // 405ing. `auth_login_cancel` never renders a page (it only
         // redirects), so it stays POST-only.
@@ -248,7 +248,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         .route("/status/activity", get(status_activity))
         .route("/about/activity", get(about_activity_redirect))
         // Pushes the Management part's two slow disk-usage tables once a
-        // viewer is connected (CLAUDE-637). Web listener only, like the
+        // viewer is connected. Web listener only, like the
         // other `/sse` route below; never mounted on the unix socket.
         .route("/sse/status/storage", get(status_storage_sse))
         // Cargo-cache delete routes (SPEC-3.10 item 10). Posted under `/api`
@@ -263,7 +263,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             "/api/status/cargo-cache/delete",
             post(cargo_cache_delete_all),
         )
-        // Docker storage prune route (SPEC-3.11 item 4, CLAUDE-517). Same
+        // Docker storage prune route (SPEC-3.11 item 4). Same
         // `/api`-mirrored, no-unix-socket pattern as the cargo-cache routes
         // above.
         .route(
@@ -1365,7 +1365,7 @@ async fn search_jobs(
             let Some(path) = r.stream_log_path.as_deref() else {
                 continue;
             };
-            // CLAUDE-253: the stored path is absolute and was recorded under
+            // The stored path is absolute and was recorded under
             // whatever layout the daemon ran with when the row was written. A
             // deployment that moved its state dir (the container's flat /state)
             // would otherwise search nothing for every pre-move row, silently
@@ -1636,7 +1636,7 @@ struct DashboardTpl {
     /// lifecycle `state`, not a persisted triage bucket: see
     /// `CiFailureRow::state()`.
     ci_state: String,
-    /// SPEC-4.3.15 / CLAUDE-598: whitelisted active triage-bucket filter
+    /// SPEC-4.3.15: whitelisted active triage-bucket filter
     /// (`code_fix`/`human_action`/`transient`/`auto_fix`, or empty for
     /// "all"), echoed into its own filter dropdown. Narrows independently
     /// of `ci_state`.
@@ -1651,7 +1651,7 @@ struct DashboardTpl {
     stuck_count: i64,
     /// The stuck-Working corrections themselves, newest first.
     stuck_rows: Vec<StuckWorkRow>,
-    /// CLAUDE-625: `concurrency.stuck_working_sweep` read `false`. The card
+    /// `concurrency.stuck_working_sweep` read `false`. The card
     /// then says the sweep is disabled instead of "No stuck-Working
     /// corrections", so an empty `stuck_rows` is not read as "nothing stuck".
     stuck_sweep_disabled: bool,
@@ -1813,7 +1813,7 @@ impl CiFailureRow {
         &self.failure.state
     }
 
-    /// SPEC-4.3.15 / CLAUDE-598: the dashboard's "Bucket" column: the
+    /// SPEC-4.3.15: the dashboard's "Bucket" column: the
     /// persisted triage bucket (`code_fix`/`human_action`/`transient`/
     /// `auto_fix`, `src/triage.rs`'s `TriageBucket`), distinct from
     /// lifecycle `state`. `"none"` when no triage ran for this row (a
@@ -2087,7 +2087,7 @@ struct DashboardQuery {
     /// SPEC-4.3.15: CI-failures repo filter, empty for all.
     #[serde(default)]
     ci_repo: String,
-    /// SPEC-4.3.15 / CLAUDE-598: CI-failures triage-bucket filter
+    /// SPEC-4.3.15: CI-failures triage-bucket filter
     /// (`code_fix`/`human_action`/`transient`/`auto_fix`), empty for all.
     /// Narrows independently of `ci_state`.
     #[serde(default)]
@@ -2336,7 +2336,7 @@ async fn dashboard(
     let stuck_since = stuck_work_window_start();
     let stuck_count = stuck_work_count(pool, &stuck_since).await?;
     let stuck_rows = stuck_work_corrections(pool, &stuck_since, STUCK_WORK_LIMIT).await?;
-    // CLAUDE-625: an empty `stuck_rows` reads as "nothing stuck" unless the
+    // An empty `stuck_rows` reads as "nothing stuck" unless the
     // card also says the sweep itself is off.
     let stuck_sweep_disabled = !s
         .api
@@ -3487,7 +3487,7 @@ struct ActionEditorTpl {
     /// Link to the structured editor, shown when one applies (a `kind: youtrack`
     /// action being edited, or the new-action page offering a YouTrack form).
     form_url: Option<String>,
-    /// CLAUDE-571: a scripted action's `env` values, for the Environment
+    /// A scripted action's `env` values, for the Environment
     /// form; empty when there is no such block (or no form to show).
     env_fields: Vec<EnvField>,
 }
@@ -3666,7 +3666,7 @@ async fn action_edit_save(
     Ok(Redirect::to(&format!("/actions/{name}")).into_response())
 }
 
-/// CLAUDE-650: a GET of `/actions/{name}/env` redirects to the edit page
+/// A GET of `/actions/{name}/env` redirects to the edit page
 /// the Environment form lives on, instead of 405ing when the browser
 /// re-requests a URL that `action_env_save`'s own error path can leave in
 /// the address bar.
@@ -3674,7 +3674,7 @@ async fn redirect_to_action_edit(AxumPath(name): AxumPath<String>) -> Redirect {
     Redirect::to(&format!("/actions/{name}/edit"))
 }
 
-/// SPEC-4.3.3, CLAUDE-571: the Environment form's save. Rewrites only the
+/// SPEC-4.3.3: the Environment form's save. Rewrites only the
 /// submitted `env` values in place ([`env_form::set_env_values`]), then
 /// takes the raw editor's path: the same validation, and nothing is written
 /// unless the result parses to exactly the submitted `env`.
@@ -3811,7 +3811,7 @@ async fn action_new_raw_page(State(s): State<WebState>) -> Result<Html<String>, 
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
 
-/// CLAUDE-650: a GET of `/actions` redirects to the raw-YAML new-action
+/// A GET of `/actions` redirects to the raw-YAML new-action
 /// page that posts here, instead of 405ing when the browser re-requests a
 /// URL that `action_create`'s own error path can leave in the address bar.
 async fn redirect_to_actions_new_raw() -> Redirect {
@@ -3977,7 +3977,7 @@ struct YoutrackEditForm {
     yt_custom_field: String,
     /// Short name of the audit project (`native.youtrack.audit_project`),
     /// substituted into `yt_query` wherever it contains the
-    /// `{{audit_project}}` placeholder (CLAUDE-409). Blank falls back to the
+    /// `{{audit_project}}` placeholder. Blank falls back to the
     /// default `AUDIT`.
     yt_audit_project: String,
     /// Type that identifies a per-target audit run
@@ -4036,12 +4036,12 @@ struct YoutrackEditForm {
     limit_budget_warn_fraction: String,
     /// Issues one run may create in the tracker.
     limit_max_issues_per_run: String,
-    /// Timeout for the post-success review session (CLAUDE-449). Blank
+    /// Timeout for the post-success review session. Blank
     /// falls back to the runner default (1800s); zero is rejected.
     limit_review_timeout_seconds: String,
     /// Per-run parallelism cap (number-as-text, like the `limit_*` fields).
     concurrency_max_parallel: String,
-    /// Per-repo cap on runner PRs with CI pending (CLAUDE-535); `0` disables.
+    /// Per-repo cap on runner PRs with CI pending; `0` disables.
     concurrency_max_ci_in_flight_per_repo: String,
     /// Comma-separated job-field names composing the concurrency key.
     concurrency_key: String,
@@ -4067,8 +4067,8 @@ struct YoutrackEditForm {
     /// (`states.no_code`). Blank inherits the `done` label.
     state_no_code: String,
     /// Tag added alongside the Needs Review AI Agent value when the agent
-    /// parks an issue via `.claude-run-needs-review` (`tags.needs_info`,
-    /// CLAUDE-373). Blank disables the tag write.
+    /// parks an issue via `.claude-run-needs-review` (`tags.needs_info`).
+    /// Blank disables the tag write.
     tags_needs_info: String,
     /// Install the repo's own git hooks on the clone
     /// (`native.youtrack.install_hooks`). Present ("on") when checked;
@@ -4369,7 +4369,7 @@ fn youtrack_form_to_yaml(
     // resets the (deprecated, ignored) timing fields to their defaults, which
     // is what clears the load-time deprecation warning for an action that
     // still carries non-default values from an older format.
-    // `finalize_status_timeout_secs` (CLAUDE-549) is not a form input, so
+    // `finalize_status_timeout_secs` is not a form input, so
     // it is carried forward from the file the way `prompt_preset` is; an
     // invalid value rejects the save rather than silently resetting it.
     let finalize_status_timeout_secs = match map
@@ -5069,9 +5069,9 @@ struct SecretsTpl {
     key_ready: bool,
     /// Why the key file did not load (shown when `key_ready` is false).
     key_error: Option<String>,
-    /// CLAUDE-636: generated peer API keys, name + timestamps only.
+    /// Generated peer API keys, name + timestamps only.
     api_keys: Vec<state::ApiKeyMeta>,
-    /// CLAUDE-636: `(name, plaintext)` of a key just generated this request.
+    /// `(name, plaintext)` of a key just generated this request.
     /// Shown exactly once: a redirect would lose it, so a successful generate
     /// re-renders this page directly instead of redirecting.
     new_api_key: Option<(String, String)>,
@@ -5108,7 +5108,7 @@ async fn render_secrets(
     render_secrets_with_key(s, status, error, None).await
 }
 
-/// CLAUDE-636: as [`render_secrets`], additionally rendering `new_api_key`'s
+/// As [`render_secrets`], additionally rendering `new_api_key`'s
 /// one-time plaintext banner when generate just succeeded. The caller sets
 /// `Cache-Control: no-store` on that response (never on any other secrets
 /// render) so the browser never caches the plaintext.
@@ -5147,7 +5147,7 @@ async fn secrets_page(State(s): State<WebState>) -> Result<Response, WebError> {
     render_secrets(&s, StatusCode::OK, None).await
 }
 
-/// CLAUDE-650: a GET of a POST-only `/secrets/...` route (rotate, delete,
+/// A GET of a POST-only `/secrets/...` route (rotate, delete,
 /// the API-key generate and revoke routes) redirects here instead of
 /// 405ing when the browser re-requests a URL those handlers' own
 /// success/error paths can leave in the address bar. Never used for the
@@ -5269,7 +5269,7 @@ async fn secret_delete(
 
 // ---- Peer API keys -----------------------------------------------------
 //
-// CLAUDE-636: "An operator generates a peer API key on the receiving instance
+// "An operator generates a peer API key on the receiving instance
 // from the Secrets page, pastes it once into a secret on the calling
 // instance, and peering works with no auth_token_ref, no config.toml edit and
 // no restart." A generated key is shown exactly once, in the response that
@@ -5280,7 +5280,7 @@ struct ApiKeyCreateForm {
     name: String,
 }
 
-/// CLAUDE-636: "Generate rejects an invalid or duplicate name inline with
+/// "Generate rejects an invalid or duplicate name inline with
 /// 422, reusing valid_secret_name. On success it renders the page with 200,
 /// Cache-Control: no-store, and a one-time banner showing the plaintext key."
 /// The `/secrets/api-keys` generate handler.
@@ -5317,7 +5317,7 @@ async fn api_key_create(
     render_secrets_with_key(&s, StatusCode::OK, None, Some((name, key))).await
 }
 
-/// CLAUDE-636: "Revoke 404s an unknown name and redirects to the listing."
+/// "Revoke 404s an unknown name and redirects to the listing."
 /// The `/secrets/api-keys/{name}/revoke` handler.
 async fn api_key_revoke(
     State(s): State<WebState>,
@@ -5403,7 +5403,7 @@ async fn access_check(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-/// CLAUDE-650: a GET of `/secrets/{name}/check` redirects to the bare
+/// A GET of `/secrets/{name}/check` redirects to the bare
 /// `/access` page (no probe pre-run) instead of 405ing when the browser
 /// re-requests a URL that `secret_check` leaves in the address bar after
 /// rendering the full Access page there.
@@ -5454,7 +5454,7 @@ struct SettingsTpl {
 
 /// SPEC-4.3.8: "The Email card is read-only, resolved from the environment
 /// at render time; a password is never shown, only whether one is set."
-/// What the Email card shows (CLAUDE-428: read-only, resolved from the
+/// What the Email card shows (read-only, resolved from the
 /// environment at render time; the password is never shown, only whether one
 /// is set).
 struct EmailCardView {
@@ -6003,7 +6003,7 @@ async fn settings_page(
     render_settings(&s, StatusCode::OK, q.saved, None).await
 }
 
-/// CLAUDE-650: a GET of any POST-only `/settings/...` route (a section
+/// A GET of any POST-only `/settings/...` route (a section
 /// save, or a service-auth card save / brokered-login step) redirects
 /// here instead of 405ing when the browser re-requests a URL those
 /// handlers' own error paths can leave in the address bar.
@@ -6362,7 +6362,7 @@ struct TestEmailForm {
 /// environment-resolved SMTP transport, the same config a real invite send
 /// would use; it requires a non-blank destination address." POST
 /// `/settings/auth/email/test`: sends a short test message through the
-/// environment-resolved SMTP transport (CLAUDE-428: no stored document),
+/// environment-resolved SMTP transport (no stored document),
 /// proving the same config a real invite send would use.
 async fn auth_test_email(
     State(s): State<WebState>,
@@ -6820,7 +6820,7 @@ async fn cargo_cache_rows(paths: &Paths, pool: &DbPool) -> Result<Vec<CargoCache
     cargo_cache_rows_sync(paths, &inflight_keys)
 }
 
-// ---- SPEC-3.11 item 4: Docker storage prune (CLAUDE-517) -------------------
+// ---- SPEC-3.11 item 4: Docker storage prune -------------------
 //
 // The Management part's second table: one row per sidecar Docker storage
 // category (stopped containers, images, build cache, unreferenced volumes),
@@ -7044,7 +7044,7 @@ struct StatusTpl {
 /// cheap reads only: the Management part's two slow disk-usage tables
 /// (`cargo_cache_rows`, `docker_storage_rows`, `crate::gc::dir_size`) are not
 /// called here. They are pushed separately once a viewer is connected to
-/// `status_storage_sse` (CLAUDE-637).
+/// `status_storage_sse`.
 async fn status_page(State(s): State<WebState>) -> Result<Response, WebError> {
     let global_pause = state::global_pause_status(&s.api.pool)
         .await?
@@ -7146,8 +7146,8 @@ fn render_docker_storage_fragment(result: Result<Vec<DockerStorageRow>, String>)
 /// SPEC-4.3.10: `GET /sse/status/storage` pushes the Status page's two slow
 /// Management reads (SPEC-3.10 item 10, SPEC-3.11 item 4) to a connected
 /// viewer as each finishes, then closes with a `done` event. Mounted only on
-/// the web router, not the unix socket, like the other `/status` controls
-/// (CLAUDE-637). Both reads are started only by this connection, never by a
+/// the web router, not the unix socket, like the other `/status` controls.
+/// Both reads are started only by this connection, never by a
 /// timer; a viewer who navigates away drops the connection, which drops this
 /// stream future (and the two spawned tasks it is still awaiting go on
 /// running to completion on their own threads, but their results are never
@@ -8485,7 +8485,7 @@ mod tests {
         render_summary_markdown,
     };
 
-    /// CLAUDE-548: the dark palette's tokens (`--bg`, `--accent`, etc.) are
+    /// The dark palette's tokens (`--bg`, `--accent`, etc.) are
     /// defined with a literal value exactly once, in `color_tokens.html`;
     /// every other page that needs them pulls them in with
     /// `{% include "color_tokens.html" %}` instead of restating the hex
@@ -8663,7 +8663,7 @@ mod tests {
             failed_jobs: 0,
         };
         let outcome = JobOutcomeRow {
-            job_key: "CLAUDE-108".to_string(),
+            job_key: "PROJ-108".to_string(),
             attempt: 2,
             ts: "2026-06-13T00:00:30Z".to_string(),
             ok: true,
@@ -8678,8 +8678,8 @@ mod tests {
             has_gate_output: false,
         };
         let job_links = std::collections::BTreeMap::from([(
-            "CLAUDE-108".to_string(),
-            "https://youtrack.example.com/issue/CLAUDE-108".to_string(),
+            "PROJ-108".to_string(),
+            "https://youtrack.example.com/issue/PROJ-108".to_string(),
         )]);
         let tpl = RunDetailTpl {
             version: "test",
@@ -8695,7 +8695,7 @@ mod tests {
         let html = tpl.render().expect("render run_detail");
         assert!(
             html.contains(
-                "<a href=\"https://youtrack.example.com/issue/CLAUDE-108\" target=\"_blank\" rel=\"noopener\">CLAUDE-108</a> - attempt 2"
+                "<a href=\"https://youtrack.example.com/issue/PROJ-108\" target=\"_blank\" rel=\"noopener\">PROJ-108</a> - attempt 2"
             ),
             "modal heading should link the key with attempt outside the anchor: {html}"
         );
@@ -8739,8 +8739,8 @@ mod tests {
     fn rendered_href_follows_the_configured_base_url() {
         for base in ["https://youtrack.example.com", "https://other.example.org"] {
             let template = super::effective_link_template(None, true, Some(base)).unwrap();
-            let href = crate::action::render_link(&template, "CLAUDE-9");
-            assert_eq!(href, format!("{base}/issue/CLAUDE-9"));
+            let href = crate::action::render_link(&template, "PROJ-9");
+            assert_eq!(href, format!("{base}/issue/PROJ-9"));
         }
     }
 
@@ -8751,16 +8751,16 @@ mod tests {
         use super::render_blocker_signature as render;
 
         let template = "https://youtrack.example.com/issue/{key}";
-        let one = render("CLAUDE-9 (depends on)", Some(template));
+        let one = render("PROJ-9 (depends on)", Some(template));
         assert_eq!(
             one,
-            r#"<a href="https://youtrack.example.com/issue/CLAUDE-9" target="_blank" rel="noopener">CLAUDE-9</a> (depends on)"#
+            r#"<a href="https://youtrack.example.com/issue/PROJ-9" target="_blank" rel="noopener">PROJ-9</a> (depends on)"#
         );
 
-        let several = render("CLAUDE-9 (depends on); ABC-12 (parent for)", Some(template));
+        let several = render("PROJ-9 (depends on); ABC-12 (parent for)", Some(template));
         assert_eq!(
             several,
-            r#"<a href="https://youtrack.example.com/issue/CLAUDE-9" target="_blank" rel="noopener">CLAUDE-9</a> (depends on); <a href="https://youtrack.example.com/issue/ABC-12" target="_blank" rel="noopener">ABC-12</a> (parent for)"#
+            r#"<a href="https://youtrack.example.com/issue/PROJ-9" target="_blank" rel="noopener">PROJ-9</a> (depends on); <a href="https://youtrack.example.com/issue/ABC-12" target="_blank" rel="noopener">ABC-12</a> (parent for)"#
         );
 
         // A leading token that is not key-shaped is left unchanged (escaped,
@@ -8769,8 +8769,8 @@ mod tests {
         assert_eq!(non_key, "not-a-key (depends on)");
 
         // No template resolves: every part renders as plain (escaped) text.
-        let no_template = render("CLAUDE-9 (depends on)", None);
-        assert_eq!(no_template, "CLAUDE-9 (depends on)");
+        let no_template = render("PROJ-9 (depends on)", None);
+        assert_eq!(no_template, "PROJ-9 (depends on)");
     }
 
     /// The Logs Message-column helper links only the row's own context key,
@@ -8782,19 +8782,19 @@ mod tests {
 
         let template = "https://youtrack.example.com/issue/{key}";
         let linked = render(
-            "attempt counter reset for `CLAUDE-9`: 3 discarded",
-            "CLAUDE-9",
+            "attempt counter reset for `PROJ-9`: 3 discarded",
+            "PROJ-9",
             Some(template),
         );
         assert_eq!(
             linked,
-            r#"attempt counter reset for `<a href="https://youtrack.example.com/issue/CLAUDE-9" target="_blank" rel="noopener">CLAUDE-9</a>`: 3 discarded"#
+            r#"attempt counter reset for `<a href="https://youtrack.example.com/issue/PROJ-9" target="_blank" rel="noopener">PROJ-9</a>`: 3 discarded"#
         );
 
         // HTML special characters in the message are escaped, not passed through.
         let escaped = render(
-            "preflight failed for <script>CLAUDE-9</script>",
-            "CLAUDE-9",
+            "preflight failed for <script>PROJ-9</script>",
+            "PROJ-9",
             Some(template),
         );
         assert!(escaped.contains("&lt;script&gt;"), "{escaped}");
@@ -8803,14 +8803,14 @@ mod tests {
         // A message that doesn't contain the context key is just escaped.
         let no_match = render(
             "unrelated failure, see the logs",
-            "CLAUDE-9",
+            "PROJ-9",
             Some(template),
         );
         assert_eq!(no_match, "unrelated failure, see the logs");
 
         // No template resolves: the message is escaped but no key is linked.
-        let no_template = render("reset for `CLAUDE-9`", "CLAUDE-9", None);
-        assert_eq!(no_template, "reset for `CLAUDE-9`");
+        let no_template = render("reset for `PROJ-9`", "PROJ-9", None);
+        assert_eq!(no_template, "reset for `PROJ-9`");
     }
 
     /// A parked row and a gate row each render an `<a href>` with the
@@ -8823,7 +8823,7 @@ mod tests {
         let row = StaleGateRow {
             gate: state::StaleGate {
                 action_name: "youtrack".to_string(),
-                job_key: "CLAUDE-9".to_string(),
+                job_key: "PROJ-9".to_string(),
                 signature: "ABC-12 (depends on)".to_string(),
                 blocked_for_ms: 0,
                 recheck_overdue_ms: 0,
@@ -8833,7 +8833,7 @@ mod tests {
         };
         assert_eq!(
             row.href(),
-            Some("https://youtrack.example.com/issue/CLAUDE-9".to_string())
+            Some("https://youtrack.example.com/issue/PROJ-9".to_string())
         );
 
         let capped = CappedKeyRow {
@@ -8875,8 +8875,8 @@ mod tests {
         let template =
             super::effective_link_template(None, true, Some("https://youtrack.example.com/"))
                 .unwrap();
-        let href = crate::action::render_link(&template, "CLAUDE-222");
-        assert_eq!(href, "https://youtrack.example.com/issue/CLAUDE-222");
+        let href = crate::action::render_link(&template, "PROJ-222");
+        assert_eq!(href, "https://youtrack.example.com/issue/PROJ-222");
 
         let run = RunRow {
             id: 3,
@@ -8891,7 +8891,7 @@ mod tests {
             failed_jobs: 0,
         };
         let outcome = JobOutcomeRow {
-            job_key: "CLAUDE-222".to_string(),
+            job_key: "PROJ-222".to_string(),
             attempt: 1,
             ts: "2026-08-08T00:00:30Z".to_string(),
             ok: true,
@@ -8906,7 +8906,7 @@ mod tests {
             has_gate_output: false,
         };
         let planned = PlannedJob {
-            key: "CLAUDE-222".to_string(),
+            key: "PROJ-222".to_string(),
             href: Some(href.clone()),
             status: "ok".to_string(),
             watch_attempt: None,
@@ -8925,7 +8925,7 @@ mod tests {
         };
         let html = tpl.render().expect("render run_detail");
         let anchor =
-            format!("<a href=\"{href}\" target=\"_blank\" rel=\"noopener\">CLAUDE-222</a>");
+            format!("<a href=\"{href}\" target=\"_blank\" rel=\"noopener\">PROJ-222</a>");
         // Planned-jobs table, outcomes table, and the modal heading.
         assert_eq!(
             html.matches(anchor.as_str()).count(),
@@ -9199,7 +9199,7 @@ mod tests {
         assert!(v.query_without("triggered").contains("outcome=timedout"));
     }
 
-    /// CLAUDE-592 / SPEC-4.3.15: rows, the over-median and at-risk highlights,
+    /// SPEC-4.3.15: rows, the over-median and at-risk highlights,
     /// and "no history" render on the dashboard; an unreadable series renders
     /// an error panel naming the cause.
     #[test]
@@ -9583,7 +9583,7 @@ mod tests {
         let html = tpl(vec![CappedKeyRow {
             capped: state::CappedKey {
                 action_name: "youtrack".to_string(),
-                job_key: "CLAUDE-9".to_string(),
+                job_key: "PROJ-9".to_string(),
                 count: 3,
                 cap: 3,
                 last_at: "2026-08-11T07:30:00Z".to_string(),
@@ -9596,7 +9596,7 @@ mod tests {
             html.contains("Jobs parked at the attempt cap"),
             "banner heading missing: {html}"
         );
-        assert!(html.contains("CLAUDE-9"), "parked key missing: {html}");
+        assert!(html.contains("PROJ-9"), "parked key missing: {html}");
         assert!(
             html.contains("/actions/youtrack"),
             "link to the owning action missing: {html}"
@@ -9616,7 +9616,7 @@ mod tests {
         // Each row carries a Reset control posting to the
         // per-key reset endpoint.
         assert!(
-            html.contains("/api/actions/youtrack/attempts/CLAUDE-9/reset"),
+            html.contains("/api/actions/youtrack/attempts/PROJ-9/reset"),
             "reset control missing: {html}"
         );
         assert!(html.contains(">Reset<"), "reset button missing: {html}");
@@ -10543,7 +10543,7 @@ mod tests {
                 "checks.yml",
                 "test",
                 None,
-                Some("CLAUDE-901"),
+                Some("PROJ-901"),
                 "open",
                 None,
                 "2999-01-01T00:00:00Z",
@@ -10553,11 +10553,11 @@ mod tests {
             crate::ci_failure::store::record_agent_pr(
                 &s.api.pool,
                 "youtrack",
-                "CLAUDE-901",
+                "PROJ-901",
                 "dev.a8n.run",
                 "acme/widgets",
                 17,
-                "fix/claude-901",
+                "fix/proj-901",
                 "open",
                 false,
                 "2999-01-01T00:00:00Z",
@@ -10588,7 +10588,7 @@ mod tests {
             )
             .await;
             assert!(
-                body.contains(r#"href="https://yt.example.com/issue/CLAUDE-901""#),
+                body.contains(r#"href="https://yt.example.com/issue/PROJ-901""#),
                 "issue link missing: {body}"
             );
             assert!(
@@ -10625,7 +10625,7 @@ mod tests {
             );
         }
 
-        /// SPEC-4.3.15 / CLAUDE-598: the state/bucket/repo filters narrow
+        /// SPEC-4.3.15: the state/bucket/repo filters narrow
         /// the CI-failures rows (the bucket filter independently of the
         /// state filter), and SPEC-3.12 item 2's stuck-work list shows the
         /// sweep's own seeded corrections.
@@ -10710,7 +10710,7 @@ mod tests {
             assert!(!body.contains(widgets_row), "{body}");
             assert!(body.contains(gizmos_row), "{body}");
 
-            // SPEC-4.3.15 / CLAUDE-598: the bucket filter narrows
+            // SPEC-4.3.15: the bucket filter narrows
             // independently of the state filter. "all" state + "code_fix"
             // bucket keeps only the resolved acme/gizmos row, even though
             // its state differs from the open acme/widgets row (which is
@@ -10744,7 +10744,7 @@ mod tests {
                 &[state::InputEvent {
                     level: "warn".into(),
                     context: Some(crate::native::youtrack::STUCK_WORKING_SWEEP_CONTEXT.into()),
-                    message: "CLAUDE-905: moved off Working (no live run) to Queued".into(),
+                    message: "PROJ-905: moved off Working (no live run) to Queued".into(),
                 }],
             )
             .await
@@ -10759,11 +10759,11 @@ mod tests {
             .await;
             assert!(body.contains("1 issue(s) corrected"), "{body}");
             assert!(
-                body.contains("CLAUDE-905: moved off Working (no live run) to Queued"),
+                body.contains("PROJ-905: moved off Working (no live run) to Queued"),
                 "{body}"
             );
 
-            // CLAUDE-625: disabling the sweep says so on the card instead of
+            // Disabling the sweep says so on the card instead of
             // the usual count/list, even though the seeded correction above
             // would otherwise render a non-empty list; an empty `stuck_rows`
             // must not be read as "nothing stuck" once the sweep itself is off.
@@ -10901,7 +10901,7 @@ mod tests {
             assert!(body.contains("bogus_field"));
         }
 
-        /// CLAUDE-571: the shipped release-notes example, a scripted action
+        /// The shipped release-notes example, a scripted action
         /// whose `env` block has comments between its keys.
         const RELEASE_NOTES: &str = include_str!("../../actions/examples/release-notes.yml");
 
@@ -11069,7 +11069,7 @@ mod tests {
 
         #[tokio::test]
         async fn get_actions_redirects_instead_of_405ing() {
-            // CLAUDE-650: `action_create`'s own error path can leave `/actions`
+            // `action_create`'s own error path can leave `/actions`
             // in the address bar; a GET there must redirect, not 405.
             let resp = redirect_to_actions_new_raw().await.into_response();
             assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -11078,7 +11078,7 @@ mod tests {
 
         #[tokio::test]
         async fn get_action_env_redirects_to_the_edit_page() {
-            // CLAUDE-650: `action_env_save`'s own error path re-renders the
+            // `action_env_save`'s own error path re-renders the
             // edit page at this same URL; a GET must redirect there, not 405.
             let resp = redirect_to_action_edit(AxumPath("yt-native".to_string()))
                 .await
@@ -11381,7 +11381,7 @@ mod tests {
 
         #[test]
         fn youtrack_form_round_trips_the_ci_in_flight_cap() {
-            // CLAUDE-535: default 3 is omitted from the file; 0 and other values
+            // Default 3 is omitted from the file; 0 and other values
             // survive the form and back; a non-number is an inline error.
             let loaded =
                 crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
@@ -11677,7 +11677,7 @@ mod tests {
         #[test]
         fn needs_info_tag_form_round_trip() {
             // Saving a non-default Needs-Info tag writes it, and the saved
-            // file loads back with that exact value (CLAUDE-373).
+            // file loads back with that exact value.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             f.tags_needs_info = "Blocked".to_string();
@@ -11694,7 +11694,7 @@ mod tests {
             // Unlike the state labels on this form, a blank Needs-Info tag box
             // is itself a valid setting (disables the tag write), not "fall
             // back to the default", so clearing a previously-set tag must save
-            // an empty string rather than reverting to "Needs-Info" (CLAUDE-373).
+            // an empty string rather than reverting to "Needs-Info".
             let yaml =
                 "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    tags:\n      needs_info: Blocked\n";
             let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
@@ -11734,7 +11734,7 @@ mod tests {
 
         #[test]
         fn automerge_form_save_keeps_finalize_status_timeout() {
-            // CLAUDE-549: the finalize status timeout is raw-YAML-only, so a
+            // The finalize status timeout is raw-YAML-only, so a
             // structured-form save carries it forward from the file on disk
             // instead of resetting it to the default.
             let yaml = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\n      finalize_status_timeout_secs: 3\n";
@@ -12153,7 +12153,7 @@ mod tests {
             // The form posts to the create route, which lives under /actions/new/
             // so it never shadows the /actions/:name detail route.
             assert!(body.contains("/actions/new/youtrack"));
-            // The post-success review session's timeout is editable (CLAUDE-449).
+            // The post-success review session's timeout is editable.
             assert!(body.contains("name=\"limit_review_timeout_seconds\""));
         }
 
@@ -12632,8 +12632,7 @@ mod tests {
         }
 
         // One test rather than two, because the SMTP inputs are process-wide
-        // environment variables and `cargo test` runs in parallel (CLAUDE-428,
-        // same reasoning as `database_url_precedence_is_file_then_env_then_config`
+        // environment variables and `cargo test` runs in parallel (// same reasoning as `database_url_precedence_is_file_then_env_then_config`
         // in `config.rs`).
         #[tokio::test]
         async fn settings_page_shows_the_email_card_read_only_from_the_environment() {
@@ -14021,7 +14020,7 @@ mod tests {
 
         #[tokio::test]
         async fn get_settings_post_only_routes_redirect_instead_of_405ing() {
-            // CLAUDE-650: a section save, a service-auth card save, or a
+            // A section save, a service-auth card save, or a
             // brokered Claude login step can each re-render the full Settings
             // page inline on error; a GET on any of those URLs must redirect
             // to `/settings`, not 405.
@@ -14273,7 +14272,7 @@ mod tests {
 
         #[tokio::test]
         async fn get_secrets_post_only_routes_redirect_instead_of_405ing() {
-            // CLAUDE-650: rotate, delete, generate and revoke each can leave
+            // Rotate, delete, generate and revoke each can leave
             // their own URL in the address bar (an inline error, or, for
             // generate, the one-time-key success render); a GET on any of
             // them must redirect to `/secrets`, not 405.
@@ -14290,7 +14289,7 @@ mod tests {
 
         #[tokio::test]
         async fn get_secret_check_redirects_to_access() {
-            // CLAUDE-650: `secret_check` renders the full Access page at this
+            // `secret_check` renders the full Access page at this
             // same URL; a GET must redirect to `/access`, not 405.
             let resp = redirect_to_access().await.into_response();
             assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -14321,16 +14320,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let logs = tmp.path();
         let streams = logs.join("act").join("streams");
-        touch(&streams.join("CLAUDE-9-attempt-1.jsonl"));
-        touch(&streams.join("CLAUDE-9-attempt-2.jsonl"));
+        touch(&streams.join("PROJ-9-attempt-1.jsonl"));
+        touch(&streams.join("PROJ-9-attempt-2.jsonl"));
         // A longer key that shares the prefix must not leak in.
-        touch(&streams.join("CLAUDE-90-attempt-5.jsonl"));
+        touch(&streams.join("PROJ-90-attempt-5.jsonl"));
         // Unrelated files are skipped.
-        touch(&streams.join("CLAUDE-9-attempt-bogus.jsonl"));
-        touch(&streams.join("CLAUDE-9.txt"));
+        touch(&streams.join("PROJ-9-attempt-bogus.jsonl"));
+        touch(&streams.join("PROJ-9.txt"));
 
-        assert_eq!(latest_attempt_on_disk(logs, "act", "CLAUDE-9"), Some(2));
-        assert_eq!(latest_attempt_on_disk(logs, "act", "CLAUDE-90"), Some(5));
+        assert_eq!(latest_attempt_on_disk(logs, "act", "PROJ-9"), Some(2));
+        assert_eq!(latest_attempt_on_disk(logs, "act", "PROJ-90"), Some(5));
     }
 
     #[test]
@@ -14400,7 +14399,7 @@ mod tests {
         crate::report::ClaudeUsagePoint {
             ts: ts.to_string(),
             action: "youtrack".to_string(),
-            job_key: Some("CLAUDE-1".to_string()),
+            job_key: Some("PROJ-1".to_string()),
             ok,
             timed_out,
             five_hour_utilization: five_hour,
@@ -14467,7 +14466,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let logs = tmp.path();
         // No streams dir at all.
-        assert_eq!(latest_attempt_on_disk(logs, "act", "CLAUDE-9"), None);
+        assert_eq!(latest_attempt_on_disk(logs, "act", "PROJ-9"), None);
         // Dir exists but holds no matching file.
         touch(
             &logs
@@ -14475,7 +14474,7 @@ mod tests {
                 .join("streams")
                 .join("other-attempt-1.jsonl"),
         );
-        assert_eq!(latest_attempt_on_disk(logs, "act", "CLAUDE-9"), None);
+        assert_eq!(latest_attempt_on_disk(logs, "act", "PROJ-9"), None);
     }
 
     // ---- Status page handlers -----------------------------------------------
@@ -14539,7 +14538,7 @@ mod tests {
 
         /// The GET renders the build version and has no update controls.
         #[tokio::test]
-        #[ignore = "CLAUDE-561: web_state() hardcodes /tmp/x/* paths; fails on CI with 'no such table: runs' and locally with 'Not a directory'"]
+        #[ignore = "PROJ-561: web_state() hardcodes /tmp/x/* paths; fails on CI with 'no such table: runs' and locally with 'Not a directory'"]
         async fn get_renders_version_without_update_controls() {
             let s = web_state().await;
             let resp = status_page(State(s)).await.unwrap();
@@ -14553,7 +14552,7 @@ mod tests {
         /// The Activity card carries the global Pause control and the live
         /// indicator, and flips to Resume (with since / reason) once paused.
         #[tokio::test]
-        #[ignore = "CLAUDE-561: web_state() hardcodes /tmp/x/* paths; fails on CI with 'no such table: runs' and locally with 'Not a directory'"]
+        #[ignore = "PROJ-561: web_state() hardcodes /tmp/x/* paths; fails on CI with 'no such table: runs' and locally with 'Not a directory'"]
         async fn activity_card_offers_pause_then_resume() {
             let s = web_state().await;
             let body = body_string(status_page(State(s.clone())).await.unwrap()).await;
@@ -14634,7 +14633,7 @@ mod tests {
             assert_eq!(resp.headers().get("location").unwrap(), "/status/activity");
         }
 
-        /// CLAUDE-637: `status_page` renders the Management part's loading
+        /// `status_page` renders the Management part's loading
         /// state and never walks the Cargo cache root or touches the Docker
         /// client itself: a fixture cache directory's slug is absent from
         /// the first response, which is pushed separately by
@@ -14665,7 +14664,7 @@ mod tests {
         /// No `cache/cargo-target/` directory yet (nothing has built there)
         /// renders an empty Management part rather than erroring.
         #[tokio::test]
-        #[ignore = "CLAUDE-561: SQLite test_pool() migrations race on CI; 'no such table: runs'"]
+        #[ignore = "PROJ-561: SQLite test_pool() migrations race on CI; 'no such table: runs'"]
         async fn management_part_is_empty_with_no_cargo_cache_dir_yet() {
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state_with_data_dir(tmp.path().to_path_buf()).await;
@@ -14679,7 +14678,7 @@ mod tests {
         /// The Management part lists one row per repo directory, with its
         /// size and a Delete button, and the Delete all button.
         #[tokio::test]
-        #[ignore = "CLAUDE-561: SQLite test_pool() migrations race on CI; 'no such table: runs'"]
+        #[ignore = "PROJ-561: SQLite test_pool() migrations race on CI; 'no such table: runs'"]
         async fn management_part_lists_cargo_cache_directories() {
             let tmp = tempfile::tempdir().unwrap();
             make_cargo_cache_dir(tmp.path(), "owner__repo-a", 2048);
@@ -14742,7 +14741,7 @@ mod tests {
             crate::state::run_inflight_add(
                 &s.api.pool,
                 run_id,
-                "CLAUDE-1",
+                "PROJ-1",
                 "CLAUDE\u{1f}owner/repo-a",
             )
             .await
@@ -14785,7 +14784,7 @@ mod tests {
             // Removing the `blob` file inside `dir` requires write (and
             // execute) permission on `dir` itself; dropping to read-only
             // makes `remove_dir_all` fail partway through instead of
-            // succeeding. No exec bit is set here (CLAUDE-255's guard scans
+            // succeeding. No exec bit is set here (a test guard scans
             // for one), and the tempdir's own best-effort cleanup on drop
             // tolerates the leftover restricted entry.
             let mut perms = std::fs::metadata(&dir).unwrap().permissions();
@@ -14803,7 +14802,7 @@ mod tests {
             assert!(dir.exists());
         }
 
-        // ---- SPEC-3.11 item 4: Docker storage prune (CLAUDE-517) --------
+        // ---- SPEC-3.11 item 4: Docker storage prune --------
 
         /// A fake [`crate::gc::DockerVolumeClient`] so these tests never shell
         /// out to the real, reachable sidecar Docker daemon. `usage` and
@@ -14890,7 +14889,7 @@ mod tests {
         /// The Status page renders the Docker storage table with its Prune
         /// buttons, each naming the category.
         #[tokio::test]
-        #[ignore = "CLAUDE-561: web_state() hardcodes /tmp/x/* paths; fails on CI with 'no such table: runs' and locally with 'Not a directory'"]
+        #[ignore = "PROJ-561: web_state() hardcodes /tmp/x/* paths; fails on CI with 'no such table: runs' and locally with 'Not a directory'"]
         async fn status_page_renders_docker_storage_table() {
             let s = web_state().await;
             let body = body_string(status_page(State(s)).await.unwrap()).await;
@@ -14974,7 +14973,7 @@ mod tests {
             assert!(err.message.contains("in flight"), "{}", err.message);
         }
 
-        // ---- CLAUDE-637: pushed disk usage (`/sse/status/storage`) --------
+        // ---- pushed disk usage (`/sse/status/storage`) --------
 
         /// A Cargo cache root that cannot be listed at all (not merely
         /// absent) yields the fragment's whole-read error, never the
@@ -15135,7 +15134,7 @@ mod tests {
             seed_job(
                 &pool,
                 1,
-                "CLAUDE-1",
+                "PROJ-1",
                 1,
                 true,
                 "2026-06-26T00:01:00+00:00",
@@ -15146,7 +15145,7 @@ mod tests {
             seed_job(
                 &pool,
                 1,
-                "CLAUDE-2",
+                "PROJ-2",
                 1,
                 true,
                 "2026-06-26T00:02:00+00:00",
@@ -15157,7 +15156,7 @@ mod tests {
 
             let view = search_jobs(&pool, &paths, "widget", false).await.unwrap();
             assert_eq!(view.hits.len(), 1);
-            assert_eq!(view.hits[0].job_key, "CLAUDE-1");
+            assert_eq!(view.hits[0].job_key, "PROJ-1");
             assert!(view.hits[0].matched_summary);
             assert!(!view.hits[0].matched_stream);
         }
@@ -15175,7 +15174,7 @@ mod tests {
                 state_dir: tmp.path().join("state"),
                 runtime_dir: tmp.path().join("run"),
             };
-            let log = tmp.path().join("CLAUDE-9-attempt-1.jsonl");
+            let log = tmp.path().join("PROJ-9-attempt-1.jsonl");
             std::fs::write(
                 &log,
                 "{\"type\":\"system\",\"subtype\":\"init\"}\n\
@@ -15188,7 +15187,7 @@ mod tests {
             seed_job(
                 &pool,
                 1,
-                "CLAUDE-9",
+                "PROJ-9",
                 1,
                 false,
                 "2026-06-26T00:01:00+00:00",
@@ -15208,7 +15207,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(view.hits.len(), 1);
-            assert_eq!(view.hits[0].job_key, "CLAUDE-9");
+            assert_eq!(view.hits[0].job_key, "PROJ-9");
             assert!(view.hits[0].matched_stream);
             assert!(view.hits[0].snippet.contains("No space left on device"));
             assert_eq!(view.files_searched, 1);
@@ -15227,9 +15226,9 @@ mod tests {
                 state_dir: tmp.path().join("state"),
                 runtime_dir: tmp.path().join("run"),
             };
-            let log = tmp.path().join("CLAUDE-3-attempt-1.jsonl");
+            let log = tmp.path().join("PROJ-3-attempt-1.jsonl");
             std::fs::write(&log, "{\"result\":\"boom token here\"}\n").unwrap();
-            let gone = tmp.path().join("CLAUDE-4-attempt-1.jsonl");
+            let gone = tmp.path().join("PROJ-4-attempt-1.jsonl");
 
             let pool = pool().await;
             seed_run(&pool, 1).await;
@@ -15237,7 +15236,7 @@ mod tests {
             seed_job(
                 &pool,
                 1,
-                "CLAUDE-3",
+                "PROJ-3",
                 1,
                 false,
                 "2026-06-26T00:02:00+00:00",
@@ -15249,7 +15248,7 @@ mod tests {
             seed_job(
                 &pool,
                 1,
-                "CLAUDE-4",
+                "PROJ-4",
                 1,
                 false,
                 "2026-06-26T00:01:00+00:00",
@@ -15261,7 +15260,7 @@ mod tests {
             let view = search_jobs(&pool, &paths, "token", true).await.unwrap();
             assert_eq!(view.hits.len(), 1);
             let hit = &view.hits[0];
-            assert_eq!(hit.job_key, "CLAUDE-3");
+            assert_eq!(hit.job_key, "PROJ-3");
             assert!(hit.matched_summary && hit.matched_stream);
             // The missing file was not opened, so it is not counted.
             assert_eq!(view.files_searched, 1);
@@ -15275,7 +15274,7 @@ mod tests {
         #[tokio::test]
         async fn read_failure_is_not_a_clean_no_match() {
             let tmp = tempfile::tempdir().unwrap();
-            let log = tmp.path().join("CLAUDE-5-attempt-1.jsonl");
+            let log = tmp.path().join("PROJ-5-attempt-1.jsonl");
             // Valid line first, then a line the UTF-8 decode in `lines()` rejects.
             let mut bytes = b"{\"result\":\"fine\"}\n".to_vec();
             bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
@@ -15301,15 +15300,15 @@ mod tests {
                 state_dir: tmp.path().join("state"),
                 runtime_dir: tmp.path().join("run"),
             };
-            let bad = tmp.path().join("CLAUDE-5-attempt-1.jsonl");
+            let bad = tmp.path().join("PROJ-5-attempt-1.jsonl");
             std::fs::write(&bad, [0xff, 0xfe, b'\n']).unwrap();
-            let good = tmp.path().join("CLAUDE-6-attempt-1.jsonl");
+            let good = tmp.path().join("PROJ-6-attempt-1.jsonl");
             std::fs::write(&good, "{\"result\":\"nothing of note\"}\n").unwrap();
-            let gone = tmp.path().join("CLAUDE-7-attempt-1.jsonl");
+            let gone = tmp.path().join("PROJ-7-attempt-1.jsonl");
 
             let pool = pool().await;
             seed_run(&pool, 1).await;
-            for (key, path) in [("CLAUDE-5", &bad), ("CLAUDE-6", &good), ("CLAUDE-7", &gone)] {
+            for (key, path) in [("PROJ-5", &bad), ("PROJ-6", &good), ("PROJ-7", &gone)] {
                 seed_job(
                     &pool,
                     1,
@@ -15330,7 +15329,7 @@ mod tests {
             // The unreadable one is named; the missing one stays silent.
             assert_eq!(view.unreadable.len(), 1);
             let u = &view.unreadable[0];
-            assert_eq!(u.job_key, "CLAUDE-5");
+            assert_eq!(u.job_key, "PROJ-5");
             assert_eq!(u.attempt, 1);
             assert_eq!(u.path, bad.to_str().unwrap());
             assert!(!u.error.is_empty());
@@ -15415,11 +15414,11 @@ mod tests {
             let s = web_state(tmp.path()).await;
             seed_run(&s.api.pool, 1).await;
             let path =
-                ClaudeInvoker::review_evidence_path(&s.paths.logs_dir(), "act", "CLAUDE-1", 1);
+                ClaudeInvoker::review_evidence_path(&s.paths.logs_dir(), "act", "PROJ-1", 1);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "the full sweep goes here").unwrap();
 
-            let resp = job_review_evidence(State(s), AxumPath((1, "CLAUDE-1".to_string(), 1)))
+            let resp = job_review_evidence(State(s), AxumPath((1, "PROJ-1".to_string(), 1)))
                 .await
                 .unwrap()
                 .into_response();
@@ -15438,10 +15437,10 @@ mod tests {
             let s = web_state(tmp.path()).await;
             seed_run(&s.api.pool, 1).await;
             let logs = s.paths.logs_dir();
-            let primary = ClaudeInvoker::review_evidence_path(&logs, "act", "CLAUDE-1", 1);
+            let primary = ClaudeInvoker::review_evidence_path(&logs, "act", "PROJ-1", 1);
             std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
             std::fs::write(&primary, "first session sweep").unwrap();
-            let stream = ClaudeInvoker::review_stream_log_path(&logs, "act", "CLAUDE-1", 1);
+            let stream = ClaudeInvoker::review_stream_log_path(&logs, "act", "PROJ-1", 1);
             std::fs::write(ClaudeInvoker::review_retry_sibling(&stream), "").unwrap();
             std::fs::write(
                 ClaudeInvoker::review_retry_sibling(&primary),
@@ -15449,7 +15448,7 @@ mod tests {
             )
             .unwrap();
 
-            let resp = job_review_evidence(State(s), AxumPath((1, "CLAUDE-1".to_string(), 1)))
+            let resp = job_review_evidence(State(s), AxumPath((1, "PROJ-1".to_string(), 1)))
                 .await
                 .unwrap()
                 .into_response();
@@ -15468,13 +15467,13 @@ mod tests {
             let s = web_state(tmp.path()).await;
             seed_run(&s.api.pool, 1).await;
             let logs = s.paths.logs_dir();
-            let primary = ClaudeInvoker::review_evidence_path(&logs, "act", "CLAUDE-1", 1);
+            let primary = ClaudeInvoker::review_evidence_path(&logs, "act", "PROJ-1", 1);
             std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
             std::fs::write(&primary, "first session sweep").unwrap();
-            let stream = ClaudeInvoker::review_stream_log_path(&logs, "act", "CLAUDE-1", 1);
+            let stream = ClaudeInvoker::review_stream_log_path(&logs, "act", "PROJ-1", 1);
             std::fs::write(ClaudeInvoker::review_retry_sibling(&stream), "").unwrap();
 
-            let resp = job_review_evidence(State(s), AxumPath((1, "CLAUDE-1".to_string(), 1)))
+            let resp = job_review_evidence(State(s), AxumPath((1, "PROJ-1".to_string(), 1)))
                 .await
                 .unwrap_err()
                 .into_response();
@@ -15487,7 +15486,7 @@ mod tests {
             let s = web_state(tmp.path()).await;
             seed_run(&s.api.pool, 1).await;
 
-            let resp = job_review_evidence(State(s), AxumPath((1, "CLAUDE-1".to_string(), 1)))
+            let resp = job_review_evidence(State(s), AxumPath((1, "PROJ-1".to_string(), 1)))
                 .await
                 .unwrap_err()
                 .into_response();
@@ -15499,7 +15498,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
 
-            let resp = job_review_evidence(State(s), AxumPath((99, "CLAUDE-1".to_string(), 1)))
+            let resp = job_review_evidence(State(s), AxumPath((99, "PROJ-1".to_string(), 1)))
                 .await
                 .unwrap_err()
                 .into_response();

@@ -1,4 +1,4 @@
--- CLAUDE-52: distinguish a claude timeout (exit 124) from a hard failure.
+-- Distinguish a claude timeout (exit 124) from a hard failure.
 --
 -- job_outcomes previously recorded only `ok`, so the web UI derived "failed"
 -- purely from `ok = 0` and could not tell a timeout apart from a crash. A

@@ -1,6 +1,6 @@
 ---
 
-# CLAUDE-94: publish the runtime image (CLAUDE-37 `runtime` target: daemon +
+# Publish the runtime image (`runtime` target: daemon +
 # pinned nu/claude/yt/fj toolchain) to the Forgejo OCI registry as
 # `dev.a8n.run/<owner>/claude-run:<tag>` on every push to main / tag, with the
 # trigger-derived tag (vX.Y.Z on tags, moving `latest` on main). The image
@@ -39,7 +39,7 @@ on:
 jobs:
   build-and-push:
     name: Build and push claude-run runtime image
-    # HEAVY: runs `docker buildx build`, a full cargo compile of the runtime image (DEV-769).
+    # HEAVY: runs `docker buildx build`, a full cargo compile of the runtime image.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_HEAVY }}
     permissions:
       contents: read
@@ -58,14 +58,14 @@ jobs:
 
       - name: Take build parallelism from the runner
         # Exports CARGO_BUILD_JOBS / NEXTEST_TEST_THREADS / CI_JOBS; warns and
-        # falls back to a low CPU-derived value when the runner did not set them (DEV-769).
+        # falls back to a low CPU-derived value when the runner did not set them.
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/build-parallelism@main
 
       - name: Start job metrics sampler
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-start@main
 
       # SPEC-9.2: resolves the publish train from this workflow's own trigger, never from `git describe`.
-      # CLAUDE-135 (GOV-13 / CLAUDE-122): a release commit is pushed to `main`
+      # A release commit is pushed to `main`
       # and tagged `v*` at the same commit, firing BOTH the branch-push and the
       # tag-push run of this workflow. OCI tags are mutable so the push does not
       # 409, but the same commit still double-builds and both runs raced to

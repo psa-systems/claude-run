@@ -1,4 +1,4 @@
--- CLAUDE-26: encrypted action secrets.
+-- Encrypted action secrets.
 --
 -- Stores credentials an action references by name (`token_ref`) instead of
 -- carrying a raw token in its YAML. Values are encrypted at rest with the `age`

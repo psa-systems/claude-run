@@ -126,7 +126,7 @@
 
 <script>
   // Pushes the two Management tables above once each finishes computing on
-  // the server (CLAUDE-637). One EventSource for both fragments; each named
+  // the server. One EventSource for both fragments; each named
   // event swaps its own container and re-runs htmx.process so the Delete /
   // Delete all / Prune forms inside the swapped-in markup keep working. The
   // connection closes on `done`, on `pagehide` (so a viewer who leaves does

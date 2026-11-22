@@ -3,7 +3,7 @@
 # https://github.com/harrydowning/vscode-yaml-embedded-languages
 # https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
 
-# Weekly release notes drafted into a newsletter system: an example to adapt (CLAUDE-474, CLAUDE-501).
+# Weekly release notes drafted into a newsletter system: an example to adapt.
 #
 # Not installed by default: `actions/examples/` is not seeded into a new install. To use it, paste this file into the
 # web UI (New action, raw YAML), replace the placeholders in `env` and store the token on the Secrets page. The run
@@ -22,7 +22,7 @@
 # not, does nothing. To redraft a week, `claude-run action reset-attempts release-notes <week>` and trigger again.
 # A week without releases yields no job; a week with nothing customer-facing yields no draft.
 #
-# The input looks back 7 days, or to the last draft or skip for this newsletter site if that is earlier (CLAUDE-476): the
+# The input looks back 7 days, or to the last draft or skip for this newsletter site if that is earlier: the
 # post step records it in `$CLAUDE_RUN_DATA_DIR/release-notes/<host>.last-draft`, so the releases of a failed week carry
 # over to the next one. The file is per site, so a staging test does not move production's window.
 

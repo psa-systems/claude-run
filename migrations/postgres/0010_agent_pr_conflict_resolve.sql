@@ -1,4 +1,4 @@
--- CLAUDE-550: bound the automerge conflict auto-resolve (CLAUDE-380) per PR.
+-- Bound the automerge conflict auto-resolve per PR.
 -- `conflict_resolve_attempts` counts dispatched resolve runs across head
 -- commits; `conflict_resolve_started_at` marks one still in flight (cleared
 -- when it finishes); `conflict_files` holds the newline-separated paths the

@@ -10,21 +10,21 @@ missing scope is named before a Claude run is paid for. If the open-PR lookup fa
 change, or a transient forge error) the runner creates the PR instead of failing the run, logging a `warn` run event
 with the CLI error. Every read-only `fj` call the runner makes (`repo view`, `pr search`, `pr status`, `whoami`, `repo
 collaborator ... permission`, and the CI-failure log/run/file reads) is retried up to four attempts total on a non-zero
-exit, waiting 0s/2s/5s before attempts 2-4 (CLAUDE-366), so a transient forge blip costs at most 7 seconds rather than
+exit, waiting 0s/2s/5s before attempts 2-4, so a transient forge blip costs at most 7 seconds rather than
 failing the run outright; a deterministic failure (a 404 or a scope error) still exhausts all four attempts before its
 error surfaces, since the retry never inspects the CLI's error text to decide whether to give up early. Every `fj`
 write (`pr create`, `pr merge`, `pr update`, comments, label edits) is never retried, since a retried write could
 double-post a comment or a PR. The read-only log-fetch token
 (`log_token_ref`, used by the CI-failure sources' log fetch) needs only `read:repository`. Two, separate write-scoped
-tokens exist for two, separate reasons: the CI-failure webhook source's own `write_token_ref` (CLAUDE-276) posts the
+tokens exist for two, separate reasons: the CI-failure webhook source's own `write_token_ref` posts the
 PR comment a CI-failure routing decision needs (the analysis on a human's PR, the agent's own re-queued issue, the
 "already tracked" note), needing `write:issue` (PR comments go through the issues API) and nothing else - it never
-pushes a branch or opens a PR. The comment-command token (`write_token_ref`, CLAUDE-220, on the SEPARATE
+pushes a branch or opens a PR. The comment-command token (`write_token_ref`, on the SEPARATE
 `webhook_comment` section) reads the commenter's effective repository permission (`fj repo collaborator ...
 permission`), posts the PR replies, and authenticates the branch push, so it needs `write:repository` plus
 `write:issue`. Per-command breakdown with the endpoint each call maps to: `actions/SCHEMA.md`, "Forgejo token scopes".
 
-**Resuming a PR on re-queue (CLAUDE-275).** Every PR the `youtrack` action opens is recorded in the `agent_pull_requests`
+**Resuming a PR on re-queue.** Every PR the `youtrack` action opens is recorded in the `agent_pull_requests`
 table (`src/ci_failure/store.rs`), keyed on `(host, repo, pr_number)`. If its issue is re-queued (`AI Agent = Queued`
 again, e.g. after a CI failure sends it back) while that PR is still open, the runner clones its head branch instead of
 the default branch and tells the agent, in the prompt, to fix the issue on that same branch rather than opening a

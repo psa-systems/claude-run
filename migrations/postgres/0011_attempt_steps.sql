@@ -1,4 +1,4 @@
--- CLAUDE-575 / SPEC-3.14: see migrations/sqlite/0030_attempt_steps.sql for the
+-- SPEC-3.14: see migrations/sqlite/0030_attempt_steps.sql for the
 -- rationale. Same shape, Postgres types per migrations/postgres/0001_init.sql's
 -- mapping (BIGINT identity id, BIGINT for every SQLite INTEGER column).
 CREATE TABLE IF NOT EXISTS attempt_steps (

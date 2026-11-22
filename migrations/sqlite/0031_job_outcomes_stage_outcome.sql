@@ -1,4 +1,4 @@
--- CLAUDE-601 / SPEC-3.14 items 1 and 7: record the stage and the outcome on
+-- SPEC-3.14 items 1 and 7: record the stage and the outcome on
 -- each attempt so "succeeded on the first / second / third try" is a query on
 -- `job_outcomes`. Historical rows are backfilled from what they stored: the
 -- stage from the attempt number, the outcome from `ok`.

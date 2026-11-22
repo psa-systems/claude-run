@@ -1,4 +1,4 @@
--- CLAUDE-147: input/poll-phase diagnostics, persisted so they surface in the
+-- Input/poll-phase diagnostics, persisted so they surface in the
 -- web UI instead of being log-only and invisible.
 --
 -- `gather()` resolves each project's VCS before `run_begin`. A probe tool error

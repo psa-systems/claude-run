@@ -1154,8 +1154,8 @@ mod tests {
     /// `POST /actions/{name}/pause` accepts both body encodings htmx's own
     /// Pause form and a JSON API client can send, plus a fully empty body
     /// (no `Content-Type`), and stores the reason only when one is given.
-    /// The urlencoded cases are what CLAUDE-618 fixes: before the change the
-    /// `Json` extractor 415'd them before the handler ever ran.
+    /// The urlencoded cases are the regression: the `Json` extractor used to
+    /// 415 them before the handler ever ran.
     #[tokio::test]
     async fn pause_action_accepts_urlencoded_and_json_and_empty_bodies() {
         let s = app_state().await;
@@ -1473,11 +1473,11 @@ mod tests {
 
         // The action has no index row here, so the default cap (3) applies.
         for _ in 0..3 {
-            state::attempts_increment(&s.pool, "youtrack", "CLAUDE-9")
+            state::attempts_increment(&s.pool, "youtrack", "PROJ-9")
                 .await
                 .unwrap();
         }
-        state::attempts_increment(&s.pool, "youtrack", "CLAUDE-8")
+        state::attempts_increment(&s.pool, "youtrack", "PROJ-8")
             .await
             .unwrap();
 
@@ -1488,7 +1488,7 @@ mod tests {
             "{:?}",
             status.attempt_cap_hits
         );
-        assert_eq!(status.attempt_cap_hits[0].job_key, "CLAUDE-9");
+        assert_eq!(status.attempt_cap_hits[0].job_key, "PROJ-9");
         assert_eq!(status.attempt_cap_hits[0].action_name, "youtrack");
         assert_eq!(
             (

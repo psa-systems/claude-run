@@ -1,4 +1,4 @@
--- SPEC-3.17 items 9 and 10 / CLAUDE-616: see
+-- SPEC-3.17 items 9 and 10 : see
 -- migrations/sqlite/0034_run_summaries.sql for the rationale.
 CREATE TABLE run_summaries (
     run_uuid TEXT PRIMARY KEY,

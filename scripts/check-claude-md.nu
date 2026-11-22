@@ -1,5 +1,5 @@
 #!/usr/bin/env nu
-# Guard CLAUDE.md against regrowth (CLAUDE-370): a byte cap, a per-line cap outside
+# Guard CLAUDE.md against regrowth: a byte cap, a per-line cap outside
 # fenced code, and every docs/ link and anchor from it must resolve.
 #
 # Also enforces that `docs/finalize-flow.md` names every `Finalized` variant in
@@ -64,8 +64,8 @@ def finalize_variants [src_text: string] {
     | flatten
 }
 
-# Every violation of the `docs/finalize-flow.md` <-> `Finalized` invariant
-# (CLAUDE-554): the diagram must name every live variant. Missing file or
+# Every violation of the `docs/finalize-flow.md` <-> `Finalized` invariant:
+# the diagram must name every live variant. Missing file or
 # missing variant text both count. A new variant without a diagram node
 # fails CI; an obsolete node that no longer matches a variant does not
 # (removing a variant is rare and the extra node is harmless until cleaned
@@ -74,13 +74,13 @@ def finalize_flow_violations [root: path] {
     let src = ($root | path join src native youtrack.rs)
     if not ($src | path exists) { return [] }
     let doc = ($root | path join docs finalize-flow.md)
-    if not ($doc | path exists) { return ["docs/finalize-flow.md is missing (CLAUDE-554)"] }
+    if not ($doc | path exists) { return ["docs/finalize-flow.md is missing"] }
     let src_text = (open --raw $src)
     let doc_text = (open --raw $doc)
     let variants = (finalize_variants $src_text)
     $variants | each {|v|
         if not ($doc_text | str contains $v) {
-            $"docs/finalize-flow.md is missing a node for Finalized::($v) (CLAUDE-554)"
+            $"docs/finalize-flow.md is missing a node for Finalized::($v)"
         }
     } | compact
 }
@@ -116,7 +116,7 @@ def violations [root: path] {
 def fixture [claude_md: string] {
     let dir = (^mktemp --directory --tmpdir claude-md-guard.XXXXXX | str trim)
     mkdir ($dir | path join docs conventions)
-    "# A\n\n## Some rule (CLAUDE-1)\n\ntext\n\n```\n## Not a heading\n```\n\n## Some rule (CLAUDE-1)\n" | save ($dir | path join docs conventions a.md)
+    "# A\n\n## Some rule\n\ntext\n\n```\n## Not a heading\n```\n\n## Some rule\n" | save ($dir | path join docs conventions a.md)
     $claude_md | save ($dir | path join CLAUDE.md)
     $dir
 }
@@ -133,7 +133,7 @@ def expect [name: string, claude_md: string, pattern: string] {
 }
 
 def self_test [] {
-    let good = "# X\n\n- rule ([CLAUDE-1](docs/conventions/a.md#some-rule-claude-1))\n- dup ([d](docs/conventions/a.md#some-rule-claude-1-1))\n"
+    let good = "# X\n\n- rule ([details](docs/conventions/a.md#some-rule))\n- dup ([d](docs/conventions/a.md#some-rule-1))\n"
     expect "clean file passes" $good ""
     expect "size cap" ($good + (1..60 | each { "" | fill --character 'x' --width 399 } | str join "\n")) "bytes, over"
     expect "line cap" ($good + ("" | fill --character 'y' --width 401)) "CLAUDE.md:5 is 401 characters"

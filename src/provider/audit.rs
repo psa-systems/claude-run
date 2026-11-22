@@ -374,11 +374,11 @@ mod tests {
 
         assert_eq!(
             tracker.create_issue("CLAUDE", "a", "", None).unwrap(),
-            "CLAUDE-1"
+            "PROJ-1"
         );
         assert_eq!(
             tracker.create_issue("CLAUDE", "b", "", None).unwrap(),
-            "CLAUDE-2"
+            "PROJ-2"
         );
         let err = tracker.create_issue("CLAUDE", "c", "", None).unwrap_err();
 
@@ -389,7 +389,7 @@ mod tests {
         );
         assert_eq!(
             stub.calls(),
-            vec!["create CLAUDE-1", "create CLAUDE-2"],
+            vec!["create PROJ-1", "create PROJ-2"],
             "the refused create must not reach the tracker"
         );
         assert_eq!(audit.created(), 2);
@@ -445,16 +445,16 @@ mod tests {
         let audit = IssueWriteAudit::new(Some(3), 0);
         let tracker = AuditedTracker::new(&stub, audit.clone());
 
-        tracker.set_state("CLAUDE-1", "In Progress").unwrap();
-        tracker.set_field("CLAUDE-1", "AI Agent", "Queued").unwrap();
-        tracker.comment("CLAUDE-1", "hi").unwrap();
+        tracker.set_state("PROJ-1", "In Progress").unwrap();
+        tracker.set_field("PROJ-1", "AI Agent", "Queued").unwrap();
+        tracker.comment("PROJ-1", "hi").unwrap();
 
         assert_eq!(
             stub.calls(),
             vec![
-                "set_state CLAUDE-1 In Progress",
-                "set_field CLAUDE-1 AI Agent=Queued",
-                "comment CLAUDE-1",
+                "set_state PROJ-1 In Progress",
+                "set_field PROJ-1 AI Agent=Queued",
+                "comment PROJ-1",
             ]
         );
         assert_eq!(audit.run_id(), Some(3));
@@ -497,7 +497,7 @@ mod tests {
                 "d",
                 "--json",
             ],
-            r#"{"idReadable":"CLAUDE-1"}"#,
+            r#"{"idReadable":"PROJ-1"}"#,
         ));
         let backend = CliBackend::new(runner.clone());
         let audit = IssueWriteAudit::new(Some(42), 1);
@@ -505,7 +505,7 @@ mod tests {
 
         assert_eq!(
             tracker.create_issue("CLAUDE", "s", "d", None).unwrap(),
-            "CLAUDE-1"
+            "PROJ-1"
         );
         assert!(tracker.create_issue("CLAUDE", "s", "d", None).is_err());
 

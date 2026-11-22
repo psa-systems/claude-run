@@ -1,4 +1,4 @@
--- CLAUDE-23: rename the per-run unit of work from "row" to "job".
+-- Rename the per-run unit of work from "row" to "job".
 --
 -- This is a pure DDL rename: no data is transformed, so every existing row in
 -- every table is preserved. Only schema identifiers change so the runtime

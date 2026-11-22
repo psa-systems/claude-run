@@ -1,6 +1,6 @@
 //! SPEC-4.5: the eight read-only MCP tools.
 //!
-//! Read-only troubleshooting MCP server (`claude-run mcp stdio`, CLAUDE-437).
+//! Read-only troubleshooting MCP server (`claude-run mcp stdio`).
 //!
 //! Runs inside the container as `docker compose exec --no-TTY --user appuser
 //! <service> claude-run mcp stdio`. The tool set is limited to status, runs,
@@ -707,7 +707,7 @@ mod tests {
             &state::JobOutcome {
                 run_id,
                 action_name: "youtrack",
-                job_key: "CLAUDE-1",
+                job_key: "PROJ-1",
                 attempt: 1,
                 ok: true,
                 claude_ran: true,
@@ -729,7 +729,7 @@ mod tests {
         assert_ne!(result.is_error, Some(true));
         let value: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
         assert_eq!(value["run"]["id"], run_id);
-        assert_eq!(value["job_outcomes"][0]["job_key"], "CLAUDE-1");
+        assert_eq!(value["job_outcomes"][0]["job_key"], "PROJ-1");
     }
 
     #[tokio::test]
@@ -792,7 +792,7 @@ mod tests {
             &state::JobOutcome {
                 run_id,
                 action_name: "youtrack",
-                job_key: "CLAUDE-2",
+                job_key: "PROJ-2",
                 attempt: 1,
                 ok: true,
                 claude_ran: true,
@@ -813,7 +813,7 @@ mod tests {
         let result = server
             .get_stream_log(Parameters(GetStreamLogArgs {
                 run_id,
-                job_key: "CLAUDE-2".to_string(),
+                job_key: "PROJ-2".to_string(),
                 attempt: None,
                 tail_lines: None,
             }))
@@ -833,7 +833,7 @@ mod tests {
             &state::JobOutcome {
                 run_id,
                 action_name: "youtrack",
-                job_key: "CLAUDE-3",
+                job_key: "PROJ-3",
                 attempt: 1,
                 ok: true,
                 claude_ran: true,
@@ -854,7 +854,7 @@ mod tests {
         let result = server
             .get_stream_log(Parameters(GetStreamLogArgs {
                 run_id,
-                job_key: "CLAUDE-3".to_string(),
+                job_key: "PROJ-3".to_string(),
                 attempt: None,
                 tail_lines: None,
             }))

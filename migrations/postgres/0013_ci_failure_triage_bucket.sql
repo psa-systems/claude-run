@@ -1,4 +1,4 @@
--- SPEC-4.3.15 / CLAUDE-598: persist the triage bucket
+-- SPEC-4.3.15: persist the triage bucket
 -- (`code_fix`/`human_action`/`transient`/`auto_fix`, `src/triage.rs`'s
 -- `TriageBucket`) on the `ci_failures` row it was computed for, so the
 -- dashboard can render it as its own column distinct from lifecycle `state`.

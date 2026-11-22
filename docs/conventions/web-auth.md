@@ -1,28 +1,28 @@
 # Web UI authentication
 
-Full text of the `CLAUDE.md` conventions on this topic, moved there verbatim by CLAUDE-370. The index in `CLAUDE.md` links each heading below.
+Full text of the `CLAUDE.md` conventions on this topic, moved there verbatim. The index in `CLAUDE.md` links each heading below.
 
 ## Setup bootstrap
 
 The web UI bootstraps itself: an exposed instance with no credential serves only `/setup`, which writes an argon2id admin hash to the `web_admin` table (`src/web_admin.rs`, migration `0020`) and is refused once one exists. `auth::resolve_gate` now returns a gate carrying whichever credentials exist (bearer token from `auth_token_ref`, DB administrator, or neither), and an unresolvable `auth_token_ref` is a `warn` with bearer auth disabled for the run rather than the old fail-closed that dropped the whole TCP listener. That old behaviour was unrecoverable in a container: the CLI that would store the secret is not the interface a container operator has. The gate holds the administrator behind an `Arc<RwLock<..>>` the setup handler swaps, so a first-run setup authenticates the next request with no restart. Sessions are HMAC'd with the admin's `session_key`, rotated on a password change, falling back to the token where no administrator exists. Where no administrator exists the pre-setup `auth_username` + token-plaintext login still works. The container image seeds `deploy/container-config.toml` (`bind = "0.0.0.0"`) into an empty config volume, because a loopback bind in a container is reachable from nothing outside it.
 
-## Mandatory TOTP (CLAUDE-368)
+## Mandatory TOTP
 
-CLAUDE-368 makes TOTP mandatory for every `web_admin` row, not optional, because a password alone was the whole story for the browser account that can pause the daemon and edit every action. `web_admin` gained `totp_secret` (encrypted at rest through `SecretsKey`, the same age-based store `secrets.rs` already uses for the token/service-login ciphertext), `totp_enrolled_at`, and `totp_last_step`, plus a new `web_admin_recovery_codes` table of argon2id-hashed, single-use codes (`migrations/{sqlite,postgres}/00{23,4}_web_admin_totp.sql`; `src/import.rs`'s `TABLES` and `IDENTITY_COLUMNS` carry the new table so a backend switch preserves it). `src/web_admin.rs` owns enrollment (`begin_totp_enrollment` mints a `totp-rs` secret and an inline-SVG QR via `qrcodegen`, `confirm_totp_enrollment` verifies the first code and returns one-time recovery codes) and verification (`verify_totp_or_recovery`, `try_consume_recovery_code`), plus `reset_totp` for the CLI escape hatch. Replay protection is one field doing double duty: `totp_last_step` advances on both enrollment confirmation and every successful login, and a code is refused whenever the matched step is not strictly newer, so the exact code that confirmed enrollment can never be replayed as a login. `src/auth.rs` gates on it: `login_submit` no longer mints a session on a correct password alone when the admin is enrolled, it mints a short-lived HMAC'd pending-2FA cookie (`PENDING_2FA_COOKIE`, keyed by the admin's `session_key` so a password change invalidates it too, capped at 5 attempts) and redirects to `/login/2fa`, which is the only place a session cookie is minted for an enrolled admin. `require_token`'s existing session-cookie branch gained an enforcement block: a signed-in but unenrolled admin is redirected to `/account/2fa/setup` on every HTML GET and 403'd otherwise, so no other page is reachable until enrollment completes; `setup_submit` sends a freshly created admin straight there instead of to `/`. A `totp_secret` the daemon cannot decrypt (a rotated `secrets.key`, corrupted ciphertext) fails login visibly, logged at `error`, rather than silently. `claude-run access reset-2fa` (`src/bin/claude-run.rs`, DB-direct like `access check`) clears enrollment and recovery codes and rotates the session key, for an operator recovering a locked-out administrator; the next login is sent back to `/account/2fa/setup`.
+TOTP is mandatory for every `web_admin` row, not optional, because a password alone was the whole story for the browser account that can pause the daemon and edit every action. `web_admin` gained `totp_secret` (encrypted at rest through `SecretsKey`, the same age-based store `secrets.rs` already uses for the token/service-login ciphertext), `totp_enrolled_at`, and `totp_last_step`, plus a new `web_admin_recovery_codes` table of argon2id-hashed, single-use codes (`migrations/{sqlite,postgres}/00{23,4}_web_admin_totp.sql`; `src/import.rs`'s `TABLES` and `IDENTITY_COLUMNS` carry the new table so a backend switch preserves it). `src/web_admin.rs` owns enrollment (`begin_totp_enrollment` mints a `totp-rs` secret and an inline-SVG QR via `qrcodegen`, `confirm_totp_enrollment` verifies the first code and returns one-time recovery codes) and verification (`verify_totp_or_recovery`, `try_consume_recovery_code`), plus `reset_totp` for the CLI escape hatch. Replay protection is one field doing double duty: `totp_last_step` advances on both enrollment confirmation and every successful login, and a code is refused whenever the matched step is not strictly newer, so the exact code that confirmed enrollment can never be replayed as a login. `src/auth.rs` gates on it: `login_submit` no longer mints a session on a correct password alone when the admin is enrolled, it mints a short-lived HMAC'd pending-2FA cookie (`PENDING_2FA_COOKIE`, keyed by the admin's `session_key` so a password change invalidates it too, capped at 5 attempts) and redirects to `/login/2fa`, which is the only place a session cookie is minted for an enrolled admin. `require_token`'s existing session-cookie branch gained an enforcement block: a signed-in but unenrolled admin is redirected to `/account/2fa/setup` on every HTML GET and 403'd otherwise, so no other page is reachable until enrollment completes; `setup_submit` sends a freshly created admin straight there instead of to `/`. A `totp_secret` the daemon cannot decrypt (a rotated `secrets.key`, corrupted ciphertext) fails login visibly, logged at `error`, rather than silently. `claude-run access reset-2fa` (`src/bin/claude-run.rs`, DB-direct like `access check`) clears enrollment and recovery codes and rotates the session key, for an operator recovering a locked-out administrator; the next login is sent back to `/account/2fa/setup`.
 
-## Invite by email (CLAUDE-394)
+## Invite by email
 
 The Accounts page invite form (`create_invite_submit` in `src/auth.rs`) takes an optional `email`. Blank keeps the
 original one-time-link flow unchanged. A non-blank address first has to parse as a `lettre::message::Mailbox`
 (refused `400`, nothing minted) and `crate::config::EmailConfig::from_env()` has to be `configured()` (`smtp_host`,
-`from`, and `public_url` all set from the `CLAUDE_RUN_SMTP_*` / `CLAUDE_RUN_PUBLIC_URL` environment, CLAUDE-428;
+`from`, and `public_url` all set from the `CLAUDE_RUN_SMTP_*` / `CLAUDE_RUN_PUBLIC_URL` environment;
 refused `400` naming the missing variables, nothing minted) before anything happens. Only then is the invite minted
 and the send attempted, in that order: a send failure keeps the invite rather than rolling it back, answers `502`
 with the SMTP error, and falls back to showing the link, so a configured-but-broken mailer never strands an invite
 nobody can reach. `render_accounts` carries a `StatusCode` on every call site for exactly this: every refused or
 failed path above answers non-2xx, not just a visually-flagged `200`.
 
-`src/mailer.rs`'s `Mailer` is built fresh per send from `EmailConfig::from_env()` (CLAUDE-428: SMTP is env-only, no
+`src/mailer.rs`'s `Mailer` is built fresh per send from `EmailConfig::from_env()` (SMTP is env-only, no
 DB-backed settings section and no Settings-page form), not cached, so an environment change (including a rotated
 password) applies on the daemon's next restart; it deliberately does not derive `Debug`, since it holds the resolved
 password in memory for the call's lifetime. The invite link in the email body is always built from the configured
@@ -31,22 +31,22 @@ necessarily accepted from the same one. Logging around a send names the recipien
 token, the full link, or the SMTP password; a send failure's log line carries the lettre/SMTP error text only.
 
 `public_url` (`CLAUDE_RUN_PUBLIC_URL`) has a second reader besides this invite flow: `crate::config::public_url`
-(CLAUDE-446) resolves it straight from the environment, with none of `EmailConfig`'s other SMTP requirements, so the
-run-comment footer (`docs/configuration.md#run-comment-footer-claude-446`) can link back to a run even when SMTP is
+ resolves it straight from the environment, with none of `EmailConfig`'s other SMTP requirements, so the
+run-comment footer (`docs/configuration.md#run-comment-footer`) can link back to a run even when SMTP is
 entirely unset or broken. The two readers deliberately stay separate: `EmailConfig::from_env()` still requires
 `smtp_host` and `from` alongside `public_url` before an invite can be emailed, but a footer link needs only the one
 variable.
 
-## Peer API keys (CLAUDE-636)
+## Peer API keys
 
 A peered instance (`SPEC-3.17`) authenticated every `/api/peer/*` call solely against `web.auth_token_ref`, so an
 accounts-based deployment with that field unset had no way to mint a peer credential at all: the only fix was an
-operator hand-editing `config.toml` and restarting. CLAUDE-636 adds a self-service alternative: a new "API Keys"
+operator hand-editing `config.toml` and restarting. A self-service alternative exists: a new "API Keys"
 section on `/secrets` (`SPEC-4.3.6`) generates a `crk_`-prefixed random key, stores only its SHA-256 hash in the new
 `api_keys` table (`src/state.rs`, migrations `0035`/`0016`), and shows the plaintext exactly once on the generate
 response. The calling instance pastes that plaintext into its own `peers[].token_ref` secret, same as it would a
 legacy token. `require_peer_bearer` (`src/peer.rs`) checks a presented bearer against the legacy token first, then
 against a hash lookup in `api_keys`, bumping `last_used_at` on a match; a lookup failure answers `500`, never `401`,
 so a database outage is never mistaken for a bad credential. This gate is independent of the web/`/api/*` gate in
-`src/auth.rs`, which never reads `api_keys`, so a generated key authenticates `/api/peer/*` only. `require_token` therefore exempts the `/api/peer/` prefix: `daemon.rs` wraps the merged peer router in that gate, and without the exemption it answered `401` to every generated key before `require_peer_bearer` ran (CLAUDE-647). Revoking a key
+`src/auth.rs`, which never reads `api_keys`, so a generated key authenticates `/api/peer/*` only. `require_token` therefore exempts the `/api/peer/` prefix: `daemon.rs` wraps the merged peer router in that gate, and without the exemption it answered `401` to every generated key before `require_peer_bearer` ran. Revoking a key
 deletes its row outright: there is no soft-revoke state for `require_peer_bearer` to check against.

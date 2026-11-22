@@ -1,4 +1,4 @@
--- CLAUDE-575 / SPEC-3.14: time an attempt as a sequence of steps instead of
+-- SPEC-3.14: time an attempt as a sequence of steps instead of
 -- one `job_outcomes.duration_ms`. `kind` is the SPEC-3.14 closed set (clone,
 -- hook_install, postgres_start, postgres_healthy, coding, check, build,
 -- checkpoint, push, pr_create, review, ci_wait, conflict_resolution, gate,

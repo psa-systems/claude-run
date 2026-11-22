@@ -1,13 +1,13 @@
 # Comment commands
 
-## Comment commands on a pull request or an issue (CLAUDE-220, CLAUDE-221)
+## Comment commands on a pull request or an issue
 
 A second inbound listener turns a `/claude <instruction>` comment on a Forgejo thread into work. The endpoint is
 `POST /webhooks/forgejo/comment/<source>`, served alongside (and independently of) the CI-failure webhook above. It has
 two routes, chosen by whether the comment's thread is a pull request:
 
-- **Pull request (CLAUDE-220):** a bounded Claude run against that PR's head branch, pushed back to the branch.
-- **Plain issue (CLAUDE-221):** an issue has no head branch to clone or push, so nothing runs here. The command mints a
+- **Pull request:** a bounded Claude run against that PR's head branch, pushed back to the branch.
+- **Plain issue:** an issue has no head branch to clone or push, so nothing runs here. The command mints a
   YouTrack issue carrying the instruction and a link back to the Forgejo issue, queued for the agent.
 
 The second route is a ROUTE, not a second listener: the request pipeline, authorization gate, trigger parsing,
@@ -15,17 +15,17 @@ bot-login loop drop, dedupe key, and caps ledger are the same implementations bo
 
 It is a SEPARATE listener, section, and synthetic action rather than a second event type on `webhook-triage`,
 because the tokens differ in power: the comment listener's `write_token_ref` pushes branches (`write:repository`
-plus `write:issue`), while a CI-failure source holds a read-only `log_token_ref` and, since CLAUDE-276, a
+plus `write:issue`), while a CI-failure source holds a read-only `log_token_ref` and a
 `write_token_ref` that only comments on pull requests (`write:issue`). Separate sections keep the push-capable token
 out of the CI-failure source block, and each listener gets its own Pause switch. What the two DO share, by reference rather than by copy: HMAC
 verification, the single replay-store instance (so one `X-Forgejo-Delivery` id fanned out to both endpoints is still
 caught), the per-source rate-limiter type and builder, the `owner/repo` allow-list matcher, and the accept-and-drop
-pause gate (CLAUDE-223), which checks the GLOBAL pause before each listener's own synthetic action.
+pause gate, which checks the GLOBAL pause before each listener's own synthetic action.
 
-**Request pipeline**, in the same order as the CI-failure endpoint: disabled listener `404` (CLAUDE-360:
+**Request pipeline**, in the same order as the CI-failure endpoint: disabled listener `404` (
 `config.webhook_comment.enabled = false`, ahead of the source lookup) -> unknown source `404` -> per-source rate limit
 `429` -> missing / unresolvable `secret_ref` `401` -> bad or missing signature `401` -> missing `X-Forgejo-Delivery`
-`400` -> replayed delivery id `409` -> Pause check, global then per-action, accept-and-drop with `2xx` (CLAUDE-223) ->
+`400` -> replayed delivery id `409` -> Pause check, global then per-action, accept-and-drop with `2xx` ->
 parse. Every post-authentication drop is acked
 with `2xx` (so Forgejo does not retry) and logged with its reason: a comment `action` other than `created`, a repo
 outside `allowed_repos`, a first line that does not open with the trigger, or an author in the mint config's
@@ -38,7 +38,7 @@ by route). An instruction over `max_instruction_chars` (default 4000) is refused
 
 **Replies.** Every reply mentions the commenter (`@alice`), so they are notified, and opens with a one-word verdict:
 **Done.**, **No.**, **Blocked.**, or **Started.** for the acknowledgement posted as soon as an instruction is admitted,
-before any work begins; the explanation follows. The usage reply carries only the mention (CLAUDE-552). An
+before any work begins; the explanation follows. The usage reply carries only the mention. An
 edited or deleted comment does nothing: re-running work from an edit expresses no new human intent, so post a new
 comment instead.
 
@@ -56,12 +56,12 @@ ONE reply stating the required set, then the delivery is acked and dropped; deni
 commit the agent itself makes, such as a merge of the base branch, is authored and committed as the bot), records the
 cloned head commit, and writes every runner scratch file (`.claude-run-instruction.md`, `.claude-run-commit-msg`,
 `.claude-run-pr-comment.md`, and the `fj pr create` body file) into the clone's own git directory (`git rev-parse
---absolute-git-dir`, joined with a `claude-run` subdirectory) rather than its work tree (CLAUDE-305), so a scratch
+--absolute-git-dir`, joined with a `claude-run` subdirectory) rather than its work tree, so a scratch
 file can never be tracked, staged, or committed, whatever the repository already tracks at the same name in the work
 tree; the instruction file is removed as soon as Claude's session returns and the commit-message file as soon as the
 commit runs. The human's instruction is written VERBATIM to that file (it is never interpolated into a shell
 command or a command line: the agent is told to read the file by its full path). The runner then runs Claude and
-applies the decision gate (CLAUDE-302, CLAUDE-303). The prompt names the PR's base branch and allows exactly one kind of commit: a merge of
+applies the decision gate. The prompt names the PR's base branch and allows exactly one kind of commit: a merge of
 that base branch, made with `git fetch --unshallow origin <base>` then `git merge FETCH_HEAD`, which is how a
 `/claude merge main and resolve the conflicts` request resolves a real conflict; every other change is left
 uncommitted for the runner. The gate first checks for unmerged paths (`git diff --diff-filter=U`) BEFORE staging
@@ -77,7 +77,7 @@ pushed. A failure anywhere in the gate (for example an unreadable checkout) is r
 changes". Within the caps the runner pushes the branch. A PR comment is posted on EVERY outcome path: pushed, push
 failed, no changes, unresolved conflicts, too big, agent error, and measurement error.
 
-**Execution on a plain issue (CLAUDE-221)** clones nothing, starts no agent session, and pushes nothing. It resolves
+**Execution on a plain issue** clones nothing, starts no agent session, and pushes nothing. It resolves
 the repo's YouTrack project through the SAME routing the CI-failure mint uses (the `[mint]` `repo_project_map`
 override, then the project whose enabled VCS integration claims the repo via the TTL-cached inverse map, then
 `fallback_project`), creates an issue whose summary names the Forgejo issue and whose body carries the instruction
@@ -135,7 +135,7 @@ request, and the listener tells them apart the same way GitHub's own payload doe
 is present. Store the write PAT first, e.g. `printf %s '<pat>' | claude-run secret set github-write-<org>`, and name
 it in the source's `write_token_ref`; it needs `contents:write` (to push the branch), `pull_requests:write`, and
 `issues:write` scopes. GitHub automerge does not use this secret: it uses the GitHub login saved in Settings -> Auth
-(`auth-github-token`). As of CLAUDE-419, `pr_status` no longer needs check-run access (see [docs/auth.md](auth.md)),
+(`auth-github-token`). `pr_status` no longer needs check-run access (see [docs/auth.md](auth.md)),
 so a fine-grained PAT works there too; to serve both with one fine-grained PAT, grant `Contents: Read and write`,
 `Pull requests: Read and write`, `Issues: Read and write`, `Actions: Read`, `Commit statuses: Read`, and
 `Metadata: Read` (implied), then save it in both places: Settings -> Auth and the secrets store under the

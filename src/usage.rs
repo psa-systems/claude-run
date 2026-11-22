@@ -13,7 +13,7 @@
 //! editing the action and starting a new run. There is no interactive path that
 //! offers to raise the limit.
 //!
-//! DEV-706: `peak_context_tokens` is the accounting side of the context-clearing
+//! `peak_context_tokens` is the accounting side of the context-clearing
 //! fix. A conversation that never compacts resends every completed operation's
 //! tool payloads, so its per-turn context grows with the turn index and its
 //! cumulative spend grows quadratically in the number of tool calls. A
@@ -111,11 +111,11 @@ pub struct StreamUsage {
     pub peak_context_tokens: u64,
     /// Sum of every turn's input side: what the whole conversation resent.
     pub cumulative_context_tokens: u64,
-    /// CLAUDE-315: the last `rate_limit_event` seen in this invocation's
+    /// The last `rate_limit_event` seen in this invocation's
     /// stream log, `None` when the invocation reported no such event at all
     /// (an older CLI, or a session that made no API call that carried one).
     pub rate_limit: Option<RateLimitSnapshot>,
-    /// CLAUDE-315: `system`/`api_retry` events, counted by their `error`
+    /// `system`/`api_retry` events, counted by their `error`
     /// value. Empty, not absent, when the invocation retried nothing: unlike
     /// `rate_limit`, "no retries happened" is itself the meaningful reading.
     pub api_retries: BTreeMap<String, u64>,
@@ -187,7 +187,7 @@ impl StreamUsage {
         self.by_tool.values().map(|t| t.calls).sum()
     }
 
-    /// DEV-706's acceptance measurement: resent context per tool call. Flat as N
+    /// Acceptance measurement: resent context per tool call. Flat as N
     /// grows is the linear signature; rising with N is the quadratic one.
     pub fn context_per_tool_call(&self) -> u64 {
         let calls = self.tool_calls();
@@ -654,7 +654,7 @@ fn append_record(path: &Path, record: &Value) {
     }
 }
 
-/// CLAUDE-315: persist one row per `claude` invocation to `claude_invocations`,
+/// Persist one row per `claude` invocation to `claude_invocations`,
 /// so the Reports page's plan-usage chart has queryable history rather than
 /// only the "claude usage" log line. `job_key` and `run_id` are `None` for an
 /// invocation with no scheduled job or run (a triage classification). A write
@@ -839,8 +839,8 @@ mod tests {
     }
 
     /// A conversation of N tool calls, each turn resending everything before it
-    /// unless `window` caps the resent prefix. This is the shape DEV-706 is
-    /// about: `window: None` is the un-compacted conversation.
+    /// unless `window` caps the resent prefix. This is the shape the
+    /// bound targets: `window: None` is the un-compacted conversation.
     fn conversation(calls: u64, per_call: u64, window: Option<u64>) -> Vec<String> {
         let mut lines = vec![assistant(
             (per_call, 10, 0, 0),
@@ -906,7 +906,7 @@ mod tests {
         assert_eq!(top_tool(&usage), "mcp__youtrack__get_issue=902");
     }
 
-    /// DEV-706 acceptance measurement. Without compaction the resent context per
+    /// Acceptance measurement. Without compaction the resent context per
     /// tool call keeps rising as N grows (cumulative spend is quadratic in N);
     /// with a bounded window it settles (cumulative spend is linear in N).
     #[test]
@@ -1216,7 +1216,7 @@ mod tests {
         r.cost = 0.05;
         r.exit_code = Some(0);
         r.usage = parse_stream_usage(&log);
-        record_invocation(&pool, "youtrack", Some("CLAUDE-1"), Some(run_id), &log, &r).await;
+        record_invocation(&pool, "youtrack", Some("PROJ-1"), Some(run_id), &log, &r).await;
 
         let row: (String, Option<String>, Option<i64>, f64, Option<f64>) = sqlx::query_as(sqlx::AssertSqlSafe(crate::db::q(
             &pool,
@@ -1226,7 +1226,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row.0, "youtrack");
-        assert_eq!(row.1.as_deref(), Some("CLAUDE-1"));
+        assert_eq!(row.1.as_deref(), Some("PROJ-1"));
         assert_eq!(row.2, Some(run_id));
         assert!((row.3 - 0.05).abs() < 1e-9);
         assert_eq!(row.4, Some(0.42));

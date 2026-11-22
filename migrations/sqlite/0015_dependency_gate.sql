@@ -1,4 +1,4 @@
--- CLAUDE-161: per-issue re-check backoff for the pre-clone dependency gate.
+-- Per-issue re-check backoff for the pre-clone dependency gate.
 --
 -- When a queued issue is blocked by an unmet dependency the gate leaves it
 -- Queued and records `blocked_until` (epoch ms) plus a `signature` of the unmet

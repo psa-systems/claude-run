@@ -1,4 +1,4 @@
--- Mandatory TOTP 2FA for the web UI's single administrator (CLAUDE-368).
+-- Mandatory TOTP 2FA for the web UI's single administrator.
 -- Same end schema as migrations/sqlite/0023_web_admin_totp.sql; see there for
 -- the column-by-column rationale.
 ALTER TABLE web_admin ADD COLUMN totp_secret BYTEA;

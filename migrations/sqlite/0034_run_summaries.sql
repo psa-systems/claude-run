@@ -1,4 +1,4 @@
--- SPEC-3.17 items 9 and 10 / CLAUDE-616: one immutable highlight row per job
+-- SPEC-3.17 items 9 and 10 : one immutable highlight row per job
 -- outcome, own and replicated, plus the per-peer pull cursor. `seq` is
 -- monotonic per `instance_id`; the unique index makes a concurrent writer
 -- retry instead of reusing a number.

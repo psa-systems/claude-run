@@ -55,7 +55,7 @@ claude-run --version
 
 ## Read-only troubleshooting MCP server
 
-`claude-run mcp stdio` (CLAUDE-437) serves a small, read-only Model Context Protocol server over stdio: JSON-RPC frames in on stdin, JSON-RPC frames out on stdout, logs on stderr only. It is DB-direct, same as `status` or `action list`, so it needs no daemon and works identically inside the container (see [self-hosting.md](self-hosting.md#troubleshooting-mcp-server)).
+`claude-run mcp stdio` serves a small, read-only Model Context Protocol server over stdio: JSON-RPC frames in on stdin, JSON-RPC frames out on stdout, logs on stderr only. It is DB-direct, same as `status` or `action list`, so it needs no daemon and works identically inside the container (see [self-hosting.md](self-hosting.md#troubleshooting-mcp-server)).
 
 It exposes exactly eight tools, each read-only (no tool ever writes):
 
@@ -83,14 +83,14 @@ It exposes exactly eight tools, each read-only (no tool ever writes):
 }
 ```
 
-### Same tools, over HTTP (CLAUDE-442)
+### Same tools, over HTTP
 
 The daemon can also serve those eight tools over MCP's Streamable HTTP transport at `/mcp`, for a client that is not
 running on this host. It is off by default; set `[mcp] enabled = true` (see
-[configuration.md](configuration.md#mcp-over-http-claude-442)) to turn it on. Unlike `mcp stdio`, the HTTP listener is
+[configuration.md](configuration.md#mcp-over-http)) to turn it on. Unlike `mcp stdio`, the HTTP listener is
 gated behind its own OAuth 2.1 / local-account / TOTP web layer (the `mcp-web` crate), entirely separate from both the
 daemon's own `[web]` dashboard auth and from `mcp stdio`'s "if you can exec into the container, you can use it"
-model; see [docs/conventions/mcp.md](conventions/mcp.md#serving-the-same-tools-over-http-claude-442) for the auth
+model; see [docs/conventions/mcp.md](conventions/mcp.md#serving-the-same-tools-over-http) for the auth
 model, the two key files, and the stream-log sensitivity note. A client talks to it the same way it would any OAuth-
 protected MCP server: discover the server's metadata, complete the OAuth dance to obtain a bearer token, then call
 tools with `Authorization: Bearer <token>` against `https://<public_url>/mcp`.
@@ -111,12 +111,12 @@ will want to know about:
   `/static/brand-mark.png`) before the app name. Unlike the mascot, these three carry no instance data and stay
   reachable in every gate state, including on `/login` and `/setup` while signed out. See `SPEC-4.3.11`.
 - **Dashboard** (`/`) leads with the conditions that make work stop without anything failing: the global-pause card, the
-  24h diagnostics banner (CLAUDE-216 / CLAUDE-235, see "Access check"), the stale-dependency-gate banner
-  (CLAUDE-225), and the attempt-cap banner (CLAUDE-232). The diagnostics banner is one line: how many `warn`/`error`
+  24h diagnostics banner (see "Access check"), the stale-dependency-gate banner,
+and the attempt-cap banner. The diagnostics banner is one line: how many `warn`/`error`
   events the last 24h holds, how many of those
   are still-open repo-access failures (whose remedy is the access check, so they are named separately), and a link to
   the Logs screen for the messages themselves. The
-  stale-gate banner lists every queued issue the CLAUDE-161 dependency gate has held for over an hour, with its blocker
+  stale-gate banner lists every queued issue the dependency gate has held for over an hour, with its blocker
   set, how
   long it has been held, and whether the gate's own re-evaluation deadline has passed (a "recheck overdue" gate is not
   being re-evaluated at all, so its blockers may already be resolved). A held issue keeps its Queued field value and a
@@ -126,7 +126,7 @@ will want to know about:
 
   The attempt-cap banner is the same signal for the sibling condition: every job whose attempt counter has reached its
   action's `limits.max_attempts_per_key`, with the action, the key, the count against the cap, and the last counted
-  attempt. For the `youtrack` native action (CLAUDE-301), reaching the cap is no longer a silent skip: the run posts
+  attempt. For the `youtrack` native action, reaching the cap is no longer a silent skip: the run posts
   one comment naming the attempt count and the cap and stating that re-queueing alone will not retry it, then sets
   `AI Agent` to the configured `needs_review` label - the same label the needs-review marker and a timeout use - so the
   issue leaves Queued instead of being skipped again on every poll. A failed comment or field write logs at `error`
@@ -134,7 +134,7 @@ will want to know about:
   until a write actually lands. The generic scripted runner has no tracker field to write, so a scripted action's cap
   hit still just skips the job with a `warn` and no outcome row, exactly as before. The same list is on `/api/status`
   as `attempt_cap_hits`, with or without the daemon. Unlike a dependency gate, the counter row does not clear itself:
-  it is the durable record of the attempts, so a key stays listed until the counter is gone. CLAUDE-238 gives the
+  it is the durable record of the attempts, so a key stays listed until the counter is gone. The runner gives the
   operator that reset directly, per (action, key), without raising the action's whole cap or deleting the action: a
   Reset control on each banner row (`POST /api/actions/<name>/attempts/<key>/reset`, 404s an unknown key), and the
   equivalent `claude-run action reset-attempts <name> <key>` on the CLI, with or without the daemon. A reset is
@@ -143,13 +143,13 @@ will want to know about:
   `actions/SCHEMA.md`, "`limits`".
 
   A third cap bounds what a single run may WRITE rather than how often it fires: `limits.max_issues_per_run`
-  (CLAUDE-234, default 25) is the ceiling on issues one run may create in YouTrack. It is enforced at the provider
+  (default 25) is the ceiling on issues one run may create in YouTrack. It is enforced at the provider
   boundary rather than in the agent prompt, so it holds whatever the prompt says; a run that reaches it stops creating,
   logs at `warn`, and records a run event, so a truncated filing run does not read as a clean one. Every issue create
   and every issue update the runner performs is journalled as one `youtrack issue write` line carrying the originating
   run id and the issue key. See `actions/SCHEMA.md`, "`limits`".
 
-  A fourth cap bounds what a single run may SPEND: `limits.run_budget_usd` (DEV-705, unset = the action's own
+  A fourth cap bounds what a single run may SPEND: `limits.run_budget_usd` (unset = the action's own
   `daily_budget_usd`). It is read from the action's YAML before the run starts and never re-read, so it cannot be raised
   while the run works; raising it means editing the action and starting a new run. A run that reaches it starts no
   further job, closes its row with exit code `6`, and logs a reason naming the budget and the spend. Nothing offers to
@@ -157,7 +157,7 @@ will want to know about:
   session cannot overshoot the ceiling between the runner's own between-job checks, and warns once when the spend passes
   `limits.budget_warn_fraction` (default 0.80) of the ceiling. See `actions/SCHEMA.md`, "`limits`".
 
-- **New action** (`/actions/new`, CLAUDE-211) is a kind picker: it lists every action kind with a one-line description
+- **New action** (`/actions/new`) is a kind picker: it lists every action kind with a one-line description
   and a link to its editor. Every native kind (`youtrack`, `closed-issue-summary`) has a structured form at
   `/actions/new/<kind>`, so no native action has to be hand-written as YAML. `scripted` is **raw YAML only** (its fields are nu snippets, which a form cannot
   structure); the raw editor is
@@ -168,38 +168,38 @@ will want to know about:
   The two webhook listeners (`webhook-triage`, `webhook-comment`) are not action kinds and are not created
   here: they are configured on the Settings page (Webhook sources, Comment webhook) and appear on the dashboard as
   soon as their section has a source, with no restart.
-- **Action detail** (`/actions/<name>`) carries an **Input errors / warnings** line (CLAUDE-147 / CLAUDE-235): how many
+- **Action detail** (`/actions/<name>`) carries an **Input errors / warnings** line: how many
   input / poll-phase diagnostics (probe failures, no-VCS drops) this action has recorded since the current serve
   started, linking to the Logs screen filtered to it. It is a signal, not a log.
-- **Logs** (`/logs`, CLAUDE-171 / CLAUDE-235) is the one diagnostics screen, in the top nav: every `run_events` row for
+- **Logs** (`/logs`) is the one diagnostics screen, in the top nav: every `run_events` row for
   every action, undeduplicated and paginated (50 per page), filterable by a whitelisted Level / Action / Context /
   message substring and a current-serve / last-24h / all-time window. Above the table, two summary cards count the last
   24h of `warn` and `error` events grouped by `context` and by `action_name`, and each row links back to the same page
   with that filter applied over the same window. `?action=<name>` narrows it to one action, which is where the
   Dashboard banner, the action page's **View logs** buttons, and the permanent redirect from the former
   `/actions/<name>/events` URL all land.
-- **Access** (`/access`, CLAUDE-216) runs the access check on demand: "Check all" probes every enabled `youtrack`
+- **Access** (`/access`) runs the access check on demand: "Check all" probes every enabled `youtrack`
   action, and the form probes a named repo (`owner/name`, optional host) and/or a YouTrack project key. Results are one
   row per probe. `/secrets` grows a per-secret **Check** button that lands here with that credential's identity probe
   already run. See "Access check".
-- **Reports** (`/reports`, CLAUDE-117) is the historical reporting page (spend / runs / time-of-day / day-of-week),
+- **Reports** (`/reports`) is the historical reporting page (spend / runs / time-of-day / day-of-week),
   global by default and narrowable with `action` + `range` query params. With peering enabled (`SPEC-3.17`) it also
   takes an `instance` param (`all`, `local` or a peer name), merges this instance with every peer's replicated run
-  summaries by default, and names any peer that is unknown or behind with its last sync time (CLAUDE-616). Its "Claude plan usage" section (CLAUDE-315)
+  summaries by default, and names any peer that is unknown or behind with its last sync time. Its "Claude plan usage" section
   charts the Claude subscription's own rate-limit utilization (five-hour and seven-day windows, 0-100%) per `claude`
   invocation, separate from the dollar spend above: a solid line for the five-hour window, a dashed line for the
   seven-day window, a red marker for a timed-out or failed invocation, and a gap in the line (with a stated count)
   wherever an invocation's log carried no rate-limit reading at all rather than a fabricated zero. A table below the
   chart lists the 20 most recent invocations with their status and API-retry counts.
-- **Status** (`/status`, CLAUDE-129, renamed from About in CLAUDE-513; `/about` and `/about/activity` redirect permanently) shows version + build info. Its **Activity** card (CLAUDE-223) carries the global Pause / Resume control and the live quiet
-  indicator (see [Global pause and the restart-safety workflow](operations.md#global-pause-and-the-restart-safety-workflow-claude-223)). Its **Management** part (SPEC-3.10 item 10, CLAUDE-513) lists each shared Cargo target cache directory under `cache/cargo-target/`
+- **Status** (`/status`, renamed from About; `/about` and `/about/activity` redirect permanently) shows version + build info. Its **Activity** card carries the global Pause / Resume control and the live quiet
+  indicator (see [Global pause and the restart-safety workflow](operations.md#global-pause-and-the-restart-safety-workflow)). Its **Management** part (SPEC-3.10 item 10) lists each shared Cargo target cache directory under `cache/cargo-target/`
   with its size, last-used time, and whether a run for that repo is in flight, with a Delete button per row and a Delete all button; a delete is refused with `409` while a run for that repo is in flight. The same part also lists the sidecar's Docker storage by
-  category (SPEC-3.11 item 4, CLAUDE-517: stopped containers, images, build cache, unreferenced volumes), each with its
+  category (SPEC-3.11 item 4: stopped containers, images, build cache, unreferenced volumes), each with its
   size, or "unknown" with the read's error when the usage read fails, and a Prune button that removes everything in
   that category now; a prune is refused with `409` while any run is in flight, and a failed prune is shown rather than
-  swallowed. See [Docker storage prune from the Status page](operations.md#docker-storage-prune-from-the-status-page-spec-311-item-4-claude-517).
+  swallowed. See [Docker storage prune from the Status page](operations.md#docker-storage-prune-from-the-status-page-spec-311-item-4).
 
-## Access check (CLAUDE-216)
+## Access check
 
 `/secrets` lists secret NAMES only, so an expired, revoked, or under-scoped token looks exactly like a healthy one, and
 the poll-time repo-access preflight leaves its issues Queued with no field change. The access check answers, on demand
@@ -244,9 +244,9 @@ For a GitHub-bound project, the VCS binding probe resolving to an empty repo (no
 token can read the project but lacks **Update Project** permission, which is what gates YouTrack's own visibility into
 the GitHub VCS integration's resolved path (see [Service auth](auth.md#service-auth-settings---auth)); it is not a broken or missing VCS integration.
 
-**Dashboard banner.** A poll-time repo-access preflight failure is recorded as a `run_events` row (CLAUDE-147); the
+**Dashboard banner.** A poll-time repo-access preflight failure is recorded as a `run_events` row; the
 Dashboard counts those from the last 24 hours in its diagnostics banner and links to `/access`, so the operator is told
 rather than having to go looking. A later poll whose preflight passes records a recovery marker for the same repo and
 that count drops to zero; the marker is written only on that fail -> pass transition, so a healthy poll adds nothing to
-the event log. CLAUDE-235 replaced the banner's table with the count: one repeating failure used to fill the operator's
-first screen with byte-identical rows, and the rows now live on the Logs screen.
+the event log. The banner shows the count, not a table: one repeating failure would fill the operator's
+first screen with byte-identical rows, so the rows live on the Logs screen.

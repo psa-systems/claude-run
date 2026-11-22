@@ -2,16 +2,16 @@
 
 # Validate code on every push and pull request.
 # Mirrors the local `just check` recipe (the `claude-md` job is its
-# `check-claude-md` step, CLAUDE-370). This stays a standalone workflow rather
+# `check-claude-md` step). This stays a standalone workflow rather
 # than calling common's reusable check.yml: that workflow cannot declare the
-# PostgreSQL service or run the suite a second time against it (CLAUDE-250).
+# PostgreSQL service or run the suite a second time against it.
 #
-# CLAUDE-570: whether a pull request needs the compile and test work is
+# Whether a pull request needs the compile and test work is
 # decided only by common's shared `classify-diff` action (common STD-3.1,
-# STD-3.2; PC-134): `code` runs everything, `comments-only` runs `cargo fmt
+# STD-3.2): `code` runs everything, `comments-only` runs `cargo fmt
 # --check` and skips clippy, build and tests, `non-code` (docs and their
 # assets) skips the compile job. A push is always `code`. This is NOT a
-# workflow-level `paths-ignore` (CLAUDE-286): Forgejo drops a workflow whose
+# workflow-level `paths-ignore`: Forgejo drops a workflow whose
 # path filter does not match before any run is created, so no status is
 # posted and branch protection's required context stays `pending` forever.
 # Instead the `changes` job always runs (on the cheap base runner) and the
@@ -40,10 +40,10 @@ jobs:
     # `check-spelling` and `check-secrets` may run.
     if: github.head_ref != 'specification'
     name: classify changed files
-    # MEDIUM: only reads the diff, compiles nothing (DEV-769).
+    # MEDIUM: only reads the diff, compiles nothing.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     outputs:
-      # `code`, `comments-only` or `non-code` (CLAUDE-570).
+      # `code`, `comments-only` or `non-code`.
       result: ${{ steps.classify.outputs.result }}
     steps:
       - name: Clone the repository
@@ -56,7 +56,7 @@ jobs:
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/classify-diff@main
 
   claude-md:
-    # CLAUDE-370: runs on every push and PR, docs-only ones included, since
+    # Runs on every push and PR, docs-only ones included, since
     # CLAUDE.md growth is exactly what a docs-only change can introduce.
     # SPEC-11.7, STD-10.6: skipped for a `specification` head branch, same as `changes`.
     if: github.head_ref != 'specification'
@@ -76,7 +76,7 @@ jobs:
 
   check:
     needs: changes
-    # CLAUDE-570: skipped for a `non-code` diff; for `comments-only` only the
+    # Skipped for a `non-code` diff; for `comments-only` only the
     # formatting check runs (the steps below gate on `code`). The CLAUDE.md
     # guard and secrets scan run unconditionally.
     # SPEC-11.7, STD-10.6: also skipped for a `specification` head branch,
@@ -84,15 +84,15 @@ jobs:
     if: needs.changes.outputs.result != 'non-code' && github.head_ref != 'specification'
     name: fmt + clippy + build + tests
     # HEAVY: compiles natively and needs the dev image's `cc` for crate build
-    # scripts (CLAUDE-203, DEV-769).
+    # scripts.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_HEAVY }}
 
-    # CLAUDE-250: the runner supports SQLite and PostgreSQL through one sqlx
+    # The runner supports SQLite and PostgreSQL through one sqlx
     # `Any` pool, so the suite runs twice: once on the default SQLite and once
     # against a real PostgreSQL. Without it the Postgres half of the dialect
     # chokepoint would only ever be exercised in principle.
     #
-    # CLAUDE-543: the PostgreSQL pass runs on a throwaway, non-durable
+    # The PostgreSQL pass runs on a throwaway, non-durable
     # Postgres started by `claude-run test-postgres --network` on this job's
     # own Docker network (SPEC-6.6, SPEC-11.1), not on a service container: a
     # service's `options` cannot turn off fsync, on this runner's busy array a
@@ -103,7 +103,7 @@ jobs:
     # the test database off the disk the build shares with everything else.
     # The timeouts end a stall in minutes rather than at the 3 hour limit.
     #
-    # CLAUDE-627: raised from 90 to 120 minutes alongside the Postgres step's
+    # Raised from 90 to 120 minutes alongside the Postgres step's
     # own 45-to-75-minute raise below, so the job itself cannot time out
     # before that step's longer budget runs out.
     timeout-minutes: 120
@@ -115,7 +115,7 @@ jobs:
 
       - name: Take build parallelism from the runner
         # Exports CARGO_BUILD_JOBS / NEXTEST_TEST_THREADS / CI_JOBS; warns and
-        # falls back to a low CPU-derived value when the runner did not set them (DEV-769).
+        # falls back to a low CPU-derived value when the runner did not set them.
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/build-parallelism@main
 
       - name: Start job metrics sampler
@@ -130,7 +130,7 @@ jobs:
         # for, which is what produced the Sqlx(PoolTimedOut)
         # failures in run #641.
         #
-        # Capped at 8 for the SQLite leg too (SPEC-5.6.10, CLAUDE-524): its
+        # Capped at 8 for the SQLite leg too (SPEC-5.6.10): its
         # test_sqlite_pool() fixtures are single-connection pools with a 120s
         # acquire_timeout that tolerates a CPU-starved background rollback,
         # but that tolerance has a limit, and this issue already showed on
@@ -148,7 +148,7 @@ jobs:
               $"RUST_TEST_THREADS=($threads)\n" | save --append $env.GITHUB_ENV
           }
 
-      # CLAUDE-559: per-phase timing + target-cache size snapshots so a PR run
+      # Per-phase timing + target-cache size snapshots so a PR run
       # surfaces where the SQLite leg's 40+ minutes go beyond the suite's own
       # ~34s wall-clock. Forgejo's UI already prints each step's duration but
       # does not break down compile vs test inside a step, and `job-metrics-report`
@@ -202,7 +202,7 @@ jobs:
         # job's container, which the runner names in JOB_CONTAINER_NAME
         # (Forgejo leaves `job.container.network` empty).
         #
-        # CLAUDE-540: only the test files that touch a DB pool are re-run here
+        # Only the test files that touch a DB pool are re-run here
         # (scripts/postgres-test-filters.txt, enforced by the db.rs guard
         # test); the pure-logic tests already ran on the SQLite leg above and
         # would do identical, SQL-free work on Postgres. This leg is DB/IO-
@@ -210,7 +210,7 @@ jobs:
         # the job's CPU share (CI_JOBS, which the build-parallelism action can
         # floor at nproc/4 = 2): the test threads mostly wait on Postgres, so
         # running several per core overlaps that wait. The thread count is
-        # capped at 8 regardless of CI_JOBS (SPEC-5.6.9, CLAUDE-524): each test's fixture
+        # capped at 8 regardless of CI_JOBS (SPEC-5.6.9): each test's fixture
         # pool can hold up to 4 connections, so 8 threads cannot ask
         # test-postgres for more than 32 at once, leaving headroom under its
         # max_connections=200. Before the first cap (16), an 8-job HEAVY
@@ -223,7 +223,7 @@ jobs:
         # 4-connection pool past even the 120s acquire_timeout. Halving the
         # thread count halves that CPU contention.
         #
-        # CLAUDE-627: raised from 45 to 75 minutes after a CPU-starved runner
+        # Raised from 45 to 75 minutes after a CPU-starved runner
         # (average 0.24 cores, high memory pressure) hit the 45 minute step
         # timeout exactly, failing the job with a copy-out error rather than a
         # real test failure.
@@ -286,8 +286,7 @@ jobs:
           # former CI Postgres service password, the docs/configuration.md and compose.yml example
           # URIs, the token-shaped remote URLs in src/ tests, the nu
           # interpolation in the removed scripts/claude-run.nu, and the
-          # retry_git_network redaction test's placeholder URL (CLAUDE-396,
-          # still present in this branch's history even after the test
+          # retry_git_network redaction test's placeholder URL (# still present in this branch's history even after the test
           # itself moved to an already-allowlisted shape).
           kingfisher_skip_regex: 'claude_run:(claude_run|secret|\(\$password\)|<that password>)@|^x-access-token$|oauth2:(secret|tok|tok-123|\(\$pat\))@|ghp_(secret|from_login|action)@|user:s3cr3t@'
 

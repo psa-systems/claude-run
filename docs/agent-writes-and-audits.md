@@ -1,6 +1,6 @@
 # Agent tracker writes and audits
 
-## What the agent may write to the tracker (CLAUDE-214, CLAUDE-297)
+## What the agent may write to the tracker
 
 The agent never publishes code: no `git push`, no pull request. The runner's finalize step opens the PR from the local
 commits and owns every field it sets. What the agent *may* do to YouTrack used to be nothing at all; the built-in
@@ -14,7 +14,7 @@ Permitted by the built-in default prompt (`prompt_preset: default`, `default_you
   triggering issue: restricted to `native.youtrack.write_projects` (defaulting to empty, which resolves to the
   **triggering issue's own project**, so the common case needs no configuration and no site specifics are baked into
   the binary), linked `yt issue link <new-issue> <KEY> --type "relates to"` (or `depends on` / `is required for` when
-  one genuinely blocks the other), **never** `--type "subtask of"` (CLAUDE-454: that verb is reserved for linking
+  one genuinely blocks the other), **never** `--type "subtask of"` (that verb is reserved for linking
   under an epic or milestone root, since making a work issue the parent lets closing the follow-up auto-close it and
   lets the dependency gate block the parent on its own child). A bug found outside the triggering
   issue's scope, in this repo or another: filed in the project whose VCS integration binds the buggy repo, falling
@@ -37,19 +37,19 @@ The permitted list is a prompt instruction. The enforced boundary is the YouTrac
 token cannot perform fails loudly and the run parks at Needs Review quoting the rejected command. An action that wants a
 different policy selects another built-in preset with `native.youtrack.prompt_preset`, or replaces the prompt wholesale
 with a `native.youtrack.prompt` override. `actions/audit-run.yml` selects `prompt_preset: audit`, the built-in audit
-prompt: it adds the audit write-back and lets the run set `AI Agent = Queued` on the finding issues it files
-(CLAUDE-295), the one place a built-in prompt permits that field.
+prompt: it adds the audit write-back and lets the run set `AI Agent = Queued` on the finding issues it files,
+the one place a built-in prompt permits that field.
 
 **No-code completion path.** A run whose deliverable is tracker output rather than code makes no commits, and the
-CLAUDE-212 ahead check fails such a run (`AI Agent = Failed`, no PR) so a silently-empty engineering run cannot look
+ ahead check fails such a run (`AI Agent = Failed`, no PR) so a silently-empty engineering run cannot look
 successful. To finish deliberately with no commits, the agent writes its human-facing summary to
 `$workdir/.claude-run-no-code-change`. Finalize then skips the PR, posts that text verbatim as the issue comment, and
 sets `AI Agent` to `native.youtrack.states.no_code` (defaulting to the `done` label, since there is no PR to review).
-`State` is left untouched, so the issue stays In Progress until a human closes it. Without the marker the CLAUDE-212
+`State` is left untouched, so the issue stays In Progress until a human closes it. Without the marker the 
 guard is unchanged, and the marker is never an escape hatch for a code task the agent could not finish: that stays
 `.claude-run-needs-review`.
 
-## Scheduled repository audits (CLAUDE-214, CLAUDE-215)
+## Scheduled repository audits
 
 Two actions share `kind: youtrack` and partition the queued issues between them:
 
@@ -58,7 +58,7 @@ Two actions share `kind: youtrack` and partition the queued issues between them:
   `-Resolved AI Agent: Queued project: {{audit_project}} tag: Audit-*`.
 
 Both `{{audit_project}}` placeholders are substituted with `native.youtrack.audit_project` (default `AUDIT`) at query
-time (CLAUDE-409); the two action files carry this field, not the project key spelled out inside the query string, so
+time; the two action files carry this field, not the project key spelled out inside the query string, so
 moving the audit project to a different short name is one field edited in each file instead of two independently
 hand-written query literals. `YoutrackSource::resolved_query` (`src/action.rs`) does the substitution.
 
@@ -85,18 +85,18 @@ resolves after the rename, but it appears in no project listing and must not be 
 upgrade updates the audit prompt. `claude-run action show audit-run` prints `"prompt_source": "builtin:audit"`. The
 preset handles both run shapes (a per-target Epic and the daily parent) and permits the tracker writes the default
 prompt forbids: one summary comment per target on the parent issue, a `## Result` block on the run's own issue
-description, the standing table on the anchor issue (daily parent run only), and filing the run's findings
-(CLAUDE-295). Findings are
+description, the standing table on the anchor issue (daily parent run only), and filing the run's findings.
+Findings are
 created only in `native.youtrack.write_projects` (empty by default, which resolves to the triggering issue's own project; an operator sets the projects findings should file into), at
 most 20 finding issues per target, and each gets `AI Agent = Queued` as its last write, so the code-issue action works
 it. `AI Agent = Needs Review` is the one other value the run may set, and only on an issue it created this run whose
-content it later finds wrong (CLAUDE-304); `AI Agent` and `State` on the audit issue itself remain the runner's
+content it later finds wrong; `AI Agent` and `State` on the audit issue itself remain the runner's
 alone, and delete stays banned regardless. The cap is a prompt instruction, not an enforced limit: `AuditedTracker`
 counts the runner's own provider calls, not the `yt` calls an agent makes. The procedure itself (audit phases, the
 coverage and carry-forward ledgers, dedup, grouping, priority, links) lives in the audits repo under `prompts/`, not in
 this prompt, so it changes by pull request there.
 
-**Filing from disk, not from a compacted context (CLAUDE-304).** A context compaction mid-run (`claude.autocompact`,
+**Filing from disk, not from a compacted context.** A context compaction mid-run (`claude.autocompact`,
 default 200000 tokens) replaces earlier conversation with a summary; an earlier audit run hit this and refiled nine findings
 whose citations did not exist because the run rebuilt them from that summary instead of re-reading them. The audit
 prompt now writes the dated report, with every finding's full block, before it files a single issue, then files each
@@ -108,7 +108,7 @@ time(s) during this run; check the issues it created.` to the success or needs-r
 `warn` naming the key and the count), so a compacted run is visible on the triggering issue even when everything it
 filed turned out fine.
 
-The dependency gate (CLAUDE-161) is left enabled, which is what sequences a daily rotation: the workflow files one
+The dependency gate is left enabled, which is what sequences a daily rotation: the workflow files one
 parent plus one Epic per target and queues all of them, and `parent for` keeps the parent blocked until every Epic
 resolves, so the run summary has something to summarize. Each finding is filed as a subtask of its Epic, which makes the
 Epic `parent for` open issues in other projects. `dependencies.block_cross_project: false` makes the gate ignore
@@ -117,7 +117,7 @@ those, or an Epic retried after a transient failure would wait until every one o
 serialization, are what keep a rotation affordable. `automerge.enabled: true` merges an audit pull request once its CI
 is green, which is what resolves its Epic and so releases the gated daily parent; the merge is normally event-driven,
 so the webhook should send Action Run Success and Recover for low latency, and the reconciler backstop merges it
-within one tick either way (see [Event-driven automerge](webhooks.md#event-driven-automerge-claude-126-claude-278)).
+within one tick either way (see [Event-driven automerge](webhooks.md#event-driven-automerge)).
 
 **Migrating an existing deployment to the audit preset.** The container entrypoint copies the shipped action files into
 `/config/actions/` only when that directory holds no `*.yml` file, so an existing deployment keeps its own

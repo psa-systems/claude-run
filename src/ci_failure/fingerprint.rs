@@ -185,7 +185,7 @@ fn parse_target_line(trimmed: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// CLAUDE-272 acceptance criterion: these lines from billing-service run
+    /// Acceptance criterion: these lines from billing-service run
     /// 5874 (timestamps stripped) must yield exactly these three ids, sorted.
     #[test]
     fn failing_tests_parses_cargo_test_output() {
@@ -236,7 +236,7 @@ error: 1 target failed:
 
     #[test]
     fn fingerprint_ignores_a_passing_tests_name_and_returns_the_real_failure() {
-        // CLAUDE-459: a passing test whose NAME contains "enospc" must not
+        // A passing test whose NAME contains "enospc" must not
         // mask the actual failing test with a branch-agnostic infra key.
         let log = "\
      Running unittests src/lib.rs (target/debug/deps/claude_run-abc)
@@ -270,7 +270,7 @@ test foo ... FAILED
         );
     }
 
-    /// CLAUDE-608 acceptance criterion: a `docker buildx build` log, where
+    /// Acceptance criterion: a `docker buildx build` log, where
     /// BuildKit prefixes every line of the `RUN cargo test` step with
     /// `#<step> <seconds> `, must parse to the same ids as the unprefixed log.
     #[test]
@@ -297,7 +297,7 @@ test foo ... FAILED
         );
     }
 
-    /// CLAUDE-608: the same log, unprefixed, yields identical ids, so the
+    /// The same log, unprefixed, yields identical ids, so the
     /// store attaches a buildx-built run to the same issue as a plain one.
     #[test]
     fn failing_tests_matches_with_or_without_the_buildkit_prefix() {
@@ -312,7 +312,7 @@ test needs_host_tools::failing_docker_leaves_no_temp_dir ... FAILED
         assert_eq!(failing_tests(prefixed), failing_tests(plain));
     }
 
-    /// CLAUDE-608 acceptance criterion: the BuildKit bootstrap warning
+    /// Acceptance criterion: the BuildKit bootstrap warning
     /// ahead of the prefixed cargo failure fingerprints to the four test
     /// ids, not to the warning line (which otherwise reads as the
     /// `runner-deadline` infra kind).

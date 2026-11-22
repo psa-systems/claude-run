@@ -29,7 +29,7 @@ pub struct Failure {
     pub infra_kind: Option<String>,
     pub issue_key: Option<String>,
     pub state: String,
-    /// SPEC-4.3.15 / CLAUDE-598: the triage bucket
+    /// SPEC-4.3.15: the triage bucket
     /// (`code_fix`/`human_action`/`transient`/`auto_fix`, `src/triage.rs`)
     /// computed at webhook-mint time. `None` for a row minted before this
     /// column existed, or adopted through the legacy YouTrack search (no
@@ -53,11 +53,11 @@ pub struct AgentPullRequest {
     pub state: String,
     pub created_at: String,
     pub updated_at: String,
-    /// True when this PR was opened by the timeout salvage path (CLAUDE-379)
-    /// and not yet cleared by a resumed run's successful finish (CLAUDE-429).
+    /// True when this PR was opened by the timeout salvage path
+    /// and not yet cleared by a resumed run's successful finish.
     /// Blocks automerge regardless of draft status. See `crate::db::flag`.
     pub salvaged: bool,
-    /// CLAUDE-630: true once `finalize` has observed `Finalized::CodeReview`
+    /// True once `finalize` has observed `Finalized::CodeReview`
     /// for this PR, i.e. the run that owns it reported success and the PR was
     /// promoted to ready. The automerge reconciler and the Action-Run webhook
     /// decision path stop touching the row once this is set: no more
@@ -70,15 +70,15 @@ pub struct AgentPullRequest {
     /// Review (`clear_failed`); a re-queue that continues the same PR does
     /// not clear it by itself. See `crate::db::flag`.
     pub failed: bool,
-    /// CLAUDE-550: automerge conflict auto-resolve runs dispatched for this
+    /// Automerge conflict auto-resolve runs dispatched for this
     /// PR, across every head commit. Capped by
     /// `webhook_comment.agent_conflict_resolve_attempts`.
     pub conflict_resolve_attempts: i64,
-    /// CLAUDE-550: when the latest conflict auto-resolve run was dispatched,
+    /// When the latest conflict auto-resolve run was dispatched,
     /// `None` once it finished. A stamp older than the comment run's own
     /// timeout plus a margin is stale (a dropped or crashed run).
     pub conflict_resolve_started_at: Option<String>,
-    /// CLAUDE-550: the paths the last conflict auto-resolve run left
+    /// The paths the last conflict auto-resolve run left
     /// unresolved; empty when it resolved them or never reported.
     pub conflict_files: Vec<String>,
 }
@@ -193,7 +193,7 @@ pub async fn get_failure(pool: &DbPool, id: i64) -> Result<Option<Failure>> {
 
 /// SPEC-3.5.2: insert a new `ci_failures` row. Returns its id.
 /// `triage_bucket` is the already-computed [`crate::triage::TriageBucket`]
-/// wire value (SPEC-4.3.15 / CLAUDE-598) when the caller minted this row from
+/// wire value (SPEC-4.3.15) when the caller minted this row from
 /// a triage verdict, `None` when no triage ran for it (a `pr_only` sighting,
 /// or a legacy-adopted issue).
 #[allow(clippy::too_many_arguments)]
@@ -275,7 +275,7 @@ pub async fn attach_run(
 
 /// SPEC-3.5.2: set `run_id`'s own failing-id fingerprint, newline-joined (fingerprint ids
 /// never contain a newline; `find_match`'s test-id overlap match is unrelated
-/// and never queries this column). CLAUDE-371: only the agent-PR fix-attempt
+/// and never queries this column). only the agent-PR fix-attempt
 /// flow needs one sighting's own fingerprint (to compare it against the
 /// immediately previous sighting on the same PR), so this and
 /// [`previous_run_test_ids`] are its only callers; every other `attach_run`
@@ -300,7 +300,7 @@ pub async fn set_run_test_ids(pool: &DbPool, run_id: i64, test_ids: &[String]) -
 /// `ci_failure_runs` row strictly older than `before_run_id`) whose recorded
 /// fingerprint is non-empty, as `(run_index, test_ids)`. `None` covers both
 /// "no earlier sighting on this PR" and "the earlier sighting's fingerprint
-/// was empty or never recorded": CLAUDE-371 requires the latter to fall back
+/// was empty or never recorded": the latter must fall back
 /// to the plain attempt-cap flow rather than comparing against a fingerprint
 /// that isn't there.
 pub async fn previous_run_test_ids(
@@ -329,7 +329,7 @@ pub async fn previous_run_test_ids(
     }))
 }
 
-/// CLAUDE-551: every earlier attempt's fingerprint on `pr_number` for
+/// Every earlier attempt's fingerprint on `pr_number` for
 /// `failure_id`, oldest first, as `(run_index, test_ids)`; attempts with no
 /// parsed test ids are left out.
 pub async fn prior_run_test_ids(
@@ -405,7 +405,7 @@ pub async fn set_failure_state(
     Ok(())
 }
 
-/// SPEC-4.3.15 / CLAUDE-598: persist the triage bucket onto an existing row,
+/// SPEC-4.3.15: persist the triage bucket onto an existing row,
 /// for the reopen path, which re-triages a resolved failure exactly as a
 /// fresh mint would.
 pub async fn set_failure_triage_bucket(
@@ -463,7 +463,7 @@ pub async fn distinct_branches(pool: &DbPool, failure_id: i64) -> Result<Vec<Str
     Ok(branches)
 }
 
-/// SPEC-3.5 / SPEC-3.5.2: the `ci_failures` row currently claimed by `issue_key`, if any (CLAUDE-276:
+/// SPEC-3.5 / SPEC-3.5.2: the `ci_failures` row currently claimed by `issue_key`, if any (
 /// used to find or lazily create the store row backing an agent's own PR, whose
 /// `ci_failures` row is addressed by issue key rather than by test overlap).
 pub async fn failure_for_issue(pool: &DbPool, issue_key: &str) -> Result<Option<Failure>> {
@@ -479,7 +479,7 @@ pub async fn failure_for_issue(pool: &DbPool, issue_key: &str) -> Result<Option<
 }
 
 /// SPEC-3.5 / SPEC-3.5.2: every distinct non-null PR number `failure_id` has been seen sighted on,
-/// sorted. CLAUDE-276: used to comment the same issue link onto every open
+/// sorted. Used to comment the same issue link onto every open
 /// PR a `pr_only` failure's two distinct branches turned out to be on.
 pub async fn pr_numbers_for_failure(pool: &DbPool, failure_id: i64) -> Result<Vec<i64>> {
     let numbers: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(
@@ -497,7 +497,7 @@ pub async fn pr_numbers_for_failure(pool: &DbPool, failure_id: i64) -> Result<Ve
 }
 
 /// SPEC-3.5 / SPEC-3.5.2: every run index `failure_id` was sighted at on PR `pr_number`, sorted.
-/// CLAUDE-276: used to list every fix attempt's run when an agent's own PR
+/// Used to list every fix attempt's run when an agent's own PR
 /// hits the `agent_pr_fix_attempts` ceiling and is flagged `Needs Review`.
 pub async fn run_indexes_for_failure_pr(
     pool: &DbPool,
@@ -543,7 +543,7 @@ pub async fn list_failures(pool: &DbPool, state: Option<&str>, limit: i64) -> Re
     rows.iter().map(failure_from_row).collect()
 }
 
-/// SPEC-4.3.15 / CLAUDE-598: the dashboard's CI-failures listing. `state`
+/// SPEC-4.3.15: the dashboard's CI-failures listing. `state`
 /// filters on the stored lifecycle `state` (`open`/`resolved`/`pr_only`),
 /// `bucket` filters on the persisted triage bucket
 /// (`code_fix`/`human_action`/`transient`/`auto_fix`), and `repo` narrows to
@@ -600,7 +600,7 @@ pub async fn distinct_failure_repos(pool: &DbPool) -> Result<Vec<String>> {
 }
 
 /// SPEC-3.5.2: record a PR the agent opened. `salvaged` is true for a timeout-salvage PR
-/// (`Finalized::TimedOut`), false otherwise (CLAUDE-429). Returns its
+/// (`Finalized::TimedOut`), false otherwise. Returns its
 /// `agent_pull_requests` id.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_agent_pr(
@@ -636,7 +636,7 @@ pub async fn record_agent_pr(
     Ok(id)
 }
 
-/// CLAUDE-630: set `id`'s `finished` flag. Called once `finalize` returns
+/// Set `id`'s `finished` flag. Called once `finalize` returns
 /// `Finalized::CodeReview`, fresh or resumed: the run reported success and
 /// the PR was promoted to ready, so there is nothing left for the agent to
 /// do on this PR. Never cleared: a later re-queue that resumes this same PR
@@ -656,8 +656,8 @@ pub async fn mark_finished(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     Ok(())
 }
 
-/// SPEC-3.5.2: clear `id`'s `salvaged` flag: called only from the resumed-success path
-/// (CLAUDE-429), once a resumed run on a salvaged PR finishes successfully.
+/// SPEC-3.5.2: clear `id`'s `salvaged` flag: called only from the resumed-success path,
+/// once a resumed run on a salvaged PR finishes successfully.
 pub async fn clear_salvaged(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         db::q(
@@ -743,7 +743,7 @@ pub async fn agent_pr(
 /// picks whichever row was touched most recently regardless of `state`; a
 /// `closed`/`merged` row from an older PR can easily have a newer
 /// `updated_at` than a currently-`open` row that has not been touched since
-/// it was recorded (CLAUDE-472), so `resolve_pr_resume` would read that stale
+/// it was recorded, so `resolve_pr_resume` would read that stale
 /// row, see `state != "open"`, and fall back to a fresh pickup - opening a
 /// second PR for an issue that still has one open. Preferring any `open` row
 /// first closes that gap.
@@ -764,7 +764,7 @@ pub async fn agent_pr_for_issue(
     row.as_ref().map(agent_pr_from_row).transpose()
 }
 
-/// SPEC-3.3.1 / SPEC-3.5.2: every `agent_pull_requests` row still `open`, for the CLAUDE-328
+/// SPEC-3.3.1 / SPEC-3.5.2: every `agent_pull_requests` row still `open`, for the 
 /// reconciler: a webhook is the low-latency trigger for automerge, but a
 /// missed delivery must not leave a green PR stuck at Code Review forever, so
 /// the reconciler walks this list on its own tick independent of any webhook.
@@ -793,7 +793,7 @@ pub async fn bump_fix_attempts(pool: &DbPool, id: i64, now: &str) -> Result<()> 
     Ok(())
 }
 
-/// CLAUDE-550: record one dispatched automerge conflict auto-resolve run on
+/// Record one dispatched automerge conflict auto-resolve run on
 /// row `id`: bump `conflict_resolve_attempts` and stamp
 /// `conflict_resolve_started_at` with `now`, marking it in flight.
 pub async fn begin_conflict_resolve(pool: &DbPool, id: i64, now: &str) -> Result<()> {
@@ -810,7 +810,7 @@ pub async fn begin_conflict_resolve(pool: &DbPool, id: i64, now: &str) -> Result
     Ok(())
 }
 
-/// CLAUDE-550: a conflict auto-resolve run on `(host, repo, pr_number)`
+/// A conflict auto-resolve run on `(host, repo, pr_number)`
 /// finished: clear its in-flight stamp and record the paths it left
 /// unresolved (empty when it resolved them, or when the run never got far
 /// enough to tell). A PR with no row (not an agent PR) is a no-op.
@@ -898,7 +898,7 @@ mod tests {
     }
 
     /// [`seed_failure`] plus a persisted triage bucket, for tests of the
-    /// SPEC-4.3.15 / CLAUDE-598 bucket filter.
+    /// SPEC-4.3.15 bucket filter.
     #[allow(clippy::too_many_arguments)]
     async fn seed_failure_with_bucket(
         pool: &DbPool,
@@ -1224,7 +1224,7 @@ mod tests {
         .await
         .unwrap();
 
-        set_issue(&pool, id, Some("CLAUDE-999"), "2026-09-02T00:00:00Z")
+        set_issue(&pool, id, Some("PROJ-999"), "2026-09-02T00:00:00Z")
             .await
             .unwrap();
         set_failure_state(&pool, id, "resolved", "2026-09-03T00:00:00Z")
@@ -1232,7 +1232,7 @@ mod tests {
             .unwrap();
 
         let failure = get_failure(&pool, id).await.unwrap().unwrap();
-        assert_eq!(failure.issue_key, Some("CLAUDE-999".to_string()));
+        assert_eq!(failure.issue_key, Some("PROJ-999".to_string()));
         assert_eq!(failure.state, "resolved");
         assert_eq!(failure.updated_at, "2026-09-03T00:00:00Z");
     }
@@ -1243,11 +1243,11 @@ mod tests {
         let id = record_agent_pr(
             &pool,
             "youtrack",
-            "CLAUDE-42",
+            "PROJ-42",
             "dev.a8n.run",
             "contoso/claude-run",
             17,
-            "fix/CLAUDE-42",
+            "fix/PROJ-42",
             "open",
             false,
             "2026-09-01T00:00:00Z",
@@ -1263,7 +1263,7 @@ mod tests {
         assert_eq!(by_pr.fix_attempts, 0);
         assert!(!by_pr.salvaged);
 
-        let by_issue = agent_pr_for_issue(&pool, "CLAUDE-42")
+        let by_issue = agent_pr_for_issue(&pool, "PROJ-42")
             .await
             .unwrap()
             .unwrap();
@@ -1285,7 +1285,7 @@ mod tests {
         assert_eq!(after.updated_at, "2026-09-03T00:00:00Z");
     }
 
-    /// CLAUDE-472: an issue that has accumulated more than one
+    /// An issue that has accumulated more than one
     /// `agent_pull_requests` row over its lifetime (an earlier PR closed or
     /// superseded, then a later one opened) must still resume its genuinely
     /// `open` PR even when an older, now-`closed` row was touched more
@@ -1300,11 +1300,11 @@ mod tests {
         let old_id = record_agent_pr(
             &pool,
             "youtrack",
-            "CLAUDE-469",
+            "PROJ-469",
             "dev.a8n.run",
             "contoso/claude-run",
             24,
-            "fix/claude-469-github-adopt-open-pr",
+            "fix/proj-469-github-adopt-open-pr",
             "open",
             false,
             "2026-10-01T00:00:00Z",
@@ -1314,11 +1314,11 @@ mod tests {
         let open_id = record_agent_pr(
             &pool,
             "youtrack",
-            "CLAUDE-469",
+            "PROJ-469",
             "dev.a8n.run",
             "contoso/claude-run",
             75,
-            "fix/claude-469-github-adopt-open-pr",
+            "fix/proj-469-github-adopt-open-pr",
             "open",
             true,
             "2026-10-27T22:14:19Z",
@@ -1331,7 +1331,7 @@ mod tests {
             .await
             .unwrap();
 
-        let by_issue = agent_pr_for_issue(&pool, "CLAUDE-469")
+        let by_issue = agent_pr_for_issue(&pool, "PROJ-469")
             .await
             .unwrap()
             .expect("an open row exists for this issue");
@@ -1348,11 +1348,11 @@ mod tests {
         let id = record_agent_pr(
             &pool,
             "youtrack",
-            "CLAUDE-43",
+            "PROJ-43",
             "dev.a8n.run",
             "contoso/claude-run",
             18,
-            "fix/CLAUDE-43",
+            "fix/PROJ-43",
             "open",
             true,
             "2026-09-01T00:00:00Z",
@@ -1384,7 +1384,7 @@ mod tests {
         let id = record_agent_pr(
             &pool,
             "youtrack",
-            "CLAUDE-630",
+            "PROJ-630",
             "dev.a8n.run",
             "contoso/claude-run",
             558,
@@ -1462,7 +1462,7 @@ mod tests {
     }
 
     /// `clear_salvaged` is the only mutator that ever flips `salvaged` to
-    /// false (CLAUDE-429): a state change from any other path, such as a
+    /// false: a state change from any other path, such as a
     /// human clearing a draft's `WIP: ` prefix (which surfaces here only as
     /// a PR state transition, never a direct column write), leaves it set.
     #[tokio::test]
@@ -1471,11 +1471,11 @@ mod tests {
         let id = record_agent_pr(
             &pool,
             "youtrack",
-            "CLAUDE-43",
+            "PROJ-43",
             "dev.a8n.run",
             "contoso/claude-run",
             19,
-            "fix/CLAUDE-43",
+            "fix/PROJ-43",
             "open",
             true,
             "2026-09-01T00:00:00Z",
@@ -1507,7 +1507,7 @@ mod tests {
             "checks.yml",
             "test",
             None,
-            Some("CLAUDE-42"),
+            Some("PROJ-42"),
             "open",
             None,
             "2026-09-01T00:00:00Z",
@@ -1515,12 +1515,12 @@ mod tests {
         .await
         .unwrap();
 
-        let found = failure_for_issue(&pool, "CLAUDE-42")
+        let found = failure_for_issue(&pool, "PROJ-42")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(found.id, id);
-        assert_eq!(failure_for_issue(&pool, "CLAUDE-999").await.unwrap(), None);
+        assert_eq!(failure_for_issue(&pool, "PROJ-999").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1532,7 +1532,7 @@ mod tests {
             "checks.yml",
             "test",
             None,
-            Some("CLAUDE-42"),
+            Some("PROJ-42"),
             "open",
             None,
             "2026-09-01T00:00:00Z",

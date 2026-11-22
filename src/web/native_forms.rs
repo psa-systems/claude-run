@@ -133,22 +133,22 @@ pub struct CommonForm {
     pub claude_cwd: String,
     pub claude_allowed_tools: String,
     pub claude_permission_mode: String,
-    /// CLAUDE-239: per-action `--model`; blank inherits the global
+    /// Per-action `--model`; blank inherits the global
     /// `config.claude.model`.
     pub claude_model: String,
-    /// CLAUDE-259: per-action `--effort`; blank inherits the global
+    /// Per-action `--effort`; blank inherits the global
     /// `config.claude.effort`.
     pub claude_effort: String,
-    /// DEV-706: per-action `--autocompact`; blank inherits the global
+    /// Per-action `--autocompact`; blank inherits the global
     /// `config.claude.autocompact`, then the runner's bounded default.
     pub claude_autocompact: String,
     pub limit_max_attempts_per_key: String,
     pub limit_max_runs_per_day: String,
     pub limit_claude_timeout_seconds: String,
     pub limit_daily_budget_usd: String,
-    /// DEV-705: dollars ONE run may spend; blank inherits the daily budget.
+    /// Dollars ONE run may spend; blank inherits the daily budget.
     pub limit_run_budget_usd: String,
-    /// DEV-705: fraction of the per-run budget at which the run warns once.
+    /// Fraction of the per-run budget at which the run warns once.
     pub limit_budget_warn_fraction: String,
     /// Issues one run may create in the tracker.
     pub limit_max_issues_per_run: String,
@@ -303,7 +303,7 @@ fn apply_common(
             &c.limit_budget_warn_fraction,
         )?,
         max_issues_per_run: parse_opt_u32("Max issues per run", &c.limit_max_issues_per_run)?,
-        // The post-success review session (CLAUDE-449) applies only to the
+        // The post-success review session applies only to the
         // `youtrack` kind, which has its own editor (`YoutrackEditForm` in
         // `web/mod.rs`); this shared block backs no kind that runs one.
         review_timeout_seconds: None,
@@ -650,7 +650,7 @@ pub(super) async fn closed_issue_summary_edit_save(
         }
     };
     let form = ClosedIssueSummaryForm::from_pairs(&pairs);
-    // CLAUDE-300: an unparsable base must not become an empty mapping, matching
+    // An unparsable base must not become an empty mapping, matching
     // `youtrack_edit_save`: the save would drop every key the form does not show.
     let raw = std::fs::read_to_string(path).map_err(WebError::from)?;
     let base: serde_yaml::Value = match serde_yaml::from_str(&raw) {
@@ -727,7 +727,7 @@ pub(super) async fn edit_save_for_kind(
 /// daemon has not indexed, or a file that no longer parses, has no structured
 /// editor.
 /// Outcome of resolving an indexed action's file to a parsed [`Action`].
-/// CLAUDE-300: a file that fails to read or fails `validate_str` is
+/// A file that fails to read or fails `validate_str` is
 /// [`IndexedAction::Invalid`], carrying the reason, rather than collapsing into
 /// the same "no form" case as an index entry with no path.
 pub(super) enum IndexedAction {
@@ -738,7 +738,7 @@ pub(super) enum IndexedAction {
 
 /// SPEC-4.3.4: resolves an indexed action to its file path and parsed form,
 /// distinguishing "no structured editor" (`NotIndexed`) from "file no longer
-/// parses" (`Invalid`), per CLAUDE-300.
+/// parses" (`Invalid`),.
 pub(super) async fn indexed_action(s: &WebState, name: &str) -> Result<IndexedAction, WebError> {
     let Some(path) = indexed_action_path(&s.api.pool, name).await? else {
         return Ok(IndexedAction::NotIndexed);
@@ -803,7 +803,7 @@ kind: closed-issue-summary
 enabled: false
 native:
   enabled: false
-  parents: [CLAUDE-100, DELTA-4]
+  parents: [PROJ-100, DELTA-4]
   query: \"-Resolved AI Agent: Reporting\"
   custom_field: Reporter
   done_label: Filed
@@ -920,7 +920,7 @@ limits:
         assert!(!cfg.enabled);
     }
 
-    /// CLAUDE-222: the structured editor renders the shared identity block, so
+    /// The structured editor renders the shared identity block, so
     /// it exposes the `link_template` field with its saved value.
     #[test]
     fn native_editor_renders_the_link_template_field() {
@@ -949,7 +949,7 @@ limits:
         );
     }
 
-    /// CLAUDE-222: `link_template` is a `CommonForm` field, so a native editor
+    /// `link_template` is a `CommonForm` field, so a native editor
     /// can both set it and clear it (a blank box removes the key).
     #[test]
     fn link_template_round_trips_through_the_common_block() {
@@ -978,7 +978,7 @@ limits:
         assert_eq!(after.action.link_template, None);
     }
 
-    /// CLAUDE-259: [`apply_common`] writes the whole `claude:` block when asked,
+    /// [`apply_common`] writes the whole `claude:` block when asked,
     /// so a pinned `effort:` (including a level outside the documented set)
     /// survives verbatim. No shipped kind in this module sets `with_claude:
     /// true` today (`closed-issue-summary` runs no agent session), so this

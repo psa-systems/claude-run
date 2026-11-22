@@ -39,7 +39,7 @@ use crate::error::{Error, Result};
 /// SPEC-5.1.
 pub type DbPool = sqlx::AnyPool;
 
-/// The SQLite chain, twenty files, unchanged since before CLAUDE-250 so an
+/// The SQLite chain, twenty files, unchanged since before the Postgres backend so an
 /// existing `state.db` matches the versions and checksums already in its
 /// `_sqlx_migrations` table and re-runs nothing. SPEC-5.4.
 pub static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
@@ -356,6 +356,63 @@ pub async fn open(target: &DatabaseTarget) -> Result<DbPool> {
     }
 }
 
+/// Rewrite the checksums recorded in `_sqlx_migrations` to those of the
+/// embedded migration files, without running any migration. Used once after an
+/// upgrade that edited already-applied migration files (comments only), which
+/// sqlx otherwise rejects as modified. Fails on a recorded version this build
+/// does not ship or whose description differs, so a database from a different
+/// lineage is never "repaired". Returns the number of rows changed.
+pub async fn refresh_migration_checksums(target: &DatabaseTarget) -> Result<u64> {
+    sqlx::any::install_default_drivers();
+    let (url, migrator) = match target {
+        DatabaseTarget::Sqlite(path) => (
+            format!("sqlite://{}?mode=rw", path.display()),
+            &SQLITE_MIGRATOR,
+        ),
+        DatabaseTarget::Postgres(url) => (url.clone(), &POSTGRES_MIGRATOR),
+    };
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect_with(AnyConnectOptions::from_str(&url)?)
+        .await?;
+    let rows: Vec<(i64, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, description, checksum FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await?;
+    let update = q(
+        &pool,
+        "UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?",
+    );
+    let mut changed = 0;
+    for (version, description, recorded) in rows {
+        let Some(shipped) = migrator.iter().find(|m| m.version == version) else {
+            return Err(anyhow::anyhow!(
+                "applied migration {version} ({description}) is not shipped by this build"
+            )
+            .into());
+        };
+        if shipped.description != description {
+            return Err(anyhow::anyhow!(
+                "applied migration {version} is `{description}` but this build ships `{}`",
+                shipped.description
+            )
+            .into());
+        }
+        if recorded.as_slice() == shipped.checksum.as_ref() {
+            continue;
+        }
+        let result = sqlx::query(sqlx::AssertSqlSafe(update.to_string()))
+            .bind(shipped.checksum.as_ref().to_vec())
+            .bind(version)
+            .execute(&pool)
+            .await?;
+        changed += result.rows_affected();
+    }
+    pool.close().await;
+    Ok(changed)
+}
+
 /// Convenience for the many tests and CLI paths that just want the SQLite
 /// file. SPEC-5.4.
 pub async fn open_sqlite(db_path: &Path) -> Result<DbPool> {
@@ -478,10 +535,10 @@ const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 /// are built with. In production it is [`POOL_ACQUIRE_TIMEOUT`] (30s): an
 /// acquire that waits that long is a real stuck pool and should fail fast.
 /// Under `cfg(test)` it is raised to 120s, matching the test-fixture pools'
-/// own rationale (CLAUDE-524): on a contended CI host a connection can take
+/// own rationale: on a contended CI host a connection can take
 /// far longer than 30s to free purely from scheduler/IO starvation, not a
 /// stuck pool (SPEC-10.1.4 slow-IO class), which was tripping the file-backed
-/// SQLite pool these tests open at 30s (CLAUDE-542). The production binary is
+/// SQLite pool these tests open at 30s. The production binary is
 /// not built with `cfg(test)`, so it keeps the 30s fail-fast behaviour.
 fn pool_acquire_timeout() -> Duration {
     if cfg!(test) {
@@ -610,8 +667,8 @@ pub async fn test_pool() -> DbPool {
 /// second connection to `sqlite::memory:` is a second, empty database. A test
 /// that drops a transaction on this pool releases the connection only once
 /// sqlx's background rollback finishes, and under the CPU contention of a
-/// full-suite run that rollback can be scheduled well behind the 30s default
-/// (CLAUDE-524); the queries themselves are in-memory and instant, so a
+/// full-suite run that rollback can be scheduled well behind the 30s default;
+/// the queries themselves are in-memory and instant, so a
 /// longer acquire timeout only tolerates scheduler starvation, not a real
 /// stuck pool.
 #[cfg(test)]
@@ -764,7 +821,7 @@ async fn connect_maintenance(url: &str) -> sqlx::AnyConnection {
 /// Builds the per-process template database once and returns its name: a
 /// database migrated to the full end schema that every fixture then clones
 /// with `CREATE DATABASE ... TEMPLATE`, a block copy far cheaper than
-/// replaying the migration set per test (CLAUDE-540). Refuses a live runner
+/// replaying the migration set per test. Refuses a live runner
 /// database here, once per process, before creating anything, by checking the
 /// maintenance database's own `public._sqlx_migrations` (SPEC-5.6.6). The
 /// `OnceCell` holds only the template's name (not a live connection), so the
@@ -825,8 +882,8 @@ async fn ensure_template(url: &str) -> &'static str {
 /// capacity-constrained pool here (most acutely `max_connections(1)` via
 /// [`test_pg_pool_single_connection`]) is exposed to the identical race, a
 /// dropped transaction's background rollback losing to full-suite CPU
-/// contention, just on the Postgres leg of CI instead of the SQLite one
-/// (CLAUDE-524). A connect failure panics with the server's state attached
+/// contention, just on the Postgres leg of CI instead of the SQLite one.
+/// A connect failure panics with the server's state attached
 /// (SPEC-5.6.12), since it carries the same "what was the server doing"
 /// question as a clone failure. SPEC-5.6.1.
 #[cfg(test)]
@@ -979,8 +1036,7 @@ fn drop_database_when_closed(pool: &DbPool, url: &str, database: &str) {
                                         // the server can lag reaping the last backends, which
                                         // makes DROP DATABASE hit 55006 ("being accessed by
                                         // other users") and burn the retry window per drop,
-                                        // starving the single-connection worker (CLAUDE-540,
-                                        // run #751/#752). pg_terminate_backend is the
+                                        // starving the single-connection worker (// run #751/#752). pg_terminate_backend is the
                                         // sanctioned way to drop a test database promptly; no
                                         // DROP DATABASE ... (FORCE). Best effort: ignore its
                                         // result, the retry below still covers a residual race.
@@ -1228,6 +1284,26 @@ mod tests {
         rewrite(Dialect::Sqlite, sql).into_owned()
     }
 
+    #[tokio::test]
+    async fn refresh_repairs_a_modified_migration_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let pool = open_sqlite(&path).await.unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = x'00' WHERE version = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        assert!(
+            open_sqlite(&path).await.is_err(),
+            "a stale checksum must fail the migrator"
+        );
+        let target = DatabaseTarget::Sqlite(path.clone());
+        assert_eq!(refresh_migration_checksums(&target).await.unwrap(), 1);
+        open_sqlite(&path).await.unwrap();
+        assert_eq!(refresh_migration_checksums(&target).await.unwrap(), 0);
+    }
+
     #[test]
     fn sqlite_is_passed_through_untouched() {
         let sql = "SELECT lower(a) FROM t WHERE b = ?1 AND c = ?";
@@ -1430,7 +1506,7 @@ mod tests {
     /// other fixture in the suite exercises; here the drop is driven directly
     /// (the worker's own terminate-then-drop sequence) so the assertion is
     /// deterministic rather than racing that single-connection worker under
-    /// full-suite load on a contended runner (CLAUDE-540).
+    /// full-suite load on a contended runner.
     #[tokio::test]
     async fn a_fixture_database_has_no_bookkeeping_and_its_drop_path_removes_it() {
         use sqlx::Connection;
@@ -1618,7 +1694,7 @@ mod tests {
         prefixes
     }
 
-    /// CLAUDE-540: the Postgres CI leg re-runs only the test files that touch a
+    /// The Postgres CI leg re-runs only the test files that touch a
     /// DB pool (`scripts/postgres-test-filters.txt`), so pure-logic tests are
     /// not re-run on Postgres. This fails if a source file gains a DB test (a
     /// call to one of the fixture entrypoints) that no filter in that file
@@ -1658,7 +1734,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-436 regression: a NULL utilization bind declares the `Any`
+    /// Regression: a NULL utilization bind declares the `Any`
     /// driver's cached-statement parameter type `float4`; a later non-NULL
     /// bind on the SAME connection must not reuse that cached Parse, or
     /// Postgres rejects the 8-byte `float8` value with 22P03. A
@@ -1724,7 +1800,7 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    /// CLAUDE-529: forces a real `sqlx::Error::PoolTimedOut` out of a
+    /// Forces a real `sqlx::Error::PoolTimedOut` out of a
     /// one-connection pool (hold its only connection, then acquire again
     /// under a short timeout) and asserts the mapped message names the pool,
     /// the configured timeout, and the pool's live size and idle count,
@@ -1765,7 +1841,7 @@ mod tests {
     /// proven on both backends per the acceptance criteria. Unlike the
     /// SQLite variant, `connect()` here opens a real network connection, so
     /// the pool itself is built with the same 120s `acquire_timeout` as
-    /// `test_sqlite_pool` and `pool_on_database` (CLAUDE-524): under
+    /// `test_sqlite_pool` and `pool_on_database`: under
     /// full-suite CPU/connection contention that connect can take well
     /// over the 50ms this test needs to deliberately force the *second*
     /// acquire to time out, which was flaking CI (connect itself tripping

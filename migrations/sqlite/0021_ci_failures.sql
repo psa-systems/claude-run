@@ -1,4 +1,4 @@
--- CLAUDE-272: the CI-failure store. Records a failure's failing-test
+-- The CI-failure store. Records a failure's failing-test
 -- fingerprint, every run it was seen on, and the PRs the agent opens against
 -- it, so a later failure can be matched by test-id overlap instead of a
 -- YouTrack full-text search that misses an unindexed issue.

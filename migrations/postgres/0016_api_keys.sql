@@ -1,4 +1,4 @@
--- CLAUDE-636: peer API keys, generated from the Secrets page so an instance
+-- Peer API keys, generated from the Secrets page so an instance
 -- with accounts and no `web.auth_token_ref` can mint a credential for a peer
 -- to call `/api/peer/*` with, with no `config.toml` edit and no restart.
 --

@@ -5,26 +5,24 @@ Durable direction and reasoning only. Status lives in YouTrack; each item links 
 ## CI-failure pipeline
 
 The current behaviour is drawn in [`ci-failure-pipeline.md`](ci-failure-pipeline.md). This section is the plan for
-changing it. The epic, CLAUDE-270, carries the same proposal in YouTrack; status lives there and on each issue below.
+changing it. The epic, carries the same proposal in YouTrack; status lives there and on each issue below.
 
 ### Tracker
 
-Epic: CLAUDE-270.
-
-1. CLAUDE-271: document the current pipeline and this redesign in `docs/`.
-2. CLAUDE-272: a CI-failure store in the runner database (failing-test fingerprints, attached runs, agent PRs). It
+1. document the current pipeline and this redesign in `docs/`.
+2. a CI-failure store in the runner database (failing-test fingerprints, attached runs, agent PRs). It
    comes first because every step below reads it.
-3. CLAUDE-273: dedupe by failing-test overlap, reopen a regression, always file a code failure.
-4. CLAUDE-274: one analysis at ingest on a bounded worker pool, routing by its verdict.
-5. CLAUDE-275: the `youtrack` action records the PR it opens and continues it when its issue is re-queued.
-6. CLAUDE-276: route a failure on an open PR by who opened it.
-7. CLAUDE-277: close an issue when its fix PR merges green (later superseded by CLAUDE-327: a YouTrack workflow
+3. dedupe by failing-test overlap, reopen a regression, always file a code failure.
+4. one analysis at ingest on a bounded worker pool, routing by its verdict.
+5. the `youtrack` action records the PR it opens and continues it when its issue is re-queued.
+6. route a failure on an open PR by who opened it.
+7. close an issue when its fix PR merges green (later superseded: a YouTrack workflow
    resolves the issue, not the runner).
-8. CLAUDE-278: automerge on the run-succeeded event instead of a polling wait.
-9. CLAUDE-279: retire `ci-failure-reconcile`, the scheduled `ci-failure-analysis`, and `forgejo-ci-fix`, once their
+8. automerge on the run-succeeded event instead of a polling wait.
+9. retire `ci-failure-reconcile`, the scheduled `ci-failure-analysis`, and `forgejo-ci-fix`, once their
    replacements have landed.
 
-Related outside this repository: GAMMA-1177 (make app-server's integration suite fast enough to require).
+Related outside this repository: making app-server's integration suite fast enough to require.
 
 ### Problems as reported
 
@@ -44,7 +42,7 @@ Related outside this repository: GAMMA-1177 (make app-server's integration suite
 5. **The reason for the split is gone.** Analysis was moved to a scheduled action because run logs were not readable
    when the webhook arrived. The webhook now fetches every job's log itself.
 6. **Recovery is polled, and the poll can never succeed for PR-only workflows.** Reconcile closes a code issue only when
-   the job is green on `main`. `app-server`'s `integration.yml` runs on `pull_request` only (DEV-612), so its issues
+   the job is green on `main`. `app-server`'s `integration.yml` runs on `pull_request` only, so its issues
    never close.
 7. **The ingest consumer is serial**, so slow work added to it delays every event behind it.
 8. **An agent's own failing PR is dropped.** The open-PR check suppresses it, automerge waits 300s for a suite that takes
@@ -55,10 +53,10 @@ Related outside this repository: GAMMA-1177 (make app-server's integration suite
 
 Four PRs (#760, #761, #763, #764) were each merged before their integration run finished. All four runs failed on the
 same invitation tests, a defect already on `main`. Because each PR was merged, the open-PR check passed; because each
-branch differs, dedupe did not match. That created GAMMA-1169, GAMMA-1170, GAMMA-1174 and GAMMA-1175, and queued four agents
-on one bug, three of them against branches that no longer existed. The GAMMA-1174 agent opened PR 766 from `main`. Its
+branch differs, dedupe did not match. That created four issues and queued four agents
+on one bug, three of them against branches that no longer existed. One of those agents opened PR 766 from `main`. Its
 run 5874 still failed three of the tests; the webhook dropped it at the open-PR check, automerge timed out, and nothing
-else acted on it. While this was being written, run 5880 on PR #765 minted and queued a fifth issue, GAMMA-1176.
+else acted on it. While this was being written, run 5880 on PR #765 minted and queued a fifth issue.
 
 ### Proposed workflow
 
@@ -111,7 +109,7 @@ flowchart TD
 Orange-bordered steps call `claude`. Analysis runs on a bounded worker pool fed by the webhook, not inside the serial
 consumer, and only for a fingerprint the runner has not seen.
 
-CLAUDE-327 supersedes step P3 above: the runner no longer closes the issue itself. A YouTrack workflow
+Step P3 above is superseded: the runner no longer closes the issue itself. A YouTrack workflow
 (`docs/yt-workflow-resolve-on-pr-merge.js`) resolves any issue whose own PR merges, so P3 is now "mark the PR's own
 `agent_pull_requests` row merged; the YouTrack workflow resolves the issue". A CI-failure match against an `open`
 row whose issue the workflow already resolved is read at match time and handled as step D3 (reopen as a regression),
@@ -125,7 +123,7 @@ not as a silent no-op.
 | Dedupe by YouTrack full-text search on branch-scoped markers                              | Fingerprint table in the runner's database, branch-agnostic, exact and immediate                        |
 | A failure matching a resolved issue is dropped silently                                   | The issue is reopened as a regression                                                                   |
 | `webhook.auto_fix` off drops code failures; the open-PR check drops them silently         | Every code defect gets an issue; a human's PR gets the analysis as a PR comment                          |
-| `ci-failure-reconcile` collapses duplicates and polls for green on `main`                 | Removed: duplicates cannot form; a YouTrack workflow resolves an issue when its own PR merges (CLAUDE-327) |
+| `ci-failure-reconcile` collapses duplicates and polls for green on `main`                 | Removed: duplicates cannot form; a YouTrack workflow resolves an issue when its own PR merges |
 | `forgejo-ci-fix` iterates on the bot's PRs, matched by login string                       | Removed: a failure on an agent PR goes back to its source issue, identified by the runner's own PR record |
 | Automerge polls for 300s                                                                  | A "run succeeded" event triggers automerge                                                              |
 | A PR merged before its CI finished leaves the failure on a dead branch                    | A failure with no open PR belongs to `main`, and the fix branches from `main`                           |
@@ -150,6 +148,6 @@ One issue and one agent thread, instead of four issues, four agents, and a stuck
    the fix is done when every test passes.
 2. **Fix-attempt cap on an agent PR: 3.**
 3. **The integration check is not required before merge yet.** In `app-server` it takes about half an hour, which
-   is too long to hold a merge on. Making it fast enough to require is tracked in GAMMA-1177. The proposal handles a PR
+   is too long to hold a merge on. Making it fast enough to require is separate work. The proposal handles a PR
    merged before its CI finished either way.
 4. **A human's PR always gets the analysis comment.**

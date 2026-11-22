@@ -111,7 +111,7 @@ fn listed_label(
         "pr_create" => Some("PR ready".to_string()),
         "conflict_resolution" => Some("Conflict resolution".to_string()),
         // A `ci_wait` outside the `ci-remediation` stage is the finalize-time
-        // status read (CLAUDE-549), not a remediation step: it only adds time.
+        // status read, not a remediation step: it only adds time.
         "ci_wait" if stage == "ci-remediation" => {
             counts.ci_remediation += 1;
             Some(format!("CI remediation {}", counts.ci_remediation))
@@ -672,7 +672,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-603 / SPEC-3.15 item 6, SPEC-8.8: a push comment renders the
+    /// SPEC-3.15 item 6, SPEC-8.8: a push comment renders the
     /// stashed rows with its own line marked, and the next checkpoint is
     /// numbered after the stored ones.
     #[test]
@@ -917,7 +917,7 @@ mod tests {
         assert!(list.contains("| 3 | Final commit |  |  |  |  |"), "{list}");
     }
 
-    /// CLAUDE-597: a `ci_wait` row lists as `CI remediation N` only in the
+    /// A `ci_wait` row lists as `CI remediation N` only in the
     /// `ci-remediation` stage; the finalize-time status read adds time only.
     #[test]
     fn ci_wait_lists_only_in_the_ci_remediation_stage() {

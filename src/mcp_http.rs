@@ -1,7 +1,7 @@
-//! SPEC-4.5: the Streamable HTTP MCP listener (CLAUDE-442).
+//! SPEC-4.5: the Streamable HTTP MCP listener.
 //!
 //! Serves the same eight read-only tools as `claude-run mcp stdio`
-//! (`src/mcp.rs`, CLAUDE-437) over `/mcp`, behind the `mcp-web` crate's
+//! (`src/mcp.rs`) over `/mcp`, behind the `mcp-web` crate's
 //! local-account + OAuth 2.1 bearer layer, so a remote client can reach them
 //! without `docker compose exec`. `McpServer` (`src/mcp.rs`) is already
 //! transport-agnostic: this module only wraps it in an `rmcp`

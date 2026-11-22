@@ -769,7 +769,7 @@ fn dir_size_checked(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-// ---- Shared Cargo target directory per-repo ceiling (CLAUDE-512) ----------
+// ---- Shared Cargo target directory per-repo ceiling ----------
 
 /// `SPEC-3.10` item 6: walk the immediate subdirectories of `base` (each one
 /// a `repo_slug()`-named shared `cargo-target/<repo-slug>` directory) and
@@ -854,7 +854,7 @@ pub fn sweep_cargo_cache(
     stats
 }
 
-// ---- Docker sidecar named-volume sweep (CLAUDE-433) -----------------------
+// ---- Docker sidecar named-volume sweep -----------------------
 
 /// SPEC-3.8.5: name prefix of a buildx state volume. Never removed: it is
 /// buildkit's own cache, not a stack artifact, and recreating it is far more
@@ -1384,7 +1384,7 @@ pub fn sweep_docker_volumes(
     stats
 }
 
-// ---- Docker sidecar storage ceiling (SPEC-3.11, CLAUDE-516) ---------------
+// ---- Docker sidecar storage ceiling (SPEC-3.11) ---------------
 
 /// One SPEC-3.11 reclaim step's result, for the "category, bytes reclaimed,
 /// size before and after" line each step logs.
@@ -1628,8 +1628,8 @@ pub fn reclaim_docker_storage(
     stats
 }
 
-// ---- Docker sidecar storage: manual per-category prune (SPEC-3.11 item 4,
-// CLAUDE-517) ----------------------------------------------------------------
+// ---- Docker sidecar storage: manual per-category prune (SPEC-3.11 item 4)
+// ----------------------------------------------------------------------------
 
 /// SPEC-3.11 item 4: remove every stopped container with NO age filter, for
 /// an operator-confirmed Status page prune of one category. Unlike
@@ -1768,7 +1768,7 @@ mod tests {
     #[test]
     fn stale_workdir_is_swept() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-1", 100);
+        let dir = make_workdir(tmp.path(), "youtrack", "PROJ-1", 100);
         // 30 days "from now": older than the 14-day window.
         let now = SystemTime::now() + days(30);
         let stats = sweep(tmp.path(), &cfg(true), now, |_| false);
@@ -1781,7 +1781,7 @@ mod tests {
     #[test]
     fn fresh_workdir_is_kept() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-2", 10);
+        let dir = make_workdir(tmp.path(), "youtrack", "PROJ-2", 10);
         // "now" is real now, so the dir's age is ~0: inside the window.
         let stats = sweep(tmp.path(), &cfg(true), SystemTime::now(), |_| false);
         assert!(dir.exists(), "a fresh workdir must be kept");
@@ -1792,7 +1792,7 @@ mod tests {
     #[test]
     fn unpushed_workdir_kept_until_hard_cap() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-3", 10);
+        let dir = make_workdir(tmp.path(), "youtrack", "PROJ-3", 10);
 
         // 30 days old: past the 14-day window but under the 60-day hard cap.
         // With unpushed commits it is respected (kept).
@@ -1822,7 +1822,7 @@ mod tests {
         // The `<key>.kept-<n>` aside dirs are siblings of key dirs under the
         // same source dir, so the `<base>/*/*` walk catches them.
         let tmp = tempfile::tempdir().unwrap();
-        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-4.kept-1", 10);
+        let dir = make_workdir(tmp.path(), "youtrack", "PROJ-4.kept-1", 10);
         let stats = sweep(tmp.path(), &cfg(true), SystemTime::now() + days(30), |_| {
             false
         });
@@ -1833,7 +1833,7 @@ mod tests {
     #[test]
     fn disabled_sweep_deletes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-5", 10);
+        let dir = make_workdir(tmp.path(), "youtrack", "PROJ-5", 10);
         let stats = sweep(
             tmp.path(),
             &cfg(false),
@@ -1865,7 +1865,7 @@ mod tests {
     #[test]
     fn fresh_kept_dir_keeps_target() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-6", 10);
+        let dir = make_workdir(tmp.path(), "youtrack", "PROJ-6", 10);
         add_target(&dir, 500);
         // "now" is real now: under the one-day target-removal threshold too.
         let stats = sweep(tmp.path(), &cfg(true), SystemTime::now(), |_| false);
@@ -1882,7 +1882,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // 2 days old: past the one-day target-removal threshold but under the
         // 14-day retention window, so the workdir itself is kept.
-        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-7", 10);
+        let dir = make_workdir(tmp.path(), "youtrack", "PROJ-7", 10);
         add_target(&dir, 500);
         let stats = sweep(tmp.path(), &cfg(true), SystemTime::now() + days(2), |_| {
             false
@@ -1901,7 +1901,7 @@ mod tests {
     #[test]
     fn unpushed_workdir_past_one_day_loses_target_but_keeps_rest() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-8", 10);
+        let dir = make_workdir(tmp.path(), "youtrack", "PROJ-8", 10);
         add_target(&dir, 500);
         // 30 days old: past the 14-day window but under the 60-day hard cap,
         // and holding local-only work, so the whole workdir is kept - but
@@ -1927,14 +1927,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let dir = make_workdir(tmp.path(), "youtrack", "CLAUDE-9", 10);
+        let dir = make_workdir(tmp.path(), "youtrack", "PROJ-9", 10);
         add_target(&dir, 500);
         // Strip write permission on the workdir itself (read+search only, no
         // exec-bit script semantics involved): removing the `target` entry
         // from within it requires write access to its parent, so
         // `remove_dir_all` on `target/` fails with EACCES. The mode is kept
         // in a variable rather than inline so this read-only-directory test
-        // is not mistaken by tooling for CLAUDE-255's "chmod a script
+        // is not mistaken by tooling for the "chmod a script
         // executable" shape, which is a different hazard entirely.
         let read_only = 0o500 + 0o055;
         let read_write = 0o700 + 0o055;
@@ -1994,7 +1994,7 @@ mod tests {
     #[test]
     fn stale_stream_log_is_swept() {
         let tmp = tempfile::tempdir().unwrap();
-        let log = make_stream_log(tmp.path(), "youtrack", "CLAUDE-1", 1, 4096);
+        let log = make_stream_log(tmp.path(), "youtrack", "PROJ-1", 1, 4096);
         // 60 days "from now": older than the 30-day window.
         let stats = sweep_stream_logs(
             tmp.path(),
@@ -2014,7 +2014,7 @@ mod tests {
     #[test]
     fn fresh_stream_log_is_kept() {
         let tmp = tempfile::tempdir().unwrap();
-        let log = make_stream_log(tmp.path(), "youtrack", "CLAUDE-2", 1, 10);
+        let log = make_stream_log(tmp.path(), "youtrack", "PROJ-2", 1, 10);
         let stats = sweep_stream_logs(
             tmp.path(),
             &log_cfg(true),
@@ -2031,13 +2031,13 @@ mod tests {
     #[test]
     fn in_flight_stream_log_is_kept_regardless_of_age() {
         let tmp = tempfile::tempdir().unwrap();
-        let live = make_stream_log(tmp.path(), "youtrack", "CLAUDE-3", 2, 10);
-        let done = make_stream_log(tmp.path(), "youtrack", "CLAUDE-4", 1, 10);
+        let live = make_stream_log(tmp.path(), "youtrack", "PROJ-3", 2, 10);
+        let done = make_stream_log(tmp.path(), "youtrack", "PROJ-4", 1, 10);
         let stats = sweep_stream_logs(
             tmp.path(),
             &log_cfg(true),
             SystemTime::now() + days(365),
-            &in_flight(&[("youtrack", "CLAUDE-3")]),
+            &in_flight(&[("youtrack", "PROJ-3")]),
         );
         assert!(
             live.exists(),
@@ -2053,12 +2053,12 @@ mod tests {
     #[test]
     fn in_flight_guard_is_scoped_to_its_action() {
         let tmp = tempfile::tempdir().unwrap();
-        let other = make_stream_log(tmp.path(), "YouTrack", "CLAUDE-3", 1, 10);
+        let other = make_stream_log(tmp.path(), "YouTrack", "PROJ-3", 1, 10);
         let stats = sweep_stream_logs(
             tmp.path(),
             &log_cfg(true),
             SystemTime::now() + days(365),
-            &in_flight(&[("youtrack", "CLAUDE-3")]),
+            &in_flight(&[("youtrack", "PROJ-3")]),
         );
         assert!(!other.exists(), "another action's aged log is swept");
         assert_eq!(stats.deleted, 1);
@@ -2067,7 +2067,7 @@ mod tests {
     #[test]
     fn disabled_stream_log_sweep_deletes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let log = make_stream_log(tmp.path(), "youtrack", "CLAUDE-5", 1, 10);
+        let log = make_stream_log(tmp.path(), "youtrack", "PROJ-5", 1, 10);
         let stats = sweep_stream_logs(
             tmp.path(),
             &log_cfg(false),
@@ -2138,7 +2138,7 @@ mod tests {
     fn aged_review_evidence_and_retry_files_are_swept() {
         let tmp = tempfile::tempdir().unwrap();
         let (evidence, evidence_retry, review_log_retry) =
-            make_review_evidence_and_retry_files(tmp.path(), "youtrack", "CLAUDE-6", 1);
+            make_review_evidence_and_retry_files(tmp.path(), "youtrack", "PROJ-6", 1);
         let stats = sweep_stream_logs(
             tmp.path(),
             &log_cfg(true),
@@ -2187,12 +2187,12 @@ mod tests {
     fn in_flight_review_evidence_and_retry_files_are_kept_regardless_of_age() {
         let tmp = tempfile::tempdir().unwrap();
         let (evidence, evidence_retry, review_log_retry) =
-            make_review_evidence_and_retry_files(tmp.path(), "youtrack", "CLAUDE-7", 1);
+            make_review_evidence_and_retry_files(tmp.path(), "youtrack", "PROJ-7", 1);
         let stats = sweep_stream_logs(
             tmp.path(),
             &log_cfg(true),
             SystemTime::now() + days(365),
-            &in_flight(&[("youtrack", "CLAUDE-7")]),
+            &in_flight(&[("youtrack", "PROJ-7")]),
         );
         assert!(evidence.exists(), "an in-flight evidence file must be kept");
         assert!(
@@ -2215,7 +2215,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("youtrack").join("streams");
         std::fs::create_dir_all(&dir).unwrap();
-        let mystery = dir.join("CLAUDE-8-attempt-1-mystery.txt");
+        let mystery = dir.join("PROJ-8-attempt-1-mystery.txt");
         std::fs::write(&mystery, b"???").unwrap();
         let (stats, logs) = crate::testutil::capture_logs(|| {
             sweep_stream_logs(
@@ -2232,7 +2232,7 @@ mod tests {
         assert_eq!(stats.deleted, 1);
         assert!(logs.contains("WARN"), "{logs}");
         assert!(
-            logs.contains("CLAUDE-8-attempt-1-mystery.txt"),
+            logs.contains("PROJ-8-attempt-1-mystery.txt"),
             "the warn log must name the file: {logs}"
         );
     }
@@ -2252,7 +2252,7 @@ mod tests {
     #[test]
     fn stale_snippet_dir_is_swept() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = make_snippet_dir(tmp.path(), "youtrack", "CLAUDE-1", 100);
+        let dir = make_snippet_dir(tmp.path(), "youtrack", "PROJ-1", 100);
         let stats = sweep_snippets(
             tmp.path(),
             &log_cfg(true),
@@ -2271,7 +2271,7 @@ mod tests {
     #[test]
     fn fresh_snippet_dir_is_kept() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = make_snippet_dir(tmp.path(), "youtrack", "CLAUDE-2", 10);
+        let dir = make_snippet_dir(tmp.path(), "youtrack", "PROJ-2", 10);
         let stats = sweep_snippets(
             tmp.path(),
             &log_cfg(true),
@@ -2289,13 +2289,13 @@ mod tests {
     #[test]
     fn in_flight_snippet_dir_is_kept_regardless_of_age() {
         let tmp = tempfile::tempdir().unwrap();
-        let live = make_snippet_dir(tmp.path(), "youtrack", "CLAUDE-3", 10);
-        let done = make_snippet_dir(tmp.path(), "youtrack", "CLAUDE-4", 10);
+        let live = make_snippet_dir(tmp.path(), "youtrack", "PROJ-3", 10);
+        let done = make_snippet_dir(tmp.path(), "youtrack", "PROJ-4", 10);
         let stats = sweep_snippets(
             tmp.path(),
             &log_cfg(true),
             SystemTime::now() + days(365),
-            &in_flight(&[("youtrack", "CLAUDE-3")]),
+            &in_flight(&[("youtrack", "PROJ-3")]),
         );
         assert!(
             live.exists(),
@@ -2312,7 +2312,7 @@ mod tests {
     #[test]
     fn disabled_snippet_sweep_deletes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = make_snippet_dir(tmp.path(), "youtrack", "CLAUDE-5", 10);
+        let dir = make_snippet_dir(tmp.path(), "youtrack", "PROJ-5", 10);
         let stats = sweep_snippets(
             tmp.path(),
             &log_cfg(false),
@@ -2525,7 +2525,7 @@ mod tests {
     #[test]
     fn the_size_pass_never_touches_a_stream_log() {
         let tmp = tempfile::tempdir().unwrap();
-        let log = make_stream_log(tmp.path(), "youtrack", "CLAUDE-1", 1, 40_000);
+        let log = make_stream_log(tmp.path(), "youtrack", "PROJ-1", 1, 40_000);
         let stats = sweep_oversized_logs(tmp.path(), &size_cfg(10_000, 10_000));
         assert_eq!(std::fs::metadata(&log).unwrap().len(), 40_000);
         assert_eq!(stats, BoundStats::default());
@@ -2650,8 +2650,8 @@ mod tests {
     #[test]
     fn streams_file_key_parses_only_our_shapes() {
         assert_eq!(
-            streams_file_key("CLAUDE-9-attempt-2.jsonl").as_deref(),
-            Some("CLAUDE-9")
+            streams_file_key("PROJ-9-attempt-2.jsonl").as_deref(),
+            Some("PROJ-9")
         );
         // A key that itself contains the separator: the LAST one wins.
         assert_eq!(
@@ -2659,29 +2659,29 @@ mod tests {
             Some("odd-attempt-key")
         );
         assert_eq!(
-            streams_file_key("CLAUDE-9-attempt-2-review.jsonl").as_deref(),
-            Some("CLAUDE-9")
+            streams_file_key("PROJ-9-attempt-2-review.jsonl").as_deref(),
+            Some("PROJ-9")
         );
         assert_eq!(
-            streams_file_key("CLAUDE-9-attempt-2-review.jsonl-retry").as_deref(),
-            Some("CLAUDE-9")
+            streams_file_key("PROJ-9-attempt-2-review.jsonl-retry").as_deref(),
+            Some("PROJ-9")
         );
         assert_eq!(
-            streams_file_key("CLAUDE-9-attempt-2-review-evidence.md").as_deref(),
-            Some("CLAUDE-9")
+            streams_file_key("PROJ-9-attempt-2-review-evidence.md").as_deref(),
+            Some("PROJ-9")
         );
         assert_eq!(
-            streams_file_key("CLAUDE-9-attempt-2-review-evidence.md-retry").as_deref(),
-            Some("CLAUDE-9")
+            streams_file_key("PROJ-9-attempt-2-review-evidence.md-retry").as_deref(),
+            Some("PROJ-9")
         );
         // The SPEC-3.3.2 gate's stored output.
         assert_eq!(
             streams_file_key("DEMO-9-attempt-2-gate.log").as_deref(),
             Some("DEMO-9")
         );
-        assert_eq!(streams_file_key("CLAUDE-9-attempt-bogus.jsonl"), None);
-        assert_eq!(streams_file_key("CLAUDE-9.jsonl"), None);
-        assert_eq!(streams_file_key("CLAUDE-9-attempt-1.txt"), None);
+        assert_eq!(streams_file_key("PROJ-9-attempt-bogus.jsonl"), None);
+        assert_eq!(streams_file_key("PROJ-9.jsonl"), None);
+        assert_eq!(streams_file_key("PROJ-9-attempt-1.txt"), None);
     }
 
     // ---- docker volume sweep --------------------------------------------------
@@ -3124,7 +3124,7 @@ mod tests {
         assert_eq!(parse_docker_size("bogus"), 0);
     }
 
-    // ---- cargo cache sweep (CLAUDE-512) -----------------------------------
+    // ---- cargo cache sweep -----------------------------------
 
     fn cargo_cache_cfg(max_bytes_per_repo: u64) -> CargoCacheConfig {
         CargoCacheConfig {
@@ -3195,7 +3195,7 @@ mod tests {
     }
 
     // ---- SPEC-3.11 item 4: manual per-category Docker storage prune
-    // (CLAUDE-517) ----------------------------------------------------------
+    // ----------------------------------------------------------
 
     /// AC: pruning the stopped-containers category removes every stopped
     /// container regardless of age, and touches no other category.

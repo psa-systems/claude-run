@@ -49,7 +49,7 @@ pub struct RunnerDefaults {
     pub budget_warn_fraction: f64,
     /// Issues one run may create when the action sets no override.
     pub max_issues_per_run: u32,
-    /// Timeout for the post-success review session (CLAUDE-449), `youtrack`
+    /// Timeout for the post-success review session, `youtrack`
     /// kind only, when the action sets no override.
     pub review_timeout_seconds: u32,
 }
@@ -85,7 +85,7 @@ pub struct EffectiveLimits {
     /// This run's issue-creation ceiling, enforced at the provider boundary by
     /// [`crate::provider::AuditedTracker`].
     pub max_issues_per_run: u32,
-    /// Timeout for the post-success review session (CLAUDE-449).
+    /// Timeout for the post-success review session.
     pub review_timeout: Duration,
 }
 
@@ -276,7 +276,7 @@ pub async fn gather_jobs(
             stderr: outcome.stderr,
         });
     }
-    // An input says what it skipped or held back on stderr (CLAUDE-644).
+    // An input says what it skipped or held back on stderr.
     let said = outcome.stderr.trim();
     if !said.is_empty() {
         info!(action = %action.action.name, stderr = %said, "input.command stderr");
@@ -556,7 +556,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
             post_failed = true;
             break;
         }
-        // A post step's stdout says what became of the job (CLAUDE-476).
+        // A post step's stdout says what became of the job.
         let said = r.stdout.trim();
         if !said.is_empty() {
             info!(action = %action.name, key = %key, step = i, output = %said, "post step output");
@@ -686,7 +686,7 @@ pub enum ProcessedJob {
     /// attempt (like `Filtered` / `CapHit`, no `attempts_increment` runs on this
     /// path). `blockers` lists the unmet dependencies (`ID (verb)`), for logging.
     Blocked { key: String, blockers: Vec<String> },
-    /// CLAUDE-535: the repo already has `max_ci_in_flight_per_repo` runner PRs
+    /// The repo already has `max_ci_in_flight_per_repo` runner PRs
     /// with CI pending, so the issue was left Queued and never cloned or handed
     /// to claude. Consumes no attempt. `pending` is the count that was found.
     Deferred { key: String, pending: u32 },

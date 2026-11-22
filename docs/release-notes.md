@@ -1,4 +1,4 @@
-# Example action: weekly release notes into a newsletter system (CLAUDE-474)
+# Example action: weekly release notes into a newsletter system
 
 `actions/examples/release-notes.yml` turns the week's releases into a draft newsletter. On Mondays from 09:00 UTC it reads the releases published in the last 7 days in the repos you list, through the Forgejo API (with the token fj already holds for your forge), has Claude write one customer-facing edition from them, and creates it as a **draft** with `POST <NEWSLETTER_URL>/api/v1/editions`. It never sends or schedules. A week without releases runs nothing; a week with nothing customer-facing creates no draft.
 

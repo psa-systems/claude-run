@@ -1,6 +1,6 @@
 //! Implements SPEC-3.9.
 //!
-//! The footer every runner-posted YouTrack comment carries (CLAUDE-446): the
+//! The footer every runner-posted YouTrack comment carries: the
 //! run's start time, end time, duration, and an absolute link back to it, so
 //! a reader goes from the issue to the run in one click.
 //!
@@ -23,7 +23,7 @@ pub struct Attempt<'a> {
     pub attempt: u32,
 }
 
-/// What caused the run that produced a comment (CLAUDE-556), printed as the
+/// What caused the run that produced a comment, printed as the
 /// footer's `Trigger:` line right after `Source:`.
 ///
 /// Variants carry the human-readable origin so a reader sees why the work
@@ -73,13 +73,13 @@ impl Trigger {
 /// footer, threaded in by the caller that already holds `run_id` and
 /// `Instant::now()`.
 ///
-/// `source` (CLAUDE-555) names the action that produced the comment, so a
+/// `source` names the action that produced the comment, so a
 /// reader scanning an issue knows which path (e.g. `youtrack`,
 /// `closed-issue-summary`, a webhook listener) wrote it without opening the
 /// run page. The field is non-defaulting on purpose: a new call site that
 /// forgets to set it fails to compile.
 ///
-/// `trigger` (CLAUDE-556) is optional: `None` omits the `Trigger:` line.
+/// `trigger` is optional: `None` omits the `Trigger:` line.
 /// It borrows so the struct stays `Copy`.
 #[derive(Clone, Copy)]
 pub struct CommentRun<'a> {
@@ -103,7 +103,7 @@ pub fn resolved_public_url() -> Option<String> {
 ///
 /// [`render`] appended for a job-lifecycle comment: links the job's own attempt page,
 /// with "now" as the finish time. The `source` for the `Source:` line is
-/// taken from the `CommentRun` itself (CLAUDE-555).
+/// taken from the `CommentRun` itself.
 pub fn append_job(body: &str, public_url: Option<&str>, run: CommentRun<'_>, key: &str) -> String {
     // SPEC-3.13: the first progress comment after a failed start notice says so.
     let body = if take_start_notice_missing(key) {
@@ -180,7 +180,7 @@ fn take_start_notice_missing(key: &str) -> bool {
 /// attempt (webhook runs, the closed-issue summary, the dependency gate, the
 /// attempt-cap comment): links `/runs/<id>`, with "now" as both the start
 /// and finish time when no better start time is available. `source`
-/// (CLAUDE-555) names the action that produced the comment.
+/// names the action that produced the comment.
 pub fn append_run(
     body: &str,
     public_url: Option<&str>,
@@ -202,7 +202,7 @@ pub fn append_run(
     format!("{body}{footer}")
 }
 
-/// CLAUDE-646: start-notice footer for a comment posted BEFORE the work
+/// Start-notice footer for a comment posted BEFORE the work
 /// begins. Renders `Run:`, `Posted:`, `Source:`, and `Trigger:`, but NOT
 /// `Finished:` or `Duration:`. [`append_run`] with `started=None` collapses
 /// to Start==Finish and Duration 0s, which on a start notice reads as if the
@@ -228,7 +228,7 @@ pub fn append_start_notice(
 
 /// SPEC-3.9: full footer text, all three link/no-link/no-run-id cases, the
 /// `Started:` / `Finished:` / `Duration:` lines, and the `Source:` line
-/// (CLAUDE-555) naming the action that produced the comment.
+/// naming the action that produced the comment.
 ///
 /// Render the footer text (leading blank line included) to append to a
 /// comment body.
@@ -355,7 +355,7 @@ mod tests {
             Some("https://claude-run.example.com/"),
             Some(42),
             Some(Attempt {
-                key: "CLAUDE-446",
+                key: "PROJ-446",
                 attempt: 1,
             }),
             started,
@@ -364,7 +364,7 @@ mod tests {
             None,
         );
         assert!(footer
-            .contains("Run: https://claude-run.example.com/runs/42/jobs/CLAUDE-446/attempt/1"));
+            .contains("Run: https://claude-run.example.com/runs/42/jobs/PROJ-446/attempt/1"));
         assert!(footer.contains("Started: 2026-10-12T18:41:03Z"));
         assert!(footer.contains("Finished: 2026-10-12T18:52:05Z"));
         assert!(footer.contains("Duration: 11m 2s"));
@@ -398,7 +398,7 @@ mod tests {
             None,
             Some(7),
             Some(Attempt {
-                key: "CLAUDE-446",
+                key: "PROJ-446",
                 attempt: 2,
             }),
             started,
@@ -426,7 +426,7 @@ mod tests {
         assert!(footer.contains("Run: no run id is available for this comment"));
     }
 
-    /// CLAUDE-555: every footer carries a `Source:` line naming the action
+    /// Every footer carries a `Source:` line naming the action
     /// that produced the comment, so a reader scanning an issue can tell
     /// which code path wrote it without opening the run page.
     #[test]
@@ -486,10 +486,10 @@ mod tests {
             "Opened a PR.",
             Some("https://claude-run.example.com"),
             run,
-            "CLAUDE-446",
+            "PROJ-446",
         );
         assert!(
-            body.contains("Run: https://claude-run.example.com/runs/9/jobs/CLAUDE-446/attempt/3")
+            body.contains("Run: https://claude-run.example.com/runs/9/jobs/PROJ-446/attempt/3")
         );
         assert!(body.contains("Source: youtrack"));
     }
@@ -509,7 +509,7 @@ mod tests {
         assert!(body.contains("Source: closed-issue-summary"));
     }
 
-    /// CLAUDE-646: the start-notice footer must not render `Finished:` or
+    /// The start-notice footer must not render `Finished:` or
     /// `Duration:`, which on a pre-work comment would read as a 0s bailout
     /// and hide the fact that a reply is still coming.
     #[test]
@@ -538,7 +538,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-646: with no run id, the start-notice still labels the Run line
+    /// With no run id, the start-notice still labels the Run line
     /// explicitly rather than omitting it, matching `append_run`'s policy.
     #[test]
     fn append_start_notice_with_no_run_id_says_so() {
@@ -582,7 +582,7 @@ mod tests {
         )
     }
 
-    /// CLAUDE-556: each trigger variant prints its own `Trigger:` line right after `Source:`.
+    /// Each trigger variant prints its own `Trigger:` line right after `Source:`.
     #[test]
     fn footer_renders_each_trigger_variant_after_source() {
         let cases = [
@@ -633,7 +633,7 @@ mod tests {
             source: "youtrack",
             trigger: Some(&trigger),
         };
-        let body = append_job("Opened a PR.", None, run, "CLAUDE-556");
+        let body = append_job("Opened a PR.", None, run, "PROJ-556");
         assert!(body.contains("\nTrigger: AI Agent pickup"), "{body}");
     }
 
