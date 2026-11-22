@@ -7,8 +7,8 @@
 # PostgreSQL service or run the suite a second time against it.
 #
 # Whether a pull request needs the compile and test work is
-# decided only by common's shared `classify-diff` action (common STD-3.1,
-# STD-3.2): `code` runs everything, `comments-only` runs `cargo fmt
+# decided only by common's shared `classify-diff` action (common PSTD-1.3.1,
+# PSTD-1.3.2): `code` runs everything, `comments-only` runs `cargo fmt
 # --check` and skips clippy, build and tests, `non-code` (docs and their
 # assets) skips the compile job. A push is always `code`. This is NOT a
 # workflow-level `paths-ignore`: Forgejo drops a workflow whose
@@ -18,7 +18,7 @@
 # compile job's own `if:` skips it; a skipped job still posts commit status
 # `skipped`, which satisfies the required check.
 #
-# SPEC-11.7, STD-10.6: for a pull request whose head branch is
+# SPEC-11.7, PSTD-1.1.9: for a pull request whose head branch is
 # `specification`, `changes`, `claude-md` and `check` skip (their `if:`
 # conditions below also check `github.head_ref`), and only `specification`,
 # `spelling` and `secrets` run. The same reasoning as above applies: these
@@ -35,7 +35,7 @@ on:
 
 jobs:
   changes:
-    # SPEC-11.7, STD-10.6: skipped (not absent) for a pull request whose head
+    # SPEC-11.7, PSTD-1.1.9: skipped (not absent) for a pull request whose head
     # branch is `specification`, where only `check-specification`,
     # `check-spelling` and `check-secrets` may run.
     if: github.head_ref != 'specification'
@@ -58,7 +58,7 @@ jobs:
   claude-md:
     # Runs on every push and PR, docs-only ones included, since
     # CLAUDE.md growth is exactly what a docs-only change can introduce.
-    # SPEC-11.7, STD-10.6: skipped for a `specification` head branch, same as `changes`.
+    # SPEC-11.7, PSTD-1.1.9: skipped for a `specification` head branch, same as `changes`.
     if: github.head_ref != 'specification'
     name: CLAUDE.md guard
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
@@ -79,7 +79,7 @@ jobs:
     # Skipped for a `non-code` diff; for `comments-only` only the
     # formatting check runs (the steps below gate on `code`). The CLAUDE.md
     # guard and secrets scan run unconditionally.
-    # SPEC-11.7, STD-10.6: also skipped for a `specification` head branch,
+    # SPEC-11.7, PSTD-1.1.9: also skipped for a `specification` head branch,
     # same as `changes`, whose `result` output this condition already reads.
     if: needs.changes.outputs.result != 'non-code' && github.head_ref != 'specification'
     name: fmt + clippy + build + tests
@@ -291,9 +291,9 @@ jobs:
           kingfisher_skip_regex: 'claude_run:(claude_run|secret|\(\$password\)|<that password>)@|^x-access-token$|oauth2:(secret|tok|tok-123|\(\$pat\))@|ghp_(secret|from_login|action)@|user:s3cr3t@'
 
   specification:
-    # SPEC-11.6, STD-10.5: runs on every pull request to `main`, including a
-    # `specification` head branch (SPEC-11.7, STD-10.6), and is never skipped.
-    # The shared action itself owns the check (STD-3.1); this repository
+    # SPEC-11.6, PSTD-1.1.8: runs on every pull request to `main`, including a
+    # `specification` head branch (SPEC-11.7, PSTD-1.1.9), and is never skipped.
+    # The shared action itself owns the check (PSTD-1.3.1); this repository
     # carries no copy of its logic.
     name: Specification scope
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
@@ -307,9 +307,9 @@ jobs:
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/check-specification@main
 
   spelling:
-    # STD-9.1: runs on every pull request, with no continue-on-error and no
-    # `if:` that would skip it (STD-9.3), including a `specification` head
-    # branch (SPEC-11.7, STD-10.6). The shared action owns the check (STD-3.1).
+    # PSTD-1.3.3: runs on every pull request, with no continue-on-error and no
+    # `if:` that would skip it (PSTD-1.3.5), including a `specification` head
+    # branch (SPEC-11.7, PSTD-1.1.9). The shared action owns the check (PSTD-1.3.1).
     name: Spell check
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     steps:
@@ -321,5 +321,5 @@ jobs:
       - name: Check spelling
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/check-spelling@main
         with:
-          # STD-9.1: pinned MAJOR.MINOR.PATCH, never a range or `latest` (SPEC-8.72).
+          # PSTD-1.3.3: pinned MAJOR.MINOR.PATCH, never a range or `latest` (SPEC-8.18.1).
           version: "10.5.2"
