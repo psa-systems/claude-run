@@ -363,8 +363,9 @@ mod tests {
             "youtrack",
             None,
         );
-        assert!(footer
-            .contains("Run: https://claude-run.example.com/runs/42/jobs/PROJ-446/attempt/1"));
+        assert!(
+            footer.contains("Run: https://claude-run.example.com/runs/42/jobs/PROJ-446/attempt/1")
+        );
         assert!(footer.contains("Started: 2026-10-12T18:41:03Z"));
         assert!(footer.contains("Finished: 2026-10-12T18:52:05Z"));
         assert!(footer.contains("Duration: 11m 2s"));
@@ -488,9 +489,7 @@ mod tests {
             run,
             "PROJ-446",
         );
-        assert!(
-            body.contains("Run: https://claude-run.example.com/runs/9/jobs/PROJ-446/attempt/3")
-        );
+        assert!(body.contains("Run: https://claude-run.example.com/runs/9/jobs/PROJ-446/attempt/3"));
         assert!(body.contains("Source: youtrack"));
     }
 

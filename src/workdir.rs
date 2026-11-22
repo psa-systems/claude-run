@@ -595,10 +595,7 @@ mod tests {
         // its own, so deleting it loses nothing.
         let base = tempfile::tempdir().unwrap();
         let clone = origin_and_single_branch_clone(base.path());
-        git_in(
-            &clone,
-            &["checkout", "-b", "feat/PROJ-269-login-required"],
-        );
+        git_in(&clone, &["checkout", "-b", "feat/PROJ-269-login-required"]);
 
         let work = local_only_work(&clone).unwrap();
         assert!(

@@ -3536,8 +3536,7 @@ mod tests {
             ],
             "",
         ));
-        b.link_issue("PROJ-230", "subtask of", "PROJ-100")
-            .unwrap();
+        b.link_issue("PROJ-230", "subtask of", "PROJ-100").unwrap();
     }
 
     /// `--create` so a tag not yet present on the instance is created rather
@@ -3546,14 +3545,7 @@ mod tests {
     fn add_tag_creates_a_missing_tag() {
         let b = backend(StubRunner::new().ok(
             "yt",
-            &[
-                "issue",
-                "tag",
-                "add",
-                "PROJ-373",
-                "Needs-Info",
-                "--create",
-            ],
+            &["issue", "tag", "add", "PROJ-373", "Needs-Info", "--create"],
             "",
         ));
         b.add_tag("PROJ-373", "Needs-Info").unwrap();
@@ -5399,9 +5391,7 @@ mod tests {
             "must push the feature branch by name: {calls:?}"
         );
         assert!(
-            calls
-                .iter()
-                .any(|c| c.contains("--head fix/PROJ-166-work")),
+            calls.iter().any(|c| c.contains("--head fix/PROJ-166-work")),
             "fj must open feature -> base with explicit --head: {calls:?}"
         );
         // The bug's signature: a HEAD push or a `main`-vs-`main` create.
@@ -5587,11 +5577,7 @@ mod tests {
         let runner = Arc::new(
             with_remote_state(runner, "feat/x", "abc", "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#PROJ-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -5661,11 +5647,7 @@ mod tests {
         );
         let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n")
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-            .ok(
-                "git",
-                &["log", "-1", "--format=%b", "feat/x"],
-                "#PROJ-1\n",
-            );
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n");
         let runner = Arc::new(with_open_pr_search(
             runner,
             r#"[{"number":88,"head_ref":"feat/x","html_url":"https://dev.a8n.run/n/c/pulls/88"}]"#,
@@ -5706,11 +5688,7 @@ mod tests {
         );
         let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n")
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-            .ok(
-                "git",
-                &["log", "-1", "--format=%b", "feat/x"],
-                "#PROJ-1\n",
-            );
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n");
         let runner = with_open_pr_search(
             runner,
             r#"[{"number":777,"head_ref":"feat/x","html_url":"https://dev.a8n.run/n/c/pulls/777"}]"#,
@@ -6040,11 +6018,7 @@ mod tests {
             )
             .ok("git", &["merge", "--abort"], "")
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-            .ok(
-                "git",
-                &["log", "-1", "--format=%b", "feat/x"],
-                "#PROJ-1\n",
-            );
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n");
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         match b
@@ -6129,11 +6103,7 @@ mod tests {
                 "",
             )
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-            .ok(
-                "git",
-                &["log", "-1", "--format=%b", "feat/x"],
-                "#PROJ-1\n",
-            );
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n");
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         match b
@@ -6232,11 +6202,7 @@ mod tests {
                 "fatal: Could not reset index",
             )
             .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-            .ok(
-                "git",
-                &["log", "-1", "--format=%b", "feat/x"],
-                "#PROJ-1\n",
-            );
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n");
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         match b

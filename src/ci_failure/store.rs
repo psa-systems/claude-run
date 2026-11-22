@@ -764,7 +764,7 @@ pub async fn agent_pr_for_issue(
     row.as_ref().map(agent_pr_from_row).transpose()
 }
 
-/// SPEC-3.3.1 / SPEC-3.5.2: every `agent_pull_requests` row still `open`, for the 
+/// SPEC-3.3.1 / SPEC-3.5.2: every `agent_pull_requests` row still `open`, for the
 /// reconciler: a webhook is the low-latency trigger for automerge, but a
 /// missed delivery must not leave a green PR stuck at Code Review forever, so
 /// the reconciler walks this list on its own tick independent of any webhook.
@@ -1263,10 +1263,7 @@ mod tests {
         assert_eq!(by_pr.fix_attempts, 0);
         assert!(!by_pr.salvaged);
 
-        let by_issue = agent_pr_for_issue(&pool, "PROJ-42")
-            .await
-            .unwrap()
-            .unwrap();
+        let by_issue = agent_pr_for_issue(&pool, "PROJ-42").await.unwrap().unwrap();
         assert_eq!(by_issue.id, id);
 
         bump_fix_attempts(&pool, id, "2026-09-02T00:00:00Z")
@@ -1515,10 +1512,7 @@ mod tests {
         .await
         .unwrap();
 
-        let found = failure_for_issue(&pool, "PROJ-42")
-            .await
-            .unwrap()
-            .unwrap();
+        let found = failure_for_issue(&pool, "PROJ-42").await.unwrap().unwrap();
         assert_eq!(found.id, id);
         assert_eq!(failure_for_issue(&pool, "PROJ-999").await.unwrap(), None);
     }

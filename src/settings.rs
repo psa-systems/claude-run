@@ -813,7 +813,7 @@ pub struct LiveSettings {
     /// Per-repo shared Cargo target directory size ceiling, read by the
     /// sweeper on each tick so a Settings save applies on the next sweep.
     /// `SPEC-3.10` item 6.
-    cargo_cache:Arc<RwLock<CargoCacheConfig>>,
+    cargo_cache: Arc<RwLock<CargoCacheConfig>>,
     /// Peering config, read by the poller each tick and by the peer API.
     peers: Arc<RwLock<PeersConfig>>,
     /// Per-peer liveness state shared by the poller, the sweep and the Status

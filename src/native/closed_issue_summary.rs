@@ -572,11 +572,7 @@ mod tests {
             (
                 "CLAUDE".to_string(),
                 vec![
-                    issue(
-                        "PROJ-214",
-                        "Allow the agent to author issues",
-                        "Claude Run",
-                    ),
+                    issue("PROJ-214", "Allow the agent to author issues", "Claude Run"),
                     issue("PROJ-215", "Partition the audit query", ""),
                 ],
             ),
@@ -827,11 +823,7 @@ mod tests {
         );
         let runner = Arc::new(
             StubRunner::new()
-                .ok(
-                    "yt",
-                    &["issue", "inspect", "PROJ-100", "--json"],
-                    &inspect,
-                )
+                .ok("yt", &["issue", "inspect", "PROJ-100", "--json"], &inspect)
                 .ok("yt", &["list", &list_args("CLAUDE"), "--json"], "[]")
                 .ok("yt", &["list", &list_args("DELTA"), "--json"], "[]"),
         );
@@ -974,10 +966,7 @@ mod tests {
         ));
         let backend = CliBackend::new(runner);
         let (targets, from_query) = resolve_targets(&backend, &c).unwrap();
-        assert_eq!(
-            targets,
-            vec!["PROJ-100".to_string(), "DELTA-3".to_string()]
-        );
+        assert_eq!(targets, vec!["PROJ-100".to_string(), "DELTA-3".to_string()]);
         assert!(from_query.contains("DELTA-3"));
         assert!(from_query.contains("PROJ-100"));
     }

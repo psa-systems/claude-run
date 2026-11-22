@@ -8801,11 +8801,7 @@ mod tests {
         assert!(!escaped.contains("<script>"), "{escaped}");
 
         // A message that doesn't contain the context key is just escaped.
-        let no_match = render(
-            "unrelated failure, see the logs",
-            "PROJ-9",
-            Some(template),
-        );
+        let no_match = render("unrelated failure, see the logs", "PROJ-9", Some(template));
         assert_eq!(no_match, "unrelated failure, see the logs");
 
         // No template resolves: the message is escaped but no key is linked.
@@ -8924,8 +8920,7 @@ mod tests {
             has_outcomes: true,
         };
         let html = tpl.render().expect("render run_detail");
-        let anchor =
-            format!("<a href=\"{href}\" target=\"_blank\" rel=\"noopener\">PROJ-222</a>");
+        let anchor = format!("<a href=\"{href}\" target=\"_blank\" rel=\"noopener\">PROJ-222</a>");
         // Planned-jobs table, outcomes table, and the modal heading.
         assert_eq!(
             html.matches(anchor.as_str()).count(),
@@ -15413,8 +15408,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
             seed_run(&s.api.pool, 1).await;
-            let path =
-                ClaudeInvoker::review_evidence_path(&s.paths.logs_dir(), "act", "PROJ-1", 1);
+            let path = ClaudeInvoker::review_evidence_path(&s.paths.logs_dir(), "act", "PROJ-1", 1);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "the full sweep goes here").unwrap();
 

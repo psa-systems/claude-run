@@ -424,7 +424,7 @@ pub struct WebhookSource {
     /// PAT that authorizes commenting on this source's pull requests
     /// (routing a CI failure on an open PR back to its issue, or onto the
     /// human author's PR). Reaches `fj` the same way `log_token_ref` does: a
-    /// temp single-host `keys.json` carrying only this one secret. 
+    /// temp single-host `keys.json` carrying only this one secret.
     /// required on every source of an `enabled` listener, same as
     /// `secret_ref` - unset fails `/settings` save and `serve` startup,
     /// naming this source, rather than only surfacing when the comment

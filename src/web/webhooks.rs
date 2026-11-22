@@ -13376,7 +13376,7 @@ mod tests {
             assert!(calls.iter().any(|c| c == "pr_comment 7"), "{calls:?}");
             let pr_comments = backend.pr_comments();
             assert_eq!(pr_comments.len(), 1, "{pr_comments:?}");
-            // `{:?}` rather than `{}`: an empty recorded body (the 
+            // `{:?}` rather than `{}`: an empty recorded body (the
             // scratch-file race) prints as `""` instead of a blank, otherwise
             // indistinguishable, failure message.
             assert!(

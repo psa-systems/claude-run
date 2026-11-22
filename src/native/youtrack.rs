@@ -14566,11 +14566,7 @@ mod tests {
                 )
                 .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#PROJ-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .ok(
                     "git",
                     &["remote", "get-url", "origin"],
@@ -15930,11 +15926,7 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#PROJ-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -16033,11 +16025,7 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#PROJ-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -16141,11 +16129,7 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#PROJ-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -16235,11 +16219,7 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#PROJ-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -16335,11 +16315,7 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#PROJ-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -16431,11 +16407,7 @@ mod tests {
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b", "feat/x"],
-                    "#PROJ-1\n",
-                )
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#PROJ-1\n")
                 .fail(
                     "git",
                     &[
@@ -19411,7 +19383,7 @@ mod tests {
             link(LinkDirection::Inward, "depends on", "TASK-40", None), // BLOCK: open blocker
             link(LinkDirection::Outward, "parent for", "PROJ-9", None), // BLOCK: open child
             link(LinkDirection::Outward, "is required for", "PROJ-1", None), // reverse Depend
-            link(LinkDirection::Inward, "subtask of", "PROJ-2", None), // reverse Subtask
+            link(LinkDirection::Inward, "subtask of", "PROJ-2", None),  // reverse Subtask
             link(LinkDirection::Inward, "depends on", "PROJ-3", Some(123)), // met (resolved)
         ];
         let blockers = unmet_blockers(&links, &block_on, None);

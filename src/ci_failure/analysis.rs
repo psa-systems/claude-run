@@ -65,7 +65,7 @@ pub(crate) fn cap_comment(text: &str, max_bytes: usize) -> String {
 /// or, when the log carries none, classify on the run's timing whether the job
 /// stopped emitting output and was killed or the run ended with no diagnostic,
 /// and give remediation. The stored log is never truncated by this
-/// tool, so the prompt never offers truncation as an explanation. 
+/// tool, so the prompt never offers truncation as an explanation.
 /// ends with a fenced JSON verdict so the at-ingest classifier can route the
 /// failure from the same session; the scheduled action ignores the trailing
 /// JSON and posts the whole reply as the comment.

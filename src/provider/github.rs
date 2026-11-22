@@ -274,7 +274,7 @@ pub struct GithubForge {
     /// with the `fj` read retry). Defaults to
     /// [`DEFAULT_READ_RETRY_WAITS`]; overridable so tests run with no delay.
     gh_read_retry_waits: [std::time::Duration; 3],
-/// Operator-visible notices accumulated while serving the job (
+    /// Operator-visible notices accumulated while serving the job (
     /// a degraded open-PR lookup), mirroring `CliBackend::notices`. Drained by
     /// [`Forge::take_notices`] and persisted as run events.
     notices: std::sync::Mutex<Vec<String>>,

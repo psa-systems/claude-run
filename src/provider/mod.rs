@@ -1275,7 +1275,7 @@ fn scrub_remote_origin_url(url: &str, workdir: &std::path::Path) -> Result<()> {
 /// when `.gitmodules` carries a relative URL, resolved against the
 /// token-bearing `origin`).
 fn scrub_submodule_config_urls(url: &str, workdir: &std::path::Path) -> Result<()> {
-    // See `scrub_remote_origin_url`: serialize against the 
+    // See `scrub_remote_origin_url`: serialize against the
     // PATH-stub test's mutation/deletion window.
     #[cfg(test)]
     let _path_guard = crate::testutil::path_env_lock();
