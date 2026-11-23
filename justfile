@@ -68,6 +68,10 @@ internal_names_exempt_paths := ".forgejo/workflows/ .gitmodules renovate.json Do
 # matching the noseyparker ignore already in place for it.
 secrets_kingfisher_excludes := "compose.yml"
 
+# Same pin as the check-spelling action's `version` input in check.yml; the
+# pre-push spelling check for a push to `specification` fails without it.
+cspell_version := "10.5.2"
+
 # Placeholder credentials in redaction-test fixtures, the same ones CI's
 # kingfisher_skip_regex allowlists; the alternatives with a literal `$` or
 # backslash stay CI-only because they do not survive this recipe's quoting.
