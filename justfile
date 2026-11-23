@@ -10,13 +10,8 @@
 # stays the single source of truth:
 #   - app: image tags (claude-run:check|local) and cargo cache volume names.
 #   - pre_commit_mode = "docker" + dev_image: claude-run has no compose.dev.yml
-#     (daemon plus CLI, not a web service), so `pre-commit` and `pre-push` run
-#     their checks in the rust-builder-musl image via `docker run`, not a
-#     compose service. `hook_layout` stays at common's default `"pre-push"`:
-#     `pre-commit` runs a fmt-only check and `pre-push` runs the full suite.
-#   - test_args = "": run the full suite (in `pre-push`, not `pre-commit`,
-#     under the default hook_layout). The unit tests live in src/** behind
-#     `mod tests` on the library target, which common's default `--bins` skips.
+#     (daemon plus CLI, not a web service), so `pre-push` runs its fmt check in
+#     the rust-builder-musl image via `docker run`, not a compose service.
 #   - dockerfile defaults to oci-build/Dockerfile, which is where it lives here.
 #
 # Inherited from common/common.just: install-hooks, pre-commit, pre-push
@@ -57,11 +52,6 @@ app := "claude-run"
 pre_commit_mode := "docker"
 dev_image := "dev.a8n.run/pandoras-box/rust-builder-musl:v1.2.0-rust1.98.1-alpine"
 
-# Run the full test suite (in pre-push under the default hook_layout): the
-# unit tests are library-target tests in src/**, which common's default
-# `--bins` would skip.
-test_args := ""
-
 # docs/self-hosting.md states an issue reference inline in prose on the same
 # line as the RUNS_ON_* variable list a rename touches, so editing that list
 # re-stages the pre-existing reference and trips check-internal-names; adds
@@ -77,6 +67,10 @@ internal_names_exempt_paths := ".forgejo/workflows/ .gitmodules renovate.json Do
 # quotes before kingfisher sees it), so exempt the same file by path instead,
 # matching the noseyparker ignore already in place for it.
 secrets_kingfisher_excludes := "compose.yml"
+
+# Same pin as the check-spelling action's `version` input in check.yml; the
+# pre-push spelling check for a push to `specification` fails without it.
+cspell_version := "10.5.2"
 
 # Placeholder credentials in redaction-test fixtures, the same ones CI's
 # kingfisher_skip_regex allowlists; the alternatives with a literal `$` or

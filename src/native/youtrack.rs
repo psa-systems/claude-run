@@ -3620,9 +3620,8 @@ fn run_pre(
 /// commit or push that fails the repo's local checks is blocked locally instead of only
 /// being caught by CI. Detects a `just
 /// install-hooks` recipe and, when present, runs it; the recipe is idempotent
-/// (it rewrites `.git/hooks/pre-commit` and, under the shared task runner's
-/// default `hook_layout`, `.git/hooks/pre-push` too), so running it on every
-/// clone is safe.
+/// (it rewrites `.git/hooks/pre-commit`, `.git/hooks/commit-msg` and
+/// `.git/hooks/pre-push`), so running it on every clone is safe.
 ///
 /// Non-fatal by contract: this is an additional local backstop, not a hard
 /// gate. A repo with no `install-hooks` recipe, or a host without `just`, is

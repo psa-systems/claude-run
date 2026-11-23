@@ -20,7 +20,7 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 
 ## Commands
 
-- `just check`: fmt + clippy + build + tests + builder-stage docker compile (the full CI gate). It starts with the CLAUDE.md guard, `just check-claude-md`. `just pre-commit` runs only a fmt-only check inside the builder image via `docker run` (common's default `hook_layout := "pre-push"`); `just pre-push` runs the full suite (fmt, clippy, compile, tests) there.
+- `just check`: fmt + clippy + build + tests + builder-stage docker compile (the full CI gate). It starts with the CLAUDE.md guard, `just check-claude-md`. `just pre-commit` runs only `check-tree-ownership`; `just pre-push` runs the fmt check inside the builder image via `docker run` plus common's guard scripts, and compiles and tests nothing.
 - CI's exact steps (`.forgejo/workflows/check.yml`): `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build --all-targets`, then `cargo test` twice: once on SQLite, once with `CLAUDE_RUN_TEST_DATABASE_URL=postgres://...` set, switching every fixture to Postgres (one schema per test, `SPEC-5.6`). A DB change must pass both.
 - Single test: `cargo test <name_substring>` (e.g. `cargo test shipped_action_queries_are_disjoint`); one module: `cargo test native::youtrack::`. Unit tests live in `src/**` under `mod tests` on the library target; `tests/fixtures/` holds data only.
 - `just run <args>` = `cargo run -- <args>`.
@@ -154,10 +154,10 @@ Cross-cutting (not a numbered phase): a container runtime (made self-contained) 
 
 ## Working on this repo
 
-- Branch off `main` per `governance/GIT_WORKFLOW.md`. Run `just pre-push` (or rely on the installed hook) before pushing; `just install-hooks` writes the `pre-commit` (fmt-only) and `pre-push` (full suite) stubs; re-run it after a `common` bump to pick up the hook.
+- Branch off `main` per `governance/GIT_WORKFLOW.md`. Run `just pre-push` (or rely on the installed hook) before pushing; `just install-hooks` writes the `pre-commit`, `commit-msg` and `pre-push` stubs; re-run it after a `common` bump to pick up the hook.
 - `just check` mirrors CI's fmt + clippy + build + tests; CI also runs the CLAUDE.md guard as `claude-md`.
 - The task runner is the shared `psa-systems/common` recipe set, vendored as the `common` submodule (`git submodule update --init` after a fresh clone).
-  `justfile` configures it through variables (`pre_commit_mode := "docker"` + `dev_image` because there is no `compose.dev.yml`, `test_args := ""` so the library-target unit tests are not skipped) and overrides only `default`, `check`, and `run`. Prefer setting a common variable over shadowing a shared recipe.
+  `justfile` configures it through variables (`pre_commit_mode := "docker"` + `dev_image` because there is no `compose.dev.yml`) and overrides only `default`, `check`, and `run`. Prefer setting a common variable over shadowing a shared recipe.
   `default` is redefined locally (as the file's first recipe) because just resolves the default recipe by source order and a top-level definition outranks the imported one, so without it a bare `just` runs whichever local recipe comes first instead of common's `just --list`.
   CI keeps its own `.forgejo/workflows/check.yml` rather than calling common's reusable one, which hardcodes `cargo test --bins`; making that configurable is a limitation of `common`'s reusable workflow. It deviates from governance `CI.md` ("Check runs on every push / PR"):
   the workflow still runs on every push and PR to `main`, but common's shared `classify-diff` action (a leading `changes` job and an `if:`, not a workflow-level `paths-ignore`) skips the compile job for a docs-only PR and everything but `cargo fmt --check` for a comment-only one.
