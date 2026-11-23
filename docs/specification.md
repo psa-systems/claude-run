@@ -300,23 +300,23 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   must still equal the queued value, and the dependency gate must pass. The dependency gate blocks on open issues linked
   by the configured verbs (defaults: `depends on`, `parent for`), leaves the issue queued, comments the blockers once,
   and re-evaluates after `recheck_timeout`.
-- CI in-flight cap (CLAUDE-535): after the dependency gate, a pickup is deferred while
+- CI in-flight cap: after the dependency gate, a pickup is deferred while
   `concurrency.max_ci_in_flight_per_repo` of the repo's other open agent PRs have CI `pending`: the issue stays queued,
   no attempt is consumed and nothing is cloned. A PR whose status lookup fails is logged at `warn` and not counted,
   and a store or forge read failure lets the pickup proceed. `0` disables the cap.
 - Pre: set the field to working and `State` to the in-progress value, optionally set `Assignee`, then
   `git clone --depth 50` and, unless `native.youtrack.install_hooks` is `false` (default `true`), install the
   repo's own git hooks (`just install-hooks`, when the clone has that recipe) so a commit or push that fails
-  the repo's local checks is blocked locally, not only caught later by CI (A8N-69). Hook install is
+  the repo's local checks is blocked locally, not only caught later by CI. Hook install is
   best-effort: a repo with no `install-hooks` recipe, or a host without `just`, is left unchanged and pickup
-  continues. `install_hooks: false` (CLAUDE-537) skips the install entirely and logs the skip at `info`, naming
+  continues. `install_hooks: false` skips the install entirely and logs the skip at `info`, naming
   the action and the issue key; this does not affect the `SPEC-3.3.2` verification gate, which still runs the
   repo's checks independently of any installed hook.
 - Claude works in the local clone; the runner pushes the result (see 3.3.1). The agent may create issues in
   `write_projects` (default: the triggering issue's project), linked `relates to` / `depends on` / `is required for`,
   never as a subtask.
-- `repo_tracker_refs: false` (CLAUDE-470, default `true`) is for a public target repo: the built-in prompt's
-  commit-message step drops the `#{{key}}` line, and every push this action makes (the CLAUDE-448 checkpoint push and
+- `repo_tracker_refs: false` (default `true`) is for a public target repo: the built-in prompt's
+  commit-message step drops the `#{{key}}` line, and every push this action makes (the checkpoint push and
   the final push in 3.3.1) is preceded by a scan of the branch name, every commit on the branch ahead of base, and (for
   the final push) the PR title/body, for a bare tracker key. A hit aborts the run: nothing further is pushed, no PR is
   opened, and the issue is parked Needs Review naming the offending text and where the unpushed work is preserved. The
@@ -355,8 +355,8 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   redacted git error. It is never reported as success.
 - Every runner push of an agent's feature branch (checkpoint, branch-strategy create-PR push, and the final push above)
   always uses `--no-verify`: the repository's own `pre-push` hook never runs on a runner push. The SPEC-3.3.2
-  verification gate is the sole post-agent full-suite check (CLAUDE-533).
-- A fresh clone carries the remote's tags (CLAUDE-484), so a repository check that reads tags gives the same verdict in a
+  verification gate is the sole post-agent full-suite check.
+- A fresh clone carries the remote's tags, so a repository check that reads tags gives the same verdict in a
   run as on a developer machine.
 - The runner never sets `State` to done. A tracker-side workflow resolves the issue when its PR merges
   (`docs/yt-workflow-resolve-on-pr-merge.js`). The legacy `states.state_done` key is deprecated and ignored (a
@@ -365,7 +365,7 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   a reconciler every 300 seconds and action-success webhooks drive the decision for recorded agent PRs. Finalize makes
   at most one status read, bounded by `automerge.finalize_status_timeout_secs` (default 10, `0` skips it), right after
   promoting a successful run's PR: a PR already green, not behind base and mergeable merges in the same tick; any other
-  answer, error or timeout leaves it at Code Review for the reconciler and webhooks (CLAUDE-549). The legacy
+  answer, error or timeout leaves it at Code Review for the reconciler and webhooks. The legacy
   `wait_seconds` / `check_interval_seconds` keys are deprecated and ignored (a load-time warning names them); loading
   still succeeds so an existing action file keeps working.
 - Finalize never makes this status read, and never merges, when the same finalize call just promoted the PR from
@@ -373,24 +373,23 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   PRs leaves only completed-but-skipped runs on the head SHA until the forge's own "ready for review" event starts
   the real ones, so a read made right after promotion could see nothing but that stale, skipped evidence and merge a
   PR whose checks never actually ran. The PR is left at Code Review for the reconciler and webhooks, which read
-  again once the real runs exist (CLAUDE-651).
+  again once the real runs exist.
 - Automerge separates a behind-base PR (its branch is simply behind its base, `behind_base: true`) from a real
   conflict: a green, behind-base PR is updated through the forge's update-branch endpoint, which retriggers CI, and a
   later success event re-evaluates and merges once that run goes green; a PR whose checks are green but the forge
   still reports it not mergeable (`mergeable: false`) gets a `/claude` conflict-resolution run, as does a non-WIP
   runner PR whose checks failed and that reports `mergeable: false`; a PR with no run to send is left at Code Review
   for a human, as is a merge call that fails after the mergeable check passed. A Forgejo WIP PR reports
-  `mergeable: false` whether or not it conflicts, so it is routed only when `fj` reports `conflicted: true` (FJ-124,
-  CLAUDE-572), under the same per-PR bound as any other PR. The conflict run clones the head
+  `mergeable: false` whether or not it conflicts, so it is routed only when `fj` reports `conflicted: true`, under the same per-PR bound as any other PR. The conflict run clones the head
   branch with the base branch's full history, so the merge base is present. When the behind-base update
   itself fails because of a merge conflict, the runner dispatches the same `/claude` conflict-resolution run instead
-  of leaving it to a human. Conflict-resolution runs are bounded per PR, not per head commit (CLAUDE-550): at most
+  of leaving it to a human. Conflict-resolution runs are bounded per PR, not per head commit: at most
   `webhook_comment.agent_conflict_resolve_attempts` (default 2) across the PR's life, one at a time (a dispatched run
   blocks the next until it finishes or its stamp is older than the listener's timeout plus 900 seconds). A resolve
   run never pushes a file the merge left unmerged or that still carries a conflict marker. Once every attempt is
   spent and the PR still conflicts, the issue gets one delivery-blocked comment (reason `unresolved-conflicts`)
   naming the files the last attempt could not resolve, and AI Agent moves to the action's delivery-blocked label. When the forge reports no `behind_base` at all, automerge takes no merge action:
-  on Forgejo this means the runtime's `fj` predates FJ-99 and a human must act; on GitHub, `mergeStateStatus` is
+  on Forgejo this means the runtime's `fj` predates the `behind_base` field and a human must act; on GitHub, `mergeStateStatus` is
   still `UNKNOWN` (computed lazily after a push) and the reconciler re-checks on its next pass. Each of these
   outcomes posts one comment naming the reason. The behind-base update runs only when the repo is below the
   `concurrency.max_ci_in_flight_per_repo` cap and no other PR's branch update on the repo is still in CI, and the
@@ -467,7 +466,7 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
   read only by the comment-command webhook (3.6). Open-PR routing: a failure on the agent's own open PR requeues its
   issue until `webhook.agent_pr_fix_attempts` (default 3) is reached, then the issue is set to needs-review, except
   that a failure whose failing tests overlap none of the earlier attempts' on that PR gets one more attempt, up to
-  `webhook.agent_pr_fix_attempts_hard_cap` (default 6, at least the normal cap; CLAUDE-551); with no earlier fingerprint
+  `webhook.agent_pr_fix_attempts_hard_cap` (default 6, at least the normal cap); with no earlier fingerprint
   or no parsed test ids it parks as before. Each re-queue writes a `run_events` row saying normal or extended, and the
   needs-review comment lists every distinct failing-test set seen on the PR; a
   failure on a human's PR is commented on that PR; a resolved match reopens as a regression, comments the run and
@@ -558,7 +557,7 @@ Hybrid: a cheap deterministic pass runs first and only the residue it cannot lab
   commenter, and every rejection is posted as a comment naming the reason.
 - Throttling: synthetic action `webhook-comment` with `max_runs_per_day` (20); session timeout
   `claude_timeout_seconds` (600); automerge conflict-resolution runs per agent PR
-  `agent_conflict_resolve_attempts` (2, CLAUDE-550).
+  `agent_conflict_resolve_attempts` (2).
 
 ### 3.7 Pause, cancel and readiness
 
@@ -679,7 +678,7 @@ callers to build one themselves:
   explicitly rather than being omitted.
 - `Started:`, `Finished:` (RFC 3339, second precision) and `Duration:` (`<minutes>m <seconds>s`, or `<seconds>s` under
   a minute) lines, computed from the attempt's or run's own start time and "now" as the finish time.
-- A `Source:` line naming the action that produced the comment (`CLAUDE-555`), e.g. `youtrack`, `closed-issue-summary`, `ci-failure-webhook`, `comment-webhook`, `automerge-reconciler`, `push-comment`. Each call site passes a non-defaulting `source: &'static str`, so a new path that forgets to set it fails to compile.
+- A `Source:` line naming the action that produced the comment, e.g. `youtrack`, `closed-issue-summary`, `ci-failure-webhook`, `comment-webhook`, `automerge-reconciler`, `push-comment`. Each call site passes a non-defaulting `source: &'static str`, so a new path that forgets to set it fails to compile.
 - `Source:` and `Trigger:` lines naming the action and what started the work (`SPEC-3.13`), and the numbered step
   list of `SPEC-3.15` for any comment about an attempt.
 
@@ -773,7 +772,7 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
    path (`run_inflight_jobs` rows left behind by a dead process of THIS daemon) is unaffected by the window: it
    releases its own issues immediately. With peered instances (`SPEC-3.17`), the sweep also leaves an issue alone
    when a reachable peer's snapshot lists it in flight, per `SPEC-3.17` item 6. The sweep is NOT unconditional:
-   `concurrency.stuck_working_sweep` (default `true`, DB-backed, live-applied with no restart; CLAUDE-625) can turn
+   `concurrency.stuck_working_sweep` (default `true`, DB-backed, live-applied with no restart) can turn
    it off entirely for a multi-instance, non-clustered deployment, where the safeguards above are best-effort and do
    not cover every case (an operator in that topology disables the sweep so this instance never re-queues another
    instance's live run). `false` skips the tracker read and write on every tick: no listing, no correction, no
@@ -813,7 +812,7 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
    pass, ends in `Needs Review` per the table. The abort-only behavior is a defect.
 5. **A draft PR is never a state.** A draft PR opened at a checkpoint or a timeout salvage (`SPEC-3.3`) always has an
    issue in a state from the table. A salvaged PR whose later run finishes the work is promoted by the same rules as
-   any other PR; the automerge block on a salvaged PR (CLAUDE-429) lasts only until a run finishes the work.
+   any other PR; the automerge block on a salvaged PR lasts only until a run finishes the work.
 6. **`Needs Review` names one action.** Its comment states the single decision or action a person must take, and the
    issue carries the `Needs-Info` tag only when that action is a decision.
 7. **Estimate against limit.** At pickup, if the issue's `Estimation` exceeds the action's session timeout, the runner
@@ -821,7 +820,7 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
    counted like any other (`limits.max_attempts_per_key` binds a repeated split), clones the repo, runs `claude` with
    the built-in split prompt, and produces no commit and no PR. The prompt requires at least two PR-sized issues, each
    with a full spec and an `Estimation` that fits the timeout, filed in `native.youtrack.write_projects` and linked
-   `subtask of` the oversized issue (the one place the CLAUDE-454 rule is lifted: the oversized issue becomes the
+   `subtask of` the oversized issue (the one place the no-subtask rule is lifted: the oversized issue becomes the
    grouping parent of its pieces), and still forbids setting `AI Agent` from inside the session. After the run exits
    the runner, through the run's audited tracker, takes the oversized issue's children that did not exist before the
    attempt as the pieces. With two or more pieces, all fitting the timeout, it sets the issue's `Type` to `Story`,
@@ -850,7 +849,7 @@ latest run-status comment on the PR). The closed set is: `Queued`, `Working`, `C
   length, so the person who typed it sees that it was picked up. Rejections (a missing permission, an over-long body, a
   daily cap) are also posted as comments naming the reason, never only logged.
 - Every runner-posted comment, in addition to the `SPEC-3.9` footer, carries a `Source:` line (the action name) and,
-  when its run has a known trigger, a `Trigger:` line right after it (`CLAUDE-556`). The trigger is one of `Scheduled`
+  when its run has a known trigger, a `Trigger:` line right after it. The trigger is one of `Scheduled`
   (the scheduler's periodic tick), `WebhookEvent` (with a readable origin such as `CI failure run #42`), `UserCommand`
   (a `/claude` command, with the asker's login), `Manual` (an operator-initiated `trigger` or `run`) and
   `AiAgentPickup` (the `youtrack` action picking up an issue whose `AI Agent` field is `Queued`). The set is closed. A
@@ -976,7 +975,7 @@ linked, never pasted.
    Truncation is never silent.
 5. **Scope.** The cap applies to the verdict, the failure comment and the `Needs Review` comment (`SPEC-3.12`). Push
    comments (`SPEC-8.8`) keep their commit list.
-6. **Embedded command output (`CLAUDE-622`).** When a runner-posted comment or PR text embeds a captured command's
+6. **Embedded command output.** When a runner-posted comment or PR text embeds a captured command's
    output or error text (`append_stdout_tail`, `git_error`, or a forge CLI failure's stderr tail), that text is
    wrapped in a Markdown fenced code block (triple backticks, or more backticks when the text itself contains a run
    of three or more, so the text can never close the fence early), and it has every terminal escape sequence (ANSI
@@ -1218,14 +1217,14 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
   be reached through a stale name.
 - A synthetic action (`audit-run`, `closed-issue-summary` reporting) rejects edit, export and delete: there is no file
   backing it to touch.
-- The edit page of a `scripted` action with an `env` block offers an Environment form (CLAUDE-571): one field per key,
+- The edit page of a `scripted` action with an `env` block offers an Environment form: one field per key,
   posted to `/actions/{name}/env`. Saving rewrites only the changed values in place, leaving comments, key order and
   every other line as they were; the result goes through the same `validate_str` path, and nothing is written unless
   its parsed `env` equals the submitted values. A key not already in the block, or a native action, is refused with
   the editor's validation message. Keys are added or removed in the raw YAML only.
 - `/actions` and `/actions/{name}/env` are POST-only; each also answers `GET` with a `303` redirect (to
   `/actions/new/raw`, or the action's own `/edit` page) rather than `405`, since a rejected submission can leave
-  that URL in the address bar (`CLAUDE-650`).
+  that URL in the address bar.
 
 #### 4.3.4 Native action editor forms (`SPEC-4.3.4`)
 
@@ -1266,7 +1265,7 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
   state. These keys authenticate `/api/peer/*` (`SPEC-3.17` item 4, `SPEC-7.6`) only, never the web UI or `/api/*`.
 - `/secrets/api-keys`, `/secrets/api-keys/{name}/revoke`, `/secrets/{name}/rotate`, `/secrets/{name}/delete` and
   `/secrets/{name}/check` are POST-only; each also answers `GET` with a `303` redirect (to `/secrets`, or `/access`
-  for `check`) rather than `405`, since a POST response at that URL can leave it in the address bar (`CLAUDE-650`).
+  for `check`) rather than `405`, since a POST response at that URL can leave it in the address bar.
 
 #### 4.3.7 Access page (`SPEC-4.3.7`)
 
@@ -1287,8 +1286,8 @@ invite, remove and revoke; these and their handlers in `src/web_admin.rs` / `src
 - Every section save and service-auth card save is POST-only (`/settings/{section}`, `/settings/auth/claude`,
   `/settings/auth/claude/login`, `/settings/auth/claude/code`, `/settings/auth/youtrack`, `/settings/auth/forgejo`,
   `/settings/auth/github`, `/settings/auth/git`, `/settings/auth/email/test`); each also answers `GET` with a `303`
-  redirect to `/settings` rather than `405`, since a rejected submission re-renders the full page at that same URL
-  (`CLAUDE-650`). `/settings/auth/claude/cancel` stays POST-only: it always redirects and never renders a page.
+  redirect to `/settings` rather than `405`, since a rejected submission re-renders the full page at that same URL.
+  `/settings/auth/claude/cancel` stays POST-only: it always redirects and never renders a page.
 
 #### 4.3.9 About and activity pages (`SPEC-4.3.9`)
 
@@ -1479,7 +1478,7 @@ configured for a different provider, or a disabled listener returns 404. Pipelin
   synthetic command to the comment listener (`SPEC-4.4.5`) instead of leaving a "needs a human" comment.
 - An automerge outcome (conflict dispatch, behind-base update/merge, or clean merge) is recorded and its comment
   posted exactly once per decision, guarded against double-posting.
-- A PR whose row is `finished` (CLAUDE-630: `finalize` observed `Finalized::CodeReview`, i.e. the run that owns it
+- A PR whose row is `finished` (`finalize` observed `Finalized::CodeReview`, i.e. the run that owns it
   already reported success and the PR was promoted to ready) is skipped before any status read: no behind-base
   branch update, no merge attempt, no comment, on either the webhook decision path or the periodic reconciler.
 - A PR whose row is `failed` (`SPEC-3.3.1`: `finalize` ended the run that owns it in `Failed`, a gate failure
@@ -1524,10 +1523,10 @@ delivery that is not `issue_comment` (except `ping`) is acked and dropped before
 - A pull-request command clones the PR's head branch, writes the instruction verbatim to a file outside the work
   tree, runs Claude, then a decision gate classifies the result as no changes, unresolved conflicts, a measurement
   failure, too big (over `max_files` / `max_lines`), or a push; only a push pushes and posts a push comment
-  (`SPEC-4.4.4`-adjacent, `CLAUDE-447`).
+  (`SPEC-4.4.4`-adjacent).
 - A plain-issue command clones nothing and runs no agent: it mints a YouTrack issue carrying the instruction verbatim,
   sets `State` then the `AI Agent` field to the queued value last, and replies naming the minted key.
-- Every reply opens with `@<commenter>` and a one-word verdict line (CLAUDE-552): `**Done.**` (a commit reached the
+- Every reply opens with `@<commenter>` and a one-word verdict line: `**Done.**` (a commit reached the
   PR, or the request was filed), `**No.**` (refused, no change, or too large to push unattended), `**Blocked.**`
   (anything that stopped it), and `**Started.**` for the acknowledgement posted once an instruction is admitted,
   before any work. The usage reply has no verdict; a synthetic command mentions no one and posts no acknowledgement.
@@ -1706,7 +1705,7 @@ caller renders names the specific thing that went wrong instead of a generic wra
 
 With `CLAUDE_RUN_TEST_DATABASE_URL` set, every test fixture pool runs on that PostgreSQL server (`db::test_pool`). The
 shared contract for such fixtures is section 12 of the `common` specification, which isolates each test in a schema of
-its own; claude-run deviates to a database-per-test clone (CLAUDE-540) because replaying the ~130-statement migration
+its own; claude-run deviates to a database-per-test clone because replaying the ~130-statement migration
 set per test was 94% of the CI job's wall time and failed under load. The requirements below are claude-run's
 implementation.
 
@@ -1735,8 +1734,7 @@ implementation.
 - **SPEC-5.6.5**: A failed drop MUST print one line to standard error naming the database it was dropping and the
   database error, then leak it (harmless: the server is a throwaway container discarded on teardown).
 - **SPEC-5.6.6**: Once per test process, before the template is created, the fixture MUST fail naming the database when
-  the maintenance database's `public._sqlx_migrations` exists, since that marks a database a runner has migrated
-  (CLAUDE-403).
+  the maintenance database's `public._sqlx_migrations` exists, since that marks a database a runner has migrated.
 - **SPEC-5.6.7**: A test MUST apply `POSTGRES_MIGRATOR` itself into a fresh database of its own and assert that it
   recorded every migration, so the production path stays exercised while fixtures clone the template.
 - **SPEC-5.6.8**: The Postgres CI leg MUST re-run only the test files that build a DB pool
@@ -1750,13 +1748,13 @@ implementation.
   the thread count straight off `CI_JOBS` with no ceiling starved the service's connection slots on a HEAVY/MASSIVE
   runner, surfacing only as a bare `PoolTimedOut` once sqlx's retry loop exhausted its `acquire_timeout` against the
   connection-limit refusal; a looser cap of 16 was tried first and still left tests timing out acquiring from their
-  OWN per-test pool under CPU contention between threads, not the service's connection ceiling (CLAUDE-524).
+  OWN per-test pool under CPU contention between threads, not the service's connection ceiling.
 - **SPEC-5.6.10**: The SQLite CI leg's `RUST_TEST_THREADS` MUST be capped at 8 too, independent of
   `NEXTEST_TEST_THREADS`, for the same CPU-contention reason as `SPEC-5.6.9`'s second half: `test_sqlite_pool()`'s
   single-connection fixture tolerates a CPU-starved background rollback only up to its own `acquire_timeout` (120s),
   and an uncapped thread count on a HEAVY/MASSIVE runner contends for CPU badly enough to starve a sibling test's
   acquire past even that raised timeout, the same mechanism `SPEC-5.6.9` already had to lower its own cap from 16 to
-  8 to tolerate (CLAUDE-524).
+  8 to tolerate.
 - **SPEC-5.6.11**: Every fixture's `CREATE DATABASE ... TEMPLATE` clone step MUST go through `clone_fixture_database`,
   the one path that runs the statement under a process-wide async lock held only for that statement and released
   before the caller's pool connects, instead of relying on `run_database_statement_with_retry`'s `55006` polling loop
@@ -1818,7 +1816,7 @@ requires `secret_ref` and `write_token_ref` on every source.
 Edited on the Settings page or through `PUT /api/settings/{section}`; changes apply without restart. Fields not listed in
 3.x: `webhook.analysis_timeout_secs` (600), `webhook.analysis_concurrency` (2); `concurrency.max_parallel_global` (0 =
 largest enabled action cap); `concurrency.stuck_working_sweep` (default `true`; `false` disables the `SPEC-3.12` item
-2 reconcile sweep, CLAUDE-625); `preferences` (`locale`, `timezone`, `datetime_format`); `claude` (`model`, `effort`,
+2 reconcile sweep); `preferences` (`locale`, `timezone`, `datetime_format`); `claude` (`model`, `effort`,
 `autocompact`); `cargo_cache` (`enabled`, `max_bytes_per_repo`, 3.10); `docker_gc.max_bytes` (250 GB, 3.11); `auth` (service base URLs, secret names, git author name and email); `peers` (3.17). `webhook_comment.sources.<name>`
 adds `allowed_permissions`, `max_files`, `max_lines`, `bot_author`, `bot_email`, `skip_marker`.
 
@@ -1867,11 +1865,11 @@ the command ends (normal exit, command failure, `SIGINT`/`SIGTERM`, or a setup e
 exit code (128 + signal if it was killed by one) and failing the run if teardown itself fails even when the command
 succeeded. It sweeps orphaned containers from earlier runs first: one labelled with this process's own pid namespace
 is an orphan when its owning pid is dead; any other (another CI job's container on the same Docker daemon, or one
-from before the namespace label) only when older than 6 hours, since its pid means nothing here (CLAUDE-573). It starts the
+from before the namespace label) only when older than 6 hours, since its pid means nothing here. It starts the
 container with a loopback-only ephemeral published port (or, with the optional `--network`, on that Docker network
 with nothing published, reached by container name on port 5432, for a caller that is itself a container on that
 network), `--rm`, no volume (the writable layer and data directory are both discarded on teardown) and a raised
-`max_connections` (the parallel fixture leg needs more than the default 100, CLAUDE-540), waits for an actual `psql`
+`max_connections` (the parallel fixture leg needs more than the default 100), waits for an actual `psql`
 connection (not `pg_isready`, which can report ready during the official image's post-`initdb` restart) up to 60s,
 then opens a TCP connection to the URL's host and port from its own process for up to 20s and fails
 fast naming `--network` when it cannot (a caller in a container of its own cannot reach the Docker host's loopback),
@@ -2057,11 +2055,11 @@ appears in a log line or an error message. CI runs its Postgres leg through it
   transaction, so a race between two acceptances of the same token can create at most one account; a used, expired or
   unknown token resolves to nothing.
 - With no email address given, the invite link is shown once in the accounts UI. With an address, the link is emailed
-  instead through `src/mailer.rs` (CLAUDE-394), built from `CLAUDE_RUN_PUBLIC_URL` rather than any request's `Host`
+  instead through `src/mailer.rs`, built from `CLAUDE_RUN_PUBLIC_URL` rather than any request's `Host`
   header, and not displayed, unless the send fails, in which case the invite is kept (not discarded) and the link is
   shown once as a fallback. The emailed body never carries the SMTP credential.
 - Sending by email requires SMTP to be configured: `CLAUDE_RUN_SMTP_HOST`, `_FROM` and `CLAUDE_RUN_PUBLIC_URL` must all
-  be set, and a `_USERNAME` without a password is refused (CLAUDE-428); the transport is built fresh from the process
+  be set, and a `_USERNAME` without a password is refused; the transport is built fresh from the process
   environment on every send, never from a Settings-page form, so a changed environment applies on the next daemon
   restart, not live. An invalid recipient address is refused with 400 and mints no invite; an unconfigured SMTP
   environment is refused with 400 naming the missing variables rather than silently falling back to the link-only
@@ -2228,7 +2226,7 @@ action's `token_ref`, which is injected per job.
 - `validate_pr_subject` rejects an empty subject or one starting with `#` (a template heading like `## Summary`, or
   a bare issue reference, mistaken for the commit's one-line subject) before every push or PR-create call on every
   path (branch, AGit, GitHub), naming the branch and the offending subject; a bad tip therefore opens no PR at all.
-- `validate_pr_body` (CLAUDE-623) rejects a commit body whose issue-reference tail is not the bare `#KEY-N` block
+- `validate_pr_body` rejects a commit body whose issue-reference tail is not the bare `#KEY-N` block
   alone: a line anywhere in the body that is only `Closes` / `Fixes` / `Resolves` / `Refs` (any case) or starts
   with one of those words, or a last block (after dropping trailing blank lines and trailer lines such as
   `Co-Authored-By:`) that is not one or more bare `#KEY-N` lines. Runs at the same call sites as
@@ -2240,7 +2238,7 @@ action's `token_ref`, which is injected per job.
   written with hard line breaks reads the same as one written as single long lines.
 - `refresh_pr_text` re-derives a PR's title and body from its branch's current tip (running the same subject and
   body validation first) and overwrites the forge-side PR, used when a resumed run replaces a timeout-salvage
-  placeholder (CLAUDE-398) with the finished tip's own text; it is a no-op on a PR that is not a draft.
+  placeholder with the finished tip's own text; it is a no-op on a PR that is not a draft.
 - `bare_issue_key` reads the bare `#<KEY>-N` reference every runner-made commit body ends with out of arbitrary
   text, for a push-comment call site with no YouTrack job key passed in directly.
 
@@ -2296,7 +2294,7 @@ action's `token_ref`, which is injected per job.
   returned as an error naming the PR, never collapsed to "was not a draft" (a wrong `false` there is the one failure
   mode that would make a just-promoted PR look already-ready and let the race in SPEC-3.3.1 back in through the
   read side instead of the write side). `CliBackend`'s Forgejo implementation reports the same thing by whether it
-  found and stripped the `WIP: ` title prefix. See `SPEC-3.3.1` for how finalize uses this return value (CLAUDE-651).
+  found and stripped the `WIP: ` title prefix. See `SPEC-3.3.1` for how finalize uses this return value.
 
 ## 9. Deployment and operations
 

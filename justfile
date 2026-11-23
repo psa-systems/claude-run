@@ -68,6 +68,11 @@ internal_names_exempt_paths := ".forgejo/workflows/ .gitmodules renovate.json Do
 # matching the noseyparker ignore already in place for it.
 secrets_kingfisher_excludes := "compose.yml"
 
+# Placeholder credentials in redaction-test fixtures, the same ones CI's
+# kingfisher_skip_regex allowlists; the alternatives with a literal `$` or
+# backslash stay CI-only because they do not survive this recipe's quoting.
+secrets_kingfisher_skip_regex := "claude_run:(claude_run|secret)@|oauth2:(secret|tok|tok-123)@|ghp_(secret|from_login|action)@|user:s3cr3t@"
+
 # -- Default (override) -------------------------------------------------------
 
 # List available recipes. Must stay the FIRST recipe in this file: just resolves the default recipe by source order, and a top-level definition outranks the imported one, so whatever appears first here wins over common's `default`.

@@ -106,7 +106,7 @@ const REVIEW_FAIL_MARKER: &str = ".claude-run-review-fail";
 /// project's enabled VCS integration.
 #[derive(Debug, Clone)]
 struct YoutrackJob {
-    /// Issue id (`idReadable`, e.g. `MK-16`); also the dedup / attempt key.
+    /// Issue id (`idReadable`, e.g. `MX-16`); also the dedup / attempt key.
     key: String,
     summary: String,
     /// Forge server URL, trailing slash trimmed (e.g. `https://dev.a8n.run`).
@@ -784,7 +784,7 @@ pub async fn reconcile_restart_inflight(
 }
 
 /// Make a job key safe as a single path component for the per-job credential
-/// dir (issue ids like `MK-16` are already safe; defensively strip separators).
+/// dir (issue ids like `MX-16` are already safe; defensively strip separators).
 fn sanitize_key(key: &str) -> String {
     key.replace(['/', '\\', '.'], "_")
 }
@@ -1361,7 +1361,7 @@ struct Gathered {
     candidate_keys: Vec<String>,
 }
 
-/// Project key prefix of an issue id (`MK-16` -> `MK`).
+/// Project key prefix of an issue id (`MX-16` -> `MX`).
 fn project_key(idreadable: &str) -> String {
     idreadable
         .split('-')
@@ -3618,7 +3618,7 @@ fn run_pre(
 ///
 /// Install the repo's git hooks on a fresh clone so a
 /// commit or push that fails the repo's local checks is blocked locally instead of only
-/// being caught by CI (the gap that produced A8N-69). Detects a `just
+/// being caught by CI. Detects a `just
 /// install-hooks` recipe and, when present, runs it; the recipe is idempotent
 /// (it rewrites `.git/hooks/pre-commit`, `.git/hooks/commit-msg` and
 /// `.git/hooks/pre-push`), so running it on every clone is safe.
@@ -8810,11 +8810,11 @@ mod tests {
         let b2 = Arc::clone(&barrier);
         let t1 = std::thread::spawn(move || {
             b1.wait();
-            scratch_file("claude-run-race-test-MK-1", "one").unwrap()
+            scratch_file("claude-run-race-test-MX-1", "one").unwrap()
         });
         let t2 = std::thread::spawn(move || {
             b2.wait();
-            scratch_file("claude-run-race-test-MK-1", "two").unwrap()
+            scratch_file("claude-run-race-test-MX-1", "two").unwrap()
         });
         let p1 = t1.join().unwrap();
         let p2 = t2.join().unwrap();
@@ -9190,7 +9190,7 @@ mod tests {
             "an authentication failure must finalize as transient, got {outcome:?}"
         );
         assert_eq!(
-            state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
+            state::attempts_get(&pool, "yt", "MX-16").await.unwrap(),
             0,
             "no attempt is spent on a transient auth failure"
         );
@@ -9285,7 +9285,7 @@ mod tests {
             "a rate-limit result must finalize as transient, got {outcome:?}"
         );
         assert_eq!(
-            state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
+            state::attempts_get(&pool, "yt", "MX-16").await.unwrap(),
             0,
             "no attempt is spent on a transient rate-limit result"
         );
@@ -9381,7 +9381,7 @@ mod tests {
             tracker.set_calls.lock().unwrap()
         );
         assert!(tracker.comments.lock().unwrap().is_empty());
-        assert_eq!(state::attempts_get(&pool, "yt", "MK-16").await.unwrap(), 0);
+        assert_eq!(state::attempts_get(&pool, "yt", "MX-16").await.unwrap(), 0);
     }
 
     /// SPEC-3.15 item 5: every `Finalized` variant maps to its
@@ -9400,7 +9400,7 @@ mod tests {
             (Finalized::NoCodeChange, "No code change"),
             (
                 Finalized::Split {
-                    pieces: vec!["MK-20".into(), "MK-21".into()],
+                    pieces: vec!["MX-20".into(), "MX-21".into()],
                 },
                 "Split",
             ),
@@ -9589,8 +9589,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ci_cap_reached_counts_other_pending_prs_only() {
         let pool = mem_pool().await;
-        // The job's own PR (MK-16, #1) and three others.
-        for (issue, pr) in [("MK-16", 1), ("MK-20", 2), ("MK-21", 3), ("MK-22", 4)] {
+        // The job's own PR (MX-16, #1) and three others.
+        for (issue, pr) in [("MX-16", 1), ("MX-20", 2), ("MX-21", 3), ("MX-22", 4)] {
             record_ci_pr(&pool, issue, pr).await;
         }
         let j = job();
@@ -9692,20 +9692,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_job_defers_when_the_repo_is_at_its_ci_cap() {
         let pool = mem_pool().await;
-        for (issue, pr) in [("MK-20", 2), ("MK-21", 3), ("MK-22", 4)] {
+        for (issue, pr) in [("MX-20", 2), ("MX-21", 3), ("MX-22", 4)] {
             record_ci_pr(&pool, issue, pr).await;
         }
         let forge = ci_forge(&[(2, "pending"), (3, "pending"), (4, "pending")]);
 
         let (outcome, tracker) = run_gated_process_job(&pool, &forge, 3, true).await;
         assert!(
-            matches!(&outcome, ProcessedJob::Deferred { key, pending: 3 } if key == "MK-16"),
+            matches!(&outcome, ProcessedJob::Deferred { key, pending: 3 } if key == "MX-16"),
             "got {outcome:?}"
         );
         assert_eq!(tracker.field(), "Queued");
         assert!(tracker.set_calls.lock().unwrap().is_empty());
         assert!(tracker.comments.lock().unwrap().is_empty());
-        assert_eq!(state::attempts_get(&pool, "yt", "MK-16").await.unwrap(), 0);
+        assert_eq!(state::attempts_get(&pool, "yt", "MX-16").await.unwrap(), 0);
     }
 
     /// Below the cap, and with the cap at 0, the pickup is not
@@ -9714,7 +9714,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_job_is_not_deferred_below_the_cap_or_with_cap_zero() {
         let pool = mem_pool().await;
-        for (issue, pr) in [("MK-20", 2), ("MK-21", 3), ("MK-22", 4)] {
+        for (issue, pr) in [("MX-20", 2), ("MX-21", 3), ("MX-22", 4)] {
             record_ci_pr(&pool, issue, pr).await;
         }
         let forge = ci_forge(&[(2, "pending"), (3, "pending"), (4, "pending")]);
@@ -9807,7 +9807,7 @@ mod tests {
         let (outcome, tracker) =
             run_estimation_gated_process_job(&pool, Some(60), Duration::from_secs(1800)).await;
         assert!(
-            matches!(&outcome, ProcessedJob::Filtered { key } if key == "MK-16"),
+            matches!(&outcome, ProcessedJob::Filtered { key } if key == "MX-16"),
             "got {outcome:?}"
         );
         assert_eq!(tracker.field(), "Queued");
@@ -9941,18 +9941,18 @@ mod tests {
     #[test]
     fn finalize_split_queues_fitting_pieces_and_makes_the_issue_a_story() {
         let t = split_tracker(
-            &["MK-1", "MK-20", "MK-21"],
+            &["MX-1", "MX-20", "MX-21"],
             &[
-                ("MK-20", Some(30)),
-                ("MK-21", Some(20)),
-                ("MK-1", Some(999)),
+                ("MX-20", Some(30)),
+                ("MX-21", Some(20)),
+                ("MX-1", Some(999)),
             ],
         );
-        let res = run_split(&t, Ok(vec!["MK-1".into()])).unwrap();
+        let res = run_split(&t, Ok(vec!["MX-1".into()])).unwrap();
         assert_eq!(
             res,
             Finalized::Split {
-                pieces: vec!["MK-20".into(), "MK-21".into()]
+                pieces: vec!["MX-20".into(), "MX-21".into()]
             }
         );
         let sets = t.sets.lock().unwrap().clone();
@@ -9960,16 +9960,16 @@ mod tests {
         assert_eq!(
             sets,
             vec![
-                s("MK-16", "Type", "Story"),
-                s("MK-20", "AI Agent", "Queued"),
-                s("MK-21", "AI Agent", "Queued"),
-                s("MK-16", "AI Agent", src().states.no_code_label()),
+                s("MX-16", "Type", "Story"),
+                s("MX-20", "AI Agent", "Queued"),
+                s("MX-21", "AI Agent", "Queued"),
+                s("MX-16", "AI Agent", src().states.no_code_label()),
             ]
         );
         let comments = t.comments.lock().unwrap().clone();
         assert_eq!(comments.len(), 1);
-        assert!(comments[0].1.contains("- MK-20") && comments[0].1.contains("- MK-21"));
-        assert!(!comments[0].1.contains("MK-1\n"), "{comments:?}");
+        assert!(comments[0].1.contains("- MX-20") && comments[0].1.contains("- MX-21"));
+        assert!(!comments[0].1.contains("MX-1\n"), "{comments:?}");
         assert!(t.tags.lock().unwrap().is_empty());
     }
 
@@ -9977,16 +9977,16 @@ mod tests {
     /// Review with Needs-Info and a comment naming the cause; nothing queued.
     #[test]
     fn finalize_split_with_fewer_than_two_pieces_parks_needs_review() {
-        let t = split_tracker(&["MK-20"], &[("MK-20", Some(30))]);
+        let t = split_tracker(&["MX-20"], &[("MX-20", Some(30))]);
         assert_eq!(run_split(&t, Ok(vec![])).unwrap(), Finalized::NeedsReview);
         let sets = t.sets.lock().unwrap().clone();
         assert_eq!(
             sets,
-            vec![("MK-16".into(), "AI Agent".into(), "Needs Review".into())]
+            vec![("MX-16".into(), "AI Agent".into(), "Needs Review".into())]
         );
         assert_eq!(
             t.tags.lock().unwrap().as_slice(),
-            [("MK-16".to_string(), "Needs-Info".to_string())]
+            [("MX-16".to_string(), "Needs-Info".to_string())]
         );
         assert!(t.comments.lock().unwrap()[0].1.contains("at least two"));
     }
@@ -9996,27 +9996,27 @@ mod tests {
     #[test]
     fn finalize_split_with_an_oversized_piece_queues_nothing() {
         let t = split_tracker(
-            &["MK-20", "MK-21", "MK-22"],
-            &[("MK-20", Some(30)), ("MK-21", Some(31)), ("MK-22", None)],
+            &["MX-20", "MX-21", "MX-22"],
+            &[("MX-20", Some(30)), ("MX-21", Some(31)), ("MX-22", None)],
         );
         assert_eq!(run_split(&t, Ok(vec![])).unwrap(), Finalized::NeedsReview);
         let sets = t.sets.lock().unwrap().clone();
         assert!(
             sets.iter()
-                .all(|(k, _, v)| k == "MK-16" && v == "Needs Review"),
+                .all(|(k, _, v)| k == "MX-16" && v == "Needs Review"),
             "{sets:?}"
         );
         let body = t.comments.lock().unwrap()[0].1.clone();
-        assert!(body.contains("MK-21 (Estimation 31 minutes)"), "{body}");
-        assert!(body.contains("MK-22 (no Estimation)"), "{body}");
-        assert!(!body.contains("MK-20 ("), "{body}");
+        assert!(body.contains("MX-21 (Estimation 31 minutes)"), "{body}");
+        assert!(body.contains("MX-22 (no Estimation)"), "{body}");
+        assert!(!body.contains("MX-20 ("), "{body}");
     }
 
     /// A children read that failed before the attempt can never
     /// read as "no pieces existed"; the split ends in Needs Review naming it.
     #[test]
     fn finalize_split_unreadable_children_park_with_the_cause() {
-        let t = split_tracker(&["MK-20", "MK-21"], &[]);
+        let t = split_tracker(&["MX-20", "MX-21"], &[]);
         let before = Err(Error::Other(anyhow::anyhow!("links failed")));
         assert_eq!(run_split(&t, before).unwrap(), Finalized::NeedsReview);
         assert!(t.comments.lock().unwrap()[0].1.contains("links failed"));
@@ -10026,8 +10026,8 @@ mod tests {
     #[test]
     fn finalize_split_write_failure_is_an_error() {
         let mut t = split_tracker(
-            &["MK-20", "MK-21"],
-            &[("MK-20", Some(30)), ("MK-21", Some(30))],
+            &["MX-20", "MX-21"],
+            &[("MX-20", Some(30)), ("MX-21", Some(30))],
         );
         t.fail_set_on = Some("Type".into());
         assert!(run_split(&t, Ok(vec![])).is_err());
@@ -10181,7 +10181,7 @@ mod tests {
             1
         );
         assert_eq!(
-            state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
+            state::attempts_get(&pool, "yt", "MX-16").await.unwrap(),
             0,
             "no attempt is spent on a mid-run login trip"
         );
@@ -10198,10 +10198,10 @@ mod tests {
         let body = cap_reached_comment(3, 3);
         let runner = Arc::new(
             StubRunner::new()
-                .ok("yt", &["issue", "comment", "MK-16", &body], "")
+                .ok("yt", &["issue", "comment", "MX-16", &body], "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -10259,7 +10259,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(&outcome, ProcessedJob::CapHit { key } if key == "MK-16"),
+            matches!(&outcome, ProcessedJob::CapHit { key } if key == "MX-16"),
             "{outcome:?}"
         );
         let calls = runner.calls.lock().unwrap();
@@ -10274,7 +10274,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "{calls:?}"
         );
         // The attempt-cap park also lands on Needs Review, but it is a
@@ -10294,10 +10294,10 @@ mod tests {
         let body = cap_reached_comment(3, 3);
         let runner = Arc::new(
             StubRunner::new()
-                .fail("yt", &["issue", "comment", "MK-16", &body], 1, "boom")
+                .fail("yt", &["issue", "comment", "MX-16", &body], 1, "boom")
                 .fail(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     1,
                     "boom",
                 ),
@@ -10356,7 +10356,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(&outcome, ProcessedJob::CapHit { key } if key == "MK-16"),
+            matches!(&outcome, ProcessedJob::CapHit { key } if key == "MX-16"),
             "a failed comment/field write must not turn the cap hit into an error, got {outcome:?}"
         );
     }
@@ -10370,7 +10370,7 @@ mod tests {
 
     fn job() -> YoutrackJob {
         YoutrackJob {
-            key: "MK-16".into(),
+            key: "MX-16".into(),
             summary: "Do the thing".into(),
             repo_host: "https://dev.a8n.run".into(),
             repo_path: "contoso/claude-run".into(),
@@ -10547,14 +10547,14 @@ mod tests {
     async fn run_checkpoint_watcher_records_the_first_opened_pr_once() {
         let pool = mem_pool().await;
         let forge = FakeCheckpointForge::new(vec![
-            Ok(Some(checkpoint_pr(77, "fix/MK-16"))),
-            Ok(Some(checkpoint_pr(77, "fix/MK-16"))),
+            Ok(Some(checkpoint_pr(77, "fix/MX-16"))),
+            Ok(Some(checkpoint_pr(77, "fix/MX-16"))),
         ]);
         let wd = tempfile::tempdir().unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let pool_handle = tokio::runtime::Handle::current();
         let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
-            &pool, 1, "act", "MK-16", 1,
+            &pool, 1, "act", "MX-16", 1,
         ));
         let cancel = CancellationToken::new();
         let outcome = std::thread::scope(|scope| {
@@ -10592,7 +10592,7 @@ mod tests {
         let opened = outcome
             .opened
             .expect("the first successful push must be recorded");
-        assert_eq!(opened.branch, "fix/MK-16");
+        assert_eq!(opened.branch, "fix/MX-16");
         assert_eq!(
             opened.pr_url,
             "https://dev.a8n.run/contoso/claude-run/pulls/77"
@@ -10628,7 +10628,7 @@ mod tests {
         .await
         .unwrap();
         let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
-            &pool, run_id, "act", "MK-16", 1,
+            &pool, run_id, "act", "MX-16", 1,
         ));
         let t0 = chrono::Utc::now() - chrono::Duration::seconds(10);
         recorder
@@ -10644,7 +10644,7 @@ mod tests {
                 None,
             )
             .await;
-        let forge = FakeCheckpointForge::new(vec![Ok(Some(checkpoint_pr(77, "fix/MK-16")))]);
+        let forge = FakeCheckpointForge::new(vec![Ok(Some(checkpoint_pr(77, "fix/MX-16")))]);
         let wd = tempfile::tempdir().unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let pool_handle = tokio::runtime::Handle::current();
@@ -10706,7 +10706,7 @@ mod tests {
         let stored: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
             crate::db::q(
                 &pool,
-                "SELECT COUNT(*) FROM attempt_steps WHERE job_key = 'MK-16' AND kind = 'checkpoint'",
+                "SELECT COUNT(*) FROM attempt_steps WHERE job_key = 'MX-16' AND kind = 'checkpoint'",
             )
             .into_owned(),
         ))
@@ -10726,12 +10726,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn run_checkpoint_watcher_skips_the_db_write_when_already_resuming() {
         let pool = mem_pool().await;
-        let forge = FakeCheckpointForge::new(vec![Ok(Some(checkpoint_pr(7, "fix/MK-16")))]);
+        let forge = FakeCheckpointForge::new(vec![Ok(Some(checkpoint_pr(7, "fix/MX-16")))]);
         let wd = tempfile::tempdir().unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let pool_handle = tokio::runtime::Handle::current();
         let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
-            &pool, 1, "act", "MK-16", 1,
+            &pool, 1, "act", "MX-16", 1,
         ));
         let cancel = CancellationToken::new();
         let outcome = std::thread::scope(|scope| {
@@ -10785,7 +10785,7 @@ mod tests {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let pool_handle = tokio::runtime::Handle::current();
         let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
-            &pool, 1, "act", "MK-16", 1,
+            &pool, 1, "act", "MX-16", 1,
         ));
         let cancel = CancellationToken::new();
         let outcome = std::thread::scope(|scope| {
@@ -10843,14 +10843,14 @@ mod tests {
     async fn run_checkpoint_watcher_never_pushes_when_a_tracker_key_is_found_first() {
         let pool = mem_pool().await;
         let forge = FakeCheckpointForge::with_scan_hits(
-            vec![Ok(Some(checkpoint_pr(77, "fix/MK-16")))],
+            vec![Ok(Some(checkpoint_pr(77, "fix/MX-16")))],
             vec!["PROJ-470".to_string()],
         );
         let wd = tempfile::tempdir().unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let pool_handle = tokio::runtime::Handle::current();
         let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
-            &pool, 1, "act", "MK-16", 1,
+            &pool, 1, "act", "MX-16", 1,
         ));
         let cancel = CancellationToken::new();
         let outcome = std::thread::scope(|scope| {
@@ -11079,7 +11079,7 @@ mod tests {
             &tracker,
             &src(),
             "act",
-            "MK-16",
+            "MX-16",
             "stopped, no fault of the issue",
             None,
         );
@@ -11103,7 +11103,7 @@ mod tests {
             &tracker,
             &src(),
             "act",
-            "MK-16",
+            "MX-16",
             "stopped, no fault of the issue",
             None,
         );
@@ -11122,10 +11122,10 @@ mod tests {
             ..FakeTracker::new("Working")
         };
         let logs = capture_logs(|| {
-            requeue_off_working(&tracker, &src(), "act", "MK-16", "body", None);
+            requeue_off_working(&tracker, &src(), "act", "MX-16", "body", None);
         });
         assert!(logs.contains("ERROR"), "{logs}");
-        assert!(logs.contains("MK-16"), "{logs}");
+        assert!(logs.contains("MX-16"), "{logs}");
         assert!(tracker.comments.lock().unwrap().is_empty());
         assert!(tracker.set_calls.lock().unwrap().is_empty());
     }
@@ -11139,10 +11139,10 @@ mod tests {
             ..FakeTracker::new("Working")
         };
         let logs = capture_logs(|| {
-            requeue_off_working(&tracker, &src(), "act", "MK-16", "body", None);
+            requeue_off_working(&tracker, &src(), "act", "MX-16", "body", None);
         });
         assert!(logs.contains("ERROR"), "{logs}");
-        assert!(logs.contains("MK-16"), "{logs}");
+        assert!(logs.contains("MX-16"), "{logs}");
         assert_eq!(tracker.field(), "Working");
     }
 
@@ -11608,7 +11608,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("stream.jsonl");
         std::fs::write(&log, "{\"type\":\"system\",\"subtype\":\"init\"}\n").unwrap();
-        let body = append_compaction_note("The PR is ready.", Some(&log), "MK-16");
+        let body = append_compaction_note("The PR is ready.", Some(&log), "MX-16");
         assert_eq!(body, "The PR is ready.");
     }
 
@@ -11624,7 +11624,7 @@ mod tests {
             "{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n",
         )
         .unwrap();
-        let body = append_compaction_note("The PR is ready.", Some(&log), "MK-16");
+        let body = append_compaction_note("The PR is ready.", Some(&log), "MX-16");
         assert_eq!(
             body,
             "The PR is ready.\n\nContext was compacted 1 time(s) during this run; check the issues it created."
@@ -11635,7 +11635,7 @@ mod tests {
     /// unchanged rather than erroring.
     #[test]
     fn append_compaction_note_leaves_body_unchanged_with_no_stream_log() {
-        let body = append_compaction_note("Parked for review.", None, "MK-16");
+        let body = append_compaction_note("Parked for review.", None, "MX-16");
         assert_eq!(body, "Parked for review.");
     }
 
@@ -11645,7 +11645,7 @@ mod tests {
     fn append_compaction_note_leaves_body_unchanged_on_a_read_failure() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.jsonl");
-        let body = append_compaction_note("The PR is ready.", Some(&missing), "MK-16");
+        let body = append_compaction_note("The PR is ready.", Some(&missing), "MX-16");
         assert_eq!(body, "The PR is ready.");
     }
 
@@ -11675,16 +11675,16 @@ mod tests {
         assert!(p.starts_with(
             "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md."
         ));
-        assert!(p.contains("Issue: MK-16: Do the thing"));
+        assert!(p.contains("Issue: MX-16: Do the thing"));
         assert!(p.contains("Repo: https://dev.a8n.run/contoso/claude-run.git"));
         assert!(p.contains("Working directory: /tmp/wd - the repo is already cloned here"));
         assert!(p.contains("60 minutes after it started"));
-        assert!(p.contains("yt issue inspect MK-16"));
+        assert!(p.contains("yt issue inspect MX-16"));
         assert!(
             !p.contains("Closes"),
             "preset prompt must not instruct writing a Closes line:\n{p}"
         );
-        assert!(p.contains("#MK-16"));
+        assert!(p.contains("#MX-16"));
         assert!(p.contains("/tmp/wd/.claude-run-needs-review"));
         assert!(p.contains("/tmp/wd/.claude-run-skip-attempt"));
         assert!(!p.contains("{{"), "unresolved placeholder:\n{p}");
@@ -11707,13 +11707,13 @@ mod tests {
         };
         let wd = std::path::Path::new("/tmp/wd");
         let p = build_prompt(&src, &job(), wd, hour(), SystemTime::now(), None);
-        assert!(p.contains("Issue: MK-16: Do the thing"));
+        assert!(p.contains("Issue: MX-16: Do the thing"));
         assert!(p.contains("Repo: https://dev.a8n.run/contoso/claude-run.git"));
         assert!(p.contains("/tmp/wd/.claude-run-needs-review"));
         assert!(p.contains("/tmp/wd/.claude-run-skip-attempt"));
         assert!(!p.contains("{{"), "unresolved placeholder:\n{p}");
         assert!(
-            !p.contains("#MK-16"),
+            !p.contains("#MX-16"),
             "the tracker-free prompt must never put the issue key into repo text:\n{p}"
         );
     }
@@ -11841,7 +11841,7 @@ mod tests {
             SystemTime::now(),
             None,
         );
-        assert_eq!(p, "Do MK-16: Do the thing in /tmp/wd");
+        assert_eq!(p, "Do MX-16: Do the thing in /tmp/wd");
         assert!(!p.contains("You are working a YouTrack issue"));
     }
 
@@ -11870,7 +11870,7 @@ mod tests {
                 SystemTime::now(),
                 None
             ),
-            "Do MK-16"
+            "Do MX-16"
         );
     }
 
@@ -11960,7 +11960,7 @@ mod tests {
         for r in [None, Some(&resume)] {
             let p = build_prompt(&audit_src(), &job(), wd, hour(), SystemTime::now(), r);
             assert!(!p.contains("{{"), "unresolved placeholder:\n{p}");
-            assert!(p.contains("Issue: MK-16: Do the thing"), "{p}");
+            assert!(p.contains("Issue: MX-16: Do the thing"), "{p}");
             assert!(
                 p.contains("Repo: https://dev.a8n.run/contoso/claude-run.git"),
                 "{p}"
@@ -11968,7 +11968,7 @@ mod tests {
             assert!(p.contains("ONLY in these projects: ALPHA, BETA"), "{p}");
             assert!(p.contains("/tmp/wd/.claude-run-needs-review"), "{p}");
             assert!(p.contains("/tmp/wd/.claude-run-skip-attempt"), "{p}");
-            assert!(p.contains("#MK-16"), "{p}");
+            assert!(p.contains("#MX-16"), "{p}");
         }
         let resumed = build_prompt(
             &audit_src(),
@@ -12053,13 +12053,13 @@ mod tests {
             std::path::Path::new("/wd"),
             hour(),
             now,
-            "MK",
+            "MX",
             "",
             None,
         );
         assert_eq!(
             p,
-            "MK-16|Do the thing|https://dev.a8n.run/contoso/claude-run.git|/wd|60|2023-11-14T23:13:20Z|.claude-run-needs-review|.claude-run-skip-attempt|.claude-run-no-code-change|MK||"
+            "MX-16|Do the thing|https://dev.a8n.run/contoso/claude-run.git|/wd|60|2023-11-14T23:13:20Z|.claude-run-needs-review|.claude-run-skip-attempt|.claude-run-no-code-change|MX||"
         );
     }
 
@@ -12089,7 +12089,7 @@ mod tests {
             std::path::Path::new("/wd"),
             Duration::from_secs(5400),
             now,
-            "MK",
+            "MX",
             "",
             None,
         );
@@ -12130,7 +12130,7 @@ mod tests {
             std::path::Path::new("/wd"),
             hour(),
             SystemTime::now(),
-            "MK",
+            "MX",
             "",
             Some(&resume),
         );
@@ -12150,11 +12150,11 @@ mod tests {
             std::path::Path::new("/wd"),
             hour(),
             SystemTime::now(),
-            "MK",
+            "MX",
             "",
             None,
         );
-        assert_eq!(p, "MK-16 {{bogus}} {{oops");
+        assert_eq!(p, "MX-16 {{bogus}} {{oops");
     }
 
     /// An empty `write_projects` resolves to the triggering issue's
@@ -12163,7 +12163,7 @@ mod tests {
     #[test]
     fn write_projects_defaults_to_the_issue_project() {
         assert!(src().write_projects.is_empty(), "the default is empty");
-        assert_eq!(write_projects(&src(), &job()), "MK");
+        assert_eq!(write_projects(&src(), &job()), "MX");
 
         let mut s = src();
         s.write_projects = vec!["AUD".into(), "DEV".into()];
@@ -12191,12 +12191,12 @@ mod tests {
         // The create scope renders from `{{write_projects}}`, defaulting to the
         // triggering issue's own project.
         assert!(
-            p.contains("create it ONLY in these projects: MK,"),
+            p.contains("create it ONLY in these projects: MX,"),
             "create scope must render the project list: {p}"
         );
         // The single permitted link write to the triggering issue.
         assert!(
-            p.contains("yt issue link <new-issue> MK-16 --type \"relates to\""),
+            p.contains("yt issue link <new-issue> MX-16 --type \"relates to\""),
             "{p}"
         );
         assert!(
@@ -12207,14 +12207,14 @@ mod tests {
         assert!(
             p.contains(
                 "you MAY comment with 'yt issue comment {{key}}'"
-                    .replace("{{key}}", "MK-16")
+                    .replace("{{key}}", "MX-16")
                     .as_str()
             ),
             "the comment permission on the triggering issue must be present: {p}"
         );
         assert!(
             p.contains(
-                "The runner still posts its own outcome comment on MK-16; do not duplicate it"
+                "The runner still posts its own outcome comment on MX-16; do not duplicate it"
             ),
             "{p}"
         );
@@ -12224,9 +12224,9 @@ mod tests {
             p.contains("NEVER set the 'AI Agent' field on ANY issue, including issues you created yourself"),
             "the AI Agent ban must be present verbatim: {p}"
         );
-        assert!(p.contains("No other write to MK-16"), "{p}");
+        assert!(p.contains("No other write to MX-16"), "{p}");
         assert!(
-            !p.contains("No other write to MK-16: no description or summary edit, no comment,"),
+            !p.contains("No other write to MX-16: no description or summary edit, no comment,"),
             "comment must no longer be listed among the bans on the triggering issue: {p}"
         );
         assert!(
@@ -12286,7 +12286,7 @@ mod tests {
             "the old size-note escape hatch must be gone: {p}"
         );
         assert!(
-            !p.contains("post one short comment on MK-16 with 'yt issue comment MK-16' saying why"),
+            !p.contains("post one short comment on MX-16 with 'yt issue comment MX-16' saying why"),
             "the size-note instruction must be gone: {p}"
         );
         assert!(
@@ -12294,7 +12294,7 @@ mod tests {
             "{p}"
         );
         assert!(
-            p.contains("Task too large:") && p.contains("Split MK-16 as proposed?"),
+            p.contains("Task too large:") && p.contains("Split MX-16 as proposed?"),
             "{p}"
         );
         assert!(
@@ -12385,7 +12385,7 @@ mod tests {
 
     #[test]
     fn project_key_splits_idreadable() {
-        assert_eq!(project_key("MK-16"), "MK");
+        assert_eq!(project_key("MX-16"), "MX");
         assert_eq!(project_key("PROJ-32"), "PROJ");
         assert_eq!(project_key("NODASH"), "NODASH");
     }
@@ -12434,7 +12434,7 @@ mod tests {
     #[test]
     fn gather_merges_repo_and_drops_projects_without_vcs() {
         let issues =
-            r#"[{"idReadable":"MK-16","summary":"a"},{"idReadable":"ZZ-1","summary":"b"}]"#;
+            r#"[{"idReadable":"MX-16","summary":"a"},{"idReadable":"ZZ-1","summary":"b"}]"#;
         let runner = StubRunner::new()
             .ok(
                 "yt",
@@ -12443,7 +12443,7 @@ mod tests {
             )
             .ok(
                 "yt",
-                &["project", "vcs", "list", "MK", "--enabled-only", "--json"],
+                &["project", "vcs", "list", "MX", "--enabled-only", "--json"],
                 r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-run"}]"#,
             )
             // ZZ has no enabled VCS -> its issue is dropped.
@@ -12455,7 +12455,7 @@ mod tests {
         let backend = CliBackend::new(Arc::new(runner));
         let Gathered { jobs, events, .. } = gather(&backend, &src().query, None).unwrap();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].key, "MK-16");
+        assert_eq!(jobs[0].key, "MX-16");
         assert_eq!(jobs[0].summary, "a");
         assert_eq!(
             jobs[0].clone_url,
@@ -12475,7 +12475,7 @@ mod tests {
         // provider-CLI-error path rather than the silent drop path. The good
         // project's issue is unaffected.
         let issues =
-            r#"[{"idReadable":"MK-16","summary":"a"},{"idReadable":"ZZ-1","summary":"b"}]"#;
+            r#"[{"idReadable":"MX-16","summary":"a"},{"idReadable":"ZZ-1","summary":"b"}]"#;
         let runner = StubRunner::new()
             .ok(
                 "yt",
@@ -12484,7 +12484,7 @@ mod tests {
             )
             .ok(
                 "yt",
-                &["project", "vcs", "list", "MK", "--enabled-only", "--json"],
+                &["project", "vcs", "list", "MX", "--enabled-only", "--json"],
                 r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-run"}]"#,
             )
             // ZZ's probe errors (mirrors the malformed-argv exit-2 symptom).
@@ -12501,7 +12501,7 @@ mod tests {
             candidate_keys,
         } = gather(&backend, &src().query, None).unwrap();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].key, "MK-16");
+        assert_eq!(jobs[0].key, "MX-16");
         // The probe failure is recorded as a warn event (not the
         // silent no-integration drop) so it surfaces in the web UI.
         assert_eq!(events.len(), 1);
@@ -12513,7 +12513,7 @@ mod tests {
         // pruned (and re-commented) every time a probe or a grant is flaky.
         assert_eq!(
             candidate_keys,
-            vec!["MK-16".to_string(), "ZZ-1".to_string()]
+            vec!["MX-16".to_string(), "ZZ-1".to_string()]
         );
     }
 
@@ -12558,11 +12558,11 @@ mod tests {
             .ok(
                 "yt",
                 &["list", "--query=-Resolved AI Agent: Queued", "--json"],
-                r#"[{"idReadable":"MK-16","summary":"a"},{"idReadable":"MK-17","summary":"b"}]"#,
+                r#"[{"idReadable":"MX-16","summary":"a"},{"idReadable":"MX-17","summary":"b"}]"#,
             )
             .ok(
                 "yt",
-                &["project", "vcs", "list", "MK", "--enabled-only", "--json"],
+                &["project", "vcs", "list", "MX", "--enabled-only", "--json"],
                 r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-run"}]"#,
             )
     }
@@ -12604,7 +12604,7 @@ mod tests {
         assert!(jobs.is_empty(), "{jobs:?}");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level, "warn");
-        assert_eq!(events[0].context.as_deref(), Some("MK"));
+        assert_eq!(events[0].context.as_deref(), Some("MX"));
         assert!(
             events[0].message.contains("contoso/claude-run"),
             "{}",
@@ -12802,13 +12802,13 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Working"],
                     "",
                 )
-                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], "")
+                .ok("yt", &["issue", "set-state", "MX-16", "In Progress"], "")
                 .ok(
                     "yt",
-                    &["issue", "update", "MK-16", "--assignee", "octocat"],
+                    &["issue", "update", "MX-16", "--assignee", "octocat"],
                     "",
                 ),
         );
@@ -12838,7 +12838,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue update MK-16 --assignee octocat"),
+                .any(|c| c == "yt issue update MX-16 --assignee octocat"),
             "{calls:?}"
         );
     }
@@ -12853,10 +12853,10 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Working"],
                     "",
                 )
-                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], ""),
+                .ok("yt", &["issue", "set-state", "MX-16", "In Progress"], ""),
         );
         // An empty key store: `clone_url` must resolve nothing here rather than
         // read the developer's real forgejo-cli credentials.
@@ -12893,13 +12893,13 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Working"],
                     "",
                 )
-                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], "")
+                .ok("yt", &["issue", "set-state", "MX-16", "In Progress"], "")
                 .fail(
                     "yt",
-                    &["issue", "update", "MK-16", "--assignee", "octocat"],
+                    &["issue", "update", "MX-16", "--assignee", "octocat"],
                     1,
                     "no such user",
                 ),
@@ -12961,10 +12961,10 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Working"],
                     "",
                 )
-                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], ""),
+                .ok("yt", &["issue", "set-state", "MX-16", "In Progress"], ""),
         );
         let keys = base.path().join("keys.json");
         std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
@@ -13031,10 +13031,10 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Working"],
                     "",
                 )
-                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], ""),
+                .ok("yt", &["issue", "set-state", "MX-16", "In Progress"], ""),
         );
         let keys = base.path().join("keys.json");
         std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
@@ -13071,7 +13071,7 @@ mod tests {
         std::fs::write(wd.join(NEEDS_REVIEW_MARKER), "need a decision on X").unwrap();
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
-            &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+            &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
             "",
         ));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
@@ -13101,7 +13101,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "{calls:?}"
         );
         // No PR on the park path.
@@ -13156,7 +13156,7 @@ mod tests {
         std::fs::write(wd.join(NEEDS_REVIEW_MARKER), "need a decision on X").unwrap();
         let runner = Arc::new(stub_runner_for_a_clean_final_push().ok(
             "yt",
-            &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+            &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
             "",
         ));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
@@ -13198,10 +13198,10 @@ mod tests {
     fn finalize_no_code_marker_pushes_the_feature_branch() {
         let dir = tempfile::tempdir().unwrap();
         let wd = dir.path();
-        std::fs::write(wd.join(NO_CODE_MARKER), "Filed MK-99 for the gap.\n").unwrap();
+        std::fs::write(wd.join(NO_CODE_MARKER), "Filed MX-99 for the gap.\n").unwrap();
         let runner = Arc::new(stub_runner_for_a_clean_final_push().ok(
             "yt",
-            &["issue", "set-field", "MK-16", "AI Agent", "Done"],
+            &["issue", "set-field", "MX-16", "AI Agent", "Done"],
             "",
         ));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
@@ -13260,7 +13260,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Failed"],
                     "",
                 ),
         );
@@ -13298,7 +13298,7 @@ mod tests {
         assert!(
             !calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "a failed final push must never be reported as Needs Review: {calls:?}"
         );
     }
@@ -13329,7 +13329,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -13366,13 +13366,13 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "default delivery_blocked label (Needs Review fallback) must be set: {calls:?}"
         );
         assert!(
             !calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Failed"),
             "a push-rejected + checkpoint-rejected pattern must not land on Failed: {calls:?}"
         );
     }
@@ -13606,17 +13606,17 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "comment", "MK-16", "need a decision on X"],
+                    &["issue", "comment", "MX-16", "need a decision on X"],
                     "",
                 )
                 .ok(
                     "yt",
-                    &["issue", "tag", "add", "MK-16", "Needs-Info", "--create"],
+                    &["issue", "tag", "add", "MX-16", "Needs-Info", "--create"],
                     "",
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -13648,11 +13648,11 @@ mod tests {
             .expect("comment posted");
         let tag_at = calls
             .iter()
-            .position(|c| c == "yt issue tag add MK-16 Needs-Info --create")
+            .position(|c| c == "yt issue tag add MX-16 Needs-Info --create")
             .expect("Needs-Info tag attached");
         let field_at = calls
             .iter()
-            .position(|c| c == "yt issue set-field MK-16 AI Agent Needs Review")
+            .position(|c| c == "yt issue set-field MX-16 AI Agent Needs Review")
             .expect("AI Agent write");
         assert!(comment_at < tag_at, "{calls:?}");
         assert!(tag_at < field_at, "{calls:?}");
@@ -13667,7 +13667,7 @@ mod tests {
         std::fs::write(wd.join(NEEDS_REVIEW_MARKER), "need a decision on X").unwrap();
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
-            &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+            &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
             "",
         ));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
@@ -13700,7 +13700,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "{calls:?}"
         );
     }
@@ -13716,13 +13716,13 @@ mod tests {
             StubRunner::new()
                 .fail(
                     "yt",
-                    &["issue", "tag", "add", "MK-16", "Needs-Info", "--create"],
+                    &["issue", "tag", "add", "MX-16", "Needs-Info", "--create"],
                     1,
                     "no such tag",
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -13751,7 +13751,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "a failed tag write must not block the AI Agent write: {calls:?}"
         );
     }
@@ -13765,10 +13765,10 @@ mod tests {
     fn finalize_no_code_marker_skips_pr_and_sets_no_code_label() {
         let dir = tempfile::tempdir().unwrap();
         let wd = dir.path();
-        std::fs::write(wd.join(NO_CODE_MARKER), "Filed MK-99 for the gap.\n").unwrap();
+        std::fs::write(wd.join(NO_CODE_MARKER), "Filed MX-99 for the gap.\n").unwrap();
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
-            &["issue", "set-field", "MK-16", "AI Agent", "Done"],
+            &["issue", "set-field", "MX-16", "AI Agent", "Done"],
             "",
         ));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
@@ -13805,14 +13805,14 @@ mod tests {
         // The marker text is the comment, verbatim.
         let comment = calls
             .iter()
-            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .find(|c| c.starts_with("yt issue comment MX-16"))
             .expect("summary comment posted");
-        assert!(comment.contains("Filed MK-99 for the gap."), "{comment}");
+        assert!(comment.contains("Filed MX-99 for the gap."), "{comment}");
         // AI Agent goes to the no-code label; State is left alone.
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Done"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Done"),
             "{calls:?}"
         );
         assert!(
@@ -13836,7 +13836,7 @@ mod tests {
         std::fs::write(wd.join(NO_CODE_MARKER), "report only").unwrap();
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
-            &["issue", "set-field", "MK-16", "AI Agent", "Reported"],
+            &["issue", "set-field", "MX-16", "AI Agent", "Reported"],
             "",
         ));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
@@ -13866,7 +13866,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Reported"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Reported"),
             "{calls:?}"
         );
     }
@@ -13882,7 +13882,7 @@ mod tests {
         std::fs::write(wd.join(NO_CODE_MARKER), "filed nothing").unwrap();
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
-            &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+            &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
             "",
         ));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
@@ -13976,7 +13976,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -14001,7 +14001,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                     "",
                 ),
         );
@@ -14048,7 +14048,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Code Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Code Review"),
             "{calls:?}"
         );
     }
@@ -14119,7 +14119,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -14142,10 +14142,10 @@ mod tests {
                     ],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
-                .ok_prefix("yt issue comment MK-16", "")
+                .ok_prefix("yt issue comment MX-16", "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                     "",
                 ),
         );
@@ -14181,7 +14181,7 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         let comment_call = calls
             .iter()
-            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .find(|c| c.starts_with("yt issue comment MX-16"))
             .unwrap_or_else(|| panic!("no issue comment call found: {calls:?}"));
         assert!(
             comment_call.contains("Verification: `just pre-push` passed."),
@@ -14190,7 +14190,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Code Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Code Review"),
             "{calls:?}"
         );
     }
@@ -14262,7 +14262,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -14285,10 +14285,10 @@ mod tests {
                     ],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
-                .ok_prefix("yt issue comment MK-16", "")
+                .ok_prefix("yt issue comment MX-16", "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                     "",
                 ),
         );
@@ -14300,7 +14300,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|c| c.starts_with("yt issue comment MK-16"));
+                .any(|c| c.starts_with("yt issue comment MX-16"));
             let mut seen = seen.lock().unwrap();
             for s in spans {
                 assert!(s.end >= s.start, "{s:?}");
@@ -14369,7 +14369,7 @@ mod tests {
         let gate_comment_prefix = format!(
             "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {}",
             std::env::temp_dir()
-                .join("claude-run-gate-pr-comment-MK-16-")
+                .join("claude-run-gate-pr-comment-MX-16-")
                 .display()
         );
         let runner = Arc::new(
@@ -14422,7 +14422,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -14446,10 +14446,10 @@ mod tests {
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok_prefix(&gate_comment_prefix, "")
-                .ok_prefix("yt issue comment MK-16", "")
+                .ok_prefix("yt issue comment MX-16", "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Failed"],
                     "",
                 ),
         );
@@ -14504,7 +14504,7 @@ mod tests {
         );
         let comment_call = calls
             .iter()
-            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .find(|c| c.starts_with("yt issue comment MX-16"))
             .unwrap_or_else(|| panic!("no issue comment call found: {calls:?}"));
         assert!(
             !comment_call.contains("FAIL some_test"),
@@ -14517,7 +14517,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Failed"),
             "{calls:?}"
         );
     }
@@ -14624,10 +14624,10 @@ mod tests {
                     "src/lib.rs\n",
                 )
                 .ok("git", &["merge", "--abort"], "")
-                .ok_prefix("yt issue comment MK-16", "")
+                .ok_prefix("yt issue comment MX-16", "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -14669,7 +14669,7 @@ mod tests {
         );
         let comment_call = calls
             .iter()
-            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .find(|c| c.starts_with("yt issue comment MX-16"))
             .unwrap_or_else(|| panic!("no issue comment call found: {calls:?}"));
         assert!(
             comment_call.contains("src/lib.rs"),
@@ -14693,7 +14693,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "{calls:?}"
         );
     }
@@ -14765,7 +14765,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -14791,7 +14791,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%B", "feat/x"],
-                    "feat: x\n\nbody\n\n#MK-16\n",
+                    "feat: x\n\nbody\n\n#MX-16\n",
                 )
                 .fail(
                     "fj",
@@ -14809,7 +14809,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                     "",
                 ),
         );
@@ -14844,7 +14844,7 @@ mod tests {
         );
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls.iter().any(|c| c.starts_with("yt issue comment MK-16")
+            calls.iter().any(|c| c.starts_with("yt issue comment MX-16")
                 && c.contains("PR comment for initial push (PR opened) failed")
                 && c.contains("network error")),
             "{calls:?}"
@@ -14874,7 +14874,7 @@ mod tests {
                 .ok("git", &["log", "-1", "--format=%b", "HEAD"], "#PROJ-1\n")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                     "",
                 ),
         ));
@@ -14922,7 +14922,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Code Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Code Review"),
             "{calls:?}"
         );
     }
@@ -14997,7 +14997,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
         assert!(has_local_only_work(dir.path()));
-        cleanup_or_preserve(dir.path(), "YouTrack", "MK-16", None);
+        cleanup_or_preserve(dir.path(), "YouTrack", "MX-16", None);
         assert!(dir.path().exists(), "unpushed commits must survive cleanup");
     }
 
@@ -15015,7 +15015,7 @@ mod tests {
             &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
         );
         assert!(!has_local_only_work(&clone));
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
+        cleanup_or_preserve(&clone, "YouTrack", "MX-16", None);
         assert!(
             !clone.exists(),
             "a workdir with no unpushed work is removed"
@@ -15045,7 +15045,7 @@ mod tests {
             has_local_only_work(&clone),
             "a dirty tree with no unpushed branch must still count as local-only work"
         );
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
+        cleanup_or_preserve(&clone, "YouTrack", "MX-16", None);
         assert!(clone.exists(), "a dirty tree must survive cleanup");
     }
 
@@ -15070,7 +15070,7 @@ mod tests {
             has_local_only_work(&clone),
             "a stash with no unpushed branch must still count as local-only work"
         );
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
+        cleanup_or_preserve(&clone, "YouTrack", "MX-16", None);
         assert!(clone.exists(), "a stash must survive cleanup");
     }
 
@@ -15182,7 +15182,7 @@ mod tests {
         git_in(&clone, &["checkout", "-b", "feat/x"]);
         git_in(&clone, &["push", "origin", "feat/x"]);
         assert!(!has_local_only_work(&clone));
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
+        cleanup_or_preserve(&clone, "YouTrack", "MX-16", None);
         assert!(!clone.exists(), "tip present on remote must be deleted");
     }
 
@@ -15196,7 +15196,7 @@ mod tests {
         git_in(&clone, &["add", "."]);
         git_in(&clone, &["commit", "-m", "feat: y"]);
         assert!(has_local_only_work(&clone));
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
+        cleanup_or_preserve(&clone, "YouTrack", "MX-16", None);
         assert!(clone.exists(), "an unpushed commit must survive cleanup");
     }
 
@@ -15598,7 +15598,7 @@ mod tests {
             "dev.a8n.run",
             "contoso/claude-run",
             7,
-            "MK-16",
+            "MX-16",
             "pre-push",
             &failure,
             Some(
@@ -15632,7 +15632,7 @@ mod tests {
             "dev.a8n.run",
             "contoso/claude-run",
             7,
-            "MK-16",
+            "MX-16",
             "pre-push",
             &failure,
             None,
@@ -15790,7 +15790,7 @@ mod tests {
         );
         assert!(body.contains(&clone.display().to_string()));
 
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
+        cleanup_or_preserve(&clone, "YouTrack", "MX-16", None);
         assert!(clone.exists(), "the dirty tree must survive cleanup");
     }
 
@@ -15822,7 +15822,7 @@ mod tests {
         git_in(&clone, &["add", ".gitignore", "src.txt"]);
         git_in(&clone, &["commit", "-m", "feat: z"]);
 
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
+        cleanup_or_preserve(&clone, "YouTrack", "MX-16", None);
 
         assert!(clone.exists(), "unpushed work must be preserved");
         assert!(
@@ -15848,7 +15848,7 @@ mod tests {
         git_in(&clone, &["add", "src.txt"]);
         git_in(&clone, &["commit", "-m", "feat: z"]);
 
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
+        cleanup_or_preserve(&clone, "YouTrack", "MX-16", None);
 
         assert!(clone.exists(), "unpushed work must be preserved");
         assert!(
@@ -15861,29 +15861,29 @@ mod tests {
     #[test]
     fn preserve_aside_moves_a_leftover_workdir() {
         let base = tempfile::tempdir().unwrap();
-        let wd = base.path().join("MK-16");
+        let wd = base.path().join("MX-16");
         std::fs::create_dir_all(&wd).unwrap();
         std::fs::write(wd.join("leftover.txt"), "kept work").unwrap();
-        preserve_aside(&wd, "YouTrack", "MK-16");
+        preserve_aside(&wd, "YouTrack", "MX-16");
         assert!(!wd.exists(), "original path freed for the fresh clone");
-        let aside = base.path().join("MK-16.kept-1");
+        let aside = base.path().join("MX-16.kept-1");
         assert!(aside.join("leftover.txt").exists(), "content moved aside");
 
         // An empty leftover is left in place (the clone tolerates it).
         std::fs::create_dir_all(&wd).unwrap();
-        preserve_aside(&wd, "YouTrack", "MK-16");
+        preserve_aside(&wd, "YouTrack", "MX-16");
         assert!(wd.exists());
     }
 
     #[test]
     fn preserve_aside_strips_target_before_moving() {
         let base = tempfile::tempdir().unwrap();
-        let wd = base.path().join("MK-16");
+        let wd = base.path().join("MX-16");
         std::fs::create_dir_all(wd.join("target")).unwrap();
         std::fs::write(wd.join("target/build.o"), "binary").unwrap();
         std::fs::write(wd.join("src.txt"), "source").unwrap();
-        preserve_aside(&wd, "YouTrack", "MK-16");
-        let aside = base.path().join("MK-16.kept-1");
+        preserve_aside(&wd, "YouTrack", "MX-16");
+        let aside = base.path().join("MX-16.kept-1");
         assert!(
             !aside.join("target").exists(),
             "target/ must not survive into the .kept-<n> sibling"
@@ -15940,7 +15940,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Failed"],
                     "",
                 ),
         );
@@ -15978,7 +15978,7 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         let comment = calls
             .iter()
-            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .find(|c| c.starts_with("yt issue comment MX-16"))
             .expect("failure comment posted");
         assert!(comment.contains("PRESERVED"), "{comment}");
         assert!(
@@ -16039,12 +16039,12 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    &["issue", "get-field", "MX-16", "AI Agent"],
                     "Working",
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Queued"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Queued"],
                     "",
                 ),
         );
@@ -16083,7 +16083,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Queued"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Queued"),
             "{calls:?}"
         );
         assert!(
@@ -16092,7 +16092,7 @@ mod tests {
         );
         let comment = calls
             .iter()
-            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .find(|c| c.starts_with("yt issue comment MX-16"))
             .expect("requeue comment posted");
         assert!(
             comment.contains("https://dev.a8n.run/contoso/claude-run/pulls/7"),
@@ -16143,7 +16143,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Failed"],
                     "",
                 ),
         );
@@ -16182,7 +16182,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Failed"),
             "{calls:?}"
         );
         assert!(
@@ -16233,13 +16233,13 @@ mod tests {
                 )
                 .fail(
                     "yt",
-                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    &["issue", "get-field", "MX-16", "AI Agent"],
                     1,
                     "yt down",
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Failed"],
                     "",
                 ),
         );
@@ -16278,7 +16278,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Failed"),
             "{calls:?}"
         );
         assert!(
@@ -16329,7 +16329,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Failed"],
                     "",
                 ),
         );
@@ -16368,7 +16368,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Failed"),
             "{calls:?}"
         );
         assert!(
@@ -16421,7 +16421,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    &["issue", "get-field", "MX-16", "AI Agent"],
                     "Needs Review",
                 ),
         );
@@ -16493,7 +16493,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Failed"],
                     "",
                 ),
         );
@@ -16526,12 +16526,12 @@ mod tests {
         assert!(
             !calls
                 .iter()
-                .any(|c| c.contains("set-field MK-16 AI Agent Code Review")),
+                .any(|c| c.contains("set-field MX-16 AI Agent Code Review")),
             "must not move to Code Review: {calls:?}"
         );
         let comment = calls
             .iter()
-            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .find(|c| c.starts_with("yt issue comment MX-16"))
             .expect("failure comment posted");
         assert!(comment.contains("no feature branch"), "{comment}");
         assert!(!comment.contains("/pulls/"), "no PR link: {comment}");
@@ -16678,7 +16678,7 @@ mod tests {
                     &[
                         "issue",
                         "set-field",
-                        "MK-16",
+                        "MX-16",
                         "Bot State",
                         "Awaiting Review",
                     ],
@@ -16710,7 +16710,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 Bot State Awaiting Review"),
+                .any(|c| c == "yt issue set-field MX-16 Bot State Awaiting Review"),
             "{calls:?}"
         );
     }
@@ -16734,7 +16734,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -16771,13 +16771,13 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "default delivery_blocked label (Needs Review fallback) must be set: {calls:?}"
         );
         assert!(
             !calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Failed"),
             "a no-commits-ahead case must not land on Failed: {calls:?}"
         );
     }
@@ -16787,7 +16787,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
-            &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+            &["issue", "set-field", "MX-16", "AI Agent", "Failed"],
             "",
         ));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
@@ -16828,7 +16828,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Failed"),
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
@@ -16842,7 +16842,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(stub_runner_for_a_clean_final_push().ok(
             "yt",
-            &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+            &["issue", "set-field", "MX-16", "AI Agent", "Failed"],
             "",
         ));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
@@ -16902,7 +16902,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Failed"],
                     "",
                 ),
         );
@@ -17061,12 +17061,12 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    &["issue", "get-field", "MX-16", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -17103,14 +17103,14 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "{calls:?}"
         );
         // Never marked Failed, never opened a PR.
         assert!(
             !calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Failed"),
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
@@ -17129,7 +17129,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
-            &["issue", "get-field", "MK-16", "AI Agent"],
+            &["issue", "get-field", "MX-16", "AI Agent"],
             "Done\n",
         ));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
@@ -17166,7 +17166,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue get-field MK-16 AI Agent"),
+                .any(|c| c == "yt issue get-field MX-16 AI Agent"),
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
@@ -17183,7 +17183,7 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    &["issue", "get-field", "MX-16", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -17191,7 +17191,7 @@ mod tests {
                     &[
                         "issue",
                         "set-field",
-                        "MK-16",
+                        "MX-16",
                         "AI Agent",
                         "Delivery Blocked",
                     ],
@@ -17233,7 +17233,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Delivery Blocked"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Delivery Blocked"),
             "configured delivery_blocked label must be the AI Agent target: {calls:?}"
         );
     }
@@ -17321,7 +17321,7 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    &["issue", "get-field", "MX-16", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -17376,7 +17376,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -17401,7 +17401,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                     "",
                 ),
         );
@@ -17438,13 +17438,13 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Code Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Code Review"),
             "an agent-completed timeout must advance AI Agent to Code Review, not Needs Review: {calls:?}"
         );
         assert!(
             !calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "an agent-completed timeout must not park at Needs Review: {calls:?}"
         );
         // mark_pr_ready is best-effort here: its list_open_prs call reads the
@@ -17454,7 +17454,7 @@ mod tests {
         // still fire, which is the invariant this test proves.
         let comment = calls
             .iter()
-            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .find(|c| c.starts_with("yt issue comment MX-16"))
             .unwrap_or_else(|| panic!("no issue comment call recorded: {calls:?}"));
         assert!(
             comment.contains("the agent had already committed its work before the kill"),
@@ -17482,7 +17482,7 @@ mod tests {
         let comment_prefix = format!(
             "fj --host dev.a8n.run pr comment contoso/claude-run#9 --body-file {}",
             std::env::temp_dir()
-                .join("claude-run-timeout-pr-comment-MK-16-")
+                .join("claude-run-timeout-pr-comment-MX-16-")
                 .display()
         );
 
@@ -17490,7 +17490,7 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    &["issue", "get-field", "MX-16", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -17545,7 +17545,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -17571,7 +17571,7 @@ mod tests {
                 .ok_prefix(&comment_prefix, "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -17620,7 +17620,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "{calls:?}"
         );
         assert!(
@@ -17650,7 +17650,7 @@ mod tests {
         let comment_prefix = format!(
             "fj --host dev.a8n.run pr comment contoso/claude-run#9 --body-file {}",
             std::env::temp_dir()
-                .join("claude-run-timeout-pr-comment-MK-16-")
+                .join("claude-run-timeout-pr-comment-MX-16-")
                 .display()
         );
 
@@ -17658,7 +17658,7 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    &["issue", "get-field", "MX-16", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -17734,7 +17734,7 @@ mod tests {
                 .ok_prefix(&comment_prefix, "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -17787,7 +17787,7 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    &["issue", "get-field", "MX-16", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -17837,7 +17837,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -17876,7 +17876,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "{calls:?}"
         );
     }
@@ -17899,7 +17899,7 @@ mod tests {
         let comment_prefix = format!(
             "fj --host dev.a8n.run pr comment contoso/claude-run#9 --body-file {}",
             std::env::temp_dir()
-                .join("claude-run-timeout-pr-comment-MK-16-")
+                .join("claude-run-timeout-pr-comment-MX-16-")
                 .display()
         );
 
@@ -17907,7 +17907,7 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    &["issue", "get-field", "MX-16", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -17962,7 +17962,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -17988,7 +17988,7 @@ mod tests {
                 .fail_prefix(&comment_prefix, 1, "comment rejected")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -18030,7 +18030,7 @@ mod tests {
         // in isolation): `git add` fails loudly rather than panicking or
         // silently no-op'ing.
         let dir = tempfile::tempdir().unwrap();
-        let err = commit_timeout_wip(dir.path(), "MK-16", false).unwrap_err();
+        let err = commit_timeout_wip(dir.path(), "MX-16", false).unwrap_err();
         assert!(
             err.contains("git add"),
             "the commit-step failure must name `git add`: {err}"
@@ -18052,7 +18052,7 @@ mod tests {
             &hooks_dir.join("pre-commit"),
             "#!/bin/sh\nprintf 'pre-commit hook: lint failed\\n'\nexit 1\n",
         );
-        let err = commit_timeout_wip(dir.path(), "MK-16", false).unwrap_err();
+        let err = commit_timeout_wip(dir.path(), "MX-16", false).unwrap_err();
         assert!(
             err.contains("pre-commit hook: lint failed"),
             "failure text must carry the hook's stdout tail: {err}"
@@ -18070,7 +18070,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
         std::fs::write(dir.path().join("dirty.txt"), "uncommitted\n").unwrap();
-        commit_timeout_wip(dir.path(), "MK-16", false).unwrap();
+        commit_timeout_wip(dir.path(), "MX-16", false).unwrap();
         let out = {
             let _path_guard = crate::testutil::path_env_lock();
             Command::new("git")
@@ -18082,7 +18082,7 @@ mod tests {
         };
         let message = String::from_utf8_lossy(&out.stdout);
         assert!(
-            message.trim_end().ends_with("#MK-16"),
+            message.trim_end().ends_with("#MX-16"),
             "the commit body must end with the bare issue reference: {message}"
         );
     }
@@ -18186,7 +18186,7 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
-                "body\n\n#MK-16\n",
+                "body\n\n#MX-16\n",
             )
             .ok(
                 "git",
@@ -18211,7 +18211,7 @@ mod tests {
             )
             .ok(
                 "yt",
-                &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                 "",
             )
             .ok_prefix("fj --host dev.a8n.run pr edit contoso/claude-run#7 ", "")
@@ -18229,7 +18229,7 @@ mod tests {
                 ],
                 "",
             )
-            .ok_prefix("yt issue comment MK-16 ", "")
+            .ok_prefix("yt issue comment MX-16 ", "")
     }
 
     /// Same fixture as [`automerge_finalize_runner`], but the PR
@@ -18287,7 +18287,7 @@ mod tests {
             .ok(
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
-                "body\n\n#MK-16\n",
+                "body\n\n#MX-16\n",
             )
             .ok(
                 "git",
@@ -18296,7 +18296,7 @@ mod tests {
             )
             .ok(
                 "yt",
-                &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                 "",
             )
             .ok_prefix("fj --host dev.a8n.run pr edit contoso/claude-run#7 ", "")
@@ -18314,7 +18314,7 @@ mod tests {
                 ],
                 "",
             )
-            .ok_prefix("yt issue comment MK-16 ", "")
+            .ok_prefix("yt issue comment MX-16 ", "")
     }
 
     /// A [`CommandRunner`] that delegates to `inner` but holds every call
@@ -18413,7 +18413,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c.starts_with("yt issue comment MK-16 ") && c.contains("merged this PR")),
+                .any(|c| c.starts_with("yt issue comment MX-16 ") && c.contains("merged this PR")),
             "the merge must be announced on the issue: {calls:?}"
         );
     }
@@ -18473,7 +18473,7 @@ mod tests {
             )
             .unwrap();
         }
-        let (steps, holes) = child_postgres_steps(&log, &[], "youtrack", "MK-16");
+        let (steps, holes) = child_postgres_steps(&log, &[], "youtrack", "MX-16");
         let seen: Vec<_> = steps.iter().map(|s| (s.kind.as_str(), s.ok)).collect();
         assert_eq!(
             seen,
@@ -18721,7 +18721,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -18746,7 +18746,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                     "",
                 )
                 .ok(
@@ -18771,7 +18771,7 @@ mod tests {
                         "edit",
                         "contoso/claude-run#7",
                         "body",
-                        "body\n\n#MK-16",
+                        "body\n\n#MX-16",
                     ],
                     "",
                 )
@@ -18898,7 +18898,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -18923,7 +18923,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                     "",
                 )
                 // The refresh_pr_text's title/body edit stubs are deliberately
@@ -18982,7 +18982,7 @@ mod tests {
         );
         let comment = calls
             .iter()
-            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .find(|c| c.starts_with("yt issue comment MX-16"))
             .unwrap_or_else(|| panic!("no issue comment call recorded: {calls:?}"));
         assert!(
             comment.contains("PR text could not be updated"),
@@ -19029,7 +19029,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -19073,7 +19073,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                     "",
                 )
                 .ok(
@@ -19098,7 +19098,7 @@ mod tests {
                         "edit",
                         "contoso/claude-run#7",
                         "body",
-                        "body\n\n#MK-16",
+                        "body\n\n#MX-16",
                     ],
                     "",
                 )
@@ -19257,7 +19257,7 @@ mod tests {
                 .ok("git", &["log", "-1", "--format=%b", "HEAD"], "#PROJ-1\n")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                     "",
                 ),
         ));
@@ -19327,7 +19327,7 @@ mod tests {
         complete_automerge(
             &backend,
             &backend,
-            "MK-16",
+            "MX-16",
             "dev.a8n.run",
             "contoso/claude-run",
             7,
@@ -19343,7 +19343,7 @@ mod tests {
         );
         assert!(
             calls.iter().any(|c| c.starts_with(
-                "yt issue comment MK-16 The runner merged this PR after its CI checks passed (automerge).\n\nPR: https://dev.a8n.run/contoso/claude-run/pulls/7"
+                "yt issue comment MX-16 The runner merged this PR after its CI checks passed (automerge).\n\nPR: https://dev.a8n.run/contoso/claude-run/pulls/7"
             ) && c.contains("Run: ") && c.contains("Duration: ")),
             "{calls:?}"
         );
@@ -19405,7 +19405,7 @@ mod tests {
         let block_on = crate::action::Dependencies::default().block_on;
         let links = vec![
             link(LinkDirection::Outward, "parent for", "ALPHA-12", None),
-            link(LinkDirection::Outward, "parent for", "AUDIT-7", None),
+            link(LinkDirection::Outward, "parent for", "AMBER-7", None),
             link(LinkDirection::Inward, "depends on", "BETA-3", None),
         ];
         let ids = |own: Option<&str>| -> Vec<String> {
@@ -19414,8 +19414,8 @@ mod tests {
                 .map(|b| b.id)
                 .collect()
         };
-        assert_eq!(ids(None), vec!["ALPHA-12", "AUDIT-7", "BETA-3"]);
-        assert_eq!(ids(Some("AUDIT")), vec!["AUDIT-7"]);
+        assert_eq!(ids(None), vec!["ALPHA-12", "AMBER-7", "BETA-3"]);
+        assert_eq!(ids(Some("AMBER")), vec!["AMBER-7"]);
     }
 
     /// `block_cross_project` reaches the gate. An Epic whose only open
@@ -19429,21 +19429,21 @@ mod tests {
         }]);
         let runner = Arc::new(
             StubRunner::new()
-                .ok("yt", &["issue", "inspect", "AUDIT-7", "--json"], inspect)
-                .ok("yt", &["issue", "comment", "AUDIT-7", &body], ""),
+                .ok("yt", &["issue", "inspect", "AMBER-7", "--json"], inspect)
+                .ok("yt", &["issue", "comment", "AMBER-7", &body], ""),
         );
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let mut s = src();
 
         let pool = mem_pool().await;
-        let d = dependency_gate(&pool, &backend, &s, "act", "AUDIT-7", false, None)
+        let d = dependency_gate(&pool, &backend, &s, "act", "AMBER-7", false, None)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Blocked { .. }), "default blocks");
 
         s.dependencies.block_cross_project = false;
         let pool = mem_pool().await;
-        let d = dependency_gate(&pool, &backend, &s, "act", "AUDIT-7", false, None)
+        let d = dependency_gate(&pool, &backend, &s, "act", "AMBER-7", false, None)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Proceed), "scoped gate proceeds");
@@ -19463,8 +19463,8 @@ mod tests {
         }]);
         let runner = Arc::new(
             StubRunner::new()
-                .ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect)
-                .ok("yt", &["issue", "comment", "MK-16", &body], ""),
+                .ok("yt", &["issue", "inspect", "MX-16", "--json"], inspect)
+                .ok("yt", &["issue", "comment", "MX-16", &body], ""),
         );
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
@@ -19478,17 +19478,17 @@ mod tests {
                 .filter(|c| c.starts_with(needle))
                 .count()
         };
-        let inspects = || count("yt issue inspect MK-16");
-        let comments = || count("yt issue comment MK-16");
+        let inspects = || count("yt issue inspect MX-16");
+        let comments = || count("yt issue comment MX-16");
 
         // First eval: blocked, comments once, persists backoff.
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
+        let d = dependency_gate(&pool, &backend, &s, "act", "MX-16", false, None)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Blocked { .. }));
         assert_eq!(inspects(), 1);
         assert_eq!(comments(), 1);
-        let st = state::dependency_gate_get(&pool, "act", "MK-16")
+        let st = state::dependency_gate_get(&pool, "act", "MX-16")
             .await
             .unwrap()
             .unwrap();
@@ -19496,7 +19496,7 @@ mod tests {
         assert!(st.blocked_until_ms > state::now_epoch_ms());
 
         // Second eval within the backoff window: no read, no comment.
-        let d2 = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
+        let d2 = dependency_gate(&pool, &backend, &s, "act", "MX-16", false, None)
             .await
             .unwrap();
         match d2 {
@@ -19512,13 +19512,13 @@ mod tests {
         state::dependency_gate_upsert(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             state::now_epoch_ms() - 1000,
             &st.signature,
         )
         .await
         .unwrap();
-        let d3 = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
+        let d3 = dependency_gate(&pool, &backend, &s, "act", "MX-16", false, None)
             .await
             .unwrap();
         assert!(matches!(d3, GateDecision::Blocked { .. }));
@@ -19600,7 +19600,7 @@ mod tests {
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let mut s = src();
         s.dependencies.enabled = false;
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
+        let d = dependency_gate(&pool, &backend, &s, "act", "MX-16", false, None)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Proceed));
@@ -19617,25 +19617,25 @@ mod tests {
         let pool = mem_pool().await;
         let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"TASK-40","resolved":123}]}]}"#;
         let runner =
-            Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect));
+            Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MX-16", "--json"], inspect));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
         // Seed a stale (expired) blocked row to prove it is cleared on the met path.
         state::dependency_gate_upsert(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             state::now_epoch_ms() - 1000,
             "TASK-40 (depends on)",
         )
         .await
         .unwrap();
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
+        let d = dependency_gate(&pool, &backend, &s, "act", "MX-16", false, None)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Proceed));
         assert!(
-            state::dependency_gate_get(&pool, "act", "MK-16")
+            state::dependency_gate_get(&pool, "act", "MX-16")
                 .await
                 .unwrap()
                 .is_none(),
@@ -19655,21 +19655,21 @@ mod tests {
         // Live links now show the blocker resolved.
         let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"TASK-40","resolved":123}]}]}"#;
         let runner =
-            Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect));
+            Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MX-16", "--json"], inspect));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
         // Seed a still-open backoff window (blocked_until in the future).
         state::dependency_gate_upsert(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             state::now_epoch_ms() + 60_000,
             "TASK-40 (depends on)",
         )
         .await
         .unwrap();
 
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", true, None)
+        let d = dependency_gate(&pool, &backend, &s, "act", "MX-16", true, None)
             .await
             .unwrap();
         assert!(
@@ -19682,11 +19682,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|c| c == "yt issue inspect MK-16 --json"),
+                .any(|c| c == "yt issue inspect MX-16 --json"),
             "bypass forces the live read inside the open window"
         );
         assert!(
-            state::dependency_gate_get(&pool, "act", "MK-16")
+            state::dependency_gate_get(&pool, "act", "MX-16")
                 .await
                 .unwrap()
                 .is_none(),
@@ -19702,15 +19702,15 @@ mod tests {
         let pool = mem_pool().await;
         let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"TASK-40","summary":"x"}]}]}"#;
         let runner =
-            Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect));
+            Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MX-16", "--json"], inspect));
         let backend = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
         let s = src();
         let seeded_until = state::now_epoch_ms() + 60_000;
-        state::dependency_gate_upsert(&pool, "act", "MK-16", seeded_until, "TASK-40 (depends on)")
+        state::dependency_gate_upsert(&pool, "act", "MX-16", seeded_until, "TASK-40 (depends on)")
             .await
             .unwrap();
 
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", true, None)
+        let d = dependency_gate(&pool, &backend, &s, "act", "MX-16", true, None)
             .await
             .unwrap();
         match d {
@@ -19725,7 +19725,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|c| c.as_str() == "yt issue inspect MK-16 --json")
+                .filter(|c| c.as_str() == "yt issue inspect MX-16 --json")
                 .count(),
             1,
             "bypass reads live once inside the window"
@@ -19737,10 +19737,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|c| c.starts_with("yt issue comment MK-16")),
+                .any(|c| c.starts_with("yt issue comment MX-16")),
             "unchanged blocker set must not re-comment on the bypass path"
         );
-        let st = state::dependency_gate_get(&pool, "act", "MK-16")
+        let st = state::dependency_gate_get(&pool, "act", "MX-16")
             .await
             .unwrap()
             .unwrap();
@@ -19763,14 +19763,14 @@ mod tests {
         state::dependency_gate_upsert(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             state::now_epoch_ms() + 60_000,
             "TASK-40 (depends on)",
         )
         .await
         .unwrap();
 
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false, None)
+        let d = dependency_gate(&pool, &backend, &s, "act", "MX-16", false, None)
             .await
             .unwrap();
         match d {
@@ -19953,11 +19953,11 @@ mod tests {
         crate::ci_failure::store::record_agent_pr(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             "dev.a8n.run",
             "contoso/claude-run",
             7,
-            "fix/MK-16",
+            "fix/MX-16",
             "open",
             false,
             "2026-09-01T00:00:00Z",
@@ -19980,7 +19980,7 @@ mod tests {
                 ],
                 &serde_json::json!({
                     "total_count": 1,
-                    "pull_requests": [open_pr(7, "fix/MK-16")],
+                    "pull_requests": [open_pr(7, "fix/MX-16")],
                 })
                 .to_string(),
             ),
@@ -19991,7 +19991,7 @@ mod tests {
             .await
             .unwrap()
             .expect("an open recorded PR resolves to a resume target");
-        assert_eq!(resume.branch, "fix/MK-16");
+        assert_eq!(resume.branch, "fix/MX-16");
         assert_eq!(
             resume.pr_url,
             "https://dev.a8n.run/contoso/claude-run/pulls/7"
@@ -20016,11 +20016,11 @@ mod tests {
         crate::ci_failure::store::record_agent_pr(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             "dev.a8n.run",
             "contoso/claude-run",
             24,
-            "fix/MK-16-old-attempt",
+            "fix/MX-16-old-attempt",
             "open",
             false,
             "2026-10-01T00:00:00Z",
@@ -20030,11 +20030,11 @@ mod tests {
         crate::ci_failure::store::record_agent_pr(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             "dev.a8n.run",
             "contoso/claude-run",
             75,
-            "fix/MK-16",
+            "fix/MX-16",
             "open",
             true,
             "2026-10-27T22:14:19Z",
@@ -20071,7 +20071,7 @@ mod tests {
                 ],
                 &serde_json::json!({
                     "total_count": 1,
-                    "pull_requests": [open_pr(75, "fix/MK-16")],
+                    "pull_requests": [open_pr(75, "fix/MX-16")],
                 })
                 .to_string(),
             ),
@@ -20082,7 +20082,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the genuinely open PR #75 must still resolve to a resume target");
-        assert_eq!(resume.branch, "fix/MK-16");
+        assert_eq!(resume.branch, "fix/MX-16");
         assert_eq!(
             resume.pr_url,
             "https://dev.a8n.run/contoso/claude-run/pulls/75"
@@ -20097,11 +20097,11 @@ mod tests {
         crate::ci_failure::store::record_agent_pr(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             "dev.a8n.run",
             "contoso/claude-run",
             7,
-            "fix/MK-16",
+            "fix/MX-16",
             "open",
             false,
             "2026-09-01T00:00:00Z",
@@ -20129,14 +20129,14 @@ mod tests {
             .await
             .unwrap();
         assert!(resume.is_none());
-        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MX-16")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(rec.state, "closed");
         let notices = forge.take_notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
-        assert!(notices[0].contains("MK-16"), "{}", notices[0]);
+        assert!(notices[0].contains("MX-16"), "{}", notices[0]);
         assert!(notices[0].contains("no longer open"), "{}", notices[0]);
     }
 
@@ -20150,11 +20150,11 @@ mod tests {
         crate::ci_failure::store::record_agent_pr(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             "dev.a8n.run",
             "contoso/claude-run",
             7,
-            "fix/MK-16",
+            "fix/MX-16",
             "open",
             false,
             "2026-09-01T00:00:00Z",
@@ -20191,7 +20191,7 @@ mod tests {
         assert!(resume.is_none());
         let notices = forge.take_notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
-        assert!(notices[0].contains("MK-16"), "{}", notices[0]);
+        assert!(notices[0].contains("MX-16"), "{}", notices[0]);
         assert!(notices[0].contains("no recorded PR"), "{}", notices[0]);
     }
 
@@ -20205,11 +20205,11 @@ mod tests {
         crate::ci_failure::store::record_agent_pr(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             "dev.a8n.run",
             "contoso/claude-run",
             7,
-            "fix/MK-16",
+            "fix/MX-16",
             "merged",
             false,
             "2026-09-01T00:00:00Z",
@@ -20229,7 +20229,7 @@ mod tests {
         );
         let notices = forge.take_notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
-        assert!(notices[0].contains("MK-16"), "{}", notices[0]);
+        assert!(notices[0].contains("MX-16"), "{}", notices[0]);
         assert!(notices[0].contains('7'), "{}", notices[0]);
         assert!(notices[0].contains("merged"), "{}", notices[0]);
     }
@@ -20243,11 +20243,11 @@ mod tests {
         crate::ci_failure::store::record_agent_pr(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             "dev.a8n.run",
             "contoso/claude-run",
             7,
-            "fix/MK-16",
+            "fix/MX-16",
             "open",
             false,
             "2026-09-01T00:00:00Z",
@@ -20278,7 +20278,7 @@ mod tests {
         assert!(resume.is_none());
         let notices = forge.take_notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
-        assert!(notices[0].contains("MK-16"), "{}", notices[0]);
+        assert!(notices[0].contains("MX-16"), "{}", notices[0]);
         assert!(notices[0].contains('7'), "{}", notices[0]);
     }
 
@@ -20303,7 +20303,7 @@ mod tests {
         )
         .await;
 
-        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MX-16")
             .await
             .unwrap()
             .expect("record_new_pr inserts a row");
@@ -20338,7 +20338,7 @@ mod tests {
 
         mark_merged_at_finalize(&pool, &job(), 9).await;
 
-        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MX-16")
             .await
             .unwrap()
             .expect("record_new_pr inserts a row");
@@ -20373,7 +20373,7 @@ mod tests {
         )
         .await;
 
-        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MX-16")
             .await
             .unwrap()
             .expect("record_new_pr inserts a row");
@@ -20381,7 +20381,7 @@ mod tests {
 
         mark_finished_at_finalize(&pool, &job(), 9).await;
 
-        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MX-16")
             .await
             .unwrap()
             .expect("record_new_pr inserts a row");
@@ -20510,7 +20510,7 @@ mod tests {
         )
         .await;
 
-        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MX-16")
             .await
             .unwrap()
             .expect("record_new_pr inserts a row");
@@ -20538,11 +20538,11 @@ mod tests {
         crate::ci_failure::store::record_agent_pr(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             "dev.a8n.run",
             "contoso/claude-run",
             75,
-            "fix/MK-16",
+            "fix/MX-16",
             "open",
             true,
             "2026-10-27T22:14:19Z",
@@ -20554,7 +20554,7 @@ mod tests {
         // `process_job` would have matched `Err(finalize_res)` and skipped
         // both `record_new_pr` and `clear_salvaged_for_resume` entirely.
 
-        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MX-16")
             .await
             .unwrap()
             .expect("the checkpoint-opened row must still exist");
@@ -20579,7 +20579,7 @@ mod tests {
                 ],
                 &serde_json::json!({
                     "total_count": 1,
-                    "pull_requests": [open_pr(75, "fix/MK-16")],
+                    "pull_requests": [open_pr(75, "fix/MX-16")],
                 })
                 .to_string(),
             ),
@@ -20589,7 +20589,7 @@ mod tests {
             .await
             .unwrap()
             .expect("a re-queue must resume the still-open checkpoint PR");
-        assert_eq!(resume.branch, "fix/MK-16");
+        assert_eq!(resume.branch, "fix/MX-16");
     }
 
     /// A resumed run that finishes successfully clears a prior timeout's
@@ -20606,7 +20606,7 @@ mod tests {
         let id = store::record_agent_pr(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             "dev.a8n.run",
             "contoso/claude-run",
             9,
@@ -20629,7 +20629,7 @@ mod tests {
         )
         .await;
 
-        let rec = store::agent_pr_for_issue(&pool, "MK-16")
+        let rec = store::agent_pr_for_issue(&pool, "MX-16")
             .await
             .unwrap()
             .unwrap();
@@ -20654,7 +20654,7 @@ mod tests {
         let id = store::record_agent_pr(
             &pool,
             "act",
-            "MK-16",
+            "MX-16",
             "dev.a8n.run",
             "contoso/claude-run",
             9,
@@ -20696,7 +20696,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let rec = store::agent_pr_for_issue(&pool, "MK-16")
+        let rec = store::agent_pr_for_issue(&pool, "MX-16")
             .await
             .unwrap()
             .unwrap();
@@ -20789,7 +20789,7 @@ mod tests {
         let run_id = state::run_begin(&pool, "yt-action", "scheduler")
             .await
             .unwrap();
-        state::run_inflight_add(&pool, run_id, "MK-16", "MK")
+        state::run_inflight_add(&pool, run_id, "MX-16", "MX")
             .await
             .unwrap();
 
@@ -20797,17 +20797,17 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    &["issue", "get-field", "MX-16", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Queued"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Queued"],
                     "",
                 )
                 .ok(
                     "yt",
-                    &["issue", "comment", "MK-16", RESTART_REQUEUE_COMMENT],
+                    &["issue", "comment", "MX-16", RESTART_REQUEUE_COMMENT],
                     "",
                 ),
         );
@@ -20820,13 +20820,13 @@ mod tests {
             assert!(
                 calls
                     .iter()
-                    .any(|c| c == "yt issue set-field MK-16 AI Agent Queued"),
+                    .any(|c| c == "yt issue set-field MX-16 AI Agent Queued"),
                 "{calls:?}"
             );
             assert_eq!(
                 calls
                     .iter()
-                    .filter(|c| c.starts_with("yt issue comment MK-16"))
+                    .filter(|c| c.starts_with("yt issue comment MX-16"))
                     .count(),
                 1,
                 "exactly one re-queue comment; {calls:?}"
@@ -20853,13 +20853,13 @@ mod tests {
         let run_id = state::run_begin(&pool, "yt-action", "scheduler")
             .await
             .unwrap();
-        state::run_inflight_add(&pool, run_id, "MK-17", "MK")
+        state::run_inflight_add(&pool, run_id, "MX-17", "MX")
             .await
             .unwrap();
 
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
-            &["issue", "get-field", "MK-17", "AI Agent"],
+            &["issue", "get-field", "MX-17", "AI Agent"],
             "Code Review\n",
         ));
         let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
@@ -20884,30 +20884,30 @@ mod tests {
         let run_id = state::run_begin(&pool, "yt-action", "scheduler")
             .await
             .unwrap();
-        state::run_inflight_add(&pool, run_id, "MK-18", "MK")
+        state::run_inflight_add(&pool, run_id, "MX-18", "MX")
             .await
             .unwrap();
-        state::run_inflight_add(&pool, run_id, "MK-19", "MK")
+        state::run_inflight_add(&pool, run_id, "MX-19", "MX")
             .await
             .unwrap();
 
-        // MK-18's get-field is left unstubbed, so the backend's call fails; MK-19
+        // MX-18's get-field is left unstubbed, so the backend's call fails; MX-19
         // still gets its full stubbed exchange.
         let runner = Arc::new(
             StubRunner::new()
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-19", "AI Agent"],
+                    &["issue", "get-field", "MX-19", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-19", "AI Agent", "Queued"],
+                    &["issue", "set-field", "MX-19", "AI Agent", "Queued"],
                     "",
                 )
                 .ok(
                     "yt",
-                    &["issue", "comment", "MK-19", RESTART_REQUEUE_COMMENT],
+                    &["issue", "comment", "MX-19", RESTART_REQUEUE_COMMENT],
                     "",
                 ),
         );
@@ -20919,13 +20919,13 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-19 AI Agent Queued"),
+                .any(|c| c == "yt issue set-field MX-19 AI Agent Queued"),
             "the second key must still be reconciled despite the first key's tracker failure; {calls:?}"
         );
         assert!(
             !calls
                 .iter()
-                .any(|c| c.contains("MK-18") && !c.contains("get-field")),
+                .any(|c| c.contains("MX-18") && !c.contains("get-field")),
             "the failing key issues no further calls beyond its failed get-field; {calls:?}"
         );
     }
@@ -20942,7 +20942,7 @@ mod tests {
         let run_id = state::run_begin(&pool, "gone-action", "scheduler")
             .await
             .unwrap();
-        state::run_inflight_add(&pool, run_id, "MK-20", "MK")
+        state::run_inflight_add(&pool, run_id, "MX-20", "MX")
             .await
             .unwrap();
 
@@ -20973,11 +20973,11 @@ mod tests {
                 .ok(
                     "yt",
                     &["list", "--query=AI Agent: Working", "--json"],
-                    r#"[{"idReadable":"MK-20"}]"#,
+                    r#"[{"idReadable":"MX-20"}]"#,
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-20", "AI Agent"],
+                    &["issue", "get-field", "MX-20", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -20985,17 +20985,17 @@ mod tests {
                     &[
                         "issue",
                         "history",
-                        "MK-20",
+                        "MX-20",
                         "--json",
                         "--category",
                         "CustomFieldCategory",
                     ],
                     "[]",
                 )
-                .ok_prefix("yt issue comment MK-20", "")
+                .ok_prefix("yt issue comment MX-20", "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-20", "AI Agent", "Queued"],
+                    &["issue", "set-field", "MX-20", "AI Agent", "Queued"],
                     "",
                 ),
         );
@@ -21008,13 +21008,13 @@ mod tests {
             assert!(
                 calls
                     .iter()
-                    .any(|c| c == "yt issue set-field MK-20 AI Agent Queued"),
+                    .any(|c| c == "yt issue set-field MX-20 AI Agent Queued"),
                 "{calls:?}"
             );
             assert_eq!(
                 calls
                     .iter()
-                    .filter(|c| c.starts_with("yt issue comment MK-20"))
+                    .filter(|c| c.starts_with("yt issue comment MX-20"))
                     .count(),
                 1,
                 "exactly one correction comment; {calls:?}"
@@ -21030,7 +21030,7 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(events[0].level, "warn", "{events:?}");
-        assert!(events[0].message.starts_with("MK-20:"), "{events:?}");
+        assert!(events[0].message.starts_with("MX-20:"), "{events:?}");
     }
 
     /// An issue the list read saw on `Working` but whose live field has since
@@ -21051,11 +21051,11 @@ mod tests {
                 .ok(
                     "yt",
                     &["list", "--query=AI Agent: Working", "--json"],
-                    r#"[{"idReadable":"MK-23"}]"#,
+                    r#"[{"idReadable":"MX-23"}]"#,
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-23", "AI Agent"],
+                    &["issue", "get-field", "MX-23", "AI Agent"],
                     "Code Review\n",
                 ),
         );
@@ -21088,7 +21088,7 @@ mod tests {
 
         // Default `max_attempts_per_key` is 3 (`RunnerDefaults::default`).
         for _ in 0..3 {
-            state::attempts_increment(&pool, "yt-action", "MK-22")
+            state::attempts_increment(&pool, "yt-action", "MX-22")
                 .await
                 .unwrap();
         }
@@ -21098,11 +21098,11 @@ mod tests {
                 .ok(
                     "yt",
                     &["list", "--query=AI Agent: Working", "--json"],
-                    r#"[{"idReadable":"MK-22"}]"#,
+                    r#"[{"idReadable":"MX-22"}]"#,
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-22", "AI Agent"],
+                    &["issue", "get-field", "MX-22", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -21110,17 +21110,17 @@ mod tests {
                     &[
                         "issue",
                         "history",
-                        "MK-22",
+                        "MX-22",
                         "--json",
                         "--category",
                         "CustomFieldCategory",
                     ],
                     "[]",
                 )
-                .ok_prefix("yt issue comment MK-22", "")
+                .ok_prefix("yt issue comment MX-22", "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-22", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-22", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -21132,13 +21132,13 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-22 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-22 AI Agent Needs Review"),
             "{calls:?}"
         );
         // SPEC-3.12 item 6: the comment that parks the issue at Needs Review
         // must name the one action a human can take.
         assert!(
-            calls.iter().any(|c| c.starts_with("yt issue comment MK-22")
+            calls.iter().any(|c| c.starts_with("yt issue comment MX-22")
                 && c.contains("limits.max_attempts_per_key")),
             "{calls:?}"
         );
@@ -21163,14 +21163,14 @@ mod tests {
         let run_id = state::run_begin(&pool, "yt-action", "scheduler")
             .await
             .unwrap();
-        state::run_inflight_add(&pool, run_id, "MK-21", "MK")
+        state::run_inflight_add(&pool, run_id, "MX-21", "MX")
             .await
             .unwrap();
 
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
             &["list", "--query=AI Agent: Working", "--json"],
-            r#"[{"idReadable":"MK-21"}]"#,
+            r#"[{"idReadable":"MX-21"}]"#,
         ));
         let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
 
@@ -21241,11 +21241,11 @@ mod tests {
                 .ok(
                     "yt",
                     &["list", "--query=AI Agent: Working", "--json"],
-                    r#"[{"idReadable":"MK-30"}]"#,
+                    r#"[{"idReadable":"MX-30"}]"#,
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-30", "AI Agent"],
+                    &["issue", "get-field", "MX-30", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -21253,7 +21253,7 @@ mod tests {
                     &[
                         "issue",
                         "history",
-                        "MK-30",
+                        "MX-30",
                         "--json",
                         "--category",
                         "CustomFieldCategory",
@@ -21298,11 +21298,11 @@ mod tests {
                 .ok(
                     "yt",
                     &["list", "--query=AI Agent: Working", "--json"],
-                    r#"[{"idReadable":"MK-31"}]"#,
+                    r#"[{"idReadable":"MX-31"}]"#,
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-31", "AI Agent"],
+                    &["issue", "get-field", "MX-31", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -21310,17 +21310,17 @@ mod tests {
                     &[
                         "issue",
                         "history",
-                        "MK-31",
+                        "MX-31",
                         "--json",
                         "--category",
                         "CustomFieldCategory",
                     ],
                     &working_history_json(twenty_five_min_ago_ms),
                 )
-                .ok_prefix("yt issue comment MK-31", "")
+                .ok_prefix("yt issue comment MX-31", "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-31", "AI Agent", "Queued"],
+                    &["issue", "set-field", "MX-31", "AI Agent", "Queued"],
                     "",
                 ),
         );
@@ -21332,7 +21332,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-31 AI Agent Queued"),
+                .any(|c| c == "yt issue set-field MX-31 AI Agent Queued"),
             "{calls:?}"
         );
     }
@@ -21351,12 +21351,12 @@ mod tests {
         let runner = Arc::new(StubRunner::new().ok(
             "yt",
             &["list", "--query=AI Agent: Working", "--json"],
-            r#"[{"idReadable":"MK-41"}]"#,
+            r#"[{"idReadable":"MX-41"}]"#,
         ));
         let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
         let mut peers = std::collections::HashMap::new();
         peers.insert(
-            ("yt-action".to_string(), "MK-41".to_string()),
+            ("yt-action".to_string(), "MX-41".to_string()),
             "peer-b".to_string(),
         );
 
@@ -21385,11 +21385,11 @@ mod tests {
                 .ok(
                     "yt",
                     &["list", "--query=AI Agent: Working", "--json"],
-                    r#"[{"idReadable":"MK-42"}]"#,
+                    r#"[{"idReadable":"MX-42"}]"#,
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-42", "AI Agent"],
+                    &["issue", "get-field", "MX-42", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -21397,24 +21397,24 @@ mod tests {
                     &[
                         "issue",
                         "history",
-                        "MK-42",
+                        "MX-42",
                         "--json",
                         "--category",
                         "CustomFieldCategory",
                     ],
                     &working_history_json(old_ms),
                 )
-                .ok_prefix("yt issue comment MK-42", "")
+                .ok_prefix("yt issue comment MX-42", "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-42", "AI Agent", "Queued"],
+                    &["issue", "set-field", "MX-42", "AI Agent", "Queued"],
                     "",
                 ),
         );
         let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
         let mut peers = std::collections::HashMap::new();
         peers.insert(
-            ("yt-action".to_string(), "MK-99".to_string()),
+            ("yt-action".to_string(), "MX-99".to_string()),
             "peer-b".to_string(),
         );
 
@@ -21424,7 +21424,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-42 AI Agent Queued"),
+                .any(|c| c == "yt issue set-field MX-42 AI Agent Queued"),
             "{calls:?}"
         );
     }
@@ -21447,11 +21447,11 @@ mod tests {
                 .ok(
                     "yt",
                     &["list", "--query=AI Agent: Working", "--json"],
-                    r#"[{"idReadable":"MK-32"}]"#,
+                    r#"[{"idReadable":"MX-32"}]"#,
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-32", "AI Agent"],
+                    &["issue", "get-field", "MX-32", "AI Agent"],
                     "Working\n",
                 )
                 .fail(
@@ -21459,7 +21459,7 @@ mod tests {
                     &[
                         "issue",
                         "history",
-                        "MK-32",
+                        "MX-32",
                         "--json",
                         "--category",
                         "CustomFieldCategory",
@@ -21495,11 +21495,11 @@ mod tests {
                 .ok(
                     "yt",
                     &["list", "--query=AI Agent: Working", "--json"],
-                    r#"[{"idReadable":"MK-33"}]"#,
+                    r#"[{"idReadable":"MX-33"}]"#,
                 )
                 .ok(
                     "yt",
-                    &["issue", "get-field", "MK-33", "AI Agent"],
+                    &["issue", "get-field", "MX-33", "AI Agent"],
                     "Working\n",
                 )
                 .ok(
@@ -21507,17 +21507,17 @@ mod tests {
                     &[
                         "issue",
                         "history",
-                        "MK-33",
+                        "MX-33",
                         "--json",
                         "--category",
                         "CustomFieldCategory",
                     ],
                     "[]",
                 )
-                .ok_prefix("yt issue comment MK-33", "")
+                .ok_prefix("yt issue comment MX-33", "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-33", "AI Agent", "Queued"],
+                    &["issue", "set-field", "MX-33", "AI Agent", "Queued"],
                     "",
                 ),
         );
@@ -21529,7 +21529,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-33 AI Agent Queued"),
+                .any(|c| c == "yt issue set-field MX-33 AI Agent Queued"),
             "{calls:?}"
         );
     }
@@ -22323,7 +22323,7 @@ mod tests {
             a.rs:6 - finding six";
         let link = "https://example.test/runs/1/jobs/mk-16/attempt/1/review-evidence";
         let logs = capture_logs(|| {
-            let capped = cap_verdict_bullets(text, "MK-16", Some(link));
+            let capped = cap_verdict_bullets(text, "MX-16", Some(link));
             let lines: Vec<&str> = capped.lines().collect();
             assert_eq!(lines[0], "Review: FAIL");
             assert_eq!(
@@ -22341,7 +22341,7 @@ mod tests {
             );
         });
         assert!(logs.contains("WARN"), "{logs}");
-        assert!(logs.contains("MK-16"), "{logs}");
+        assert!(logs.contains("MX-16"), "{logs}");
     }
 
     /// SPEC-3.16 items 1 and 2: `cap_verdict_outcome` applies the cap to
@@ -22354,7 +22354,7 @@ mod tests {
 
         let capped = cap_verdict_outcome(
             ReviewOutcome::Pass("Review: PASS\na.rs:1 - ok".to_string()),
-            "MK-16",
+            "MX-16",
             Some(link),
         );
         match capped {
@@ -22367,7 +22367,7 @@ mod tests {
 
         let capped = cap_verdict_outcome(
             ReviewOutcome::Fail("Review: FAIL\na.rs:1 - bad".to_string()),
-            "MK-16",
+            "MX-16",
             Some(link),
         );
         match capped {
@@ -22380,7 +22380,7 @@ mod tests {
 
         let no_verdict = cap_verdict_outcome(
             ReviewOutcome::NoVerdict("no marker written".to_string()),
-            "MK-16",
+            "MX-16",
             Some(link),
         );
         assert!(matches!(no_verdict, ReviewOutcome::NoVerdict(ref t) if t == "no marker written"));
@@ -22489,7 +22489,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -22527,7 +22527,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                     "",
                 ),
         );
@@ -22569,7 +22569,7 @@ mod tests {
         );
         let comment = calls
             .iter()
-            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .find(|c| c.starts_with("yt issue comment MX-16"))
             .unwrap_or_else(|| panic!("no issue comment call recorded: {calls:?}"));
         assert!(
             comment.contains("## Review") && comment.contains("all criteria check out"),
@@ -22638,7 +22638,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -22663,7 +22663,7 @@ mod tests {
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Code Review"],
                     "",
                 ),
         );
@@ -22699,7 +22699,7 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         let comment = calls
             .iter()
-            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .find(|c| c.starts_with("yt issue comment MX-16"))
             .unwrap_or_else(|| panic!("no issue comment call recorded: {calls:?}"));
         assert!(
             comment.contains("PR could not be promoted from draft:"),
@@ -22769,7 +22769,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -22796,14 +22796,14 @@ mod tests {
                     &format!(
                         "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {}",
                         std::env::temp_dir()
-                            .join("claude-run-review-pr-comment-MK-16-")
+                            .join("claude-run-review-pr-comment-MX-16-")
                             .display()
                     ),
                     "",
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Queued"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Queued"],
                     "",
                 ),
         );
@@ -22851,7 +22851,7 @@ mod tests {
         );
         let comment = calls
             .iter()
-            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .find(|c| c.starts_with("yt issue comment MX-16"))
             .unwrap_or_else(|| panic!("no issue comment call recorded: {calls:?}"));
         assert!(
             comment.contains("criterion 3 has no evidence"),
@@ -22860,7 +22860,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Queued"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Queued"),
             "below the attempt cap a review fail must requeue, not park: {calls:?}"
         );
     }
@@ -23364,7 +23364,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -23391,14 +23391,14 @@ mod tests {
                     &format!(
                         "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {}",
                         std::env::temp_dir()
-                            .join("claude-run-review-pr-comment-MK-16-")
+                            .join("claude-run-review-pr-comment-MX-16-")
                             .display()
                     ),
                     "",
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -23437,7 +23437,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "at the attempt cap a review fail must park at Needs Review: {calls:?}"
         );
     }
@@ -23504,7 +23504,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -23531,14 +23531,14 @@ mod tests {
                     &format!(
                         "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {}",
                         std::env::temp_dir()
-                            .join("claude-run-review-pr-comment-MK-16-")
+                            .join("claude-run-review-pr-comment-MX-16-")
                             .display()
                     ),
                     "",
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -23580,7 +23580,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "a NoVerdict must always park at Needs Review, even far below the attempt cap: {calls:?}"
         );
         assert!(
@@ -23654,7 +23654,7 @@ mod tests {
                 .ok(
                     "git",
                     &["log", "-1", "--format=%b", "feat/x"],
-                    "body\n\n#MK-16\n",
+                    "body\n\n#MX-16\n",
                 )
                 .ok(
                     "git",
@@ -23681,14 +23681,14 @@ mod tests {
                     &format!(
                         "fj --host dev.a8n.run pr comment contoso/claude-run#7 --body-file {}",
                         std::env::temp_dir()
-                            .join("claude-run-review-pr-comment-MK-16-")
+                            .join("claude-run-review-pr-comment-MX-16-")
                             .display()
                     ),
                     "",
                 )
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    &["issue", "set-field", "MX-16", "AI Agent", "Needs Review"],
                     "",
                 ),
         );
@@ -23727,7 +23727,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+                .any(|c| c == "yt issue set-field MX-16 AI Agent Needs Review"),
             "default delivery_blocked label (Needs Review fallback) must be set: {calls:?}"
         );
         assert!(
@@ -23843,7 +23843,7 @@ mod tests {
             (
                 "split-only attempt, two or more fitting pieces",
                 Finalized::Split {
-                    pieces: vec!["MK-20".into(), "MK-21".into()],
+                    pieces: vec!["MX-20".into(), "MX-21".into()],
                 },
                 "done label",
             ),
