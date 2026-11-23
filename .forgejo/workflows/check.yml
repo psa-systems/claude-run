@@ -32,13 +32,16 @@ on:
   pull_request:
     branches:
       - main
+    # PSTD-1.1.14, SPEC-11.5.20: so a title or label correction re-runs the scope check.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
 
 jobs:
   changes:
     # SPEC-11.7, PSTD-1.1.9: skipped (not absent) for a pull request whose head
     # branch is `specification`, where only `check-specification`,
     # `check-spelling` and `check-secrets` may run.
-    if: github.head_ref != 'specification'
+    # PSTD-1.1.14: also skipped on a title/label-only re-run.
+    if: github.event.action != 'edited' && github.event.action != 'labeled' && github.event.action != 'unlabeled' && github.head_ref != 'specification'
     name: classify changed files
     # MEDIUM: only reads the diff, compiles nothing.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
@@ -59,7 +62,8 @@ jobs:
     # Runs on every push and PR, docs-only ones included, since
     # CLAUDE.md growth is exactly what a docs-only change can introduce.
     # SPEC-11.7, PSTD-1.1.9: skipped for a `specification` head branch, same as `changes`.
-    if: github.head_ref != 'specification'
+    # PSTD-1.1.14: also skipped on a title/label-only re-run.
+    if: github.event.action != 'edited' && github.event.action != 'labeled' && github.event.action != 'unlabeled' && github.head_ref != 'specification'
     name: CLAUDE.md guard
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     steps:
@@ -81,7 +85,8 @@ jobs:
     # guard and secrets scan run unconditionally.
     # SPEC-11.7, PSTD-1.1.9: also skipped for a `specification` head branch,
     # same as `changes`, whose `result` output this condition already reads.
-    if: needs.changes.outputs.result != 'non-code' && github.head_ref != 'specification'
+    # PSTD-1.1.14: also skipped on a title/label-only re-run.
+    if: github.event.action != 'edited' && github.event.action != 'labeled' && github.event.action != 'unlabeled' && needs.changes.outputs.result != 'non-code' && github.head_ref != 'specification'
     name: fmt + clippy + build + tests
     # HEAVY: compiles natively and needs the dev image's `cc` for crate build
     # scripts.
@@ -262,6 +267,8 @@ jobs:
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main
 
   secrets:
+    # PSTD-1.1.14: skipped on a title/label-only re-run; the scope job alone runs then.
+    if: github.event.action != 'edited' && github.event.action != 'labeled' && github.event.action != 'unlabeled'
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     steps:
       - name: Rename .gitconfig
@@ -308,8 +315,10 @@ jobs:
 
   spelling:
     # PSTD-1.3.3: runs on every pull request, with no continue-on-error and no
-    # `if:` that would skip it (PSTD-1.3.5), including a `specification` head
-    # branch (SPEC-11.7, PSTD-1.1.9). The shared action owns the check (PSTD-1.3.1).
+    # `if:` that would skip it (PSTD-1.3.5) beyond the PSTD-1.1.14 title/label-only
+    # re-run, including a `specification` head branch (SPEC-11.7, PSTD-1.1.9).
+    # The shared action owns the check (PSTD-1.3.1).
+    if: github.event.action != 'edited' && github.event.action != 'labeled' && github.event.action != 'unlabeled'
     name: Spell check
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     steps:
