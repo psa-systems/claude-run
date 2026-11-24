@@ -35,6 +35,11 @@ on:
     # PSTD-1.1.14, SPEC-11.5.20: so a title or label correction re-runs the scope check.
     types: [opened, synchronize, reopened, edited, labeled, unlabeled]
 
+# PSPEC-1.1.4: workflow level, so every job builds the same artifacts.
+env:
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   changes:
     # SPEC-11.7, PSTD-1.1.9: skipped (not absent) for a pull request whose head
@@ -102,9 +107,10 @@ jobs:
     # own Docker network (SPEC-6.6, SPEC-11.1), not on a service container: a
     # service's `options` cannot turn off fsync, on this runner's busy array a
     # durable server made the pass take an hour (run #764, 3735 s) where the
-    # non-durable one took about 5 minutes (run #766), and the postgres 18
-    # image refuses to start with a tmpfs at /var/lib/postgresql/data (run
-    # #815). That is not a timeout, retry or skip (SPEC-10.1.3); it only keeps
+    # non-durable one took about 5 minutes (run #766). Its data directory is a
+    # tmpfs at /var/lib/postgresql, the PGDATA parent on postgres 18 (a tmpfs at
+    # /var/lib/postgresql/data, run #815, missed PGDATA and the image refused
+    # it). That is not a timeout, retry or skip (SPEC-10.1.3); it only keeps
     # the test database off the disk the build shares with everything else.
     # The timeouts end a stall in minutes rather than at the 3 hour limit.
     #
@@ -125,6 +131,27 @@ jobs:
 
       - name: Start job metrics sampler
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-start@main
+
+      - name: Start test profile sampler
+        # PSPEC-2.7.1, PSPEC-2.1.3: samples host MemAvailable and this job's own
+        # test-postgres data directory size every 5 s, read by the always() step below.
+        if: needs.changes.outputs.result == 'code'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/profile-sampler"
+          mkdir -p "${dir}"
+          pidns="$(readlink /proc/self/ns/pid)"
+          nohup sh -c '
+            while :; do
+              awk "/^MemAvailable:/ {print \$2}" /proc/meminfo >> "$0/memavailable_kb"
+              c="$(docker ps --quiet --filter "label=claude-run.test-postgres.pidns=$1" | head -n 1)"
+              if [ -n "${c}" ]; then
+                docker exec "${c}" du -sk /var/lib/postgresql 2>/dev/null | cut -f1 >> "$0/pgdata_kb" || true
+              fi
+              sleep 5
+            done' "${dir}" "${pidns}" > "${dir}/sampler.log" 2>&1 &
+          echo $! > "${dir}/pid"
 
       - name: Resolve RUST_TEST_THREADS from NEXTEST_TEST_THREADS
         # libtest reads RUST_TEST_THREADS, but only cargo-nextest reads
@@ -199,7 +226,8 @@ jobs:
       - name: Unit tests (PostgreSQL)
         if: needs.changes.outputs.result == 'code'
         # SPEC-6.6, SPEC-11.1: `claude-run test-postgres` starts a throwaway
-        # Postgres with fsync, synchronous_commit and full_page_writes off and
+        # Postgres on a tmpfs with fsync, full_page_writes, synchronous_commit
+        # and autovacuum off (common PSPEC-2.1.1 to PSPEC-2.1.5) and
         # sets CLAUDE_RUN_TEST_DATABASE_URL for the command only, so the SQLite
         # step above still runs on SQLite. The job runs in a container on its
         # own per-job network, out of reach of a port published on the Docker
@@ -260,6 +288,24 @@ jobs:
           print $"test-postgres on network ($network); test threads: ($threads); filters: ($filters)"
           ^cargo run -- test-postgres --network $network -- cargo test -- --test-threads $threads ...$filters
           print $"TIMING: postgres-tests-end ((date now | format date '%+'))"
+
+      - name: Report test profile samples
+        # PSPEC-2.7.1: lowest MemAvailable; PSPEC-2.1.3: peak data directory to size the tmpfs.
+        if: always()
+        shell: bash
+        run: |
+          dir="${RUNNER_TEMP}/profile-sampler"
+          if [ -f "${dir}/pid" ]; then kill "$(cat "${dir}/pid")" 2>/dev/null || true; fi
+          if [ -s "${dir}/memavailable_kb" ]; then
+            echo "TEST-PROFILE: lowest MemAvailable $(sort -n "${dir}/memavailable_kb" | head -n 1) kB over $(wc -l < "${dir}/memavailable_kb") samples"
+          else
+            echo "TEST-PROFILE: no MemAvailable samples"
+          fi
+          if [ -s "${dir}/pgdata_kb" ]; then
+            echo "TEST-PROFILE: peak test-postgres data directory $(sort -n "${dir}/pgdata_kb" | tail -n 1) kB (tmpfs size=2g)"
+          else
+            echo "TEST-PROFILE: no test-postgres data directory samples"
+          fi
 
       - name: Report job metrics
         # Last and always(), so a failing job still reports (composite actions have no post hook).
