@@ -1869,10 +1869,10 @@ from before the namespace label) only when older than 6 hours, since its pid mea
 container with a loopback-only ephemeral published port (or, with the optional `--network`, on that Docker network
 with nothing published, reached by container name on port 5432, for a caller that is itself a container on that
 network), `--rm`, no volume (the writable layer and data directory are both discarded on teardown), its data directory
-on a tmpfs at `/var/lib/postgresql` (the parent of `PGDATA` for PostgreSQL 18 images) sized to fit inside its
+on a tmpfs at `/var/lib/postgresql` (the parent of the data directory for PostgreSQL 18 images) sized to fit inside its
 `--memory` cap, a raised `max_connections` (the parallel fixture leg needs more than the default 100), and `fsync`,
-`full_page_writes`, `synchronous_commit` and `autovacuum` off as `-c` server arguments (common `PSPEC-2.1.1` through
-`PSPEC-2.1.5`), waits for an actual `psql`
+`full_page_writes`, `synchronous_commit` and automatic vacuuming turned off as `-c` server arguments (section 2.1 of
+the adopted PostgreSQL test profile, section 12), waits for an actual `psql`
 connection (not `pg_isready`, which can report ready during the official image's post-`initdb` restart) up to 60s,
 then opens a TCP connection to the URL's host and port from its own process for up to 20s and fails
 fast naming `--network` when it cannot (a caller in a container of its own cannot reach the Docker host's loopback),
