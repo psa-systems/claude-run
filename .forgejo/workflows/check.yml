@@ -302,7 +302,7 @@ jobs:
             echo "TEST-PROFILE: no MemAvailable samples"
           fi
           if [ -s "${dir}/pgdata_kb" ]; then
-            echo "TEST-PROFILE: peak test-postgres data directory $(sort -n "${dir}/pgdata_kb" | tail -n 1) kB (tmpfs size=2g)"
+            echo "TEST-PROFILE: peak test-postgres data directory $(sort -n "${dir}/pgdata_kb" | tail -n 1) kB (tmpfs size=2g, last measured peak 404 MiB)"
           else
             echo "TEST-PROFILE: no test-postgres data directory samples"
           fi

@@ -179,8 +179,8 @@ pub fn docker_run_args(
         "256m".into(),
         "--memory".into(),
         "4g".into(),
-        // PG 18 keeps PGDATA under /var/lib/postgresql/18/docker. Provisional size inside
-        // the 4g cap until CI's sampler reports the peak data directory size.
+        // PG 18 keeps PGDATA under /var/lib/postgresql/18/docker. Measured peak 404 MiB
+        // (CI run #1455), so 2g leaves headroom and still fits the 4g cap.
         "--tmpfs".into(),
         "/var/lib/postgresql:rw,size=2g".into(),
         "-e".into(),
