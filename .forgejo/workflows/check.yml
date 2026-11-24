@@ -144,7 +144,7 @@ jobs:
           pidns="$(readlink /proc/self/ns/pid)"
           nohup sh -c '
             while :; do
-              awk "/^MemAvailable:/ {print \$2}" /proc/meminfo >> "$0/memavailable_kb"
+              awk "/^MemAvailable:/ {print \$2}" /proc/meminfo >> "$0/mem_available_kb"
               c="$(docker ps --quiet --filter "label=claude-run.test-postgres.pidns=$1" | head -n 1)"
               if [ -n "${c}" ]; then
                 docker exec "${c}" du -sk /var/lib/postgresql 2>/dev/null | cut -f1 >> "$0/pgdata_kb" || true
@@ -296,8 +296,8 @@ jobs:
         run: |
           dir="${RUNNER_TEMP}/profile-sampler"
           if [ -f "${dir}/pid" ]; then kill "$(cat "${dir}/pid")" 2>/dev/null || true; fi
-          if [ -s "${dir}/memavailable_kb" ]; then
-            echo "TEST-PROFILE: lowest MemAvailable $(sort -n "${dir}/memavailable_kb" | head -n 1) kB over $(wc -l < "${dir}/memavailable_kb") samples"
+          if [ -s "${dir}/mem_available_kb" ]; then
+            echo "TEST-PROFILE: lowest MemAvailable $(sort -n "${dir}/mem_available_kb" | head -n 1) kB over $(wc -l < "${dir}/mem_available_kb") samples"
           else
             echo "TEST-PROFILE: no MemAvailable samples"
           fi

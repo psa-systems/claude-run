@@ -198,7 +198,7 @@ pub fn docker_run_args(
         "-c".into(),
         "max_connections=200".into(),
         // Durability off at start (a throwaway server needs no crash safety);
-        // autovacuum off since each pass invalidates the shared relcache file.
+        // autovacuum off since each pass invalidates the shared relation cache file.
         "-c".into(),
         "fsync=off".into(),
         "-c".into(),
