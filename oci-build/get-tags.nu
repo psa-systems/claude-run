@@ -7,17 +7,13 @@
 # The publish MODE is derived from the workflow TRIGGER (not from `git
 # describe`) and passed in via --mode:
 # - release: an exact `v*` tag push. Publishes ONLY the immutable <version> artifact.
-# - latest:  a push to main. Publishes ONLY the rolling `latest` artifact.
+# - latest:  a push to develop. Publishes ONLY the rolling `latest` artifact.
 # - dry-run: a workflow_dispatch. The caller builds and prints but mutates nothing.
 #
-# Deriving the mode from the trigger is what removes the twin-publish race
-# The release commit is
-# simultaneously a push to `main` AND the `v*` tag push, so both workflow
-# events fire. With `git describe` as the source of truth, both runs resolved
-# the identical `[vX.Y.Z, latest]` set and raced to write the same destination
-# (an overwrite race on the OCI `latest` tag). Trigger-derived modes return DISJOINT tag sets: the tag-push
-# run publishes only `vX.Y.Z`, the branch-push run publishes only `latest`, so
-# the two runs never write the same destination.
+# Deriving the mode from the trigger keeps the tag-push run and the branch-push
+# run off the same destination. Trigger-derived modes return DISJOINT tag sets:
+# the tag-push run publishes only `vX.Y.Z`, the branch-push run (`develop`)
+# publishes only `latest`. A push to `main` publishes nothing (SPEC-11.15).
 #
 # A dry-run still resolves to one of the two real publish trains so the caller
 # can exercise either path:

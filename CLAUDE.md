@@ -154,12 +154,12 @@ Cross-cutting (not a numbered phase): a container runtime (made self-contained) 
 
 ## Working on this repo
 
-- Branch off `main` per `governance/GIT_WORKFLOW.md`. Run `just pre-push` (or rely on the installed hook) before pushing; `just install-hooks` writes the `pre-commit`, `commit-msg` and `pre-push` stubs; re-run it after a `common` bump to pick up the hook.
+- Branch off `develop` per `governance/GIT_WORKFLOW.md`; a person merges `develop` into `main` (`SPEC-11.11`). Run `just pre-push` (or rely on the installed hook) before pushing; `just install-hooks` writes the `pre-commit`, `commit-msg` and `pre-push` stubs; re-run it after a `common` bump to pick up the hook.
 - `just check` mirrors CI's fmt + clippy + build + tests; CI also runs the CLAUDE.md guard as `claude-md`.
 - The task runner is the shared `psa-systems/common` recipe set, vendored as the `common` submodule (`git submodule update --init` after a fresh clone).
   `justfile` configures it through variables (`pre_commit_mode := "docker"` + `dev_image` because there is no `compose.dev.yml`) and overrides only `default`, `check`, and `run`. Prefer setting a common variable over shadowing a shared recipe.
   `default` is redefined locally (as the file's first recipe) because just resolves the default recipe by source order and a top-level definition outranks the imported one, so without it a bare `just` runs whichever local recipe comes first instead of common's `just --list`.
   CI keeps its own `.forgejo/workflows/check.yml` rather than calling common's reusable one, which hardcodes `cargo test --bins`; making that configurable is a limitation of `common`'s reusable workflow. It deviates from governance `CI.md` ("Check runs on every push / PR"):
-  the workflow still runs on every push and PR to `main`, but common's shared `classify-diff` action (a leading `changes` job and an `if:`, not a workflow-level `paths-ignore`) skips the compile job for a docs-only PR and everything but `cargo fmt --check` for a comment-only one.
+  the workflow still runs on every push and PR to `main` and `develop` (`develop` gets the minimal checks, `main` the full ones, `SPEC-11.13`), but common's shared `classify-diff` action (a leading `changes` job and an `if:`, not a workflow-level `paths-ignore`) skips the compile job for a docs-only PR and everything but `cargo fmt --check` for a comment-only one.
 - Daemon smoke-test pattern: `CLAUDE_RUN_*_DIR=/tmp/...` env vars + a stub `claude` on `PATH` (see `src/bin/claude-run.rs`).
 - The legacy `scripts/claude-run.nu` is gone; the Rust binary is the only runner.
