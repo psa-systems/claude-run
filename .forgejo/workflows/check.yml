@@ -1,6 +1,12 @@
 ---
 
-# Validate code on every push and pull request.
+# Minimal checks for `develop`, full checks for `main` (SPEC-11.11 to SPEC-11.14).
+# A pull request whose base is `develop` and a push to `develop` run fmt, clippy,
+# the CLAUDE.md guard, the secrets scan and spelling. A pull request whose base is
+# `main` and a push to `main` add the build, the unit tests on SQLite and
+# PostgreSQL and a not-pushed image compile. No other branch starts a workflow
+# (SPEC-11.12). Image publication is `build-image.yml`, not a check (SPEC-11.15).
+#
 # Mirrors the local `just check` recipe (the `claude-md` job is its
 # `check-claude-md` step). This stays a standalone workflow rather
 # than calling common's reusable check.yml: that workflow cannot declare the
@@ -29,9 +35,11 @@ on:
   push:
     branches:
       - main
+      - develop
   pull_request:
     branches:
       - main
+      - develop
     # PSTD-1.1.14, SPEC-11.5.20: so a title or label correction re-runs the scope check.
     types: [opened, synchronize, reopened, edited, labeled, unlabeled]
 
@@ -205,7 +213,8 @@ jobs:
           print $"TIMING: clippy-end ((date now | format date '%+'))"
 
       - name: Build
-        if: needs.changes.outputs.result == 'code'
+        # Full checks only (SPEC-11.14).
+        if: needs.changes.outputs.result == 'code' && ((github.event_name == 'pull_request' && github.base_ref == 'main') || github.ref == 'refs/heads/main')
         shell: nu {0}
         run: |
           print $"TIMING: build-start ((date now | format date '%+'))"
@@ -215,7 +224,8 @@ jobs:
           print $"TIMING: target-cache-size-after-build ($size) bytes"
 
       - name: Unit tests (SQLite, the default backend)
-        if: needs.changes.outputs.result == 'code'
+        # Full checks only (SPEC-11.14).
+        if: needs.changes.outputs.result == 'code' && ((github.event_name == 'pull_request' && github.base_ref == 'main') || github.ref == 'refs/heads/main')
         timeout-minutes: 30
         shell: nu {0}
         run: |
@@ -224,7 +234,8 @@ jobs:
           print $"TIMING: sqlite-tests-end ((date now | format date '%+'))"
 
       - name: Unit tests (PostgreSQL)
-        if: needs.changes.outputs.result == 'code'
+        # Full checks only (SPEC-11.14).
+        if: needs.changes.outputs.result == 'code' && ((github.event_name == 'pull_request' && github.base_ref == 'main') || github.ref == 'refs/heads/main')
         # SPEC-6.6, SPEC-11.1: `claude-run test-postgres` starts a throwaway
         # Postgres on a tmpfs with fsync, full_page_writes, synchronous_commit
         # and autovacuum off (common PSPEC-2.1.1 to PSPEC-2.1.5) and
@@ -311,6 +322,33 @@ jobs:
         # Last and always(), so a failing job still reports (composite actions have no post hook).
         if: always()
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main
+
+  image:
+    # Full checks only (SPEC-11.14): compiles the builder stage and pushes
+    # nothing; publication is build-image.yml. `classify-diff` decides the skip
+    # (SPEC-11.17), via the `changes` job.
+    # SPEC-11.7, PSTD-1.1.9: also skipped for a `specification` head branch.
+    # PSTD-1.1.14: also skipped on a title/label-only re-run.
+    needs: changes
+    if: github.event.action != 'edited' && github.event.action != 'labeled' && github.event.action != 'unlabeled' && needs.changes.outputs.result == 'code' && ((github.event_name == 'pull_request' && github.base_ref == 'main') || github.ref == 'refs/heads/main') && github.head_ref != 'specification'
+    name: Image compile (not pushed)
+    # HEAVY: runs `docker buildx build` of the builder stage, a full cargo compile.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_HEAVY }}
+    timeout-minutes: 60
+    steps:
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Set up buildx builder
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/setup-buildx@main
+        with:
+          name: check-image
+
+      - name: Compile the builder stage
+        run: just check-docker
 
   secrets:
     # PSTD-1.1.14: skipped on a title/label-only re-run; the scope job alone runs then.

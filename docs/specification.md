@@ -1868,13 +1868,15 @@ is an orphan when its owning pid is dead; any other (another CI job's container 
 from before the namespace label) only when older than 6 hours, since its pid means nothing here. It starts the
 container with a loopback-only ephemeral published port (or, with the optional `--network`, on that Docker network
 with nothing published, reached by container name on port 5432, for a caller that is itself a container on that
-network), `--rm`, no volume (the writable layer and data directory are both discarded on teardown) and a raised
-`max_connections` (the parallel fixture leg needs more than the default 100), waits for an actual `psql`
+network), `--rm`, no volume (the writable layer and data directory are both discarded on teardown), its data directory
+on a tmpfs at `/var/lib/postgresql` (the parent of the data directory for PostgreSQL 18 images) sized to fit inside its
+`--memory` cap, a raised `max_connections` (the parallel fixture leg needs more than the default 100), and `fsync`,
+`full_page_writes`, `synchronous_commit` and automatic vacuuming turned off as `-c` server arguments (section 2.1 of
+the adopted PostgreSQL test profile, section 12), waits for an actual `psql`
 connection (not `pg_isready`, which can report ready during the official image's post-`initdb` restart) up to 60s,
 then opens a TCP connection to the URL's host and port from its own process for up to 20s and fails
 fast naming `--network` when it cannot (a caller in a container of its own cannot reach the Docker host's loopback),
-then disables `fsync`, `synchronous_commit` and
-`full_page_writes` and verifies the change by reading `SHOW fsync` back, retrying for up to 20s against a
+then verifies durability is off by reading `SHOW fsync` back, retrying for up to 20s against a
 restart-shaped connection failure. Each `--init-sql` file then runs in order with `ON_ERROR_STOP`, through the same
 retry. When `CLAUDE_RUN_STEP_SPANS_FILE` is set it appends the `postgres_start` and `postgres_healthy` steps it timed
 to that file (`SPEC-3.14` item 3); a failed append is printed and never fails the run. The generated password never
@@ -2360,7 +2362,8 @@ from `git describe`, because a release commit is simultaneously a push to `main`
 runs fire:
 
 - `release` train (an exact `v*` tag push): publishes only the immutable `<version>` artifact.
-- `latest` train (a push to `main`): publishes only the rolling `latest` artifact.
+- `latest` train (a push to `develop`, `SPEC-11.11`): publishes only the rolling `latest` artifact. A push to `main`
+  resolves to no train and publishes no artifact (`SPEC-11.15`).
 - `dry-run` (a `workflow_dispatch`): builds and prints without mutating the registry; it resolves to the `release` train
   when given a `--simulate-tag` version to exercise, else to the `latest` train.
 
@@ -2447,3 +2450,32 @@ This section is the claude-run form of the shared standard on specification chan
   identifier it implements is on `main`, and MUST name each one. An implementing change that finds its requirement
   missing or wrong MUST stop, edit neither document, and report the gap to a person, who decides it on `specification`
   first (`PSTD-1.1.12`).
+
+### 11.3 Branch flow (`SPEC-11.11`)
+
+- **SPEC-11.11**: A change MUST reach `main` through `develop`: a working branch is merged into `develop` by a pull
+  request, and `develop` is merged into `main` by a pull request that a person merges. This does not apply to a
+  pull request from `specification` (`SPEC-11.2`), which targets `main` directly.
+- **SPEC-11.12**: A push to a branch other than `main` and `develop` MUST NOT start a workflow.
+- **SPEC-11.13**: A pull request whose base is `develop`, and a push to `develop`, MUST run the minimal checks of
+  `SPEC-11.14` and no other check. The image publication of `SPEC-11.15` is not a check. A pull request whose base is
+  `main`, and a push to `main`, MUST run the full checks of `SPEC-11.14`.
+- **SPEC-11.14**: The minimal checks are the secrets scan, `check-spelling`, `cargo fmt --all --check`,
+  `cargo clippy --all-targets -- -D warnings` and the `CLAUDE.md` guard. They MUST NOT run a build, the unit tests or an
+  image build. The full checks are the minimal checks plus the build, the unit-test suite on SQLite and on PostgreSQL
+  (`SPEC-11.1`, `SPEC-5.6`) and the builder-stage image compile, which is not pushed.
+- **SPEC-11.15**: A push to `develop` MUST build the production image and publish it as `latest`. A push of a `v*` tag
+  MUST publish the image under that version tag only. A push to `main` MUST NOT publish any image tag. The publication
+  mode MUST be derived from the workflow trigger (`SPEC-9.2`), never from `git describe`.
+- **SPEC-11.16**: The image publication run MUST NOT be a required status check on `develop` or `main`, and a failure
+  of it MUST remain visible as a failed run. A push to `develop` MUST cancel a `develop` publication that is still
+  running. A tag publication MUST NOT be cancelled.
+- **SPEC-11.17**: Whether a step is skipped for a documentation-only or comment-only diff MUST be decided by the shared
+  `classify-diff` action alone, for the minimal and the full checks alike (`PSTD-1.3.1`, `PSTD-1.3.2`).
+
+## 12. Adopted profiles
+
+This repository adopts these profiles of `common`; each requirement they state is normative here as written there.
+
+- `common/docs/profile-specification.md`, chapter 1: Rust test build profile.
+- `common/docs/profile-specification.md`, chapter 2: PostgreSQL test profile.

@@ -36,7 +36,7 @@ name: claude-bot
 services:
   claude-bot:
     container_name: claude-bot
-    # Published by .forgejo/workflows/build-image.yml on every main
+    # Published by .forgejo/workflows/build-image.yml on every develop
     # push (`latest`) and release tag (`vX.Y.Z`). Pin a version tag in
     # production. Pulling needs `docker login dev.a8n.run` with a PAT that can
     # read the psa-systems-private packages. For local development, comment `image:` and uncomment
