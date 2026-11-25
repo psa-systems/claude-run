@@ -1868,13 +1868,15 @@ is an orphan when its owning pid is dead; any other (another CI job's container 
 from before the namespace label) only when older than 6 hours, since its pid means nothing here. It starts the
 container with a loopback-only ephemeral published port (or, with the optional `--network`, on that Docker network
 with nothing published, reached by container name on port 5432, for a caller that is itself a container on that
-network), `--rm`, no volume (the writable layer and data directory are both discarded on teardown) and a raised
-`max_connections` (the parallel fixture leg needs more than the default 100), waits for an actual `psql`
+network), `--rm`, no volume (the writable layer and data directory are both discarded on teardown), its data directory
+on a tmpfs at `/var/lib/postgresql` (the parent of the data directory for PostgreSQL 18 images) sized to fit inside its
+`--memory` cap, a raised `max_connections` (the parallel fixture leg needs more than the default 100), and `fsync`,
+`full_page_writes`, `synchronous_commit` and automatic vacuuming turned off as `-c` server arguments (section 2.1 of
+the adopted PostgreSQL test profile, section 12), waits for an actual `psql`
 connection (not `pg_isready`, which can report ready during the official image's post-`initdb` restart) up to 60s,
 then opens a TCP connection to the URL's host and port from its own process for up to 20s and fails
 fast naming `--network` when it cannot (a caller in a container of its own cannot reach the Docker host's loopback),
-then disables `fsync`, `synchronous_commit` and
-`full_page_writes` and verifies the change by reading `SHOW fsync` back, retrying for up to 20s against a
+then verifies durability is off by reading `SHOW fsync` back, retrying for up to 20s against a
 restart-shaped connection failure. Each `--init-sql` file then runs in order with `ON_ERROR_STOP`, through the same
 retry. When `CLAUDE_RUN_STEP_SPANS_FILE` is set it appends the `postgres_start` and `postgres_healthy` steps it timed
 to that file (`SPEC-3.14` item 3); a failed append is printed and never fails the run. The generated password never
@@ -2447,3 +2449,10 @@ This section is the claude-run form of the shared standard on specification chan
   identifier it implements is on `main`, and MUST name each one. An implementing change that finds its requirement
   missing or wrong MUST stop, edit neither document, and report the gap to a person, who decides it on `specification`
   first (`PSTD-1.1.12`).
+
+## 12. Adopted profiles
+
+This repository adopts these profiles of `common`; each requirement they state is normative here as written there.
+
+- `common/docs/profile-specification.md`, chapter 1: Rust test build profile.
+- `common/docs/profile-specification.md`, chapter 2: PostgreSQL test profile.
