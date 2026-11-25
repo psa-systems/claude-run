@@ -2362,7 +2362,8 @@ from `git describe`, because a release commit is simultaneously a push to `main`
 runs fire:
 
 - `release` train (an exact `v*` tag push): publishes only the immutable `<version>` artifact.
-- `latest` train (a push to `main`): publishes only the rolling `latest` artifact.
+- `latest` train (a push to `develop`, `SPEC-11.11`): publishes only the rolling `latest` artifact. A push to `main`
+  resolves to no train and publishes no artifact (`SPEC-11.15`).
 - `dry-run` (a `workflow_dispatch`): builds and prints without mutating the registry; it resolves to the `release` train
   when given a `--simulate-tag` version to exercise, else to the `latest` train.
 
@@ -2449,6 +2450,28 @@ This section is the claude-run form of the shared standard on specification chan
   identifier it implements is on `main`, and MUST name each one. An implementing change that finds its requirement
   missing or wrong MUST stop, edit neither document, and report the gap to a person, who decides it on `specification`
   first (`PSTD-1.1.12`).
+
+### 11.3 Branch flow (`SPEC-11.11`)
+
+- **SPEC-11.11**: A change MUST reach `main` through `develop`: a working branch is merged into `develop` by a pull
+  request, and `develop` is merged into `main` by a pull request that a person merges. This does not apply to a
+  pull request from `specification` (`SPEC-11.2`), which targets `main` directly.
+- **SPEC-11.12**: A push to a branch other than `main` and `develop` MUST NOT start a workflow.
+- **SPEC-11.13**: A pull request whose base is `develop`, and a push to `develop`, MUST run the minimal checks of
+  `SPEC-11.14` and no other check. The image publication of `SPEC-11.15` is not a check. A pull request whose base is
+  `main`, and a push to `main`, MUST run the full checks of `SPEC-11.14`.
+- **SPEC-11.14**: The minimal checks are the secrets scan, `check-spelling`, `cargo fmt --all --check`,
+  `cargo clippy --all-targets -- -D warnings` and the `CLAUDE.md` guard. They MUST NOT run a build, the unit tests or an
+  image build. The full checks are the minimal checks plus the build, the unit-test suite on SQLite and on PostgreSQL
+  (`SPEC-11.1`, `SPEC-5.6`) and the builder-stage image compile, which is not pushed.
+- **SPEC-11.15**: A push to `develop` MUST build the production image and publish it as `latest`. A push of a `v*` tag
+  MUST publish the image under that version tag only. A push to `main` MUST NOT publish any image tag. The publication
+  mode MUST be derived from the workflow trigger (`SPEC-9.2`), never from `git describe`.
+- **SPEC-11.16**: The image publication run MUST NOT be a required status check on `develop` or `main`, and a failure
+  of it MUST remain visible as a failed run. A push to `develop` MUST cancel a `develop` publication that is still
+  running. A tag publication MUST NOT be cancelled.
+- **SPEC-11.17**: Whether a step is skipped for a documentation-only or comment-only diff MUST be decided by the shared
+  `classify-diff` action alone, for the minimal and the full checks alike (`PSTD-1.3.1`, `PSTD-1.3.2`).
 
 ## 12. Adopted profiles
 
