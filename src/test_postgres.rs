@@ -4,8 +4,8 @@
 //! A `claude` child must never reach the runner's live
 //! database. This subcommand is the replacement: it starts a private
 //! `postgres` container in the Docker-in-Docker sidecar every agent session
-//! already has, disables durability (fsync/synchronous_commit/full_page_writes
-//! off; a throwaway database does not need to survive a crash, and skipping
+//! already has, on a tmpfs with durability off (fsync/synchronous_commit/
+//! full_page_writes/autovacuum as `-c` arguments; a throwaway database does not need to survive a crash, and skipping
 //! those writes is most of the measured speedup), runs `<command>` with
 //! `DATABASE_URL` / `CLAUDE_RUN_TEST_DATABASE_URL` pointed at it, and tears the
 //! container down no matter how the command ends: normal exit, failure,
@@ -98,7 +98,7 @@ fn docker(args: &[&str], redact: &[&str]) -> Result<std::process::Output> {
 }
 
 /// Run `docker exec -i <name> <rest>` feeding `stdin` to the child, used for
-/// every `psql` invocation (the settings script, `SHOW fsync`, and each
+/// every `psql` invocation (the `SHOW fsync` read-back and each
 /// `--init-sql` file). Never includes the password: `psql` connects over the
 /// container's local unix socket, which the official image trusts
 /// unconditionally.
@@ -179,6 +179,10 @@ pub fn docker_run_args(
         "256m".into(),
         "--memory".into(),
         "4g".into(),
+        // PG 18 keeps PGDATA under /var/lib/postgresql/18/docker. Measured peak 404 MiB
+        // (CI run #1455), so 2g leaves headroom and still fits the 4g cap.
+        "--tmpfs".into(),
+        "/var/lib/postgresql:rw,size=2g".into(),
         "-e".into(),
         "POSTGRES_USER=postgres".into(),
         "-e".into(),
@@ -193,6 +197,16 @@ pub fn docker_run_args(
         // image name, which the official entrypoint forwards to `postgres`.
         "-c".into(),
         "max_connections=200".into(),
+        // Durability off at start (a throwaway server needs no crash safety);
+        // autovacuum off since each pass invalidates the shared relation cache file.
+        "-c".into(),
+        "fsync=off".into(),
+        "-c".into(),
+        "full_page_writes=off".into(),
+        "-c".into(),
+        "synchronous_commit=off".into(),
+        "-c".into(),
+        "autovacuum=off".into(),
     ]
 }
 
@@ -439,13 +453,6 @@ fn wait_reachable(host: &str, port: u16) -> Result<()> {
     }
 }
 
-const DISABLE_DURABILITY_SQL: &str = "\
-ALTER SYSTEM SET fsync = off;
-ALTER SYSTEM SET synchronous_commit = off;
-ALTER SYSTEM SET full_page_writes = off;
-SELECT pg_reload_conf();
-";
-
 fn psql_args() -> [&'static str; 5] {
     ["psql", "--username", "postgres", "--set", "ON_ERROR_STOP=1"]
 }
@@ -524,9 +531,8 @@ fn apply_sql(name: &str, stage: &str, sql: &str) -> Result<()> {
     ))
 }
 
-fn disable_durability(name: &str) -> Result<()> {
-    apply_sql(name, "disable durability", DISABLE_DURABILITY_SQL)?;
-
+/// Confirm the `-c fsync=off` server argument took effect. SPEC-6.6.
+fn verify_durability_off(name: &str) -> Result<()> {
     let args = vec![
         name,
         "psql",
@@ -606,7 +612,7 @@ fn wait_for_child(mut child: Child) -> Result<i32> {
     }
 }
 
-/// Run `test-postgres`: sweep orphans, start a container, disable durability,
+/// Run `test-postgres`: sweep orphans, start a container, verify durability is off,
 /// apply `--init-sql` files, run `command`, tear the container down, and
 /// return the exit code to propagate. Teardown always runs once the container
 /// has started, even when an earlier step, the command, or a signal is what
@@ -706,7 +712,7 @@ pub fn run(opts: &Opts, command: &[String]) -> Result<i32> {
     );
     let result = (|| -> Result<i32> {
         let (host, port) = ready?;
-        disable_durability(&name)?;
+        verify_durability_off(&name)?;
         apply_init_files(&name, &opts.init_sql)?;
 
         let url = format!("postgres://postgres:{password}@{host}:{port}/postgres");
@@ -759,6 +765,8 @@ mod tests {
                 "256m",
                 "--memory",
                 "4g",
+                "--tmpfs",
+                "/var/lib/postgresql:rw,size=2g",
                 "-e",
                 "POSTGRES_USER=postgres",
                 "-e",
@@ -768,11 +776,17 @@ mod tests {
                 DEFAULT_IMAGE,
                 "-c",
                 "max_connections=200",
+                "-c",
+                "fsync=off",
+                "-c",
+                "full_page_writes=off",
+                "-c",
+                "synchronous_commit=off",
+                "-c",
+                "autovacuum=off",
             ]
         );
-        assert!(!args
-            .iter()
-            .any(|a| a.contains("tmpfs") || a.contains("--volume")));
+        assert!(!args.iter().any(|a| a.contains("--volume")));
     }
 
     #[test]
@@ -783,7 +797,21 @@ mod tests {
             .position(|a| a == "postgres:18.2-alpine3.23")
             .expect("the image override appears in the args");
         // Server flags follow the image name, so the image is no longer last.
-        assert_eq!(&args[image_at + 1..], &["-c", "max_connections=200"]);
+        assert_eq!(
+            &args[image_at + 1..],
+            &[
+                "-c",
+                "max_connections=200",
+                "-c",
+                "fsync=off",
+                "-c",
+                "full_page_writes=off",
+                "-c",
+                "synchronous_commit=off",
+                "-c",
+                "autovacuum=off",
+            ]
+        );
     }
 
     #[test]
@@ -1271,7 +1299,7 @@ exit 0
     }
 
     #[test]
-    fn disable_durability_retries_the_show_fsync_read_back_through_a_restart() {
+    fn verify_durability_off_retries_the_show_fsync_read_back_through_a_restart() {
         with_stub_on_path(|| {
             let dir = tempfile::tempdir().unwrap();
             let state_path = dir.path().join("show-fsync-attempts");
@@ -1316,7 +1344,7 @@ exit 0
                 std::env::set_var("PATH", format!("{}:{old_path}", dir.path().display()));
             }
 
-            let result = disable_durability("stubcontainer");
+            let result = verify_durability_off("stubcontainer");
 
             unsafe {
                 std::env::set_var("PATH", old_path);
