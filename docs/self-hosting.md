@@ -30,7 +30,7 @@ every first-party image's shared `gosu-entrypoint.sh` falls back to) with `$HOME
 the earlier `claudebot` user), which holds nothing persistent: everything the operator cares about lives on the three
 flat volumes below.
 
-**Published image.** CI publishes the runtime image to the Forgejo OCI registry on every push to main (
+**Published image.** CI publishes the runtime image to the Forgejo OCI registry on every push to develop (
 `:latest`) and every release tag (`:vX.Y.Z`), the only published artifact. The image publish runs
 in its own workflow, `.forgejo/workflows/build-image.yml`. It is published under the private `psa-systems-private` package owner, so pulling
 needs a one-time login with a Forgejo PAT that can read it:
@@ -40,7 +40,7 @@ docker login dev.a8n.run --username <forgejo-user>
 docker pull dev.a8n.run/psa-systems-private/claude-run:latest
 ```
 
-Pin `:vX.Y.Z` in production; `:latest` tracks main. Container deployments update by pulling a newer tag and recreating
+Pin `:vX.Y.Z` in production; `:latest` tracks develop. Container deployments update by pulling a newer tag and recreating
 the service:
 
 ```nu
