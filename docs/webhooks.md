@@ -116,7 +116,7 @@ whether `agent_pull_requests` has an `open` row for `(host, repo, pr.number)`:
   instead, with a comment listing every fix attempt's run and every distinct failing-test set seen on the PR. A
   failure whose fingerprint repeats the immediately preceding attempt's unchanged (the loop-breaker) also
   flags `Needs Review` instead of re-queueing, naming the decision needed (fix the recurring failure by hand, or
-  re-queue once it no longer reproduces). Both of these `Needs Review` writes are the `SPEC-3.12` item 3 "CI
+  re-queue once it no longer reproduces). Both of these `Needs Review` writes are the `SPEC-3.12.4` "CI
   remediation ceiling reached" table row, so both also tag `Needs-Info` (`mint.needs_info_tag`, default
   `Needs-Info`). One exception: when this failure's tests overlap none of the earlier attempts' on the
   PR (the agent fixed what it was asked to and a different test tripped), it gets one more attempt, up to
@@ -125,14 +125,13 @@ whether `agent_pull_requests` has an `open` row for `(host, repo, pr.number)`:
   belongs to an issue that already exists. This replaces matching `trigger_user` against `bot_logins`, which is what
   silently dropped a real incident (run 5874 on PR 766, opened by the bot as `Claude-Run`, never matched the
   lowercase-only `claude-run` in `bot_logins`).
-- **A human's PR** always gets the analysis, one way or another: sharing a failing test with an already-`open` failure
-  gets a PR comment naming the issue ("This failure is already tracked in \<KEY\>; it is not caused by this PR.") and
-  the run attached, with no analysis (the failure is already fully triaged); sharing a failing test with a `pr_only`
-  failure whose sightings now span two distinct branches means the failure belongs to `main`, not either PR, so an
-  issue is minted for real (triage + `mint::mint`, caps applied and advanced exactly like a fresh mint) and
-  both PRs get a comment linking it; anything else (no store match at all) runs the analysis and comments it on the PR
-  - always - then records a `pr_only` row (branch, PR number) with no issue yet, so a second branch hitting the same
-  failure is what promotes it.
+- **A human's PR** is analyzed only when `config.webhook.pr_analysis` is true (default false); when false the failure
+  is dropped with an `info` log, with no analysis, no comment, no store row and no issue. When true: sharing a failing
+  test with an already-`open` failure gets a PR comment naming the issue ("This failure is already tracked in
+  \<KEY\>; it is not caused by this PR.") and the run attached, with no analysis (the failure is already fully
+  triaged); anything else (no store match, or a `pr_only` match) runs the analysis, comments it on the PR, and
+  records or keeps a `pr_only` row (branch, PR number) with no issue. A human PR's failure never mints an issue, even
+  when it is seen on a second branch.
 
 PR comments post through a webhook source's own `write_token_ref` (a Forgejo PAT that can comment on pull requests),
 reaching `fj` the same temp single-host `keys.json` way `log_token_ref` and the comment listener's own `write_token_ref`
@@ -146,7 +145,7 @@ agent's-own-PR case, before `mint` is ever reached. `config.mint.bot_logins` is 
 
 **the listener has its own `enabled` switch.** `config.webhook.enabled` defaults `false`; while off, `POST /webhooks/forgejo/triage/<source>` 404s every request regardless of `sources` (logged as `"webhook rejected: disabled"`, distinct from an unknown-source 404), ahead of any source lookup. A Settings save that sets it `true` is rejected unless `sources` is non-empty and every source carries `secret_ref`, naming every offending source, so "enabled" can never mean "accepting requests with no real authentication configured behind it." At `serve` start, a stored document with `sources` already configured but `enabled` unset (the state an upgrade from a version with no such flag deserializes to) logs one `warn` naming the section.
 
-**The webhook is a configurable action.** It is named `webhook-triage` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings decides only whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) gets `AI Agent = Queued`. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check still creates an issue but with no `AI Agent` write, so no fixup PR is queued and the failure stays reported on the original PR for its author to fix in place (a `human_action` failure is unaffected either way); with it on, the corrective-fixup behavior above applies. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-triage` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/triage/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. A dropped delivery is not recovered after Resume. The GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
+**The webhook is a configurable action.** It is named `webhook-triage` (formerly `webhook-fast-path`), and the `queue_fix_issues` toggle on the `Webhook` settings decides only whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) gets `AI Agent = Queued`. It defaults to `false` (opt-in): with `queue_fix_issues` off, a failure still creates an issue but with no `AI Agent` write, so no fixup PR is queued and the failure stays reported on the original PR for its author to fix in place (a `human_action` failure is unaffected either way); with it on, the corrective-fixup behavior above applies. This toggle never decides whether an issue is created, and is independent of the Issue minting `detect_fixable.enabled` switch, which decides whether the deterministic detectors run. Which branches are triaged at all is `triage_branches` (see "Branch scope" below). The `webhook-triage` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/triage/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. A dropped delivery is not recovered after Resume. The GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
 
 A minted issue is routed to a YouTrack project in this order: an explicit `repo_project_map` override, then
 the project whose **enabled VCS integration** claims the failing repo, then `fallback_project`. The VCS lookup is the
@@ -162,8 +161,8 @@ wrong destination is diagnosable.
 
 The webhook sources and the mint routing are edited on the **Settings** page (the `Webhook sources` and `Issue minting`
 sections, formerly `[webhook]` and `[mint]` in `config.toml`), or over the API. Adding / editing a source (
-allow-list, rate limit, `secret_ref`, `log_token_ref`, `write_token_ref`) and the webhook `auto_fix` toggle
-take effect live, as do `agent_pr_fix_attempts` (default 3) and `agent_pr_fix_attempts_hard_cap` (default 6), applying to the next event; `replay_window_secs`
+allow-list, rate limit, `secret_ref`, `log_token_ref`, `write_token_ref`), the webhook `queue_fix_issues`, `triage_branches` and
+`pr_analysis` settings take effect live, as do `agent_pr_fix_attempts` (default 3) and `agent_pr_fix_attempts_hard_cap` (default 6), applying to the next event; `replay_window_secs`
 applies on restart. A mint edit is honored by the next event.
 
 ### Resolving a CI-failure issue on merge
@@ -268,19 +267,28 @@ enabled (see the migration note above), so a green PR merges within seconds rath
 reconciler tick. Without them, the reconciler is what keeps a PR opened by such an action from sitting at Code Review
 forever; automerge itself does not depend on the webhook.
 
+### Branch scope
+
+A failed run is triaged only when its branch is in `config.webhook.triage_branches`, a map from repo pattern (`owner/repo`,
+`owner/*` or `*`; the most specific wins) to a list of branches, default `{"*": ["main", "develop"]}` (`SPEC-4.4.39` through `SPEC-4.4.46`).
+The check runs after the open-PR lookup. With no open PR, a branch outside the list is acknowledged and dropped before
+any store write, `claude` call or mint, logged at `info` with the repo, run and branch; a branch
+the run log does not reveal fails the run (`error` log, failed run row) and is never dropped. A run on the agent's own
+open PR is routed by who opened it and ignores the list. A repo that no pattern matches triages no branch.
+
 ### Auto-fix for mechanically-fixable failures
 
-Some CI failures are verification-only and have a known, judgement-free fix. The canonical case is `cargo fmt --check`:
-the fix is `cargo fmt --all`. The general case is any failure of a configured checks workflow (default `check.yml`),
-whose steps (fmt, clippy, build, tests) check code rather than produce it. The old triage classified a
-`cargo fmt --check` failure on a push to `main` (no open PR) as `human_action` with a "human must commit the result
-directly to main" analysis. That is backwards: it manufactures manual toil for a mechanical fix.
+Some CI failures have a mechanical signature and a known, judgement-free fix. The canonical case is
+`cargo fmt --check`: the fix is `cargo fmt --all`. The old triage classified such a failure on a push to `main` (no
+open PR) as `human_action` with a "human must commit the result directly to main" analysis. That is backwards: it
+manufactures manual toil for a mechanical fix. A failed workflow with no such signature is never an auto-fix: it goes
+to the analysis pass.
 
-The auto-fix framework (the `auto_fix` block in the `mint` settings) adds a deterministic detector layer that runs
-inside triage AFTER the transient/no-log rules (so a flaky run of a checks workflow stays transient, never auto-fixed)
-but BEFORE the LLM classifier. Two detectors ship: `cargo-fmt` (matches the rustfmt `Diff in ...` signature, fix
-`cargo fmt --all`) and `checks-workflow` (matches `workflow_id` against `checks_workflows`, handing the runner the
-failing step). A match short-circuits to the `auto_fix` triage bucket, which routes exactly like `code_fix` (mint a
+The auto-fix framework (the `detect_fixable` block in the `mint` settings) adds a deterministic detector layer that
+runs inside triage AFTER the transient/no-log rules (so a flaky run stays transient, never auto-fixed) but BEFORE the
+LLM classifier. One detector ships: `cargo-fmt` (matches the rustfmt `Diff in ...` signature, fix `cargo fmt --all`).
+`detect_fixable.enabled = false` runs no detector, so the failure is analyzed and minted as `CI failure:`. A match
+short-circuits to the `auto_fix` triage bucket, which routes exactly like `code_fix` (mint a
 queued issue, `AI Agent=Queued`, no human assignee) and never reaches the classifier prompt that would label it
 `human_action`. The minted issue's summary (`Auto-fix: cargo fmt on <repo> (run #N, <sha>)`) and description name the
 concrete problem, the fix command, and the delivery instruction: commit on a fresh `chore/<kind>-<short-sha>` branch
@@ -376,4 +384,4 @@ pair processes it; the other answers `200` and drops the delivery with an `info`
 is built from payload fields identical across hook targets (run index and outcome, PR number, action and head commit,
 or comment id), never the delivery id. A peer that times out, errors or answers garbage is bypassed: the event is
 processed, a `warn` log names the peer and key, and the Status page counts the bypass per peer for 24 hours. A paused
-instance drops without claiming, so its peer takes the event. `SPEC-3.17` item 7 is the contract.
+instance drops without claiming, so its peer takes the event. `SPEC-3.17.8` is the contract.

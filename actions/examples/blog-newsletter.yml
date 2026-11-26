@@ -305,7 +305,7 @@ limits:
   claude_timeout_seconds: 600
   run_budget_usd: 1.00
 # Due 15 minutes after the last run; a check that finds no new post starts no run and checks again every
-# `regather_interval` (SPEC-2.2).
+# `regather_interval` (SPEC-2.2.1 through SPEC-2.2.2).
 schedule:
   kind: interval
   spec: 15m

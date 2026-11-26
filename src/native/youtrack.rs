@@ -1,4 +1,4 @@
-//! Implements SPEC-3.3 and SPEC-3.3.1. Native YouTrack action handler.
+//! Implements SPEC-3.3.1 through SPEC-3.3.25 and SPEC-3.3.8 through SPEC-3.3.19. Native YouTrack action handler.
 //!
 //! Ports the scripted `actions/youtrack.yml` pipeline to typed Rust on the
 //! dispatch seam ([`super`]) and the provider abstraction
@@ -117,7 +117,7 @@ struct YoutrackJob {
     clone_url: String,
 }
 
-/// SPEC-3.3: the `youtrack` kind's handler.
+/// SPEC-3.3.1 through SPEC-3.3.25: the `youtrack` kind's handler.
 ///
 /// Built-in YouTrack handler. Routed to by [`super::handler_for`].
 pub struct YoutrackHandler;
@@ -128,7 +128,7 @@ impl NativeHandler for YoutrackHandler {
     }
 }
 
-/// SPEC-3.3: drives the whole gather / eligible / pre / claude / finalize
+/// SPEC-3.3.1 through SPEC-3.3.25: drives the whole gather / eligible / pre / claude / finalize
 /// pipeline this section describes.
 ///
 /// Drive a full YouTrack run: caps/budget, gather, then the per-job pipeline,
@@ -434,7 +434,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                     let backend = credentialed_backend(&runner, &guard);
                     (backend, Some(guard))
                 };
-            // SPEC-3.12 item 4: wire the bounded conflict-resolution pass
+            // SPEC-3.12.5: wire the bounded conflict-resolution pass
             // in here, the one place this job's `CliBackend` is
             // constructed, where `ClaudeInvoker`, this job's claude config,
             // its timeout, cancellation and spend ledger are all already in
@@ -614,7 +614,7 @@ fn concurrency_key(fields: &[String], job: &YoutrackJob) -> String {
     }
 }
 
-/// SPEC-3.3: the per-job tracker/forge backend every gather, pre and finalize
+/// SPEC-3.3.1 through SPEC-3.3.25: the per-job tracker/forge backend every gather, pre and finalize
 /// call in this file uses, built from the job's own materialized credentials.
 ///
 /// Build a [`CliBackend`] from `runner`, applying a job's materialized
@@ -658,7 +658,7 @@ const RESTART_REQUEUE_COMMENT: &str =
 /// credential or tracker error) is logged and the row is left to
 /// [`state::reap_orphaned_runs`]'s unconditional delete; the daemon must
 /// finish starting either way.
-/// SPEC-2.2: "reconciles tracker issues stranded in the working state" left
+/// SPEC-2.2.1 through SPEC-2.2.2: "reconciles tracker issues stranded in the working state" left
 /// by a daemon that stopped or died mid-job.
 pub async fn reconcile_restart_inflight(
     pool: &DbPool,
@@ -790,13 +790,13 @@ fn sanitize_key(key: &str) -> String {
 }
 
 /// `run_events` context tag for every correction the stuck-Working sweep
-/// records, so the dashboard can list them as one group (SPEC-3.12 item 2).
+/// records, so the dashboard can list them as one group (SPEC-3.12.3).
 pub(crate) const STUCK_WORKING_SWEEP_CONTEXT: &str = "stuck-working-sweep";
 
 /// Comment posted when the sweep moves an issue off `Working` because no
-/// live run backs it. SPEC-3.12 item 2: "a comment naming the cause and the
+/// live run backs it. SPEC-3.12.3: "a comment naming the cause and the
 /// last recorded step". When the correction lands on `Needs Review` (the key
-/// is at its attempt cap), SPEC-3.12 item 6 also requires the comment to name
+/// is at its attempt cap), SPEC-3.12.7 also requires the comment to name
 /// the one action a human can take; `at_cap` adds the same action line
 /// [`cap_reached_comment`] uses for the pickup-time attempt-cap park, since
 /// this is that same park reached from the sweep instead of pickup. No
@@ -819,7 +819,7 @@ fn stuck_working_comment(last_step: Option<&str>, at_cap: bool) -> String {
     body
 }
 
-/// SPEC-3.12 item 2: the periodic reconcile sweep for a daemon that stays up
+/// SPEC-3.12.3: the periodic reconcile sweep for a daemon that stays up
 /// while a run exits without finalizing (a crash, a kill outside the
 /// runner's own exit paths, or a bug). Unlike [`reconcile_restart_inflight`]
 /// (startup only, driven by leftover `run_inflight_jobs` rows a dead process
@@ -850,7 +850,7 @@ fn stuck_working_comment(last_step: Option<&str>, at_cap: bool) -> String {
 ///
 /// Never aborts on one action's or one key's failure: a tracker read
 /// failure is logged at `error` and that action's issues are left for the
-/// next tick, never treated as "nothing stuck" (SPEC-3.12 item 2); a
+/// next tick, never treated as "nothing stuck" (SPEC-3.12.3); a
 /// credential or write failure for one action or key is logged and the next
 /// one is still tried.
 pub async fn reconcile_stuck_working(
@@ -863,7 +863,7 @@ pub async fn reconcile_stuck_working(
 }
 
 /// [`reconcile_stuck_working`] that also leaves alone an issue a reachable
-/// peer lists in flight (`SPEC-3.17` item 6). `peer_in_flight` maps
+/// peer lists in flight (`SPEC-3.17.7`). `peer_in_flight` maps
 /// `(action, job_key)` to the listing peer's name, from
 /// [`crate::peer::PeerRegistry::live_peer_in_flight`]; empty with no peering.
 pub async fn reconcile_stuck_working_with_peers(
@@ -1191,7 +1191,7 @@ fn forge_access_check(
     })
 }
 
-/// SPEC-3.3: "Gather: query the tracker with `native.youtrack.query` ...
+/// SPEC-3.3.1 through SPEC-3.3.25: "Gather: query the tracker with `native.youtrack.query` ...
 /// resolve each issue's repository from its project's enabled VCS
 /// integration, drop issues with no integration, and drop issues whose
 /// repository the forge token cannot read (they stay queued)."
@@ -1381,7 +1381,7 @@ enum Eligibility {
     Blocked,
 }
 
-/// SPEC-3.3: "Eligibility, checked at gather time and again after winning the
+/// SPEC-3.3.1 through SPEC-3.3.25: "Eligibility, checked at gather time and again after winning the
 /// concurrency gate: the custom field (default `AI Agent`) must still equal
 /// the queued value, and the dependency gate must pass."
 ///
@@ -1462,7 +1462,7 @@ async fn filter_eligible(
     eligible
 }
 
-/// SPEC-3.3: the per-job filter/pre/prompt/claude/finalize pipeline this
+/// SPEC-3.3.1 through SPEC-3.3.25: the per-job filter/pre/prompt/claude/finalize pipeline this
 /// whole section describes.
 ///
 /// Process a single job through filter / pre / prompt / claude / finalize,
@@ -1498,7 +1498,7 @@ async fn process_job(
     let action = &loaded.action;
     let key = &job.key;
     let attempts = state::attempts_get(pool, &action.name, key).await?;
-    // SPEC-3.14 item 1: an attempt that continues a PR whose CI failed (the
+    // SPEC-3.14.2: an attempt that continues a PR whose CI failed (the
     // recorded PR has spent a fix attempt) is the `ci-remediation` stage; any
     // other attempt is `initial`, `retry-2` or `retry-3` by its number. A store
     // read failure is logged and falls back to the numbered stage.
@@ -1553,7 +1553,7 @@ async fn process_job(
 
     let wb_base = workdir::resolve_workdir_base(action.workdir_base.as_deref(), paths);
     let workdir_path = workdir::job_workdir(&wb_base, &action.name, key);
-    // SPEC-3.10 item 2: computed from the job's own clone URL, independent of
+    // SPEC-3.10.3: computed from the job's own clone URL, independent of
     // `run_pre`'s clone outcome, so it is available to both the main
     // invocation and the post-success review session below.
     let cargo_target_dir = cargo_target_dir(paths, &job.clone_url);
@@ -1623,7 +1623,7 @@ async fn process_job(
         }
     }
 
-    // ---- estimate vs session timeout (SPEC-3.12 item 7) ----
+    // ---- estimate vs session timeout (SPEC-3.12.8) ----
     // An issue whose Estimation exceeds the session timeout is not refused and
     // never coded: it runs as a split-only attempt whose one job is to file
     // PR-sized pieces. The children it already has are read first, so the
@@ -1733,7 +1733,7 @@ async fn process_job(
         return Ok(ProcessedJob::Filtered { key: key.clone() });
     }
 
-    // SPEC-3.13: the start notice is the first runner write for this attempt,
+    // SPEC-3.13.1 through SPEC-3.13.5: the start notice is the first runner write for this attempt,
     // posted before the `Working` field write and the clone. A failed post is
     // logged at `error` with the issue key, the run proceeds, and the first
     // progress comment states the notice is missing.
@@ -1768,7 +1768,7 @@ async fn process_job(
             key,
         );
         if let Err(e) = crate::blocking::in_place(|| backend.comment(key, &body)) {
-            error!(action = %action.name, key = %key, error = %e, "SPEC-3.13: posting the start notice failed; the run proceeds");
+            error!(action = %action.name, key = %key, error = %e, "SPEC-3.13.1 through SPEC-3.13.5: posting the start notice failed; the run proceeds");
             crate::run_footer::mark_start_notice_missing(key);
         }
     }
@@ -1782,11 +1782,11 @@ async fn process_job(
     // `yt` field writes plus a full `git clone` of the target repo,
     // all synchronous; keep them off the async worker thread.
     let resume_branch = resume.as_ref().map(|r| r.branch.as_str());
-    // SPEC-3.14: the `clone` runner-owned step, timed by `run_pre` around the
+    // SPEC-3.14.1 through SPEC-3.14.9: the `clone` runner-owned step, timed by `run_pre` around the
     // `clone_repo` call alone (not the field writes before it, which fall into
     // `unaccounted` honestly); the hook install after it is its own step.
     // Runner-owned steps are written when they end, through this
-    // one recorder, so the rows exist when a push comment renders the SPEC-3.15
+    // one recorder, so the rows exist when a push comment renders the SPEC-3.15.1 through SPEC-3.15.8
     // list. Rows an earlier uncounted attempt left under this attempt number
     // are dropped first, and an uncounted attempt drops its own at the end.
     let recorder = tokio::sync::Mutex::new(crate::attempt_steps::StepRecorder::new(
@@ -1813,7 +1813,7 @@ async fn process_job(
         )
     });
 
-    // SPEC-3.14: the `clone` row, written the moment the clone ends.
+    // SPEC-3.14.1 through SPEC-3.14.9: the `clone` row, written the moment the clone ends.
     if let Some((clone_start, clone_end, clone_ok)) = clone_timing {
         recorder
             .lock()
@@ -1830,7 +1830,7 @@ async fn process_job(
             .await;
     }
 
-    // SPEC-3.14 item 3: the `hook_install` row, written the moment the install ends.
+    // SPEC-3.14.4: the `hook_install` row, written the moment the install ends.
     if let Some((hook_start, hook_end, hook_ok)) = hook_timing {
         recorder
             .lock()
@@ -1865,7 +1865,7 @@ async fn process_job(
     // during `claude.invoke`, carved out of the derived coding/check/build steps.
     let mut checkpoint_spans: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
         Vec::new();
-    // SPEC-3.14: the stream-log path plus the `claude.invoke` call's own
+    // SPEC-3.14.1 through SPEC-3.14.9: the stream-log path plus the `claude.invoke` call's own
     // start/end, set only in the claude-ran arm below. `coding`/`check`/
     // `build` steps are derived from this span's stream log once this
     // attempt is known to count.
@@ -1916,7 +1916,7 @@ async fn process_job(
                 false,
             )
         }
-        // SPEC-3.10 item 3: the directory is created (or confirmed writable)
+        // SPEC-3.10.4: the directory is created (or confirmed writable)
         // before the child starts; an unwritable directory fails this
         // attempt (finalize still runs) rather than falling back to a
         // per-workdir `target/`.
@@ -1928,7 +1928,7 @@ async fn process_job(
                 "could not create or write the Cargo target directory {}: {error}",
                 cargo_target_dir.display()
             );
-            warn!(action = %action.name, key = %key, %reason, "cargo target directory unwritable (SPEC-3.10 item 3); claude not started, finalize still runs");
+            warn!(action = %action.name, key = %key, %reason, "cargo target directory unwritable (SPEC-3.10.4); claude not started, finalize still runs");
             (
                 ClaudeResult::synthesized("Cargo target directory unwritable", reason),
                 false,
@@ -1955,7 +1955,7 @@ async fn process_job(
             };
             let stream_log =
                 ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1);
-            // SPEC-3.10 item 9: the run's start log line names the
+            // SPEC-3.10.10: the run's start log line names the
             // `CARGO_TARGET_DIR` the run was given.
             info!(
                 action = %action.name, key = %key, stream_log = %stream_log.display(),
@@ -2002,7 +2002,7 @@ async fn process_job(
                     cancel,
                     // Cap the child at the run's remaining ceiling.
                     Some(spend.remaining_usd()),
-                    // SPEC-3.10 item 3: every child spawned for this repo
+                    // SPEC-3.10.4: every child spawned for this repo
                     // workdir shares the repo's cache.
                     Some(cargo_target_dir.as_path()),
                 );
@@ -2130,8 +2130,8 @@ async fn process_job(
         ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1)
     });
 
-    // ---- SPEC-3.3.2 verification gate, before the post-success review
-    // (SPEC-3.3.2) ----
+    // ---- SPEC-3.3.20 through SPEC-3.3.25 verification gate, before the post-success review
+    // (SPEC-3.3.20 through SPEC-3.3.25) ----
     // Opens the draft PR and runs the gate now, before the review session
     // below, under exactly the condition the review's own `if` repeats, so
     // a failing gate bills no review session. `finalize_with_steps` then
@@ -2156,7 +2156,7 @@ async fn process_job(
     } else {
         None
     };
-    // SPEC-3.3.2: a failing gate bills no review session; a PR-open failure
+    // SPEC-3.3.20 through SPEC-3.3.25: a failing gate bills no review session; a PR-open failure
     // (tracker-key scan hit or push/PR-create error) is unrelated to the
     // gate and still gets the review it always did.
     let gate_failed = matches!(
@@ -2184,11 +2184,11 @@ async fn process_job(
             key,
             attempts + 1,
         );
-        // SPEC-3.12 item 9: the one retry a workdir-modifying review gets
+        // SPEC-3.12.10: the one retry a workdir-modifying review gets
         // logs to its own file, alongside the first attempt's, rather than
         // overwriting it.
         let review_retry_stream_log = ClaudeInvoker::review_retry_sibling(&review_stream_log);
-        // SPEC-3.16 item 2: evidence file paths, named like the stream-log
+        // SPEC-3.16.3: evidence file paths, named like the stream-log
         // retry above, so a retried review's evidence does not overwrite the
         // first attempt's.
         let review_evidence =
@@ -2213,7 +2213,7 @@ async fn process_job(
                 attempts + 1,
             )
         });
-        // SPEC-3.14: the `review` runner-owned step, recorded below once this
+        // SPEC-3.14.1 through SPEC-3.14.9: the `review` runner-owned step, recorded below once this
         // attempt is known to count.
         let review_end = chrono::Utc::now();
         let review_ok = matches!(outcome, ReviewOutcome::Pass(_));
@@ -2249,7 +2249,7 @@ async fn process_job(
             .await;
             state::daily_cost_add(pool, &action.name, result.cost).await?;
         }
-        // SPEC-3.16 items 1 and 2: cap the verdict to 5 bullets and link
+        // SPEC-3.16.2 and SPEC-3.16.3: cap the verdict to 5 bullets and link
         // whichever evidence file is authoritative (the retry's, when a
         // retry ran) before the outcome reaches `finalize` and is posted.
         let evidence_link = ClaudeInvoker::review_evidence_authoritative(
@@ -2278,7 +2278,7 @@ async fn process_job(
     // this issue, whether from a re-queue or a checkpoint push opened one
     // mid-run, so a PR-step failure comment can say truthfully whether a
     // re-queue resumes that PR's branch.
-    // SPEC-3.15 item 6: the steps `finalize`'s comments list: the stored rows
+    // SPEC-3.15.7: the steps `finalize`'s comments list: the stored rows
     // of earlier attempts plus this attempt's steps derived so far (they are
     // written to `attempt_steps` right after `finalize` returns). Handed over
     // through a keyed stash because `finalize` is synchronous with no pool.
@@ -2372,7 +2372,7 @@ async fn process_job(
         );
     };
     // Computed unconditionally, mirroring `stream_log` above, so
-    // finalize always has somewhere to write the SPEC-3.3.2 gate's output if
+    // finalize always has somewhere to write the SPEC-3.3.20 through SPEC-3.3.25 gate's output if
     // it fails.
     let gate_output_path =
         ClaudeInvoker::gate_output_path(&paths.logs_dir(), &action.name, key, attempts + 1);
@@ -2509,22 +2509,22 @@ async fn process_job(
                 },
             )
             .await;
-            // SPEC-3.3.1: a resumed run that finishes
+            // SPEC-3.3.8 through SPEC-3.3.19: a resumed run that finishes
             // successfully clears a prior run's `failed` flag on this same
             // PR, the only way the flag is ever cleared.
             clear_failed_at_resume(pool, &action.name, job, resume.id).await;
         }
     }
     // The run reported success and the PR was promoted to ready;
-    // mark the row finished so the reconciler and the Action-Run webhook
-    // decision path stop re-syncing it, fresh or resumed alike, whether or
+    // mark the row ready so the reconciler and the Action-Run webhook
+    // decision path record that, fresh or resumed alike, whether or
     // not finalize also merged it in the same tick below.
     if let Ok(Finalized::CodeReview {
         pr_number: Some(pr_number),
         ..
     }) = &finalize_res
     {
-        mark_finished_at_finalize(pool, job, *pr_number).await;
+        mark_ready_at_finalize(pool, job, *pr_number).await;
     }
     // A PR `finalize` merged in the same tick is recorded as
     // merged right here, after the row above exists, so neither the webhook
@@ -2538,7 +2538,7 @@ async fn process_job(
     {
         mark_merged_at_finalize(pool, job, *pr_number).await;
     }
-    // SPEC-3.3.1: every `Failed` outcome (the `requeued: true`
+    // SPEC-3.3.8 through SPEC-3.3.19: every `Failed` outcome (the `requeued: true`
     // push/PR-create arm reads as `Queued (push)`, not `Failed`; see
     // `Finalized::as_str`) whose issue has a recorded PR sets that row's
     // `failed` flag, blocking automerge until a later run for the issue
@@ -2615,7 +2615,7 @@ async fn process_job(
         state::daily_count_increment(pool, &action.name).await?;
     }
 
-    // SPEC-3.14: record the rest of this attempt's steps (the claude
+    // SPEC-3.14.1 through SPEC-3.14.9: record the rest of this attempt's steps (the claude
     // invocation's derived coding/check/build steps and the verification
     // gates; the clone, checkpoint and review rows were written when each
     // ended; the push, pr_create and gate rows likewise),
@@ -2628,7 +2628,7 @@ async fn process_job(
         if let Some((log_path, invoke_start, invoke_end)) = claude_span.as_ref() {
             match crate::attempt_steps::derive_claude_steps(log_path, *invoke_start, *invoke_end) {
                 Ok(steps) => {
-                    // SPEC-3.14 item 3: the Postgres steps `test-postgres` timed
+                    // SPEC-3.14.4: the Postgres steps `test-postgres` timed
                     // itself, carved out of the derived steps.
                     let (pg_steps, holes) =
                         child_postgres_steps(log_path, &checkpoint_spans, &action.name, key);
@@ -2786,7 +2786,7 @@ async fn ci_cap_reached(
 /// live confirmation (the record might be stale; a false resume is worse than
 /// a redundant PR, so this errs toward a fresh pickup exactly like the rest of
 /// this pipeline's read-then-degrade checks).
-/// SPEC-3.3.1: "The branch name is deterministic per issue, so a requeued
+/// SPEC-3.3.8 through SPEC-3.3.19: "The branch name is deterministic per issue, so a requeued
 /// issue continues the same branch."
 async fn resolve_pr_resume(
     pool: &DbPool,
@@ -2989,24 +2989,23 @@ async fn mark_merged_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: u6
 }
 
 /// Set the `agent_pull_requests` row for a PR `finalize` just
-/// reported `Finalized::CodeReview` for as `finished`: the run succeeded and
-/// the PR was promoted to ready, so there is nothing left for the agent to
-/// do here. Looked up by `(host, repo, pr_number)`, covering a fresh PR
+/// reported `Finalized::CodeReview` for as `ready`: the run succeeded and
+/// the PR was promoted to ready. Looked up by `(host, repo, pr_number)`, covering a fresh PR
 /// (recorded moments ago by [`record_new_pr`]) and a resumed one alike, the
 /// same way [`mark_merged_at_finalize`] does. Once set, the automerge
 /// reconciler and the Action-Run webhook decision path
-/// (`apply_automerge_decision`) stop touching the row: no more behind-base
-/// branch updates, no more status comments. A lookup or write failure is
+/// (`apply_automerge_decision`) evaluate the PR for merge the same as any
+/// other open row. A lookup or write failure is
 /// logged at `error` and otherwise ignored: the PR itself is already
 /// promoted and the row simply stays eligible for reconciliation, which is
 /// the safe direction (noisy, not silent).
-async fn mark_finished_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: u64) {
+async fn mark_ready_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: u64) {
     use crate::ci_failure::store;
     let host = host_only(&job.repo_host);
     let row = match store::agent_pr(pool, &host, &job.repo_path, pr_number as i64).await {
         Ok(Some(row)) => row,
         Ok(None) => {
-            tracing::error!(key = %job.key, pr = pr_number, "PR promoted to ready at finalize, but no agent_pull_requests row exists to mark finished");
+            tracing::error!(key = %job.key, pr = pr_number, "PR promoted to ready at finalize, but no agent_pull_requests row exists to mark ready");
             return;
         }
         Err(e) => {
@@ -3014,12 +3013,12 @@ async fn mark_finished_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: 
             return;
         }
     };
-    if let Err(e) = store::mark_finished(pool, row.id, &state::now_iso()).await {
-        tracing::error!(key = %job.key, pr = pr_number, error = %e, "PR promoted to ready at finalize, but marking its agent_pull_requests row finished failed");
+    if let Err(e) = store::mark_ready(pool, row.id, &state::now_iso()).await {
+        tracing::error!(key = %job.key, pr = pr_number, error = %e, "PR promoted to ready at finalize, but marking its agent_pull_requests row ready failed");
     }
 }
 
-/// SPEC-3.3.1: set the `failed` flag on the `agent_pull_requests`
+/// SPEC-3.3.8 through SPEC-3.3.19: set the `failed` flag on the `agent_pull_requests`
 /// row for a `Finalized::Failed { requeued: false, .. }` outcome, so automerge
 /// takes no action on the PR until a later run for the issue ends in Code
 /// Review. A resumed job's PR is already recorded; `resume` is consulted
@@ -3028,7 +3027,7 @@ async fn mark_finished_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: 
 /// [`record_new_pr`] does, since only the gate-failure arm of `Failed` ever
 /// carries one (every other arm opens no PR of its own, and `pr_number` is
 /// `None`, so there is nothing to mark). A lookup or write failure is logged
-/// at `error` and otherwise ignored, the same as [`mark_finished_at_finalize`].
+/// at `error` and otherwise ignored, the same as [`mark_ready_at_finalize`].
 async fn mark_failed_at_finalize(
     pool: &DbPool,
     action_name: &str,
@@ -3082,7 +3081,7 @@ async fn mark_failed_at_finalize(
     }
 }
 
-/// SPEC-3.3.1: the only way a PR's `failed` flag is ever
+/// SPEC-3.3.8 through SPEC-3.3.19: the only way a PR's `failed` flag is ever
 /// cleared, a resumed run that finishes in Code Review.
 async fn clear_failed_at_resume(pool: &DbPool, action_name: &str, job: &YoutrackJob, pr_id: i64) {
     use crate::ci_failure::store;
@@ -3145,7 +3144,7 @@ struct CheckpointOutcome {
 /// rejected non-fast-forward), logs at `error`, records the reason, and stops
 /// ticking for the rest of the run; keeps waiting on `stop_rx` so the thread
 /// still exits promptly when `claude` finishes.
-/// SPEC-3.3.1: "the checkpoint push (every 60 seconds while `claude` runs) is
+/// SPEC-3.3.8 through SPEC-3.3.19: "the checkpoint push (every 60 seconds while `claude` runs) is
 /// the backstop if the runner dies first." Runs off a plain OS thread, not a
 /// tokio task (`docs/conventions/claude-runtime.md#checkpoint-push-watcher-runs-off-a-plain-os-thread-not-a-tokio-task`).
 #[allow(clippy::too_many_arguments)]
@@ -3207,7 +3206,7 @@ fn run_checkpoint_watcher(
                 };
             }
         }
-        // SPEC-3.15 item 6, SPEC-8.8: stash the stored rows of this
+        // SPEC-3.15.7, SPEC-8.8.1 through SPEC-8.8.2: stash the stored rows of this
         // job just before the push, so the push comment lists every step that
         // ended before it and marks its own `Checkpoint N` line.
         crate::progress_list::stash_context(
@@ -3230,7 +3229,7 @@ fn run_checkpoint_watcher(
         crate::progress_list::clear_context(&job.key);
         match pushed {
             Ok(Some(pr)) => {
-                // SPEC-3.14: the `checkpoint` row, written the
+                // SPEC-3.14.1 through SPEC-3.14.9: the `checkpoint` row, written the
                 // moment the push ends, so the next checkpoint's comment lists it.
                 let push_end = chrono::Utc::now();
                 pool_handle.block_on(async {
@@ -3378,7 +3377,7 @@ fn blocked_comment(blockers: &[Blocker]) -> String {
     s
 }
 
-/// SPEC-3.3: "The dependency gate blocks on open issues linked by the
+/// SPEC-3.3.1 through SPEC-3.3.25: "The dependency gate blocks on open issues linked by the
 /// configured verbs (defaults: `depends on`, `parent for`), leaves the issue
 /// queued, comments the blockers once, and re-evaluates after
 /// `recheck_timeout`."
@@ -3516,7 +3515,7 @@ fn log_held(action: &str, key: &str, signature: &str, blocked_since_ms: i64, now
 
 type TimeSpan = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>);
 
-/// SPEC-3.14 item 3: the `postgres_start` / `postgres_healthy` steps the
+/// SPEC-3.14.4: the `postgres_start` / `postgres_healthy` steps the
 /// `test-postgres` processes of one `claude` invocation reported through its
 /// span file, trimmed so no instant is counted twice, plus the holes to carve
 /// out of the derived steps (the checkpoint spans and these steps). An
@@ -3541,7 +3540,7 @@ fn child_postgres_steps(
     (steps, holes)
 }
 
-/// SPEC-3.3: "Pre: set the field to working and `State` to the in-progress
+/// SPEC-3.3.1 through SPEC-3.3.25: "Pre: set the field to working and `State` to the in-progress
 /// value, optionally set `Assignee`, then `git clone --depth 50` and install
 /// the repo's own git hooks."
 ///
@@ -3559,7 +3558,7 @@ fn run_pre(
     // default-branch clone this always used to be.
     resume_branch: Option<&str>,
     action_name: &str,
-    // SPEC-3.14: filled with the `clone_repo` call's own start/end/ok,
+    // SPEC-3.14.1 through SPEC-3.14.9: filled with the `clone_repo` call's own start/end/ok,
     // timed around that call alone so the `clone` step never blends in the
     // field writes above it (left to fall into `unaccounted` honestly) or the
     // hook install below it (its own step, `hook_timing`). Left `None` when a
@@ -3569,7 +3568,7 @@ fn run_pre(
         chrono::DateTime<chrono::Utc>,
         bool,
     )>,
-    // SPEC-3.14: the `hook_install` step, set only when `just install-hooks`
+    // SPEC-3.14.1 through SPEC-3.14.9: the `hook_install` step, set only when `just install-hooks`
     // actually ran (no recipe, no `just`, or `install_hooks: false` is no step).
     hook_timing: &mut Option<(
         chrono::DateTime<chrono::Utc>,
@@ -3611,7 +3610,7 @@ fn run_pre(
     Ok(())
 }
 
-/// SPEC-3.3: "install the repo's own git hooks (`just install-hooks`, when
+/// SPEC-3.3.1 through SPEC-3.3.25: "install the repo's own git hooks (`just install-hooks`, when
 /// the clone has that recipe) ... best-effort: a repo with no
 /// `install-hooks` recipe, or a host without `just`, is left unchanged and
 /// pickup continues."
@@ -3630,7 +3629,7 @@ fn run_pre(
 ///
 /// Returns `Some(ok)` when `just install-hooks` was run (`ok` is its success)
 /// and `None` when there was nothing to run, so the caller times only a real
-/// install (SPEC-3.14 item 3).
+/// install (SPEC-3.14.4).
 fn install_hooks(workdir: &Path) -> Option<bool> {
     // `just --show <recipe>` exits non-zero when the recipe (or the justfile
     // itself) is absent, so it doubles as the presence probe with no output
@@ -3676,7 +3675,7 @@ fn install_hooks(workdir: &Path) -> Option<bool> {
     }
 }
 
-/// SPEC-3.3.2: whether a gate's failure text is the command's own
+/// SPEC-3.3.20 through SPEC-3.3.25: whether a gate's failure text is the command's own
 /// captured output, or a cause naming why the command could not even start.
 /// The two are rendered differently in a comment: `Output` is never posted
 /// (it is stored with the run instead; a reader does not need
@@ -3698,7 +3697,7 @@ enum GateFailure {
     Cause(String),
 }
 
-/// SPEC-3.3.2: what the runner's own re-run of the repository's pre-push
+/// SPEC-3.3.20 through SPEC-3.3.25: what the runner's own re-run of the repository's pre-push
 /// checks found, before any success outcome is recorded. `command` is the
 /// recipe the runner actually invoked (`"pre-push"` or `"check"`), or
 /// `None` when the clone has neither and the gate ran nothing. `failure`
@@ -3709,13 +3708,13 @@ enum GateFailure {
 struct GateResult {
     command: Option<&'static str>,
     failure: Option<GateFailure>,
-    /// SPEC-3.14: when the recipe ran, its timing and timed stage spans, for
+    /// SPEC-3.14.1 through SPEC-3.14.9: when the recipe ran, its timing and timed stage spans, for
     /// the caller to hand to the step sink.
     timing: Option<crate::attempt_steps::GateTiming>,
 }
 
 /// Run `just <recipe>` in `workdir`, stamping each stdout line with its
-/// arrival time so the recipe's stage banners can be timed (SPEC-3.14 item 5).
+/// arrival time so the recipe's stage banners can be timed (SPEC-3.14.6).
 /// Returns the exit status, the full stdout and stderr, and the timed stdout
 /// lines. A reader thread that fails is an error, never a silently short log.
 fn run_recipe_timed(
@@ -3770,7 +3769,7 @@ fn run_recipe_timed(
     Ok((status, out_text, err_text, timed))
 }
 
-/// SPEC-3.3.2 "Verification gate": re-run the repository's own pre-push
+/// SPEC-3.3.20 through SPEC-3.3.25 "Verification gate": re-run the repository's own pre-push
 /// entrypoint in the clone before the runner records an attempt as
 /// successful, rather than trusting the agent's own report that checks
 /// passed (the gap that let two runs report passing checks while the
@@ -3828,7 +3827,7 @@ fn run_verification_gate(workdir: &Path) -> GateResult {
     }
 }
 
-/// SPEC-3.3.2 item 3: whether `command` also failed on the base branch tip,
+/// SPEC-3.3.22: whether `command` also failed on the base branch tip,
 /// so a failure this attempt introduced can be told apart from one the base
 /// branch already carries.
 enum BaseGateResult {
@@ -3846,7 +3845,7 @@ struct BaseGateCheck {
     output: Option<(String, String)>,
 }
 
-/// SPEC-3.3.2 item 3: re-run `command` once more against the base branch
+/// SPEC-3.3.22: re-run `command` once more against the base branch
 /// tip, in a separate `git worktree` off this same clone (so the base
 /// branch's own history is used, never this attempt's branch), to tell a
 /// failure this attempt introduced apart from one the base branch already
@@ -3972,7 +3971,7 @@ fn run_gate_on_base_branch(workdir: &Path, command: &str) -> BaseGateCheck {
     }
 }
 
-/// SPEC-3.3.2 item 3, SPEC-3.16 item 3: exactly one of these three sentences,
+/// SPEC-3.3.22, SPEC-3.16.4: exactly one of these three sentences,
 /// folded onto the same line as [`gate_failure_comment`]'s own cause.
 fn base_gate_comment_note(check: &BaseGateCheck) -> String {
     match &check.result {
@@ -4043,7 +4042,7 @@ fn cap_gate_output(text: String) -> String {
 /// escape-stripped and capped (see [`full_gate_output`], [`cap_gate_output`]),
 /// creating the `streams/` parent directory first since nothing earlier in
 /// this attempt necessarily did.
-/// SPEC-3.3.2 item 3: `base`, when given, is the base branch's own
+/// SPEC-3.3.22: `base`, when given, is the base branch's own
 /// comparison run's name and stdout/stderr (only present for
 /// [`BaseGateResult::Fails`]/[`BaseGateResult::Passes`]); it is appended
 /// after a section header naming the base branch, in the same file, capped
@@ -4116,16 +4115,16 @@ fn store_gate_output_and_note(
         match write_gate_output(gate_output_path, stdout, stderr, base) {
             Ok(()) => {
                 let link = gate_output_link_text(public_url, run_id, key, attempt);
-                info!(key = %key, command, gate_output = %gate_output_path.display(), "SPEC-3.3.2 verification gate failed; full output stored");
+                info!(key = %key, command, gate_output = %gate_output_path.display(), "SPEC-3.3.20 through SPEC-3.3.25 verification gate failed; full output stored");
                 record_gate_event(&format!(
-                    "SPEC-3.3.2 verification gate failed (`just {command}`); full output: {link}"
+                    "SPEC-3.3.20 through SPEC-3.3.25 verification gate failed (`just {command}`); full output: {link}"
                 ));
                 format!("the full output is at {link}")
             }
             Err(e) => {
-                error!(key = %key, command, gate_output = %gate_output_path.display(), error = %e, "storing the SPEC-3.3.2 gate output failed");
+                error!(key = %key, command, gate_output = %gate_output_path.display(), error = %e, "storing the SPEC-3.3.20 through SPEC-3.3.25 gate output failed");
                 record_gate_event(&format!(
-                "SPEC-3.3.2 verification gate failed (`just {command}`); storing its output failed: {e}"
+                "SPEC-3.3.20 through SPEC-3.3.25 verification gate failed (`just {command}`); storing its output failed: {e}"
             ));
                 format!("storing it failed: {e}")
             }
@@ -4176,7 +4175,7 @@ fn clone_repo(clone_url: &str, workdir: &Path, branch: Option<&str>) -> Result<(
     provider::shallow_clone(clone_url, branch, workdir, 50)
 }
 
-/// Derive `<repo-slug>` from a clone URL's path (`SPEC-3.10` item 2):
+/// Derive `<repo-slug>` from a clone URL's path (`SPEC-3.10.3`):
 /// `<owner>__<repo>`, lowercased, with every character outside
 /// `[a-z0-9._-]` replaced by `_`. The owner segment keeps two repos with the
 /// same name under different owners from colliding.
@@ -4210,8 +4209,8 @@ pub(crate) fn repo_slug(clone_url: &str) -> String {
         .collect()
 }
 
-/// `<data dir>/cache/cargo-target/<repo-slug>` (`SPEC-3.10` item 2): outside
-/// `workdirs/`, so workdir GC (`SPEC-3.8`) never reaches it.
+/// `<data dir>/cache/cargo-target/<repo-slug>` (`SPEC-3.10.3`): outside
+/// `workdirs/`, so workdir GC (`SPEC-3.8.1` through `SPEC-3.8.21`) never reaches it.
 pub(crate) fn cargo_target_dir(paths: &Paths, clone_url: &str) -> PathBuf {
     paths
         .data_dir
@@ -4221,7 +4220,7 @@ pub(crate) fn cargo_target_dir(paths: &Paths, clone_url: &str) -> PathBuf {
 }
 
 /// Create the repo's shared Cargo target directory if needed and confirm it
-/// is writable (`SPEC-3.10` item 3): the runner never falls back to a
+/// is writable (`SPEC-3.10.4`): the runner never falls back to a
 /// per-workdir `target/`, so a directory that cannot be created or written
 /// must fail the attempt instead of silently degrading. `create_dir_all`
 /// alone would not catch an existing, unwritable directory, so this also
@@ -4233,10 +4232,10 @@ pub(crate) fn ensure_cargo_target_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::remove_file(&probe)
 }
 
-/// SPEC-3.3: "Claude works in the local clone ... The agent may create
+/// SPEC-3.3.1 through SPEC-3.3.25: "Claude works in the local clone ... The agent may create
 /// issues in `write_projects` (default: the triggering issue's project),
 /// linked `relates to` / `depends on` / `is required for`, never as a
-/// subtask." SPEC-3.3.1: "Prompt: `prompt` overrides; otherwise
+/// subtask." SPEC-3.3.8 through SPEC-3.3.19: "Prompt: `prompt` overrides; otherwise
 /// `prompt_preset` is `default` or `audit`"; this is the `default` preset.
 ///
 /// The built-in YouTrack agent prompt as a placeholder template.
@@ -4292,7 +4291,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
         "3. If {{existing_branch}} is empty, create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, ALSO read that PR's own comments (a prior timed-out run may have left one explaining what it salvaged and why, e.g. a draft PR opened from uncommitted work at kill time, or a separate fresh-context review session may have left one listing findings that kept the PR a draft), then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
         "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit whose body ends with the bare '#{{key}}' reference, so a kill leaves committed progress instead of none; the final commit still carries the full PR-description format from step 7 and stays the branch tip. The runner pushes your commits as WIP checkpoints automatically every 60 seconds while you work, from whatever feature branch is checked out, and opens a draft PR from the first one - this is not something you do, and a checkpoint landing is not a stopping point or a reason to wrap up early; keep working exactly as step 1 describes until you are done, blocked, or killed. Because of those checkpoint pushes, a commit on this branch may already be on the remote before you notice a mistake in it: never run 'git reset', 'git commit --amend', 'git rebase', 'git filter-branch', or any force push on this branch to fix it - any of those rewrites history the runner has already published and orphans the checkpoint. Fix a mistake, including a wrong commit message, with a new commit on top instead.",
-        "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (the repo's 'just pre-push' recipe when it exists, else 'just check', else the repo's documented checks) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off. The runner itself re-runs the repository's own pre-push entrypoint (`just pre-push`, else `just check`) in the clone after this attempt finishes and before recording it as successful (SPEC-3.3.2): it does not trust this report, so a report that checks passed must name the exact command you ran, and a failing check still needs fixing here rather than left for the gate to catch.",
+        "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (the repo's 'just pre-push' recipe when it exists, else 'just check', else the repo's documented checks) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off. The runner itself re-runs the repository's own pre-push entrypoint (`just pre-push`, else `just check`) in the clone after this attempt finishes and before recording it as successful (SPEC-3.3.20 through SPEC-3.3.25): it does not trust this report, so a report that checks passed must name the exact command you ran, and a failing check still needs fixing here rather than left for the gate to catch.",
         "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
         "7. The runner uses this commit's SUBJECT as the PR title and its body as the PR description (if you make more than one commit, the LAST commit carries both, since the runner reads only the branch tip). The subject is a SEPARATE line from the body, not the body's first heading: write one short imperative line (about 72 characters or fewer, no leading '#', not a Markdown heading like '## Summary') that names the change itself, e.g. 'Fix the off-by-one in the retry budget'; confirm it with 'git log -1 --format=%s' before you stop - if that prints a Markdown heading, a bare issue reference, or anything else that is not a one-line summary of the change, the commit is wrong and the runner will refuse to open the PR from it. The body (what 'git log -1 --format=%b' prints) is the PR description; it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the bare issue reference alone, '#<KEY>-N' on its own line with nothing before or after it on that line and no line after it; a 'Co-Authored-By:' trailer, when you add one, goes BELOW it as its own block, separated from the reference by one blank line, and never on the line directly above the reference or inside the reference block. If the commit owns more than one issue, put each '#<KEY>-N' on its own line in the one reference block, with the single attribution trailer below that block after a blank line. The reference is always bare; no linking word of any kind precedes it, in any case, anywhere in the body. NO 'State ...' command after the reference. Example of the tail:",
         "     ## Verification",
@@ -4371,7 +4370,7 @@ pub(crate) fn default_youtrack_prompt_tracker_free() -> String {
         "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
         "3. If {{existing_branch}} is empty, create a feature branch off the default branch, named only for the change itself (e.g. 'fix/redact-log-output', 'feat/add-export-button', 'chore/bump-deps') - never include {{key}} or any other tracker key in the branch name, per the ban above. If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, ALSO read that PR's own comments (a prior timed-out run may have left one explaining what it salvaged and why, e.g. a draft PR opened from uncommitted work at kill time, or a separate fresh-context review session may have left one listing findings that kept the PR a draft), then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
         "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit with a plain commit message describing only the change itself - no bare issue reference, no tracker key, no internal hostname, local path, person's name, or realistic-looking secret anywhere in the subject or body, per the ban above. The final commit still carries the full PR-description format from step 7 and stays the branch tip. The runner pushes your commits as WIP checkpoints automatically every 60 seconds while you work, from whatever feature branch is checked out, and opens a draft PR from the first one that passes its tracker-key scan - this is not something you do, and a checkpoint landing is not a stopping point or a reason to wrap up early; keep working exactly as step 1 describes until you are done, blocked, or killed. Because of those checkpoint pushes, a commit on this branch may already be on the remote before you notice a mistake in it: never run 'git reset', 'git commit --amend', 'git rebase', 'git filter-branch', or any force push on this branch to fix it - any of those rewrites history the runner has already published and orphans the checkpoint. Fix a mistake, including a wrong commit message, with a new commit on top instead.",
-        "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (the repo's 'just pre-push' recipe when it exists, else 'just check', else the repo's documented checks) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off. The runner itself re-runs the repository's own pre-push entrypoint (`just pre-push`, else `just check`) in the clone after this attempt finishes and before recording it as successful (SPEC-3.3.2): it does not trust this report, so a report that checks passed must name the exact command you ran, and a failing check still needs fixing here rather than left for the gate to catch.",
+        "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (the repo's 'just pre-push' recipe when it exists, else 'just check', else the repo's documented checks) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off. The runner itself re-runs the repository's own pre-push entrypoint (`just pre-push`, else `just check`) in the clone after this attempt finishes and before recording it as successful (SPEC-3.3.20 through SPEC-3.3.25): it does not trust this report, so a report that checks passed must name the exact command you ran, and a failing check still needs fixing here rather than left for the gate to catch.",
         "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
         "7. The runner uses this commit's SUBJECT as the PR title and its body as the PR description (if you make more than one commit, the LAST commit carries both, since the runner reads only the branch tip). The subject is a SEPARATE line from the body, not the body's first heading: write one short imperative line (about 72 characters or fewer, no leading '#', not a Markdown heading like '## Summary') that names the change itself, e.g. 'Fix the off-by-one in the retry budget'; confirm it with 'git log -1 --format=%s' before you stop - if that prints a Markdown heading, a bare issue reference, or anything else that is not a one-line summary of the change, the commit is wrong and the runner will refuse to open the PR from it. The body (what 'git log -1 --format=%b' prints) is the PR description; it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) Nothing after the last section: unlike a repo where the key may appear, this body ends with the '## Verification' (or last non-empty) section and carries NO bare issue reference, no '#<KEY>-N' anywhere, and no linking word toward {{key}} or any other tracker key, anywhere in the subject or body - the runner links {{key}} to this PR itself, through its own YouTrack comment, not through repo text. A 'Co-Authored-By:' trailer, when you add one, is the only thing allowed after the last section, as its own block separated by one blank line. Example of the tail:",
         "     ## Verification",
@@ -4401,7 +4400,7 @@ pub(crate) fn default_youtrack_prompt_tracker_free() -> String {
     .join("\n")
 }
 
-/// SPEC-3.3.1: "`prompt_preset` is `default` or `audit`."
+/// SPEC-3.3.8 through SPEC-3.3.19: "`prompt_preset` is `default` or `audit`."
 pub(crate) fn preset_prompt(p: PromptPreset) -> String {
     match p {
         PromptPreset::Default => default_youtrack_prompt(),
@@ -4409,7 +4408,7 @@ pub(crate) fn preset_prompt(p: PromptPreset) -> String {
     }
 }
 
-/// SPEC-3.3.1: "Prompt: `prompt` overrides; otherwise `prompt_preset` is
+/// SPEC-3.3.8 through SPEC-3.3.19: "Prompt: `prompt` overrides; otherwise `prompt_preset` is
 /// `default` or `audit`."
 pub(crate) fn prompt_template(src: &YoutrackSource) -> String {
     match &src.prompt {
@@ -4601,7 +4600,7 @@ fn review_prompt_template(preset: PromptPreset) -> String {
 
 /// Build the review session's instruction text for `job`, substituting the
 /// same `{{...}}` placeholders [`build_prompt`] uses, plus `evidence_path`
-/// (SPEC-3.16 item 2) as `{{review_evidence_file}}`.
+/// (SPEC-3.16.3) as `{{review_evidence_file}}`.
 fn build_review_prompt(
     preset: PromptPreset,
     job: &YoutrackJob,
@@ -4669,7 +4668,7 @@ fn git_head_sha(workdir: &Path) -> Option<String> {
 /// overridden to a read-only set regardless of the action's own
 /// configuration, so the review can never itself change the work it is
 /// judging.
-/// SPEC-3.3: "a fresh read-only review session runs, and a pass marker
+/// SPEC-3.3.1 through SPEC-3.3.25: "a fresh read-only review session runs, and a pass marker
 /// `.claude-run-review-pass` promotes the PR to ready and sets the field to
 /// code-review. A fail marker `.claude-run-review-fail` or no verdict keeps
 /// the PR draft."
@@ -4683,13 +4682,13 @@ fn run_review_session(
     workdir: &Path,
     timeout: Duration,
     stream_log: &Path,
-    // SPEC-3.16 item 2: where the review session writes its full sweep
+    // SPEC-3.16.3: where the review session writes its full sweep
     // (invariant, search pattern, classified table), kept out of the capped
     // verdict marker and linked from the posted comment instead.
     evidence_path: &Path,
     cancel: &CancellationToken,
     budget_usd: Option<f64>,
-    // SPEC-3.10 item 3: the review session is a `claude` child spawned for
+    // SPEC-3.10.4: the review session is a `claude` child spawned for
     // this same repo workdir, so it shares the repo's cache too.
     cargo_target_dir: Option<&Path>,
     // The job's attempt number, carried only for the denied-tool-call warn
@@ -4785,7 +4784,7 @@ fn run_review_session(
         )),
     };
     // Strip the marker files from the workdir now the outcome is
-    // captured. Leaving them in place poisoned the SPEC-3.3.2 push gate in
+    // captured. Leaving them in place poisoned the SPEC-3.3.20 through SPEC-3.3.25 push gate in
     // consumers that scan the whole tree (storefront's em-dash guard caught
     // the agent's own narrative notes). `discard_review_changes` still has
     // its PASS/FAIL skips for defense in depth on the retry path.
@@ -4869,7 +4868,7 @@ fn sanitize_marker_content(raw: &str) -> String {
     raw.replace('\u{2014}', "-").trim().to_string()
 }
 
-/// SPEC-3.12 item 4: the instruction for the bounded conflict-resolution
+/// SPEC-3.12.5: the instruction for the bounded conflict-resolution
 /// pass, modeled on `CONFLICT_RESOLVE_INSTRUCTION`
 /// (`src/web/comment_webhooks.rs`) but for the opposite merge direction:
 /// here the local branch's own work is merging in a newer copy of itself
@@ -4882,7 +4881,7 @@ const FINAL_PUSH_CONFLICT_RESOLVE_INSTRUCTION: &str =
      the project's build and test gate once afterward and fix only what the merge broke. If a \
      conflict cannot be resolved safely, leave it unresolved and say which files in your summary.";
 
-/// SPEC-3.12 item 4: the bounded, one-shot conflict-resolution pass run in
+/// SPEC-3.12.5: the bounded, one-shot conflict-resolution pass run in
 /// the same clone when the final push finds the remote branch diverged and
 /// the local merge of it conflicts. Implements [`ConflictResolver`], the
 /// provider-layer seam `CliBackend::merge_remote_branch` calls through, so
@@ -4918,7 +4917,7 @@ impl ConflictResolver for FinalPushConflictResolver {
             branch = %branch,
             local_sha = %local_sha,
             remote_sha = %remote_sha,
-            "running the bounded conflict-resolution pass (SPEC-3.12 item 4)"
+            "running the bounded conflict-resolution pass (SPEC-3.12.5)"
         );
         let pass_start = chrono::Utc::now();
         let invoked = self.claude.invoke(
@@ -4934,8 +4933,8 @@ impl ConflictResolver for FinalPushConflictResolver {
             // that losing that cache here is not worth threading it through.
             None,
         );
-        // SPEC-3.14 item 3: the `conflict_resolution` step is the `claude` pass
-        // itself; an invoke error or a timeout closes it `ok = false` (item 6).
+        // SPEC-3.14.4: the `conflict_resolution` step is the `claude` pass
+        // itself; an invoke error or a timeout closes it `ok = false` (SPEC-3.14.7).
         // The gate below is its own `gate` step.
         crate::attempt_steps::stash_step_spans(
             &self.key,
@@ -4950,7 +4949,7 @@ impl ConflictResolver for FinalPushConflictResolver {
         );
         let result = invoked?;
         self.spend.record(&result);
-        // SPEC-3.12 item 4: this pass is a `claude` invocation like any
+        // SPEC-3.12.5: this pass is a `claude` invocation like any
         // other, so it leaves a `claude_invocations` row the same way the
         // job's main attempt and review session do.
         tokio::runtime::Handle::current().block_on(crate::usage::record_invocation(
@@ -4971,7 +4970,7 @@ impl ConflictResolver for FinalPushConflictResolver {
                 "the conflict-resolution pass did not conclude successfully"
             )));
         }
-        // SPEC-3.3.2: re-run the repository's own pre-push gate in the
+        // SPEC-3.3.20 through SPEC-3.3.25: re-run the repository's own pre-push gate in the
         // clone, exactly as the normal (non-conflict) path does after its
         // push, rather than trusting the agent's own report; here it runs
         // before the push because a merge resolution that breaks the build
@@ -4995,13 +4994,13 @@ impl ConflictResolver for FinalPushConflictResolver {
                     code,
                 } => {
                     let output = provider::append_stdout_tail(&stderr, &stdout, &[]);
-                    error!(key = %self.key, command, code = ?code, output = %output, "conflict-resolution merge commit failed the SPEC-3.3.2 gate");
+                    error!(key = %self.key, command, code = ?code, output = %output, "conflict-resolution merge commit failed the SPEC-3.3.20 through SPEC-3.3.25 gate");
                     String::new()
                 }
                 GateFailure::Cause(cause) => format!(": {cause}"),
             };
             return Err(Error::Other(anyhow::anyhow!(
-                "the conflict-resolution pass's merge commit failed the SPEC-3.3.2 verification \
+                "the conflict-resolution pass's merge commit failed the SPEC-3.3.20 through SPEC-3.3.25 verification \
                  gate (`just {command}`){detail}"
             )));
         }
@@ -5064,7 +5063,7 @@ fn remove_path_explicit(workdir: &Path, path: &str) {
     }
 }
 
-/// SPEC-3.12 item 9: discard a review session's changes, restoring `workdir`
+/// SPEC-3.12.10: discard a review session's changes, restoring `workdir`
 /// to `pre_review_sha`, and log the changed paths at `warn`. A tracked path
 /// is checked out back from `pre_review_sha` (`git checkout <sha> -- <path>`);
 /// a path that does not exist there (an untracked file the session wrote, or
@@ -5110,11 +5109,11 @@ fn discard_review_changes(workdir: &Path, key: &str, pre_review_sha: &str) {
     warn!(
         key = %key,
         changed = ?changed,
-        "post-success review session modified the read-only workdir; discarding its changes and re-running the review once (SPEC-3.12 item 9)"
+        "post-success review session modified the read-only workdir; discarding its changes and re-running the review once (SPEC-3.12.10)"
     );
 }
 
-/// SPEC-3.12 item 9: run the post-success review session, retrying it once
+/// SPEC-3.12.10: run the post-success review session, retrying it once
 /// when it modifies the read-only workdir. The first attempt's changes are
 /// discarded ([`discard_review_changes`]) and a fresh session runs in the
 /// restored workdir; only a second no-verdict (any cause, including another
@@ -5189,7 +5188,7 @@ fn run_review_session_with_retry(
     (combined, vec![result, second_result])
 }
 
-/// SPEC-3.16 item 2: the evidence-file link text appended to a capped
+/// SPEC-3.16.3: the evidence-file link text appended to a capped
 /// verdict, built with the same `public_url`-aware degradation
 /// [`crate::run_footer::render`] uses for its `Run:` line, so a reader
 /// without `CLAUDE_RUN_PUBLIC_URL` set still learns where to look.
@@ -5210,7 +5209,7 @@ fn review_evidence_link_text(
     }
 }
 
-/// SPEC-3.16 item 1: cap a verdict marker's bullets at 5 so a posted comment
+/// SPEC-3.16.2: cap a verdict marker's bullets at 5 so a posted comment
 /// stays short. `text` is the raw marker content: a `Review: PASS`/`Review:
 /// FAIL` header line, then zero or more `file:line - ...` bullets. The
 /// evidence link (when `Some`) counts as one of the 5 bullets, so at most 4
@@ -5237,7 +5236,7 @@ fn cap_verdict_bullets(text: &str, key: &str, evidence_link: Option<&str>) -> St
             key = %key,
             dropped = dropped,
             total = findings.len(),
-            "verdict marker exceeded the 5-bullet cap; truncating and linking the evidence file (SPEC-3.16)"
+            "verdict marker exceeded the 5-bullet cap; truncating and linking the evidence file (SPEC-3.16.1 through SPEC-3.16.7)"
         );
         let mut kept: Vec<String> = findings[..finding_budget - 1]
             .iter()
@@ -5264,7 +5263,7 @@ fn cap_verdict_bullets(text: &str, key: &str, evidence_link: Option<&str>) -> St
     out
 }
 
-/// SPEC-3.16 items 1 and 2: apply [`cap_verdict_bullets`] to a review
+/// SPEC-3.16.2 and SPEC-3.16.3: apply [`cap_verdict_bullets`] to a review
 /// outcome's text before it reaches [`finalize`], so the posted comment is
 /// always capped regardless of what the review session wrote. `NoVerdict`
 /// passes through unchanged: it carries the runner's own short diagnostic
@@ -5343,7 +5342,7 @@ enum Finalized {
         /// failure that has no recorded PR, is at the attempt cap, or finds
         /// the field already advanced off `Working`.
         requeued: bool,
-        /// SPEC-3.3.1: the PR a fresh (non-resumed) run opened
+        /// SPEC-3.3.8 through SPEC-3.3.19: the PR a fresh (non-resumed) run opened
         /// in this same attempt before the verification gate failed, left as
         /// an un-promoted draft. `None` for every other `Failed` arm, since
         /// none of them opens a PR of its own; `process_job` records it in
@@ -5467,7 +5466,7 @@ impl DeliveryBlockedReason {
     }
 }
 
-/// SPEC-3.15 item 5: the step-list line a lifecycle comment about `f` is
+/// SPEC-3.15.6: the step-list line a lifecycle comment about `f` is
 /// marked with. Reference table for the literal labels `finalize` passes to
 /// [`lifecycle_footer`]; the test below pins one line per variant. One arm per [`Finalized`] variant, no wildcard. A re-queue
 /// announces the next attempt's `Retry N`; a run that ends in `Needs Review` or
@@ -5493,7 +5492,7 @@ fn finalized_line(f: &Finalized, attempt: u32) -> String {
     }
 }
 
-/// SPEC-3.15 + SPEC-3.9: `body`, the numbered step list with `line` marked as
+/// SPEC-3.15.1 through SPEC-3.15.8 + SPEC-3.9.1: `body`, the numbered step list with `line` marked as
 /// this comment, then the run footer. Every `finalize` lifecycle comment ends
 /// through here so the list sits before the footer.
 fn lifecycle_footer(
@@ -5529,7 +5528,7 @@ impl Finalized {
     }
 }
 
-/// SPEC-3.14 item 7 / SPEC-3.12 item 3: the stored outcome of an attempt, one
+/// SPEC-3.14.8 / SPEC-3.12.4: the stored outcome of an attempt, one
 /// arm per [`Finalized`] variant with no wildcard. A `finalize` that returned
 /// `Err` is a hard failure.
 fn attempt_outcome_of(finalize_res: &Result<Finalized>) -> crate::attempt_steps::Outcome {
@@ -5564,7 +5563,7 @@ fn attempt_outcome_of(finalize_res: &Result<Finalized>) -> crate::attempt_steps:
 /// `finalize` that errored) leaves both exactly as the agent's own result
 /// reported them, so a successful run's Summary stays byte-for-byte
 /// unchanged.
-/// SPEC-3.3: folds `finalize`'s external-mutation verdict into the run's own
+/// SPEC-3.3.1 through SPEC-3.3.25: folds `finalize`'s external-mutation verdict into the run's own
 /// recorded ok/summary, so a job whose agent session "succeeded" but whose
 /// finalize outcome was Failed or ReviewFailed is not recorded as clean.
 fn record_finalize_outcome(
@@ -5588,16 +5587,16 @@ fn record_finalize_outcome(
     (ok, summary)
 }
 
-/// SPEC-3.3.1's final push for a finalize path that opens no PR
+/// SPEC-3.3.8 through SPEC-3.3.19's final push for a finalize path that opens no PR
 /// (needs-review, no-code-change, and the generic hard-failure path below):
 /// those paths never call [`Forge::create_pr_with_draft`], which is the only
 /// other place a push happens, so without this call any commits the agent
 /// made would end the run local-only. Like every other runner push of the
 /// agent branch, this never runs the repo's `pre-push` hook. A
-/// failed push is itself an error: per SPEC-3.3.1 ("a failed final push is a
+/// failed push is itself an error: per SPEC-3.3.8 through SPEC-3.3.19 ("a failed final push is a
 /// failure ... never reported as success"), the caller must turn whichever
 /// outcome it was about to report into a failure instead.
-/// SPEC-3.14 item 3: the `push` and `pr_create` spans of one PR open that took
+/// SPEC-3.14.4: the `push` and `pr_create` spans of one PR open that took
 /// `[start, end]`, split where the provider reported the push ended.
 fn pr_open_spans(
     start: chrono::DateTime<chrono::Utc>,
@@ -5635,7 +5634,7 @@ fn final_push(
     let start = chrono::Utc::now();
     let pushed = forge.final_push(workdir, &host);
     let end = chrono::Utc::now();
-    // SPEC-3.14 item 3: a conflict-resolution pass and gate that ran inside
+    // SPEC-3.14.4: a conflict-resolution pass and gate that ran inside
     // the push is stored first and the `push` row starts after it, so the rows
     // never overlap.
     let mut push_start = start;
@@ -5653,12 +5652,14 @@ fn final_push(
             detail: None,
         }]);
     }
-    pushed
-        .map(|_| ())
-        .map_err(|e| Error::Other(anyhow::anyhow!("final push failed (SPEC-3.3.1): {e}")))
+    pushed.map(|_| ()).map_err(|e| {
+        Error::Other(anyhow::anyhow!(
+            "final push failed (SPEC-3.3.8 through SPEC-3.3.19): {e}"
+        ))
+    })
 }
 
-/// The outcome of a failed [`final_push`] call (SPEC-3.3.1): always
+/// The outcome of a failed [`final_push`] call (SPEC-3.3.8 through SPEC-3.3.19): always
 /// Failed, whatever marker or result would otherwise have driven this
 /// finalize path, since the commits never reached the forge.
 fn final_push_failed(
@@ -5669,7 +5670,7 @@ fn final_push_failed(
     public_url: Option<&str>,
     run: crate::run_footer::CommentRun<'_>,
 ) -> Result<Finalized> {
-    // SPEC-3.16.3/5: the final-push failure maps directly onto the closed
+    // SPEC-3.16.4/5: the final-push failure maps directly onto the closed
     // cause set's `push rejected` member.
     let cause = crate::run_footer::FailureCause::PushRejected {
         error: err.to_string(),
@@ -5691,7 +5692,7 @@ fn final_push_failed(
 
 /// Shared write-and-return path for every delivery-blocked
 /// blocker. Composes the short outcome comment (`delivery_blocked_comment`),
-/// appends the SPEC-3.9 run footer, posts the comment best-effort, then
+/// appends the SPEC-3.9.1 run footer, posts the comment best-effort, then
 /// sets AI Agent to the configured `delivery_blocked` label (falling back
 /// to `needs_review` when none is configured, so an unset config still
 /// parks the issue for a human rather than stranding it at Working).
@@ -5788,7 +5789,7 @@ enum PrOpenOutcome {
     },
 }
 
-/// The draft PR and SPEC-3.3.2 gate result [`open_draft_pr_and_gate`]
+/// The draft PR and SPEC-3.3.20 through SPEC-3.3.25 gate result [`open_draft_pr_and_gate`]
 /// produces once the PR is open, whether the gate passed or failed.
 struct PrGateOutcome {
     pr: PullRequest,
@@ -5797,10 +5798,10 @@ struct PrGateOutcome {
     gate: GateResult,
 }
 
-/// SPEC-3.3.2: the draft-PR-open and
+/// SPEC-3.3.20 through SPEC-3.3.25: the draft-PR-open and
 /// verification-gate portion of `finalize_with_steps`'s success branch,
 /// factored out so `process_job` can run it before billing the post-success
-/// review session, since SPEC-3.3.2 bills no review on a failing gate. Called
+/// review session, since SPEC-3.3.20 through SPEC-3.3.25 bills no review on a failing gate. Called
 /// either here, inside `finalize_with_steps` itself when no `precomputed`
 /// result was handed in (every existing caller, including every unit test),
 /// or earlier in `process_job`, whose result then arrives as `precomputed`.
@@ -5865,7 +5866,7 @@ fn open_draft_pr_and_gate(
             });
         }
     };
-    // SPEC-3.14 item 3: `push` ended where the provider
+    // SPEC-3.14.4: `push` ended where the provider
     // says; with no push time (nothing pushed, or AGit's single call)
     // the whole call is the `pr_create` step.
     collected.extend(pr_open_spans(open_start, open_end, &pr));
@@ -5887,14 +5888,14 @@ fn open_draft_pr_and_gate(
             }
         }
     }
-    // SPEC-3.3.2: the commits are already pushed and the draft PR
+    // SPEC-3.3.20 through SPEC-3.3.25: the commits are already pushed and the draft PR
     // above already exists, so a failed gate still satisfies
-    // SPEC-3.3.1; this only decides whether the attempt is
+    // SPEC-3.3.8 through SPEC-3.3.19; this only decides whether the attempt is
     // recorded as a success or a failure. Runs before the
     // post-success review session: there is no point reviewing a
-    // diff whose own checks do not pass (SPEC-3.3.2).
+    // diff whose own checks do not pass (SPEC-3.3.20 through SPEC-3.3.25).
     let gate = run_verification_gate(workdir);
-    // SPEC-3.14 item 3: stored the moment the gate ends.
+    // SPEC-3.14.4: stored the moment the gate ends.
     if let Some(t) = &gate.timing {
         collected.extend(crate::attempt_steps::gate_spans(t));
     }
@@ -5954,9 +5955,9 @@ fn finalize(
     )
 }
 
-/// SPEC-3.3: "Finalize runs on every path and is the only place external
+/// SPEC-3.3.1 through SPEC-3.3.25: "Finalize runs on every path and is the only place external
 /// mutations happen." Implements the whole "Finalize runs on every path ..."
-/// bullet list and, via [`complete_automerge`], SPEC-3.3.1's automerge bullet.
+/// bullet list and, via [`complete_automerge`], SPEC-3.3.8 through SPEC-3.3.19's automerge bullet.
 ///
 /// The finalize state machine (the native "post"). Runs on every path. Mirrors
 /// the single finalize `post` step in `actions/youtrack.yml`: the comment is
@@ -6005,7 +6006,7 @@ fn finalize_with_steps(
     // does for the ordinary attempt cap.
     attempts_after: u32,
     max_attempts_per_key: u32,
-    // Where this attempt's SPEC-3.3.2 gate output, if the gate
+    // Where this attempt's SPEC-3.3.20 through SPEC-3.3.25 gate output, if the gate
     // fails, is written beside the attempt's stream log. Computed by the
     // caller (which knows the logs dir, action name, key and attempt number)
     // rather than here, mirroring how `stream_log` itself is passed in.
@@ -6015,14 +6016,14 @@ fn finalize_with_steps(
     // deliberately synchronous; the caller supplies a closure that blocks on
     // its own async write, mirroring `step_sink`.
     record_gate_event: &dyn Fn(&str),
-    // SPEC-3.3.2: the success branch's
+    // SPEC-3.3.20 through SPEC-3.3.25: the success branch's
     // [`open_draft_pr_and_gate`] result, computed earlier in `process_job`
     // (before the post-success review session is billed) so a failing gate
     // bills no review. `None` for every other caller, including every unit
     // test: the success branch then computes it itself, exactly as before
     // this was factored out.
     precomputed: Option<std::result::Result<PrGateOutcome, PrOpenOutcome>>,
-    // SPEC-3.14 item 3: receives each `push`, `pr_create` and
+    // SPEC-3.14.4: receives each `push`, `pr_create` and
     // `gate` span the moment it ends, so it is stored before the next comment.
     steps: crate::attempt_steps::StepSink<'_>,
 ) -> Result<Finalized> {
@@ -6088,10 +6089,10 @@ fn finalize_with_steps(
                 run,
             );
         }
-        // SPEC-3.3.1: push any commits before anything else, since this path
+        // SPEC-3.3.8 through SPEC-3.3.19: push any commits before anything else, since this path
         // opens no PR of its own and would otherwise leave them local-only.
         // A failed push overrides this outcome with Failed, never Needs
-        // Review: SPEC-3.3.1 forbids reporting a failed push as anything
+        // Review: SPEC-3.3.8 through SPEC-3.3.19 forbids reporting a failed push as anything
         // else.
         if let Err(e) = final_push(forge, job, workdir, steps) {
             // When the checkpoint watcher's own push was
@@ -6154,12 +6155,12 @@ fn finalize_with_steps(
         }
         // The run usually produced tracker output rather than code, with
         // nothing to push, but an attempt can still leave commits alongside
-        // the marker (SPEC-3.3.1: "any commits the attempt made are
+        // the marker (SPEC-3.3.8 through SPEC-3.3.19: "any commits the attempt made are
         // pushed"), so push them now rather than assuming there are none.
         // No PR either way: skip the forge beyond that push, post the marker
         // text verbatim, and finish on the no-code label. State is left
         // alone, so the issue stays In Progress until a human closes it. A
-        // failed push overrides this outcome with Failed, per SPEC-3.3.1.
+        // failed push overrides this outcome with Failed, per SPEC-3.3.8 through SPEC-3.3.19.
         if let Err(e) = final_push(forge, job, workdir, steps) {
             // See the equivalent branch above.
             if checkpoint_push_rejected.is_some() {
@@ -6190,7 +6191,7 @@ fn finalize_with_steps(
         info!(key = %job.key, %label, "no-code-change marker present; skipping PR");
         Ok(Finalized::NoCodeChange)
     } else if claude_result.ok {
-        // SPEC-3.3.2: computed either here (no
+        // SPEC-3.3.20 through SPEC-3.3.25: computed either here (no
         // `precomputed`, every existing caller) or earlier in `process_job`,
         // before the post-success review session is billed, so a failing
         // gate bills no review. Either way, its stashed steps drain into
@@ -6230,7 +6231,7 @@ fn finalize_with_steps(
                 let gate = outcome.gate;
                 if let Some(output) = &gate.failure {
                     let command = gate.command.unwrap_or("none");
-                    // SPEC-3.3.2 item 3: only a command that actually ran and
+                    // SPEC-3.3.22: only a command that actually ran and
                     // failed has anything to compare; a `GateFailure::Cause`
                     // means the gate never ran at all.
                     let base_check = matches!(output, GateFailure::Output { .. })
@@ -6276,7 +6277,7 @@ fn finalize_with_steps(
                         lifecycle_footer(&body, public_url.as_deref(), run, &job.key, "Failed");
                     comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
                     return Ok(Finalized::Failed {
-                        cause: format!("SPEC-3.3.2 verification gate failed (`just {command}`)"),
+                        cause: format!("SPEC-3.3.20 through SPEC-3.3.25 verification gate failed (`just {command}`)"),
                         pr_step: Some("verify"),
                         requeued: false,
                         pr_number: pr.number,
@@ -6530,7 +6531,7 @@ fn finalize_with_steps(
                 else {
                     unreachable!()
                 };
-                // SPEC-3.12 item 4: distinct from the generic push/
+                // SPEC-3.12.5: distinct from the generic push/
                 // PR-create failure below. `merge_remote_branch` already
                 // aborted the merge before returning this, so the agent's
                 // local commits are exactly as they were; this is a human
@@ -6606,7 +6607,7 @@ fn finalize_with_steps(
                     WorkLocation::RemoteBranch { .. } => "pr_create",
                     _ => "push",
                 };
-                // SPEC-3.14 item 3: the failed step is stored with
+                // SPEC-3.14.4: the failed step is stored with
                 // `ok = false` over the whole call.
                 steps(vec![crate::attempt_steps::StepSpan {
                     kind: if pr_step == "push" {
@@ -6856,7 +6857,7 @@ fn finalize_with_steps(
         if let Err(e) = backend.comment(&job.key, &body) {
             warn!(key = %job.key, error = %e, "timeout comment failed (continuing)");
         }
-        // SPEC-3.12 item 5: a draft PR opened by the salvage above is never
+        // SPEC-3.12.6: a draft PR opened by the salvage above is never
         // left standing in for a state; this write (or the deliberate
         // human-override skip) always pairs it with a field from the closed
         // set.
@@ -6872,7 +6873,7 @@ fn finalize_with_steps(
     } else {
         // Failure: crash, empty prompt, pre failure, or an operator cancel
         // (synthesized by the caller as this same `ok: false, timed_out:
-        // false` shape). SPEC-3.3.1: push any commits before commenting,
+        // false` shape). SPEC-3.3.8 through SPEC-3.3.19: push any commits before commenting,
         // since this path opens no PR of its own; a failed push is folded
         // into both the comment and `cause` rather than silently leaving the
         // commits unpushed.
@@ -6882,7 +6883,7 @@ fn finalize_with_steps(
                 "Any commits were pushed to the branch; no PR was opened for this run.".to_string()
             }
             Err(e) => format!(
-                "The final push also failed (SPEC-3.3.1): {e}; the commits are preserved on \
+                "The final push also failed (SPEC-3.3.8 through SPEC-3.3.19): {e}; the commits are preserved on \
                  the runner host only."
             ),
         };
@@ -6932,18 +6933,20 @@ fn append_compaction_note(body: &str, stream_log: Option<&Path>, key: &str) -> S
     }
 }
 
-/// SPEC-3.3.1's finalize-time merge. After a successful run's PR
+/// SPEC-3.3.8 through SPEC-3.3.19's finalize-time merge. After a successful run's PR
 /// is promoted from draft, make ONE status read bounded by
 /// `automerge.finalize_status_timeout_secs` and merge the PR right away when
-/// its checks are already `success`, its branch is not behind base and the
-/// forge reports it mergeable: the same three conditions
-/// `crate::web::webhooks::apply_automerge_decision` merges on. Every other
-/// answer returns `false` and changes nothing, leaving the PR at Code Review
-/// for the webhook and the reconciler, which own the pending, red,
-/// behind-base and not-mergeable cases (and their comments). In particular a
-/// behind-base PR is never branch-updated here, so this path never starts a
-/// new CI run and never takes a `max_ci_in_flight_per_repo` slot;
-/// merging a green PR only ever frees one.
+/// its checks are already `success`, the forge reports it mergeable, and it
+/// is either not behind base or `automerge.branch_up_to_date` resolves (via
+/// [`crate::provider::resolve_branch_up_to_date`]) to not requiring it: the
+/// same conditions `crate::web::webhooks::apply_automerge_decision` merges
+/// on. Every other answer returns `false` and changes nothing, leaving the
+/// PR at Code Review for the webhook and the reconciler, which own the
+/// pending, red, not-mergeable, and behind-base-and-required cases (and their
+/// comments). A behind-base PR is never branch-updated here even when the
+/// setting would require it before merging, so this path never starts a new
+/// CI run and never takes a `max_ci_in_flight_per_repo` slot; merging a green
+/// PR only ever frees one.
 ///
 /// Returns `true` only when the merge landed. A merge failure is logged at
 /// `error` and returns `false`: the next webhook or reconciler pass retries
@@ -6967,7 +6970,7 @@ fn automerge_at_finalize(
     let timeout = Duration::from_secs(automerge.finalize_status_timeout_secs);
     let read_start = chrono::Utc::now();
     let read = forge.pr_status_within(host, repo, pr_number, timeout);
-    // SPEC-3.14 item 3: the one bounded CI status read is the
+    // SPEC-3.14.4: the one bounded CI status read is the
     // attempt's `ci_wait` step; a failed or timed-out read closes it `ok = false`.
     steps(vec![crate::attempt_steps::StepSpan {
         kind: crate::attempt_steps::StepKind::CiWait,
@@ -6985,7 +6988,26 @@ fn automerge_at_finalize(
         }
     };
     let green = status.state.trim() == "success";
-    if !(green && status.behind_base == Some(false) && status.mergeable == Some(true)) {
+    let base_ok = match status.behind_base {
+        Some(false) => true,
+        Some(true) => {
+            match crate::provider::resolve_branch_up_to_date(
+                forge,
+                host,
+                repo,
+                pr_number,
+                automerge.branch_up_to_date,
+            ) {
+                Ok(requires_up_to_date) => !requires_up_to_date,
+                Err(e) => {
+                    warn!(key = %issue_key, pr_number, error = %e, "finalize-time automerge: branch_up_to_date resolution failed; leaving the PR at Code Review for the webhook and reconciler");
+                    false
+                }
+            }
+        }
+        None => false,
+    };
+    if !(green && base_ok && status.mergeable == Some(true)) {
         info!(
             key = %issue_key,
             pr_number,
@@ -7017,7 +7039,7 @@ fn automerge_at_finalize(
     }
 }
 
-/// SPEC-3.3.1: "Optional `automerge` (default off): merge and set the field
+/// SPEC-3.3.8 through SPEC-3.3.19: "Optional `automerge` (default off): merge and set the field
 /// to done once checks pass. Finalize never polls for this; a reconciler
 /// every 300 seconds and action-success webhooks drive the decision for
 /// recorded agent PRs."
@@ -7067,7 +7089,7 @@ fn merged_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
-/// SPEC-3.3.1: a green PR the forge reports not mergeable that has no
+/// SPEC-3.3.8 through SPEC-3.3.19: a green PR the forge reports not mergeable that has no
 /// conflict-resolution run to send is left at Code Review for a
 /// human.
 ///
@@ -7095,7 +7117,7 @@ pub(crate) fn automerge_not_mergeable_comment(pr_url: &str, backend: BehindBaseB
     .join("\n")
 }
 
-/// SPEC-3.3.1: "a green, behind-base PR is updated through the forge's
+/// SPEC-3.3.8 through SPEC-3.3.19: "a green, behind-base PR is updated through the forge's
 /// update-branch endpoint, which retriggers CI, and a later success event
 /// re-evaluates and merges once that run goes green."
 ///
@@ -7115,7 +7137,7 @@ pub(crate) fn automerge_branch_updated_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
-/// SPEC-3.3.1: "a behind-base update that itself fails (for example a 409)
+/// SPEC-3.3.8 through SPEC-3.3.19: "a behind-base update that itself fails (for example a 409)
 /// ... is left at Code Review for a human."
 ///
 /// The branch was behind its base, and updating it against the
@@ -7134,7 +7156,7 @@ pub(crate) fn automerge_update_failed_comment(pr_url: &str, error: &str) -> Stri
     .join("\n")
 }
 
-/// SPEC-3.3.1: "when the behind-base update itself fails because of a merge
+/// SPEC-3.3.8 through SPEC-3.3.19: "when the behind-base update itself fails because of a merge
 /// conflict, the runner dispatches one `/claude` conflict-resolution run
 /// instead of leaving it to a human on the first attempt per PR head commit."
 ///
@@ -7158,7 +7180,7 @@ pub(crate) fn automerge_conflict_resolving_comment(pr_url: &str, attempt: i64, c
     .join("\n")
 }
 
-/// SPEC-3.3.1: "when the forge reports no `behind_base` at all, automerge
+/// SPEC-3.3.8 through SPEC-3.3.19: "when the forge reports no `behind_base` at all, automerge
 /// takes no merge action" - which forge decides the cause named in the
 /// comment and run event.
 ///
@@ -7171,7 +7193,7 @@ pub(crate) enum BehindBaseBackend {
 }
 
 impl BehindBaseBackend {
-    /// The forge's own name, for any message that names it (SPEC-2.3).
+    /// The forge's own name, for any message that names it (SPEC-2.3.1 through SPEC-2.3.2).
     pub(crate) fn display_name(self) -> &'static str {
         match self {
             BehindBaseBackend::Forgejo => "Forgejo",
@@ -7180,7 +7202,7 @@ impl BehindBaseBackend {
     }
 }
 
-/// SPEC-3.3.1: the `behind_base` missing outcome text, one form per forge.
+/// SPEC-3.3.8 through SPEC-3.3.19: the `behind_base` missing outcome text, one form per forge.
 ///
 /// The `behind_base missing` outcome text for `backend`, shared by the
 /// `run_events` row and the issue-comment dedupe key.
@@ -7193,7 +7215,7 @@ pub(crate) fn behind_base_missing_outcome(backend: BehindBaseBackend) -> String 
     }
 }
 
-/// SPEC-3.3.1: "on Forgejo this means the runtime's `fj` is too old to report it and a
+/// SPEC-3.3.8 through SPEC-3.3.19: "on Forgejo this means the runtime's `fj` is too old to report it and a
 /// human must act; on GitHub, `mergeStateStatus` is still `UNKNOWN`
 /// (computed lazily after a push) and the reconciler re-checks on its next
 /// pass."
@@ -7231,7 +7253,7 @@ pub(crate) fn automerge_behind_base_missing_comment(
     .join("\n")
 }
 
-/// SPEC-3.3.1: "a merge call that fails after the mergeable check passed"
+/// SPEC-3.3.8 through SPEC-3.3.19: "a merge call that fails after the mergeable check passed"
 /// is left at Code Review for a human.
 ///
 /// The merge itself was refused by Forgejo (for example a
@@ -7261,9 +7283,9 @@ pub(crate) fn automerge_merge_failed_comment(pr_url: &str, error: &str) -> Strin
 /// independently and a failure of either logs at `error` naming the key and
 /// the cause.
 ///
-/// SPEC-3.12 item 6 audit: [`cap_reached_comment`] already names
+/// SPEC-3.12.7 audit: [`cap_reached_comment`] already names
 /// the one action a human can take (raise the cap or reset the counter), so
-/// this site satisfies the "states one action" half of item 6. It does not
+/// this site satisfies the "states one action" half of SPEC-3.12.7. It does not
 /// write the `Needs-Info` tag; that is the documented carve-out
 /// (`actions/SCHEMA.md`: "the attempt-cap park... never write[s] this tag"),
 /// not an oversight this issue should change.
@@ -7369,8 +7391,7 @@ fn build_split_prompt(
 /// audited tracker. The pieces are the issue's `parent for` children that did
 /// not exist before the attempt. At least two, each with an Estimation that
 /// fits the session timeout, are required: otherwise nothing is queued and the
-/// issue ends in `Needs Review` with `Needs-Info` naming the cause (SPEC-3.12
-/// item 6). On success the issue becomes a `Story`, each piece is queued, and
+/// issue ends in `Needs Review` with `Needs-Info` naming the cause (SPEC-3.12.7). On success the issue becomes a `Story`, each piece is queued, and
 /// the issue leaves `Queued` on the no-code state with a comment listing the
 /// pieces. A failed write is logged at `error` naming the issue and returned,
 /// never read as a completed split.
@@ -7571,7 +7592,7 @@ fn requeue_comment(r: &ClaudeResult) -> String {
     .join("\n")
 }
 
-/// SPEC-3.3: supports the `forgejo` target's `base_url`-driven `fj` calls.
+/// SPEC-3.3.1 through SPEC-3.3.25: supports the `forgejo` target's `base_url`-driven `fj` calls.
 ///
 /// Bare host of a forge server URL: `https://dev.a8n.run` -> `dev.a8n.run`,
 /// for `fj --host <host>`.
@@ -7602,7 +7623,7 @@ fn pr_url(job: &YoutrackJob, pr: &PullRequest) -> String {
     }
 }
 
-/// SPEC-3.3.2: "a report that the checks passed must name the command that
+/// SPEC-3.3.20 through SPEC-3.3.25: "a report that the checks passed must name the command that
 /// actually ran"; `gate_command` is `None` only when the clone had neither a
 /// `pre-push` nor a `check` recipe, so the comment says so rather than
 /// naming a command that never ran.
@@ -7626,7 +7647,7 @@ fn success_comment(r: &ClaudeResult, pr_url: &str, gate_command: Option<&str>) -
     .join("\n")
 }
 
-/// SPEC-3.3.2: the issue comment for a verification-gate failure. The PR
+/// SPEC-3.3.20 through SPEC-3.3.25: the issue comment for a verification-gate failure. The PR
 /// already exists (pushed as a draft before the gate ran), so the comment
 /// names it and says the gate, not the agent's own work, decided this.
 /// The command's own output is never posted here, only linked;
@@ -7640,7 +7661,7 @@ fn gate_failure_comment(
     command: &str,
     failure: &GateFailure,
     output_note: Option<&str>,
-    // SPEC-3.3.2 item 3, SPEC-3.16 item 3: the base-branch comparison, kept
+    // SPEC-3.3.22, SPEC-3.16.4: the base-branch comparison, kept
     // on this same line as `output_note`/the cause. `None` for a
     // `GateFailure::Cause`, which has nothing to compare.
     base_check: Option<&BaseGateCheck>,
@@ -7721,11 +7742,11 @@ fn post_gate_failure_on_pr(
         GateFailure::Output { .. } => {
             let note = output_note.unwrap_or("its output is not included here");
             format!(
-                "SPEC-3.3.2 verification gate: the runner's own `just {command}` failed; {note}."
+                "SPEC-3.3.20 through SPEC-3.3.25 verification gate: the runner's own `just {command}` failed; {note}."
             )
         }
         GateFailure::Cause(cause) => format!(
-            "SPEC-3.3.2 verification gate: the runner's own `just {command}` could not be \
+            "SPEC-3.3.20 through SPEC-3.3.25 verification gate: the runner's own `just {command}` could not be \
              run:\n\n{}",
             provider::fenced_block("", cause)
         ),
@@ -7739,8 +7760,8 @@ fn post_gate_failure_on_pr(
 /// Issue comment for a [`Finalized::ReviewFailed`] outcome: the PR stays a
 /// draft, so the comment says so and names where the findings also landed.
 ///
-/// SPEC-3.16.3/5: at most 2 bullets (the cause, then the draft PR to look
-/// at; the run link is the third bullet, appended by the caller's SPEC-3.9
+/// SPEC-3.16.4/5: at most 2 bullets (the cause, then the draft PR to look
+/// at; the run link is the third bullet, appended by the caller's SPEC-3.9.1
 /// footer), the cause first. `findings` and the agent's summary move to a
 /// collapsed `<details>` block, which is not a bullet and so is not bound by
 /// the cap.
@@ -7749,7 +7770,7 @@ fn review_findings_comment(
     pr_url: &str,
     findings: &str,
     no_verdict: bool,
-    // SPEC-3.12 item 6: whether this outcome requeues automatically (below
+    // SPEC-3.12.7: whether this outcome requeues automatically (below
     // the attempt cap) or parks for a human, so the single named action
     // matches what `finalize` actually does instead of always claiming a
     // human decision is pending even when the issue is about to retry on
@@ -7917,9 +7938,9 @@ fn post_review_findings_on_pr(
 // on a recorded PR means a re-queue resumes that PR's branch rather than
 // opening a fresh one.
 //
-// SPEC-3.16.3/5: capped at the same 2-bullet shape as
+// SPEC-3.16.4/5: capped at the same 2-bullet shape as
 // `run_footer::failure_comment` (cause, then what was or was not pushed; the
-// run link is the third bullet, appended by the caller's SPEC-3.9 footer).
+// run link is the third bullet, appended by the caller's SPEC-3.9.1 footer).
 // The cause is drawn from the closed `FailureCause` set: a push failure
 // classifies as `PushRejected` (mirrors `final_push_failed`), a PR-create
 // failure as `CommandFailed { command: "pr create" }`. `err`'s text and the
@@ -7981,7 +8002,7 @@ fn pr_failure_comment(
     body
 }
 
-/// SPEC-3.12 item 4: the issue comment for a diverged final push whose
+/// SPEC-3.12.5: the issue comment for a diverged final push whose
 /// bounded conflict-resolution pass failed (or found its cap already
 /// spent), distinct from the generic push/PR-create failure comment: names
 /// the conflicting files and both SHAs, since that is exactly what a human
@@ -7999,7 +8020,7 @@ fn conflict_resolution_failed_comment(
         format!(
             "Claude AI agent run completed, but the final push found branch `{branch}` had \
              diverged from the remote and the runner's bounded conflict-resolution pass \
-             (SPEC-3.12 item 4) could not resolve it. The merge was aborted; nothing was \
+             (SPEC-3.12.5) could not resolve it. The merge was aborted; nothing was \
              force-pushed, and the agent's local commits are unchanged."
         ),
         String::new(),
@@ -8010,11 +8031,11 @@ fn conflict_resolution_failed_comment(
         "Conflict-resolution pass failure:".to_string(),
         String::new(),
         // `detail` can carry `append_stdout_tail` text (the
-        // SPEC-3.3.2 gate's cause, or a merge's own captured stderr), so it
+        // SPEC-3.3.20 through SPEC-3.3.25 gate's cause, or a merge's own captured stderr), so it
         // is fenced rather than pasted inline.
         provider::fenced_block("", detail),
         String::new(),
-        // SPEC-3.12 item 6: name the single action a human takes next,
+        // SPEC-3.12.7: name the single action a human takes next,
         // rather than only describing the state.
         format!(
             "Resolve the conflict by hand (merge `origin/{branch}` into `{branch}`, fix {files}, \
@@ -8109,7 +8130,7 @@ struct SalvageReport {
     tracker_key_hit: Option<String>,
 }
 
-/// SPEC-3.3: "timeout or cancel: the final push in 3.3.1 runs ... A draft PR
+/// SPEC-3.3.1 through SPEC-3.3.25: "timeout or cancel: the final push in 3.3.1 runs ... A draft PR
 /// is opened and the issue lands in needs-review."
 ///
 /// Commit, push, and open a draft PR from a timed-out run's local work.
@@ -8405,10 +8426,10 @@ fn timeout_salvage_pr_comment(
     body
 }
 
-/// SPEC-3.12 item 3, the "timeout or cancel with commits" row: the
-/// Needs-Review comment for a timed-out run. SPEC-3.16.3/5: capped at 3
+/// SPEC-3.12.4, the "timeout or cancel with commits" row: the
+/// Needs-Review comment for a timed-out run. SPEC-3.16.4/5: capped at 3
 /// bullets (the cause, the salvage outcome, the follow-up action), the cause
-/// first; the run link comes from the SPEC-3.9 footer the caller appends.
+/// first; the run link comes from the SPEC-3.9.1 footer the caller appends.
 /// Neither the raw stream-log path (`r.error`) nor the raw terminal event
 /// reaches the comment: the kill-time ambiguity paragraph and the agent's
 /// last summary move to a collapsed `<details>` block instead, which is not
@@ -8419,7 +8440,7 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
         timeout.as_secs()
     );
 
-    // SPEC-3.16.3's bullet contract is "what was or was not pushed" in full:
+    // SPEC-3.16.4's bullet contract is "what was or was not pushed" in full:
     // `salvage_timeout_work` always attempts `create_pr_with_draft` after a
     // failed WIP commit, so `commit_error` and `pr_url`/`open_error` can both
     // be set on the same report. Reporting only one silently drops the other
@@ -8477,7 +8498,7 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
     let detail = [
         "The agent may have completed all, some, or none of the work before being killed. A backgrounded command can hold the process open past the limit even after the functional work is done, so this is not necessarily a failure. The runner did NOT mark this issue Failed.".to_string(),
         String::new(),
-        // SPEC-3.16.3: the collapsed block is still part of the posted comment, so it gets the same redaction.
+        // SPEC-3.16.4: the collapsed block is still part of the posted comment, so it gets the same redaction.
         redact_stream_log_path(&r.summary),
     ]
     .join("\n");
@@ -8485,12 +8506,12 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
     body
 }
 
-/// SPEC-3.16.3/5: the closed-cause FAILED comment for a crashed, empty
+/// SPEC-3.16.4/5: the closed-cause FAILED comment for a crashed, empty
 /// prompt, pre-failed, or operator-cancelled run. `r.error` carries the raw
 /// "claude exited N, see stream.jsonl" text for a real crash, so it is
 /// classified into a [`crate::run_footer::FailureCause`] rather than quoted
 /// directly: the raw stream-log path never reaches the comment, since the
-/// run link (in the SPEC-3.9 footer the caller appends) reaches it instead.
+/// run link (in the SPEC-3.9.1 footer the caller appends) reaches it instead.
 fn failure_comment(r: &ClaudeResult, pushed: &str) -> String {
     crate::run_footer::failure_comment(&failure_cause(r), pushed)
 }
@@ -8517,7 +8538,7 @@ fn failure_cause(r: &ClaudeResult) -> crate::run_footer::FailureCause {
     }
 }
 
-/// SPEC-3.16.3: strips the raw stream-log path that
+/// SPEC-3.16.4: strips the raw stream-log path that
 /// `claude::no_final_message_summary` / `claude::unreadable_log_summary`
 /// embed in an otherwise single-line `ClaudeResult.summary`, so it never
 /// reaches a FAILED comment via [`failure_cause`] or the webhook-comment
@@ -8647,7 +8668,7 @@ fn cleanup_workdir(workdir: &Path) {
     crate::workdir::force_remove(workdir);
 }
 
-/// SPEC-3.8: "A workdir holding unpushed commits violates 3.3.1; it is kept
+/// SPEC-3.8.1 through SPEC-3.8.21: "A workdir holding unpushed commits violates 3.3.1; it is kept
 /// until `unpushed_hard_cap_days` (60) and logged as a defect, never treated
 /// as normal."
 ///
@@ -8661,7 +8682,7 @@ pub(crate) fn has_local_only_work(workdir: &Path) -> bool {
     has_local_only_work_with_token(workdir, None)
 }
 
-/// SPEC-3.8: same unpushed-work check as [`has_local_only_work`], used by the
+/// SPEC-3.8.1 through SPEC-3.8.21: same unpushed-work check as [`has_local_only_work`], used by the
 /// per-job callers that have a forge token in scope.
 ///
 /// Same check as [`has_local_only_work`], authenticating the `ls-remote
@@ -8724,7 +8745,7 @@ fn work_location(workdir: &Path, token_url: Option<&str>) -> WorkLocation {
     }
 }
 
-/// SPEC-3.8: "Workdir GC: preserved or aside workdirs older than
+/// SPEC-3.8.1 through SPEC-3.8.21: "Workdir GC: preserved or aside workdirs older than
 /// `retention_days` (14) are deleted. A workdir holding unpushed commits
 /// violates 3.3.1; it is kept."
 ///
@@ -8736,7 +8757,7 @@ fn work_location(workdir: &Path, token_url: Option<&str>) -> WorkLocation {
 /// uncommitted and stashed work a branch-only check would miss.
 ///
 /// `target/` is stripped before the preserve decision keeps `workdir`
-/// (`SPEC-3.10` item 5); that happens inside
+/// (`SPEC-3.10.6`); that happens inside
 /// [`crate::workdir::cleanup_or_preserve_with_token`] itself, so every other
 /// caller of that shared guarded delete (scripted-action jobs, the comment
 /// webhook) gets the same removal, not just this native action.
@@ -8748,7 +8769,7 @@ fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str, token_url: Optio
 /// attempt's clone, to the first free `<dir>.kept-<n>` sibling. An empty
 /// leftover directory is left in place (the clone tolerates it).
 ///
-/// `target/` is stripped first (`SPEC-3.10` item 5), so the directory this
+/// `target/` is stripped first (`SPEC-3.10.6`), so the directory this
 /// moves aside never carries its build output into the `.kept-<n>` sibling.
 fn preserve_aside(workdir: &Path, action: &str, key: &str) {
     let occupied = std::fs::read_dir(workdir)
@@ -8883,7 +8904,7 @@ mod tests {
         assert!(written.contains("test result::FAIL some_test"));
     }
 
-    /// SPEC-3.3.2 item 3: the base branch's own stdout/stderr is appended to
+    /// SPEC-3.3.22: the base branch's own stdout/stderr is appended to
     /// the SAME gate-output file, after a section header naming the base
     /// branch, rather than written to a second file.
     #[test]
@@ -9384,7 +9405,7 @@ mod tests {
         assert_eq!(state::attempts_get(&pool, "yt", "MX-16").await.unwrap(), 0);
     }
 
-    /// SPEC-3.15 item 5: every `Finalized` variant maps to its
+    /// SPEC-3.15.6: every `Finalized` variant maps to its
     /// own step-list line, and a lifecycle comment ends its list with that
     /// line marked, before the run footer.
     #[test]
@@ -9484,7 +9505,7 @@ mod tests {
         }
     }
 
-    /// SPEC-3.13: the pickup posts the start notice, naming the
+    /// SPEC-3.13.1 through SPEC-3.13.5: the pickup posts the start notice, naming the
     /// attempt, stage, timeout and expected duration, before it clones: the
     /// clone fails here, and the notice is still the first comment.
     #[tokio::test]
@@ -9732,7 +9753,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.12 item 7 test harness: a pickup whose tracker reports
+    /// SPEC-3.12.8 test harness: a pickup whose tracker reports
     /// `estimation_minutes` for `Estimation`, under a `claude_timeout` session
     /// limit. The cancel token is always set, so a pickup that is NOT parked
     /// over the estimate instead stops at the next checkpoint (`Filtered`),
@@ -9797,7 +9818,7 @@ mod tests {
         (outcome, tracker)
     }
 
-    /// SPEC-3.12 item 7: an issue whose `Estimation` exceeds the
+    /// SPEC-3.12.8: an issue whose `Estimation` exceeds the
     /// action's session timeout is no longer parked at pickup. It proceeds as a
     /// split-only attempt (here: past the gate to the cancel checkpoint), with
     /// no Needs Review write, no comment and no Needs-Info tag from the gate.
@@ -9973,7 +9994,7 @@ mod tests {
         assert!(t.tags.lock().unwrap().is_empty());
     }
 
-    /// SPEC-3.12 item 6: fewer than two new pieces ends in Needs
+    /// SPEC-3.12.7: fewer than two new pieces ends in Needs
     /// Review with Needs-Info and a comment naming the cause; nothing queued.
     #[test]
     fn finalize_split_with_fewer_than_two_pieces_parks_needs_review() {
@@ -10064,7 +10085,7 @@ mod tests {
         assert!(!p.contains("{{"), "unrendered placeholder: {p}");
     }
 
-    /// SPEC-3.12 item 7: an issue with no `Estimation`, and one at or below
+    /// SPEC-3.12.8: an issue with no `Estimation`, and one at or below
     /// the timeout, is picked up as before (here: proceeding past this gate to
     /// the cancel checkpoint, never parked over the estimate).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10610,7 +10631,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.15 item 6, SPEC-8.8: each checkpoint push comment
+    /// SPEC-3.15.7, SPEC-8.8.1 through SPEC-8.8.2: each checkpoint push comment
     /// is rendered from rows stored before that push. The clone row exists
     /// first, the first checkpoint's own row is written when its push ends,
     /// and the second comment lists it and marks `Checkpoint 2`.
@@ -11146,7 +11167,7 @@ mod tests {
         assert_eq!(tracker.field(), "Working");
     }
 
-    /// SPEC-3.16.3/5: a crash classifies as `agent error`, reported from the
+    /// SPEC-3.16.4/5: a crash classifies as `agent error`, reported from the
     /// friendly one-line summary; the raw `r.error` stream-log text never
     /// surfaces in the comment.
     #[test]
@@ -11219,7 +11240,7 @@ mod tests {
         assert!(!body.contains("unknown"), "{body}");
     }
 
-    /// SPEC-3.16.3: the pre-step sentinel `r.error` classifies as
+    /// SPEC-3.16.4: the pre-step sentinel `r.error` classifies as
     /// `` `pre` failed ``, never quoted verbatim or paired with a raw details
     /// block.
     #[test]
@@ -11260,7 +11281,7 @@ mod tests {
         assert!(!timeout_body.contains("secret reasoning"), "{timeout_body}");
     }
 
-    /// SPEC-3.16.3: `failure_cause`'s `AgentError` mapping must never let the
+    /// SPEC-3.16.4: `failure_cause`'s `AgentError` mapping must never let the
     /// raw stream-log path embedded in `claude::no_final_message_summary` /
     /// `claude::unreadable_log_summary` reach the FAILED comment, since those
     /// summaries have no newline and `r.summary.lines().next()` would
@@ -11428,7 +11449,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.16.3: a killed run with no final message carries the raw stream-log
+    /// SPEC-3.16.4: a killed run with no final message carries the raw stream-log
     /// path in `summary`; the collapsed detail block must not repeat it.
     #[test]
     fn timeout_comment_detail_redacts_the_stream_log_path() {
@@ -11443,7 +11464,7 @@ mod tests {
         assert!(body.contains("The run produced no final message"), "{body}");
     }
 
-    /// SPEC-3.16.3/5: the timeout Needs-Review comment is at most 3 bullets,
+    /// SPEC-3.16.4/5: the timeout Needs-Review comment is at most 3 bullets,
     /// the cause first, and never carries the raw stream-log path or the raw
     /// terminal result event, across every salvage outcome.
     #[test]
@@ -11521,7 +11542,7 @@ mod tests {
     }
 
     /// The failure comment leads with a one-line outcome and
-    /// SPEC-3.16.3: the pre-step failure body is capped at 2 bullets here
+    /// SPEC-3.16.4: the pre-step failure body is capped at 2 bullets here
     /// (cause, pushed), leading with the cause.
     #[test]
     fn failure_comment_leads_with_outcome_and_renders_bullets() {
@@ -12929,7 +12950,7 @@ mod tests {
         assert!(err.starts_with("set Assignee=octocat:"), "{err}");
         // The clone is never attempted: the workdir stays absent.
         assert!(!wd.exists(), "clone must not run after an assignee failure");
-        // SPEC-3.14: the `clone` step must never be recorded as covering time
+        // SPEC-3.14.1 through SPEC-3.14.9: the `clone` step must never be recorded as covering time
         // spent on the field writes above it, so a failure before `clone_repo`
         // is ever reached leaves no clone timing to record at all (that time
         // falls into `unaccounted` honestly instead).
@@ -12997,7 +13018,7 @@ mod tests {
         };
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "fix/existing");
         assert_eq!(std::fs::read_to_string(wd.join("f.txt")).unwrap(), "fix");
-        // SPEC-3.14: a successful clone must record its own timing, bracketing
+        // SPEC-3.14.1 through SPEC-3.14.9: a successful clone must record its own timing, bracketing
         // only the `clone_repo` call rather than the whole `run_pre` span.
         let (start, end, ok) = clone_timing.expect("a successful clone must record timing");
         assert!(ok, "a successful clone must be recorded as ok");
@@ -13111,7 +13132,7 @@ mod tests {
     /// A `StubRunner` stubbed to answer every `git` call `final_push` (and
     /// the plumbing it calls into) makes while resolving and pushing a single
     /// feature branch `feat/x`, ahead of `main`, not yet on the remote.
-    /// Shared by the SPEC-3.3.1 finalize-path push tests below, which differ
+    /// Shared by the SPEC-3.3.8 through SPEC-3.3.19 finalize-path push tests below, which differ
     /// only in which marker file is present.
     fn stub_runner_for_a_clean_final_push() -> StubRunner {
         StubRunner::new()
@@ -13146,7 +13167,7 @@ mod tests {
             )
     }
 
-    /// SPEC-3.3.1: the needs-review path opens no PR, but it must still push
+    /// SPEC-3.3.8 through SPEC-3.3.19: the needs-review path opens no PR, but it must still push
     /// any commits the agent made before parking, rather than leaving them
     /// local-only. Proven here by a real `git push` call reaching the stub.
     #[test]
@@ -13185,13 +13206,13 @@ mod tests {
             calls
                 .iter()
                 .any(|c| c == "git push --no-verify --set-upstream origin feat/x:feat/x"),
-            "needs-review must still push the feature branch (SPEC-3.3.1): {calls:?}"
+            "needs-review must still push the feature branch (SPEC-3.3.8 through SPEC-3.3.19): {calls:?}"
         );
         // Still no PR: needs-review opens none.
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
     }
 
-    /// SPEC-3.3.1: a no-code-change run can still carry commits alongside the
+    /// SPEC-3.3.8 through SPEC-3.3.19: a no-code-change run can still carry commits alongside the
     /// marker (e.g. a leftover fix the agent made before realizing the issue
     /// needed no code), and those must reach the forge too.
     #[test]
@@ -13230,12 +13251,12 @@ mod tests {
             calls
                 .iter()
                 .any(|c| c == "git push --no-verify --set-upstream origin feat/x:feat/x"),
-            "no-code-change must still push any commits the agent made (SPEC-3.3.1): {calls:?}"
+            "no-code-change must still push any commits the agent made (SPEC-3.3.8 through SPEC-3.3.19): {calls:?}"
         );
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
     }
 
-    /// SPEC-3.3.1: a failed push on a no-PR finalize path is itself a
+    /// SPEC-3.3.8 through SPEC-3.3.19: a failed push on a no-PR finalize path is itself a
     /// failure, never reported as the ordinary outcome for that path (here,
     /// Needs Review): the commits never reached the forge, so the run cannot
     /// read as parked-but-fine.
@@ -13794,7 +13815,7 @@ mod tests {
         assert_eq!(res, Finalized::NoCodeChange);
 
         let calls = runner.calls.lock().unwrap();
-        // No forge call at all: no PR is opened for a no-code run. SPEC-3.3.1
+        // No forge call at all: no PR is opened for a no-code run. SPEC-3.3.8 through SPEC-3.3.19
         // still probes for a feature branch to push (the `git` calls below),
         // but finds none ahead of base in this bare workdir and pushes
         // nothing.
@@ -14053,7 +14074,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.3.2: a clone whose `pre-push` recipe passes proceeds exactly as
+    /// SPEC-3.3.20 through SPEC-3.3.25: a clone whose `pre-push` recipe passes proceeds exactly as
     /// before, and the success comment names the command the gate actually ran.
     #[test]
     fn finalize_verification_gate_pass_proceeds_as_before() {
@@ -14195,7 +14216,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.14 item 3: the success path hands its `push`,
+    /// SPEC-3.14.4: the success path hands its `push`,
     /// `pr_create` and `gate` spans to the step sink in order, each before the
     /// outcome comment is posted.
     #[test]
@@ -14343,7 +14364,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.3.2: a clone whose `pre-push` recipe fails is recorded as a
+    /// SPEC-3.3.20 through SPEC-3.3.25: a clone whose `pre-push` recipe fails is recorded as a
     /// failure, with the redacted output attached to both the issue and the
     /// PR, and the draft PR the push already opened stays a draft.
     #[test]
@@ -14476,7 +14497,8 @@ mod tests {
         assert_eq!(
             res,
             Finalized::Failed {
-                cause: "SPEC-3.3.2 verification gate failed (`just pre-push`)".into(),
+                cause: "SPEC-3.3.20 through SPEC-3.3.25 verification gate failed (`just pre-push`)"
+                    .into(),
                 pr_step: Some("verify"),
                 requeued: false,
                 pr_number: Some(7),
@@ -14542,7 +14564,7 @@ mod tests {
         }
     }
 
-    /// SPEC-3.12 item 4, acceptance criterion 2: the final push finds the
+    /// SPEC-3.12.5, acceptance criterion 2: the final push finds the
     /// remote branch diverged, the local merge conflicts, and the bounded
     /// conflict-resolution pass fails. `finalize` must abort the merge
     /// (preserving the agent's local commits), park the issue at Needs
@@ -14683,7 +14705,7 @@ mod tests {
             comment_call.contains("remotesha"),
             "names the remote SHA: {comment_call}"
         );
-        // SPEC-3.12 item 6: the comment must name the one action a human
+        // SPEC-3.12.7: the comment must name the one action a human
         // takes next, not just describe the aborted state.
         assert!(
             comment_call.contains("Resolve the conflict by hand")
@@ -15102,7 +15124,7 @@ mod tests {
         )
         .unwrap();
 
-        // SPEC-3.14 item 3: a recipe that ran reports `Some(ok)` so `run_pre` times it.
+        // SPEC-3.14.4: a recipe that ran reports `Some(ok)` so `run_pre` times it.
         assert_eq!(install_hooks(dir.path()), Some(true));
 
         let hook = dir.path().join(".git/hooks/pre-commit");
@@ -15122,7 +15144,7 @@ mod tests {
         // whether or not `just` is installed.
         let dir = tempfile::tempdir().unwrap();
         git_in(dir.path(), &["init"]);
-        // SPEC-3.14 item 3: nothing ran, so there is no `hook_install` step.
+        // SPEC-3.14.4: nothing ran, so there is no `hook_install` step.
         assert_eq!(install_hooks(dir.path()), None);
         assert!(
             !dir.path().join(".git/hooks/pre-commit").exists(),
@@ -15282,7 +15304,7 @@ mod tests {
     /// command in a `git`/`fj` error), so the fence wrapping it in the
     /// collapsed detail must be longer than any backtick run already there.
     /// A conflict-resolution pass's own failure detail can carry
-    /// backticks (e.g. a quoted command from the SPEC-3.3.2 gate's cause),
+    /// backticks (e.g. a quoted command from the SPEC-3.3.20 through SPEC-3.3.25 gate's cause),
     /// so the fence wrapping it must be longer than any run already there.
     #[test]
     fn conflict_resolution_failed_comment_fences_a_detail_containing_backticks() {
@@ -15446,7 +15468,7 @@ mod tests {
                 lead.contains("https://dev.a8n.run/contoso/claude-run/pulls/42"),
                 "the draft PR must still be named outside <details>: {body}"
             );
-            // SPEC-3.12 item 6: the comment must name the one true action,
+            // SPEC-3.12.7: the comment must name the one true action,
             // never claim a human decision is pending when this issue is
             // about to retry on its own.
             if requeued {
@@ -15835,7 +15857,7 @@ mod tests {
 
     #[test]
     fn preserved_workdir_loses_target_even_when_not_gitignored() {
-        // SPEC-3.10 item 5: `target/` is stripped by this path explicitly, not
+        // SPEC-3.10.6: `target/` is stripped by this path explicitly, not
         // only as a side effect of `git clean -fdX` pruning gitignored
         // artifacts, so a repo with no `target/` entry in `.gitignore` (or a
         // build that writes outside the clean's reach) still loses it.
@@ -16834,7 +16856,7 @@ mod tests {
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
     }
 
-    /// SPEC-3.3.1: the generic claude-failure arm (crash, empty prompt, pre
+    /// SPEC-3.3.8 through SPEC-3.3.19: the generic claude-failure arm (crash, empty prompt, pre
     /// failure, operator cancel) opens no PR, but any commits the agent made
     /// before failing must still be pushed rather than left local-only.
     #[test]
@@ -16875,12 +16897,12 @@ mod tests {
             calls
                 .iter()
                 .any(|c| c == "git push --no-verify --set-upstream origin feat/x:feat/x"),
-            "a generic failure must still push the feature branch (SPEC-3.3.1): {calls:?}"
+            "a generic failure must still push the feature branch (SPEC-3.3.8 through SPEC-3.3.19): {calls:?}"
         );
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
     }
 
-    /// SPEC-3.3.1: a final-push failure on the generic failure arm must be
+    /// SPEC-3.3.8 through SPEC-3.3.19: a final-push failure on the generic failure arm must be
     /// folded into `pr_step` so it is distinguishable from the agent's own
     /// failure, and the comment must say the commits are still only local.
     #[test]
@@ -18445,7 +18467,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.14 item 3: the Postgres steps a `test-postgres`
+    /// SPEC-3.14.4: the Postgres steps a `test-postgres`
     /// process reported are read back, and become holes in the derived steps.
     #[test]
     fn child_postgres_steps_reads_the_span_file_and_returns_holes() {
@@ -18483,7 +18505,7 @@ mod tests {
         assert_eq!(holes, vec![(at(0), at(3)), (at(3), at(8))]);
     }
 
-    /// SPEC-3.14 item 3: the finalize-time bounded status read is
+    /// SPEC-3.14.4: the finalize-time bounded status read is
     /// stored as a `ci_wait` step, `ok` when the read answered.
     #[test]
     fn finalize_time_status_read_is_a_ci_wait_step() {
@@ -18599,6 +18621,58 @@ mod tests {
                 .iter()
                 .any(|c| c.contains(" pr merge ") || c.contains(" pr update ")),
             "a behind-base PR must be neither merged nor updated at finalize: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_merges_a_green_behind_base_pr_when_branch_up_to_date_is_dont_require() {
+        // `branch_up_to_date: dont_require` resolves without a forge
+        // lookup, so a behind-base PR merges directly at finalize instead of
+        // being left for the webhook/reconciler branch update.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
+            "fj",
+            &FINALIZE_PR_STATUS_ARGS,
+            r#"{"pr":7,"head_sha":"abc","state":"success","mergeable":true,"behind_base":true}"#,
+        ));
+        let forge = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
+        let mut src = automerge_src(10);
+        src.automerge.branch_up_to_date = crate::action::BranchUpToDate::DontRequire;
+        let res = finalize_automerge_case(&forge, &src, dir.path());
+        assert_eq!(res, code_review_pr7(true));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.contains(FINALIZE_PR_MERGE_CALL)),
+            "a behind-base PR must merge directly when branch_up_to_date is dont_require: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains(" pr update ")),
+            "dont_require must never update the branch first: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_leaves_a_green_behind_base_pr_when_branch_up_to_date_is_require() {
+        // `branch_up_to_date: require` keeps the pre-setting behavior: a
+        // behind-base PR is left for the webhook/reconciler branch update,
+        // same as the `match_forge` default against an unreadable forge.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
+            "fj",
+            &FINALIZE_PR_STATUS_ARGS,
+            r#"{"pr":7,"head_sha":"abc","state":"success","mergeable":true,"behind_base":true}"#,
+        ));
+        let forge = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
+        let mut src = automerge_src(10);
+        src.automerge.branch_up_to_date = crate::action::BranchUpToDate::Require;
+        let res = finalize_automerge_case(&forge, &src, dir.path());
+        assert_eq!(res, code_review_pr7(false));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains(" pr merge ") || c.contains(" pr update ")),
+            "a behind-base PR must be neither merged nor updated at finalize when require: {calls:?}"
         );
     }
 
@@ -20353,10 +20427,10 @@ mod tests {
     }
 
     /// A PR promoted to ready at finalize (`Finalized::CodeReview`)
-    /// has its row marked `finished`, so the automerge reconciler and the
-    /// Action-Run webhook decision path stop re-syncing it.
+    /// has its row marked `ready`, so the automerge reconciler and the
+    /// Action-Run webhook decision path evaluate it for merge.
     #[tokio::test]
-    async fn mark_finished_at_finalize_sets_the_recorded_row_finished() {
+    async fn mark_ready_at_finalize_sets_the_recorded_row_ready() {
         let pool = mem_pool().await;
         let forge = CliBackend::new(Arc::new(StubRunner::new()));
         let backend = CliBackend::new(Arc::new(StubRunner::new()));
@@ -20377,22 +20451,22 @@ mod tests {
             .await
             .unwrap()
             .expect("record_new_pr inserts a row");
-        assert!(!rec.finished, "not finished until finalize marks it");
+        assert!(!rec.ready, "not ready until finalize marks it");
 
-        mark_finished_at_finalize(&pool, &job(), 9).await;
+        mark_ready_at_finalize(&pool, &job(), 9).await;
 
         let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MX-16")
             .await
             .unwrap()
             .expect("record_new_pr inserts a row");
-        assert!(rec.finished);
+        assert!(rec.ready);
         assert_eq!(
             rec.state, "open",
-            "finished does not change state; a finished PR is still open until a human merges it"
+            "ready does not change state; a ready PR is still open until merged"
         );
     }
 
-    /// SPEC-3.3.1: a fresh job's PR left open as a draft by a
+    /// SPEC-3.3.8 through SPEC-3.3.19: a fresh job's PR left open as a draft by a
     /// gate failure has no recorded `agent_pull_requests` row yet (the
     /// `record_new_pr` call site in `process_job` only matches `CodeReview`,
     /// `TimedOut` and `ReviewFailed`); `mark_failed_at_finalize` records it
@@ -20412,7 +20486,7 @@ mod tests {
         assert!(rec.failed);
     }
 
-    /// SPEC-3.3.1: a resumed job's PR is already recorded, so
+    /// SPEC-3.3.8 through SPEC-3.3.19: a resumed job's PR is already recorded, so
     /// `mark_failed_at_finalize` marks that row by `resume.id` directly,
     /// whatever `pr_number`/`head_branch` the `Failed` outcome itself carries
     /// (every arm but the gate-failure one leaves them `None`).
@@ -20452,7 +20526,7 @@ mod tests {
         assert!(rec.failed);
     }
 
-    /// SPEC-3.3.1: the only way a PR's `failed` flag is ever
+    /// SPEC-3.3.8 through SPEC-3.3.19: the only way a PR's `failed` flag is ever
     /// cleared, a resumed run that finishes in Code Review.
     #[tokio::test]
     async fn clear_failed_at_resume_clears_a_previously_failed_row() {
@@ -20953,7 +21027,7 @@ mod tests {
         assert!(runner.calls.lock().unwrap().is_empty());
     }
 
-    // ---- SPEC-3.12 item 2: periodic sweep of stuck Working issues ----
+    // ---- SPEC-3.12.3: periodic sweep of stuck Working issues ----
 
     /// A `Working` issue with no `run_inflight_jobs` row for its action's
     /// open runs is moved to `Queued` (attempts below the cap) and gets
@@ -21135,7 +21209,7 @@ mod tests {
                 .any(|c| c == "yt issue set-field MX-22 AI Agent Needs Review"),
             "{calls:?}"
         );
-        // SPEC-3.12 item 6: the comment that parks the issue at Needs Review
+        // SPEC-3.12.7: the comment that parks the issue at Needs Review
         // must name the one action a human can take.
         assert!(
             calls.iter().any(|c| c.starts_with("yt issue comment MX-22")
@@ -21183,7 +21257,7 @@ mod tests {
 
     /// A tracker read failure (`yt list` erroring) is logged and changes
     /// nothing: no `set-field`, no comment, and the next tick still gets a
-    /// chance (SPEC-3.12 item 2: never treated as "nothing stuck").
+    /// chance (SPEC-3.12.3: never treated as "nothing stuck").
     #[tokio::test]
     async fn reconcile_stuck_working_tracker_read_failure_changes_nothing() {
         let pool = mem_pool().await;
@@ -21986,7 +22060,7 @@ mod tests {
         );
     }
 
-    // --- SPEC-3.12 item 9: discard-and-retry-once ---
+    // --- SPEC-3.12.10: discard-and-retry-once ---
 
     #[test]
     fn run_review_session_with_retry_discards_a_modified_tracked_file_then_promotes_on_pass() {
@@ -22145,7 +22219,7 @@ mod tests {
         repo_with_commit(dir.path());
         let scratch = tempfile::tempdir().unwrap();
         // Writes neither marker but never touches the workdir: an ordinary
-        // no-verdict that SPEC-3.12 item 9 does not single out for a retry.
+        // no-verdict that SPEC-3.12.10 does not single out for a retry.
         let stub = review_stub(
             scratch.path(),
             &format!("#!/bin/sh\nprintf '%s\\n' '{REVIEW_RESULT_OK}'\nexit 0\n"),
@@ -22249,7 +22323,7 @@ mod tests {
         assert!(prompt.contains("no Edit, no Write"));
     }
 
-    /// SPEC-3.16 item 2: the prompt tells the session to write its full
+    /// SPEC-3.16.3: the prompt tells the session to write its full
     /// sweep to the evidence file and keep the marker itself to bullets.
     #[test]
     fn build_review_prompt_names_the_evidence_file_and_caps_the_marker_to_bullets() {
@@ -22308,7 +22382,7 @@ mod tests {
         }
     }
 
-    /// SPEC-3.16 item 1: a marker with more findings than the cap allows is
+    /// SPEC-3.16.2: a marker with more findings than the cap allows is
     /// truncated to 5 total bullets, the final bullet names the dropped
     /// count and links the evidence file, and the drop is logged at `warn`
     /// with the issue key.
@@ -22344,7 +22418,7 @@ mod tests {
         assert!(logs.contains("MX-16"), "{logs}");
     }
 
-    /// SPEC-3.16 items 1 and 2: `cap_verdict_outcome` applies the cap to
+    /// SPEC-3.16.2 and SPEC-3.16.3: `cap_verdict_outcome` applies the cap to
     /// both `Pass` and `Fail` text, leaves `NoVerdict` untouched, and the
     /// non-overflow case appends a single evidence-link bullet rather than
     /// truncating anything.
@@ -23742,7 +23816,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.12 item 3: the field category `finalize` writes for a given
+    /// SPEC-3.12.4: the field category `finalize` writes for a given
     /// [`Finalized`] outcome, named generically (the SPEC table's own
     /// vocabulary, not an action's configured label text) so the match in
     /// [`finalized_outcomes_cover_every_spec_3_12_row`] below is exhaustive
@@ -23751,7 +23825,7 @@ mod tests {
     /// error, so a finalize path can never ship uncovered by this table.
     ///
     /// `DeliveryBlocked` is a refinement layered on top of the
-    /// item 3 table after it was written: each reason substitutes for the
+    /// SPEC-3.12.4 table after it was written: each reason substitutes for the
     /// table row it replaces (named per-arm below) with an operator
     /// label that falls back to `Needs Review`, and carries its own single
     /// named action (`delivery_blocked_comment`). It is asserted here as
@@ -23815,7 +23889,7 @@ mod tests {
         }
     }
 
-    /// SPEC-3.12 item 3: one sample outcome per table row (plus every
+    /// SPEC-3.12.4: one sample outcome per table row (plus every
     /// `DeliveryBlockedReason`), asserting the field category
     /// [`spec_3_12_field_category`] assigns it. The match that function
     /// contains has no wildcard arm, so this test (and every other caller)

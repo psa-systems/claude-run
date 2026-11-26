@@ -1,4 +1,4 @@
-//! SPEC-8.2: CLI backend: implements [`IssueTracker`] + [`Forge`] over the host `yt` /
+//! SPEC-8.2.1 through SPEC-8.2.4: CLI backend: implements [`IssueTracker`] + [`Forge`] over the host `yt` /
 //! `fj` binaries, parsing their `--json` output and mapping failures to typed
 //! errors. No raw REST.
 //!
@@ -30,7 +30,7 @@ struct PrSearchResponse {
 /// 5s, for a worst-case added delay of 7s across four attempts total. Shared
 /// by every binary-neutral read-retry caller (`fj` and `gh` reads alike) so
 /// there is one copy of the schedule.
-/// SPEC-8.4: read-only CLI retry schedule, shared by `fj` and `gh` reads.
+/// SPEC-8.4.1 through SPEC-8.4.3: read-only CLI retry schedule, shared by `fj` and `gh` reads.
 pub(crate) const DEFAULT_READ_RETRY_WAITS: [Duration; 3] = [
     Duration::from_secs(0),
     Duration::from_secs(2),
@@ -57,7 +57,7 @@ fn stderr_tail(stderr: &str) -> &str {
         .unwrap_or("no stderr")
 }
 
-/// SPEC-8.4: run a read-only CLI invocation with up to four attempts total, waiting
+/// SPEC-8.4.1 through SPEC-8.4.3: run a read-only CLI invocation with up to four attempts total, waiting
 /// `waits[0]` / `waits[1]` / `waits[2]` before attempts 2, 3 and 4 (/// generalized beyond `fj`). A failed attempt is a runner
 /// `Ok(out)` with `!out.ok`: any non-zero exit is retried on the exit code
 /// alone, never by classifying `stderr`'s wording (forbidden by
@@ -167,6 +167,24 @@ fn pr_create_error_with_lookup(
 /// Derive a PR number from a forge PR URL's trailing
 /// `/pulls/<n>` (Forgejo) or `/pull/<n>` (GitHub-style) segment. Used only as a
 /// fallback when `fj pr create --json` omits the `number` field.
+/// Match a branch-protection rule name against a branch, where the rule name
+/// may be a literal branch name or a glob using `*` (any run of characters,
+/// including none) and `?` (exactly one character). Used to find which rule
+/// governs a PR's base branch when no rule name matches it exactly.
+fn glob_match(pattern: &str, candidate: &str) -> bool {
+    fn rec(pat: &[char], text: &[char]) -> bool {
+        match pat.first() {
+            None => text.is_empty(),
+            Some('*') => rec(&pat[1..], text) || (!text.is_empty() && rec(pat, &text[1..])),
+            Some('?') => !text.is_empty() && rec(&pat[1..], &text[1..]),
+            Some(c) => text.first() == Some(c) && rec(&pat[1..], &text[1..]),
+        }
+    }
+    let pat: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = candidate.chars().collect();
+    rec(&pat, &text)
+}
+
 fn number_from_pr_url(url: &str) -> Option<u64> {
     let rest = url
         .rsplit_once("/pulls/")
@@ -314,7 +332,7 @@ fn accepts_continuation(line: &str) -> bool {
 /// ending in a hard break (two or more trailing spaces, or a backslash) is
 /// never joined to by the line after it. Infallible, introduces no new error
 /// path.
-/// SPEC-8.7: rejoin a hard-wrapped PR body back to one line per paragraph.
+/// SPEC-8.7.1 through SPEC-8.7.5: rejoin a hard-wrapped PR body back to one line per paragraph.
 fn unwrap_prose(body: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut in_fence = false;
@@ -455,11 +473,11 @@ impl CommandRunner for ProcessRunner {
     }
 }
 
-/// SPEC-3.12 item 4: a bounded, one-shot pass that resolves a real merge
+/// SPEC-3.12.5: a bounded, one-shot pass that resolves a real merge
 /// conflict found while landing the final push, in the same clone, instead
 /// of the runner aborting the merge immediately. The real implementation (a
 /// `claude` invocation with budget, timeout and cancellation, followed by
-/// the SPEC-3.3.2 verification gate) lives in `native::youtrack`, which
+/// the SPEC-3.3.20 through SPEC-3.3.25 verification gate) lives in `native::youtrack`, which
 /// alone owns `ClaudeInvoker`; this provider-layer trait is the seam that
 /// lets [`CliBackend::merge_remote_branch`] call it without this module
 /// depending on that layer. `workdir` has a conflicted merge in progress
@@ -505,13 +523,12 @@ pub struct CliBackend {
     /// [`crate::provider::GIT_NETWORK_RETRY_WAITS`]; overridable so tests run
     /// with no delay.
     git_retry_waits: [Duration; 3],
-    /// SPEC-3.12 item 4: the bounded conflict-resolution pass to try before
+    /// SPEC-3.12.5: the bounded conflict-resolution pass to try before
     /// [`Self::merge_remote_branch`] aborts a conflicted merge. `None` (the
     /// default) keeps that method aborting on the first conflict exactly as
     /// it always has.
     conflict_resolver: Option<Arc<dyn ConflictResolver>>,
-    /// Caps the pass to one attempt per `CliBackend` instance (SPEC-3.12
-    /// item 4: "a second divergence ... aborts the merge as before"), since
+    /// Caps the pass to one attempt per `CliBackend` instance (SPEC-3.12.5: "a second divergence ... aborts the merge as before"), since
     /// one instance lives for exactly one job attempt.
     conflict_resolve_spent: std::sync::atomic::AtomicBool,
 }
@@ -762,7 +779,7 @@ impl CliBackend {
         self
     }
 
-    /// Inject the SPEC-3.12 item 4 bounded conflict-resolution pass (the
+    /// Inject the SPEC-3.12.5 bounded conflict-resolution pass (the
     /// real `native::youtrack` implementation in production, a stub in
     /// tests). Leaving this unset keeps [`Self::merge_remote_branch`]
     /// aborting a conflicted merge on first sight, exactly as before this
@@ -964,7 +981,7 @@ impl CliBackend {
     /// outcome, because `cleanup_or_preserve` makes the keep-or-delete
     /// decision later, from its own check of the workdir, and can legitimately
     /// delete the directory.
-    /// SPEC-8.7: validates the tip subject before any push or PR-create call.
+    /// SPEC-8.7.1 through SPEC-8.7.5: validates the tip subject before any push or PR-create call.
     fn create_pr_branch(
         &self,
         workdir: &Path,
@@ -1106,7 +1123,7 @@ impl CliBackend {
     /// caller now passes the salvage signal explicitly instead. The failure,
     /// if any, is recorded on `pr` rather than propagated: a failed comment
     /// must never fail, retry, or roll back the push it reports on.
-    /// SPEC-8.8: the shared push-comment call every runner write to a PR
+    /// SPEC-8.8.1 through SPEC-8.8.2: the shared push-comment call every runner write to a PR
     /// branch makes.
     #[allow(clippy::too_many_arguments)]
     fn post_branch_push_comment(
@@ -1149,7 +1166,7 @@ impl CliBackend {
                 return;
             }
         };
-        // SPEC-3.15 item 6, SPEC-8.8: the list is rendered from stored rows.
+        // SPEC-3.15.7, SPEC-8.8.1 through SPEC-8.8.2: the list is rendered from stored rows.
         let progress = crate::progress_list::render_push(&issue_key, event);
         let ctx = crate::push_comment::PushCommentContext {
             event,
@@ -1358,7 +1375,7 @@ impl CliBackend {
     /// create succeeds without forcing it, and a rejected update (which can
     /// only happen on a later call reusing the same workdir) is a real signal
     /// worth surfacing rather than overwriting.
-    /// SPEC-8.5: a retried, per-invocation-authenticated git network call.
+    /// SPEC-8.5.1 through SPEC-8.5.3: a retried, per-invocation-authenticated git network call.
     fn fetch_branch(&self, workdir: &Path, branch: &str, token_url: Option<&str>) -> Result<()> {
         let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
         let args = ["fetch", "origin", refspec.as_str()];
@@ -1396,7 +1413,7 @@ impl CliBackend {
         }
     }
 
-    /// SPEC-3.12 item 4: the files `git` still lists as unmerged while a
+    /// SPEC-3.12.5: the files `git` still lists as unmerged while a
     /// merge conflict is open, named in the `Needs Review` comment when the
     /// conflict-resolution pass does not clear them, and used to
     /// independently verify a resolver's claimed success rather than
@@ -1468,7 +1485,7 @@ impl CliBackend {
             "merging the remote branch into the local work conflicted"
         );
 
-        // SPEC-3.12 item 4: before aborting, give the configured resolver
+        // SPEC-3.12.5: before aborting, give the configured resolver
         // one bounded pass per `CliBackend` instance (i.e. per attempt).
         // With no resolver configured, or the cap already spent (a second
         // divergence in this same clone), this falls straight through to
@@ -1486,7 +1503,7 @@ impl CliBackend {
                 info!(
                     branch = %branch,
                     files = %files.join(", "),
-                    "dispatching the bounded conflict-resolution pass (SPEC-3.12 item 4)"
+                    "dispatching the bounded conflict-resolution pass (SPEC-3.12.5)"
                 );
                 let outcome = resolver
                     .resolve(workdir, branch, local_sha, remote_sha)
@@ -1568,9 +1585,9 @@ impl CliBackend {
     /// current checkout. Never forced: a rejected non-fast-forward push is a
     /// real-divergence signal the caller has already ruled out before calling.
     /// Always `--no-verify`: the runner never runs the repo's `pre-push` hook
-    /// on any push of an agent's feature branch, since the SPEC-3.3.2
+    /// on any push of an agent's feature branch, since the SPEC-3.3.20 through SPEC-3.3.25
     /// verification gate is the only post-agent full-suite run.
-    /// SPEC-8.5: a retried, per-invocation-authenticated git network call.
+    /// SPEC-8.5.1 through SPEC-8.5.3: a retried, per-invocation-authenticated git network call.
     fn push_branch(&self, workdir: &Path, branch: &str, token_url: Option<&str>) -> Result<()> {
         let refspec = format!("{branch}:{branch}");
         let push_args = [
@@ -1624,7 +1641,7 @@ impl CliBackend {
     /// none" with a warn plus an operator-visible notice. The degraded path can
     /// race a PR that already exists, so a create rejected as already-existing
     /// retries the lookup exactly once and adopts what it finds.
-    /// SPEC-8.10: adopt an open PR when the lookup resolves one, degrade to
+    /// SPEC-8.10.1 through SPEC-8.10.2: adopt an open PR when the lookup resolves one, degrade to
     /// create on a failed lookup, and retry the lookup once on "already exists".
     fn find_or_create_pr(
         &self,
@@ -1768,8 +1785,8 @@ impl CliBackend {
     /// branch ahead of base. Without that guard a run with no commits still
     /// succeeded here (`-aA` pushes the base tip and autofills from an unrelated
     /// commit), and the issue was moved to `AI Agent = Code Review`.
-    /// SPEC-8.7: validates the tip subject before AGit pushes anything;
-    /// SPEC-8.8: posts the push comment on success.
+    /// SPEC-8.7.1 through SPEC-8.7.5: validates the tip subject before AGit pushes anything;
+    /// SPEC-8.8.1 through SPEC-8.8.2: posts the push comment on success.
     fn create_pr_agit(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
         // The subject guard runs before `fj` pushes anything.
         // The body guard runs alongside it.
@@ -1818,7 +1835,7 @@ impl CliBackend {
     /// Probe that both CLIs are invokable (`<bin> --version`). Used by the
     /// factory to decide whether this backend is usable. A missing binary
     /// surfaces as [`Error::CliNotFound`].
-    /// SPEC-8.2: the probe [`super::resolve`] uses to decide this backend is usable.
+    /// SPEC-8.2.1 through SPEC-8.2.4: the probe [`super::resolve`] uses to decide this backend is usable.
     pub fn probe(&self) -> Result<()> {
         self.runner.run(&self.yt, &["--version"])?;
         self.runner.run(&self.fj, &["--version"])?;
@@ -1996,7 +2013,7 @@ impl CliBackend {
         Self::checked_redacting(binary, out, args, &[])
     }
 
-    /// SPEC-8.6: [`Self::checked`] for a call that ran with credentials: `secrets` are
+    /// SPEC-8.6.1 through SPEC-8.6.5: [`Self::checked`] for a call that ran with credentials: `secrets` are
     /// masked out of the failure text. A failure carries the tail of stdout after
     /// stderr, because a `pre-push` hook writes its test report there.
     fn checked_redacting(
@@ -2120,7 +2137,7 @@ impl IssueTracker for CliBackend {
         Ok(parsed.name)
     }
 
-    /// SPEC-3.12 item 7: the `Estimation` read backing the pickup-time
+    /// SPEC-3.12.8: the `Estimation` read backing the pickup-time
     /// estimate-vs-session-timeout check.
     fn get_estimation_minutes(&self, key: &str) -> Result<Option<i64>> {
         let stdout = self.yt_ok(&["issue", "get-field", key, "Estimation", "--json"])?;
@@ -2390,7 +2407,7 @@ impl Forge for CliBackend {
     /// checkpointing for the rest of the run. This also means the default
     /// branch itself is never a push target: `resolve_feature_branch` only
     /// ever resolves to a branch strictly ahead of it.
-    /// SPEC-8.8: posts the push comment after the checkpoint push lands.
+    /// SPEC-8.8.1 through SPEC-8.8.2: posts the push comment after the checkpoint push lands.
     fn checkpoint_push(
         &self,
         workdir: &Path,
@@ -2419,7 +2436,7 @@ impl Forge for CliBackend {
             let public_url = crate::run_footer::resolved_public_url();
             match self.git_dir_scratch(workdir) {
                 Ok(scratch) => {
-                    // SPEC-3.15 item 6, SPEC-8.8: the watcher stashed the stored
+                    // SPEC-3.15.7, SPEC-8.8.1 through SPEC-8.8.2: the watcher stashed the stored
                     // rows for this key just before the push.
                     let progress = crate::progress_list::render_push(
                         issue_key,
@@ -2451,11 +2468,11 @@ impl Forge for CliBackend {
         Ok(Some(pr))
     }
 
-    /// SPEC-3.3.1's final push: see [`Forge::final_push`]. Shares
+    /// SPEC-3.3.8 through SPEC-3.3.19's final push: see [`Forge::final_push`]. Shares
     /// [`Self::resolve_feature_branch`] / [`Self::remote_branch_sha`] with
     /// [`Self::checkpoint_push`] for the "nothing to push" degrade. Opens no
     /// PR. Like every other runner push of the agent branch, this never runs
-    /// the repo's `pre-push` hook: the SPEC-3.3.2 verification
+    /// the repo's `pre-push` hook: the SPEC-3.3.20 through SPEC-3.3.25 verification
     /// gate is the only post-agent full-suite run.
     fn final_push(
         &self,
@@ -2561,7 +2578,7 @@ impl Forge for CliBackend {
     /// [`crate::provider::validate_pr_subject`], and overwrites the PR with
     /// `fj pr edit <id> title` then `fj pr edit <id> body` (/// `fj` has no `--title`/`--body-file` flags on `pr edit`).
     /// A failed body edit after a successful title edit names the body step.
-    /// SPEC-8.7: re-derives title/body from the branch's current tip.
+    /// SPEC-8.7.1 through SPEC-8.7.5: re-derives title/body from the branch's current tip.
     fn refresh_pr_text(
         &self,
         workdir: &Path,
@@ -2611,7 +2628,7 @@ impl Forge for CliBackend {
         self.notices.lock().unwrap().push(message);
     }
 
-    /// SPEC-8.9: two probes, one per scope category the PR path
+    /// SPEC-8.9.1 through SPEC-8.9.2: two probes, one per scope category the PR path
     /// crosses (`actions/SCHEMA.md`, "Forgejo token scopes").
     ///
     /// 1. `fj --host <host> repo view <owner/repo> --json` (repository read). A
@@ -2777,6 +2794,56 @@ impl Forge for CliBackend {
         Ok(())
     }
 
+    fn branch_requires_up_to_date(
+        &self,
+        host: &str,
+        repo: &str,
+        base_ref: &str,
+    ) -> Result<Option<bool>> {
+        let args = [
+            "--host",
+            host,
+            "repo",
+            "branch-protection",
+            repo,
+            "list",
+            "--json",
+        ];
+        let out = self.run_fj_read(None, &args, &self.fj_envs()).map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "reading branch-protection rules for `{repo}` (base `{base_ref}`) at {host} failed: {e}"
+            ))
+        })?;
+        let stdout = Self::checked(&self.fj, out, &args).map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "reading branch-protection rules for `{repo}` (base `{base_ref}`) at {host} failed: {e}"
+            ))
+        })?;
+        #[derive(Deserialize)]
+        struct BranchProtectionRule {
+            rule_name: String,
+            #[serde(default)]
+            block_on_outdated_branch: bool,
+        }
+        let rules: Vec<BranchProtectionRule> = Self::parse_json(
+            &self.fj,
+            "fj repo branch-protection list --json",
+            &stdout,
+        )
+        .map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "parsing branch-protection rules for `{repo}` (base `{base_ref}`) at {host} failed: {e}"
+            ))
+        })?;
+        let rule = rules
+            .iter()
+            .find(|r| r.rule_name == base_ref)
+            .or_else(|| rules.iter().find(|r| glob_match(&r.rule_name, base_ref)));
+        Ok(Some(
+            rule.map(|r| r.block_on_outdated_branch).unwrap_or(false),
+        ))
+    }
+
     fn repo_permission(&self, host: &str, repo: &str, username: &str) -> Result<String> {
         // `fj repo collaborator <owner>/<repo> permission <user>
         // --format json` answers `{"username":..,"permission":..,"role_name":..}`.
@@ -2903,7 +2970,7 @@ impl Backend for CliBackend {
     }
 }
 
-/// SPEC-3.5: every forge read the CI-failure actions make, all
+/// SPEC-3.5.1 through SPEC-3.5.18: every forge read the CI-failure actions make, all
 /// through `fj`, so each action holds ONE client:
 ///
 /// - [`ActionLogClient`] -> `fj actions logs`, the ONE path a run's logs are read
@@ -3452,6 +3519,66 @@ mod tests {
 
     fn backend(runner: StubRunner) -> CliBackend {
         CliBackend::new(Arc::new(runner))
+    }
+
+    #[test]
+    fn glob_match_exact_and_wildcards() {
+        assert!(glob_match("main", "main"));
+        assert!(!glob_match("main", "develop"));
+        assert!(glob_match("release/*", "release/1.0"));
+        assert!(!glob_match("release/*", "main"));
+        assert!(glob_match("*-stable", "v2-stable"));
+        assert!(glob_match("rel-?-x", "rel-1-x"));
+        assert!(!glob_match("rel-?-x", "rel-12-x"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn branch_requires_up_to_date_matches_exact_then_glob_then_default_false() {
+        let json = r#"[
+            {"rule_name": "release/*", "block_on_outdated_branch": true},
+            {"rule_name": "main", "block_on_outdated_branch": false}
+        ]"#;
+        let args = [
+            "--host",
+            "dev.example.org",
+            "repo",
+            "branch-protection",
+            "acme/widgets",
+            "list",
+            "--json",
+        ];
+        let b = CliBackend::new(Arc::new(StubRunner::new().ok("fj", &args, json)));
+        assert_eq!(
+            b.branch_requires_up_to_date("dev.example.org", "acme/widgets", "main")
+                .unwrap(),
+            Some(false),
+            "exact match wins"
+        );
+        assert_eq!(
+            b.branch_requires_up_to_date("dev.example.org", "acme/widgets", "release/1.0")
+                .unwrap(),
+            Some(true),
+            "glob match used when no exact rule"
+        );
+        assert_eq!(
+            b.branch_requires_up_to_date("dev.example.org", "acme/widgets", "develop")
+                .unwrap(),
+            Some(false),
+            "no matching rule defaults to false"
+        );
+    }
+
+    #[test]
+    fn branch_requires_up_to_date_surfaces_read_failures() {
+        let b = CliBackend::new(Arc::new(StubRunner::new()));
+        let err = b
+            .branch_requires_up_to_date("dev.example.org", "acme/widgets", "main")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("acme/widgets"));
+        assert!(msg.contains("main"));
     }
 
     #[test]
@@ -6930,7 +7057,7 @@ mod tests {
 
     /// Test double for [`ConflictResolver`]: simulates the pass failing
     /// outright (an unsafe conflict, a `claude` crash, a failed
-    /// SPEC-3.3.2 gate), leaving the conflicted merge exactly as
+    /// SPEC-3.3.20 through SPEC-3.3.25 gate), leaving the conflicted merge exactly as
     /// `merge_remote_branch` handed it over.
     struct FailingTestResolver;
 
@@ -6948,7 +7075,7 @@ mod tests {
         }
     }
 
-    /// Shared setup for the two SPEC-3.12 item 4 real-conflict tests below:
+    /// Shared setup for the two SPEC-3.12.5 real-conflict tests below:
     /// two clones of the same origin both edit `g.txt`, diverging with a
     /// genuine content conflict (not merely divergent history), then
     /// returns `(origin, workdir, local_sha, remote_sha)`.
@@ -7036,7 +7163,7 @@ mod tests {
         (origin, workdir, local_sha, remote_sha)
     }
 
-    /// SPEC-3.12 item 4, acceptance criterion 1: two clones editing the same
+    /// SPEC-3.12.5, acceptance criterion 1: two clones editing the same
     /// file produce a real conflict; the configured resolver resolves it and
     /// concludes the merge, and the caller's subsequent push is a plain
     /// fast-forward with no `--force`.
@@ -7102,7 +7229,7 @@ mod tests {
         assert_eq!(pushed_sha, merged_local_sha);
     }
 
-    /// SPEC-3.12 item 4, acceptance criterion 2: a resolver that fails
+    /// SPEC-3.12.5, acceptance criterion 2: a resolver that fails
     /// leaves the merge aborted exactly as the no-resolver path always has,
     /// preserves the local work untouched, and the returned error names the
     /// conflicting file and both SHAs.

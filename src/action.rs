@@ -4,9 +4,9 @@
 //! code plus an optional interpreter; the runner shells out to that interpreter
 //! (default `nu`) to execute it (see `crate::snippet`).
 //!
-//! Implements SPEC-3.1 (action file discovery, kinds, schedule, limits), with
+//! Implements SPEC-3.1.1 through SPEC-3.1.12 (action file discovery, kinds, schedule, limits), with
 //! the YouTrack- and closed-issue-summary-specific config types also citing
-//! SPEC-3.3 / SPEC-3.4 where they carry that action's own schema. A type-level
+//! SPEC-3.3.1 through SPEC-3.3.25 / SPEC-3.4.1 where they carry that action's own schema. A type-level
 //! citation covers its own accessor methods unless one is annotated
 //! separately.
 
@@ -29,7 +29,7 @@ use crate::error::{Error, Result};
 /// `shell` defaults to `nu` when omitted. The interpreter is a bare binary
 /// name resolved on `PATH` (no arguments).
 ///
-/// SPEC-3.1: "each script is a plain string or `{run, shell}`, with `nu` as
+/// SPEC-3.1.1 through SPEC-3.1.12: "each script is a plain string or `{run, shell}`, with `nu` as
 /// the default interpreter".
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -83,7 +83,7 @@ impl From<&str> for Script {
 /// to a built-in Rust handler and supply a typed [`NativeConfig`] under
 /// `native` instead of the script-bearing fields.
 ///
-/// SPEC-3.1: "Action kinds: `scripted` (default), `youtrack`,
+/// SPEC-3.1.1 through SPEC-3.1.12: "Action kinds: `scripted` (default), `youtrack`,
 /// `closed-issue-summary`. A native kind requires a matching `native` block."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,7 +136,7 @@ impl ActionKind {
 /// `native:` holds the variant's fields directly (e.g. the `youtrack` blocks
 /// under `native:`) rather than re-tagging the variant in YAML.
 ///
-/// SPEC-3.1: "A native kind requires a matching `native` block."
+/// SPEC-3.1.1 through SPEC-3.1.12: "A native kind requires a matching `native` block."
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum NativeConfig {
@@ -185,7 +185,7 @@ impl NativeConfig {
 /// [`crate::secrets`]. When neither block sets a `token_ref` the
 /// CLIs use host auth, exactly as the scripted action did.
 ///
-/// SPEC-3.3 / SPEC-3.3.1: schema backing the YouTrack action's gather,
+/// SPEC-3.3.1 through SPEC-3.3.25 / SPEC-3.3.8 through SPEC-3.3.19: schema backing the YouTrack action's gather,
 /// pre/finalize and forge-target requirements.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -206,7 +206,7 @@ pub struct YoutrackConfig {
 
 /// YouTrack-side settings for the native handler.
 ///
-/// SPEC-3.3: gather query, custom field, states, prompt source and
+/// SPEC-3.3.1 through SPEC-3.3.25: gather query, custom field, states, prompt source and
 /// write-projects.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -277,7 +277,7 @@ pub struct YoutrackSource {
     pub tags: Tags,
     /// Install the repo's own git hooks (`just install-hooks`) on the fresh
     /// clone during `run_pre`. Enabled by default; `false` skips the install
-    /// so the agent's commits are only checked by the `SPEC-3.3.2`
+    /// so the agent's commits are only checked by the `SPEC-3.3.20` through `SPEC-3.3.25`
     /// verification gate and CI, which still run unconditionally.
     #[serde(skip_serializing_if = "is_true")]
     pub install_hooks: bool,
@@ -343,7 +343,7 @@ impl YoutrackSource {
     /// `audit_project` alone re-derives both the audit and worker queries
     /// without hand-editing either query string.
     ///
-    /// SPEC-3.3: "query the tracker with `native.youtrack.query` ... with the
+    /// SPEC-3.3.1 through SPEC-3.3.25: "query the tracker with `native.youtrack.query` ... with the
     /// placeholder `{{audit_project}}` replaced by `audit_project`".
     pub fn resolved_query(&self) -> String {
         self.query.replace("{{audit_project}}", &self.audit_project)
@@ -353,7 +353,7 @@ impl YoutrackSource {
 /// Built-in agent prompt a `kind: youtrack` action uses when it sets no
 /// `prompt` override. The text lives in the binary, not in the action YAML.
 ///
-/// SPEC-3.3.1: "Prompt: `prompt` overrides; otherwise `prompt_preset` is
+/// SPEC-3.3.8 through SPEC-3.3.19: "Prompt: `prompt` overrides; otherwise `prompt_preset` is
 /// `default` or `audit`."
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -410,7 +410,7 @@ impl std::fmt::Display for PromptSource {
 /// `parent for` (Subtask OUTWARD, an open child), never `is required for` /
 /// `subtask of`.
 ///
-/// SPEC-3.3: "the dependency gate must pass. The dependency gate blocks on
+/// SPEC-3.3.1 through SPEC-3.3.25: "the dependency gate must pass. The dependency gate blocks on
 /// open issues linked by the configured verbs ..., leaves the issue queued,
 /// comments the blockers once, and re-evaluates after `recheck_timeout`."
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -461,7 +461,7 @@ fn default_block_on() -> Vec<String> {
 
 /// Tag names written alongside an AI Agent value.
 ///
-/// SPEC-3.3: "field set to needs-review, no PR, `Needs-Info` tag added (name
+/// SPEC-3.3.1 through SPEC-3.3.25: "field set to needs-review, no PR, `Needs-Info` tag added (name
 /// configurable under `tags.needs_info`)".
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -471,7 +471,7 @@ pub struct Tags {
     /// value. An empty value disables the tag write; the attempt-cap park and
     /// the in-run claude timeout/cancel park (which also set `Needs Review`)
     /// never write this tag. The pre-pickup estimate-over-timeout park
-    /// (`SPEC-3.12` item 7) does write it: that park names a decision (split
+    /// (`SPEC-3.12.8`) does write it: that park names a decision (split
     /// the issue or raise the limit), same as the marker path.
     pub needs_info: String,
 }
@@ -500,7 +500,7 @@ impl Tags {
 /// advances the issue to Done. Disabled by default, leaving the existing
 /// stop-at-Code-Review behavior unchanged.
 ///
-/// SPEC-3.3.1: "Optional `automerge` (default off): ... A reconciler every 300
+/// SPEC-3.3.8 through SPEC-3.3.19: "Optional `automerge` (default off): ... A reconciler every 300
 /// seconds and action-success webhooks drive the same decision for recorded
 /// agent PRs."
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -521,6 +521,57 @@ pub struct Automerge {
     /// falls back to Code Review, leaving the merge to the webhook and the
     /// reconciler. `0` skips the finalize-time merge entirely.
     pub finalize_status_timeout_secs: u64,
+    /// Whether a green, mergeable PR must have an up-to-date base branch
+    /// before it is automerged. `MatchForge` (the default) follows the
+    /// forge's own branch-protection rule for the PR's base branch;
+    /// `Require` always brings a behind-base branch current first (the
+    /// historical behavior); `DontRequire` merges a behind-base PR directly
+    /// and never calls [`crate::provider::Forge::update_pr_branch`]. Applied
+    /// identically by the webhook/reconciler decision in
+    /// `apply_automerge_decision` and by the finalize-time merge condition in
+    /// `src/native/youtrack.rs`.
+    pub branch_up_to_date: BranchUpToDate,
+}
+
+/// [`Automerge::branch_up_to_date`]'s setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchUpToDate {
+    /// Follow the forge's own branch-protection rule for the PR's base
+    /// branch. On Forgejo this reads `block_on_outdated_branch` off the
+    /// matching branch-protection rule; on GitHub, where that rule is not
+    /// readable through `gh`, this behaves as [`BranchUpToDate::DontRequire`].
+    #[default]
+    MatchForge,
+    /// Always require the branch to be up to date before merging: update a
+    /// behind-base branch and wait for the next green run, the behavior this
+    /// setting replaces when absent.
+    Require,
+    /// Never require the branch to be up to date: merge a green, mergeable,
+    /// behind-base PR directly.
+    DontRequire,
+}
+
+impl BranchUpToDate {
+    /// The snake_case wire / web-form value, matching the serde
+    /// `rename_all` encoding.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BranchUpToDate::MatchForge => "match_forge",
+            BranchUpToDate::Require => "require",
+            BranchUpToDate::DontRequire => "dont_require",
+        }
+    }
+
+    /// Parse a web-form value. An empty or unrecognized value falls back to
+    /// the default ([`BranchUpToDate::MatchForge`]).
+    pub fn from_form_value(s: &str) -> Self {
+        match s {
+            "require" => BranchUpToDate::Require,
+            "dont_require" => BranchUpToDate::DontRequire,
+            _ => BranchUpToDate::MatchForge,
+        }
+    }
 }
 
 /// [`Automerge::finalize_status_timeout_secs`]'s default.
@@ -533,6 +584,7 @@ impl Default for Automerge {
             wait_seconds: 1800,
             check_interval_seconds: 30,
             finalize_status_timeout_secs: DEFAULT_FINALIZE_STATUS_TIMEOUT_SECS,
+            branch_up_to_date: BranchUpToDate::default(),
         }
     }
 }
@@ -572,7 +624,7 @@ fn is_default_audit_target_type(v: &str) -> bool {
 /// The AI Agent (and standard `State`) values the handler reads and writes.
 /// Defaults match the merged scripted action's hardcoded labels.
 ///
-/// SPEC-3.3: the queued/working/code-review/needs-review/failed/done/no-code
+/// SPEC-3.3.1 through SPEC-3.3.25: the queued/working/code-review/needs-review/failed/done/no-code
 /// labels this section's finalize-path bullets name by role, not by literal
 /// string.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -673,7 +725,7 @@ impl YoutrackStates {
 /// creation (exactly one local branch ahead of the base), so neither can open a
 /// PR for a run that produced no commits.
 ///
-/// SPEC-3.3.1: "Targets: `forgejo` (`base_url`, `token_ref`, `pr_strategy`)".
+/// SPEC-3.3.8 through SPEC-3.3.19: "Targets: `forgejo` (`base_url`, `token_ref`, `pr_strategy`)".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PrStrategy {
@@ -709,7 +761,7 @@ impl PrStrategy {
 
 /// Forgejo-side settings for the native handler.
 ///
-/// SPEC-3.3.1: "Targets: `forgejo` (`base_url`, `token_ref`, `pr_strategy`)
+/// SPEC-3.3.8 through SPEC-3.3.19: "Targets: `forgejo` (`base_url`, `token_ref`, `pr_strategy`)
 /// ... any other host uses `fj`."
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -734,7 +786,7 @@ pub struct ForgejoTarget {
 /// every field is optional and defaults so existing Forgejo actions validate
 /// and behave identically.
 ///
-/// SPEC-3.3.1: "`github` (`hosts`, `mcp_endpoint`, `token_ref`). A job whose
+/// SPEC-3.3.8 through SPEC-3.3.19: "`github` (`hosts`, `mcp_endpoint`, `token_ref`). A job whose
 /// repository host is `github.com` or listed in `github.hosts` uses the
 /// GitHub backend; any other host uses `fj`."
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -801,7 +853,7 @@ pub fn default_github_mcp_endpoint() -> String {
 /// variant from the other native configs under the untagged `native:` block, so
 /// a shipped action MUST set at least one of them.
 ///
-/// SPEC-3.4: schema backing the closed-issue summary action's targets, window,
+/// SPEC-3.4.1: schema backing the closed-issue summary action's targets, window,
 /// rendering and idempotency-marker requirements.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -868,7 +920,7 @@ impl Default for ClosedIssueSummaryConfig {
     }
 }
 
-/// SPEC-3.1: "An action is a YAML file `*.yml` in `<config dir>/actions/` ...
+/// SPEC-3.1.1 through SPEC-3.1.12: "An action is a YAML file `*.yml` in `<config dir>/actions/` ...
 /// Parsing rejects unknown fields (`deny_unknown_fields`)."
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -948,7 +1000,7 @@ pub struct Action {
     pub enabled: bool,
 }
 
-/// SPEC-3.1: "Optional `link_template` renders a job key as a clickable link
+/// SPEC-3.1.1 through SPEC-3.1.12: "Optional `link_template` renders a job key as a clickable link
 /// in the web UI, substituting `{key}`; other `{...}` tokens pass through
 /// unchanged."
 pub fn render_link(template: &str, key: &str) -> String {
@@ -2733,7 +2785,7 @@ fn default_enabled() -> bool {
     true
 }
 
-/// SPEC-3.1: "`scripted` runs `input.command` (emits a JSON array) -> `filter`
+/// SPEC-3.1.1 through SPEC-3.1.12: "`scripted` runs `input.command` (emits a JSON array) -> `filter`
 /// -> `pre` -> `prompt` -> `claude` -> `post`."
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2741,7 +2793,7 @@ pub struct InputBlock {
     pub command: Script,
 }
 
-/// SPEC-3.1 / SPEC-3.2: "`claude` block: `cwd`, `allowed_tools`,
+/// SPEC-3.1.1 through SPEC-3.1.12 / SPEC-3.2.1 through SPEC-3.2.13: "`claude` block: `cwd`, `allowed_tools`,
 /// `permission_mode`, `model`, `effort`, `autocompact`. Precedence for model,
 /// effort and autocompact: action value, then the `claude` settings section,
 /// then the Claude CLI default."
@@ -2769,7 +2821,7 @@ pub struct ClaudeBlock {
     pub autocompact: Option<String>,
 }
 
-/// SPEC-3.1: "Optional `output.file` (relative to the state dir) appends one
+/// SPEC-3.1.1 through SPEC-3.1.12: "Optional `output.file` (relative to the state dir) appends one
 /// JSON record per job outcome, the same shape the DB's `job_outcomes` table
 /// stores; unset writes nothing."
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -2778,7 +2830,7 @@ pub struct OutputBlock {
     pub file: Option<String>,
 }
 
-/// SPEC-3.1: "Per-action `limits`: `max_attempts_per_key` (default 3),
+/// SPEC-3.1.1 through SPEC-3.1.12: "Per-action `limits`: `max_attempts_per_key` (default 3),
 /// `max_runs_per_day` (20), `claude_timeout_seconds` (600),
 /// `daily_budget_usd` (5.00), `run_budget_usd`, `budget_warn_fraction`,
 /// `max_issues_per_run`, `review_timeout_seconds` (1800)."
@@ -2814,7 +2866,7 @@ pub struct Limits {
     pub review_timeout_seconds: Option<u32>,
 }
 
-/// SPEC-3.1: "`concurrency` has `max_parallel` and a `key` list; two jobs
+/// SPEC-3.1.1 through SPEC-3.1.12: "`concurrency` has `max_parallel` and a `key` list; two jobs
 /// sharing a concurrency key never overlap, across scheduled runs and manual
 /// triggers."
 ///
@@ -2865,7 +2917,7 @@ fn default_concurrency_key() -> Vec<String> {
     ]
 }
 
-/// SPEC-3.1: "Schedule: `kind: interval` (`humantime` duration, e.g. `30m`),
+/// SPEC-3.1.1 through SPEC-3.1.12: "Schedule: `kind: interval` (`humantime` duration, e.g. `30m`),
 /// `kind: cron` (5-field or 6-field expression), or `kind: manual` (only
 /// `trigger` fires it)."
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2876,7 +2928,7 @@ pub struct Schedule {
     pub spec: Option<String>,
 }
 
-/// SPEC-3.1: the three `Schedule::kind` values.
+/// SPEC-3.1.1 through SPEC-3.1.12: the three `Schedule::kind` values.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleKind {
@@ -2885,7 +2937,7 @@ pub enum ScheduleKind {
     Manual,
 }
 
-/// SPEC-3.1: "The directory is rescanned every scheduler tick, so new files
+/// SPEC-3.1.1 through SPEC-3.1.12: "The directory is rescanned every scheduler tick, so new files
 /// need no restart", which requires detecting an on-disk edit to a
 /// previously loaded action.
 ///
@@ -2898,7 +2950,7 @@ pub struct LoadedAction {
     pub yaml_sha256: String,
 }
 
-/// SPEC-3.1: "An action is a YAML file `*.yml` in `<config dir>/actions/`."
+/// SPEC-3.1.1 through SPEC-3.1.12: "An action is a YAML file `*.yml` in `<config dir>/actions/`."
 ///
 /// Load a YAML file as an [`Action`]. Path resolution rules:
 ///
@@ -2918,7 +2970,7 @@ pub fn resolve_action_path(arg: &str, actions_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// SPEC-3.1: "A file that fails to parse is recorded with a parse error and
+/// SPEC-3.1.1 through SPEC-3.1.12: "A file that fails to parse is recorded with a parse error and
 /// never scheduled."
 pub fn load_from_path(path: &Path) -> Result<LoadedAction> {
     let raw = std::fs::read_to_string(path)?;
@@ -2933,7 +2985,7 @@ pub fn load_from_path(path: &Path) -> Result<LoadedAction> {
 /// `path` is set to it but callers that persist should overwrite it with the
 /// real destination. Used by the web UI to reject broken YAML before it ever
 /// reaches `actions/<name>.yml`.
-/// SPEC-3.1: "A retired kind ... fails to load with an error naming the
+/// SPEC-3.1.1 through SPEC-3.1.12: "A retired kind ... fails to load with an error naming the
 /// retired kind, checked before the general YAML parse."
 ///
 /// Kinds retired: `forgejo-ci-fix`, `ci-failure-analysis`
@@ -2948,7 +3000,7 @@ const RETIRED_KINDS: &[&str] = &[
     "ci-failure-reconcile",
 ];
 
-/// SPEC-3.1: retired-kind rejection, see [`RETIRED_KINDS`].
+/// SPEC-3.1.1 through SPEC-3.1.12: retired-kind rejection, see [`RETIRED_KINDS`].
 fn reject_retired_kind(raw: &str, label: &str) -> Result<()> {
     let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(raw) else {
         return Ok(());
@@ -2965,7 +3017,7 @@ fn reject_retired_kind(raw: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// SPEC-3.1: "An unknown `native.youtrack.prompt_preset` value fails to load
+/// SPEC-3.1.1 through SPEC-3.1.12: "An unknown `native.youtrack.prompt_preset` value fails to load
 /// with an error naming it and the valid presets, checked before the general
 /// YAML parse."
 ///
@@ -3009,7 +3061,7 @@ fn reject_unknown_prompt_preset(raw: &str, label: &str) -> Result<()> {
     })
 }
 
-/// SPEC-3.1: "Parsing rejects unknown fields (`deny_unknown_fields`)";
+/// SPEC-3.1.1 through SPEC-3.1.12: "Parsing rejects unknown fields (`deny_unknown_fields`)";
 /// drives the retired-kind, prompt-preset and required-field checks above
 /// `serde`'s own validation.
 pub fn validate_str(raw: &str, label: &str) -> Result<LoadedAction> {
@@ -3048,7 +3100,7 @@ pub fn validate_str(raw: &str, label: &str) -> Result<LoadedAction> {
     })
 }
 
-/// SPEC-3.1: "Optional `env` and `secrets` blocks (`scripted` only ...): each
+/// SPEC-3.1.1 through SPEC-3.1.12: "Optional `env` and `secrets` blocks (`scripted` only ...): each
 /// key is a shell-safe variable name (`A-Z0-9_`), named in at most one of the
 /// two blocks, and a `secrets` value names a non-empty secret."
 ///
@@ -3097,7 +3149,7 @@ fn validate_action_env(action: &Action, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// SPEC-3.1: a `scripted` action's `input.command` -> ... -> `prompt` -> ...
+/// SPEC-3.1.1 through SPEC-3.1.12: a `scripted` action's `input.command` -> ... -> `prompt` -> ...
 /// pipeline requires both to be present and non-empty.
 ///
 /// Validate the script-bearing fields a `scripted` action requires:
@@ -3122,11 +3174,11 @@ fn validate_scripted(action: &Action, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// SPEC-3.1: "A native kind requires a matching `native` block." SPEC-3.3:
+/// SPEC-3.1.1 through SPEC-3.1.12: "A native kind requires a matching `native` block." SPEC-3.3.1 through SPEC-3.3.25:
 /// rejects a non-humantime `dependencies.recheck_timeout` at load rather than
-/// falling back silently at gate time. SPEC-3.1's `limits.review_timeout_seconds`
+/// falling back silently at gate time. SPEC-3.1.1 through SPEC-3.1.12's `limits.review_timeout_seconds`
 /// bullet: `Some(0)` is rejected (a zero-second review session
-/// always reads as a crash). SPEC-3.3.1: warns once on the deprecated
+/// always reads as a crash). SPEC-3.3.8 through SPEC-3.3.19: warns once on the deprecated
 /// `automerge.wait_seconds` / `check_interval_seconds` and `states.state_done`
 /// keys rather than failing to load.
 ///
@@ -3204,7 +3256,7 @@ fn validate_native(action: &Action, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// SPEC-3.1: "An action is a YAML file `*.yml` in `<config dir>/actions/`."
+/// SPEC-3.1.1 through SPEC-3.1.12: "An action is a YAML file `*.yml` in `<config dir>/actions/`."
 ///
 /// Resolve `arg` to a path and load. Convenience for the CLI.
 pub fn load(arg: &str, actions_dir: &Path) -> Result<LoadedAction> {

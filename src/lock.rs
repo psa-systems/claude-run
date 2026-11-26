@@ -8,7 +8,7 @@
 //!
 //! `flock(LOCK_EX | LOCK_NB)` semantics: try-lock, fail fast if held.
 //!
-//! SPEC-4.1: "`run <action>` | Run one action once, holding the per-action
+//! SPEC-4.1.1 through SPEC-4.1.4: "`run <action>` | Run one action once, holding the per-action
 //! lock."
 
 use std::fs::{File, OpenOptions};
@@ -19,7 +19,7 @@ use fs2::FileExt;
 
 use crate::error::Result;
 
-/// SPEC-4.1: the per-action lock `run <action>` holds for its duration.
+/// SPEC-4.1.1 through SPEC-4.1.4: the per-action lock `run <action>` holds for its duration.
 pub struct ActionLock {
     _file: File,
     path: PathBuf,
@@ -30,7 +30,7 @@ impl ActionLock {
     /// `<lock_dir>/<action>.lock`. Returns `Ok(None)` if another process holds
     /// it, `Ok(Some(_))` on success.
     ///
-    /// SPEC-4.1: "`run <action>` | Run one action once, holding the
+    /// SPEC-4.1.1 through SPEC-4.1.4: "`run <action>` | Run one action once, holding the
     /// per-action lock"; exit code `exit::LOCKED` (2) when another process
     /// holds it.
     pub fn try_acquire(lock_dir: &Path, action: &str) -> Result<Option<Self>> {

@@ -1,8 +1,8 @@
 //! Deterministic infrastructure-failure detector.
 //!
-//! Implements the infrastructure-detection half of SPEC-3.5.1 and the
+//! Implements the infrastructure-detection half of SPEC-3.5.8 through SPEC-3.5.13 and the
 //! branch-agnostic `infra:<kind>` fingerprint/dedupe key it feeds into
-//! SPEC-3.5.2.
+//! SPEC-3.5.14 through SPEC-3.5.18.
 //!
 //! A CI failure caused by the RUNNER rather than the commit (a full disk, an
 //! OOM kill, an unreachable package registry) is identical on every branch and
@@ -24,7 +24,7 @@
 //! worse than leaving a host condition ungrouped, so each detector requires an
 //! unambiguous phrase and an undetected condition is the preferred failure mode.
 
-/// SPEC-3.5.1 / SPEC-3.12 item 8: every `kind` [`detect`] can return. Each is a
+/// SPEC-3.5.8 through SPEC-3.5.13 / SPEC-3.12.9: every `kind` [`detect`] can return. Each is a
 /// runner condition rather than a defect in the commit, so a CI failure that
 /// carries one spends no `webhook.agent_pr_fix_attempts` attempt and starts no
 /// remediation run ([`InfraFailure::spends_no_attempt`]).
@@ -38,7 +38,7 @@ pub const KINDS: &[&str] = &[
     "no-diagnostic",
 ];
 
-/// SPEC-3.5.1 / SPEC-3.5.2: an infrastructure / runner condition recognized in
+/// SPEC-3.5.8 through SPEC-3.5.13 / SPEC-3.5.14 through SPEC-3.5.18: an infrastructure / runner condition recognized in
 /// a job log. Same shape as
 /// [`crate::autofix::AutoFix`]: a stable `kind` id (what the dedupe key is built
 /// from, so the same condition keys identically however the message is worded)
@@ -53,7 +53,7 @@ pub struct InfraFailure {
 }
 
 impl InfraFailure {
-    /// SPEC-3.12 item 8: an infrastructure failure never counts toward
+    /// SPEC-3.12.9: an infrastructure failure never counts toward
     /// `webhook.agent_pr_fix_attempts` and starts no remediation run. True for
     /// every kind in [`KINDS`]; a string outside the closed set is not an
     /// infrastructure kind and still spends an attempt.
@@ -62,7 +62,7 @@ impl InfraFailure {
     }
 }
 
-/// SPEC-3.5.1: run the infrastructure detectors against a full redacted job
+/// SPEC-3.5.8 through SPEC-3.5.13: run the infrastructure detectors against a full redacted job
 /// log, most specific first. `None` when no detector matches, which is the
 /// common case: a code failure must never match here.
 ///
@@ -197,8 +197,7 @@ fn detect_runner_unavailable(lower: &str) -> Option<InfraFailure> {
     })
 }
 
-/// `job-timeout`: the job was killed by its own `timeout-minutes` (SPEC-3.12
-/// item 8). The runner prints the exceeded-limit wording, not the test suite.
+/// `job-timeout`: the job was killed by its own `timeout-minutes` (SPEC-3.12.9). The runner prints the exceeded-limit wording, not the test suite.
 fn detect_job_timeout(lower: &str) -> Option<InfraFailure> {
     const PHRASES: &[&str] = &[
         "exceeded the maximum execution time",
@@ -213,7 +212,7 @@ fn detect_job_timeout(lower: &str) -> Option<InfraFailure> {
 }
 
 /// `container-not-started`: the job container never came up, so no step of the
-/// workflow ran (SPEC-3.12 item 8).
+/// workflow ran (SPEC-3.12.9).
 fn detect_container_not_started(lower: &str) -> Option<InfraFailure> {
     const PHRASES: &[&str] = &[
         "failed to start container",
@@ -229,7 +228,7 @@ fn detect_container_not_started(lower: &str) -> Option<InfraFailure> {
 }
 
 /// `runner-deadline`: the runner's own API call to the forge or the container
-/// runtime timed out (SPEC-3.12 item 8).
+/// runtime timed out (SPEC-3.12.9).
 fn detect_runner_deadline(lower: &str) -> Option<InfraFailure> {
     lower
         .contains("context deadline exceeded")
@@ -239,7 +238,7 @@ fn detect_runner_deadline(lower: &str) -> Option<InfraFailure> {
         })
 }
 
-/// `no-diagnostic` (SPEC-3.12 item 8): a non-empty log with no parsed failing
+/// `no-diagnostic` (SPEC-3.12.9): a non-empty log with no parsed failing
 /// test id and no compiler, test or lint diagnostic of any kind. Nothing in it
 /// points at the commit, so a fix attempt has nothing to act on. The runner's
 /// own `Process completed with exit code` line is not a diagnostic.

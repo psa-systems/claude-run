@@ -1,6 +1,6 @@
 //! Async functions over [`DbPool`] for the CI-failure store
 //! (`ci_failures`, `ci_failure_tests`, `ci_failure_runs`,
-//! `agent_pull_requests`). Implements SPEC-3.5.2.
+//! `agent_pull_requests`). Implements SPEC-3.5.14 through SPEC-3.5.18.
 //! (`migrations/sqlite/0021_ci_failures.sql` and
 //! `migrations/postgres/0002_ci_failures.sql`). Every statement goes through
 //! [`db::q`], the dialect chokepoint every other module in the tree uses, so
@@ -11,7 +11,7 @@ use sqlx::Row;
 use crate::db::{self, DbPool};
 use crate::error::Result;
 
-/// SPEC-3.5.2: a `ci_failures` row a fingerprint matched, returned by [`find_match`].
+/// SPEC-3.5.14 through SPEC-3.5.18: a `ci_failures` row a fingerprint matched, returned by [`find_match`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureMatch {
     pub id: i64,
@@ -19,7 +19,7 @@ pub struct FailureMatch {
     pub state: String,
 }
 
-/// SPEC-3.5.2: a `ci_failures` row's own fields, without the derived match ranking.
+/// SPEC-3.5.14 through SPEC-3.5.18: a `ci_failures` row's own fields, without the derived match ranking.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Failure {
     pub id: i64,
@@ -29,7 +29,7 @@ pub struct Failure {
     pub infra_kind: Option<String>,
     pub issue_key: Option<String>,
     pub state: String,
-    /// SPEC-4.3.15: the triage bucket
+    /// SPEC-4.3.57 through SPEC-4.3.61: the triage bucket
     /// (`code_fix`/`human_action`/`transient`/`auto_fix`, `src/triage.rs`)
     /// computed at webhook-mint time. `None` for a row minted before this
     /// column existed, or adopted through the legacy YouTrack search (no
@@ -39,7 +39,7 @@ pub struct Failure {
     pub updated_at: String,
 }
 
-/// SPEC-3.5.2: an `agent_pull_requests` row.
+/// SPEC-3.5.14 through SPEC-3.5.18: an `agent_pull_requests` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPullRequest {
     pub id: i64,
@@ -59,12 +59,12 @@ pub struct AgentPullRequest {
     pub salvaged: bool,
     /// True once `finalize` has observed `Finalized::CodeReview`
     /// for this PR, i.e. the run that owns it reported success and the PR was
-    /// promoted to ready. The automerge reconciler and the Action-Run webhook
-    /// decision path stop touching the row once this is set: no more
-    /// behind-base branch updates, no more status comments. Never cleared.
-    pub finished: bool,
-    /// SPEC-3.3.1: true once `finalize` has ended the run that
-    /// owns this PR in `Failed` (a gate failure, `SPEC-3.3.2`, included).
+    /// promoted to ready. A `ready` PR is still evaluated for automerge: the
+    /// webhook decision path and the reconciler merge it once it is green and
+    /// mergeable, subject to the same `salvaged`/`failed`/draft exclusions.
+    pub ready: bool,
+    /// SPEC-3.3.8 through SPEC-3.3.19: true once `finalize` has ended the run that
+    /// owns this PR in `Failed` (a gate failure, `SPEC-3.3.20` through `SPEC-3.3.25`, included).
     /// Blocks automerge, whatever the PR's draft, mergeable, behind-base or
     /// CI state. Cleared only when a later run for the issue ends in Code
     /// Review (`clear_failed`); a re-queue that continues the same PR does
@@ -112,7 +112,7 @@ fn agent_pr_from_row(row: &sqlx::any::AnyRow) -> Result<AgentPullRequest> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         salvaged: db::flag(row, "salvaged")?,
-        finished: db::flag(row, "finished")?,
+        ready: db::flag(row, "ready")?,
         failed: db::flag(row, "failed")?,
         conflict_resolve_attempts: row.try_get("conflict_resolve_attempts")?,
         conflict_resolve_started_at: row.try_get("conflict_resolve_started_at")?,
@@ -136,7 +136,7 @@ fn agent_pr_from_row(row: &sqlx::any::AnyRow) -> Result<AgentPullRequest> {
 const STATE_PRIORITY_CASE: &str =
     "CASE state WHEN 'open' THEN 0 WHEN 'resolved' THEN 1 WHEN 'pr_only' THEN 2 ELSE 3 END";
 
-/// SPEC-3.5.2: find the best `ci_failures` row that shares at least one test id with
+/// SPEC-3.5.14 through SPEC-3.5.18: find the best `ci_failures` row that shares at least one test id with
 /// `test_ids`, within the same `(repo, workflow_id, job_name)`. An `open`
 /// match wins over `resolved`, which wins over `pr_only`; ties go to the
 /// newest (`updated_at`).
@@ -178,7 +178,7 @@ pub async fn find_match(
     })
 }
 
-/// SPEC-3.5.2: fetch one `ci_failures` row by id.
+/// SPEC-3.5.14 through SPEC-3.5.18: fetch one `ci_failures` row by id.
 pub async fn get_failure(pool: &DbPool, id: i64) -> Result<Option<Failure>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
@@ -191,9 +191,9 @@ pub async fn get_failure(pool: &DbPool, id: i64) -> Result<Option<Failure>> {
     row.as_ref().map(failure_from_row).transpose()
 }
 
-/// SPEC-3.5.2: insert a new `ci_failures` row. Returns its id.
+/// SPEC-3.5.14 through SPEC-3.5.18: insert a new `ci_failures` row. Returns its id.
 /// `triage_bucket` is the already-computed [`crate::triage::TriageBucket`]
-/// wire value (SPEC-4.3.15) when the caller minted this row from
+/// wire value (SPEC-4.3.57 through SPEC-4.3.61) when the caller minted this row from
 /// a triage verdict, `None` when no triage ran for it (a `pr_only` sighting,
 /// or a legacy-adopted issue).
 #[allow(clippy::too_many_arguments)]
@@ -227,7 +227,7 @@ pub async fn record_failure(
     Ok(id)
 }
 
-/// SPEC-3.5.2: add every id in `test_ids` to `failure_id`'s fingerprint. Idempotent: an id
+/// SPEC-3.5.14 through SPEC-3.5.18: add every id in `test_ids` to `failure_id`'s fingerprint. Idempotent: an id
 /// already recorded on a repeat sighting is skipped rather than erroring.
 pub async fn add_tests(pool: &DbPool, failure_id: i64, test_ids: &[String]) -> Result<()> {
     for test_id in test_ids {
@@ -247,7 +247,7 @@ pub async fn add_tests(pool: &DbPool, failure_id: i64, test_ids: &[String]) -> R
     Ok(())
 }
 
-/// SPEC-3.5.2: record one sighting of `failure_id`. Returns the new `ci_failure_runs` id.
+/// SPEC-3.5.14 through SPEC-3.5.18: record one sighting of `failure_id`. Returns the new `ci_failure_runs` id.
 pub async fn attach_run(
     pool: &DbPool,
     failure_id: i64,
@@ -273,7 +273,7 @@ pub async fn attach_run(
     Ok(id)
 }
 
-/// SPEC-3.5.2: set `run_id`'s own failing-id fingerprint, newline-joined (fingerprint ids
+/// SPEC-3.5.14 through SPEC-3.5.18: set `run_id`'s own failing-id fingerprint, newline-joined (fingerprint ids
 /// never contain a newline; `find_match`'s test-id overlap match is unrelated
 /// and never queries this column). only the agent-PR fix-attempt
 /// flow needs one sighting's own fingerprint (to compare it against the
@@ -296,7 +296,7 @@ pub async fn set_run_test_ids(pool: &DbPool, run_id: i64, test_ids: &[String]) -
     Ok(())
 }
 
-/// SPEC-3.5.2: `failure_id`'s previous sighting on `pr_number` (the newest
+/// SPEC-3.5.14 through SPEC-3.5.18: `failure_id`'s previous sighting on `pr_number` (the newest
 /// `ci_failure_runs` row strictly older than `before_run_id`) whose recorded
 /// fingerprint is non-empty, as `(run_index, test_ids)`. `None` covers both
 /// "no earlier sighting on this PR" and "the earlier sighting's fingerprint
@@ -361,7 +361,7 @@ pub async fn prior_run_test_ids(
         .collect())
 }
 
-/// SPEC-3.5.2: point `failure_id` at `issue_key` (or clear it with `None`).
+/// SPEC-3.5.14 through SPEC-3.5.18: point `failure_id` at `issue_key` (or clear it with `None`).
 pub async fn set_issue(
     pool: &DbPool,
     failure_id: i64,
@@ -383,7 +383,7 @@ pub async fn set_issue(
     Ok(())
 }
 
-/// SPEC-3.5.2: transition `failure_id` to `state` (`open`, `resolved`, `pr_only`).
+/// SPEC-3.5.14 through SPEC-3.5.18: transition `failure_id` to `state` (`open`, `resolved`, `pr_only`).
 pub async fn set_failure_state(
     pool: &DbPool,
     failure_id: i64,
@@ -405,7 +405,7 @@ pub async fn set_failure_state(
     Ok(())
 }
 
-/// SPEC-4.3.15: persist the triage bucket onto an existing row,
+/// SPEC-4.3.57 through SPEC-4.3.61: persist the triage bucket onto an existing row,
 /// for the reopen path, which re-triages a resolved failure exactly as a
 /// fresh mint would.
 pub async fn set_failure_triage_bucket(
@@ -429,7 +429,7 @@ pub async fn set_failure_triage_bucket(
     Ok(())
 }
 
-/// SPEC-3.12 item 8: store the infrastructure `kind` on an existing failure
+/// SPEC-3.12.9: store the infrastructure `kind` on an existing failure
 /// row, so a failure first recorded before the condition was recognised still
 /// shows its category on the dashboard and in the Reports failure causes.
 pub async fn set_infra_kind(pool: &DbPool, failure_id: i64, kind: &str, now: &str) -> Result<()> {
@@ -448,7 +448,7 @@ pub async fn set_infra_kind(pool: &DbPool, failure_id: i64, kind: &str, now: &st
     Ok(())
 }
 
-/// SPEC-3.5.2: every distinct branch `failure_id` has been seen on, sorted.
+/// SPEC-3.5.14 through SPEC-3.5.18: every distinct branch `failure_id` has been seen on, sorted.
 pub async fn distinct_branches(pool: &DbPool, failure_id: i64) -> Result<Vec<String>> {
     let branches: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
         db::q(
@@ -463,7 +463,7 @@ pub async fn distinct_branches(pool: &DbPool, failure_id: i64) -> Result<Vec<Str
     Ok(branches)
 }
 
-/// SPEC-3.5 / SPEC-3.5.2: the `ci_failures` row currently claimed by `issue_key`, if any (
+/// SPEC-3.5.1 through SPEC-3.5.18 / SPEC-3.5.14 through SPEC-3.5.18: the `ci_failures` row currently claimed by `issue_key`, if any (
 /// used to find or lazily create the store row backing an agent's own PR, whose
 /// `ci_failures` row is addressed by issue key rather than by test overlap).
 pub async fn failure_for_issue(pool: &DbPool, issue_key: &str) -> Result<Option<Failure>> {
@@ -478,7 +478,7 @@ pub async fn failure_for_issue(pool: &DbPool, issue_key: &str) -> Result<Option<
     row.as_ref().map(failure_from_row).transpose()
 }
 
-/// SPEC-3.5 / SPEC-3.5.2: every distinct non-null PR number `failure_id` has been seen sighted on,
+/// SPEC-3.5.1 through SPEC-3.5.18 / SPEC-3.5.14 through SPEC-3.5.18: every distinct non-null PR number `failure_id` has been seen sighted on,
 /// sorted. Used to comment the same issue link onto every open
 /// PR a `pr_only` failure's two distinct branches turned out to be on.
 pub async fn pr_numbers_for_failure(pool: &DbPool, failure_id: i64) -> Result<Vec<i64>> {
@@ -496,7 +496,7 @@ pub async fn pr_numbers_for_failure(pool: &DbPool, failure_id: i64) -> Result<Ve
     Ok(numbers)
 }
 
-/// SPEC-3.5 / SPEC-3.5.2: every run index `failure_id` was sighted at on PR `pr_number`, sorted.
+/// SPEC-3.5.1 through SPEC-3.5.18 / SPEC-3.5.14 through SPEC-3.5.18: every run index `failure_id` was sighted at on PR `pr_number`, sorted.
 /// Used to list every fix attempt's run when an agent's own PR
 /// hits the `agent_pr_fix_attempts` ceiling and is flagged `Needs Review`.
 pub async fn run_indexes_for_failure_pr(
@@ -519,7 +519,7 @@ pub async fn run_indexes_for_failure_pr(
     Ok(indexes)
 }
 
-/// SPEC-3.5.2: `ci_failures` rows for `mcp stdio`'s `list_ci_failures` tool, newest first.
+/// SPEC-3.5.14 through SPEC-3.5.18: `ci_failures` rows for `mcp stdio`'s `list_ci_failures` tool, newest first.
 /// `state` narrows to one `state` value (`open` / `resolved` / `pr_only`); with
 /// `None` every state is returned.
 pub async fn list_failures(pool: &DbPool, state: Option<&str>, limit: i64) -> Result<Vec<Failure>> {
@@ -543,7 +543,7 @@ pub async fn list_failures(pool: &DbPool, state: Option<&str>, limit: i64) -> Re
     rows.iter().map(failure_from_row).collect()
 }
 
-/// SPEC-4.3.15: the dashboard's CI-failures listing. `state`
+/// SPEC-4.3.57 through SPEC-4.3.61: the dashboard's CI-failures listing. `state`
 /// filters on the stored lifecycle `state` (`open`/`resolved`/`pr_only`),
 /// `bucket` filters on the persisted triage bucket
 /// (`code_fix`/`human_action`/`transient`/`auto_fix`), and `repo` narrows to
@@ -588,7 +588,7 @@ pub async fn list_failures_for_dashboard(
     rows.iter().map(failure_from_row).collect()
 }
 
-/// SPEC-4.3.15: distinct repos with at least one `ci_failures` row,
+/// SPEC-4.3.57 through SPEC-4.3.61: distinct repos with at least one `ci_failures` row,
 /// alphabetically, for the dashboard's repository filter dropdown.
 pub async fn distinct_failure_repos(pool: &DbPool) -> Result<Vec<String>> {
     let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
@@ -599,7 +599,7 @@ pub async fn distinct_failure_repos(pool: &DbPool) -> Result<Vec<String>> {
     Ok(rows)
 }
 
-/// SPEC-3.5.2: record a PR the agent opened. `salvaged` is true for a timeout-salvage PR
+/// SPEC-3.5.14 through SPEC-3.5.18: record a PR the agent opened. `salvaged` is true for a timeout-salvage PR
 /// (`Finalized::TimedOut`), false otherwise. Returns its
 /// `agent_pull_requests` id.
 #[allow(clippy::too_many_arguments)]
@@ -636,16 +636,16 @@ pub async fn record_agent_pr(
     Ok(id)
 }
 
-/// Set `id`'s `finished` flag. Called once `finalize` returns
+/// Set `id`'s `ready` flag. Called once `finalize` returns
 /// `Finalized::CodeReview`, fresh or resumed: the run reported success and
 /// the PR was promoted to ready, so there is nothing left for the agent to
 /// do on this PR. Never cleared: a later re-queue that resumes this same PR
 /// (another `CodeReview`) is a harmless no-op write.
-pub async fn mark_finished(pool: &DbPool, id: i64, now: &str) -> Result<()> {
+pub async fn mark_ready(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         db::q(
             pool,
-            "UPDATE agent_pull_requests SET finished = 1, updated_at = ? WHERE id = ?",
+            "UPDATE agent_pull_requests SET ready = 1, updated_at = ? WHERE id = ?",
         )
         .into_owned(),
     ))
@@ -656,7 +656,7 @@ pub async fn mark_finished(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     Ok(())
 }
 
-/// SPEC-3.5.2: clear `id`'s `salvaged` flag: called only from the resumed-success path,
+/// SPEC-3.5.14 through SPEC-3.5.18: clear `id`'s `salvaged` flag: called only from the resumed-success path,
 /// once a resumed run on a salvaged PR finishes successfully.
 pub async fn clear_salvaged(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
@@ -673,9 +673,9 @@ pub async fn clear_salvaged(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     Ok(())
 }
 
-/// SPEC-3.3.1: set `id`'s `failed` flag. Called whenever
+/// SPEC-3.3.8 through SPEC-3.3.19: set `id`'s `failed` flag. Called whenever
 /// `finalize` returns `Finalized::Failed` for a run whose issue has this
-/// recorded PR (a gate failure, `SPEC-3.3.2`, included). While set, automerge
+/// recorded PR (a gate failure, `SPEC-3.3.20` through `SPEC-3.3.25`, included). While set, automerge
 /// (the webhook decision path and the periodic reconciler) takes no action on
 /// the PR. Cleared only by [`clear_failed`], once a later run for the issue
 /// ends in Code Review.
@@ -694,7 +694,7 @@ pub async fn mark_failed(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     Ok(())
 }
 
-/// SPEC-3.3.1: clear `id`'s `failed` flag. Called once
+/// SPEC-3.3.8 through SPEC-3.3.19: clear `id`'s `failed` flag. Called once
 /// `finalize` returns `Finalized::CodeReview` for the PR, fresh or resumed:
 /// the run that owns it succeeded, so the automerge block a prior `Failed`
 /// run left behind no longer applies.
@@ -713,7 +713,7 @@ pub async fn clear_failed(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     Ok(())
 }
 
-/// SPEC-3.5.2: the agent's PR at `(host, repo, pr_number)`, the unique key a PR is
+/// SPEC-3.5.14 through SPEC-3.5.18: the agent's PR at `(host, repo, pr_number)`, the unique key a PR is
 /// addressed by regardless of which issue currently claims it.
 pub async fn agent_pr(
     pool: &DbPool,
@@ -723,7 +723,7 @@ pub async fn agent_pr(
 ) -> Result<Option<AgentPullRequest>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, finished, failed, created_at, updated_at, \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, ready, failed, created_at, updated_at, \
          conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
          FROM agent_pull_requests WHERE host = ? AND repo = ? AND pr_number = ?",
     ).into_owned()))
@@ -735,7 +735,7 @@ pub async fn agent_pr(
     row.as_ref().map(agent_pr_from_row).transpose()
 }
 
-/// SPEC-3.5.2: the agent PR filed against `issue_key` that a re-queue should continue:
+/// SPEC-3.5.14 through SPEC-3.5.18: the agent PR filed against `issue_key` that a re-queue should continue:
 /// the `open` row when one exists (an issue carries at most one open agent PR
 /// at a time), falling back to the most recently updated row otherwise. Over
 /// an issue's lifetime more than one row can accumulate (an earlier PR closed
@@ -753,7 +753,7 @@ pub async fn agent_pr_for_issue(
 ) -> Result<Option<AgentPullRequest>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, finished, failed, created_at, updated_at, \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, ready, failed, created_at, updated_at, \
          conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
          FROM agent_pull_requests WHERE issue_key = ? \
          ORDER BY CASE WHEN state = 'open' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1",
@@ -764,14 +764,14 @@ pub async fn agent_pr_for_issue(
     row.as_ref().map(agent_pr_from_row).transpose()
 }
 
-/// SPEC-3.3.1 / SPEC-3.5.2: every `agent_pull_requests` row still `open`, for the
+/// SPEC-3.3.8 through SPEC-3.3.19 / SPEC-3.5.14 through SPEC-3.5.18: every `agent_pull_requests` row still `open`, for the
 /// reconciler: a webhook is the low-latency trigger for automerge, but a
 /// missed delivery must not leave a green PR stuck at Code Review forever, so
 /// the reconciler walks this list on its own tick independent of any webhook.
 pub async fn open_agent_prs(pool: &DbPool) -> Result<Vec<AgentPullRequest>> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, finished, failed, created_at, updated_at, \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, ready, failed, created_at, updated_at, \
          conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
          FROM agent_pull_requests WHERE state = 'open' ORDER BY id",
     ).into_owned()))
@@ -780,7 +780,7 @@ pub async fn open_agent_prs(pool: &DbPool) -> Result<Vec<AgentPullRequest>> {
     rows.iter().map(agent_pr_from_row).collect()
 }
 
-/// SPEC-3.5 / SPEC-3.5.2: increment `id`'s `fix_attempts` by one.
+/// SPEC-3.5.1 through SPEC-3.5.18 / SPEC-3.5.14 through SPEC-3.5.18: increment `id`'s `fix_attempts` by one.
 pub async fn bump_fix_attempts(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
@@ -838,7 +838,7 @@ pub async fn finish_conflict_resolve(
     Ok(())
 }
 
-/// SPEC-3.5.2: transition `id` to `state` (`open`, `merged`, `closed`).
+/// SPEC-3.5.14 through SPEC-3.5.18: transition `id` to `state` (`open`, `merged`, `closed`).
 pub async fn set_agent_pr_state(pool: &DbPool, id: i64, state: &str, now: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         db::q(
@@ -898,7 +898,7 @@ mod tests {
     }
 
     /// [`seed_failure`] plus a persisted triage bucket, for tests of the
-    /// SPEC-4.3.15 bucket filter.
+    /// SPEC-4.3.57 through SPEC-4.3.61 bucket filter.
     #[allow(clippy::too_many_arguments)]
     async fn seed_failure_with_bucket(
         pool: &DbPool,
@@ -1376,7 +1376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finished_flag_defaults_false_and_mark_finished_sets_it() {
+    async fn ready_flag_defaults_false_and_mark_ready_sets_it() {
         let pool = test_pool().await;
         let id = record_agent_pr(
             &pool,
@@ -1397,18 +1397,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!fresh.finished, "a newly recorded row is not finished yet");
+        assert!(!fresh.ready, "a newly recorded row is not ready yet");
 
-        mark_finished(&pool, id, "2026-11-05T00:00:00Z")
-            .await
-            .unwrap();
+        mark_ready(&pool, id, "2026-11-05T00:00:00Z").await.unwrap();
 
-        let finished = agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 558)
+        let ready = agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 558)
             .await
             .unwrap()
             .unwrap();
-        assert!(finished.finished);
-        assert_eq!(finished.updated_at, "2026-11-05T00:00:00Z");
+        assert!(ready.ready);
+        assert_eq!(ready.updated_at, "2026-11-05T00:00:00Z");
     }
 
     #[tokio::test]

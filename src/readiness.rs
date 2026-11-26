@@ -34,7 +34,7 @@
 //! [`ReadinessGate::clear_login_required`], guarded so a repeated trip (or a
 //! probe re-confirming an already-tripped state) writes nothing further.
 //!
-//! SPEC-3.7: the three credential sources, checked in priority order
+//! SPEC-3.7.1 through SPEC-3.7.3: the three credential sources, checked in priority order
 //! (`.credentials.json` file, then a stored API key, then `ANTHROPIC_API_KEY`),
 //! and the rule that a login-required trip overrides a present-but-expired
 //! credential.
@@ -51,7 +51,7 @@ use crate::service_auth::ApiKeyHandle;
 pub const NOT_READY_REASON: &str =
     "no Claude credential: sign in at Settings -> Auth (or store an API key) to start running actions";
 
-/// SPEC-3.7: which of the two not-ready axes is active.
+/// SPEC-3.7.1 through SPEC-3.7.3: which of the two not-ready axes is active.
 ///
 /// Which of the two not-ready axes is active. `no_credential` and
 /// `login_required` are also the exact `/api/status` `not_ready_kind` strings
@@ -114,7 +114,7 @@ impl Readiness {
     }
 }
 
-/// SPEC-3.7: the gate the scheduler, dispatcher, and trigger endpoint consult
+/// SPEC-3.7.1 through SPEC-3.7.3: the gate the scheduler, dispatcher, and trigger endpoint consult
 /// before running an agent.
 ///
 /// Shared readiness check. Cheap enough (one `stat` plus a lock read) to call
@@ -160,7 +160,7 @@ impl ReadinessGate {
         }
     }
 
-    /// SPEC-3.7: checks the three credential sources in priority order
+    /// SPEC-3.7.1 through SPEC-3.7.3: checks the three credential sources in priority order
     /// (`.credentials.json` file, stored API key, `ANTHROPIC_API_KEY`).
     ///
     /// Credential-only readiness, ignoring the login-required overlay. This is
@@ -217,7 +217,7 @@ impl ReadinessGate {
         }
     }
 
-    /// SPEC-3.7: a login-required trip overrides a present-but-expired
+    /// SPEC-3.7.1 through SPEC-3.7.3: a login-required trip overrides a present-but-expired
     /// credential.
     ///
     /// Current readiness, without logging. The login-required axis (an
@@ -250,7 +250,7 @@ impl ReadinessGate {
         self.credential_readiness()
     }
 
-    /// SPEC-3.7: the scheduler's gating readiness check.
+    /// SPEC-3.7.1 through SPEC-3.7.3: the scheduler's gating readiness check.
     ///
     /// Readiness for a scheduling decision, logging each CREDENTIAL-axis
     /// transition once. The login-required axis is logged separately, exactly
@@ -278,7 +278,7 @@ impl ReadinessGate {
         cred.ready && !self.is_login_required()
     }
 
-    /// SPEC-7.4 / SPEC-7.5: read-side check for the login-required axis.
+    /// SPEC-7.4.1 / SPEC-7.5.1 through SPEC-7.5.3: read-side check for the login-required axis.
     ///
     /// Whether the login-required axis is currently tripped, with no logging.
     pub fn is_login_required(&self) -> bool {
@@ -295,7 +295,7 @@ impl ReadinessGate {
     /// Logs once, at `error`, the first time this trips; a repeated trip (a
     /// second invocation failing, or the probe re-confirming) updates the
     /// message/time silently.
-    /// SPEC-7.4 / SPEC-7.5: write-side primitive that trips the login-required
+    /// SPEC-7.4.1 / SPEC-7.5.1 through SPEC-7.5.3: write-side primitive that trips the login-required
     /// axis.
     pub fn trip_login_required(&self, message: impl Into<String>, source: &'static str) {
         let message = message.into();
@@ -322,7 +322,7 @@ impl ReadinessGate {
     /// Clear the login-required state (a brokered sign-in completed, an API key
     /// was saved, or the status probe reported `loggedIn: true`). Logs once, at
     /// `info`, only when the state was actually set.
-    /// SPEC-7.4 / SPEC-7.5: write-side primitive that clears the
+    /// SPEC-7.4.1 / SPEC-7.5.1 through SPEC-7.5.3: write-side primitive that clears the
     /// login-required axis.
     pub fn clear_login_required(&self) {
         let mut guard = self
@@ -336,7 +336,7 @@ impl ReadinessGate {
     }
 }
 
-/// SPEC-3.7: the `.credentials.json` file check, the first credential source
+/// SPEC-3.7.1 through SPEC-3.7.3: the `.credentials.json` file check, the first credential source
 /// in priority order.
 ///
 /// Whether a usable credential file sits in `dir`. `exists()` follows symlinks,

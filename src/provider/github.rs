@@ -1,4 +1,4 @@
-//! SPEC-8.2: GitHub `Forge` backend.
+//! SPEC-8.2.1 through SPEC-8.2.4: GitHub `Forge` backend.
 //!
 //! The native YouTrack handler opens PRs through the [`Forge`](super::Forge)
 //! trait. The CLI backend ([`super::CliBackend`]) speaks only the Forgejo/Gitea
@@ -114,7 +114,7 @@ fn gh_auth_token(
     Ok(token)
 }
 
-/// SPEC-8.10: transport for the embedded MCP client, the first-priority PR-create
+/// SPEC-8.10.1 through SPEC-8.10.2: transport for the embedded MCP client, the first-priority PR-create
 /// path. Seam so the synchronous `Forge` path can be unit-tested with a stub
 /// instead of reaching the network.
 pub trait McpTransport: Send + Sync {
@@ -250,7 +250,7 @@ fn extract_json(text: &str) -> Result<Value> {
     last.ok_or_else(|| Error::Other(anyhow::anyhow!("no JSON object in MCP response")))
 }
 
-/// SPEC-8.2, SPEC-8.10: GitHub `Forge`: pushes the working branch then opens a
+/// SPEC-8.2.1 through SPEC-8.2.4, SPEC-8.10.1 through SPEC-8.10.2: GitHub `Forge`: pushes the working branch then opens a
 /// PR, preferring the remote MCP and falling back to `gh`.
 pub struct GithubForge {
     runner: Arc<dyn CommandRunner>,
@@ -354,7 +354,7 @@ impl GithubForge {
         self
     }
 
-    /// SPEC-8.4: run a read-only `gh` invocation, retried up to four attempts total
+    /// SPEC-8.4.1 through SPEC-8.4.3: run a read-only `gh` invocation, retried up to four attempts total
     /// (parity with the `fj` read retry). Never used
     /// for a write: a write must fail on its first and only attempt.
     fn run_gh_read(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<CmdOutput> {
@@ -430,7 +430,7 @@ impl GithubForge {
     /// warning with both misses named rather than failing silently. Always
     /// `--no-verify`: the runner never runs the repo's `pre-push` hook on any
     /// push of an agent's feature branch.
-    /// SPEC-8.5: pushes authenticated per invocation via the credential-helper mechanism.
+    /// SPEC-8.5.1 through SPEC-8.5.3: pushes authenticated per invocation via the credential-helper mechanism.
     fn push(&self, workdir: &Path, host: &str, repo: &str, branch: &str) -> Result<()> {
         let refspec = format!("HEAD:{branch}");
         let push_args: Vec<&str> = vec!["push", "--no-verify", "origin", refspec.as_str()];
@@ -570,7 +570,7 @@ impl GithubForge {
         Ok(parse_pr_from_gh(&out.stdout))
     }
 
-    /// SPEC-8.7, SPEC-8.10: shared body for [`Forge::create_pr`] / [`Forge::create_pr_with_draft`],
+    /// SPEC-8.7.1 through SPEC-8.7.5, SPEC-8.10.1 through SPEC-8.10.2: shared body for [`Forge::create_pr`] / [`Forge::create_pr_with_draft`],
     /// validating the tip subject and degrading an open-PR lookup failure to a create.
     /// `body_override`, when `Some` (the timeout-salvage draft body),
     /// is written verbatim instead of the tip commit's own body.
@@ -588,7 +588,7 @@ impl GithubForge {
     }
 
     /// The push-then-open flow; `pushed_at` is set when the push ends so the
-    /// caller can time `push` and `pr_create` apart (SPEC-3.14 item 3).
+    /// caller can time `push` and `pr_create` apart (SPEC-3.14.4).
     fn create_pr_inner(
         &self,
         workdir: &Path,
@@ -821,7 +821,7 @@ impl GithubForge {
         ));
     }
 
-    /// SPEC-8.10: resolve a PR-create failure against the open-PR lookup,
+    /// SPEC-8.10.1 through SPEC-8.10.2: resolve a PR-create failure against the open-PR lookup,
     /// mirroring `CliBackend::find_or_create_pr`'s already-exists retry: a
     /// create rejected because a PR for this head already exists retries the
     /// lookup exactly once and adopts the result, posting the push comment
@@ -871,7 +871,7 @@ impl GithubForge {
         ))
     }
 
-    /// SPEC-8.8: post the push comment for `create_pr_impl`'s push, folding
+    /// SPEC-8.8.1 through SPEC-8.8.2: post the push comment for `create_pr_impl`'s push, folding
     /// a failure into `pr.push_comment_failure` for the caller's own outcome
     /// comment rather than failing the PR create that already succeeded.
     #[allow(clippy::too_many_arguments)]
@@ -898,7 +898,7 @@ impl GithubForge {
             None => crate::push_comment::CommitSubjects::Unavailable,
         };
         let public_url = crate::run_footer::resolved_public_url();
-        // SPEC-3.15 item 6, SPEC-8.8: the list is rendered from stored rows.
+        // SPEC-3.15.7, SPEC-8.8.1 through SPEC-8.8.2: the list is rendered from stored rows.
         let progress = crate::progress_list::render_push(issue_key, event);
         let ctx = crate::push_comment::PushCommentContext {
             event,
@@ -917,7 +917,7 @@ impl GithubForge {
     }
 }
 
-/// SPEC-8.2: GitHub-side `Forge` operations, backed by the MCP/`gh` priority
+/// SPEC-8.2.1 through SPEC-8.2.4: GitHub-side `Forge` operations, backed by the MCP/`gh` priority
 /// list resolved by [`super::resolve`].
 impl Forge for GithubForge {
     fn create_pr(
@@ -1023,7 +1023,7 @@ impl Forge for GithubForge {
     /// A no-op on a PR that is not a real GitHub draft: a non-draft adopted
     /// PR is left untouched. Otherwise reads `HEAD`'s current subject/body
     /// (the same read `create_pr_impl` does), validates the subject, and
-    /// SPEC-8.7: overwrites the PR with `gh pr edit <number> --repo <repo> --title
+    /// SPEC-8.7.1 through SPEC-8.7.5: overwrites the PR with `gh pr edit <number> --repo <repo> --title
     /// <title> --body-file <path>`.
     fn refresh_pr_text(
         &self,
@@ -1103,7 +1103,7 @@ impl Forge for GithubForge {
         Ok(())
     }
 
-    /// SPEC-3.3.1's final push: see [`Forge::final_push`]. GitHub has no
+    /// SPEC-3.3.8 through SPEC-3.3.19's final push: see [`Forge::final_push`]. GitHub has no
     /// AGit equivalent, so `HEAD` is always the feature branch; "nothing to
     /// push" degrades to `Ok(None)` when it carries no commit the base
     /// lacks. Like every other push here, the repo's `pre-push` hook is
@@ -1145,7 +1145,7 @@ impl Forge for GithubForge {
         }
     }
 
-    /// SPEC-8.9: two probes, run with the action's PAT as `GH_TOKEN` exactly as
+    /// SPEC-8.9.1 through SPEC-8.9.2: two probes, run with the action's PAT as `GH_TOKEN` exactly as
     /// `open_via_gh` does, so they test the identity that will open the PR.
     /// The MCP transport exposes neither read, so this is
     /// `gh`-only; a host without `gh` reports that by name rather than silently
@@ -1291,7 +1291,7 @@ impl Forge for GithubForge {
     /// value, never a default: silently guessing a CI verdict is worse than
     /// failing loudly. Only the latest run per workflow on the head SHA
     /// counts (`latest_runs_per_workflow`), and a latest run concluded
-    /// `skipped` is `pending`, not `success` (SPEC-8.11): a repo
+    /// `skipped` is `pending`, not `success` (SPEC-8.11.1 through SPEC-8.11.2): a repo
     /// whose required checks gate on `if: !draft` leaves exactly this shape
     /// on the head SHA for as long as the PR stays a draft.
     fn pr_status(&self, _host: &str, repo: &str, pr_number: u64) -> Result<super::PrStatus> {
@@ -1482,6 +1482,21 @@ impl Forge for GithubForge {
         Ok(())
     }
 
+    /// GitHub's branch protection is not readable through `gh` in a form that
+    /// maps to "does merging this PR require the base branch to be up to
+    /// date first", so this backend always answers `None` (not readable),
+    /// same as the trait's default. Written out explicitly here rather than
+    /// left to the default so the "not supported on GitHub" fact is visible
+    /// next to the rest of this backend's `Forge` impl.
+    fn branch_requires_up_to_date(
+        &self,
+        _host: &str,
+        _repo: &str,
+        _base_ref: &str,
+    ) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
     /// `gh api repos/<repo>/collaborators/<username>/permission --jq
     /// .permission`, run with the action's PAT as `GH_TOKEN` exactly as
     /// `repo_access` does. GitHub's REST response's `permission` field is one
@@ -1523,7 +1538,7 @@ impl Forge for GithubForge {
     }
 }
 
-/// SPEC-8.2: forward every [`IssueTracker`] operation to a fresh, cheap
+/// SPEC-8.2.1 through SPEC-8.2.4: forward every [`IssueTracker`] operation to a fresh, cheap
 /// [`CliBackend`] (default `yt`/`fj` binaries, no per-call state, so a new one
 /// per call costs nothing). A YouTrack write needs no GitHub credential or
 /// state, only ambient `yt` auth exactly like the Forgejo path; this is what
@@ -1602,7 +1617,7 @@ impl IssueTracker for GithubForge {
     }
 }
 
-/// SPEC-8.2: marks `GithubForge` as usable by [`super::resolve`]/[`super::resolve_runner`].
+/// SPEC-8.2.1 through SPEC-8.2.4: marks `GithubForge` as usable by [`super::resolve`]/[`super::resolve_runner`].
 impl Backend for GithubForge {
     fn name(&self) -> &'static str {
         "github"
@@ -1996,7 +2011,7 @@ impl GhPrEntry {
 /// once a run has more than 25 jobs). GitHub's webhook `run_number` (the
 /// trait methods' `run_number` parameter, from `workflow_run.run_number`) is
 /// not the id the REST API addresses a run by (`workflow_run.id`), so
-/// SPEC-3.5: [`GhForgeReads::find_run`] pages `GET /repos/{repo}/actions/runs`
+/// SPEC-3.5.1 through SPEC-3.5.18: [`GhForgeReads::find_run`] pages `GET /repos/{repo}/actions/runs`
 /// newest-first and matches `run_number` locally, reusing
 /// [`crate::forge_log::parse_runs_list_entries`]'s tolerant field-name
 /// matching (GitHub's `run_number` / `id` / `path` / `updated_at` are among
@@ -2202,7 +2217,7 @@ struct GhJobEntry {
     conclusion: Option<String>,
 }
 
-/// SPEC-3.5: GitHub-side job log fetch for `forge_log`'s triage and
+/// SPEC-3.5.1 through SPEC-3.5.18: GitHub-side job log fetch for `forge_log`'s triage and
 /// CI-diagnostic-context paths.
 impl crate::forge_log::ActionLogClient for GhForgeReads {
     fn run_logs(
@@ -2289,7 +2304,7 @@ impl crate::forge_log::ActionLogClient for GhForgeReads {
     }
 }
 
-/// SPEC-3.5: GitHub-side run listing/timing for `forge_log`'s triage and
+/// SPEC-3.5.1 through SPEC-3.5.18: GitHub-side run listing/timing for `forge_log`'s triage and
 /// CI-diagnostic-context paths.
 impl crate::forge_log::ActionRunsClient for GhForgeReads {
     fn list_runs(
@@ -2393,7 +2408,7 @@ impl crate::forge_log::ActionRunsClient for GhForgeReads {
     }
 }
 
-/// SPEC-3.5: GitHub-side workflow YAML read for `forge_log`'s analysis pass.
+/// SPEC-3.5.1 through SPEC-3.5.18: GitHub-side workflow YAML read for `forge_log`'s analysis pass.
 impl crate::forge_log::RepoFileClient for GhForgeReads {
     fn read_file(
         &self,
@@ -2657,7 +2672,7 @@ mod tests {
         assert_eq!(push_calls, 2, "{calls:?}");
     }
 
-    /// SPEC-3.3.1: `GithubForge::final_push` pushes HEAD when it
+    /// SPEC-3.3.8 through SPEC-3.3.19: `GithubForge::final_push` pushes HEAD when it
     /// is ahead of the detected base.
     #[test]
     fn final_push_pushes_ahead_commits() {

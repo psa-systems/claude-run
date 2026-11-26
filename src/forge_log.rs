@@ -1,4 +1,4 @@
-//! SPEC-3.5: Forgejo Action log fetch with retry and secret redaction.
+//! SPEC-3.5.1 through SPEC-3.5.18: Forgejo Action log fetch with retry and secret redaction.
 //!
 //! A run's logs are read through the `fj` CLI:
 //!
@@ -72,7 +72,7 @@ const MIN_KNOWN_SECRET_LEN: usize = 8;
 /// this keeps ordinary prose ("the token implementation") from being redacted.
 const MIN_VALUE_LEN: usize = 16;
 
-/// SPEC-3.5: one job of a run as `fj actions logs --json` reports it. The
+/// SPEC-3.5.1 through SPEC-3.5.18: one job of a run as `fj actions logs --json` reports it. The
 /// vector order is the run order, so a job's position IS its job index.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct JobLog {
@@ -97,10 +97,10 @@ pub struct JobLog {
     pub log_reason: Option<String>,
 }
 
-/// SPEC-3.5: the [`JobLog::log_state`] value that means the log is gone for good.
+/// SPEC-3.5.1 through SPEC-3.5.18: the [`JobLog::log_state`] value that means the log is gone for good.
 pub const LOG_STATE_MISSING: &str = "missing";
 
-/// SPEC-3.5: `Some(reason)` when `fj` reports EVERY job's log as permanently
+/// SPEC-3.5.1 through SPEC-3.5.18: `Some(reason)` when `fj` reports EVERY job's log as permanently
 /// missing (the signal), so the run has no log to analyze and never will.
 /// `None` when any job carries a log, when the run has no jobs, or when the `fj`
 /// that answered is older and says nothing about the state: this may only
@@ -132,7 +132,7 @@ struct RunLogsDoc {
     jobs: Vec<JobLog>,
 }
 
-/// SPEC-3.5: outcome of ONE `fj actions logs` invocation.
+/// SPEC-3.5.1 through SPEC-3.5.18: outcome of ONE `fj actions logs` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunLogsOutcome {
     /// The run's jobs in run order, with raw (unredacted) logs.
@@ -146,7 +146,7 @@ pub enum RunLogsOutcome {
     Failed(String),
 }
 
-/// SPEC-3.5: seam over `fj actions logs`, implemented by
+/// SPEC-3.5.1 through SPEC-3.5.18: seam over `fj actions logs`, implemented by
 /// [`crate::provider::cli::FjForgeReads`]. Abstracted so the retry / redaction
 /// logic is unit-testable without spawning a process.
 pub trait ActionLogClient: Send + Sync {
@@ -162,7 +162,7 @@ pub trait ActionLogClient: Send + Sync {
     ) -> RunLogsOutcome;
 }
 
-/// SPEC-3.5: seam over `fj actions runs`, implemented by
+/// SPEC-3.5.1 through SPEC-3.5.18: seam over `fj actions runs`, implemented by
 /// [`crate::provider::cli::FjForgeReads`]. The implementation owns the paging,
 /// so a caller asks once for up to `max_pages` pages worth of runs.
 pub trait ActionRunsClient: Send + Sync {
@@ -191,7 +191,7 @@ pub trait ActionRunsClient: Send + Sync {
     ) -> std::result::Result<RunTiming, String>;
 }
 
-/// SPEC-3.5: seam over `fj repo file`, implemented by
+/// SPEC-3.5.1 through SPEC-3.5.18: seam over `fj repo file`, implemented by
 /// [`crate::provider::cli::FjForgeReads`].
 pub trait RepoFileClient: Send + Sync {
     /// Read `path` in `repo` at `git_ref` on forge `host`, returning the file's
@@ -207,19 +207,19 @@ pub trait RepoFileClient: Send + Sync {
     ) -> std::result::Result<String, String>;
 }
 
-/// SPEC-3.5: every forge read the CI-failure actions make, so each holds ONE
+/// SPEC-3.5.1 through SPEC-3.5.18: every forge read the CI-failure actions make, so each holds ONE
 /// client instead of one per endpoint.
 pub trait ForgeReads: ActionLogClient + ActionRunsClient + RepoFileClient {}
 
 impl<T: ActionLogClient + ActionRunsClient + RepoFileClient> ForgeReads for T {}
 
-/// SPEC-3.5: parse a `fj actions logs --json` document into its jobs.
+/// SPEC-3.5.1 through SPEC-3.5.18: parse a `fj actions logs --json` document into its jobs.
 pub fn parse_run_logs(stdout: &str) -> std::result::Result<Vec<JobLog>, String> {
     let doc: RunLogsDoc = serde_json::from_str(stdout.trim()).map_err(|e| e.to_string())?;
     Ok(doc.jobs)
 }
 
-/// SPEC-3.5: which run's logs to fetch.
+/// SPEC-3.5.1 through SPEC-3.5.18: which run's logs to fetch.
 #[derive(Debug, Clone)]
 pub struct LogTarget {
     /// Forge host, e.g. `dev.a8n.run` (what `fj --host` takes).
@@ -234,7 +234,7 @@ pub struct LogTarget {
 }
 
 impl LogTarget {
-    /// SPEC-3.5: build a target for `(repo, run_number)` from the failure
+    /// SPEC-3.5.1 through SPEC-3.5.18: build a target for `(repo, run_number)` from the failure
     /// event's `html_url`, deriving the forge host from it. `None` when the
     /// host cannot be derived.
     pub fn for_run(
@@ -252,7 +252,7 @@ impl LogTarget {
     }
 }
 
-/// SPEC-3.5: tunables for the fetch retry/backoff loop.
+/// SPEC-3.5.1 through SPEC-3.5.18: tunables for the fetch retry/backoff loop.
 #[derive(Debug, Clone)]
 pub struct LogFetchConfig {
     /// Number of *retries* after the first attempt. Total GETs = `1 + max_retries`.
@@ -274,7 +274,7 @@ impl Default for LogFetchConfig {
 }
 
 impl LogFetchConfig {
-    /// SPEC-3.5: one call, no backoff. For the polling actions, which read
+    /// SPEC-3.5.1 through SPEC-3.5.18: one call, no backoff. For the polling actions, which read
     /// runs that finished long ago: a run `fj` cannot see there is
     /// pruned, not un-flushed, so waiting only burns the budget per issue. The
     /// webhook consumer keeps the retrying default, since its event arrives the
@@ -287,7 +287,7 @@ impl LogFetchConfig {
     }
 }
 
-/// SPEC-3.5: a successfully fetched and redacted run log.
+/// SPEC-3.5.1 through SPEC-3.5.18: a successfully fetched and redacted run log.
 #[derive(Debug, Clone)]
 pub struct RedactedLog {
     /// Every job's redacted log concatenated under a `===== name =====` header,
@@ -301,7 +301,7 @@ pub struct RedactedLog {
     pub jobs: Vec<JobLog>,
 }
 
-/// SPEC-3.5: outcome of a fetch. A persistent miss is `TransientMiss`, not an
+/// SPEC-3.5.1 through SPEC-3.5.18: outcome of a fetch. A persistent miss is `TransientMiss`, not an
 /// error, so the caller treats it as "logs not available yet / pruned" rather
 /// than a fault.
 #[derive(Debug, Clone)]
@@ -328,7 +328,7 @@ enum LastProbe {
     Fault(String),
 }
 
-/// SPEC-3.5: fetch every job's log for `target` through `fj actions logs`, retrying while
+/// SPEC-3.5.1 through SPEC-3.5.18: fetch every job's log for `target` through `fj actions logs`, retrying while
 /// the run is not visible yet, redact each job's log, and write the concatenated
 /// redacted text to an artifact file under `out_dir`. Returns
 /// [`LogOutcome::Fetched`] on success, [`LogOutcome::AuthDenied`] immediately on
@@ -405,7 +405,7 @@ fn render_run_log(jobs: &[JobLog]) -> String {
     out
 }
 
-/// SPEC-3.5: authority (`host[:port]`) of a forge URL, the bare host
+/// SPEC-3.5.1 through SPEC-3.5.18: authority (`host[:port]`) of a forge URL, the bare host
 /// `fj --host` takes (e.g. `dev.a8n.run`). `None` when the URL has no host
 /// segment.
 pub fn host_from_html_url(url: &str) -> Option<String> {
@@ -425,7 +425,7 @@ fn write_artifact(out_dir: &Path, target: &LogTarget, text: &str) -> Result<Path
     Ok(path)
 }
 
-/// SPEC-3.5: one run pulled from the runs-list JSON with the full set of
+/// SPEC-3.5.1 through SPEC-3.5.18: one run pulled from the runs-list JSON with the full set of
 /// fields the auto-close reconciler needs to group and evaluate runs. The
 /// reconciler reduces these to the LATEST run per `(branch, workflow_id)` and
 /// reads each latest run's per-job status from the jobs `fj actions logs`
@@ -454,7 +454,7 @@ pub struct RunEntry {
     pub stopped: String,
 }
 
-/// SPEC-3.5: parse one `fj actions runs --json` page into [`RunEntry`]s,
+/// SPEC-3.5.1 through SPEC-3.5.18: parse one `fj actions runs --json` page into [`RunEntry`]s,
 /// tolerant of Forgejo's field naming. Runs missing an `id` are skipped. The
 /// branch is empty when the page carries no plain branch name (the reconciler
 /// then resolves it from the log).
@@ -528,7 +528,7 @@ fn run_index(run: &serde_json::Value) -> i64 {
         .unwrap_or(0)
 }
 
-/// SPEC-3.5: one run's forge-reported start / stop times. Handed to the
+/// SPEC-3.5.1 through SPEC-3.5.18: one run's forge-reported start / stop times. Handed to the
 /// CI-failure analysis so it can tell a job that stopped emitting output and was
 /// killed (a long gap between the last log line and `stopped`) from a capture
 /// that lost data.
@@ -540,7 +540,7 @@ pub struct RunTiming {
     pub stopped: String,
 }
 
-/// SPEC-3.5: read `run_number`'s `started` / `stopped` out of a
+/// SPEC-3.5.1 through SPEC-3.5.18: read `run_number`'s `started` / `stopped` out of a
 /// `fj actions runs --json` page. `Err` names the reason (unparseable page, no
 /// such run, a run still in flight that reports no stop time), so the caller
 /// logs it and analyzes without the timing rather than inventing one.
@@ -598,7 +598,7 @@ fn branch_name(value: &str) -> String {
     }
 }
 
-/// SPEC-3.5: outcome of fetching the runs list. Auth-class / not-found
+/// SPEC-3.5.1 through SPEC-3.5.18: outcome of fetching the runs list. Auth-class / not-found
 /// responses on the FIRST page are terminal; a mid-paging error stops paging
 /// and returns the entries already collected (partial coverage is better than
 /// none for a poll).
@@ -624,7 +624,7 @@ const WORKFLOW_DIRS: &[&str] = &[
 /// and returns the first that resolves, redacted. `None` when none
 /// resolve (the analysis proceeds over the log alone and says the YAML was
 /// unavailable). Never errors on a miss.
-/// SPEC-3.5: redacted read of the failing workflow's YAML, used by the
+/// SPEC-3.5.1 through SPEC-3.5.18: redacted read of the failing workflow's YAML, used by the
 /// analysis pass alongside the fetched job logs.
 pub fn read_workflow_yaml<C: RepoFileClient + ?Sized>(
     client: &C,
@@ -737,7 +737,7 @@ fn branch_from_ref(value: &str) -> Option<&str> {
 /// tag ref rather than returning a number or a tag name as a branch. `None`
 /// when the log carries no readable ref (a log that stops before the env dump,
 /// a diagnostic-free log, a logless failure).
-/// SPEC-3.5: the log-environment fallback for a run's branch, used because the
+/// SPEC-3.5.1 through SPEC-3.5.18: the log-environment fallback for a run's branch, used because the
 /// deployed Forgejo's run-detail API reports a null `head_branch`.
 pub fn parse_branch_from_log(log: &str) -> Option<String> {
     let env = collect_ref_env(log);
@@ -758,7 +758,7 @@ pub fn parse_branch_from_log(log: &str) -> Option<String> {
     env.ref_name
 }
 
-/// SPEC-3.5: resolve the branch, preferring a non-empty run-detail
+/// SPEC-3.5.1 through SPEC-3.5.18: resolve the branch, preferring a non-empty run-detail
 /// `head_branch` and falling back to the log environment dump. On the deployed
 /// Forgejo run detail returns `head_branch: null`, so in practice this is the
 /// log parse; the run-detail arm keeps the resolver correct where the field IS
@@ -774,7 +774,7 @@ pub fn resolve_branch(run_detail_branch: Option<&str>, log: &str) -> Option<Stri
 /// logs` returned: the first job whose status denotes a failure, else the first
 /// job. `None` for a run with no jobs. The job's position in the slice is its
 /// job index in run order, so nothing has to assume index 0.
-/// SPEC-3.5: triage input, selecting which job's log/name backs the failure.
+/// SPEC-3.5.1 through SPEC-3.5.18: triage input, selecting which job's log/name backs the failure.
 pub fn resolve_failing_job(jobs: &[JobLog]) -> Option<&JobLog> {
     jobs.iter()
         .find(|j| is_failure_status(&j.status))
@@ -785,7 +785,7 @@ pub fn resolve_failing_job(jobs: &[JobLog]) -> Option<&JobLog> {
 /// [`resolve_failing_job`] (which always returns exactly one job, falling back
 /// to the first), this is empty when nothing failed, and carries every failing
 /// job of a run where several checks failed independently.
-/// SPEC-3.5: every failing job, used by the CI-diagnostic context.
+/// SPEC-3.5.1 through SPEC-3.5.18: every failing job, used by the CI-diagnostic context.
 pub fn failing_jobs(jobs: &[JobLog]) -> Vec<&JobLog> {
     jobs.iter()
         .filter(|j| is_failure_status(&j.status))
@@ -800,7 +800,7 @@ fn is_failure_status(s: &str) -> bool {
     )
 }
 
-/// SPEC-3.6: the last `n` lines of `text` (fewer if it has fewer), joined back
+/// SPEC-3.6.1 through SPEC-3.6.7: the last `n` lines of `text` (fewer if it has fewer), joined back
 /// with `\n`. Bounds how much of a failing job's log is carried into a fix
 /// request's context: the whole log is setup and teardown noise
 /// around a comparatively short error, so only the tail is included.
@@ -810,7 +810,7 @@ pub fn tail_lines(text: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-/// SPEC-3.6: lines of a failing job's log carried into a fix request's
+/// SPEC-3.6.1 through SPEC-3.6.7: lines of a failing job's log carried into a fix request's
 /// CI-diagnostic context ([`ci_failure_context_for_branch`]). Assumed to bound
 /// the error region adequately; revisit if validation shows
 /// otherwise.
@@ -830,7 +830,7 @@ const CI_FAILURE_RUN_PROBE_LIMIT: usize = 5;
 /// carries no failing job. Callers proceed without CI context on `None`, per
 /// the acceptance criteria: a fix request with no resolvable failing run still
 /// proceeds as if this were never called.
-/// SPEC-3.6: diagnostic context for a comment-command fix request, resolved
+/// SPEC-3.6.1 through SPEC-3.6.7: diagnostic context for a comment-command fix request, resolved
 /// from the PR head branch's most recent failing check run.
 pub fn ci_failure_context_for_branch(
     client: &dyn ForgeReads,
@@ -924,7 +924,7 @@ const STOPPED_STATUSES: &[&str] = &["cancelled", "skipped"];
 /// failed. Forgejo reports run-level `failure` for a run whose jobs were merely
 /// cancelled (a newer push superseded it), so the payload status alone cannot
 /// tell a broken build from a stopped one.
-/// SPEC-3.5: distinguishes a broken build from a stopped run, so a superseded
+/// SPEC-3.5.1 through SPEC-3.5.18: distinguishes a broken build from a stopped run, so a superseded
 /// or skipped run never triages as `code_fix`/`auto_fix`/`human_action`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobsVerdict {
@@ -940,7 +940,7 @@ pub enum JobsVerdict {
 }
 
 impl JobsVerdict {
-    /// SPEC-3.5: the verdict for one fetch. `unavailable_reason` is the
+    /// SPEC-3.5.1 through SPEC-3.5.18: the verdict for one fetch. `unavailable_reason` is the
     /// caller's cause for a fetch that returned no job list (transient miss,
     /// auth denial, fault, panicked task); when it is set the verdict is
     /// [`JobsVerdict::Unknown`] regardless of `jobs`.
@@ -961,7 +961,7 @@ impl JobsVerdict {
         }
     }
 
-    /// SPEC-3.5: true when the run was stopped rather than broken: it has
+    /// SPEC-3.5.1 through SPEC-3.5.18: true when the run was stopped rather than broken: it has
     /// jobs, none failed, and every one ended in [`STOPPED_STATUSES`]. False
     /// for an empty job list, so a run that resolved with no jobs at all still
     /// mints.
@@ -977,7 +977,7 @@ impl JobsVerdict {
         }
     }
 
-    /// SPEC-3.5: the observed statuses as one comma-separated string, for a
+    /// SPEC-3.5.1 through SPEC-3.5.18: the observed statuses as one comma-separated string, for a
     /// log line and the run summary. Empty for a verdict that carries no
     /// status list.
     pub fn statuses_display(&self) -> String {
@@ -991,7 +991,7 @@ impl JobsVerdict {
 /// Redact secrets from `input`: first mask each known secret value verbatim,
 /// then redact token *shapes* (known prefixes, and high-entropy values that
 /// follow an auth keyword). Pure; the unit of the AC's redaction test.
-/// SPEC-3.5: shared redaction applied to every log fetched here before it is
+/// SPEC-3.5.1 through SPEC-3.5.18: shared redaction applied to every log fetched here before it is
 /// stored, attached, or fed into a diagnostic context.
 pub fn redact(input: &str, known_secrets: &[String]) -> String {
     let mut text = input.to_string();

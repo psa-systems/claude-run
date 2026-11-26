@@ -15,7 +15,7 @@
 //! object keys and diverge from the current direct-struct output. Lexing the
 //! canonical string keeps the bytes identical regardless of the source type.
 //!
-//! SPEC-4.1.1: "stripping the color codes back out always yields
+//! SPEC-4.1.2 through SPEC-4.1.4: "stripping the color codes back out always yields
 //! byte-identical output to the plain `serde_json::to_string_pretty` form."
 
 use std::fmt::Write as _;
@@ -38,7 +38,7 @@ const LITERAL: Style = AnsiColor::Magenta.on_default();
 /// (e.g. [`print_json`]) so they are stripped when color is disabled. Stripping
 /// the result yields exactly [`serde_json::to_string_pretty`] output.
 ///
-/// SPEC-4.1.1: "JSON ... is syntax-highlighted token by token (keys,
+/// SPEC-4.1.2 through SPEC-4.1.4: "JSON ... is syntax-highlighted token by token (keys,
 /// strings, numbers, `true`/`false`/`null`) with the surrounding structure
 /// and whitespace copied through unchanged."
 pub fn to_colored_string<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<String> {
@@ -49,7 +49,7 @@ pub fn to_colored_string<T: Serialize + ?Sized>(value: &T) -> serde_json::Result
 /// `anstream::stdout()` so ANSI codes are stripped when color is off. Drop-in
 /// replacement for `println!("{}", serde_json::to_string_pretty(value)?)`.
 ///
-/// SPEC-4.1.1: "JSON printed to a terminal (`--color auto`, a TTY) or forced
+/// SPEC-4.1.2 through SPEC-4.1.4: "JSON printed to a terminal (`--color auto`, a TTY) or forced
 /// on is syntax-highlighted"; `anstream` strips the codes otherwise.
 pub fn print_json<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<()> {
     anstream::println!("{}", to_colored_string(value)?);
@@ -60,7 +60,7 @@ pub fn print_json<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<()> {
 /// else byte-for-byte. `pretty` must be well-formed JSON as produced by
 /// [`serde_json::to_string_pretty`].
 ///
-/// SPEC-4.1.1: the token-by-token highlighter whose output, with color
+/// SPEC-4.1.2 through SPEC-4.1.4: the token-by-token highlighter whose output, with color
 /// codes stripped, is byte-identical to `pretty`.
 pub fn highlight(pretty: &str) -> String {
     let mut out = String::with_capacity(pretty.len());

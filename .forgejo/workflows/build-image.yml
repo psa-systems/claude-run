@@ -4,8 +4,8 @@
 # pinned nu/claude/yt/fj toolchain) to the Forgejo OCI registry as
 # `dev.a8n.run/<owner>/claude-run:<tag>` on every push to develop / tag, with the
 # trigger-derived tag (vX.Y.Z on tags, moving `latest` on develop). A push to
-# `main` publishes nothing (SPEC-11.15). Not a required status check
-# (SPEC-11.16). The image compiles from source via the multi-stage Dockerfile
+# `main` publishes nothing (SPEC-11.3.5). Not a required status check
+# (SPEC-11.3.6). The image compiles from source via the multi-stage Dockerfile
 # and is the only published artifact.
 name: Build image
 
@@ -38,7 +38,7 @@ on:
         default: ""
 
 # A new develop push replaces a running develop publication; a tag publication
-# is never cancelled (SPEC-11.16). Manual runs get their own group.
+# is never cancelled (SPEC-11.3.6). Manual runs get their own group.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
@@ -71,7 +71,7 @@ jobs:
       - name: Start job metrics sampler
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-start@main
 
-      # SPEC-9.2: resolves the publish train from this workflow's own trigger, never from `git describe`.
+      # SPEC-9.2.1 through SPEC-9.2.2: resolves the publish train from this workflow's own trigger, never from `git describe`.
       # The publish MODE is derived from the TRIGGER, never from `git
       # describe`: a tag ref -> release (push `vX.Y.Z` only), a develop push ->
       # latest (push `latest` only), a manual run -> dry-run. Resolving disjoint

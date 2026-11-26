@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPEC-9.1: "It gets its own shallow chown from the `20-data-dir.sh` hook
+# SPEC-9.1.1 through SPEC-9.1.5: "It gets its own shallow chown from the `20-data-dir.sh` hook
 # instead: the directory itself, every entry directly under it except
 # `workdirs` (chowned recursively), and the `workdirs` directory entry itself
 # (not its contents)." Root hook, run by gosu-entrypoint.sh before the chown.

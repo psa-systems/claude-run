@@ -12,7 +12,7 @@
 //! whether an action's schedule makes it due now, and `regather_due` paces how
 //! often a due action is gathered.
 //!
-//! SPEC-3.1: "`schedule.kind` is `interval`, `cron`, or `manual`"; SPEC-2.2:
+//! SPEC-3.1.1 through SPEC-3.1.12: "`schedule.kind` is `interval`, `cron`, or `manual`"; SPEC-2.2.1 through SPEC-2.2.2:
 //! the scheduler computes a due time per schedule kind and tracks regather
 //! cadence in memory, not from DB rows.
 
@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use crate::action::{Schedule, ScheduleKind};
 use crate::error::Result;
 
-/// SPEC-3.1: the parsed form of an action's `schedule:` block (`interval`,
+/// SPEC-3.1.1 through SPEC-3.1.12: the parsed form of an action's `schedule:` block (`interval`,
 /// `cron`, or `manual`).
 #[derive(Debug, Clone)]
 pub enum ParsedSchedule {
@@ -35,7 +35,7 @@ pub enum ParsedSchedule {
     Manual,
 }
 
-/// SPEC-3.1: validates an action's stored `schedule.kind` / `schedule.spec`.
+/// SPEC-3.1.1 through SPEC-3.1.12: validates an action's stored `schedule.kind` / `schedule.spec`.
 pub fn parse_schedule(s: &Schedule) -> Result<ParsedSchedule> {
     match s.kind {
         ScheduleKind::Manual => Ok(ParsedSchedule::Manual),
@@ -68,7 +68,7 @@ pub fn parse_schedule(s: &Schedule) -> Result<ParsedSchedule> {
     }
 }
 
-/// SPEC-2.2: computes the due time for an action's schedule kind.
+/// SPEC-2.2.1 through SPEC-2.2.2: computes the due time for an action's schedule kind.
 ///
 /// Decide whether an action is due to fire now, given when it last started.
 pub fn next_fire_due(
@@ -96,7 +96,7 @@ pub fn next_fire_due(
     }
 }
 
-/// SPEC-2.2: tracks regather cadence in memory (the dispatcher's `last_fire`
+/// SPEC-2.2.1 through SPEC-2.2.2: tracks regather cadence in memory (the dispatcher's `last_fire`
 /// map), not from DB-row state.
 ///
 /// The continuous-pickup cadence check. Replaces the old

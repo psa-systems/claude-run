@@ -1,4 +1,4 @@
-//! Implements SPEC-4.3.13. Shared reporting aggregations over historical
+//! Implements SPEC-4.3.41 through SPEC-4.3.47. Shared reporting aggregations over historical
 //! state.
 //!
 //! Both the JSON API (`/api/report/*`, [`crate::api`]) and the `/reports` HTML
@@ -27,7 +27,7 @@ use serde::Serialize;
 
 use crate::error::Result;
 
-/// SPEC-4.3.13: selectable reporting window. Bounds every query by date / `ts`.
+/// SPEC-4.3.41 through SPEC-4.3.47: selectable reporting window. Bounds every query by date / `ts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Range {
     Last7Days,
@@ -37,7 +37,7 @@ pub enum Range {
 }
 
 impl Range {
-    /// SPEC-4.3.13: "query `range` (`30d`, `90d`, other values mean all
+    /// SPEC-4.3.41 through SPEC-4.3.47: "query `range` (`30d`, `90d`, other values mean all
     /// time)." Anything but `30d` / `90d` (including an absent value)
     /// defaults to all-time.
     pub fn from_param(s: &str) -> Range {
@@ -86,7 +86,7 @@ fn ts_cutoff(range: Range) -> Option<String> {
         .map(|d| (Utc::now() - Duration::days(d)).to_rfc3339())
 }
 
-/// SPEC-4.3.13: "All weekday / hour bucketing converts the stored UTC
+/// SPEC-4.3.41 through SPEC-4.3.47: "All weekday / hour bucketing converts the stored UTC
 /// timestamp to the daemon's local timezone before extracting the weekday /
 /// hour." `weekday` is `0 = Sunday .. 6 = Saturday`, `hour` is `0..=23`.
 /// Returns `None` if the timestamp fails to parse. Generic over the timezone
@@ -116,7 +116,7 @@ fn weekday_label(idx: u32) -> &'static str {
 
 // ---- output series --------------------------------------------------------
 
-/// SPEC-4.3.13: top-line totals over the window.
+/// SPEC-4.3.41 through SPEC-4.3.47: top-line totals over the window.
 #[derive(Debug, Default, Serialize)]
 pub struct Summary {
     pub range: String,
@@ -166,7 +166,7 @@ pub struct HourBucket {
     pub run_starts: i64,
 }
 
-/// SPEC-4.3.13: one `claude_invocations` row, oldest-to-newest, for the plan
+/// SPEC-4.3.41 through SPEC-4.3.47: one `claude_invocations` row, oldest-to-newest, for the plan
 /// usage chart. `five_hour_utilization` / `seven_day_utilization` are `None`
 /// when the invocation's stream log had no `rate_limit_event` at all (an old
 /// CLI, or a session that made no API call reporting one): those points are
@@ -206,7 +206,7 @@ pub struct RecentInvocation {
     pub api_retries: u64,
 }
 
-/// SPEC-4.3.13: the whole "Claude plan usage" report section: the chart
+/// SPEC-4.3.41 through SPEC-4.3.47: the whole "Claude plan usage" report section: the chart
 /// series plus the most-recent-invocations table, both honoring the same
 /// `range`/`action` filters as the rest of `/reports`.
 #[derive(Debug, Default, Serialize)]
@@ -221,7 +221,7 @@ pub struct ClaudeUsageReport {
 
 // ---- aggregations ---------------------------------------------------------
 
-/// SPEC-4.3.13: "`GET /report/daily`" series: daily spend + run-count from
+/// SPEC-4.3.41 through SPEC-4.3.47: "`GET /report/daily`" series: daily spend + run-count from
 /// `daily_ledger` (already local-dated), oldest to newest.
 pub async fn daily(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Vec<DailyPoint>> {
     let cutoff = date_cutoff(range);
@@ -256,7 +256,7 @@ pub async fn daily(pool: &DbPool, range: Range, action: Option<&str>) -> Result<
         .collect())
 }
 
-/// SPEC-4.3.13: "`GET /report/weekly`" series. ISO-week rollup of [`daily`],
+/// SPEC-4.3.41 through SPEC-4.3.47: "`GET /report/weekly`" series. ISO-week rollup of [`daily`],
 /// aggregated in Rust rather than via SQLite date functions, which lack
 /// ISO-week support.
 pub async fn weekly(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Vec<WeeklyPoint>> {
@@ -337,7 +337,7 @@ async fn run_span_rows(
     Ok(q.fetch_all(pool).await?)
 }
 
-/// SPEC-4.3.13: "`GET /report/by-weekday`" series: spend from `job_outcomes`,
+/// SPEC-4.3.41 through SPEC-4.3.47: "`GET /report/by-weekday`" series: spend from `job_outcomes`,
 /// run count + run minutes from `runs`, bucketed by local weekday. Always
 /// returns 7 buckets, Sunday first, even when empty, rather than omitting an
 /// empty bucket.
@@ -377,7 +377,7 @@ pub async fn by_weekday(
         .collect())
 }
 
-/// SPEC-4.3.13: "`GET /report/by-hour`" series: spend + job activity from
+/// SPEC-4.3.41 through SPEC-4.3.47: "`GET /report/by-hour`" series: spend + job activity from
 /// `job_outcomes` and run starts from `runs`, bucketed by local hour. Always
 /// returns 24 buckets, `0..=23`, even when empty.
 pub async fn by_hour(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Vec<HourBucket>> {
@@ -407,7 +407,7 @@ pub async fn by_hour(pool: &DbPool, range: Range, action: Option<&str>) -> Resul
         .collect())
 }
 
-/// SPEC-4.3.13: "`GET /report/summary`" totals: spend + run count from
+/// SPEC-4.3.41 through SPEC-4.3.47: "`GET /report/summary`" totals: spend + run count from
 /// `daily_ledger`, run minutes from `runs` (the only source with both
 /// endpoints; NULL `ended_at` excluded).
 pub async fn summary(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Summary> {
@@ -450,7 +450,7 @@ pub async fn summary(pool: &DbPool, range: Range, action: Option<&str>) -> Resul
 // ---- replicated (peered) series -------------------------------------------
 
 /// Which store the five merged series (`daily`, `weekly`, `by_weekday`,
-/// `by_hour`, `summary`) read (`SPEC-3.17` item 10).
+/// `by_hour`, `summary`) read (`SPEC-3.17.11`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     /// Peering is off: `daily_ledger`, `job_outcomes` and `runs`, as before.
@@ -644,7 +644,7 @@ pub async fn summary_scoped(
     })
 }
 
-/// SPEC-4.3.13: the "Claude plan usage" section backing [`ClaudeUsageReport`].
+/// SPEC-4.3.41 through SPEC-4.3.47: the "Claude plan usage" section backing [`ClaudeUsageReport`].
 /// The chart reads every row in the window oldest first, so the SVG draws
 /// left-to-right; the table re-queries the same window newest-first and caps
 /// at 20, rather than reversing and slicing the chart's own rows, so a huge
@@ -771,7 +771,7 @@ pub async fn claude_usage(
     })
 }
 
-/// SPEC-3.14 items 1 and 7: attempts counted by `(stage,
+/// SPEC-3.14.2 and SPEC-3.14.8: attempts counted by `(stage,
 /// outcome)` straight from `job_outcomes`, so "succeeded on the first try" is
 /// a query and not a re-derivation from `attempt_steps`.
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -781,7 +781,7 @@ pub struct StageOutcomeCount {
     pub count: i64,
 }
 
-/// SPEC-3.14 item 7: attempt counts by stage and outcome over the window.
+/// SPEC-3.14.8: attempt counts by stage and outcome over the window.
 /// A row with a NULL stage or outcome (it cannot exist after the backfill
 /// migration) is an error, never silently bucketed.
 pub async fn attempts_by_outcome(
@@ -818,14 +818,14 @@ pub async fn attempts_by_outcome(
         .collect())
 }
 
-/// SPEC-4.3.14: one `kind`'s total duration over the window.
+/// SPEC-4.3.48 through SPEC-4.3.56: one `kind`'s total duration over the window.
 #[derive(Debug, Serialize)]
 pub struct KindDuration {
     pub kind: String,
     pub seconds: f64,
 }
 
-/// SPEC-4.3.14: one `check` sub-step `label`'s total duration + occurrence
+/// SPEC-4.3.48 through SPEC-4.3.56: one `check` sub-step `label`'s total duration + occurrence
 /// count over the window.
 #[derive(Debug, Serialize)]
 pub struct CheckLabelDuration {
@@ -834,7 +834,7 @@ pub struct CheckLabelDuration {
     pub count: i64,
 }
 
-/// SPEC-4.3.14 "where the time goes": the two series (time by
+/// SPEC-4.3.48 through SPEC-4.3.56 "where the time goes": the two series (time by
 /// `kind`, and the `check` breakdown by `label`), plus the count of attempts
 /// in the window with no `attempt_steps` rows at all. That count is reported
 /// as its own figure, never folded into the series as a zero (an attempt with
@@ -875,7 +875,7 @@ async fn attempt_step_rows(
     Ok(q.fetch_all(pool).await?)
 }
 
-/// SPEC-4.3.14: time-by-kind + checks series, plus the
+/// SPEC-4.3.48 through SPEC-4.3.56: time-by-kind + checks series, plus the
 /// "no step data" count (older attempts recorded before this feature shipped,
 /// or an attempt whose step writes all failed, never shown as zero).
 pub async fn step_timing(
@@ -953,7 +953,7 @@ pub async fn step_timing(
     })
 }
 
-// ---- SPEC-4.3.14: stages, Postgres, funnel, failure causes ---------------
+// ---- SPEC-4.3.48 through SPEC-4.3.56: stages, Postgres, funnel, failure causes ---------------
 
 /// Nearest-rank percentile of `sorted` (ascending), `p` in `0..=100`.
 /// `None` for an empty slice: no data is not a zero.
@@ -965,7 +965,7 @@ fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     sorted.get(rank - 1).copied()
 }
 
-/// The shared statistics helper SPEC-4.3.14 names: count, median, 95th
+/// The shared statistics helper SPEC-4.3.48 through SPEC-4.3.56 names: count, median, 95th
 /// percentile and maximum of `values` (seconds).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Stats {
@@ -986,7 +986,7 @@ fn stats(mut values: Vec<f64>) -> Stats {
 }
 
 /// Counted attempts in the window with no `attempt_steps` rows at all
-/// (SPEC-4.3.14 "no step data"): shown as its own figure on every series,
+/// (SPEC-4.3.48 through SPEC-4.3.56 "no step data"): shown as its own figure on every series,
 /// never folded in as zero seconds.
 async fn attempts_without_steps(pool: &DbPool, range: Range, action: Option<&str>) -> Result<i64> {
     let cutoff = ts_cutoff(range);
@@ -1018,7 +1018,7 @@ async fn attempts_without_steps(pool: &DbPool, range: Range, action: Option<&str
     Ok((counts[0] - counts[1]).max(0))
 }
 
-/// SPEC-3.14 item 1: the closed stage set, in report order.
+/// SPEC-3.14.2: the closed stage set, in report order.
 pub const STAGES: &[&str] = &[
     "initial",
     "retry-2",
@@ -1029,7 +1029,7 @@ pub const STAGES: &[&str] = &[
     "final",
 ];
 
-/// SPEC-4.3.14 stages series: one row per stage.
+/// SPEC-4.3.48 through SPEC-4.3.56 stages series: one row per stage.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct StageStats {
     pub stage: String,
@@ -1072,7 +1072,7 @@ async fn stage_step_rows(
     Ok(q.fetch_all(pool).await?)
 }
 
-/// SPEC-4.3.14: duration per stage (count, median, 95th percentile), one
+/// SPEC-4.3.48 through SPEC-4.3.56: duration per stage (count, median, 95th percentile), one
 /// duration per `(action, job, attempt, stage)` summed from its steps. Always
 /// returns every stage of [`STAGES`], a stage with no attempts having a zero
 /// count and no statistics (absent, not zero seconds).
@@ -1093,7 +1093,7 @@ pub async fn stages(pool: &DbPool, range: Range, action: Option<&str>) -> Result
     // A stage outside the closed set is a data defect: surface it.
     if let Some(unknown) = by_stage.keys().find(|k| !STAGES.contains(&k.as_str())) {
         return Err(crate::error::Error::Other(anyhow::anyhow!(
-            "attempt_steps holds a stage outside the SPEC-3.14 closed set: {unknown:?}"
+            "attempt_steps holds a stage outside the SPEC-3.14.1 through SPEC-3.14.9 closed set: {unknown:?}"
         )));
     }
     let stages = STAGES
@@ -1109,7 +1109,7 @@ pub async fn stages(pool: &DbPool, range: Range, action: Option<&str>) -> Result
     })
 }
 
-/// SPEC-4.3.14 Postgres series.
+/// SPEC-4.3.48 through SPEC-4.3.56 Postgres series.
 #[derive(Debug, Default, Serialize)]
 pub struct PostgresReport {
     /// Attempts that started a Postgres container.
@@ -1126,7 +1126,7 @@ pub struct PostgresReport {
     pub attempts_with_no_step_data: i64,
 }
 
-/// SPEC-4.3.14: time from Postgres start to healthy (median, 95th percentile,
+/// SPEC-4.3.48 through SPEC-4.3.56: time from Postgres start to healthy (median, 95th percentile,
 /// maximum), the count of starts that never became healthy and the cause of
 /// the last such failure.
 pub async fn postgres(pool: &DbPool, range: Range, action: Option<&str>) -> Result<PostgresReport> {
@@ -1217,7 +1217,7 @@ pub async fn postgres(pool: &DbPool, range: Range, action: Option<&str>) -> Resu
     })
 }
 
-/// SPEC-3.14 item 7: seconds after an issue's last attempt before a
+/// SPEC-3.14.8: seconds after an issue's last attempt before a
 /// non-terminal outcome counts as "never finished".
 pub const NEVER_FINISHED_AFTER_SECS: i64 = 300;
 
@@ -1296,7 +1296,7 @@ async fn attempt_rows(
         .collect()
 }
 
-/// SPEC-4.3.14 funnel: where the issues in range ended up.
+/// SPEC-4.3.48 through SPEC-4.3.56 funnel: where the issues in range ended up.
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
 pub struct FunnelCounts {
     pub first_attempt: usize,
@@ -1375,7 +1375,7 @@ pub struct FunnelReport {
     pub attempts_with_no_step_data: i64,
 }
 
-/// SPEC-4.3.14 funnel series.
+/// SPEC-4.3.48 through SPEC-4.3.56 funnel series.
 pub async fn funnel(pool: &DbPool, range: Range, action: Option<&str>) -> Result<FunnelReport> {
     let rows = attempt_rows(pool, range, action).await?;
     let counts = fold_funnel(&rows, Utc::now());
@@ -1415,7 +1415,7 @@ pub async fn funnel(pool: &DbPool, range: Range, action: Option<&str>) -> Result
     })
 }
 
-/// SPEC-4.3.14: the closed failure-cause set.
+/// SPEC-4.3.48 through SPEC-4.3.56: the closed failure-cause set.
 pub const FAILURE_CAUSES: &[&str] = &[
     "test",
     "compile",
@@ -1428,7 +1428,7 @@ pub const FAILURE_CAUSES: &[&str] = &[
     "other",
 ];
 
-/// SPEC-4.3.14: classify one failed attempt into [`FAILURE_CAUSES`] from its
+/// SPEC-4.3.48 through SPEC-4.3.56: classify one failed attempt into [`FAILURE_CAUSES`] from its
 /// timeout flag and recorded summary. `other` is the explicit bucket for
 /// everything that matches no rule; it is shown, never merged elsewhere.
 pub fn classify_failure_cause(timed_out: bool, summary: &str) -> &'static str {
@@ -1489,8 +1489,8 @@ pub struct FailureCauseReport {
     pub attempts_with_no_step_data: i64,
 }
 
-/// SPEC-4.3.14 failure-causes series: failed attempts by closed category, plus
-/// the infrastructure CI failures `triage` stored with a kind (SPEC-3.12 item 8).
+/// SPEC-4.3.48 through SPEC-4.3.56 failure-causes series: failed attempts by closed category, plus
+/// the infrastructure CI failures `triage` stored with a kind (SPEC-3.12.9).
 pub async fn failure_causes(
     pool: &DbPool,
     range: Range,
@@ -1546,9 +1546,9 @@ pub async fn failure_causes(
     })
 }
 
-// ---- SPEC-4.3.15: in flight and recent averages --------------------------
+// ---- SPEC-4.3.57 through SPEC-4.3.61: in flight and recent averages --------------------------
 
-/// SPEC-4.3.15: the fraction of the session timeout past which an in-flight
+/// SPEC-4.3.57 through SPEC-4.3.61: the fraction of the session timeout past which an in-flight
 /// job is highlighted as at risk.
 pub const AT_RISK_FRACTION: f64 = 0.8;
 
@@ -1571,7 +1571,7 @@ pub struct InflightJob {
     pub at_risk: bool,
 }
 
-/// SPEC-4.3.15: highlight flags for one job. Pure, so the rule is tested alone.
+/// SPEC-4.3.57 through SPEC-4.3.61: highlight flags for one job. Pure, so the rule is tested alone.
 pub fn highlight(
     elapsed_secs: i64,
     median_secs: Option<i64>,
@@ -1582,7 +1582,7 @@ pub fn highlight(
     (over_median, at_risk)
 }
 
-/// SPEC-4.3.15: every job in flight with its stage, current step, elapsed time
+/// SPEC-4.3.57 through SPEC-4.3.61: every job in flight with its stage, current step, elapsed time
 /// and the median of recent completed attempts. `timeout_for` gives an
 /// action's session timeout, `None` when it cannot be resolved (no at-risk
 /// highlight then; the caller logs why).
@@ -1658,7 +1658,7 @@ pub async fn inflight_jobs(
     Ok(out)
 }
 
-/// SPEC-4.3.15: mean attempt duration for one action.
+/// SPEC-4.3.57 through SPEC-4.3.61: mean attempt duration for one action.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ActionMean {
     pub action: String,
@@ -1666,7 +1666,7 @@ pub struct ActionMean {
     pub mean_seconds: f64,
 }
 
-/// SPEC-4.3.15: mean attempt duration by action over the window, from attempts
+/// SPEC-4.3.57 through SPEC-4.3.61: mean attempt duration by action over the window, from attempts
 /// that recorded a duration. Sorted by action name.
 pub async fn mean_attempt_duration_by_action(
     pool: &DbPool,
@@ -2516,7 +2516,7 @@ mod tests {
             .unwrap();
     }
 
-    /// SPEC-4.3.14: time-by-kind sums seconds per `kind`, the `checks` series
+    /// SPEC-4.3.48 through SPEC-4.3.56: time-by-kind sums seconds per `kind`, the `checks` series
     /// breaks `kind = check` down by `label`, and an attempt with no
     /// `attempt_steps` rows at all (an older attempt, predating this feature)
     /// is counted separately rather than folded into either series as zero.

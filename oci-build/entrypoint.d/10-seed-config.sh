@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPEC-9: "Entrypoint hooks seed `config.toml` and the shipped action files
+# SPEC-9.3.4: "Entrypoint hooks seed `config.toml` and the shipped action files
 # into an empty config volume." Root hook, run by gosu-entrypoint.sh before
 # the chown. Seeds the config volume on its first boot; never overwrites an
 # operator edit afterwards.

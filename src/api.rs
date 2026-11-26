@@ -1,4 +1,4 @@
-//! SPEC-4.2: the JSON API.
+//! SPEC-4.2.1 through SPEC-4.2.2: the JSON API.
 //!
 //! HTTP API exposed by the daemon. Phase 2 serves it over a unix socket at
 //! `$RUNTIME_DIR/daemon.sock`. Phase 3 binds the same router to TCP for the
@@ -44,7 +44,7 @@ use tokio::sync::mpsc;
 use crate::cancel::RunRegistry;
 use crate::state;
 
-/// SPEC-4.2: the in-memory half of the delete/trigger in-flight check.
+/// SPEC-4.2.1 through SPEC-4.2.2: the in-memory half of the delete/trigger in-flight check.
 ///
 /// The daemon's in-memory set of action names with a dispatched run.
 /// Shared between the dispatcher (which bumps/drops a per-action refcount as runs
@@ -55,7 +55,7 @@ use crate::state;
 /// positive count means "in flight".
 pub type InFlight = Arc<tokio::sync::Mutex<std::collections::HashMap<String, usize>>>;
 
-/// SPEC-4.2: the state every JSON API handler runs against.
+/// SPEC-4.2.1 through SPEC-4.2.2: the state every JSON API handler runs against.
 ///
 /// Shared state injected into every handler. `Clone` is trivial because the
 /// fields are already cheap-clone (`DbPool` is `Arc`-shaped, `Sender`
@@ -104,7 +104,7 @@ pub struct AppState {
     pub agent_config_dir: Option<std::path::PathBuf>,
 }
 
-/// SPEC-4.2: the route table.
+/// SPEC-4.2.1 through SPEC-4.2.2: the route table.
 ///
 /// JSON API router. Phase 2 mounted it at root over the unix socket;
 /// Phase 3 mounts it under `/api/` over TCP (alongside the web UI). The
@@ -148,9 +148,9 @@ pub fn router(state: AppState) -> Router {
         .with_state(Arc::new(state))
 }
 
-/// SPEC-4.2: `GET /status`'s body; `stale_gates` is SPEC-3.3's dependency
-/// gate, `attempt_cap_hits` SPEC-3.1's per-key cap, `not_ready_*`/
-/// `login_required_since` SPEC-3.7's readiness axes.
+/// SPEC-4.2.1 through SPEC-4.2.2: `GET /status`'s body; `stale_gates` is SPEC-3.3.1 through SPEC-3.3.25's dependency
+/// gate, `attempt_cap_hits` SPEC-3.1.1 through SPEC-3.1.12's per-key cap, `not_ready_*`/
+/// `login_required_since` SPEC-3.7.1 through SPEC-3.7.3's readiness axes.
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     version: String,
@@ -183,7 +183,7 @@ struct StatusResponse {
     actions: Vec<ActionStatus>,
 }
 
-/// SPEC-9: the `quiet` flag the restart-safety bullet names.
+/// SPEC-9.3.1 through SPEC-9.3.12: the `quiet` flag the restart-safety bullet names.
 ///
 /// The daemon's live-work snapshot. One type behind `/api/status`,
 /// `claude-run status`, and the Status page.s quiet indicator, so the three
@@ -202,7 +202,7 @@ pub struct Activity {
     pub dispatched_actions: Vec<String>,
 }
 
-/// SPEC-9: builds the shared `quiet` snapshot.
+/// SPEC-9.3.1 through SPEC-9.3.12: builds the shared `quiet` snapshot.
 ///
 /// Build the [`Activity`] snapshot. A DB failure propagates rather
 /// than degrading to an empty list: reporting "idle, safe to restart" because
@@ -246,7 +246,7 @@ struct ActionStatus {
     parse_error: Option<String>,
 }
 
-/// SPEC-4.2: `GET /status`.
+/// SPEC-4.2.1 through SPEC-4.2.2: `GET /status`.
 async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusResponse>, AppError> {
     let global = state::global_pause_status(&s.pool)
         .await?
@@ -317,7 +317,7 @@ async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusRespons
     }))
 }
 
-/// SPEC-4.2: `GET /actions`.
+/// SPEC-4.2.1 through SPEC-4.2.2: `GET /actions`.
 async fn list_actions(
     State(s): State<Arc<AppState>>,
 ) -> Result<Json<Vec<state::ActionIndexRow>>, AppError> {
@@ -330,7 +330,7 @@ struct AckResponse {
     message: String,
 }
 
-/// SPEC-4.2: `POST /actions/{name}/trigger` and its 400/404/409/503 reasons.
+/// SPEC-4.2.1 through SPEC-4.2.2: `POST /actions/{name}/trigger` and its 400/404/409/503 reasons.
 async fn trigger_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
@@ -399,7 +399,7 @@ struct PauseRequest {
     reason: Option<String>,
 }
 
-/// SPEC-4.2 / SPEC-3.7: `POST /actions/{name}/pause`.
+/// SPEC-4.2.1 through SPEC-4.2.2 / SPEC-3.7.1 through SPEC-3.7.3: `POST /actions/{name}/pause`.
 async fn pause_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
@@ -414,7 +414,7 @@ async fn pause_action(
     }))
 }
 
-/// SPEC-4.2 / SPEC-3.7: `POST /actions/{name}/resume`.
+/// SPEC-4.2.1 through SPEC-4.2.2 / SPEC-3.7.1 through SPEC-3.7.3: `POST /actions/{name}/resume`.
 async fn resume_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
@@ -426,7 +426,7 @@ async fn resume_action(
     }))
 }
 
-/// SPEC-4.2: `POST /actions/{name}/attempts/{key}/reset`.
+/// SPEC-4.2.1 through SPEC-4.2.2: `POST /actions/{name}/attempts/{key}/reset`.
 ///
 /// Clear one key's attempt counter so a job parked at the cap can
 /// be retried. 404s a key with no counter row rather than a silent no-op on a
@@ -461,7 +461,7 @@ async fn reset_attempts(
     }))
 }
 
-/// SPEC-4.2: `POST /actions/{name}/delete`.
+/// SPEC-4.2.1 through SPEC-4.2.2: `POST /actions/{name}/delete`.
 ///
 /// Delete an action from every surface. Refuses (409) when a run is
 /// in flight, 404s an unknown action, otherwise removes the YAML file, the
@@ -503,7 +503,7 @@ async fn delete_action(
     }))
 }
 
-/// SPEC-4.2: the delete semantics shared by the API, web and CLI paths.
+/// SPEC-4.2.1 through SPEC-4.2.2: the delete semantics shared by the API, web and CLI paths.
 ///
 /// Remove an indexed action's YAML file (tolerating an already-gone
 /// file) and purge its derived index + control state. Run history is kept.
@@ -524,7 +524,7 @@ pub async fn delete_indexed_action(pool: &DbPool, name: &str) -> Result<bool, cr
     Ok(true)
 }
 
-/// SPEC-4.2 / SPEC-3.7: `POST /runs/{id}/cancel`.
+/// SPEC-4.2.1 through SPEC-4.2.2 / SPEC-3.7.1 through SPEC-3.7.3: `POST /runs/{id}/cancel`.
 ///
 /// Cancel an in-flight run. Tripping the token tears the run down:
 /// the claude child is terminated, the in-flight job runs its `post` phase
@@ -549,7 +549,7 @@ async fn cancel_run(
     }
 }
 
-/// SPEC-4.2: the dual-encoding pause reason.
+/// SPEC-4.2.1 through SPEC-4.2.2: the dual-encoding pause reason.
 ///
 /// The optional pause reason, from either encoding. The CLI and
 /// API clients send `{"reason": "..."}`; the Status page.s Pause form posts
@@ -579,7 +579,7 @@ fn pause_reason(headers: &axum::http::HeaderMap, body: &str) -> Option<String> {
     }
 }
 
-/// SPEC-4.2 / SPEC-3.7: `POST /pause`.
+/// SPEC-4.2.1 through SPEC-4.2.2 / SPEC-3.7.1 through SPEC-3.7.3: `POST /pause`.
 async fn global_pause_handler(
     State(s): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -593,7 +593,7 @@ async fn global_pause_handler(
     }))
 }
 
-/// SPEC-4.2 / SPEC-3.7: `POST /resume`.
+/// SPEC-4.2.1 through SPEC-4.2.2 / SPEC-3.7.1 through SPEC-3.7.3: `POST /resume`.
 async fn global_resume_handler(
     State(s): State<Arc<AppState>>,
 ) -> Result<Json<AckResponse>, AppError> {
@@ -604,7 +604,7 @@ async fn global_resume_handler(
     }))
 }
 
-/// SPEC-4.2: resolves the `{section}` path segment for the settings routes.
+/// SPEC-4.2.1 through SPEC-4.2.2: resolves the `{section}` path segment for the settings routes.
 fn parse_section(section: &str) -> Result<crate::settings::Section, AppError> {
     crate::settings::Section::from_path(section).ok_or_else(|| AppError {
         status: StatusCode::NOT_FOUND,
@@ -612,7 +612,7 @@ fn parse_section(section: &str) -> Result<crate::settings::Section, AppError> {
     })
 }
 
-/// SPEC-4.2: `GET /settings/{section}`. Secrets appear as their `*_ref`
+/// SPEC-4.2.1 through SPEC-4.2.2: `GET /settings/{section}`. Secrets appear as their `*_ref`
 /// names only.
 async fn get_settings_section(
     State(s): State<Arc<AppState>>,
@@ -628,7 +628,7 @@ async fn get_settings_section(
         .into_response())
 }
 
-/// SPEC-4.2: `PUT /settings/{section}`. A serde error 400s with the message;
+/// SPEC-4.2.1 through SPEC-4.2.2: `PUT /settings/{section}`. A serde error 400s with the message;
 /// nothing is persisted on rejection.
 async fn put_settings_section(
     State(s): State<Arc<AppState>>,
@@ -654,7 +654,7 @@ async fn put_settings_section(
 
 // ---- reporting endpoints ---------------------------------------------------
 
-/// SPEC-4.2: `range`/`action` query params shared by every report endpoint.
+/// SPEC-4.2.1 through SPEC-4.2.2: `range`/`action` query params shared by every report endpoint.
 ///
 /// Query params shared by every `/api/report/*` endpoint. Both fields are
 /// optional: `range` defaults to all-time, an empty / absent `action` means
@@ -666,7 +666,7 @@ struct ReportQuery {
     #[serde(default)]
     action: Option<String>,
     /// `all` (default), `local` or a peer name; honored by the five merged
-    /// series (`SPEC-3.17` item 10).
+    /// series (`SPEC-3.17.11`).
     #[serde(default)]
     instance: Option<String>,
 }
@@ -710,7 +710,7 @@ async fn report_view(s: &AppState, q: &ReportQuery) -> Result<crate::peer::Repor
     .await?)
 }
 
-/// SPEC-4.2: `GET /report/summary`.
+/// SPEC-4.2.1 through SPEC-4.2.2: `GET /report/summary`.
 async fn report_summary(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -721,7 +721,7 @@ async fn report_summary(
     ))
 }
 
-/// SPEC-4.2: `GET /report/daily`.
+/// SPEC-4.2.1 through SPEC-4.2.2: `GET /report/daily`.
 async fn report_daily(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -732,7 +732,7 @@ async fn report_daily(
     ))
 }
 
-/// SPEC-4.2: `GET /report/weekly`.
+/// SPEC-4.2.1 through SPEC-4.2.2: `GET /report/weekly`.
 async fn report_weekly(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -743,7 +743,7 @@ async fn report_weekly(
     ))
 }
 
-/// SPEC-4.2: `GET /report/by-weekday`.
+/// SPEC-4.2.1 through SPEC-4.2.2: `GET /report/by-weekday`.
 async fn report_by_weekday(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -754,7 +754,7 @@ async fn report_by_weekday(
     ))
 }
 
-/// SPEC-4.2: `GET /report/by-hour`.
+/// SPEC-4.2.1 through SPEC-4.2.2: `GET /report/by-hour`.
 async fn report_by_hour(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -765,7 +765,7 @@ async fn report_by_hour(
     ))
 }
 
-/// SPEC-4.3.14: `GET /report/step-timing`.
+/// SPEC-4.3.48 through SPEC-4.3.56: `GET /report/step-timing`.
 async fn report_step_timing(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -775,7 +775,7 @@ async fn report_step_timing(
     ))
 }
 
-/// SPEC-4.2 / SPEC-4.3.14: `GET /report/stages`.
+/// SPEC-4.2.1 through SPEC-4.2.2 / SPEC-4.3.48 through SPEC-4.3.56: `GET /report/stages`.
 async fn report_stages(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -785,7 +785,7 @@ async fn report_stages(
     ))
 }
 
-/// SPEC-4.2 / SPEC-4.3.14: `GET /report/postgres`.
+/// SPEC-4.2.1 through SPEC-4.2.2 / SPEC-4.3.48 through SPEC-4.3.56: `GET /report/postgres`.
 async fn report_postgres(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -795,7 +795,7 @@ async fn report_postgres(
     ))
 }
 
-/// SPEC-4.2 / SPEC-4.3.14: `GET /report/funnel`.
+/// SPEC-4.2.1 through SPEC-4.2.2 / SPEC-4.3.48 through SPEC-4.3.56: `GET /report/funnel`.
 async fn report_funnel(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -805,7 +805,7 @@ async fn report_funnel(
     ))
 }
 
-/// SPEC-4.2 / SPEC-4.3.14: `GET /report/failure-causes`.
+/// SPEC-4.2.1 through SPEC-4.2.2 / SPEC-4.3.48 through SPEC-4.3.56: `GET /report/failure-causes`.
 async fn report_failure_causes(
     State(s): State<Arc<AppState>>,
     Query(q): Query<ReportQuery>,
@@ -817,7 +817,7 @@ async fn report_failure_causes(
 
 // ---- access check -----------------------------------------------------------
 
-/// SPEC-4.6 / SPEC-7.2: the credential base an access check materializes into.
+/// SPEC-4.6.1 through SPEC-4.6.4 / SPEC-7.2.1 through SPEC-7.2.4: the credential base an access check materializes into.
 ///
 /// The credential base directory every access check materializes into: the same
 /// `credentials` tree the per-job path uses, under its own `access` namespace.
@@ -826,7 +826,7 @@ pub fn access_cred_base(paths: &crate::config::Paths) -> std::path::PathBuf {
     paths.runtime_dir.join("credentials").join("access")
 }
 
-/// SPEC-4.2 / SPEC-4.6: `POST /access/check`.
+/// SPEC-4.2.1 through SPEC-4.2.2 / SPEC-4.6.1 through SPEC-4.6.4: `POST /access/check`.
 ///
 /// `POST /access/check`: run the on-demand access check and return the typed
 /// report. An absent / empty body checks everything. No secret value is ever
@@ -862,7 +862,7 @@ async fn access_check(
     Ok(Json(report))
 }
 
-/// SPEC-10: API errors carry a JSON message and a non-2xx status.
+/// SPEC-10.2.1 through SPEC-10.2.8: API errors carry a JSON message and a non-2xx status.
 #[derive(Debug)]
 struct AppError {
     status: StatusCode,
@@ -926,7 +926,7 @@ mod tests {
         (state, rx)
     }
 
-    /// SPEC-3.17 item 4: `api::router` is the unix-socket router too, and the
+    /// SPEC-3.17.5: `api::router` is the unix-socket router too, and the
     /// peer API must never be served there.
     #[tokio::test]
     async fn the_unix_socket_router_serves_no_peer_route() {

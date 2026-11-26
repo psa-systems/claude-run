@@ -11,7 +11,7 @@
 #
 # On Mondays from 09:00 UTC the releases published in the last 7 days in the repos below become ONE draft edition, written
 # for customers. The cron line alone is not enough: a Monday with no releases starts no run, so the action stays due and
-# would draft when the first release of the week appears (SPEC-2.2). The input therefore also gates on the time: any other
+# would draft when the first release of the week appears (SPEC-2.2.1 through SPEC-2.2.2). The input therefore also gates on the time: any other
 # time it yields no job and makes no API call. Set `DRAFT_ANY_DAY` to "true" to draft outside that window, for a test. The action only ever creates a draft (`POST <NEWSLETTER_URL>/api/v1/editions`): it never sends or
 # schedules. Adapt the post step if your newsletter system has a different API.
 #

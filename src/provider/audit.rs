@@ -1,4 +1,4 @@
-//! SPEC-8.3: the per-run bound and the audit trail on the YouTrack issue
+//! SPEC-8.3.1 through SPEC-8.3.4: the per-run bound and the audit trail on the YouTrack issue
 //! writes a run performs.
 //!
 //! Two guardrails, both at the provider boundary rather than in a prompt (a
@@ -31,7 +31,7 @@ use tracing::{info, warn};
 use super::{IssueInspect, IssueLink, IssueTracker, VcsMapEntry, VcsRepo};
 use crate::error::{Error, Result};
 
-/// SPEC-8.3: issues one run may create when no action overrides it. Above
+/// SPEC-8.3.1 through SPEC-8.3.4: issues one run may create when no action overrides it. Above
 /// the audit prompts' instructed 20-per-target figure, so the enforced
 /// ceiling backstops the instructed one instead of fighting it.
 pub const DEFAULT_MAX_ISSUES_PER_RUN: u32 = 25;
@@ -100,7 +100,7 @@ impl IssueWriteAudit {
         }
     }
 
-    /// SPEC-8.3: claim one create slot, returning this create's 1-based
+    /// SPEC-8.3.1 through SPEC-8.3.4: claim one create slot, returning this create's 1-based
     /// ordinal within the run. Errors [`Error::IssueCapReached`] when the run
     /// is already at its ceiling; the claim is taken BEFORE the CLI is
     /// invoked, so a refusal creates nothing.
@@ -141,7 +141,7 @@ impl IssueWriteAudit {
         }
     }
 
-    /// SPEC-8.3: the audit line for one write: which operation, which issue,
+    /// SPEC-8.3.1 through SPEC-8.3.4: the audit line for one write: which operation, which issue,
     /// which run, and whether the write landed. A failed write is recorded
     /// too (it was still attempted), marked `ok = false` so it never reads
     /// as a change.
@@ -156,7 +156,7 @@ impl IssueWriteAudit {
     }
 }
 
-/// SPEC-8.3: an [`IssueTracker`] bounded and attributed by an
+/// SPEC-8.3.1 through SPEC-8.3.4: an [`IssueTracker`] bounded and attributed by an
 /// [`IssueWriteAudit`]. Reads pass straight through; creates are capped and
 /// logged, updates are logged.
 pub struct AuditedTracker<'a> {
@@ -232,7 +232,7 @@ impl IssueTracker for AuditedTracker<'_> {
         description: &str,
         assignee: Option<&str>,
     ) -> Result<String> {
-        // SPEC-8.3: claim first, a refusal must never reach `yt issue create`.
+        // SPEC-8.3.1 through SPEC-8.3.4: claim first, a refusal must never reach `yt issue create`.
         self.audit.claim_create(project)?;
         let key = self
             .inner

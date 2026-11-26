@@ -83,7 +83,7 @@ Edits apply live (the dashboard, run and action detail pages, the secrets table,
 ## Continuous pickup and concurrency caps
 
 The daemon does not serialize runs per action. An issue queued while a run is in flight is picked up by a new,
-**overlapping** run once the action's `schedule` makes it due (SPEC-2.2: for `interval`, once `spec` has passed since the
+**overlapping** run once the action's `schedule` makes it due (SPEC-2.2.1 through SPEC-2.2.2: for `interval`, once `spec` has passed since the
 last run started) and `regather_interval` (default 60s) has elapsed, rather than waiting for the in-flight run to drain, and it is
 never blocked behind an unrelated in-flight run of another action. A manual `trigger` during an in-flight run likewise
 starts an overlapping pickup run instead of being silently dropped. Concurrency is bounded by five limits:
@@ -167,10 +167,10 @@ Scripting a reboot instead of clicking: `/api/status` (and `claude-run status`) 
 in-flight map is empty AND no `runs` row has `ended_at IS NULL`. Neither alone is sufficient, because the map catches a
 run dispatched before its row exists and the row catches a run started by a daemonless `claude-run run`.
 
-## Docker storage prune from the Status page (SPEC-3.11 item 4)
+## Docker storage prune from the Status page (SPEC-3.11.5)
 
 The **Management** part of `/status` also lists the sidecar's Docker storage by category: stopped containers, images,
-build cache, and unreferenced volumes (the same four categories [Docker storage ceiling reclaim](conventions/retention.md#docker-storage-ceiling-reclaim-spec-311)
+build cache, and unreferenced volumes (the same four categories [Docker storage ceiling reclaim](conventions/retention.md#docker-storage-ceiling-reclaim-spec-3111-through-spec-3116)
 reads for its ceiling check). Each row's size comes from one `DockerVolumeClient::usage()` read shared across all four
 rows, so a single unreachable daemon shows the same "unknown" plus the read's error on every row rather than querying
 per category; a Prune button next to each row removes everything currently in that category, with a confirmation

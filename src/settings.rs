@@ -1,6 +1,6 @@
 //! Runtime-tunable configuration stored in the DB instead of
-//! `config.toml`. SPEC-6.3 (section schema and store), SPEC-6.4 (live apply),
-//! SPEC-6.5 (one-time file-to-DB import).
+//! `config.toml`. SPEC-6.3.1 through SPEC-6.3.2 (section schema and store), SPEC-6.4.1 (live apply),
+//! SPEC-6.5.1 (one-time file-to-DB import).
 //!
 //! Every runtime-tunable section lives as one JSON document in the existing
 //! `settings` key/value table (`migrations/sqlite/0001_init.sql`), keyed
@@ -42,7 +42,7 @@ use crate::error::Result;
 use crate::state::now_iso;
 use crate::web::webhooks::{build_rate_map, rate_map_from, RateLimiter};
 
-/// One DB-backed runtime-tunable config section. SPEC-6.3.
+/// One DB-backed runtime-tunable config section. SPEC-6.3.1 through SPEC-6.3.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Mint,
@@ -71,14 +71,14 @@ pub enum Section {
     Auth,
     /// Docker sidecar named-volume GC retention window.
     DockerGc,
-    /// Per-repo shared Cargo target directory size ceiling (/// `SPEC-3.10` item 6).
+    /// Per-repo shared Cargo target directory size ceiling (/// `SPEC-3.10.7`).
     CargoCache,
-    /// Optional peering between instances (`SPEC-3.17` item 3).
+    /// Optional peering between instances (`SPEC-3.17.4`).
     Peers,
 }
 
 impl Section {
-    /// Every section, in display order (used by the Settings page). SPEC-6.3.
+    /// Every section, in display order (used by the Settings page). SPEC-6.3.1 through SPEC-6.3.2.
     pub const ALL: [Section; 14] = [
         Section::Mint,
         Section::Webhook,
@@ -96,8 +96,8 @@ impl Section {
         Section::Auth,
     ];
 
-    /// `settings` table primary key for this section's JSON document. SPEC-6.3,
-    /// SPEC-5.2.
+    /// `settings` table primary key for this section's JSON document. SPEC-6.3.1 through SPEC-6.3.2,
+    /// SPEC-5.2.1.
     pub fn key(self) -> &'static str {
         match self {
             Section::Mint => "config.mint",
@@ -117,7 +117,7 @@ impl Section {
         }
     }
 
-    /// URL path segment for the web / API routes (`/settings/<seg>`). SPEC-6.3.
+    /// URL path segment for the web / API routes (`/settings/<seg>`). SPEC-6.3.1 through SPEC-6.3.2.
     pub fn as_path(self) -> &'static str {
         match self {
             Section::Mint => "mint",
@@ -138,12 +138,12 @@ impl Section {
     }
 
     /// Parse the URL path segment back into a section; `None` for anything
-    /// else. SPEC-6.3.
+    /// else. SPEC-6.3.1 through SPEC-6.3.2.
     pub fn from_path(s: &str) -> Option<Section> {
         Section::ALL.into_iter().find(|sec| sec.as_path() == s)
     }
 
-    /// Human title for the Settings page card. SPEC-6.3.
+    /// Human title for the Settings page card. SPEC-6.3.1 through SPEC-6.3.2.
     pub fn title(self) -> &'static str {
         match self {
             Section::Mint => "Issue minting",
@@ -163,8 +163,8 @@ impl Section {
         }
     }
 
-    /// Apply semantics badge shown next to the section heading. SPEC-6.3,
-    /// SPEC-6.4.
+    /// Apply semantics badge shown next to the section heading. SPEC-6.3.1 through SPEC-6.3.2,
+    /// SPEC-6.4.1.
     pub fn apply_badge(self) -> &'static str {
         match self {
             Section::Mint => "next event",
@@ -186,7 +186,7 @@ impl Section {
 
 /// JSON shape of the `config.log_filter` section. A single optional directive so
 /// the stored document is an object (`{"filter": "info,..."}`) like the others
-/// rather than a bare string, leaving room for future log knobs. SPEC-6.3.
+/// rather than a bare string, leaving room for future log knobs. SPEC-6.3.1 through SPEC-6.3.2.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LogFilterDoc {
@@ -202,7 +202,7 @@ pub struct LogFilterDoc {
 /// current preferences from here. Kept current by [`LiveSettings`] (set on build
 /// and on every save of the Preferences section). Defaults to UTC / ISO, so an
 /// unset snapshot renders exactly today's values.
-// SPEC-10: "Time rendering: stored UTC timestamps are rendered through the
+// SPEC-10.2.8: "Time rendering: stored UTC timestamps are rendered through the
 // preferences timezone, locale and format." The process-global snapshot and
 // the format/validate/parse helpers below implement that.
 fn preferences_cell() -> &'static std::sync::RwLock<PreferencesConfig> {
@@ -212,14 +212,14 @@ fn preferences_cell() -> &'static std::sync::RwLock<PreferencesConfig> {
 }
 
 /// Replace the process-global preferences snapshot (called by [`LiveSettings`]).
-/// SPEC-10.
+/// SPEC-10.2.8.
 pub fn set_preferences_snapshot(prefs: PreferencesConfig) {
     *preferences_cell()
         .write()
         .expect("preferences lock poisoned") = prefs;
 }
 
-/// Clone the current process-global preferences snapshot. SPEC-10.
+/// Clone the current process-global preferences snapshot. SPEC-10.2.8.
 pub fn current_preferences() -> PreferencesConfig {
     preferences_cell()
         .read()
@@ -231,7 +231,7 @@ pub fn current_preferences() -> PreferencesConfig {
 /// [`chrono::Locale`]. chrono's locale identifiers use an underscore separator
 /// (`en_US`), so the hyphen is normalized before parsing. Returns `Err` with the
 /// offending value for an unknown locale so callers can reject it on save.
-/// SPEC-10.
+/// SPEC-10.2.8.
 pub fn parse_locale(locale: &str) -> std::result::Result<chrono::Locale, String> {
     chrono::Locale::try_from(locale.replace('-', "_").as_str())
         .map_err(|_| format!("unknown locale `{locale}`"))
@@ -240,8 +240,8 @@ pub fn parse_locale(locale: &str) -> std::result::Result<chrono::Locale, String>
 /// Validate a [`PreferencesConfig`] before it is persisted: the `locale` must map
 /// to a known [`chrono::Locale`], the `timezone` must be a known IANA name, and
 /// the `datetime_format` must be a parseable strftime pattern. Returns a human
-/// message on the first failure, `Ok(())` otherwise. SPEC-6.3 (validated
-/// before persisting), SPEC-10 (the fields it validates).
+/// message on the first failure, `Ok(())` otherwise. SPEC-6.3.1 through SPEC-6.3.2 (validated
+/// before persisting), SPEC-10.2.1 through SPEC-10.2.8 (the fields it validates).
 pub fn validate_preferences(prefs: &PreferencesConfig) -> std::result::Result<(), String> {
     parse_locale(&prefs.locale)?;
     prefs
@@ -260,7 +260,7 @@ pub fn validate_preferences(prefs: &PreferencesConfig) -> std::result::Result<()
 /// True when the strftime pattern contains an unparseable specifier. chrono
 /// surfaces a bad specifier as an [`Item::Error`] in the parsed item stream and
 /// would otherwise panic when the format is written, so we detect it up front.
-/// SPEC-10.
+/// SPEC-10.2.8.
 fn strftime_has_error(fmt: &str) -> bool {
     use chrono::format::{Item, StrftimeItems};
     StrftimeItems::new(fmt).any(|item| matches!(item, Item::Error))
@@ -273,7 +273,7 @@ fn strftime_has_error(fmt: &str) -> bool {
 /// `format_localized`. On ANY failure (unparseable input, bad
 /// timezone, bad locale, bad format) it returns the input unchanged, so
 /// sentinels like `running` / `never` / empty pass through and a malformed value
-/// is never blanked or panicked on. SPEC-10.
+/// is never blanked or panicked on. SPEC-10.2.8.
 pub fn format_datetime(rfc3339: &str, prefs: &PreferencesConfig) -> String {
     let (Ok(tz), Ok(dt), Ok(locale)) = (
         prefs.timezone.parse::<chrono_tz::Tz>(),
@@ -292,7 +292,7 @@ pub fn format_datetime(rfc3339: &str, prefs: &PreferencesConfig) -> String {
 
 // ---- raw + typed store ----------------------------------------------------
 
-/// Read a raw settings value by key. `None` when the key is absent. SPEC-5.2
+/// Read a raw settings value by key. `None` when the key is absent. SPEC-5.2.1
 /// (the `settings` table row).
 pub async fn get_raw(pool: &DbPool, key: &str) -> Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(
@@ -304,7 +304,7 @@ pub async fn get_raw(pool: &DbPool, key: &str) -> Result<Option<String>> {
     Ok(row.map(|r| r.0))
 }
 
-/// Upsert a raw settings value. SPEC-5.2.
+/// Upsert a raw settings value. SPEC-5.2.1.
 pub async fn set_raw(pool: &DbPool, key: &str, value: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         crate::db::q(
@@ -324,14 +324,14 @@ pub async fn set_raw(pool: &DbPool, key: &str, value: &str) -> Result<()> {
 
 /// `settings` key holding the wall-clock start of the CURRENT serve.
 /// Not a `config.*` section: it is daemon lifetime state, not a tunable, so it
-/// never appears on the Settings page. SPEC-5.2.
+/// never appears on the Settings page. SPEC-5.2.1.
 const SERVE_STARTED_AT_KEY: &str = "daemon.started_at";
 
 /// Stamp the start of this serve. Written once per `serve` start
 /// (overwriting the previous lifetime's value), in the same
 /// [`crate::state::now_iso`] RFC3339-UTC-seconds format every `run_events.ts` is
 /// written in, so the web layer can bound events to this lifetime with a
-/// lexicographic `ts >= started_at`. Returns the stamp it wrote. SPEC-5.2.
+/// lexicographic `ts >= started_at`. Returns the stamp it wrote. SPEC-5.2.1.
 pub async fn record_serve_start(pool: &DbPool) -> Result<String> {
     let now = now_iso();
     set_raw(pool, SERVE_STARTED_AT_KEY, &now).await?;
@@ -341,13 +341,13 @@ pub async fn record_serve_start(pool: &DbPool) -> Result<String> {
 /// The current serve's start stamp, or `None` when no serve has
 /// recorded one yet (a CLI invocation against a never-served DB). Callers that
 /// filter by it treat `None` as "no lower bound" rather than "no rows".
-/// SPEC-5.2.
+/// SPEC-5.2.1.
 pub async fn serve_started_at(pool: &DbPool) -> Result<Option<String>> {
     get_raw(pool, SERVE_STARTED_AT_KEY).await
 }
 
 /// Read and deserialize a JSON settings document. `None` when the key is
-/// absent. SPEC-5.2, SPEC-6.3.
+/// absent. SPEC-5.2.1, SPEC-6.3.1 through SPEC-6.3.2.
 pub async fn get_json<T: DeserializeOwned>(pool: &DbPool, key: &str) -> Result<Option<T>> {
     match get_raw(pool, key).await? {
         Some(raw) => Ok(Some(serde_json::from_str(&raw)?)),
@@ -355,7 +355,7 @@ pub async fn get_json<T: DeserializeOwned>(pool: &DbPool, key: &str) -> Result<O
     }
 }
 
-/// Serialize and upsert a JSON settings document. SPEC-5.2, SPEC-6.3.
+/// Serialize and upsert a JSON settings document. SPEC-5.2.1, SPEC-6.3.1 through SPEC-6.3.2.
 pub async fn set_json<T: Serialize>(pool: &DbPool, key: &str, value: &T) -> Result<()> {
     let raw = serde_json::to_string(value)?;
     set_raw(pool, key, &raw).await
@@ -367,7 +367,7 @@ pub async fn set_json<T: Serialize>(pool: &DbPool, key: &str, value: &T) -> Resu
 /// present, else the (bootstrap) file value, else the built-in default. After
 /// [`migrate_config_file`] runs the DB is authoritative; the file fallback only
 /// matters for a CLI invocation (e.g. `version`) before any serve has migrated.
-/// SPEC-6.3.
+/// SPEC-6.3.1 through SPEC-6.3.2.
 #[derive(Debug, Clone, Default)]
 pub struct EffectiveRuntime {
     pub mint: MintConfig,
@@ -405,17 +405,16 @@ pub struct EffectiveRuntime {
     /// (never in `config.toml`), so the DB value or the built-in default (3
     /// days).
     pub docker_gc: DockerGcConfig,
-    /// Per-repo shared Cargo target directory size ceiling (`SPEC-3.10` item
-    /// 6). Brand-new section (never in `config.toml`), so the DB value or the
+    /// Per-repo shared Cargo target directory size ceiling (`SPEC-3.10.7`). Brand-new section (never in `config.toml`), so the DB value or the
     /// built-in default (60 GB).
     pub cargo_cache: CargoCacheConfig,
-    /// Peering (`SPEC-3.17`). Brand-new section: the DB value or the
+    /// Peering (`SPEC-3.17.1` through `SPEC-3.17.12`). Brand-new section: the DB value or the
     /// built-in default (disabled).
     pub peers: PeersConfig,
 }
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
-/// `config.toml`) for any section the DB does not hold. SPEC-6.3.
+/// `config.toml`) for any section the DB does not hold. SPEC-6.3.1 through SPEC-6.3.2.
 pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRuntime> {
     let mint = get_json::<MintConfig>(pool, Section::Mint.key())
         .await?
@@ -482,7 +481,7 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
 /// cadence must be at least one second (a zero interval would fire an overlapping
 /// run every tick). `max_parallel_global` needs no bound: `0` means auto and any
 /// positive value is a valid explicit cap. Returns a human message on failure.
-/// SPEC-6.3.
+/// SPEC-6.3.1 through SPEC-6.3.2.
 pub fn validate_concurrency(cfg: &ConcurrencyConfig) -> std::result::Result<(), String> {
     if cfg.regather_interval_secs == 0 {
         return Err("regather_interval_secs must be >= 1".to_string());
@@ -490,16 +489,16 @@ pub fn validate_concurrency(cfg: &ConcurrencyConfig) -> std::result::Result<(), 
     Ok(())
 }
 
-/// SPEC-3.8.4: longest reporting range the web UI exposes, in days
+/// SPEC-3.8.14 through SPEC-3.8.16: longest reporting range the web UI exposes, in days
 /// ([`crate::report::Range::Last90Days`]). A retention window shorter than this
 /// would silently truncate the bounded reports, so a save is rejected below it.
-/// SPEC-6.3.
+/// SPEC-6.3.1 through SPEC-6.3.2.
 pub const MIN_DB_RETENTION_DAYS: u64 = 90;
 
-/// SPEC-3.8.4: validate a [`DbRetentionConfig`] before it is persisted. The
+/// SPEC-3.8.14 through SPEC-3.8.16: validate a [`DbRetentionConfig`] before it is persisted. The
 /// window must stay `>=` the longest reporting range so a prune never silently
 /// truncates the 30d / 90d reports. Returns a human message on failure.
-/// SPEC-6.3.
+/// SPEC-6.3.1 through SPEC-6.3.2.
 pub fn validate_db_retention(cfg: &DbRetentionConfig) -> std::result::Result<(), String> {
     if cfg.enabled && cfg.retention_days < MIN_DB_RETENTION_DAYS {
         return Err(format!(
@@ -509,11 +508,11 @@ pub fn validate_db_retention(cfg: &DbRetentionConfig) -> std::result::Result<(),
     Ok(())
 }
 
-/// SPEC-3.8.5, SPEC-3.11, SPEC-6.3: validate a [`DockerGcConfig`] before it is
+/// SPEC-3.8.17 through SPEC-3.8.21, SPEC-3.11.1 through SPEC-3.11.6, SPEC-6.3.1 through SPEC-6.3.2: validate a [`DockerGcConfig`] before it is
 /// persisted: `volume_retention_days` must be at least 1, since Docker records
 /// no last-used time and a 0-day window would remove a volume a session created
 /// moments ago while its container was between restarts. `max_bytes`
-/// (SPEC-3.11) must be at least 1, since 0 would read as "always over the
+/// (SPEC-3.11.1 through SPEC-3.11.6) must be at least 1, since 0 would read as "always over the
 /// ceiling" on the very first usage read rather than as a disabled bound.
 pub fn validate_docker_gc(cfg: &DockerGcConfig) -> std::result::Result<(), String> {
     if cfg.volume_retention_days < 1 {
@@ -525,7 +524,7 @@ pub fn validate_docker_gc(cfg: &DockerGcConfig) -> std::result::Result<(), Strin
     Ok(())
 }
 
-/// `SPEC-3.10` item 6, SPEC-6.3: validate a [`CargoCacheConfig`] before it is
+/// `SPEC-3.10.7`, SPEC-6.3.1 through SPEC-6.3.2: validate a [`CargoCacheConfig`] before it is
 /// persisted: `max_bytes_per_repo` must be at least 1, since `0` would read
 /// as "always over the ceiling" on the very first measurement rather than as
 /// a disabled bound.
@@ -536,7 +535,7 @@ pub fn validate_cargo_cache(cfg: &CargoCacheConfig) -> std::result::Result<(), S
     Ok(())
 }
 
-/// `SPEC-3.17` item 3: validate a [`PeersConfig`] before it is persisted. The
+/// `SPEC-3.17.4`: validate a [`PeersConfig`] before it is persisted. The
 /// whole save is rejected on the first problem, so nothing is stored.
 pub fn validate_peers(cfg: &PeersConfig) -> std::result::Result<(), String> {
     if cfg.poll_secs < 5 {
@@ -593,12 +592,12 @@ pub fn validate_peers(cfg: &PeersConfig) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Settings key holding this instance's stable UUID (`SPEC-3.17` item 2).
+/// Settings key holding this instance's stable UUID (`SPEC-3.17.3`).
 pub const INSTANCE_ID_KEY: &str = "instance.id";
 
 /// Return this instance's id, generating and storing a UUID on first call. It
 /// is never regenerated: the insert ignores an existing row and the value is
-/// read back, so concurrent first calls agree on one id. `SPEC-3.17` item 2.
+/// read back, so concurrent first calls agree on one id. `SPEC-3.17.3`.
 pub async fn ensure_instance_id(pool: &DbPool) -> Result<String> {
     if let Some(id) = get_raw(pool, INSTANCE_ID_KEY).await? {
         return Ok(id);
@@ -627,7 +626,7 @@ pub async fn ensure_instance_id(pool: &DbPool) -> Result<String> {
 /// no parsed `config.toml` (the native CI-failure handlers, which reach the
 /// webhook sources only for their per-repo log-token fallback). Same order as
 /// [`effective`]: the DB document, else the on-disk file, else the default.
-/// SPEC-6.3.
+/// SPEC-6.3.1 through SPEC-6.3.2.
 pub async fn effective_webhook(pool: &DbPool, paths: &Paths) -> Result<WebhookConfig> {
     match get_json::<WebhookConfig>(pool, Section::Webhook.key()).await? {
         Some(webhook) => Ok(webhook),
@@ -638,7 +637,7 @@ pub async fn effective_webhook(pool: &DbPool, paths: &Paths) -> Result<WebhookCo
 /// Resolve the effective [`ClaudeConfig`] for a caller that holds no
 /// [`LiveSettings`] (the daemonless `claude-run run`). DB-only from birth, so
 /// there is no file fallback: the stored document or the built-in default.
-/// SPEC-6.3.
+/// SPEC-6.3.1 through SPEC-6.3.2.
 pub async fn effective_claude(pool: &DbPool) -> Result<ClaudeConfig> {
     Ok(get_json::<ClaudeConfig>(pool, Section::Claude.key())
         .await?
@@ -651,7 +650,7 @@ pub async fn effective_claude(pool: &DbPool) -> Result<ClaudeConfig> {
 /// still present in the file, either import it into the DB (when the DB does not
 /// yet hold it) or refuse to start (when the DB already holds it). A missing file
 /// or a file with no moved sections is a clean no-op. Bootstrap keys (`[web]`,
-/// `[daemon]` binary overrides) are ignored here. SPEC-6.5.
+/// `[daemon]` binary overrides) are ignored here. SPEC-6.5.1.
 pub async fn migrate_config_file(pool: &DbPool, paths: &Paths) -> Result<()> {
     let f = paths.config_file();
     if !f.exists() {
@@ -683,7 +682,7 @@ pub async fn migrate_config_file(pool: &DbPool, paths: &Paths) -> Result<()> {
 }
 
 /// Import one TOML-subtree section into the DB, or error if the DB already holds
-/// it (both-sources-present case). SPEC-6.5.
+/// it (both-sources-present case). SPEC-6.5.1.
 async fn import_or_error<T>(
     pool: &DbPool,
     section: Section,
@@ -712,7 +711,7 @@ where
 
 /// Import an already-built section document (used for `[daemon].log_filter`,
 /// which is a sub-key rather than a TOML table), or error if the DB holds it.
-/// SPEC-6.5.
+/// SPEC-6.5.1.
 async fn import_doc_or_error<T>(
     pool: &DbPool,
     section: Section,
@@ -736,7 +735,7 @@ where
     Ok(())
 }
 
-/// SPEC-6.5: the breaking-migration refusal message named above.
+/// SPEC-6.5.1: the breaking-migration refusal message named above.
 fn stale_section_error(section: Section, label: &str, path: &str) -> crate::error::Error {
     anyhow::anyhow!(
         "config.toml ({path}) still defines {label}, but it has already been migrated to the \
@@ -752,13 +751,13 @@ fn stale_section_error(section: Section, label: &str, path: &str) -> crate::erro
 /// Closure that swaps the live tracing `EnvFilter` (the reload handle),
 /// returning the directive error string on a bad filter. `None` when
 /// `CLAUDE_RUN_LOG` is set (the env var wins, so a saved filter persists but is
-/// not applied) or when no reload handle is available. SPEC-6.4.
+/// not applied) or when no reload handle is available. SPEC-6.4.1.
 pub type LogFilterApply =
     Arc<dyn Fn(&str) -> std::result::Result<(), String> + Send + Sync + 'static>;
 
 /// Result of a save attempt. [`SaveError::Invalid`] carries the serde message so
 /// the web page can re-render it inline and the API can 400 with it; nothing is
-/// persisted on an invalid payload. SPEC-6.3, SPEC-6.4.
+/// persisted on an invalid payload. SPEC-6.3.1 through SPEC-6.3.2, SPEC-6.4.1.
 #[derive(Debug)]
 pub enum SaveError {
     Invalid(String),
@@ -782,7 +781,7 @@ impl From<crate::error::Error> for SaveError {
 
 /// Runtime copy of the tunable settings, shared (via `Arc<RwLock<..>>`) with the
 /// webhook listener, the webhook consumer, and the mint context so a save applies
-/// live without a restart. SPEC-6.4.
+/// live without a restart. SPEC-6.4.1.
 pub struct LiveSettings {
     pool: DbPool,
     mint: Arc<RwLock<MintConfig>>,
@@ -812,12 +811,12 @@ pub struct LiveSettings {
     docker_gc: Arc<RwLock<DockerGcConfig>>,
     /// Per-repo shared Cargo target directory size ceiling, read by the
     /// sweeper on each tick so a Settings save applies on the next sweep.
-    /// `SPEC-3.10` item 6.
+    /// `SPEC-3.10.7`.
     cargo_cache: Arc<RwLock<CargoCacheConfig>>,
     /// Peering config, read by the poller each tick and by the peer API.
     peers: Arc<RwLock<PeersConfig>>,
     /// Per-peer liveness state shared by the poller, the sweep and the Status
-    /// page (`SPEC-3.17` item 5).
+    /// page (`SPEC-3.17.6`).
     peer_registry: crate::peer::PeerRegistry,
 }
 
@@ -825,7 +824,7 @@ impl LiveSettings {
     /// Build from the effective runtime config. Applies the effective log filter
     /// immediately (so a DB value wins over the file value the bootstrap path
     /// already applied), unless `log_apply` is `None` (env wins / no handle).
-    /// SPEC-6.4.
+    /// SPEC-6.4.1.
     pub fn new(pool: DbPool, eff: EffectiveRuntime, log_apply: Option<LogFilterApply>) -> Self {
         let webhook_rate = build_rate_map(&eff.webhook);
         let webhook_comment_rate = comment_rate_map(&eff.webhook_comment);
@@ -865,12 +864,12 @@ impl LiveSettings {
     }
 
     /// Standalone instance backed by `pool` with built-in defaults and no live
-    /// log-filter hook. For tests and any context without a daemon. SPEC-6.4.
+    /// log-filter hook. For tests and any context without a daemon. SPEC-6.4.1.
     pub fn detached(pool: DbPool) -> Self {
         Self::new(pool, EffectiveRuntime::default(), None)
     }
 
-    // SPEC-6.4: every `*_handle` accessor below returns the same shared
+    // SPEC-6.4.1: every `*_handle` accessor below returns the same shared
     // `Arc<RwLock<..>>` the relevant consumer reads per request/tick/event, so
     // a `save_section` swap is visible to it immediately with no restart.
 
@@ -943,31 +942,31 @@ impl LiveSettings {
 
     /// Shared handle to the live Cargo cache ceiling config, read by the
     /// sweeper on each tick so a Settings save applies on the next sweep.
-    /// `SPEC-3.10` item 6.
+    /// `SPEC-3.10.7`.
     pub fn cargo_cache_handle(&self) -> Arc<RwLock<CargoCacheConfig>> {
         self.cargo_cache.clone()
     }
 
-    /// Shared handle to the live peering config (`SPEC-3.17` item 3).
+    /// Shared handle to the live peering config (`SPEC-3.17.4`).
     pub fn peers_handle(&self) -> Arc<RwLock<PeersConfig>> {
         self.peers.clone()
     }
 
-    /// The shared per-peer liveness registry (`SPEC-3.17` item 5).
+    /// The shared per-peer liveness registry (`SPEC-3.17.6`).
     pub fn peer_registry(&self) -> crate::peer::PeerRegistry {
         self.peer_registry.clone()
     }
 
     /// Shared handle to the live `claude` invocation defaults, read
     /// by [`crate::claude::ClaudeInvoker`] on each invocation so a Settings save
-    /// applies to the next one without a daemon restart. SPEC-6.4.
+    /// applies to the next one without a daemon restart. SPEC-6.4.1.
     pub fn claude_handle(&self) -> ClaudeConfigHandle {
         self.claude.clone()
     }
 
     /// Current value of `section` as a pretty JSON document (secrets appear as
     /// their `*_ref` names only - no secret material is stored or rendered).
-    /// SPEC-6.3, SPEC-6.4.
+    /// SPEC-6.3.1 through SPEC-6.3.2, SPEC-6.4.1.
     pub async fn section_json(&self, section: Section) -> String {
         match section {
             Section::Mint => to_pretty(&*self.mint.read().await),
@@ -991,7 +990,7 @@ impl LiveSettings {
 
     /// Validate `json` against the section's struct, persist it, and apply it
     /// live. On an invalid payload nothing is persisted and the serde error is
-    /// returned in [`SaveError::Invalid`]. SPEC-6.3, SPEC-6.4.
+    /// returned in [`SaveError::Invalid`]. SPEC-6.3.1 through SPEC-6.3.2, SPEC-6.4.1.
     pub async fn save_section(
         &self,
         section: Section,
@@ -1116,7 +1115,7 @@ impl LiveSettings {
 /// Read the shared [`ClaudeConfig`] handle, recovering the value a
 /// panicking writer poisoned rather than propagating the panic: a stale-but-real
 /// default is better than killing the run that is reading it. The poisoning is
-/// logged so the panic that caused it is never silent. SPEC-6.4.
+/// logged so the panic that caused it is never silent. SPEC-6.4.1.
 pub fn read_claude(handle: &ClaudeConfigHandle) -> std::sync::RwLockReadGuard<'_, ClaudeConfig> {
     handle.read().unwrap_or_else(|poisoned| {
         tracing::error!("claude settings lock poisoned; reading the last stored value");
@@ -1138,6 +1137,24 @@ fn comment_rate_map(cfg: &CommentWebhookConfig) -> HashMap<String, Mutex<RateLim
     rate_map_from(cfg.sources.iter().map(|(n, s)| (n, s.rate_limit_per_min)))
 }
 
+/// SPEC-4.4.39 through SPEC-4.4.46: one of the three literal repo-pattern forms `repo_matches`
+/// reads (`owner/repo`, `owner/*`, `*`), with no other wildcard.
+fn is_repo_pattern(p: &str) -> bool {
+    if p == "*" {
+        return true;
+    }
+    match p.split_once('/') {
+        Some((owner, repo)) => {
+            !owner.is_empty()
+                && !repo.is_empty()
+                && !owner.contains('*')
+                && (repo == "*" || !repo.contains('*'))
+                && !repo.contains('/')
+        }
+        None => false,
+    }
+}
+
 /// Validate a [`CommentWebhookConfig`] before it is persisted. An
 /// empty trigger would match every comment and a zero instruction cap would
 /// refuse every command, so both are rejected rather than stored.
@@ -1155,7 +1172,7 @@ fn comment_rate_map(cfg: &CommentWebhookConfig) -> HashMap<String, Mutex<RateLim
 /// caught here, at startup, naming the source and the field, instead of only
 /// surfacing when [`crate::web::webhooks::build_pr_comment_backend`] (or its
 /// `comment_webhooks.rs` counterpart) tries to use it and fails the run.
-// SPEC-6.3: validated on save before anything is persisted.
+// SPEC-6.3.1 through SPEC-6.3.2: validated on save before anything is persisted.
 pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> {
     if cfg.analysis_concurrency < 1 {
         return Err("analysis_concurrency must be >= 1".to_string());
@@ -1168,6 +1185,13 @@ pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> 
     }
     if cfg.max_runs_per_day < 1 {
         return Err("max_runs_per_day must be >= 1".to_string());
+    }
+    for pattern in cfg.triage_branches.keys() {
+        if !is_repo_pattern(pattern) {
+            return Err(format!(
+                "triage_branches key `{pattern}` must be `owner/repo`, `owner/*` or `*`"
+            ));
+        }
     }
     if cfg.enabled {
         validate_enabled_sources(&cfg.sources)?;
@@ -1182,7 +1206,7 @@ pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> 
 /// document's host/from (never the password) when a row is actually found; a
 /// no-op, silent, when there is nothing to retire. Deleting either the row or
 /// the secret is a failure: no partial retirement.
-// SPEC-5.2: the row and its secret live in the same `settings`/secrets store
+// SPEC-5.2.1: the row and its secret live in the same `settings`/secrets store
 // the rest of this module reads and writes through.
 pub async fn retire_email_section(pool: &DbPool) -> Result<()> {
     if let Some(raw) = get_raw(pool, "config.email").await? {
@@ -1219,7 +1243,7 @@ pub async fn retire_email_section(pool: &DbPool) -> Result<()> {
 /// resolved token are only discoverable by calling the forge, which happens at
 /// request time (see the 401/403 handling in `provider/cli.rs` and
 /// `provider/github.rs`) and not here.
-// SPEC-6.3: shared enabled-source validation both webhook sections' saves go through.
+// SPEC-6.3.1 through SPEC-6.3.2: shared enabled-source validation both webhook sections' saves go through.
 fn validate_enabled_sources<S>(sources: &BTreeMap<String, S>) -> std::result::Result<(), String>
 where
     S: RequiredRefs,
@@ -1248,7 +1272,7 @@ where
 /// required-reference set per webhook source type in one place, so a type
 /// added later that forgets to implement this trait fails to compile rather
 /// than silently skipping validation.
-// SPEC-6.3.
+// SPEC-6.3.1 through SPEC-6.3.2.
 trait RequiredRefs {
     fn secret_ref(&self) -> Option<&String>;
     fn write_token_ref(&self) -> Option<&String>;
@@ -1286,7 +1310,7 @@ impl RequiredRefs for CommentWebhookSource {
     }
 }
 
-// SPEC-6.3: validated on save before anything is persisted.
+// SPEC-6.3.1 through SPEC-6.3.2: validated on save before anything is persisted.
 pub fn validate_comment_webhook(cfg: &CommentWebhookConfig) -> std::result::Result<(), String> {
     if cfg.trigger.trim().is_empty() {
         return Err("trigger must not be empty".to_string());
@@ -1324,7 +1348,7 @@ pub fn validate_comment_webhook(cfg: &CommentWebhookConfig) -> std::result::Resu
 /// transition (a stored document with no `enabled` key deserializes to the
 /// new default `false`), and `serve` start logs one `warn` per entry this
 /// returns, naming the section, rather than the listener going quiet with no
-/// explanation. SPEC-6.3.
+/// explanation. SPEC-6.3.1 through SPEC-6.3.2.
 pub fn disabled_but_configured_webhook_sections(effective: &EffectiveRuntime) -> Vec<&'static str> {
     let mut sections = Vec::new();
     if !effective.webhook.enabled && !effective.webhook.sources.is_empty() {
@@ -1336,12 +1360,12 @@ pub fn disabled_but_configured_webhook_sections(effective: &EffectiveRuntime) ->
     sections
 }
 
-// SPEC-6.3: the deserialize half of a section save.
+// SPEC-6.3.1 through SPEC-6.3.2: the deserialize half of a section save.
 fn parse<T: DeserializeOwned>(json: &str) -> std::result::Result<T, SaveError> {
     serde_json::from_str(json).map_err(|e| SaveError::Invalid(e.to_string()))
 }
 
-// SPEC-6.3: the serialize half of [`LiveSettings::section_json`].
+// SPEC-6.3.1 through SPEC-6.3.2: the serialize half of [`LiveSettings::section_json`].
 fn to_pretty<T: Serialize>(v: &T) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
 }
@@ -1622,6 +1646,98 @@ mod tests {
         assert!(get_raw(&pool, Section::Mint.key()).await.unwrap().is_some());
     }
 
+    /// SPEC-4.4.39 through SPEC-4.4.46: the migration renames `auto_fix` in the stored mint and
+    /// webhook documents, keeps each value, leaves a document without the key
+    /// alone, and replaying it changes nothing.
+    #[tokio::test]
+    async fn rename_auto_fix_settings_migration_renames_both_stored_keys() {
+        let pool = pool().await;
+        set_raw(
+            &pool,
+            Section::Mint.key(),
+            r#"{"fallback_project":"FJ","auto_fix":{"enabled":false}}"#,
+        )
+        .await
+        .unwrap();
+        set_raw(
+            &pool,
+            Section::Webhook.key(),
+            r#"{"enabled":true,"auto_fix":true,"max_runs_per_day":7}"#,
+        )
+        .await
+        .unwrap();
+        set_raw(&pool, Section::WorkdirGc.key(), r#"{"enabled":true}"#)
+            .await
+            .unwrap();
+        let sql = match crate::db::dialect(&pool) {
+            crate::db::Dialect::Sqlite => {
+                include_str!("../migrations/sqlite/0039_rename_auto_fix_settings.sql")
+            }
+            crate::db::Dialect::Postgres => {
+                include_str!("../migrations/postgres/0020_rename_auto_fix_settings.sql")
+            }
+        };
+        for _ in 0..2 {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+            let mint: MintConfig = get_json(&pool, Section::Mint.key()).await.unwrap().unwrap();
+            assert_eq!(mint.fallback_project, "FJ");
+            assert!(!mint.detect_fixable.enabled);
+            let webhook: WebhookConfig = get_json(&pool, Section::Webhook.key())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(webhook.queue_fix_issues, "the boolean stays a boolean");
+            assert_eq!(webhook.max_runs_per_day, 7);
+            assert_eq!(
+                get_raw(&pool, Section::WorkdirGc.key())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                r#"{"enabled":true}"#
+            );
+        }
+    }
+
+    /// The migration that drops `detect_fixable.checks_workflows` from the
+    /// stored `config.mint` document leaves the key absent so the document
+    /// loads as `MintConfig` (which no longer has the field), is idempotent,
+    /// and leaves another row alone.
+    #[tokio::test]
+    async fn drop_checks_workflows_setting_migration_removes_only_that_key() {
+        let pool = pool().await;
+        set_raw(
+            &pool,
+            Section::Mint.key(),
+            r#"{"fallback_project":"FJ","detect_fixable":{"enabled":false,"checks_workflows":["ci.yml"]}}"#,
+        )
+        .await
+        .unwrap();
+        set_raw(&pool, Section::WorkdirGc.key(), r#"{"enabled":true}"#)
+            .await
+            .unwrap();
+        let sql = match crate::db::dialect(&pool) {
+            crate::db::Dialect::Sqlite => {
+                include_str!("../migrations/sqlite/0040_drop_checks_workflows_setting.sql")
+            }
+            crate::db::Dialect::Postgres => {
+                include_str!("../migrations/postgres/0021_drop_checks_workflows_setting.sql")
+            }
+        };
+        for _ in 0..2 {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+            let mint: MintConfig = get_json(&pool, Section::Mint.key()).await.unwrap().unwrap();
+            assert_eq!(mint.fallback_project, "FJ");
+            assert!(!mint.detect_fixable.enabled);
+            assert_eq!(
+                get_raw(&pool, Section::WorkdirGc.key())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                r#"{"enabled":true}"#
+            );
+        }
+    }
+
     #[tokio::test]
     async fn migration_clean_file_is_a_noop() {
         let pool = pool().await;
@@ -1742,7 +1858,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.11: `max_bytes` defaults to 250 GB, round-trips, and rejects 0.
+    /// SPEC-3.11.1 through SPEC-3.11.6: `max_bytes` defaults to 250 GB, round-trips, and rejects 0.
     #[tokio::test]
     async fn docker_gc_max_bytes_defaults_round_trips_and_rejects_zero() {
         let pool = pool().await;
@@ -2396,6 +2512,30 @@ mod tests {
             },
         );
         validate_webhook(&cfg).expect("fully-configured source must pass");
+    }
+
+    #[test]
+    fn webhook_triage_branches_keys_must_be_repo_patterns() {
+        for good in ["*", "acme/*", "acme/widgets"] {
+            let mut cfg = WebhookConfig::default();
+            cfg.triage_branches
+                .insert(good.to_string(), vec!["main".to_string()]);
+            validate_webhook(&cfg).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+        for bad in [
+            "acme",
+            "acme/wid*",
+            "*/widgets",
+            "/widgets",
+            "acme/",
+            "a/b/c",
+        ] {
+            let mut cfg = WebhookConfig::default();
+            cfg.triage_branches
+                .insert(bad.to_string(), vec!["main".to_string()]);
+            let err = validate_webhook(&cfg).unwrap_err();
+            assert!(err.contains("triage_branches"), "{bad}: {err}");
+        }
     }
 
     #[test]

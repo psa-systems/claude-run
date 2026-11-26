@@ -96,7 +96,7 @@
 # runs a split-only attempt with its own built-in prompt, and only there every piece the agent files is linked
 # subtask of the oversized issue, which becomes the grouping parent of its pieces. The runner then sets that issue's
 # Type to Story, queues the pieces that fit the timeout and moves the issue to states.no_code; a split with under two
-# pieces or an oversized piece parks it at Needs Review instead (SPEC-3.12 item 7).
+# pieces or an oversized piece parks it at Needs Review instead (SPEC-3.12.8).
 # Either way the agent may update / comment on / link only the issues it created this run, so a gap or bug it finds
 # becomes a tracked issue rather than a line of prose. The agent may also comment on the triggering issue itself; the
 # runner still posts its own outcome comment on it. Everything else stays the handler's: the AI Agent field on ANY issue, and every

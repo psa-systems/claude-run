@@ -242,12 +242,13 @@
   {% endif %}
   {% if !sec.fields.is_empty() %}
   <table style="margin-bottom: 12px;">
-    <thead><tr><th>Field</th><th>Apply</th><th>Notes</th></tr></thead>
+    <thead><tr><th>Field</th><th>Apply</th>{% if sec.shows_used_by %}<th>Used by</th>{% endif %}<th>Notes</th></tr></thead>
     <tbody>
       {% for f in sec.fields %}
       <tr>
         <td class="mono">{{ f.name }}</td>
         <td><span class="badge neutral">{{ f.badge }}</span></td>
+        {% if sec.shows_used_by %}<td class="mono">{{ f.used_by|join(", ") }}</td>{% endif %}
         <td class="dim">{{ f.note }}</td>
       </tr>
       {% endfor %}
