@@ -483,10 +483,7 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
   `pre-push` hook never runs on a runner push (`SPEC-3.3.8` through `SPEC-3.3.19`). This gate is independent of both and runs even when the
   clone has no hooks installed, or the host has no `just install-hooks` recipe to run.
 
-- **SPEC-3.3.26**: A pickup that finds no `agent_pull_requests` row for the issue looks up the issue's deterministic branch
-  (`SPEC-3.3.9`) and its open PR on the forge before choosing a start point. If either exists the run continues it with
-  no second PR. It starts from the default branch only when the forge reports neither. A failed forge read leaves the
-  issue queued, consumes no attempt and is logged at `error` naming the issue key and the repository.
+- **SPEC-3.3.26**: Superseded by `SPEC-3.17.16`.
 
 ### 3.4 Closed-issue summary action (`kind: closed-issue-summary`)
 
@@ -1229,14 +1226,19 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
     caller proceeds, logs at `warn` naming the peer, the key and the error, and counts the bypass for the Status page.
     It is never retried.
 
-13. **SPEC-3.17.14**: **Work query.** `GET /api/peer/work?key=<issue key>` is read-only and requires the credential of
-    `SPEC-3.17.5`. It returns `instance_id`, `key`, `run` (null, or `run_id`, `stage` and `started_at`), `pr` (null, or
-    `repo`, `number`, `branch`, `draft`, `ready`, `salvaged`, `failed`, `fix_attempts` and `head_sha`) and
-    `last_outcome` (null, or `outcome` and `ended_at`). `run_id` is the answering instance's local id and `stage` is
-    the `SPEC-3.14.2` stage of the attempt. The response carries no secret, prompt, log text or comment body.
+13. **SPEC-3.17.14**: **Work query.** `GET /api/peer/work` is read-only and requires the credential of `SPEC-3.17.5`. It
+    takes either `key=<issue key>`, or `host=<host>&repo=<repo>` with exactly one of `pr=<number>` or `branch=<name>`
+    (the PR form); any other combination is `400`. The PR form answers for the issue the answering instance has
+    recorded for that PR in `agent_pull_requests`. It returns `instance_id`, `key` (the issue key, null when the PR form
+    finds no record), `run` (null, or `run_id`, `stage` and `started_at`), `pr` (null, or `host`, `repo`, `number`,
+    `branch`, `state`, `ready`, `salvaged`, `failed` and `fix_attempts`) and `last_outcome` (null, or `outcome` and
+    `ended_at`). A key or PR the answering instance has no record of returns `run`, `pr` and `last_outcome` null.
+    `run_id` is the answering instance's local id and `stage` is the `SPEC-3.14.2` stage of the attempt. The response
+    carries no secret, prompt, log text or comment body.
 
 14. **SPEC-3.17.15**: **Owner.** An instance owns a key while it has a live `run_inflight_jobs` row for it, or else an
-    `open` `agent_pull_requests` row for it. A key reported with a live run by two instances is a duplicate
+    `open` `agent_pull_requests` row for it. It owns a PR (`host`, `repo` and number) while it has an `open`
+    `agent_pull_requests` row for that PR. A key reported with a live run by two instances is a duplicate
     (`SPEC-3.17.19`).
 
 15. **SPEC-3.17.16**: **Pickup consults peers.** After the dependency gate and the CI in-flight cap (`SPEC-3.3.3`) and
@@ -1251,10 +1253,14 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
     instance that has already written `Working` for the key refuses.
 
 17. **SPEC-3.17.18**: **Ownership of incoming events.** Before the claim of `SPEC-3.17.8`, an instance that received an
-    event naming an issue or a PR, and does not own the key, sends the work query to every `reachable` peer. If a peer
-    owns the key, the instance drops the delivery with `200` and an `info` log naming the owner, and takes no claim.
-    The owner handles the event through its own hook target. A delivery the owner never received is not handled until
-    the next event.
+    event naming a PR, and does not own that PR (`SPEC-3.17.15`), sends the work query in its PR form to every
+    `reachable` peer. A pull-request delivery names its PR by number, and a comment delivery on a PR by its issue
+    number. An Action-run delivery names no PR: the instance matches its `commit_sha` against the `head_sha` of the
+    repository's open PRs (`Forge::list_open_prs`). When that read fails or nothing matches, the instance skips this
+    step and goes on to the claim, logging a failed read at `warn` naming the repository and the run index. An event
+    naming no PR, such as a comment on a plain issue, skips this step. If a peer owns the PR, the instance drops the
+    delivery with `200` and an `info` log naming the owner, and takes no claim. The owner handles the event through its
+    own hook target. A delivery the owner never received is not handled until the next event.
 
 18. **SPEC-3.17.19**: **A reachable duplicate is a defect.** A run that learns from a snapshot or a work query that a
     peer has a live run for its key logs at `error` naming the key, both runs (each by `instance_id` and `run_id`) and
