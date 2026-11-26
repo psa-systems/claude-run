@@ -16033,6 +16033,86 @@ mod tests {
             }
 
             #[tokio::test]
+            async fn apply_automerge_decision_routes_a_behind_base_github_pr_to_merge_under_match_forge(
+            ) {
+                // GitHub's `branch_requires_up_to_date` always answers `None`
+                // (see the override's own doc comment), which `match_forge`
+                // (the default, unset here) treats the same as
+                // `dont_require`: a green, mergeable, behind-base PR on
+                // `github.com` merges directly instead of updating the branch.
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
+                let backend = Arc::new(StoreBackend::new());
+                let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+                let runs_args = gh_pr_runs_args("octo/widget");
+                let runs_args: Vec<&str> = runs_args.iter().map(String::as_str).collect();
+                let status_args = gh_pr_commit_status_args("octo/widget");
+                let status_args: Vec<&str> = status_args.iter().map(String::as_str).collect();
+                let runner = Arc::new(
+                    crate::provider::cli::testutil::StubRunner::new()
+                        .ok(
+                            "gh",
+                            &gh_list_open_prs_args("octo/widget"),
+                            GH_OPEN_PRS_JSON,
+                        )
+                        .ok(
+                            "gh",
+                            &gh_pr_view_args("octo/widget"),
+                            &gh_pr_view_json("BEHIND"),
+                        )
+                        .ok("gh", &runs_args, GH_PR_RUNS_JSON_GREEN)
+                        .ok("gh", &status_args, GH_PR_COMMIT_STATUS_JSON_EMPTY)
+                        .ok(
+                            "gh",
+                            &[
+                                "pr",
+                                "merge",
+                                "42",
+                                "--repo",
+                                "octo/widget",
+                                "--merge",
+                                "--delete-branch",
+                            ],
+                            "",
+                        ),
+                );
+                let ctx = store_mint_context_in(
+                    pool.clone(),
+                    backend.clone(),
+                    classifier,
+                    dir.path(),
+                    runner.clone(),
+                );
+                let row = seeded_github_row(&pool).await;
+
+                let result = apply_automerge_decision(
+                    &ctx,
+                    &pool,
+                    "github.com",
+                    "octo/widget",
+                    42,
+                    "https://github.com/octo/widget/pulls/42",
+                    &row,
+                )
+                .await;
+
+                assert!(
+                    matches!(result, Ok(AutomergeOutcome::Acted(_))),
+                    "{result:?}"
+                );
+                let calls = runner.calls.lock().unwrap();
+                assert!(
+                    calls.iter().any(|c| c.starts_with("gh pr merge 42")),
+                    "{calls:?}"
+                );
+                assert!(
+                    !calls.iter().any(|c| c.starts_with("gh pr update-branch")),
+                    "{calls:?}"
+                );
+            }
+
+            #[tokio::test]
             async fn reconciler_run_link_uses_pull_not_pulls_for_a_github_host() {
                 // The reconciler's own run link (`agent_pr_url`)
                 // must follow GitHub's `/pull/<n>` shape for a `github.com`
