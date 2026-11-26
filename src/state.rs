@@ -1346,20 +1346,33 @@ pub async fn peer_work_event_insert(pool: &DbPool, e: &PeerWorkEvent) -> Result<
     Ok(res.rows_affected() == 1)
 }
 
+/// One `peer_work_events` row as selected by [`peer_work_events_recent`].
+type PeerWorkEventRow = (String, i64, String, String, Option<i64>, String, String);
+
+/// One in-flight job row joined with its run's start, as selected by [`run_inflight_with_start`].
+type InflightJobStartRow = (
+    String,
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
 /// The newest `limit` peer notices, newest first, for the Status page (`SPEC-3.17.12`).
 pub async fn peer_work_events_recent(pool: &DbPool, limit: i64) -> Result<Vec<PeerWorkEvent>> {
-    let rows: Vec<(String, i64, String, String, Option<i64>, String, String)> =
-        sqlx::query_as(sqlx::AssertSqlSafe(
-            crate::db::q(
-                pool,
-                "SELECT instance_id, run_id, event, key, pr_number, at, received_at
+    let rows: Vec<PeerWorkEventRow> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT instance_id, run_id, event, key, pr_number, at, received_at
              FROM peer_work_events ORDER BY received_at DESC, instance_id, run_id, event LIMIT ?",
-            )
-            .into_owned(),
-        ))
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+        )
+        .into_owned(),
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
     Ok(rows
         .into_iter()
         .map(
@@ -1436,7 +1449,7 @@ pub struct InflightJobStart {
 /// Every `run_inflight_jobs` row of a still-open run, with the run's start.
 /// Unlike [`run_inflight_rows_all`] this is safe to call on a live daemon.
 pub async fn run_inflight_with_start(pool: &DbPool) -> Result<Vec<InflightJobStart>> {
-    let rows: Vec<(String, String, String, i64, Option<String>, Option<String>, Option<i64>)> =
+    let rows: Vec<InflightJobStartRow> =
         sqlx::query_as(sqlx::AssertSqlSafe(
             crate::db::q(
                 pool,
