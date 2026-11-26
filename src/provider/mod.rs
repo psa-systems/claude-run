@@ -910,6 +910,31 @@ pub trait Forge: Send + Sync {
         )))
     }
 
+    /// Whether this forge's own branch-protection rule for `base_ref` in
+    /// `repo` on `host` blocks a merge while the branch is behind base
+    /// (Forgejo's `block_on_outdated_branch`). `Ok(None)` means this read is
+    /// not supported by this backend, which [`Automerge::branch_up_to_date`]'s
+    /// `MatchForge` resolution treats the same as `DontRequire`; this is NOT
+    /// an error. The default returns `Ok(None)`, matching GitHub (the rule is
+    /// not readable through `gh`) and every test-only stub. Forgejo's CLI
+    /// backend overrides this to read `fj --host <host> repo
+    /// branch-protection <repo> list --json` and resolve the rule matching
+    /// `base_ref` (an exact `rule_name` match first, else the first rule
+    /// whose `rule_name` glob-matches `base_ref`), returning its
+    /// `block_on_outdated_branch`; a failed or unparsable read is an `Err`
+    /// naming the repo and base branch, never defaulted to `None` or `false`.
+    ///
+    /// [`Automerge::branch_up_to_date`]: crate::action::Automerge::branch_up_to_date
+    fn branch_requires_up_to_date(
+        &self,
+        host: &str,
+        repo: &str,
+        base_ref: &str,
+    ) -> Result<Option<bool>> {
+        let _ = (host, repo, base_ref);
+        Ok(None)
+    }
+
     /// Add Forgejo labels to PR `pr_number` in `repo` on `host`
     /// (`fj pr edit <repo>#<n> labels --add <label>`). Used to flag a PR Needs
     /// Review when the per-PR auto-fix ceiling is reached. The default errors so
@@ -925,6 +950,44 @@ pub trait Forge: Send + Sync {
         Err(Error::Other(anyhow::anyhow!(
             "pr_add_labels not supported by this forge backend"
         )))
+    }
+}
+
+/// Resolve one `branch_up_to_date` setting to its effective `bool`: `Require`
+/// and `DontRequire` settle without a forge call; `MatchForge` looks up the
+/// PR's own base branch via [`Forge::list_open_prs`], then asks
+/// [`Forge::branch_requires_up_to_date`], treating `Ok(None)` (the read is not
+/// supported by this backend, which is always true for GitHub) the same as
+/// `DontRequire`. `true` means a behind-base PR must update from base before
+/// merging (the pre-setting behavior); `false` means a green, mergeable,
+/// behind-base PR merges directly. A listing or forge-protection-read failure
+/// is returned as `Err` naming the cause, never defaulted. Synchronous:
+/// `crate::web::webhooks`'s async caller runs this through `spawn_blocking`.
+pub fn resolve_branch_up_to_date(
+    forge: &dyn Forge,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    setting: crate::action::BranchUpToDate,
+) -> std::result::Result<bool, String> {
+    use crate::action::BranchUpToDate;
+    match setting {
+        BranchUpToDate::Require => Ok(true),
+        BranchUpToDate::DontRequire => Ok(false),
+        BranchUpToDate::MatchForge => {
+            let prs = forge
+                .list_open_prs(host, repo)
+                .map_err(|e| format!("list_open_prs for {repo} failed: {e}"))?;
+            let base_ref = prs
+                .iter()
+                .find(|p| p.number == pr_number)
+                .map(|p| p.base_ref.clone())
+                .ok_or_else(|| format!("PR #{pr_number} not found in open-PR listing"))?;
+            let result = forge
+                .branch_requires_up_to_date(host, repo, &base_ref)
+                .map_err(|e| format!("branch_requires_up_to_date failed: {e}"))?;
+            Ok(result.unwrap_or(false))
+        }
     }
 }
 

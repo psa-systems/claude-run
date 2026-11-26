@@ -83,9 +83,12 @@ flowchart TD
         AM3 -- no --> AN1
         AM3 -- yes --> AM4["fj pr status --json (behind_base)"]
         AM4 -- "success, behind_base missing" --> AM6b["comment: fj must report behind_base; fail run"]
-        AM4 -- "success, behind_base=true" --> AM7{"update_pr_branch (fj pr update --style merge)"}
+        AM4 -- "success, behind_base=true" --> AM7x{"resolve_branch_up_to_date (require/dont_require/match_forge)"}
+        AM7x -- "true" --> AM7{"update_pr_branch (fj pr update --style merge)"}
         AM7 -- ok --> AM7a["comment: branch updated; leave at Code Review"]
         AM7 -- error --> AM7b["comment: update failed; fail run"]
+        AM7x -- "false" --> AM5
+        AM7x -- error --> AM7c["comment: resolution failed; fail run"]
         AM4 -- "success, behind_base=false, not mergeable" --> AM6{"conflict run for this head commit (non-WIP or conflicted, under CI cap)"}
         AM6 -- dispatched --> AM6a["comment: runner is resolving the conflict"]
         AM6 -- "none to send" --> AM6c["comment: not mergeable; leave at Code Review"]

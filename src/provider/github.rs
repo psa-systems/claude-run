@@ -1482,6 +1482,21 @@ impl Forge for GithubForge {
         Ok(())
     }
 
+    /// GitHub's branch protection is not readable through `gh` in a form that
+    /// maps to "does merging this PR require the base branch to be up to
+    /// date first", so this backend always answers `None` (not readable),
+    /// same as the trait's default. Written out explicitly here rather than
+    /// left to the default so the "not supported on GitHub" fact is visible
+    /// next to the rest of this backend's `Forge` impl.
+    fn branch_requires_up_to_date(
+        &self,
+        _host: &str,
+        _repo: &str,
+        _base_ref: &str,
+    ) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
     /// `gh api repos/<repo>/collaborators/<username>/permission --jq
     /// .permission`, run with the action's PAT as `GH_TOKEN` exactly as
     /// `repo_access` does. GitHub's REST response's `permission` field is one

@@ -76,6 +76,15 @@
       <span>Enabled (merge the PR once its CI goes green, then advance the issue to Done)</span>
     </label>
     <p class="hint dim">When enabled, a successful run still stops at Code Review, unless its PR's CI is already green and the branch is current and mergeable when the run finishes, in which case the runner merges it right away. Otherwise the runner merges the PR later, once its CI goes green and the branch is mergeable, then comments on the issue; AI Agent and State stay at Code Review, and a YouTrack workflow (see <code>docs/yt-workflow-resolve-on-pr-merge.js</code>) resolves the issue once the merge lands. Normally the merge happens within seconds of a Forgejo Action Run Success or Recover webhook; if that webhook is missed, dropped, or never configured, a periodic reconciler pass merges it within a few minutes instead, so the webhook is a low-latency trigger and not a requirement (see "Event-driven automerge" in docs/webhooks.md). Disabled (the default) leaves the PR for a human to merge.</p>
+    <label class="fld">
+      <span>Branch must be up to date before automerging</span>
+      <select name="automerge_branch_up_to_date">
+        <option value="match_forge"{% if form.automerge_branch_up_to_date == "require" || form.automerge_branch_up_to_date == "dont_require" %}{% else %} selected{% endif %}>Match the forge's own branch-protection rule (recommended)</option>
+        <option value="require"{% if form.automerge_branch_up_to_date == "require" %} selected{% endif %}>Always require (update the branch from base before merging)</option>
+        <option value="dont_require"{% if form.automerge_branch_up_to_date == "dont_require" %} selected{% endif %}>Never require (merge a green, mergeable PR directly, even behind base)</option>
+      </select>
+    </label>
+    <p class="hint dim">"Match the forge" asks Forgejo's own branch-protection rule for the PR's base branch (<code>block_on_outdated_branch</code>); GitHub never reports this, so it behaves like "Never require" there. This setting has no effect on a PR that is not behind base.</p>
   </div>
 
   <div class="card">

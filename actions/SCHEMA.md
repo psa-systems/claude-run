@@ -177,6 +177,9 @@ native:
                                            # merging writes no State or AI Agent field
       finalize_status_timeout_secs: 10    # bound on finalize's one status read; a PR already green
                                            # merges in the same tick; 0 skips that read
+      branch_up_to_date: match_forge       # match_forge (default) | require | dont_require;
+                                           # whether a behind-base PR must update from base
+                                           # before automerging it
     dependencies:                         # optional; pre-clone dependency gate
       enabled: true                       # on by default; false makes the gate a no-op
       recheck_timeout: 5m                 # backoff before a blocked issue is re-evaluated
@@ -215,6 +218,7 @@ native:
 | `youtrack.states.no_code` | the `done` label                 | AI Agent label set when a successful run deliberately produced no commits and left `.claude-run-no-code-change`. Defaults to whatever `states.done` is, because there is no PR for a human to review. `State` is left untouched, so the issue stays In Progress until a human closes it. Exposed in the structured editor as the "No-code label" field, blank meaning inherit the Done label. |
 | `youtrack.automerge.enabled` | `false`                       | Master switch for CI-gated automerge. When `false`, the PR is never merged by the runner (unchanged behavior). When `true`, `finalize` still stops at Code Review immediately; the merge happens later, normally driven by a `success`/`recover` Action-run webhook event and, if that event is missed, by the reconciler's own periodic pass - the webhook is a low-latency trigger, not the only one. |
 | `youtrack.automerge.finalize_status_timeout_secs` | `10`     | when automerge is enabled, `finalize` makes ONE PR status read right after promoting a successful run's PR, bounded by this many seconds, and merges the PR in the same tick when its checks are already `success`, its branch is not behind base and it is mergeable. Any other answer, a read error, or a read slower than this leaves the PR at Code Review for the webhook and reconciler. `0` skips the read. Not a structured-form input; a form save keeps the value on disk. |
+| `youtrack.automerge.branch_up_to_date` | `match_forge`     | Whether a green, mergeable, behind-base PR must update from base before automerging. `match_forge` (default) asks the forge's own branch-protection rule for the PR's base branch (Forgejo: `block_on_outdated_branch`; GitHub always answers "no rule", so this behaves like `dont_require` there) and treats "no rule" or a backend with no answer as `dont_require`. `require` always updates the branch from base first (the pre-setting behavior). `dont_require` always merges a green, mergeable PR directly, even behind base. Applied identically by `finalize`'s own merge, the webhook decision, and the reconciler. A forge read failure leaves the PR at Code Review rather than guessing. Editable in the structured web form ("Branch must be up to date before automerging"). |
 | `youtrack.automerge.wait_seconds` | `1800`                   | **Deprecated:** the runner no longer polls, so this is parsed (an action file setting it still loads) but otherwise ignored; setting it away from its default logs one deprecation warning at load. Saving the action's structured form resets it to the default. |
 | `youtrack.automerge.check_interval_seconds` | `30`           | **Deprecated:** same as `wait_seconds`.                                                  |
 | `youtrack.dependencies.enabled` | `true`                    | Master switch for the pre-clone dependency gate. When `true`, a queued issue with any unmet dependency is left Queued (not cloned, no claude spend) and re-evaluated after `recheck_timeout`. When `false`, the gate is a no-op and pickup proceeds exactly as before. See [Pre-clone dependency gate](#pre-clone-dependency-gate). Editable in the structured web form. |
@@ -461,9 +465,10 @@ By default a successful run opens the PR, sets AI Agent to `code_review`, and st
 human merges. Setting `youtrack.automerge.enabled: true` opts each successful run into merging the PR itself once its CI
 checks pass. `finalize` itself never waits for CI: once the PR is opened it stops at Code Review exactly as when automerge
 is disabled, with one exception: right after promoting the PR it makes a single status read bounded by
-`automerge.finalize_status_timeout_secs`, and a PR whose checks are already green, whose branch is not behind base and
-which the forge reports mergeable is merged in that same tick (outcome `Merged`, `agent_pull_requests` row set to
-`merged`). Every other answer leaves the PR to the later paths below; finalize never branch-updates, comments on a
+`automerge.finalize_status_timeout_secs`, and a PR whose checks are already green and which the forge reports mergeable
+is merged in that same tick (outcome `Merged`, `agent_pull_requests` row set to `merged`) when its branch is not behind
+base, or it is behind base but `automerge.branch_up_to_date` resolves to `false` for it (see the key's own entry above).
+Every other answer leaves the PR to the later paths below; finalize never branch-updates, comments on a
 not-ready PR, or retries. Otherwise the merge happens later, normally driven by a Forgejo webhook `success` or `recover` Action-run
 event on that PR's head commit (`POST /webhooks/forgejo/triage/<source>`, the same endpoint the CI-failure listener uses) - so
 the wait holds no job slot no matter how long the suite takes, and there is nothing to time out. The webhook is not the
@@ -486,11 +491,15 @@ and dispatches on `behind_base` first, since Forgejo's `mergeable` never reflect
 
 - **`behind_base` missing** (an older `fj` without `behind_base`): no merge action is taken; the handler comments that the
   runtime's `fj` must report `behind_base` and fails the run so a stale deployment does not silently stop automerging.
-- **Green and `behind_base: true`:** the branch is updated with `fj pr update <repo>#<n> --style merge`
-  (`update_pr_branch`), which merges the base into the head branch through Forgejo's own
-  Update-branch endpoint, instead of racing straight into a 405 from `pr merge`. A successful update comments that the
-  branch was updated and leaves the issue at Code Review; updating a branch retriggers CI, and the next `success`
-  event tries again. A failed update comments the failure and fails the run.
+- **Green and `behind_base: true`:** the effective `automerge.branch_up_to_date` is resolved once for the decision
+  (`require` -> `true`, `dont_require` -> `false`, `match_forge` -> the forge's own `branch_requires_up_to_date`
+  answer, treating "no rule" or an unsupported backend as `false`). When it resolves `true` the branch is updated with
+  `fj pr update <repo>#<n> --style merge` (`update_pr_branch`), which merges the base into the head branch through
+  Forgejo's own Update-branch endpoint, instead of racing straight into a 405 from `pr merge`. A successful update
+  comments that the branch was updated and leaves the issue at Code Review; updating a branch retriggers CI, and the
+  next `success` event tries again. A failed update comments the failure and fails the run. When it resolves `false`
+  the PR is merged directly, exactly as the "Green, `behind_base: false`, and mergeable" case below. A resolution
+  failure (a branch-protection read error) comments the failure and fails the run rather than guessing either way.
 - **Green, `behind_base: false`, and not mergeable** (a real conflict, still-checking, or a WIP PR): the handler
   dispatches a conflict-resolution run through the `concurrency.max_ci_in_flight_per_repo` gate and
   comments that it is resolving the conflict (attempt n of `webhook_comment.agent_conflict_resolve_attempts`); a WIP PR is skipped unless `fj` reports `conflicted: true`. With no run to send it

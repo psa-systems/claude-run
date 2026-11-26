@@ -4001,6 +4001,9 @@ struct YoutrackEditForm {
     state_done: String,
     /// Present ("on") when the automerge checkbox is checked.
     automerge_enabled: Option<String>,
+    /// `"match_forge"` (default), `"require"`, or `"dont_require"`
+    /// (`native.youtrack.automerge.branch_up_to_date`).
+    automerge_branch_up_to_date: String,
     fj_base_url: String,
     fj_token_ref: String,
     /// PR-creation strategy: `"branch"` (default) or `"agit"`.
@@ -4119,6 +4122,7 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
     let conc = Concurrency::default();
     let deps = crate::action::Dependencies::default();
     YoutrackEditForm {
+        automerge_branch_up_to_date: c.youtrack.automerge.branch_up_to_date.as_str().to_string(),
         yt_query: c.youtrack.query,
         yt_custom_field: c.youtrack.custom_field,
         yt_audit_project: c.youtrack.audit_project,
@@ -4179,6 +4183,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         state_in_progress: yt.youtrack.states.in_progress.clone(),
         state_done: yt.youtrack.states.done.clone(),
         automerge_enabled: yt.youtrack.automerge.enabled.then(|| "on".to_string()),
+        automerge_branch_up_to_date: yt.youtrack.automerge.branch_up_to_date.as_str().to_string(),
         fj_base_url: s(&yt.forgejo.base_url),
         fj_token_ref: s(&yt.forgejo.token_ref),
         fj_pr_strategy: yt.forgejo.pr_strategy.as_str().to_string(),
@@ -4386,6 +4391,9 @@ fn youtrack_form_to_yaml(
     youtrack.automerge = Automerge {
         enabled: form.is_automerge_enabled(),
         finalize_status_timeout_secs,
+        branch_up_to_date: crate::action::BranchUpToDate::from_form_value(
+            &form.automerge_branch_up_to_date,
+        ),
         ..Automerge::default()
     };
     // Projects the agent may create issues in. Comma-separated,
@@ -11782,6 +11790,73 @@ mod tests {
             f.name = "yt".to_string();
             let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
             assert!(!yaml.contains("automerge"), "automerge leaked:\n{yaml}");
+        }
+
+        #[test]
+        fn branch_up_to_date_round_trips_from_form() {
+            // A non-default branch_up_to_date value serializes, reloads, and
+            // prefills the form's select back to the same value.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.automerge_branch_up_to_date = "dont_require".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.as_ref().unwrap()
+            else {
+                panic!("expected youtrack native config");
+            };
+            assert_eq!(
+                yt.youtrack.automerge.branch_up_to_date,
+                crate::action::BranchUpToDate::DontRequire
+            );
+
+            let form = action_to_youtrack_form(&loaded.action).unwrap();
+            assert_eq!(form.automerge_branch_up_to_date, "dont_require");
+        }
+
+        #[test]
+        fn branch_up_to_date_default_omits_the_automerge_block() {
+            // The match_forge default, like every other Automerge default,
+            // writes no automerge block at all when automerge stays
+            // disabled (see `automerge_default_omits_block`).
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            assert!(
+                !yaml.contains("branch_up_to_date"),
+                "branch_up_to_date leaked:\n{yaml}"
+            );
+        }
+
+        #[test]
+        fn automerge_editor_renders_the_branch_up_to_date_select() {
+            // The structured editor's Automerge card exposes the
+            // branch_up_to_date setting so it never requires the raw-YAML
+            // editor to change.
+            use askama::Template as _;
+            let mut form = super::super::youtrack_form_defaults();
+            form.automerge_branch_up_to_date = "require".to_string();
+            let tpl = super::super::YoutrackEditorTpl {
+                version: "test",
+                heading: "Edit yt".to_string(),
+                post_url: "/actions/yt/form".to_string(),
+                raw_url: "/actions/yt/edit".to_string(),
+                form,
+                secrets: Vec::new(),
+                error: None,
+                name: Some("yt".to_string()),
+                prompt_source: "builtin:default".to_string(),
+                prompt_preset: "default",
+            };
+            let html = tpl.render().unwrap();
+            assert!(
+                html.contains("name=\"automerge_branch_up_to_date\""),
+                "branch_up_to_date select missing:\n{html}"
+            );
+            assert!(
+                html.contains("value=\"require\" selected"),
+                "require option not selected:\n{html}"
+            );
         }
 
         #[test]

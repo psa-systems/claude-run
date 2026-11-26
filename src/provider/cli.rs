@@ -167,6 +167,24 @@ fn pr_create_error_with_lookup(
 /// Derive a PR number from a forge PR URL's trailing
 /// `/pulls/<n>` (Forgejo) or `/pull/<n>` (GitHub-style) segment. Used only as a
 /// fallback when `fj pr create --json` omits the `number` field.
+/// Match a branch-protection rule name against a branch, where the rule name
+/// may be a literal branch name or a glob using `*` (any run of characters,
+/// including none) and `?` (exactly one character). Used to find which rule
+/// governs a PR's base branch when no rule name matches it exactly.
+fn glob_match(pattern: &str, candidate: &str) -> bool {
+    fn rec(pat: &[char], text: &[char]) -> bool {
+        match pat.first() {
+            None => text.is_empty(),
+            Some('*') => rec(&pat[1..], text) || (!text.is_empty() && rec(pat, &text[1..])),
+            Some('?') => !text.is_empty() && rec(&pat[1..], &text[1..]),
+            Some(c) => text.first() == Some(c) && rec(&pat[1..], &text[1..]),
+        }
+    }
+    let pat: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = candidate.chars().collect();
+    rec(&pat, &text)
+}
+
 fn number_from_pr_url(url: &str) -> Option<u64> {
     let rest = url
         .rsplit_once("/pulls/")
@@ -2777,6 +2795,56 @@ impl Forge for CliBackend {
         Ok(())
     }
 
+    fn branch_requires_up_to_date(
+        &self,
+        host: &str,
+        repo: &str,
+        base_ref: &str,
+    ) -> Result<Option<bool>> {
+        let args = [
+            "--host",
+            host,
+            "repo",
+            "branch-protection",
+            repo,
+            "list",
+            "--json",
+        ];
+        let out = self.run_fj_read(None, &args, &self.fj_envs()).map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "reading branch-protection rules for `{repo}` (base `{base_ref}`) at {host} failed: {e}"
+            ))
+        })?;
+        let stdout = Self::checked(&self.fj, out, &args).map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "reading branch-protection rules for `{repo}` (base `{base_ref}`) at {host} failed: {e}"
+            ))
+        })?;
+        #[derive(Deserialize)]
+        struct BranchProtectionRule {
+            rule_name: String,
+            #[serde(default)]
+            block_on_outdated_branch: bool,
+        }
+        let rules: Vec<BranchProtectionRule> = Self::parse_json(
+            &self.fj,
+            "fj repo branch-protection list --json",
+            &stdout,
+        )
+        .map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "parsing branch-protection rules for `{repo}` (base `{base_ref}`) at {host} failed: {e}"
+            ))
+        })?;
+        let rule = rules
+            .iter()
+            .find(|r| r.rule_name == base_ref)
+            .or_else(|| rules.iter().find(|r| glob_match(&r.rule_name, base_ref)));
+        Ok(Some(
+            rule.map(|r| r.block_on_outdated_branch).unwrap_or(false),
+        ))
+    }
+
     fn repo_permission(&self, host: &str, repo: &str, username: &str) -> Result<String> {
         // `fj repo collaborator <owner>/<repo> permission <user>
         // --format json` answers `{"username":..,"permission":..,"role_name":..}`.
@@ -3452,6 +3520,66 @@ mod tests {
 
     fn backend(runner: StubRunner) -> CliBackend {
         CliBackend::new(Arc::new(runner))
+    }
+
+    #[test]
+    fn glob_match_exact_and_wildcards() {
+        assert!(glob_match("main", "main"));
+        assert!(!glob_match("main", "develop"));
+        assert!(glob_match("release/*", "release/1.0"));
+        assert!(!glob_match("release/*", "main"));
+        assert!(glob_match("*-stable", "v2-stable"));
+        assert!(glob_match("rel-?-x", "rel-1-x"));
+        assert!(!glob_match("rel-?-x", "rel-12-x"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn branch_requires_up_to_date_matches_exact_then_glob_then_default_false() {
+        let json = r#"[
+            {"rule_name": "release/*", "block_on_outdated_branch": true},
+            {"rule_name": "main", "block_on_outdated_branch": false}
+        ]"#;
+        let args = [
+            "--host",
+            "dev.example.org",
+            "repo",
+            "branch-protection",
+            "acme/widgets",
+            "list",
+            "--json",
+        ];
+        let b = CliBackend::new(Arc::new(StubRunner::new().ok("fj", &args, json)));
+        assert_eq!(
+            b.branch_requires_up_to_date("dev.example.org", "acme/widgets", "main")
+                .unwrap(),
+            Some(false),
+            "exact match wins"
+        );
+        assert_eq!(
+            b.branch_requires_up_to_date("dev.example.org", "acme/widgets", "release/1.0")
+                .unwrap(),
+            Some(true),
+            "glob match used when no exact rule"
+        );
+        assert_eq!(
+            b.branch_requires_up_to_date("dev.example.org", "acme/widgets", "develop")
+                .unwrap(),
+            Some(false),
+            "no matching rule defaults to false"
+        );
+    }
+
+    #[test]
+    fn branch_requires_up_to_date_surfaces_read_failures() {
+        let b = CliBackend::new(Arc::new(StubRunner::new()));
+        let err = b
+            .branch_requires_up_to_date("dev.example.org", "acme/widgets", "main")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("acme/widgets"));
+        assert!(msg.contains("main"));
     }
 
     #[test]
