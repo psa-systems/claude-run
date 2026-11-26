@@ -521,6 +521,57 @@ pub struct Automerge {
     /// falls back to Code Review, leaving the merge to the webhook and the
     /// reconciler. `0` skips the finalize-time merge entirely.
     pub finalize_status_timeout_secs: u64,
+    /// Whether a green, mergeable PR must have an up-to-date base branch
+    /// before it is automerged. `MatchForge` (the default) follows the
+    /// forge's own branch-protection rule for the PR's base branch;
+    /// `Require` always brings a behind-base branch current first (the
+    /// historical behavior); `DontRequire` merges a behind-base PR directly
+    /// and never calls [`crate::provider::Forge::update_pr_branch`]. Applied
+    /// identically by the webhook/reconciler decision in
+    /// `apply_automerge_decision` and by the finalize-time merge condition in
+    /// `src/native/youtrack.rs`.
+    pub branch_up_to_date: BranchUpToDate,
+}
+
+/// [`Automerge::branch_up_to_date`]'s setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchUpToDate {
+    /// Follow the forge's own branch-protection rule for the PR's base
+    /// branch. On Forgejo this reads `block_on_outdated_branch` off the
+    /// matching branch-protection rule; on GitHub, where that rule is not
+    /// readable through `gh`, this behaves as [`BranchUpToDate::DontRequire`].
+    #[default]
+    MatchForge,
+    /// Always require the branch to be up to date before merging: update a
+    /// behind-base branch and wait for the next green run, the behavior this
+    /// setting replaces when absent.
+    Require,
+    /// Never require the branch to be up to date: merge a green, mergeable,
+    /// behind-base PR directly.
+    DontRequire,
+}
+
+impl BranchUpToDate {
+    /// The snake_case wire / web-form value, matching the serde
+    /// `rename_all` encoding.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BranchUpToDate::MatchForge => "match_forge",
+            BranchUpToDate::Require => "require",
+            BranchUpToDate::DontRequire => "dont_require",
+        }
+    }
+
+    /// Parse a web-form value. An empty or unrecognized value falls back to
+    /// the default ([`BranchUpToDate::MatchForge`]).
+    pub fn from_form_value(s: &str) -> Self {
+        match s {
+            "require" => BranchUpToDate::Require,
+            "dont_require" => BranchUpToDate::DontRequire,
+            _ => BranchUpToDate::MatchForge,
+        }
+    }
 }
 
 /// [`Automerge::finalize_status_timeout_secs`]'s default.
@@ -533,6 +584,7 @@ impl Default for Automerge {
             wait_seconds: 1800,
             check_interval_seconds: 30,
             finalize_status_timeout_secs: DEFAULT_FINALIZE_STATUS_TIMEOUT_SECS,
+            branch_up_to_date: BranchUpToDate::default(),
         }
     }
 }

@@ -2516,15 +2516,15 @@ async fn process_job(
         }
     }
     // The run reported success and the PR was promoted to ready;
-    // mark the row finished so the reconciler and the Action-Run webhook
-    // decision path stop re-syncing it, fresh or resumed alike, whether or
+    // mark the row ready so the reconciler and the Action-Run webhook
+    // decision path record that, fresh or resumed alike, whether or
     // not finalize also merged it in the same tick below.
     if let Ok(Finalized::CodeReview {
         pr_number: Some(pr_number),
         ..
     }) = &finalize_res
     {
-        mark_finished_at_finalize(pool, job, *pr_number).await;
+        mark_ready_at_finalize(pool, job, *pr_number).await;
     }
     // A PR `finalize` merged in the same tick is recorded as
     // merged right here, after the row above exists, so neither the webhook
@@ -2989,24 +2989,23 @@ async fn mark_merged_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: u6
 }
 
 /// Set the `agent_pull_requests` row for a PR `finalize` just
-/// reported `Finalized::CodeReview` for as `finished`: the run succeeded and
-/// the PR was promoted to ready, so there is nothing left for the agent to
-/// do here. Looked up by `(host, repo, pr_number)`, covering a fresh PR
+/// reported `Finalized::CodeReview` for as `ready`: the run succeeded and
+/// the PR was promoted to ready. Looked up by `(host, repo, pr_number)`, covering a fresh PR
 /// (recorded moments ago by [`record_new_pr`]) and a resumed one alike, the
 /// same way [`mark_merged_at_finalize`] does. Once set, the automerge
 /// reconciler and the Action-Run webhook decision path
-/// (`apply_automerge_decision`) stop touching the row: no more behind-base
-/// branch updates, no more status comments. A lookup or write failure is
+/// (`apply_automerge_decision`) evaluate the PR for merge the same as any
+/// other open row. A lookup or write failure is
 /// logged at `error` and otherwise ignored: the PR itself is already
 /// promoted and the row simply stays eligible for reconciliation, which is
 /// the safe direction (noisy, not silent).
-async fn mark_finished_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: u64) {
+async fn mark_ready_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: u64) {
     use crate::ci_failure::store;
     let host = host_only(&job.repo_host);
     let row = match store::agent_pr(pool, &host, &job.repo_path, pr_number as i64).await {
         Ok(Some(row)) => row,
         Ok(None) => {
-            tracing::error!(key = %job.key, pr = pr_number, "PR promoted to ready at finalize, but no agent_pull_requests row exists to mark finished");
+            tracing::error!(key = %job.key, pr = pr_number, "PR promoted to ready at finalize, but no agent_pull_requests row exists to mark ready");
             return;
         }
         Err(e) => {
@@ -3014,8 +3013,8 @@ async fn mark_finished_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: 
             return;
         }
     };
-    if let Err(e) = store::mark_finished(pool, row.id, &state::now_iso()).await {
-        tracing::error!(key = %job.key, pr = pr_number, error = %e, "PR promoted to ready at finalize, but marking its agent_pull_requests row finished failed");
+    if let Err(e) = store::mark_ready(pool, row.id, &state::now_iso()).await {
+        tracing::error!(key = %job.key, pr = pr_number, error = %e, "PR promoted to ready at finalize, but marking its agent_pull_requests row ready failed");
     }
 }
 
@@ -3028,7 +3027,7 @@ async fn mark_finished_at_finalize(pool: &DbPool, job: &YoutrackJob, pr_number: 
 /// [`record_new_pr`] does, since only the gate-failure arm of `Failed` ever
 /// carries one (every other arm opens no PR of its own, and `pr_number` is
 /// `None`, so there is nothing to mark). A lookup or write failure is logged
-/// at `error` and otherwise ignored, the same as [`mark_finished_at_finalize`].
+/// at `error` and otherwise ignored, the same as [`mark_ready_at_finalize`].
 async fn mark_failed_at_finalize(
     pool: &DbPool,
     action_name: &str,
@@ -20353,10 +20352,10 @@ mod tests {
     }
 
     /// A PR promoted to ready at finalize (`Finalized::CodeReview`)
-    /// has its row marked `finished`, so the automerge reconciler and the
-    /// Action-Run webhook decision path stop re-syncing it.
+    /// has its row marked `ready`, so the automerge reconciler and the
+    /// Action-Run webhook decision path evaluate it for merge.
     #[tokio::test]
-    async fn mark_finished_at_finalize_sets_the_recorded_row_finished() {
+    async fn mark_ready_at_finalize_sets_the_recorded_row_ready() {
         let pool = mem_pool().await;
         let forge = CliBackend::new(Arc::new(StubRunner::new()));
         let backend = CliBackend::new(Arc::new(StubRunner::new()));
@@ -20377,18 +20376,18 @@ mod tests {
             .await
             .unwrap()
             .expect("record_new_pr inserts a row");
-        assert!(!rec.finished, "not finished until finalize marks it");
+        assert!(!rec.ready, "not ready until finalize marks it");
 
-        mark_finished_at_finalize(&pool, &job(), 9).await;
+        mark_ready_at_finalize(&pool, &job(), 9).await;
 
         let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MX-16")
             .await
             .unwrap()
             .expect("record_new_pr inserts a row");
-        assert!(rec.finished);
+        assert!(rec.ready);
         assert_eq!(
             rec.state, "open",
-            "finished does not change state; a finished PR is still open until a human merges it"
+            "ready does not change state; a ready PR is still open until merged"
         );
     }
 

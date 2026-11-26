@@ -171,7 +171,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             salvaged: false,
-            finished: false,
+            ready: false,
             failed: false,
             conflict_resolve_attempts: 0,
             conflict_resolve_started_at: None,

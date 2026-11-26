@@ -59,10 +59,10 @@ pub struct AgentPullRequest {
     pub salvaged: bool,
     /// True once `finalize` has observed `Finalized::CodeReview`
     /// for this PR, i.e. the run that owns it reported success and the PR was
-    /// promoted to ready. The automerge reconciler and the Action-Run webhook
-    /// decision path stop touching the row once this is set: no more
-    /// behind-base branch updates, no more status comments. Never cleared.
-    pub finished: bool,
+    /// promoted to ready. A `ready` PR is still evaluated for automerge: the
+    /// webhook decision path and the reconciler merge it once it is green and
+    /// mergeable, subject to the same `salvaged`/`failed`/draft exclusions.
+    pub ready: bool,
     /// SPEC-3.3.1: true once `finalize` has ended the run that
     /// owns this PR in `Failed` (a gate failure, `SPEC-3.3.2`, included).
     /// Blocks automerge, whatever the PR's draft, mergeable, behind-base or
@@ -112,7 +112,7 @@ fn agent_pr_from_row(row: &sqlx::any::AnyRow) -> Result<AgentPullRequest> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         salvaged: db::flag(row, "salvaged")?,
-        finished: db::flag(row, "finished")?,
+        ready: db::flag(row, "ready")?,
         failed: db::flag(row, "failed")?,
         conflict_resolve_attempts: row.try_get("conflict_resolve_attempts")?,
         conflict_resolve_started_at: row.try_get("conflict_resolve_started_at")?,
@@ -636,16 +636,16 @@ pub async fn record_agent_pr(
     Ok(id)
 }
 
-/// Set `id`'s `finished` flag. Called once `finalize` returns
+/// Set `id`'s `ready` flag. Called once `finalize` returns
 /// `Finalized::CodeReview`, fresh or resumed: the run reported success and
 /// the PR was promoted to ready, so there is nothing left for the agent to
 /// do on this PR. Never cleared: a later re-queue that resumes this same PR
 /// (another `CodeReview`) is a harmless no-op write.
-pub async fn mark_finished(pool: &DbPool, id: i64, now: &str) -> Result<()> {
+pub async fn mark_ready(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(
         db::q(
             pool,
-            "UPDATE agent_pull_requests SET finished = 1, updated_at = ? WHERE id = ?",
+            "UPDATE agent_pull_requests SET ready = 1, updated_at = ? WHERE id = ?",
         )
         .into_owned(),
     ))
@@ -723,7 +723,7 @@ pub async fn agent_pr(
 ) -> Result<Option<AgentPullRequest>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, finished, failed, created_at, updated_at, \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, ready, failed, created_at, updated_at, \
          conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
          FROM agent_pull_requests WHERE host = ? AND repo = ? AND pr_number = ?",
     ).into_owned()))
@@ -753,7 +753,7 @@ pub async fn agent_pr_for_issue(
 ) -> Result<Option<AgentPullRequest>> {
     let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, finished, failed, created_at, updated_at, \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, ready, failed, created_at, updated_at, \
          conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
          FROM agent_pull_requests WHERE issue_key = ? \
          ORDER BY CASE WHEN state = 'open' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1",
@@ -771,7 +771,7 @@ pub async fn agent_pr_for_issue(
 pub async fn open_agent_prs(pool: &DbPool) -> Result<Vec<AgentPullRequest>> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, finished, failed, created_at, updated_at, \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, ready, failed, created_at, updated_at, \
          conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
          FROM agent_pull_requests WHERE state = 'open' ORDER BY id",
     ).into_owned()))
@@ -1376,7 +1376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finished_flag_defaults_false_and_mark_finished_sets_it() {
+    async fn ready_flag_defaults_false_and_mark_ready_sets_it() {
         let pool = test_pool().await;
         let id = record_agent_pr(
             &pool,
@@ -1397,18 +1397,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!fresh.finished, "a newly recorded row is not finished yet");
+        assert!(!fresh.ready, "a newly recorded row is not ready yet");
 
-        mark_finished(&pool, id, "2026-11-05T00:00:00Z")
+        mark_ready(&pool, id, "2026-11-05T00:00:00Z")
             .await
             .unwrap();
 
-        let finished = agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 558)
+        let ready = agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 558)
             .await
             .unwrap()
             .unwrap();
-        assert!(finished.finished);
-        assert_eq!(finished.updated_at, "2026-11-05T00:00:00Z");
+        assert!(ready.ready);
+        assert_eq!(ready.updated_at, "2026-11-05T00:00:00Z");
     }
 
     #[tokio::test]

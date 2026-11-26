@@ -5407,19 +5407,11 @@ async fn apply_automerge_decision(
             "PR's owning run ended Failed; automerge blocked".to_string(),
         ));
     }
-    // Once `finalize` has observed `Finalized::CodeReview` for
-    // this PR, the run that owns it is done: the PR was promoted to ready
-    // and there is nothing left for the agent to do. Stop here with no
-    // comment, so a finished PR does not keep accruing behind-base branch
-    // updates and status comments on every webhook delivery and every
-    // reconciler tick (unlike the `salvaged` case above, which is itself
-    // still mid-run and so is worth narrating); a human merges it by hand.
-    if row.finished {
-        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR already finished per its own completion criteria; automerge reconciliation skipped");
-        return Ok(AutomergeOutcome::NoAction(
-            "PR already finished; no further sync needed".to_string(),
-        ));
-    }
+    // A `ready` row (`finalize` observed `Finalized::CodeReview` for this
+    // PR: the run that owns it reported success and the PR was promoted to
+    // ready) is still evaluated below like any other open row: a `ready` PR
+    // is merged once it is green and mergeable, subject only to the
+    // `salvaged`/`failed`/draft exclusions above and below.
     // A GitHub-hosted PR must route through `GithubForge`, not
     // `mint.backend` (always `fj`, which 410s against GitHub's API).
     let forge = resolve_forge(mint, host, &github_cfg.hosts, &github_cfg.mcp_endpoint);
@@ -14331,13 +14323,12 @@ mod tests {
             assert_eq!(row.state, "open", "never retired by automerge");
         }
 
-        /// Once a PR's row is `finished` (the run that owns it
-        /// already reported success and the PR was promoted to ready), the
-        /// reconciler must not touch it at all: no branch update, no merge,
-        /// and - unlike the still-mid-run `salvaged` case above - no comment
-        /// either, since there is nothing new to narrate on every tick.
+        /// A `ready` row (the run that owns it already reported success and
+        /// the PR was promoted to ready) is still evaluated for merge: once
+        /// green and mergeable, the reconciler merges it exactly like any
+        /// other open row.
         #[tokio::test]
-        async fn reconciler_never_touches_a_finished_pr() {
+        async fn reconciler_merges_a_ready_pr_once_green() {
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
@@ -14356,40 +14347,29 @@ mod tests {
             )
             .await
             .unwrap();
-            ci_failure_store::mark_finished(&pool, id, now)
-                .await
-                .unwrap();
+            ci_failure_store::mark_ready(&pool, id, now).await.unwrap();
 
             let backend = Arc::new(
                 StoreBackend::new()
                     .with_open_prs(vec![pr(558, "")])
-                    .with_pr_status_behind("success", true, Some(true)),
+                    .with_pr_status("success", true),
             );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
             let gate = crate::concurrency::KeyGate::new();
 
             reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
-            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
 
             let calls = backend.calls();
             assert!(
-                !calls.iter().any(|c| c.starts_with("merge_pr")),
-                "{calls:?}"
-            );
-            assert!(
-                !calls.iter().any(|c| c.starts_with("update_pr_branch")),
-                "{calls:?}"
-            );
-            assert!(
-                !calls.iter().any(|c| c.starts_with("comment")),
-                "a finished PR must get no status comment at all: {calls:?}"
+                calls.iter().any(|c| c == "merge_pr 558"),
+                "a ready PR must still be merged once green and mergeable: {calls:?}"
             );
 
             let row = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "contoso/audits", 558)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(row.state, "open", "never retired by automerge");
+            assert_eq!(row.state, "merged");
         }
 
         /// SPEC-3.3.1 / SPEC-4.4.3: once a PR's row is `failed`
