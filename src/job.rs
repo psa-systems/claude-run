@@ -690,6 +690,10 @@ pub enum ProcessedJob {
     /// with CI pending, so the issue was left Queued and never cloned or handed
     /// to claude. Consumes no attempt. `pending` is the count that was found.
     Deferred { key: String, pending: u32 },
+    /// SPEC-3.17.16 and SPEC-3.17.17: a reachable peer owns the issue (a live run) or holds the pickup
+    /// claim, so the issue was left as it is and never cloned or handed to claude. Consumes no attempt.
+    /// `peer` names the owner for logging.
+    PeerDeferred { key: String, peer: String },
     /// Job reached at least pre steps; outcome record is meaningful.
     Done {
         key: String,

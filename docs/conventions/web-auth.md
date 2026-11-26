@@ -39,7 +39,7 @@ variable.
 
 ## Peer API keys
 
-A peered instance (`SPEC-3.17.1` through `SPEC-3.17.12`) authenticated every `/api/peer/*` call solely against `web.auth_token_ref`, so an
+A peered instance (`SPEC-3.17.1` through `SPEC-3.17.22`) authenticated every `/api/peer/*` call solely against `web.auth_token_ref`, so an
 accounts-based deployment with that field unset had no way to mint a peer credential at all: the only fix was an
 operator hand-editing `config.toml` and restarting. A self-service alternative exists: a new "API Keys"
 section on `/secrets` (`SPEC-4.3.20` through `SPEC-4.3.24`) generates a `crk_`-prefixed random key, stores only its SHA-256 hash in the new

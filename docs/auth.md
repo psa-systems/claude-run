@@ -78,7 +78,7 @@ still signs in: `auth_username` plus the token plaintext as the password, so exi
 
 Run the daemon behind a TLS-terminating reverse proxy when exposed; the token is bearer credentials and must not cross
 the network in plaintext. The `/webhooks/` route keeps its own HMAC verification and is exempt from the gate, before and
-after setup. `/api/peer/*` is exempt too: it has its own bearer gate (`SPEC-3.17.1` through `SPEC-3.17.12`) that also accepts generated API keys.
+after setup. `/api/peer/*` is exempt too: it has its own bearer gate (`SPEC-3.17.1` through `SPEC-3.17.22`) that also accepts generated API keys.
 
 ### Service auth (Settings -> Auth)
 

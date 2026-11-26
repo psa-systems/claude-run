@@ -91,6 +91,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - `config.toml` holds only bootstrap keys; runtime settings are DB-backed and edited in the UI ([details](docs/conventions/state.md#bootstrap-vs-runtime-config))
 - Global pause is one DB flag honored at EVERY entry point ([details](docs/conventions/state.md#global-pause))
 - A periodic sweep corrects any `Working` issue with no live run ([details](docs/conventions/state.md#stuck-working-sweep))
+- Peers ask each other before a pickup or an event: work query, pickup claim, notices, cancel stays local ([details](docs/conventions/state.md#peer-work-exchange))
 
 ### CI failures and webhooks
 

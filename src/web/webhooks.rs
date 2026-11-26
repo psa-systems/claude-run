@@ -838,6 +838,9 @@ pub fn router(state: WebhookState) -> Router {
 pub struct MintContext {
     /// State DB, for the reused caps ledger.
     pub pool: DbPool,
+    /// SPEC-3.17.21: tells peers when the agent's PR failure re-queues its issue or reaches the ceiling.
+    /// `None` outside the daemon.
+    pub peers: Option<crate::peer::PeerClaims>,
     /// The LLM pass for the residue the deterministic rules cannot label.
     pub classifier: Arc<dyn FailureClassifier>,
     /// Provider backend: the `IssueTracker` the mint writes through and the
@@ -2498,6 +2501,27 @@ async fn report_infra_failure_on_agent_pr(
     }
 }
 
+/// SPEC-3.17.21: tell the peers the agent's PR failure was re-queued or hit the ceiling, once the
+/// tracker write is done. The notice names the webhook run; without one there is no `run_id` to send, so
+/// the notice is skipped and logged at `warn`.
+async fn notify_peers(
+    ctx: &MintContext,
+    webhook_run_id: Option<i64>,
+    event: crate::peer::LifecycleEvent,
+    record: &ci_failure_store::AgentPullRequest,
+) {
+    let Some(peers) = ctx.peers.as_ref() else {
+        return;
+    };
+    let Some(run_id) = webhook_run_id else {
+        warn!(key = %record.issue_key, event = event.as_str(), "peer notice skipped: the webhook run has no run id");
+        return;
+    };
+    peers
+        .notify(event, &record.issue_key, run_id, Some(record.pr_number))
+        .await;
+}
+
 /// `ev` failed on an open PR the agent itself opened (an `open`
 /// `agent_pull_requests` row). Below `webhook_cfg.agent_pr_fix_attempts`,
 /// comment the recorded issue with the run, the failing tests and the
@@ -2834,6 +2858,13 @@ async fn route_agent_pr_failure(
         if let Err(e) = ci_failure_store::bump_fix_attempts(&ctx.pool, record.id, &now).await {
             warn!(error = %e, "bumping the agent PR's fix-attempt counter failed (continuing)");
         }
+        notify_peers(
+            ctx,
+            webhook_run_id,
+            crate::peer::LifecycleEvent::Requeued,
+            &record,
+        )
+        .await;
         info!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, extended, "CI failure on the agent's own open PR; re-queued its issue");
         WebhookRunSummary {
             text: if extended {
@@ -2951,6 +2982,13 @@ async fn route_agent_pr_failure(
                 return WebhookRunSummary::error(format!("task panicked: {e}"));
             }
         }
+        notify_peers(
+            ctx,
+            webhook_run_id,
+            crate::peer::LifecycleEvent::CeilingReached,
+            &record,
+        )
+        .await;
         info!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, "agent PR fix-attempt ceiling reached; flagged Needs Review");
         WebhookRunSummary {
             text: format!(
@@ -3827,6 +3865,36 @@ pub(crate) fn pull_request_claim_key(
     )
 }
 
+/// SPEC-3.17.18: before the claim, drop a delivery that names a PR a reachable peer owns. `Some(response)`
+/// (`200`) when it must be dropped; `None` to go on to the claim. A delivery whose forge host cannot be
+/// derived skips the check, logged at `warn`.
+pub(crate) async fn ownership_or_drop(
+    claims: &Option<crate::peer::PeerClaims>,
+    host: Option<String>,
+    repo: &str,
+    pr: crate::peer::EventPr,
+    label: &str,
+    source: &str,
+    delivery: &str,
+) -> Option<Response> {
+    let claims = claims.as_ref()?;
+    if pr == crate::peer::EventPr::None {
+        return None;
+    }
+    let Some(host) = host else {
+        warn!(
+            source,
+            delivery,
+            repo,
+            "ownership check skipped: the delivery's forge host could not be derived"
+        );
+        return None;
+    };
+    let owner = claims.peer_owner_of_event(&host, repo, &pr, label).await?;
+    info!(source, delivery, repo, owner = %owner, "delivery names a PR a peer owns; dropped without a claim");
+    Some(StatusCode::OK.into_response())
+}
+
 /// Run the peer claim step for one delivery. `Some(response)` when the
 /// delivery must be dropped (`200`); `None` to dispatch it.
 pub(crate) async fn claim_or_drop(
@@ -4096,6 +4164,19 @@ async fn forgejo_webhook(
     match verified_failure_event(&payload, &src_cfg.allowed_repos, &source) {
         Some(event) => {
             let key = action_run_claim_key(provider, &payload);
+            if let Some(resp) = ownership_or_drop(
+                &st.claims,
+                forge_host_from_url(&event.html_url),
+                &event.repo,
+                crate::peer::EventPr::Commit(event.commit_sha.clone()),
+                &format!("run {}", event.index_in_repo),
+                &source,
+                delivery,
+            )
+            .await
+            {
+                return resp;
+            }
             if let Some(resp) =
                 claim_or_drop(&st.claims, key, &payload.action, &source, delivery).await
             {
@@ -4171,6 +4252,19 @@ async fn handle_action_success(
         return StatusCode::OK.into_response();
     };
     let key = action_run_claim_key(provider, payload);
+    if let Some(resp) = ownership_or_drop(
+        &st.claims,
+        forge_host_from_url(&event.html_url),
+        &event.repo,
+        crate::peer::EventPr::Commit(event.commit_sha.clone()),
+        &format!("run {}", payload.run.index_in_repo),
+        source,
+        delivery,
+    )
+    .await
+    {
+        return resp;
+    }
     if let Some(resp) = claim_or_drop(&st.claims, key, &payload.action, source, delivery).await {
         return resp;
     }
@@ -4251,6 +4345,19 @@ async fn handle_pull_request_delivery(
         return StatusCode::OK.into_response();
     };
     let key = pull_request_claim_key(provider, &payload);
+    if let Some(resp) = ownership_or_drop(
+        &st.claims,
+        forge_host_from_url(&event.html_url),
+        &event.repo,
+        crate::peer::EventPr::Number(event.number),
+        &format!("pull request #{}", event.number),
+        source,
+        delivery,
+    )
+    .await
+    {
+        return resp;
+    }
     if let Some(resp) =
         claim_or_drop(&st.claims, key, PULL_REQUEST_EVENT_TYPE, source, delivery).await
     {
@@ -7464,6 +7571,7 @@ mod tests {
     ) -> MintContext {
         MintContext {
             pool,
+            peers: None,
             classifier,
             backend,
             mint_cfg: Arc::new(RwLock::new(store_mint_cfg())),

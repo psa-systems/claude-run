@@ -1,4 +1,4 @@
-//! Optional peering between independently operating instances (`SPEC-3.17.1` through `SPEC-3.17.12`).
+//! Optional peering between independently operating instances (`SPEC-3.17.1` through `SPEC-3.17.22`).
 //!
 //! This module holds the instance identity helper, the peer state endpoint
 //! (`GET /api/peer/state`), the claim endpoint and client (`POST
@@ -83,6 +83,14 @@ pub struct InFlightEntry {
     pub action: String,
     pub job_key: String,
     pub started_at: String,
+    /// The serving instance's local run id (`SPEC-3.17.20`).
+    pub run_id: i64,
+    /// The `SPEC-3.14.2` stage of the attempt. `null` for a job with no attempt stage (a scripted or
+    /// webhook job) and until the attempt starts.
+    pub stage: Option<String>,
+    /// The PR branch and number; `null` before a PR exists.
+    pub branch: Option<String>,
+    pub pr_number: Option<i64>,
 }
 
 /// The body of `GET /api/peer/state` (`SPEC-3.17.5`). Carries no secret,
@@ -131,6 +139,10 @@ struct PeerStatus {
     skewed: bool,
     /// When each claim bypass happened, pruned to the last 24 hours.
     bypasses: Vec<DateTime<Utc>>,
+    /// When each duplicate run against this peer was logged (`SPEC-3.17.19`), pruned to the last 24 hours.
+    duplicates: Vec<DateTime<Utc>>,
+    /// Duplicates already logged and commented, so each is reported once.
+    reported_duplicates: HashSet<String>,
     /// The outcome of the last summary sync (`SPEC-3.17.10`).
     sync: SummarySync,
 }
@@ -180,6 +192,11 @@ pub struct PeerRow {
     pub in_flight: Option<u64>,
     /// Event claims bypassed for this peer in the last 24 hours (`SPEC-3.17.12`). Kept in memory, so a restart resets it.
     pub claims_bypassed: u64,
+    /// Duplicate runs logged against this peer in the last 24 hours (`SPEC-3.17.12`, `SPEC-3.17.19`). In memory.
+    pub duplicates: u64,
+    /// The peer's in-flight jobs from its latest snapshot, `None` unless it is `reachable` with a snapshot
+    /// (`SPEC-3.17.12`); `Some` of an empty list is a peer that is working nothing.
+    pub in_flight_jobs: Option<Vec<InFlightEntry>>,
     /// Summary replication state (`SPEC-3.17.12`).
     pub summary_sync: SummarySync,
 }
@@ -318,6 +335,14 @@ impl PeerRegistry {
                         .iter()
                         .filter(|t| now.signed_duration_since(**t) < BYPASS_WINDOW)
                         .count() as u64,
+                    duplicates: st
+                        .duplicates
+                        .iter()
+                        .filter(|t| now.signed_duration_since(**t) < BYPASS_WINDOW)
+                        .count() as u64,
+                    in_flight_jobs: (state == PeerState::Reachable)
+                        .then(|| st.snapshot.as_ref().map(|d| d.in_flight.clone()))
+                        .flatten(),
                     summary_sync: st.sync.clone(),
                 }
             })
@@ -390,6 +415,47 @@ impl PeerRegistry {
         st.bypasses
             .retain(|t| now.signed_duration_since(*t) < BYPASS_WINDOW);
         st.bypasses.push(now);
+    }
+
+    /// The live runs `key` has on `reachable` peers, from their fresh snapshots (`SPEC-3.17.19`):
+    /// `(peer name, peer instance id, peer run id)`. Empty while peering is disabled.
+    pub fn live_peer_runs_for_key(
+        &self,
+        cfg: &PeersConfig,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Vec<(String, String, i64)> {
+        let mut out = Vec::new();
+        if !cfg.enabled {
+            return out;
+        }
+        let map = self.lock();
+        for p in &cfg.peers {
+            let Some(st) = map.get(&p.name) else { continue };
+            if state_at(st, now, cfg.stale_after_secs) != PeerState::Reachable {
+                continue;
+            }
+            if let Some(doc) = &st.snapshot {
+                for e in doc.in_flight.iter().filter(|e| e.job_key == key) {
+                    out.push((p.name.clone(), doc.instance_id.clone(), e.run_id));
+                }
+            }
+        }
+        out
+    }
+
+    /// Count a duplicate against `peer`. True the first time `dedupe` (key plus both runs) is seen,
+    /// so the caller logs and comments once (`SPEC-3.17.19`).
+    pub fn record_duplicate(&self, peer: &str, dedupe: &str, now: DateTime<Utc>) -> bool {
+        let mut map = self.lock();
+        let st = map.entry(peer.to_string()).or_default();
+        if !st.reported_duplicates.insert(dedupe.to_string()) {
+            return false;
+        }
+        st.duplicates.push(now);
+        st.duplicates
+            .retain(|t| now.signed_duration_since(*t) < BYPASS_WINDOW);
+        true
     }
 
     /// `(action, job_key)` pairs listed in flight by every `reachable` peer
@@ -1000,6 +1066,8 @@ pub fn router(state: PeerApiState) -> Router {
         .route("/api/peer/state", get(peer_state))
         .route("/api/peer/claim", post(peer_claim))
         .route("/api/peer/summaries", get(peer_summaries))
+        .route("/api/peer/work", get(peer_work))
+        .route("/api/peer/notify", post(peer_notify))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_peer_bearer,
@@ -1092,6 +1160,10 @@ async fn peer_state(State(s): State<PeerApiState>) -> Response {
             action: r.action_name,
             job_key: r.job_key,
             started_at: r.started_at,
+            run_id: r.run_id,
+            stage: r.stage,
+            branch: r.branch,
+            pr_number: r.pr_number,
         })
         .collect();
     Json(PeerStateDoc {
@@ -1235,6 +1307,304 @@ async fn peer_claim(State(s): State<PeerApiState>, Json(req): Json<ClaimRequest>
     }
 }
 
+/// The query of `GET /api/peer/work` (`SPEC-3.17.14`): a `key`, or the PR form (`host`, `repo` and
+/// one of `pr` or `branch`). Also the shape a client serializes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// A validated [`WorkQuery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkForm {
+    Key(String),
+    PrNumber {
+        host: String,
+        repo: String,
+        number: i64,
+    },
+    PrBranch {
+        host: String,
+        repo: String,
+        branch: String,
+    },
+}
+
+impl WorkQuery {
+    pub fn by_key(key: &str) -> Self {
+        Self {
+            key: Some(key.to_string()),
+            ..Self::default()
+        }
+    }
+
+    pub fn by_pr(host: &str, repo: &str, number: i64) -> Self {
+        Self {
+            host: Some(host.to_string()),
+            repo: Some(repo.to_string()),
+            pr: Some(number),
+            ..Self::default()
+        }
+    }
+
+    /// `SPEC-3.17.14`: exactly the key form, or `host` and `repo` with exactly one of `pr` or
+    /// `branch`. Any other combination is an error naming what was sent.
+    pub fn validate(&self) -> std::result::Result<WorkForm, String> {
+        let bad = || {
+            Err(format!(
+                "send either `key`, or `host` and `repo` with exactly one of `pr` or `branch`; got {self:?}"
+            ))
+        };
+        match (&self.key, &self.host, &self.repo, self.pr, &self.branch) {
+            (Some(key), None, None, None, None) if !key.is_empty() => {
+                Ok(WorkForm::Key(key.clone()))
+            }
+            (None, Some(host), Some(repo), Some(number), None)
+                if !host.is_empty() && !repo.is_empty() =>
+            {
+                Ok(WorkForm::PrNumber {
+                    host: host.clone(),
+                    repo: repo.clone(),
+                    number,
+                })
+            }
+            (None, Some(host), Some(repo), None, Some(branch))
+                if !host.is_empty() && !repo.is_empty() && !branch.is_empty() =>
+            {
+                Ok(WorkForm::PrBranch {
+                    host: host.clone(),
+                    repo: repo.clone(),
+                    branch: branch.clone(),
+                })
+            }
+            _ => bad(),
+        }
+    }
+}
+
+/// The live run in a work answer (`SPEC-3.17.14`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkRun {
+    pub run_id: i64,
+    pub stage: Option<String>,
+    pub started_at: String,
+}
+
+/// The recorded PR in a work answer (`SPEC-3.17.14`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkPr {
+    pub host: String,
+    pub repo: String,
+    pub number: i64,
+    pub branch: String,
+    pub state: String,
+    pub ready: bool,
+    pub salvaged: bool,
+    pub failed: bool,
+    pub fix_attempts: i64,
+}
+
+/// The newest outcome in a work answer (`SPEC-3.17.14`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkOutcome {
+    pub outcome: String,
+    pub ended_at: String,
+}
+
+/// The body of `GET /api/peer/work` (`SPEC-3.17.14`). Carries no secret, prompt, log text or
+/// comment body. A key or PR the instance has no record of answers `run`, `pr` and `last_outcome` null.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkDoc {
+    pub instance_id: String,
+    pub key: Option<String>,
+    pub run: Option<WorkRun>,
+    pub pr: Option<WorkPr>,
+    pub last_outcome: Option<WorkOutcome>,
+}
+
+/// Answer a work query from this instance's own store (`SPEC-3.17.14`).
+pub async fn work_doc(pool: &DbPool, own_id: &str, form: &WorkForm) -> Result<WorkDoc> {
+    use crate::ci_failure::store;
+    let (key, row) = match form {
+        WorkForm::Key(k) => (Some(k.clone()), store::agent_pr_for_issue(pool, k).await?),
+        WorkForm::PrNumber { host, repo, number } => {
+            let row = store::agent_pr(pool, host, repo, *number).await?;
+            (row.as_ref().map(|r| r.issue_key.clone()), row)
+        }
+        WorkForm::PrBranch { host, repo, branch } => {
+            let row = store::agent_pr_by_branch(pool, host, repo, branch).await?;
+            (row.as_ref().map(|r| r.issue_key.clone()), row)
+        }
+    };
+    let Some(key) = key else {
+        return Ok(WorkDoc {
+            instance_id: own_id.to_string(),
+            key: None,
+            run: None,
+            pr: None,
+            last_outcome: None,
+        });
+    };
+    let run =
+        crate::state::live_run_for_key(pool, &key)
+            .await?
+            .map(|(run_id, stage, started_at)| WorkRun {
+                run_id,
+                stage,
+                started_at,
+            });
+    let last_outcome = crate::state::latest_outcome_for_key(pool, &key)
+        .await?
+        .map(|(outcome, ended_at)| WorkOutcome { outcome, ended_at });
+    let pr = row.map(|r| WorkPr {
+        host: r.host,
+        repo: r.repo,
+        number: r.pr_number,
+        branch: r.head_branch,
+        state: r.state,
+        ready: r.ready,
+        salvaged: r.salvaged,
+        failed: r.failed,
+        fix_attempts: r.fix_attempts,
+    });
+    Ok(WorkDoc {
+        instance_id: own_id.to_string(),
+        key: Some(key),
+        run,
+        pr,
+        last_outcome,
+    })
+}
+
+/// `SPEC-3.17.15`: this instance owns `key` while it has a live run for it, or else an `open` agent PR.
+pub async fn owns_key(pool: &DbPool, key: &str) -> Result<bool> {
+    if crate::state::live_run_for_key(pool, key).await?.is_some() {
+        return Ok(true);
+    }
+    Ok(crate::ci_failure::store::agent_pr_for_issue(pool, key)
+        .await?
+        .is_some_and(|r| r.state == "open"))
+}
+
+/// `SPEC-3.17.15`: this instance owns a PR while it has an `open` agent PR row for it.
+pub async fn owns_pr(pool: &DbPool, host: &str, repo: &str, number: i64) -> Result<bool> {
+    Ok(crate::ci_failure::store::agent_pr(pool, host, repo, number)
+        .await?
+        .is_some_and(|r| r.state == "open"))
+}
+
+async fn peer_work(State(s): State<PeerApiState>, Query(q): Query<WorkQuery>) -> Response {
+    let form = match q.validate() {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let own_id = match crate::settings::ensure_instance_id(&s.pool).await {
+        Ok(id) => id,
+        Err(e) => {
+            error!(error = %e, "peer work: reading the instance id failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "instance id unavailable").into_response();
+        }
+    };
+    match work_doc(&s.pool, &own_id, &form).await {
+        Ok(doc) => Json(doc).into_response(),
+        Err(e) => {
+            error!(query = ?form, error = %e, "peer work: answering the query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "work query failed").into_response()
+        }
+    }
+}
+
+/// The closed set of lifecycle events a notice carries (`SPEC-3.17.21`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleEvent {
+    PickupStarted,
+    PrOpened,
+    Outcome,
+    Requeued,
+    CeilingReached,
+    Cancelled,
+}
+
+impl LifecycleEvent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LifecycleEvent::PickupStarted => "pickup_started",
+            LifecycleEvent::PrOpened => "pr_opened",
+            LifecycleEvent::Outcome => "outcome",
+            LifecycleEvent::Requeued => "requeued",
+            LifecycleEvent::CeilingReached => "ceiling_reached",
+            LifecycleEvent::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "pickup_started" => LifecycleEvent::PickupStarted,
+            "pr_opened" => LifecycleEvent::PrOpened,
+            "outcome" => LifecycleEvent::Outcome,
+            "requeued" => LifecycleEvent::Requeued,
+            "ceiling_reached" => LifecycleEvent::CeilingReached,
+            "cancelled" => LifecycleEvent::Cancelled,
+            _ => return None,
+        })
+    }
+}
+
+/// The body of `POST /api/peer/notify` (`SPEC-3.17.21`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyRequest {
+    pub event: String,
+    pub key: String,
+    pub instance_id: String,
+    pub run_id: i64,
+    pub at: String,
+    pub pr_number: Option<i64>,
+}
+
+/// The reply to a notice: whether it was new.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyResponse {
+    pub stored: bool,
+}
+
+async fn peer_notify(State(s): State<PeerApiState>, Json(req): Json<NotifyRequest>) -> Response {
+    if LifecycleEvent::parse(&req.event).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("unknown lifecycle event `{}`", req.event),
+        )
+            .into_response();
+    }
+    if req.key.is_empty() || req.instance_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "key and instance_id are required").into_response();
+    }
+    let row = crate::state::PeerWorkEvent {
+        instance_id: req.instance_id.clone(),
+        run_id: req.run_id,
+        event: req.event.clone(),
+        key: req.key.clone(),
+        pr_number: req.pr_number,
+        at: req.at.clone(),
+        received_at: crate::state::now_iso(),
+    };
+    match crate::state::peer_work_event_insert(&s.pool, &row).await {
+        Ok(stored) => Json(NotifyResponse { stored }).into_response(),
+        Err(e) => {
+            error!(peer = %req.instance_id, key = %req.key, event = %req.event, error = %e, "peer notify: storing the notice failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "notice not stored").into_response()
+        }
+    }
+}
+
 /// What the webhook pipeline does with a delivery after the claim step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimDecision {
@@ -1309,6 +1679,9 @@ pub struct PeerClaims {
     registry: PeerRegistry,
     client: reqwest::Client,
     dispatched: DispatchedClaims,
+    /// Resolves an Action-run delivery's commit to its open PR (`SPEC-3.17.18`). `None` where the host
+    /// has no usable forge backend, in which case that ownership check is skipped and logged.
+    forge: Option<Arc<dyn crate::provider::Forge>>,
 }
 
 impl PeerClaims {
@@ -1319,7 +1692,14 @@ impl PeerClaims {
             registry,
             client: reqwest::Client::new(),
             dispatched: DispatchedClaims::default(),
+            forge: None,
         }
+    }
+
+    /// Give the claim step the forge it resolves an Action-run delivery's commit through (`SPEC-3.17.18`).
+    pub fn with_forge(mut self, forge: Arc<dyn crate::provider::Forge>) -> Self {
+        self.forge = Some(forge);
+        self
     }
 
     /// The handle the peer API uses to refuse a claim for an event this
@@ -1522,6 +1902,339 @@ impl PeerClaims {
     }
 }
 
+/// What an incoming event says about a PR, for the ownership check (`SPEC-3.17.18`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventPr {
+    /// A pull-request delivery, or a comment delivery on a PR: named by number.
+    Number(i64),
+    /// An Action-run delivery: named only by its commit.
+    Commit(String),
+    /// An event naming no PR, such as a comment on a plain issue.
+    None,
+}
+
+/// What a pickup does after asking its peers (`SPEC-3.17.16` and `SPEC-3.17.17`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickupVerdict {
+    /// No peer objects. `adopt` carries a peer's open PR, which the pickup continues.
+    Proceed { adopt: Option<(String, WorkPr)> },
+    /// A peer owns the work or won the claim: leave the issue as it is.
+    Defer { peer: String, reason: String },
+}
+
+impl PeerClaims {
+    /// The reachable peers with their resolved tokens; empty while peering is disabled or no peer is
+    /// reachable, in which case no call is made (`SPEC-3.17.2`).
+    async fn reachable_targets(
+        &self,
+    ) -> (
+        PeersConfig,
+        Vec<(PeerConfig, std::result::Result<String, String>)>,
+    ) {
+        let cfg = self.cfg.read().await.clone();
+        let peers = self.registry.reachable_peers(&cfg, Utc::now());
+        let mut out = Vec::new();
+        for p in peers {
+            let token = resolve_token(&self.pool, &p.token_ref).await;
+            out.push((p, token));
+        }
+        (cfg, out)
+    }
+
+    /// `SPEC-3.17.14`: ask every reachable peer the same work query, each bounded by
+    /// `claim_timeout_secs`. A peer that fails is bypassed (`SPEC-3.17.13`): logged at `warn`, counted,
+    /// never retried. Returns each answering peer's name and document.
+    pub async fn query_work(&self, q: &WorkQuery) -> Vec<(String, WorkDoc)> {
+        let (cfg, targets) = self.reachable_targets().await;
+        let timeout = Duration::from_secs(cfg.claim_timeout_secs);
+        let mut set = tokio::task::JoinSet::new();
+        for (p, token) in targets {
+            let client = self.client.clone();
+            let q = q.clone();
+            set.spawn(async move {
+                let outcome = match token {
+                    Ok(t) => fetch_work(&client, &p, &t, &q, timeout).await,
+                    Err(e) => Err(format!(
+                        "token_ref `{}` could not be resolved: {e}",
+                        p.token_ref
+                    )),
+                };
+                (p.name, outcome)
+            });
+        }
+        let mut answers = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((name, Ok(doc))) => answers.push((name, doc)),
+                Ok((name, Err(e))) => {
+                    warn!(peer = %name, query = ?q, error = %e, "peer work query bypassed: the peer did not answer");
+                    self.registry.record_bypass(&name, Utc::now());
+                }
+                Err(e) => error!(error = %e, "a peer work query task panicked or was cancelled"),
+            }
+        }
+        answers.sort_by(|a, b| a.0.cmp(&b.0));
+        answers
+    }
+
+    /// `SPEC-3.17.21`: send a lifecycle notice to every reachable peer, after the event is durable
+    /// locally. Bounded, never retried; a peer that fails is logged at `warn` and counted.
+    pub async fn notify(
+        &self,
+        event: LifecycleEvent,
+        key: &str,
+        run_id: i64,
+        pr_number: Option<i64>,
+    ) {
+        let (cfg, targets) = self.reachable_targets().await;
+        if targets.is_empty() {
+            return;
+        }
+        let own_id = match crate::settings::ensure_instance_id(&self.pool).await {
+            Ok(id) => id,
+            Err(e) => {
+                error!(key, event = event.as_str(), error = %e, "peer notice not sent: reading the instance id failed");
+                return;
+            }
+        };
+        let req = NotifyRequest {
+            event: event.as_str().to_string(),
+            key: key.to_string(),
+            instance_id: own_id,
+            run_id,
+            at: Utc::now().to_rfc3339(),
+            pr_number,
+        };
+        let timeout = Duration::from_secs(cfg.claim_timeout_secs);
+        let mut set = tokio::task::JoinSet::new();
+        for (p, token) in targets {
+            let client = self.client.clone();
+            let req = req.clone();
+            set.spawn(async move {
+                let outcome = match token {
+                    Ok(t) => send_notice(&client, &p, &t, &req, timeout).await,
+                    Err(e) => Err(format!(
+                        "token_ref `{}` could not be resolved: {e}",
+                        p.token_ref
+                    )),
+                };
+                (p.name, outcome)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((_, Ok(()))) => {}
+                Ok((name, Err(e))) => {
+                    warn!(peer = %name, key, event = event.as_str(), error = %e, "peer notice bypassed: the peer did not answer");
+                    self.registry.record_bypass(&name, Utc::now());
+                }
+                Err(e) => error!(error = %e, "a peer notice task panicked or was cancelled"),
+            }
+        }
+    }
+
+    /// `SPEC-3.17.16` and `SPEC-3.17.17`: before a pickup writes `Working`, ask the peers about
+    /// `key`, then take the pickup claim. `queued_at` is the time the `Queued` value was written;
+    /// `None` skips the claim (logged), since its key cannot be built.
+    pub async fn pickup_gate(&self, key: &str, queued_at: Option<&str>) -> PickupVerdict {
+        let answers = self.query_work(&WorkQuery::by_key(key)).await;
+        for (peer, doc) in &answers {
+            if let Some(run) = &doc.run {
+                info!(key, peer = %peer, peer_run_id = run.run_id, "pickup deferred: a peer has a live run for this issue");
+                return PickupVerdict::Defer {
+                    peer: peer.clone(),
+                    reason: format!("live run {} on that peer", run.run_id),
+                };
+            }
+        }
+        let adopt = answers.iter().find_map(|(peer, doc)| {
+            doc.pr
+                .as_ref()
+                .filter(|pr| pr.state == "open")
+                .map(|pr| (peer.clone(), pr.clone()))
+        });
+        let Some(queued_at) = queued_at else {
+            warn!(
+                key,
+                "pickup claim skipped: the time the Queued value was written is unknown"
+            );
+            return PickupVerdict::Proceed { adopt };
+        };
+        let event_key = format!("youtrack:{key}:pickup:{queued_at}");
+        match self
+            .claim(Some(&event_key), "pickup", "youtrack", key)
+            .await
+        {
+            ClaimDecision::Drop { holder } => {
+                info!(key, holder = %holder, "pickup deferred: a peer holds the pickup claim");
+                PickupVerdict::Defer {
+                    peer: holder,
+                    reason: "the pickup claim is held by that instance".to_string(),
+                }
+            }
+            ClaimDecision::Proceed => PickupVerdict::Proceed { adopt },
+        }
+    }
+
+    /// `SPEC-3.17.18`: the peer that owns the PR `host`/`repo`#`number`, when this instance does not.
+    /// `None` when this instance owns it, no reachable peer does, or no peer is reachable.
+    pub async fn pr_owner_elsewhere(&self, host: &str, repo: &str, number: i64) -> Option<String> {
+        match owns_pr(&self.pool, host, repo, number).await {
+            Ok(true) => return None,
+            Ok(false) => {}
+            Err(e) => {
+                error!(host, repo, pr = number, error = %e, "ownership check skipped: reading the local agent PR failed");
+                return None;
+            }
+        }
+        self.query_work(&WorkQuery::by_pr(host, repo, number))
+            .await
+            .into_iter()
+            .find(|(_, d)| d.pr.as_ref().is_some_and(|p| p.state == "open"))
+            .map(|(peer, _)| peer)
+    }
+
+    /// `SPEC-3.17.18`: the peer that owns the PR an incoming event names, when this instance does not.
+    /// A commit names its PR through the forge's open PRs; a failed read is logged at `warn` naming the
+    /// repository and `label` (the run index) and skips the check, as does no match.
+    pub async fn peer_owner_of_event(
+        &self,
+        host: &str,
+        repo: &str,
+        pr: &EventPr,
+        label: &str,
+    ) -> Option<String> {
+        let number = match pr {
+            EventPr::None => return None,
+            EventPr::Number(n) => *n,
+            EventPr::Commit(sha) => {
+                // No reachable peer means nobody else can own it: skip the forge read.
+                let cfg = self.cfg.read().await.clone();
+                if self.registry.reachable_peers(&cfg, Utc::now()).is_empty() {
+                    return None;
+                }
+                let Some(forge) = self.forge.clone() else {
+                    info!(
+                        repo,
+                        label,
+                        "ownership check skipped: no forge backend to resolve the commit to a PR"
+                    );
+                    return None;
+                };
+                let (h, r) = (host.to_string(), repo.to_string());
+                let listed = match tokio::task::spawn_blocking(move || forge.list_open_prs(&h, &r))
+                    .await
+                {
+                    Ok(res) => res,
+                    Err(e) => {
+                        error!(repo, label, error = %e, "ownership check skipped: the open-PR read task panicked");
+                        return None;
+                    }
+                };
+                match listed {
+                    Ok(prs) => match prs
+                        .iter()
+                        .find(|p| !p.head_sha.is_empty() && p.head_sha == *sha)
+                    {
+                        Some(p) => p.number as i64,
+                        None => {
+                            info!(repo, label, commit = %sha, "ownership check skipped: no open PR has this commit as its head");
+                            return None;
+                        }
+                    },
+                    Err(e) => {
+                        warn!(repo, label, error = %e, "ownership check skipped: reading the open PRs failed");
+                        return None;
+                    }
+                }
+            }
+        };
+        self.pr_owner_elsewhere(host, repo, number).await
+    }
+
+    /// `SPEC-3.17.19`: the runs a peer's fresh snapshot lists for `key` that have not been reported
+    /// yet, each logged at `error` once. The caller comments once on the issue per returned run.
+    pub async fn new_duplicates(&self, key: &str, own_run_id: i64) -> Vec<(String, i64)> {
+        let cfg = self.cfg.read().await.clone();
+        let own_id = match crate::settings::ensure_instance_id(&self.pool).await {
+            Ok(id) => id,
+            Err(e) => {
+                error!(key, error = %e, "duplicate check skipped: reading the instance id failed");
+                return Vec::new();
+            }
+        };
+        let mut fresh = Vec::new();
+        for (peer, peer_instance, peer_run) in
+            self.registry.live_peer_runs_for_key(&cfg, key, Utc::now())
+        {
+            let dedupe = format!("{key}:{own_id}:{own_run_id}:{peer_instance}:{peer_run}");
+            if self.registry.record_duplicate(&peer, &dedupe, Utc::now()) {
+                error!(
+                    key,
+                    own_instance = %own_id,
+                    own_run_id,
+                    peer = %peer,
+                    peer_instance = %peer_instance,
+                    peer_run_id = peer_run,
+                    "duplicate run: a reachable peer has a live run for the issue this instance is working"
+                );
+                fresh.push((peer, peer_run));
+            }
+        }
+        fresh
+    }
+}
+
+/// One bounded `GET <url>/api/peer/work`.
+async fn fetch_work(
+    client: &reqwest::Client,
+    peer: &PeerConfig,
+    token: &str,
+    q: &WorkQuery,
+    timeout: Duration,
+) -> std::result::Result<WorkDoc, String> {
+    let url = format!("{}/api/peer/work", peer.url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .timeout(timeout)
+        .query(q)
+        .send()
+        .await
+        .map_err(|e| format!("request to {url} failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("{url} answered {status}"));
+    }
+    resp.json::<WorkDoc>()
+        .await
+        .map_err(|e| format!("{url} returned an undecodable body: {e}"))
+}
+
+/// One bounded `POST <url>/api/peer/notify`.
+async fn send_notice(
+    client: &reqwest::Client,
+    peer: &PeerConfig,
+    token: &str,
+    req: &NotifyRequest,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    let url = format!("{}/api/peer/notify", peer.url.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .bearer_auth(token)
+        .timeout(timeout)
+        .json(req)
+        .send()
+        .await
+        .map_err(|e| format!("request to {url} failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("{url} answered {status}"));
+    }
+    Ok(())
+}
+
 /// One bounded `POST <url>/api/peer/claim`.
 async fn send_claim(
     client: &reqwest::Client,
@@ -1704,6 +2417,10 @@ mod tests {
                     action: (*a).into(),
                     job_key: (*k).into(),
                     started_at: "2026-01-01T00:00:00Z".into(),
+                    run_id: 1,
+                    stage: Some("initial".into()),
+                    branch: None,
+                    pr_number: None,
                 })
                 .collect(),
         }
@@ -2425,6 +3142,502 @@ mod tests {
                 .unwrap()
                 .status(),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    // ---- SPEC-3.17.13 through SPEC-3.17.22: work, ownership and status exchange ----
+
+    /// A live run for `key` on `n`, with its stage set: what `process_job` leaves in flight.
+    async fn seed_live_run(n: &Node, key: &str) -> i64 {
+        let run = crate::state::run_begin(&n.pool, "act", "scheduler")
+            .await
+            .unwrap();
+        crate::state::run_inflight_add(&n.pool, run, key, "PROJ")
+            .await
+            .unwrap();
+        crate::state::run_inflight_set_stage(&n.pool, run, key, "initial")
+            .await
+            .unwrap();
+        run
+    }
+
+    /// An `open` agent PR for `key` on `n`, carrying `fix_attempts`.
+    async fn seed_pr(n: &Node, key: &str, number: i64, branch: &str, fix_attempts: i64) {
+        let now = crate::state::now_iso();
+        let id = crate::ci_failure::store::record_agent_pr(
+            &n.pool,
+            "yt",
+            key,
+            "dev.example",
+            "o/r",
+            number,
+            branch,
+            "open",
+            false,
+            &now,
+        )
+        .await
+        .unwrap();
+        crate::ci_failure::store::set_fix_attempts(&n.pool, id, fix_attempts, &now)
+            .await
+            .unwrap();
+    }
+
+    async fn get_status(url: &str, token: &str) -> u16 {
+        reqwest::Client::new()
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    #[test]
+    fn a_work_query_is_the_key_form_or_the_pr_form_and_nothing_else() {
+        assert_eq!(
+            WorkQuery::by_key("PROJ-1").validate(),
+            Ok(WorkForm::Key("PROJ-1".into()))
+        );
+        assert_eq!(
+            WorkQuery::by_pr("h", "o/r", 7).validate(),
+            Ok(WorkForm::PrNumber {
+                host: "h".into(),
+                repo: "o/r".into(),
+                number: 7
+            })
+        );
+        let by_branch = WorkQuery {
+            host: Some("h".into()),
+            repo: Some("o/r".into()),
+            branch: Some("feat/x".into()),
+            ..WorkQuery::default()
+        };
+        assert_eq!(
+            by_branch.validate(),
+            Ok(WorkForm::PrBranch {
+                host: "h".into(),
+                repo: "o/r".into(),
+                branch: "feat/x".into()
+            })
+        );
+        let both = WorkQuery {
+            pr: Some(7),
+            ..by_branch.clone()
+        };
+        let key_and_pr = WorkQuery {
+            key: Some("PROJ-1".into()),
+            ..WorkQuery::by_pr("h", "o/r", 7)
+        };
+        let no_repo = WorkQuery {
+            host: Some("h".into()),
+            pr: Some(7),
+            ..WorkQuery::default()
+        };
+        for bad in [WorkQuery::default(), both, key_and_pr, no_repo] {
+            assert!(bad.validate().is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_work_endpoint_refuses_a_bad_query_shape_with_400() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (_a, b) = pair(0, 0).await;
+        for q in [
+            "",
+            "?host=h&repo=o/r",
+            "?key=PROJ-1&host=h&repo=o/r&pr=7",
+            "?host=h&repo=o/r&pr=7&branch=x",
+        ] {
+            let status = get_status(&format!("{}/api/peer/work{q}", b.addr), &b.token).await;
+            assert_eq!(status, 400, "query {q:?}");
+        }
+        let ok = get_status(&format!("{}/api/peer/work?key=PROJ-1", b.addr), &b.token).await;
+        assert_eq!(ok, 200);
+        let unauth = get_status(&format!("{}/api/peer/work?key=PROJ-1", b.addr), "wrong").await;
+        assert_eq!(unauth, 401, "the work endpoint needs the peer credential");
+    }
+
+    #[tokio::test]
+    async fn a_peer_answers_the_work_query_by_key_pr_number_and_branch() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (a, b) = pair(0, 0).await;
+        let run = seed_live_run(&b, "PROJ-1").await;
+        seed_pr(&b, "PROJ-1", 7, "feat/x", 2).await;
+
+        for q in [
+            WorkQuery::by_key("PROJ-1"),
+            WorkQuery::by_pr("dev.example", "o/r", 7),
+            WorkQuery {
+                host: Some("dev.example".into()),
+                repo: Some("o/r".into()),
+                branch: Some("feat/x".into()),
+                ..WorkQuery::default()
+            },
+        ] {
+            let answers = a.claims.query_work(&q).await;
+            assert_eq!(answers.len(), 1, "{q:?}");
+            let (peer, doc) = &answers[0];
+            assert_eq!(peer, "b");
+            assert_eq!(doc.instance_id, b.id);
+            assert_eq!(doc.key.as_deref(), Some("PROJ-1"), "{q:?}");
+            let r = doc.run.as_ref().expect("a live run");
+            assert_eq!((r.run_id, r.stage.as_deref()), (run, Some("initial")));
+            let pr = doc.pr.as_ref().expect("an open PR");
+            assert_eq!(
+                (pr.number, pr.branch.as_str(), pr.fix_attempts),
+                (7, "feat/x", 2)
+            );
+            assert_eq!(pr.state, "open");
+        }
+
+        let unknown = a.claims.query_work(&WorkQuery::by_key("PROJ-404")).await;
+        let doc = &unknown[0].1;
+        assert!(doc.run.is_none() && doc.pr.is_none() && doc.last_outcome.is_none());
+        let unknown_pr = a
+            .claims
+            .query_work(&WorkQuery::by_pr("dev.example", "o/r", 99))
+            .await;
+        assert_eq!(unknown_pr[0].1.key, None, "no record: no key");
+    }
+
+    #[tokio::test]
+    async fn a_pickup_is_deferred_while_a_reachable_peer_has_a_live_run() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (a, b) = pair(0, 0).await;
+        let run = seed_live_run(&b, "PROJ-1").await;
+        match a.claims.pickup_gate("PROJ-1", Some("t0")).await {
+            PickupVerdict::Defer { peer, reason } => {
+                assert_eq!(peer, "b");
+                assert!(reason.contains(&run.to_string()), "{reason}");
+            }
+            other => panic!("expected a deferral, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peers_open_pr_with_no_live_run_is_offered_for_adoption() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (a, b) = pair(0, 0).await;
+        seed_pr(&b, "PROJ-1", 7, "feat/x", 2).await;
+        match a.claims.pickup_gate("PROJ-1", Some("t0")).await {
+            PickupVerdict::Proceed {
+                adopt: Some((peer, pr)),
+            } => {
+                assert_eq!(peer, "b");
+                assert_eq!((pr.number, pr.fix_attempts), (7, 2));
+            }
+            other => panic!("expected adoption, got {other:?}"),
+        }
+        let none = a.claims.pickup_gate("PROJ-2", Some("t0")).await;
+        assert_eq!(none, PickupVerdict::Proceed { adopt: None });
+    }
+
+    #[tokio::test]
+    async fn a_pickup_claim_held_by_a_peer_defers_the_pickup() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (a, b) = pair(0, 0).await;
+        let key = "youtrack:PROJ-9:pickup:t0";
+        assert!(proceeds(
+            &b.claims
+                .claim(Some(key), "pickup", "youtrack", "PROJ-9")
+                .await
+        ));
+        match a.claims.pickup_gate("PROJ-9", Some("t0")).await {
+            PickupVerdict::Defer { peer, .. } => assert_eq!(peer, b.id),
+            other => panic!("expected the claim to defer the pickup, got {other:?}"),
+        }
+        // A later Queued write is a new pickup key: it is not refused by the old claim.
+        assert_eq!(
+            a.claims.pickup_gate("PROJ-9", Some("t1")).await,
+            PickupVerdict::Proceed { adopt: None }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_peer_is_bypassed_logged_and_counted() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let a = node("a", 0).await;
+        // A peer whose last pull succeeded but whose port answers nothing now.
+        a.cfg
+            .write()
+            .await
+            .peers
+            .push(peer("ghost", "http://127.0.0.1:9"));
+        let key = crate::secrets::SecretsKey::load().unwrap();
+        crate::state::secret_create(&a.pool, "ghost-token", &key.encrypt("t").unwrap())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        a.registry
+            .record("ghost", &a.id, Ok(doc("ghost-id", &[], now)), now, 120);
+
+        let answers = a.claims.query_work(&WorkQuery::by_key("PROJ-1")).await;
+        assert!(answers.is_empty(), "the failed peer gives no answer");
+        let cfg = a.cfg.read().await.clone();
+        let rows = a.registry.rows(&cfg, Utc::now());
+        assert_eq!(
+            rows[0].claims_bypassed, 1,
+            "the bypass is counted for the Status page"
+        );
+        assert_eq!(
+            a.claims.pickup_gate("PROJ-1", Some("t0")).await,
+            PickupVerdict::Proceed { adopt: None },
+            "a peer that does not answer never blocks a pickup"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_peering_makes_no_call_and_writes_nothing() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (a, b) = pair(0, 0).await;
+        a.cfg.write().await.enabled = false;
+        seed_live_run(&b, "PROJ-1").await;
+        assert!(a
+            .claims
+            .query_work(&WorkQuery::by_key("PROJ-1"))
+            .await
+            .is_empty());
+        assert_eq!(
+            a.claims.pickup_gate("PROJ-1", Some("t0")).await,
+            PickupVerdict::Proceed { adopt: None }
+        );
+        a.claims
+            .notify(LifecycleEvent::PickupStarted, "PROJ-1", 1, None)
+            .await;
+        assert!(crate::state::peer_work_events_recent(&b.pool, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            crate::state::peer_claim_get(&a.pool, "youtrack:PROJ-1:pickup:t0")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_notice_is_stored_once_and_an_unknown_event_is_refused() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (a, b) = pair(0, 0).await;
+        a.claims
+            .notify(LifecycleEvent::PrOpened, "PROJ-1", 5, Some(7))
+            .await;
+        a.claims
+            .notify(LifecycleEvent::PrOpened, "PROJ-1", 5, Some(7))
+            .await;
+        a.claims
+            .notify(LifecycleEvent::Outcome, "PROJ-1", 5, None)
+            .await;
+        let rows = crate::state::peer_work_events_recent(&b.pool, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "idempotent per (instance, run, event): {rows:?}"
+        );
+        assert!(rows
+            .iter()
+            .all(|r| r.instance_id == a.id && r.run_id == 5 && r.key == "PROJ-1"));
+        assert!(rows
+            .iter()
+            .any(|r| r.event == "pr_opened" && r.pr_number == Some(7)));
+
+        let resp = reqwest::Client::new()
+            .post(format!("{}/api/peer/notify", b.addr))
+            .bearer_auth(&b.token)
+            .json(&serde_json::json!({
+                "event": "exploded", "key": "PROJ-1", "instance_id": a.id,
+                "run_id": 5, "at": "t", "pr_number": null
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400);
+        assert_eq!(
+            crate::state::peer_work_events_recent(&b.pool, 10)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "a refused notice stores nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pr_a_peer_owns_is_reported_and_one_this_instance_owns_is_not() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (a, b) = pair(0, 0).await;
+        seed_pr(&b, "PROJ-1", 7, "feat/x", 0).await;
+        assert_eq!(
+            a.claims.pr_owner_elsewhere("dev.example", "o/r", 7).await,
+            Some("b".to_string())
+        );
+        assert_eq!(
+            b.claims.pr_owner_elsewhere("dev.example", "o/r", 7).await,
+            None,
+            "the owner handles its own event"
+        );
+        assert_eq!(
+            a.claims.pr_owner_elsewhere("dev.example", "o/r", 99).await,
+            None,
+            "a PR nobody records is claimed as before"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_action_run_commit_is_matched_to_its_open_pr_through_the_forge() {
+        use crate::provider::cli::testutil::StubRunner;
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (a, b) = pair(0, 0).await;
+        seed_pr(&b, "PROJ-1", 7, "feat/x", 0).await;
+        let args = [
+            "--host",
+            "dev.example",
+            "pr",
+            "search",
+            "--repo",
+            "o/r",
+            "--state",
+            "open",
+            "--json",
+        ];
+        let json = r#"{"total_count":1,"pull_requests":[{"number":7,"head_sha":"abc123","head_ref":"feat/x"}]}"#;
+        let forge: Arc<dyn crate::provider::Forge> =
+            Arc::new(crate::provider::cli::CliBackend::new(Arc::new(
+                StubRunner::new().ok("fj", &args, json),
+            )));
+        let claims = a.claims.clone().with_forge(forge);
+
+        let owned = claims
+            .peer_owner_of_event(
+                "dev.example",
+                "o/r",
+                &EventPr::Commit("abc123".into()),
+                "run 1",
+            )
+            .await;
+        assert_eq!(owned, Some("b".to_string()));
+        let no_match = claims
+            .peer_owner_of_event(
+                "dev.example",
+                "o/r",
+                &EventPr::Commit("zzz".into()),
+                "run 2",
+            )
+            .await;
+        assert_eq!(
+            no_match, None,
+            "no open PR has this commit: the claim goes on"
+        );
+        assert_eq!(
+            claims
+                .peer_owner_of_event("dev.example", "o/r", &EventPr::None, "comment 3")
+                .await,
+            None
+        );
+        // Without a forge the commit cannot be resolved: skipped, not guessed.
+        assert_eq!(
+            a.claims
+                .peer_owner_of_event(
+                    "dev.example",
+                    "o/r",
+                    &EventPr::Commit("abc123".into()),
+                    "run 4"
+                )
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reachable_duplicate_is_reported_once_and_counted() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let (a, b) = pair(0, 0).await;
+        let now = Utc::now();
+        a.registry.record(
+            "b",
+            &a.id,
+            Ok(doc(&b.id, &[("act", "PROJ-1")], now)),
+            now,
+            120,
+        );
+        assert_eq!(
+            a.claims.new_duplicates("PROJ-1", 3).await,
+            vec![("b".to_string(), 1)]
+        );
+        assert!(
+            a.claims.new_duplicates("PROJ-1", 3).await.is_empty(),
+            "the same pair is reported once"
+        );
+        assert!(a.claims.new_duplicates("PROJ-2", 3).await.is_empty());
+        let cfg = a.cfg.read().await.clone();
+        let rows = a.registry.rows(&cfg, Utc::now());
+        assert_eq!(rows[0].duplicates, 1);
+        assert_eq!(
+            rows[0].in_flight_jobs.as_ref().map(Vec::len),
+            Some(1),
+            "the Status page lists the peer's in-flight job"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_carries_the_run_stage_branch_and_pr() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        set_key_file(tmp.path()).await;
+        let b = node("b", 0).await;
+        let run = seed_live_run(&b, "PROJ-1").await;
+        crate::state::run_inflight_set_pr(&b.pool, run, "PROJ-1", "feat/x", 7)
+            .await
+            .unwrap();
+        let body: PeerStateDoc = reqwest::Client::new()
+            .get(format!("{}/api/peer/state", b.addr))
+            .bearer_auth(&b.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let e = body
+            .in_flight
+            .iter()
+            .find(|e| e.job_key == "PROJ-1")
+            .unwrap();
+        assert_eq!(
+            (
+                e.run_id,
+                e.stage.as_deref(),
+                e.branch.as_deref(),
+                e.pr_number
+            ),
+            (run, Some("initial"), Some("feat/x"), Some(7))
         );
     }
 }

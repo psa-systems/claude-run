@@ -385,3 +385,11 @@ is built from payload fields identical across hook targets (run index and outcom
 or comment id), never the delivery id. A peer that times out, errors or answers garbage is bypassed: the event is
 processed, a `warn` log names the peer and key, and the Status page counts the bypass per peer for 24 hours. A paused
 instance drops without claiming, so its peer takes the event. `SPEC-3.17.8` is the contract.
+
+An event that names a PR is first checked against the PR's owner (`SPEC-3.17.18`). A pull-request delivery names its PR
+by number, a comment delivery on a PR by its issue number, and an Action-run delivery by its commit, which is matched
+against the head commit of the repository's open PRs through the forge. If this instance does not own the PR (it has no
+`open` `agent_pull_requests` row for it) and a `reachable` peer does, the delivery is dropped with `200` and an `info`
+log naming the owner, with no claim taken: the owner handles it through its own hook target, and a delivery the owner
+never received waits for the next event. A failed forge read, no matching PR, or an unreachable peer goes on to the
+claim, logged. A comment on a plain issue skips the check.

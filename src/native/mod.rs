@@ -72,6 +72,9 @@ pub struct NativeContext<'a> {
     /// handler starts. A handler bills every `claude` invocation against it,
     /// checks it before each pickup, and finalizes it with its run's exit code.
     pub spend: crate::usage::RunSpend,
+    /// SPEC-3.17.13 through SPEC-3.17.22: the peer handle a pickup asks and a run notifies through.
+    /// `None` when the run has no peer layer (a standalone `claude-run run`).
+    pub peers: Option<crate::peer::PeerClaims>,
 }
 
 /// Boxed future returned by a [`NativeHandler`]. Hand-rolled (rather than

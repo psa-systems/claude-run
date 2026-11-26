@@ -398,6 +398,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         let job_pause = run_pause.clone();
         let job_audit = audit.clone();
         let job_spend = ctx.spend.clone();
+        let job_peers = ctx.peers.clone();
         let fut: crate::concurrency::JobFuture = Box::pin(async move {
             let action = &loaded.action;
             // Best-effort cap/budget check before launch; bounded
@@ -496,6 +497,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                 pr_strategy,
                 bypass_backoff,
                 run_id,
+                job_peers.as_ref(),
             )
             .await;
             if let Err(e) = state::run_inflight_remove(&pool, run_id, &job.key).await {
@@ -523,6 +525,12 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
             }
             let outcome = outcome?;
             record_outcome(loaded.as_ref(), &paths, &pool, run_id, &outcome).await?;
+            // SPEC-3.17.21: the outcome is durable, so tell the peers.
+            if let (Some(peers), ProcessedJob::Done { key, .. }) = (job_peers.as_ref(), &outcome) {
+                peers
+                    .notify(crate::peer::LifecycleEvent::Outcome, key, run_id, None)
+                    .await;
+            }
             Ok::<bool, crate::error::Error>(true)
         });
         items.push((gate_key, fut));
@@ -1492,6 +1500,8 @@ async fn process_job(
     // record; the job itself already threads `run_id` through the calling
     // scheduler loop for `run_inflight_add`/`run_inflight_remove`.
     run_id: i64,
+    // SPEC-3.17.13 through SPEC-3.17.22: the peer handle; `None` where there is no peer layer.
+    peers: Option<&crate::peer::PeerClaims>,
 ) -> Result<ProcessedJob> {
     let started = Instant::now();
     let started_wall = chrono::Utc::now();
@@ -1510,6 +1520,11 @@ async fn process_job(
             crate::attempt_steps::stage_for_attempt(attempts + 1)
         }
     };
+    // SPEC-3.17.20: peers read the stage from the in-flight snapshot. A failed write is logged and the
+    // run goes on, since the snapshot only loses a field.
+    if let Err(e) = state::run_inflight_set_stage(pool, run_id, key, stage).await {
+        warn!(action = %action.name, key = %key, error = %e, "recording the attempt stage for the peer snapshot failed");
+    }
     // A scheduler pickup is the AI Agent = Queued pickup; any
     // other origin (`bypass_backoff`) is an operator-initiated run.
     let trigger = if bypass_backoff {
@@ -1684,6 +1699,42 @@ async fn process_job(
         }
     }
 
+    // ---- peer gate (SPEC-3.17.16 and SPEC-3.17.17) ----
+    // A reachable peer with a live run for this issue, or the pickup claim held by a peer, leaves the
+    // issue as it is: no attempt, nothing cloned. A peer's open PR with no live run is adopted so the
+    // resume lookup below continues its branch instead of starting from the default branch. Peers that
+    // do not answer are bypassed inside `pickup_gate`, so this never waits beyond `claim_timeout_secs`.
+    if let Some(peers) = peers {
+        let queued_at = match crate::blocking::in_place(|| {
+            backend.field_changed_at(key, &src.custom_field, &src.states.queued)
+        }) {
+            Ok(Some(t)) => Some(t.to_rfc3339()),
+            Ok(None) => {
+                warn!(action = %action.name, key = %key, "the issue history holds no change to the Queued value; the pickup claim is skipped");
+                None
+            }
+            Err(e) => {
+                warn!(action = %action.name, key = %key, error = %e, "reading when the issue was queued failed; the pickup claim is skipped");
+                None
+            }
+        };
+        match peers.pickup_gate(key, queued_at.as_deref()).await {
+            crate::peer::PickupVerdict::Defer { peer, reason } => {
+                info!(action = %action.name, key = %key, peer = %peer, reason = %reason, "a peer owns this issue; job deferred, issue left as it is, no attempt consumed");
+                return Ok(ProcessedJob::PeerDeferred {
+                    key: key.clone(),
+                    peer,
+                });
+            }
+            crate::peer::PickupVerdict::Proceed {
+                adopt: Some((peer, pr)),
+            } => {
+                adopt_peer_pr(pool, &action.name, job, &peer, &pr).await?;
+            }
+            crate::peer::PickupVerdict::Proceed { adopt: None } => {}
+        }
+    }
+
     // ---- resume an existing open PR's branch on a re-queue ----
     // A DB lookup (async) plus, when a record is found, a live confirmation
     // against the forge (sync, so wrapped). Any failure here just means a fresh
@@ -1708,6 +1759,24 @@ async fn process_job(
             None
         }
     };
+
+    // SPEC-3.17.20: a resumed PR is already the run's PR, so the snapshot names its branch and number.
+    if resume.is_some() {
+        match crate::ci_failure::store::agent_pr_for_issue(pool, key).await {
+            Ok(Some(row)) => {
+                if let Err(e) =
+                    state::run_inflight_set_pr(pool, run_id, key, &row.head_branch, row.pr_number)
+                        .await
+                {
+                    warn!(action = %action.name, key = %key, error = %e, "recording the resumed PR for the peer snapshot failed");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(action = %action.name, key = %key, error = %e, "reading the resumed PR for the peer snapshot failed");
+            }
+        }
+    }
 
     // ---- pre-mutation checkpoint: stop before Working ----
     // Checked once more, right before the first mutation of this issue
@@ -1812,6 +1881,25 @@ async fn process_job(
             &mut hook_timing,
         )
     });
+
+    // SPEC-3.17.21: `Working` is written, so tell the peers the pickup started.
+    if pre_result.is_ok() {
+        if let Some(peers) = peers {
+            peers
+                .notify(
+                    crate::peer::LifecycleEvent::PickupStarted,
+                    key,
+                    run_id,
+                    None,
+                )
+                .await;
+        }
+    }
+
+    // SPEC-3.17.19: a peer's snapshot may already show a live run for this issue.
+    if pre_result.is_ok() {
+        report_duplicate_runs(peers, backend, &action.name, key, run_id).await;
+    }
 
     // SPEC-3.14.1 through SPEC-3.14.9: the `clone` row, written the moment the clone ends.
     if let Some((clone_start, clone_end, clone_ok)) = clone_timing {
@@ -1991,6 +2079,7 @@ async fn process_job(
                         stage,
                         !src.repo_tracker_refs,
                         cancel,
+                        peers,
                     )
                 });
                 let invoke_result = claude.invoke(
@@ -2390,6 +2479,8 @@ async fn process_job(
             }
         });
     };
+    // SPEC-3.17.19: a peer may have started on this issue while this run worked; its snapshot says so.
+    report_duplicate_runs(peers, backend, &action.name, key, run_id).await;
     // A split-only attempt that ran to a result finalizes through
     // the split path; a failed run, or one that parked itself with the
     // needs-review marker, takes the ordinary closed outcome table.
@@ -2487,6 +2578,7 @@ async fn process_job(
                 },
             )
             .await;
+            announce_pr(pool, peers, run_id, key, head_branch, *pr_number as i64).await;
         }
     } else if let Some(resume) = resume.as_ref() {
         // A resumed run that finishes successfully clears the salvaged flag
@@ -2561,6 +2653,11 @@ async fn process_job(
             head_branch.as_deref(),
         )
         .await;
+        if resume.is_none() {
+            if let (Some(pr_number), Some(head_branch)) = (pr_number, head_branch.as_deref()) {
+                announce_pr(pool, peers, run_id, key, head_branch, *pr_number as i64).await;
+            }
+        }
     }
     let post_failed = match &finalize_res {
         Ok(Finalized::CodeReview { pr_url, .. }) => {
@@ -2602,6 +2699,14 @@ async fn process_job(
     let skip_attempt = skip_marker.exists() || cancelled || paused_before_claude;
     if skip_attempt {
         info!(action = %action.name, key = %key, cancelled, paused = paused_before_claude, "not counting attempt");
+    }
+    // SPEC-3.17.21: an operator cancel is durable once the run stopped, so tell the peers.
+    if cancelled {
+        if let Some(peers) = peers {
+            peers
+                .notify(crate::peer::LifecycleEvent::Cancelled, key, run_id, None)
+                .await;
+        }
     }
 
     let (ok, mut summary) = record_finalize_outcome(&claude_result, &finalize_res, post_failed);
@@ -2867,6 +2972,104 @@ async fn resolve_pr_resume(
         rec.pr_number, job.key
     ));
     Ok(None)
+}
+
+/// SPEC-3.17.19: when a reachable peer's snapshot lists a live run for `key` that was not reported yet, log
+/// it at `error` (done by [`crate::peer::PeerClaims::new_duplicates`]) and comment once on the issue naming
+/// both runs. Neither run is cancelled. A failed comment is logged at `error`; it is not retried, since the
+/// duplicate stays in the log and on the Status page.
+async fn report_duplicate_runs(
+    peers: Option<&crate::peer::PeerClaims>,
+    backend: &dyn IssueTracker,
+    action_name: &str,
+    key: &str,
+    run_id: i64,
+) {
+    let Some(peers) = peers else {
+        return;
+    };
+    for (peer, peer_run_id) in peers.new_duplicates(key, run_id).await {
+        let body = format!(
+            "Duplicate run: peer `{peer}` also has a live run (run {peer_run_id}) for {key}, while this instance's run {run_id} of `{action_name}` is working it. Neither run was cancelled; cancel one on the instance that runs it."
+        );
+        if let Err(e) = crate::blocking::in_place(|| backend.comment(key, &body)) {
+            error!(action = %action_name, key = %key, peer = %peer, error = %e, "SPEC-3.17.19: commenting the duplicate run on the issue failed");
+        }
+    }
+}
+
+/// SPEC-3.17.20 and SPEC-3.17.21: the run now works on PR `pr_number`: name its branch and number in the
+/// in-flight snapshot and send the `pr_opened` notice. A failed snapshot write is logged; the notice is
+/// sent regardless.
+async fn announce_pr(
+    pool: &DbPool,
+    peers: Option<&crate::peer::PeerClaims>,
+    run_id: i64,
+    key: &str,
+    branch: &str,
+    pr_number: i64,
+) {
+    if let Err(e) = state::run_inflight_set_pr(pool, run_id, key, branch, pr_number).await {
+        warn!(key = %key, pr = pr_number, error = %e, "recording the opened PR for the peer snapshot failed");
+    }
+    if let Some(peers) = peers {
+        peers
+            .notify(
+                crate::peer::LifecycleEvent::PrOpened,
+                key,
+                run_id,
+                Some(pr_number),
+            )
+            .await;
+    }
+}
+
+/// SPEC-3.17.16: record the open PR a peer reports for this issue in this instance's own
+/// `agent_pull_requests`, with the peer's flags and `fix_attempts`, so the resume lookup continues its
+/// branch and no second PR is opened. A PR on another repository, or one already recorded here, is left
+/// as it is. A store failure is an error: starting without the PR would reproduce the duplicate.
+async fn adopt_peer_pr(
+    pool: &DbPool,
+    action_name: &str,
+    job: &YoutrackJob,
+    peer: &str,
+    pr: &crate::peer::WorkPr,
+) -> Result<()> {
+    use crate::ci_failure::store;
+    if pr.repo != job.repo_path {
+        warn!(key = %job.key, peer = %peer, peer_repo = %pr.repo, repo = %job.repo_path, "the PR a peer reports for this issue is on another repository; not adopted");
+        return Ok(());
+    }
+    if store::agent_pr(pool, &pr.host, &pr.repo, pr.number)
+        .await?
+        .is_some()
+    {
+        info!(key = %job.key, peer = %peer, pr = pr.number, "the PR a peer reports is already recorded here");
+        return Ok(());
+    }
+    let now = state::now_iso();
+    let id = store::record_agent_pr(
+        pool,
+        action_name,
+        &job.key,
+        &pr.host,
+        &pr.repo,
+        pr.number,
+        &pr.branch,
+        "open",
+        pr.salvaged,
+        &now,
+    )
+    .await?;
+    store::set_fix_attempts(pool, id, pr.fix_attempts, &now).await?;
+    if pr.ready {
+        store::mark_ready(pool, id, &now).await?;
+    }
+    if pr.failed {
+        store::mark_failed(pool, id, &now).await?;
+    }
+    info!(key = %job.key, peer = %peer, pr = pr.number, branch = %pr.branch, fix_attempts = pr.fix_attempts, "adopted the open PR a peer reports for this issue; the pickup continues its branch");
+    Ok(())
 }
 
 /// Record a freshly opened PR against its issue in the
@@ -3171,6 +3374,8 @@ fn run_checkpoint_watcher(
     // promptly instead of running out the clock after the run is already
     // doomed to Needs Review.
     cancel: &CancellationToken,
+    // SPEC-3.17.20 and SPEC-3.17.21: tells peers when the checkpoint push opens the run's PR.
+    peers: Option<&crate::peer::PeerClaims>,
 ) -> CheckpointOutcome {
     use std::sync::mpsc::RecvTimeoutError;
     let host = host_only(&job.repo_host);
@@ -3267,6 +3472,14 @@ fn run_checkpoint_watcher(
                         )) {
                             Ok(id) => {
                                 let url = pr_url(job, &pr);
+                                pool_handle.block_on(announce_pr(
+                                    pool,
+                                    peers,
+                                    run_id,
+                                    &job.key,
+                                    &head_branch,
+                                    pr_number as i64,
+                                ));
                                 opened = Some(PrResume {
                                     id,
                                     branch: head_branch,
@@ -9202,6 +9415,7 @@ mod tests {
             PrStrategy::Branch,
             false,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -9297,6 +9511,7 @@ mod tests {
             PrStrategy::Branch,
             false,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -9387,6 +9602,7 @@ mod tests {
             PrStrategy::Branch,
             false,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -9558,6 +9774,7 @@ mod tests {
             PrStrategy::Branch,
             false,
             1,
+            None,
         )
         .await;
         let comments = tracker.comments.lock().unwrap();
@@ -9702,6 +9919,7 @@ mod tests {
             PrStrategy::Branch,
             false,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -9812,6 +10030,7 @@ mod tests {
             PrStrategy::Branch,
             false,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -10182,6 +10401,7 @@ mod tests {
             PrStrategy::Branch,
             false,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -10275,6 +10495,7 @@ mod tests {
             PrStrategy::Branch,
             false,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -10372,6 +10593,7 @@ mod tests {
             PrStrategy::Branch,
             false,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -10596,6 +10818,7 @@ mod tests {
                     "initial",
                     false,
                     &cancel,
+                    None,
                 )
             });
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -10688,6 +10911,7 @@ mod tests {
                     "initial",
                     false,
                     &cancel,
+                    None,
                 )
             });
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -10773,6 +10997,7 @@ mod tests {
                     "initial",
                     false,
                     &cancel,
+                    None,
                 )
             });
             std::thread::sleep(Duration::from_millis(30));
@@ -10827,6 +11052,7 @@ mod tests {
                     "initial",
                     false,
                     &cancel,
+                    None,
                 )
             });
             // Wait for the rejecting tick, then leave several more
@@ -10892,6 +11118,7 @@ mod tests {
                     "initial",
                     true,
                     &cancel,
+                    None,
                 )
             });
             // Wait for the watcher to find the hit and cancel (it then
