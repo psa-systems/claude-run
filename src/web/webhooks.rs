@@ -1575,7 +1575,6 @@ async fn triage_and_mint(
     // is the failing-test overlap key the store matches on.
     let failure_signature = crate::mint::failure_signature(&log_text);
     let resolved_branch = crate::forge_log::resolve_branch(None, &log_text);
-    let branch = resolved_branch.clone().unwrap_or_default();
     let infra = crate::infra_failure::detect(&log_text);
     if let Some(f) = &infra {
         info!(
@@ -1658,7 +1657,8 @@ async fn triage_and_mint(
                     .to_string(),
             );
         };
-        if !webhook_cfg.triages_branch(&ev.repo, failed_branch) {
+        let branch = failed_branch.to_string();
+        if !webhook_cfg.triages_branch(&ev.repo, &branch) {
             info!(
                 repo = %ev.repo,
                 run = ev.index_in_repo,
@@ -1754,6 +1754,31 @@ async fn triage_and_mint(
             spend,
         )
         .await;
+    };
+
+    // On the open-PR routes the PR's own head branch is authoritative when
+    // the log has no branch; when neither source has one, the run fails
+    // rather than recording an empty branch.
+    let branch = match resolved_branch
+        .filter(|b| !b.trim().is_empty())
+        .or_else(|| (!pr.head_ref.trim().is_empty()).then(|| pr.head_ref.clone()))
+    {
+        Some(b) => b,
+        None => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, pr = pr.number, "failed run's branch could not be derived from the log or the PR's head ref");
+            record_run_event(
+                &ctx.pool,
+                run_id,
+                WEBHOOK_MINT_ACTION,
+                "error",
+                "failed run's branch could not be derived from the log or the PR's head ref"
+                    .to_string(),
+            )
+            .await;
+            return WebhookRunSummary::error(
+                "branch could not be derived from the log or the PR's head ref".to_string(),
+            );
+        }
     };
 
     let Some(host) = forge_host_from_url(&ev.html_url) else {
@@ -9908,6 +9933,142 @@ mod tests {
         );
         assert_eq!(counting.call_count(), 0);
         assert!(!backend.calls().iter().any(|c| c.starts_with("create")));
+    }
+
+    #[tokio::test]
+    async fn human_pr_failure_with_no_log_branch_uses_pr_head_ref() {
+        // On an open-PR route, a log with no branch falls back to the PR's
+        // own head ref rather than recording an empty branch.
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = crate::db::test_pool().await;
+        setup_write_secret(&pool, tmp.path(), "write-ref", "secret-pat").await;
+
+        let paths = test_paths(tmp.path());
+        let body_file = pr_comment_body_path(&paths, "acme/widgets", 21);
+        let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "comment",
+                "acme/widgets#21",
+                "--body-file",
+                body_file.to_str().unwrap(),
+            ],
+            "",
+        ));
+
+        let open_pr = ForgePullRequest {
+            head_ref: "feat/from-pr-head".to_string(),
+            ..pr(21, "commit-7109")
+        };
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![open_pr]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context_in(
+            pool.clone(),
+            backend.clone(),
+            classifier,
+            tmp.path(),
+            runner.clone(),
+        );
+        let ev = store_event(7109);
+        // No `GITHUB_HEAD_REF` line and no other branch marker: the log alone
+        // cannot resolve a branch.
+        let log = "     Running tests/mod_a.rs (target/debug/deps/mod_a-abc123)\ntest test_one ... FAILED\n".to_string();
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &webhook_cfg_with_write_token(Some("write-ref")),
+            &test_spend(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+
+        let m = ci_failure_store::find_match(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            &["mod_a::test_one".to_string()],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let branches = ci_failure_store::distinct_branches(&pool, m.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            branches,
+            vec!["feat/from-pr-head".to_string()],
+            "the PR's head ref is recorded, not an empty branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_route_failure_with_no_branch_anywhere_fails_the_run() {
+        // When neither the log nor the PR's head ref names a branch, the run
+        // fails with an `error` log instead of recording an empty branch.
+        let pool = crate::db::test_pool().await;
+        // `pr()` already leaves `head_ref` empty.
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(22, "commit-7110")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(7110);
+        let log = "     Running tests/mod_a.rs (target/debug/deps/mod_a-abc123)\ntest mod_a::test_one ... FAILED\n".to_string();
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &webhook_cfg_with_write_token(Some("write-ref")),
+            &test_spend(),
+        )
+        .await;
+        assert!(!result.ok, "{}", result.text);
+        assert!(
+            result.text.contains("branch could not be derived"),
+            "{}",
+            result.text
+        );
+        assert!(!backend.calls().iter().any(|c| c.starts_with("create")));
+
+        let events = state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 10)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.level == "error" && e.message.contains("branch could not be derived")),
+            "a failed run row is recorded: {events:?}"
+        );
+        let m = ci_failure_store::find_match(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            &["mod_a::test_one".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(m.is_none(), "nothing is minted or recorded");
     }
 
     #[tokio::test]
