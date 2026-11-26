@@ -375,7 +375,7 @@ folded into a later prompt, so a script that prints a secret cannot leak it.
   PR whose checks never actually ran. The PR is left at Code Review for the reconciler and webhooks, which read
   again once the real runs exist.
 - Automerge separates a behind-base PR (its branch is simply behind its base, `behind_base: true`) from a real
-  conflict: a green, behind-base PR is updated through the forge's update-branch endpoint, which retriggers CI, and a
+  conflict: when the up-to-date setting (`SPEC-4.4.3`) resolves to `require`, a green, behind-base PR is updated through the forge's update-branch endpoint, which retriggers CI, and a
   later success event re-evaluates and merges once that run goes green; a PR whose checks are green but the forge
   still reports it not mergeable (`mergeable: false`) gets a `/claude` conflict-resolution run, as does a non-WIP
   runner PR whose checks failed and that reports `mergeable: false`; a PR with no run to send is left at Code Review
@@ -511,7 +511,7 @@ Hybrid: a cheap deterministic pass runs first and only the residue it cannot lab
 - `ci_failures` (one row per distinct failure, keyed on `(repo, workflow_id, job_name)`), `ci_failure_tests` (its
   failing-test fingerprint), `ci_failure_runs` (one row per sighting: commit, branch, PR number, timestamp), and
   `agent_pull_requests` (every PR the runner's own `youtrack` action opens, carrying `fix_attempts`, a `salvaged`
-  flag, a `finished` flag and a `failed` flag) replace a YouTrack full-text search for dedupe: an unindexed issue is invisible to that search, and a
+  flag, a `ready` flag and a `failed` flag) replace a YouTrack full-text search for dedupe: an unindexed issue is invisible to that search, and a
   failure every PR inherits from `main` would otherwise mint one issue per PR.
 - The fingerprint is the sorted, deduplicated `<target>::<test>` ids parsed from cargo test output (a target that
   failed to build or run at all, with no parsed test, contributes a bare `<target>` id), or `infra:<kind>` when the
@@ -1478,9 +1478,19 @@ configured for a different provider, or a disabled listener returns 404. Pipelin
   synthetic command to the comment listener (`SPEC-4.4.5`) instead of leaving a "needs a human" comment.
 - An automerge outcome (conflict dispatch, behind-base update/merge, or clean merge) is recorded and its comment
   posted exactly once per decision, guarded against double-posting.
-- A PR whose row is `finished` (`finalize` observed `Finalized::CodeReview`, i.e. the run that owns it
-  already reported success and the PR was promoted to ready) is skipped before any status read: no behind-base
-  branch update, no merge attempt, no comment, on either the webhook decision path or the periodic reconciler.
+- A PR whose row is `ready` (`finalize` observed `Finalized::CodeReview`: the run that owns it reported success and
+  the PR was promoted from draft to ready) stays eligible for automerge on both the webhook decision path and the
+  periodic reconciler. Its CI status is read, and a green, mergeable PR is merged. While CI is pending or failing,
+  automerge posts no comment for it. Only a `salvaged` or `failed` row, or a PR the forge reports as a draft, is
+  excluded from merging.
+- Automerge takes one setting, "Branch must be up to date before automerging", with three values: `match forge`
+  (default), `require` and `don't require`.
+  - `require`: a behind-base PR has its branch updated (once per decision, one comment) and is merged only after it
+    is current.
+  - `don't require`: a green, mergeable PR is merged even when behind base, and automerge never updates its branch.
+  - `match forge`: on Forgejo, the effective value is the base branch's `block_on_outdated_branch`. On GitHub, the
+    rule is not readable through `gh`, so it behaves as `don't require`, and a merge the forge refuses is logged and
+    commented with the forge's reason, never treated as success.
 - A PR whose row is `failed` (`SPEC-3.3.1`: `finalize` ended the run that owns it in `Failed`, a gate failure
   included) is skipped before any status read, on both the webhook decision path and the periodic reconciler: no
   branch update, no conflict-resolution dispatch, no merge, no comment. The skip is logged at `info` naming the
@@ -1631,7 +1641,7 @@ same schema. Pool: 16 connections, 30-second acquire timeout. Timestamps are RFC
 | `secrets` | `name` (unique), age `ciphertext`, `created_at`, `last_used_at` |
 | `api_keys` | Generated peer API keys (`SPEC-4.3.6`): `name` (unique), `key_hash` (unique, SHA-256 hex of the plaintext), `created_at`, `last_used_at` |
 | `ci_failures`, `ci_failure_tests`, `ci_failure_runs` | Failure store: repo, workflow, job, `infra_kind`, `issue_key`, `state`; unique (`failure_id`, `test_id`); run index, commit, branch, PR number |
-| `agent_pull_requests` | Recorded agent PRs: unique (`host`, `repo`, `pr_number`), `issue_key`, `head_branch`, `fix_attempts`, `state`, `salvaged`, `finished`, `failed` |
+| `agent_pull_requests` | Recorded agent PRs: unique (`host`, `repo`, `pr_number`), `issue_key`, `head_branch`, `fix_attempts`, `state`, `salvaged`, `ready`, `failed` |
 | `claude_invocations` | Per-invocation cost, token and rate-limit utilization record |
 | `attempt_steps` | Timed steps of an attempt (`SPEC-3.14`): `run_id`, `job_key`, `attempt`, `seq`, `stage`, `kind`, `label`, `started_at`, `ended_at`, `ok`, `detail`; `job_outcomes` gains `stage` and `outcome` |
 | `run_summaries` | Peered-instance run highlights (`SPEC-3.17` item 9): `run_uuid` (PK), `instance_id`, `seq`, `action_name`, `job_key`, `attempt`, `outcome`, `ok`, `started_at`, `ended_at`, `duration_ms`, `cost_usd`, `timed_out`; own and replicated rows |
