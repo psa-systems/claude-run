@@ -19,7 +19,7 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
     pull-request branch or turns a plain-issue comment into a queued tracker issue.
 
 - **SPEC-1.1.2**: Users are operators of a runner instance. The web UI, the HTTP API and the CLI control a single daemon with a single
-  state store. Several instances may be peered to share liveness, webhook claims and run summaries (`SPEC-3.17.1` through `SPEC-3.17.12`); each
+  state store. Several instances may be peered to share liveness, webhook claims, work ownership, lifecycle notices and run summaries (`SPEC-3.17.1` through `SPEC-3.17.22`); each
   still keeps its own state store.
 
 ### 1.2 Exclusions
@@ -157,7 +157,7 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
   `daily_budget_usd` (5.00), `run_budget_usd`, `budget_warn_fraction`, `max_issues_per_run`, `review_timeout_seconds`
   (1800). `concurrency` has `max_parallel` and a `key` list; two jobs sharing a concurrency key never overlap, across
   scheduled runs and manual triggers. `concurrency.max_ci_in_flight_per_repo` (default 3, `0` disables) caps the runner
-  PRs on one repo with CI pending (`SPEC-3.3.1` through `SPEC-3.3.25`). The key is the literal joined value of those fields, not prefixed by the
+  PRs on one repo with CI pending (`SPEC-3.3.1` through `SPEC-3.3.26`). The key is the literal joined value of those fields, not prefixed by the
   action name, and is held in one process-wide gate: two jobs from *different* actions that resolve to the same key
   value also never overlap, not only two jobs of the same action.
 
@@ -479,9 +479,14 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
 - **SPEC-3.3.24**: A file change a failing check requires is allowed in the diff and is justified in the PR body; the gate checks the
   state of the clone after the agent's own commits, not whether the agent's diff was minimal.
 
-- **SPEC-3.3.25**: The clone's own commit hooks (`SPEC-3.3.1` through `SPEC-3.3.25`'s `just install-hooks` step) already run locally on every commit; the
+- **SPEC-3.3.25**: The clone's own commit hooks (`SPEC-3.3.1` through `SPEC-3.3.26`'s `just install-hooks` step) already run locally on every commit; the
   `pre-push` hook never runs on a runner push (`SPEC-3.3.8` through `SPEC-3.3.19`). This gate is independent of both and runs even when the
   clone has no hooks installed, or the host has no `just install-hooks` recipe to run.
+
+- **SPEC-3.3.26**: A pickup that finds no `agent_pull_requests` row for the issue looks up the issue's deterministic branch
+  (`SPEC-3.3.9`) and its open PR on the forge before choosing a start point. If either exists the run continues it with
+  no second PR. It starts from the default branch only when the forge reports neither. A failed forge read leaves the
+  issue queued, consumes no attempt and is logged at `error` naming the issue key and the repository.
 
 ### 3.4 Closed-issue summary action (`kind: closed-issue-summary`)
 
@@ -710,8 +715,8 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
 - **SPEC-3.8.14**: Rows older than `retention_days` (180), by their stored `ts`, are deleted from `job_outcomes`, `run_events`,
   `ci_failure_runs` and `claude_invocations`. Each pruned table has a single-column index on `ts` so the cutoff
   predicate seeks rather than scans. `run_summaries` rows are pruned the same way by `ended_at`, except that each
-  origin's newest row is kept so the next `seq` never restarts, and `peer_claims` rows after 24 hours by `claimed_at`
-  (`SPEC-3.17.1` through `SPEC-3.17.12`).
+  origin's newest row is kept so the next `seq` never restarts, and `peer_claims` rows after 24 hours by `claimed_at`, and `peer_work_events` rows after 24 hours by `received_at`
+  (`SPEC-3.17.1` through `SPEC-3.17.22`).
 
 - **SPEC-3.8.15**: `ci_failures`, `ci_failure_tests` and `agent_pull_requests` are never pruned by this sweep: a resolved failure or a
   merged PR must still be matchable against a regression months later, so only the per-sighting/per-invocation
@@ -850,7 +855,7 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
    the issue in a daemon that is running, OR the field was set to `Working` recently enough that a run started by a
    DIFFERENT runner instance polling the same tracker query may still legitimately own it (item 2). The runner never
    leaves `Working` behind on any exit path, including a crash, a restart, a kill, a timeout and a cancel. With
-   peered instances (`SPEC-3.17.1` through `SPEC-3.17.12`) the row may also be in a peer's daemon (`SPEC-3.17.7`).
+   peered instances (`SPEC-3.17.1` through `SPEC-3.17.22`) the row may also be in a peer's daemon (`SPEC-3.17.7`).
 
 2. **SPEC-3.12.3**: **Reconcile sweep.** On daemon start and every 300 seconds (the automerge reconciler interval), the runner lists
    issues whose field reads `Working` and which have no in-flight row. `run_inflight_jobs` only knows runs of the
@@ -862,7 +867,7 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
    (`SPEC-3.14.1` through `SPEC-3.14.9`). Each correction is logged at `warn` naming the issue key. A sweep that cannot read the tracker, or
    whose history read fails, is logged at `error` and retried, never treated as "nothing stuck". The startup-only
    path (`run_inflight_jobs` rows left behind by a dead process of THIS daemon) is unaffected by the window: it
-   releases its own issues immediately. With peered instances (`SPEC-3.17.1` through `SPEC-3.17.12`), the sweep also leaves an issue alone
+   releases its own issues immediately. With peered instances (`SPEC-3.17.1` through `SPEC-3.17.22`), the sweep also leaves an issue alone
    when a reachable peer's snapshot lists it in flight, per `SPEC-3.17.7`. The sweep is NOT unconditional:
    `concurrency.stuck_working_sweep` (default `true`, DB-backed, live-applied with no restart) can turn
    it off entirely for a multi-instance, non-clustered deployment, where the safeguards above are best-effort and do
@@ -904,7 +909,7 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
    without a force flag. The pass records a `conflict_resolution` step (`SPEC-3.14.1` through `SPEC-3.14.9`). A second divergence, or a failed
    pass, ends in `Needs Review` per the table. The abort-only behavior is a defect.
 
-5. **SPEC-3.12.6**: **A draft PR is never a state.** A draft PR opened at a checkpoint or a timeout salvage (`SPEC-3.3.1` through `SPEC-3.3.25`) always has an
+5. **SPEC-3.12.6**: **A draft PR is never a state.** A draft PR opened at a checkpoint or a timeout salvage (`SPEC-3.3.1` through `SPEC-3.3.26`) always has an
    issue in a state from the table. A salvaged PR whose later run finishes the work is promoted by the same rules as
    any other PR; the automerge block on a salvaged PR lasts only until a run finishes the work.
 
@@ -1108,11 +1113,12 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
 - **SPEC-3.17.1**: Two or more claude-run instances, typically at different sites joined by an overlay network and each possibly offline,
   may be peered. Peering is optional and best-effort. Each instance keeps its own state store and keeps working alone; a
   peer is never a dependency of a run. Duplicate work while peers cannot reach each other is accepted, exactly as it is
-  without peering. The peer layer only narrows that window and merges what the instances report.
+  without peering. The peer layer only narrows that window and merges what the instances report. Duplicate work while a
+  peer is `reachable` and reports owning the work is a defect (`SPEC-3.17.19`).
 
 1. **SPEC-3.17.2**: **Autonomy.** No run, finalize, push, sweep or webhook response waits on a peer beyond the bounded timeouts below.
    With `peers.enabled` false (the default) or no peer configured, behavior is exactly as without this section: no
-   route mounted, no outbound call, no row written to `peer_claims` or `peer_cursors`. This instance's own
+   route mounted, no outbound call, no row written to `peer_claims`, `peer_cursors` or `peer_work_events`. This instance's own
    `run_summaries` rows are always written, so history is complete when peering is first enabled. No state store is shared between instances.
 
 2. **SPEC-3.17.3**: **Identity.** Each instance generates a UUID `instance_id` on first start and stores it under the `settings` key
@@ -1131,11 +1137,14 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
 
 4. **SPEC-3.17.5**: **Peer API.** Served only on the TCP listener under `/api/peer`, never on the unix socket (7.14), mounted only when
    enabled, and requiring the bearer credential of 7.6 (the legacy `auth_token_ref` token or a generated API key, SPEC-4.3.20 through SPEC-4.3.24)
-   even on a loopback bind. It is read-only except the claim call,
-   and never starts, cancels or pauses a run or writes a setting. No response carries a secret, a prompt, log text or a
+   even on a loopback bind. It is read-only except the claim and notify calls,
+   which change only the receiver's own peer view, and never starts, cancels or pauses a run or writes a setting. No response carries a secret, a prompt, log text or a
    comment body.
    - `GET /api/peer/state`: `instance_id`, `instance_name`, version, the server's current time, `load` (the count of
-     in-flight jobs) and `in_flight` (action, job key and run start for each `run_inflight_jobs` row).
+     in-flight jobs) and `in_flight` (action, job key and run start for each `run_inflight_jobs` row, and the fields of
+     `SPEC-3.17.20`).
+   - `GET /api/peer/work?key=<issue key>`: the work query of `SPEC-3.17.14`.
+   - `POST /api/peer/notify`: a lifecycle notice (`SPEC-3.17.21`).
    - `POST /api/peer/claim`: body `event_key`, `claimant_id`, `claimant_load`; response `granted` plus the holder's id
      and load (item 7).
    - `GET /api/peer/summaries?after=<seq>&limit=<n>`: this instance's own `run_summaries` rows with `seq` above `after`,
@@ -1196,7 +1205,8 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
    `run_summaries` backfills one row per existing `job_outcomes` row, with a fresh `run_uuid` and `seq` in time order,
    so a new peer receives history through the same pull.
    - Not replicated: stream logs, `run_events`, `attempt_steps`, comments, secrets, settings, pause state, attempt
-     counters, `daily_ledger`, the CI-failure store and `agent_pull_requests`.
+     counters, `daily_ledger`, the CI-failure store and `agent_pull_requests`, which a peer reads by query
+     (`SPEC-3.17.14`) and never receives as rows.
    - Spend ceilings (`SPEC-3.2.3`) and `daily_ledger` caps stay per instance. Replicated cost is for reporting only.
 
 10. **SPEC-3.17.11**: **Reports.** With peering enabled, `/reports` and the `GET /report/{summary,daily,weekly,by-weekday,by-hour}`
@@ -1210,7 +1220,59 @@ sits under and `<n>` counts the requirements in that section from 1. Code cites 
 
 11. **SPEC-3.17.12**: **Status page.** With peering enabled the Status page (`SPEC-4.3.31`) lists each peer: name, state, last successful
     pull, last error, summary sync state (caught up or behind), the peer's in-flight count when `reachable`, and the
-    number of claims bypassed in the last 24 hours.
+    number of claims bypassed in the last 24 hours. It also lists each peer's in-flight keys with `stage`, `branch` and
+    `pr_number`, flags a key in flight on two instances, and shows the number of duplicates logged under
+    `SPEC-3.17.19` in the last 24 hours.
+
+12. **SPEC-3.17.13**: **Bounds.** Every call in `SPEC-3.17.14` through `SPEC-3.17.21` goes only to `reachable` peers and is
+    bounded by `claim_timeout_secs`. A peer that times out, errors or returns an undecodable reply is bypassed: the
+    caller proceeds, logs at `warn` naming the peer, the key and the error, and counts the bypass for the Status page.
+    It is never retried.
+
+13. **SPEC-3.17.14**: **Work query.** `GET /api/peer/work?key=<issue key>` is read-only and requires the credential of
+    `SPEC-3.17.5`. It returns `instance_id`, `key`, `run` (null, or `run_id`, `stage` and `started_at`), `pr` (null, or
+    `repo`, `number`, `branch`, `draft`, `ready`, `salvaged`, `failed`, `fix_attempts` and `head_sha`) and
+    `last_outcome` (null, or `outcome` and `ended_at`). `run_id` is the answering instance's local id and `stage` is
+    the `SPEC-3.14.2` stage of the attempt. The response carries no secret, prompt, log text or comment body.
+
+14. **SPEC-3.17.15**: **Owner.** An instance owns a key while it has a live `run_inflight_jobs` row for it, or else an
+    `open` `agent_pull_requests` row for it. A key reported with a live run by two instances is a duplicate
+    (`SPEC-3.17.19`).
+
+15. **SPEC-3.17.16**: **Pickup consults peers.** After the dependency gate and the CI in-flight cap (`SPEC-3.3.3`) and
+    before the pickup writes `Working`, the instance sends the work query (`SPEC-3.17.14`) for the key to every
+    `reachable` peer. A peer reporting a live run defers the pickup: the issue is left as it is, no attempt is consumed,
+    nothing is cloned, and the deferral is logged at `info` naming the peer and its `run_id`. A peer reporting an open
+    PR and no live run lets the pickup proceed on that PR's branch with no second PR, and the instance records the PR
+    in its own `agent_pull_requests` with the peer's `fix_attempts`.
+
+16. **SPEC-3.17.17**: **Pickup claim.** The pickup then takes a claim by the mechanics of `SPEC-3.17.8`, with `event_key`
+    `youtrack:<key>:pickup:<time the Queued value was written>`. A refusal defers the pickup as in `SPEC-3.17.16`, and an
+    instance that has already written `Working` for the key refuses.
+
+17. **SPEC-3.17.18**: **Ownership of incoming events.** Before the claim of `SPEC-3.17.8`, an instance that received an
+    event naming an issue or a PR, and does not own the key, sends the work query to every `reachable` peer. If a peer
+    owns the key, the instance drops the delivery with `200` and an `info` log naming the owner, and takes no claim.
+    The owner handles the event through its own hook target. A delivery the owner never received is not handled until
+    the next event.
+
+18. **SPEC-3.17.19**: **A reachable duplicate is a defect.** A run that learns from a snapshot or a work query that a
+    peer has a live run for its key logs at `error` naming the key, both runs (each by `instance_id` and `run_id`) and
+    the peer, and comments once on the issue. It cancels neither run.
+
+19. **SPEC-3.17.20**: **Live snapshot.** Each `in_flight` entry of `GET /api/peer/state` also carries `run_id` (this
+    instance's local id), `stage` (the `SPEC-3.14.2` stage of the attempt), `branch` and `pr_number` (null before a PR
+    exists).
+
+20. **SPEC-3.17.21**: **Lifecycle notices.** After an event is durable locally, the instance sends
+    `POST /api/peer/notify` to every `reachable` peer: `event` (`pickup_started`, `pr_opened`, `outcome`, `requeued`,
+    `ceiling_reached` or `cancelled`), `key`, `instance_id`, `run_id`, `at` and `pr_number` when one exists. The receiver
+    stores it in `peer_work_events`, idempotent per `(instance_id, run_id, event)`, and shows it on the Status page. A
+    notice starts, cancels or pauses no run and writes no tracker field or setting. The snapshot of `SPEC-3.17.6` stays
+    authoritative, so a missed notice is corrected at the next poll.
+
+21. **SPEC-3.17.22**: **Cancel stays local.** `cancel` stops only a run of this instance. A peer's run is shown but not
+    cancellable from here, and the Status page names the instance on which it is cancelled.
 
 ## 4. Interfaces
 
@@ -2025,6 +2087,7 @@ implementation.
   | `run_summaries` | Peered-instance run highlights (`SPEC-3.17.10`): `run_uuid` (PK), `instance_id`, `seq`, `action_name`, `job_key`, `attempt`, `outcome`, `ok`, `started_at`, `ended_at`, `duration_ms`, `cost_usd`, `timed_out`; own and replicated rows |
   | `peer_cursors` | PK `peer_instance_id`: `after_seq`, `last_success_at`, `last_error` |
   | `peer_claims` | Webhook event claims (`SPEC-3.17.8`): `event_key` (PK), `holder_id`, `holder_load`, `claimed_at` |
+  | `peer_work_events` | Peer lifecycle notices (`SPEC-3.17.21`): PK (`instance_id`, `run_id`, `event`), `key`, `pr_number`, `at`, `received_at` |
   | `web_accounts` | `username`, unique `username_key`, argon2 `password_hash`, `session_key`, TOTP secret (encrypted), `totp_enrolled_at`, `totp_last_step`, `created_by` |
   | `web_account_recovery_codes` | Hashed one-time recovery codes per account |
   | `web_invites` | `token_hash` (unique), `created_by`, `expires_at`, `used_at`, `email` |
