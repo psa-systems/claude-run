@@ -1254,7 +1254,7 @@ async fn process_event(
             log_available,
             log_artifact,
             log_unavailable_reason,
-            webhook_cfg.auto_fix,
+            webhook_cfg.queue_fix_issues,
             job_name,
             log_token,
             &keygate,
@@ -1480,6 +1480,15 @@ impl WebhookRunSummary {
             ok: false,
         }
     }
+
+    /// SPEC-4.4.6: a run deliberately not triaged because a setting excludes
+    /// it; the run row states which setting and why, and is `ok`.
+    fn out_of_scope(reason: String) -> Self {
+        Self {
+            text: format!("not triaged: {reason}; no issue"),
+            ok: true,
+        }
+    }
 }
 
 /// The outcomes the `ci_failure` store drives directly, with no
@@ -1547,7 +1556,7 @@ async fn triage_and_mint(
     log_available: bool,
     log_artifact: Option<PathBuf>,
     log_unavailable_reason: Option<String>,
-    auto_fix_enabled: bool,
+    queue_fix_issues: bool,
     job_name: String,
     log_token: Option<String>,
     keygate: &crate::concurrency::KeyGate,
@@ -1565,7 +1574,8 @@ async fn triage_and_mint(
     // from the redacted log up front (pure string work); the fingerprint
     // is the failing-test overlap key the store matches on.
     let failure_signature = crate::mint::failure_signature(&log_text);
-    let branch = crate::forge_log::resolve_branch(None, &log_text).unwrap_or_default();
+    let resolved_branch = crate::forge_log::resolve_branch(None, &log_text);
+    let branch = resolved_branch.clone().unwrap_or_default();
     let infra = crate::infra_failure::detect(&log_text);
     if let Some(f) = &infra {
         info!(
@@ -1630,7 +1640,36 @@ async fn triage_and_mint(
     };
 
     let Some(pr) = pr else {
-        // No open PR for this commit: the store dispatch, run
+        // SPEC-4.4.6: with no open PR, only a branch the repo lists is
+        // triaged. An open PR is routed by who opened it below and ignores the
+        // list. A branch the log does not reveal is a failure, never a drop.
+        let Some(failed_branch) = resolved_branch.as_deref() else {
+            error!(repo = %ev.repo, run = ev.index_in_repo, "failed run's branch could not be derived from the log; cannot apply webhook.triage_branches");
+            record_run_event(
+                &ctx.pool,
+                run_id,
+                WEBHOOK_MINT_ACTION,
+                "error",
+                "failed run's branch could not be derived from the log".to_string(),
+            )
+            .await;
+            return WebhookRunSummary::error(
+                "branch could not be derived from the log; webhook.triage_branches not applied"
+                    .to_string(),
+            );
+        };
+        if !webhook_cfg.triages_branch(&ev.repo, failed_branch) {
+            info!(
+                repo = %ev.repo,
+                run = ev.index_in_repo,
+                branch = %failed_branch,
+                "branch is not in webhook.triage_branches; not triaged"
+            );
+            return WebhookRunSummary::out_of_scope(format!(
+                "branch `{failed_branch}` is not in webhook.triage_branches"
+            ));
+        }
+        // The branch is in scope: the store dispatch, run
         // exactly as before.
         if let Some(m) = store_match {
             if m.state == "open" {
@@ -1645,7 +1684,7 @@ async fn triage_and_mint(
                                 log_text,
                                 log_available,
                                 log_unavailable_reason,
-                                auto_fix_enabled,
+                                queue_fix_issues,
                                 branch,
                                 test_ids,
                                 log_token,
@@ -1684,7 +1723,7 @@ async fn triage_and_mint(
                     log_text,
                     log_available,
                     log_unavailable_reason,
-                    auto_fix_enabled,
+                    queue_fix_issues,
                     branch,
                     test_ids,
                     log_token,
@@ -1704,7 +1743,7 @@ async fn triage_and_mint(
             log_available,
             log_artifact,
             log_unavailable_reason,
-            auto_fix_enabled,
+            queue_fix_issues,
             job_name,
             branch,
             failure_signature,
@@ -1744,6 +1783,18 @@ async fn triage_and_mint(
             )
             .await
         }
+        Ok(_) if !webhook_cfg.pr_analysis => {
+            info!(
+                repo = %ev.repo,
+                run = ev.index_in_repo,
+                pr = pr.number,
+                "failure on a human-authored PR and webhook.pr_analysis is off; not analyzed"
+            );
+            WebhookRunSummary::out_of_scope(format!(
+                "failure on human-authored PR #{} and webhook.pr_analysis is off",
+                pr.number
+            ))
+        }
         Ok(_) => {
             route_human_pr_failure(
                 ctx,
@@ -1752,10 +1803,9 @@ async fn triage_and_mint(
                 log_text,
                 log_available,
                 log_unavailable_reason,
-                auto_fix_enabled,
+                queue_fix_issues,
                 &job_name,
                 &branch,
-                failure_signature.as_deref(),
                 infra_kind.as_deref(),
                 &test_ids,
                 log_token,
@@ -1903,7 +1953,7 @@ async fn reopen_resolved_failure(
     log_text: String,
     log_available: bool,
     log_unavailable_reason: Option<String>,
-    auto_fix_enabled: bool,
+    queue_fix_issues: bool,
     branch: String,
     test_ids: Vec<String>,
     log_token: Option<String>,
@@ -1976,7 +2026,7 @@ async fn reopen_resolved_failure(
             let verdict = triage::triage(
                 &input,
                 classifier.as_ref(),
-                &mint_cfg.auto_fix,
+                &mint_cfg.detect_fixable,
                 &mint_cfg.bot_branch_prefixes,
                 &spend,
             );
@@ -1989,7 +2039,7 @@ async fn reopen_resolved_failure(
                 Some(&ci_failure_trigger(event.index_in_repo)),
             );
             backend.comment(&key2, &analysis)?;
-            if mint::queues_for_fix(verdict.bucket) && auto_fix_enabled {
+            if mint::queues_for_fix(verdict.bucket) && queue_fix_issues {
                 backend.set_field(&key2, &mint_cfg.ai_agent_field, &mint_cfg.queued_value)?;
             }
             Ok(verdict.bucket)
@@ -2328,7 +2378,7 @@ async fn analyze_and_comment_pr(
             let verdict = triage::triage(
                 &input,
                 classifier.as_ref(),
-                &mint_cfg.auto_fix,
+                &mint_cfg.detect_fixable,
                 &mint_cfg.bot_branch_prefixes,
                 &spend,
             );
@@ -2713,7 +2763,7 @@ async fn route_agent_pr_failure(
             let verdict = triage::triage(
                 &input,
                 classifier.as_ref(),
-                &mint_cfg.auto_fix,
+                &mint_cfg.detect_fixable,
                 &mint_cfg.bot_branch_prefixes,
                 &spend,
             );
@@ -2897,10 +2947,9 @@ async fn route_human_pr_failure(
     log_text: String,
     log_available: bool,
     log_unavailable_reason: Option<String>,
-    auto_fix_enabled: bool,
+    queue_fix_issues: bool,
     job_name: &str,
     branch: &str,
-    failure_signature: Option<&str>,
     infra_kind: Option<&str>,
     test_ids: &[String],
     log_token: Option<String>,
@@ -2923,7 +2972,7 @@ async fn route_human_pr_failure(
                             log_text,
                             log_available,
                             log_unavailable_reason,
-                            auto_fix_enabled,
+                            queue_fix_issues,
                             branch.to_string(),
                             test_ids.to_vec(),
                             log_token,
@@ -2974,7 +3023,7 @@ async fn route_human_pr_failure(
                 log_text,
                 log_available,
                 log_unavailable_reason,
-                auto_fix_enabled,
+                queue_fix_issues,
                 branch.to_string(),
                 test_ids.to_vec(),
                 log_token,
@@ -2991,11 +3040,7 @@ async fn route_human_pr_failure(
                 log_text,
                 log_available,
                 log_unavailable_reason,
-                auto_fix_enabled,
-                job_name,
                 branch,
-                failure_signature,
-                infra_kind,
                 test_ids,
                 log_token,
                 &m,
@@ -3101,11 +3146,9 @@ async fn route_pr_matches_open_failure(
 }
 
 /// `ev`'s failing tests overlap a `pr_only` row: a prior sighting
-/// on some open PR (possibly this same one). If the attach brings the row's
-/// distinct branches to 2 or more, the failure belongs to `main`: mint a real
-/// issue and comment its link onto every PR it was sighted on. Otherwise this
-/// is another sighting of the same still-single-branch failure: analyze again
-/// and comment the PR, same as a fresh sighting.
+/// on some open PR (possibly this same one): another sighting, so analyze again
+/// and comment the PR, same as a fresh sighting. A human PR's failure never
+/// mints an issue, whatever number of branches it was seen on (SPEC-4.4.6).
 #[allow(clippy::too_many_arguments)]
 async fn route_pr_matches_pr_only_failure(
     ctx: &MintContext,
@@ -3114,11 +3157,7 @@ async fn route_pr_matches_pr_only_failure(
     log_text: String,
     log_available: bool,
     log_unavailable_reason: Option<String>,
-    auto_fix_enabled: bool,
-    job_name: &str,
     branch: &str,
-    failure_signature: Option<&str>,
-    infra_kind: Option<&str>,
     test_ids: &[String],
     log_token: Option<String>,
     m: &ci_failure_store::FailureMatch,
@@ -3145,35 +3184,6 @@ async fn route_pr_matches_pr_only_failure(
     {
         error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
         return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
-    }
-
-    let branches = match ci_failure_store::distinct_branches(&ctx.pool, m.id).await {
-        Ok(b) => b,
-        Err(e) => {
-            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store read failed");
-            return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
-        }
-    };
-
-    if branches.len() >= 2 {
-        return mint_for_two_branch_pr_only_failure(
-            ctx,
-            ev,
-            log_text,
-            log_available,
-            log_unavailable_reason,
-            auto_fix_enabled,
-            job_name,
-            branch,
-            failure_signature,
-            infra_kind,
-            log_token,
-            m.id,
-            host,
-            webhook_cfg,
-            spend,
-        )
-        .await;
     }
 
     let env = match require_pr_comment_backend(ctx, run_id, ev, host, webhook_cfg).await {
@@ -3203,10 +3213,7 @@ async fn route_pr_matches_pr_only_failure(
                 warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "persisting triage bucket failed (continuing)");
             }
             WebhookRunSummary {
-                text: format!(
-                    "commented analysis on PR #{} (pr_only, still one branch)",
-                    pr.number
-                ),
+                text: format!("commented analysis on PR #{} (pr_only)", pr.number),
                 ok: true,
             }
         }
@@ -3215,185 +3222,6 @@ async fn route_pr_matches_pr_only_failure(
             WebhookRunSummary::error(e.to_string())
         }
     }
-}
-
-/// A `pr_only` failure's tests just appeared on a second distinct
-/// branch: promote it to a real issue (triage + mint, caps applied and
-/// advanced exactly like a fresh mint), point the existing store row at it
-/// instead of inserting a duplicate, and comment the issue link onto every
-/// open PR the failure was sighted on.
-#[allow(clippy::too_many_arguments)]
-async fn mint_for_two_branch_pr_only_failure(
-    ctx: &MintContext,
-    ev: &VerifiedFailureEvent,
-    log_text: String,
-    log_available: bool,
-    log_unavailable_reason: Option<String>,
-    auto_fix_enabled: bool,
-    job_name: &str,
-    branch: &str,
-    failure_signature: Option<&str>,
-    infra_kind: Option<&str>,
-    log_token: Option<String>,
-    failure_id: i64,
-    host: &str,
-    webhook_cfg: &WebhookConfig,
-    spend: &crate::usage::RunSpend,
-) -> WebhookRunSummary {
-    let job_key = format!("{}#{}", ev.repo, ev.index_in_repo);
-    let attempts = state::attempts_get(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key)
-        .await
-        .unwrap_or(0);
-    let daily = state::daily_count_get(&ctx.pool, WEBHOOK_MINT_ACTION)
-        .await
-        .unwrap_or(0);
-    let caps = MintCaps {
-        attempts,
-        max_attempts: ctx.defaults.max_attempts_per_key,
-        daily,
-        max_runs_per_day: webhook_cfg.max_runs_per_day,
-    };
-
-    let backend = ctx.backend.clone();
-    let classifier = ctx.classifier.clone();
-    let audit = crate::provider::IssueWriteAudit::new(None, ctx.defaults.max_issues_per_run);
-    let mint_cfg = ctx.mint_cfg.read().await.clone();
-    let route_cache = ctx.route_cache.clone();
-    let event = ev.clone();
-    let job_name_owned = job_name.to_string();
-    let branch_owned = branch.to_string();
-    let sig_owned = failure_signature.map(str::to_string);
-    let infra_owned = infra_kind.map(str::to_string);
-    let spend = spend.clone();
-
-    let decision = tokio::task::spawn_blocking(
-        move || -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
-            let tracker = crate::provider::AuditedTracker::new(backend.as_ref(), audit);
-            let input = TriageInput {
-                repo: event.repo.clone(),
-                workflow_id: event.workflow_id.clone(),
-                commit_sha: event.commit_sha.clone(),
-                html_url: event.html_url.clone(),
-                log: log_text,
-                log_available,
-                log_unavailable_reason,
-                has_open_pr: true,
-                branch: branch_owned.clone(),
-                log_token,
-            };
-            let verdict = triage::triage(
-                &input,
-                classifier.as_ref(),
-                &mint_cfg.auto_fix,
-                &mint_cfg.bot_branch_prefixes,
-                &spend,
-            );
-            let req = MintRequest {
-                repo: &event.repo,
-                index_in_repo: event.index_in_repo,
-                commit_sha: &event.commit_sha,
-                workflow_id: &event.workflow_id,
-                branch: &branch_owned,
-                job_name: &job_name_owned,
-                failure_signature: sig_owned.as_deref(),
-                infra_kind: infra_owned.as_deref(),
-                html_url: &event.html_url,
-                trigger_user: &event.trigger_user,
-                triage: &verdict,
-                log_path: None,
-                private: event.private,
-                has_open_pr: true,
-                auto_fix_enabled,
-            };
-            let outcome = mint::mint(&tracker, &mint_cfg, route_cache.as_ref(), &req, &caps)?;
-            Ok((verdict.bucket, outcome))
-        },
-    )
-    .await;
-
-    let (bucket, outcome) = match decision {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "two-branch mint failed");
-            return WebhookRunSummary::error(e.to_string());
-        }
-        Err(e) => {
-            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "two-branch mint task panicked");
-            return WebhookRunSummary::error(format!("task panicked: {e}"));
-        }
-    };
-
-    let key = match &outcome {
-        MintOutcome::Created { key, .. } => key.clone(),
-        other => {
-            log_mint_outcome(ev, other);
-            return WebhookRunSummary::decided(bucket, other);
-        }
-    };
-
-    if let Err(e) = state::attempts_increment(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key).await {
-        warn!(error = %e, "advancing webhook attempt counter failed");
-    }
-    if let Err(e) = state::daily_count_increment(&ctx.pool, WEBHOOK_MINT_ACTION).await {
-        warn!(error = %e, "advancing webhook daily ledger failed");
-    }
-
-    let now = state::now_iso();
-    if let Err(e) = ci_failure_store::set_issue(&ctx.pool, failure_id, Some(&key), &now).await {
-        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store write failed");
-        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
-    }
-    if let Err(e) = ci_failure_store::set_failure_state(&ctx.pool, failure_id, "open", &now).await {
-        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store write failed");
-        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
-    }
-
-    let pr_numbers = ci_failure_store::pr_numbers_for_failure(&ctx.pool, failure_id)
-        .await
-        .unwrap_or_default();
-    if !pr_numbers.is_empty() {
-        match require_pr_comment_backend(ctx, None, ev, host, webhook_cfg).await {
-            Ok(env) => {
-                let body =
-                    format!("Filed as {key}; the same failure was seen on another branch's PR.");
-                let repo = ev.repo.clone();
-                let host_owned = host.to_string();
-                let backend = env.backend;
-                let paths = ctx.paths.clone();
-                let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
-                    for pr_number in pr_numbers {
-                        let body_file = pr_comment_body_path(&paths, &repo, pr_number as u64);
-                        write_and_post_pr_comment(
-                            backend.as_ref(),
-                            &host_owned,
-                            &repo,
-                            pr_number as u64,
-                            &body_file,
-                            &body,
-                        )?;
-                    }
-                    Ok(())
-                })
-                .await;
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "commenting the issue link onto a PR failed (continuing)");
-                    }
-                    Err(e) => {
-                        warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "commenting the issue link onto every PR task panicked (continuing)");
-                    }
-                }
-            }
-            Err(_) => {
-                // Already logged and recorded by require_pr_comment_backend; the
-                // issue itself is already filed, so this is best-effort only.
-            }
-        }
-    }
-
-    log_mint_outcome(ev, &outcome);
-    WebhookRunSummary::decided(bucket, &outcome)
 }
 
 /// `ev`'s failing tests matched no store row at all, on an open PR
@@ -3508,7 +3336,7 @@ async fn classify_and_mint(
     log_available: bool,
     log_artifact: Option<PathBuf>,
     log_unavailable_reason: Option<String>,
-    auto_fix_enabled: bool,
+    queue_fix_issues: bool,
     job_name: String,
     branch: String,
     failure_signature: Option<String>,
@@ -3593,7 +3421,7 @@ async fn classify_and_mint(
             log_artifact.as_deref(),
             log_unavailable_reason,
             has_open_pr,
-            auto_fix_enabled,
+            queue_fix_issues,
             &job_name_for_blocking,
             &branch_for_blocking,
             sig_for_blocking.as_deref(),
@@ -3694,7 +3522,7 @@ fn decide_with_legacy_adoption(
     log_artifact: Option<&std::path::Path>,
     log_unavailable_reason: Option<String>,
     has_open_pr: bool,
-    auto_fix_enabled: bool,
+    queue_fix_issues: bool,
     job_name: &str,
     branch: &str,
     failure_signature: Option<&str>,
@@ -3729,7 +3557,7 @@ fn decide_with_legacy_adoption(
         log_artifact,
         log_unavailable_reason,
         has_open_pr,
-        auto_fix_enabled,
+        queue_fix_issues,
         job_name,
         log_token,
         report_stage,
@@ -3759,7 +3587,7 @@ fn decide_mint(
     log_artifact: Option<&std::path::Path>,
     log_unavailable_reason: Option<String>,
     has_open_pr: bool,
-    auto_fix_enabled: bool,
+    queue_fix_issues: bool,
     job_name: &str,
     log_token: Option<String>,
     report_stage: &(dyn Fn(&'static str) + Send + Sync),
@@ -3807,7 +3635,7 @@ fn decide_mint(
     let verdict = triage::triage(
         &input,
         &reporting,
-        &mint_cfg.auto_fix,
+        &mint_cfg.detect_fixable,
         &mint_cfg.bot_branch_prefixes,
         spend,
     );
@@ -3827,7 +3655,7 @@ fn decide_mint(
         log_path: log_artifact,
         private: ev.private,
         has_open_pr,
-        auto_fix_enabled,
+        queue_fix_issues,
     };
     let outcome = mint::mint(tracker, mint_cfg, route_cache, &req, caps)?;
     Ok((verdict.bucket, outcome))
@@ -7365,6 +7193,40 @@ mod tests {
     /// A log carrying `test_id` as its one failing test (cargo-test-shaped, so
     /// [`fingerprint::fingerprint`] parses it), on `branch`, resolvable to a
     /// non-transient signature.
+    /// A webhook config that triages every branch the tests below fail on and
+    /// analyzes human-authored PRs, so a test exercises the routing it names
+    /// and not the SPEC-4.4.6 scope gates (which have their own tests).
+    fn test_webhook_cfg() -> WebhookConfig {
+        let branches = [
+            "main",
+            "branch/a",
+            "branch/b",
+            "feat/ALPHA-1126-kb-provenance",
+            "feature/x",
+            "fix/ALPHA-1041-invoice-module-gate",
+            "fix/PROJ-40",
+            "fix/PROJ-41",
+            "fix/PROJ-50",
+            "fix/PROJ-51",
+            "fix/PROJ-52",
+            "fix/PROJ-53",
+            "fix/a",
+            "fix/b",
+            "human/branch",
+            "human/branch2",
+            "human/branch3",
+            "human/branch4",
+        ];
+        WebhookConfig {
+            triage_branches: std::collections::BTreeMap::from([(
+                "*".to_string(),
+                branches.iter().map(|b| b.to_string()).collect(),
+            )]),
+            pr_analysis: true,
+            ..WebhookConfig::default()
+        }
+    }
+
     fn failing_test_log(target: &str, test_id: &str, branch: &str) -> String {
         format!(
             "GITHUB_HEAD_REF={branch}\n     Running tests/{target}.rs (target/debug/deps/{target}-abc123)\ntest {test_id} ... FAILED\n"
@@ -7552,7 +7414,7 @@ mod tests {
                     backend.clone(),
                     classifier.clone(),
                 )),
-                Arc::new(RwLock::new(WebhookConfig::default())),
+                Arc::new(RwLock::new(test_webhook_cfg())),
                 crate::concurrency::KeyGate::new(),
             )
             .await;
@@ -7600,7 +7462,7 @@ mod tests {
                 paths_dir.path(),
                 Arc::new(crate::provider::cli::testutil::StubRunner::new()),
             )),
-            Arc::new(RwLock::new(WebhookConfig::default())),
+            Arc::new(RwLock::new(test_webhook_cfg())),
             crate::concurrency::KeyGate::new(),
         )
         .await;
@@ -7673,7 +7535,7 @@ mod tests {
             Arc::new(ScriptedFailingLogs { logs }),
             out_dir.path().to_path_buf(),
             Some(store_mint_context(pool.clone(), backend, classifier)),
-            Arc::new(RwLock::new(WebhookConfig::default())),
+            Arc::new(RwLock::new(test_webhook_cfg())),
             crate::concurrency::KeyGate::new(),
         )
         .await;
@@ -7733,7 +7595,7 @@ mod tests {
             Arc::new(ScriptedFailingLogs { logs }),
             out_dir.path().to_path_buf(),
             Some(ctx),
-            Arc::new(RwLock::new(WebhookConfig::default())),
+            Arc::new(RwLock::new(test_webhook_cfg())),
             crate::concurrency::KeyGate::new(),
         )
         .await;
@@ -7888,7 +7750,7 @@ mod tests {
                         backend.clone(),
                         classifier,
                     )),
-                    Arc::new(RwLock::new(WebhookConfig::default())),
+                    Arc::new(RwLock::new(test_webhook_cfg())),
                     crate::concurrency::KeyGate::new(),
                 )
                 .await;
@@ -8018,7 +7880,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -8101,7 +7963,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -8175,7 +8037,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -8243,7 +8105,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -8312,7 +8174,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -8351,7 +8213,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -8407,7 +8269,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -8481,7 +8343,7 @@ mod tests {
             None,
             Some("private repo: unauthorized".to_string()),
             false,
-            true, // auto_fix_enabled
+            true, // queue_fix_issues
             "",
             None,
             &|_| {},
@@ -8524,7 +8386,7 @@ mod tests {
             None,
             None,
             true,
-            true, // auto_fix_enabled
+            true, // queue_fix_issues
             "",
             None,
             &|_| {},
@@ -8557,7 +8419,7 @@ mod tests {
             None,
             None,
             false, // has_open_pr: no PR, so the code_fix route still queues
-            true,  // auto_fix_enabled
+            true,  // queue_fix_issues
             "",
             None,
             &|_| {},
@@ -8604,7 +8466,7 @@ mod tests {
             None,
             None,
             false,
-            true, // auto_fix_enabled
+            true, // queue_fix_issues
             "",
             None,
             &|_| {},
@@ -8650,7 +8512,7 @@ mod tests {
             None,
             None,
             false, // has_open_pr: push to main, no PR
-            true,  // auto_fix_enabled
+            true,  // queue_fix_issues
             "",
             None,
             &|_| {},
@@ -8708,7 +8570,7 @@ mod tests {
             None,
             None,
             true, // has_open_pr: context only, no longer a suppression signal
-            true, // auto_fix_enabled
+            true, // queue_fix_issues
             "",
             None,
             &|_| {},
@@ -8810,7 +8672,7 @@ mod tests {
             None,
             None,
             false, // has_open_pr: no PR; the toggle, not open-PR, does the gating
-            false, // auto_fix_enabled: OFF
+            false, // queue_fix_issues: OFF
             "",
             None,
             &|_| {},
@@ -8928,7 +8790,7 @@ mod tests {
                 Arc::new(PanicLogs),
                 out_dir.path().to_path_buf(),
                 None,
-                Arc::new(RwLock::new(WebhookConfig::default())),
+                Arc::new(RwLock::new(test_webhook_cfg())),
                 crate::concurrency::KeyGate::new(),
             )
             .await;
@@ -9053,7 +8915,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut cfg = WebhookConfig::default();
+        let mut cfg = test_webhook_cfg();
         cfg.sources.insert(
             "test-source".to_string(),
             WebhookSource {
@@ -9206,7 +9068,7 @@ mod tests {
             logs,
             out_dir.path().to_path_buf(),
             None,
-            Arc::new(RwLock::new(WebhookConfig::default())),
+            Arc::new(RwLock::new(test_webhook_cfg())),
             crate::concurrency::KeyGate::new(),
         )
         .await;
@@ -9242,7 +9104,7 @@ mod tests {
             logs,
             out_dir.path().to_path_buf(),
             None,
-            Arc::new(RwLock::new(WebhookConfig::default())),
+            Arc::new(RwLock::new(test_webhook_cfg())),
             crate::concurrency::KeyGate::new(),
         )
         .await;
@@ -9276,7 +9138,7 @@ mod tests {
             logs,
             out_dir.path().to_path_buf(),
             None,
-            Arc::new(RwLock::new(WebhookConfig::default())),
+            Arc::new(RwLock::new(test_webhook_cfg())),
             crate::concurrency::KeyGate::new(),
         )
         .await;
@@ -9332,7 +9194,7 @@ mod tests {
                 logs.clone(),
                 out_dir.path().to_path_buf(),
                 None,
-                Arc::new(RwLock::new(WebhookConfig::default())),
+                Arc::new(RwLock::new(test_webhook_cfg())),
                 crate::concurrency::KeyGate::new(),
             )
             .await;
@@ -9386,7 +9248,7 @@ mod tests {
                 Arc::new(ScriptedLogs::new(outcome)),
                 out_dir.path().to_path_buf(),
                 None,
-                Arc::new(RwLock::new(WebhookConfig::default())),
+                Arc::new(RwLock::new(test_webhook_cfg())),
                 crate::concurrency::KeyGate::new(),
             )
             .await;
@@ -9419,7 +9281,7 @@ mod tests {
             Arc::new(ReadyLogs),
             out_dir.path().to_path_buf(),
             None,
-            Arc::new(RwLock::new(WebhookConfig::default())),
+            Arc::new(RwLock::new(test_webhook_cfg())),
             crate::concurrency::KeyGate::new(),
         )
         .await;
@@ -9661,7 +9523,7 @@ mod tests {
             None,
             None,
             true,
-            true, // auto_fix_enabled
+            true, // queue_fix_issues
             "",
             None,
             &report,
@@ -9694,7 +9556,7 @@ mod tests {
             None,
             None,
             true,
-            true, // auto_fix_enabled
+            true, // queue_fix_issues
             "",
             None,
             &report,
@@ -9763,7 +9625,7 @@ mod tests {
     /// carrying `write_token_ref`, so a PR-comment routing decision has a
     /// backend to build.
     fn webhook_cfg_with_write_token(token_ref: Option<&str>) -> WebhookConfig {
-        let mut cfg = WebhookConfig::default();
+        let mut cfg = test_webhook_cfg();
         cfg.sources.insert(
             "test-source".to_string(),
             WebhookSource {
@@ -9797,7 +9659,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -9816,6 +9678,142 @@ mod tests {
             "nothing minted: {:?}",
             backend.calls()
         );
+    }
+
+    /// Drive one no-open-PR failure through [`triage_and_mint`]
+    /// with `cfg`, returning the summary, the backend and the classifier.
+    async fn run_scope_case(
+        cfg: &WebhookConfig,
+        log: String,
+        index: i64,
+    ) -> (
+        WebhookRunSummary,
+        Arc<StoreBackend>,
+        Arc<CountingClassifier>,
+    ) {
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new());
+        let counting = Arc::new(CountingClassifier::new());
+        let classifier: Arc<dyn FailureClassifier> = counting.clone();
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &store_event(index),
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            cfg,
+            &test_spend(),
+        )
+        .await;
+        (result, backend, counting)
+    }
+
+    #[tokio::test]
+    async fn failure_on_an_unlisted_branch_with_no_open_pr_is_not_triaged() {
+        // SPEC-4.4.6: only the listed branches are triaged; the default list is
+        // `main` and `develop`, so a working branch is acknowledged and dropped
+        // with no `claude` call and no issue.
+        let log = failing_test_log("mod_a", "test_one", "feature/x");
+        let (result, backend, counting) =
+            run_scope_case(&WebhookConfig::default(), log, 7701).await;
+        assert!(result.ok, "{}", result.text);
+        assert!(
+            result.text.contains("webhook.triage_branches"),
+            "{}",
+            result.text
+        );
+        assert_eq!(counting.call_count(), 0, "no analysis runs");
+        assert!(
+            !backend.calls().iter().any(|c| c.starts_with("create")),
+            "no issue: {:?}",
+            backend.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_on_a_listed_branch_is_triaged() {
+        let log = failing_test_log("mod_a", "test_one", "main");
+        let (result, backend, _) = run_scope_case(&WebhookConfig::default(), log, 7702).await;
+        assert!(result.ok, "{}", result.text);
+        assert!(
+            !result.text.contains("webhook.triage_branches"),
+            "{}",
+            result.text
+        );
+        assert!(
+            backend.calls().iter().any(|c| c.starts_with("create")),
+            "an issue is minted: {:?}",
+            backend.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_the_log_does_not_reveal_fails_the_run() {
+        // SPEC-4.4.6: an underivable branch is a failure, never a drop.
+        let log = "     Running tests/mod_a.rs (target/debug/deps/mod_a-abc123)\ntest mod_a::test_one ... FAILED\n".to_string();
+        let (result, backend, counting) =
+            run_scope_case(&WebhookConfig::default(), log, 7703).await;
+        assert!(!result.ok, "{}", result.text);
+        assert!(
+            result.text.contains("branch could not be derived"),
+            "{}",
+            result.text
+        );
+        assert_eq!(counting.call_count(), 0);
+        assert!(!backend.calls().iter().any(|c| c.starts_with("create")));
+    }
+
+    #[tokio::test]
+    async fn human_pr_failure_with_pr_analysis_off_is_not_analyzed() {
+        // SPEC-4.4.6: the default is off; no analysis, no comment, no store
+        // row, no issue.
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(17, "commit-7704")]));
+        let counting = Arc::new(CountingClassifier::new());
+        let classifier: Arc<dyn FailureClassifier> = counting.clone();
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let log = failing_test_log("mod_a", "test_one", "human/branch");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &store_event(7704),
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+            &test_spend(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        assert!(
+            result.text.contains("webhook.pr_analysis is off"),
+            "{}",
+            result.text
+        );
+        assert_eq!(counting.call_count(), 0);
+        assert!(!backend.calls().iter().any(|c| c.starts_with("create")));
+        let m = ci_failure_store::find_match(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            &["mod_a::test_one".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(m.is_none(), "no store row is written");
     }
 
     #[tokio::test]
@@ -9858,7 +9856,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -9946,7 +9944,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -10188,7 +10186,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -10207,7 +10205,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -10302,7 +10300,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -10321,7 +10319,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -10387,7 +10385,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -10406,7 +10404,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -10468,7 +10466,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -10487,7 +10485,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -10578,7 +10576,7 @@ mod tests {
                 "test".to_string(),
                 None,
                 &crate::concurrency::KeyGate::new(),
-                &WebhookConfig::default(),
+                &test_webhook_cfg(),
                 &test_spend(),
             )
             .await;
@@ -10834,7 +10832,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -10908,7 +10906,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
-            &WebhookConfig::default(),
+            &test_webhook_cfg(),
             &test_spend(),
         )
         .await;
@@ -11346,12 +11344,13 @@ mod tests {
                 enabled: true,
                 replay_window_secs: 300,
                 sources,
-                auto_fix: false,
+                queue_fix_issues: false,
                 analysis_timeout_secs: 600,
                 analysis_concurrency: 2,
                 max_runs_per_day: 20,
                 agent_pr_fix_attempts: 3,
                 agent_pr_fix_attempts_hard_cap: 6,
+                ..WebhookConfig::default()
             }
         }
 
@@ -11950,12 +11949,13 @@ mod tests {
                 enabled: true,
                 replay_window_secs: 300,
                 sources,
-                auto_fix: false,
+                queue_fix_issues: false,
                 analysis_timeout_secs: 600,
                 analysis_concurrency: 2,
                 max_runs_per_day: 20,
                 agent_pr_fix_attempts: 3,
                 agent_pr_fix_attempts_hard_cap: 6,
+                ..WebhookConfig::default()
             };
             let (tx, _rx) = mpsc::channel(8);
             let st = WebhookState::new(pool, config, tx);
@@ -16162,7 +16162,7 @@ mod tests {
                 "test".to_string(),
                 None,
                 &crate::concurrency::KeyGate::new(),
-                &WebhookConfig::default(),
+                &test_webhook_cfg(),
                 &test_spend(),
             )
             .await;
@@ -16233,7 +16233,7 @@ mod tests {
                 "test".to_string(),
                 None,
                 &crate::concurrency::KeyGate::new(),
-                &WebhookConfig::default(),
+                &test_webhook_cfg(),
                 &test_spend(),
             )
             .await;
@@ -16293,7 +16293,7 @@ mod tests {
                 "test".to_string(),
                 None,
                 &crate::concurrency::KeyGate::new(),
-                &WebhookConfig::default(),
+                &test_webhook_cfg(),
                 &test_spend(),
             )
             .await;

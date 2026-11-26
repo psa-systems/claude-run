@@ -21,7 +21,7 @@
 //! mint    -> create in the mapped project, State=To do, attach the redacted log,
 //!            then route the bucket:
 //!              bucket 1 (code_fix)    -> AI Agent=Queued when the webhook's
-//!                                        `auto_fix` toggle is on (the
+//!                                        `queue_fix_issues` toggle is on (the
 //!                                        `youtrack` action then picks it up
 //!                                        and opens the fix PR); off, the
 //!                                        issue is still created with no AI
@@ -111,13 +111,13 @@ pub struct MintRequest<'a> {
     /// this no longer gates the route (the caller decides PR routing before
     /// `mint` runs, replacing the old `SkippedOpenPr` suppression).
     pub has_open_pr: bool,
-    /// The webhook-scoped auto-fix toggle
-    /// (`[webhook].auto_fix`). It no longer decides whether an issue is
+    /// The webhook-scoped queue toggle
+    /// (`[webhook].queue_fix_issues`). It no longer decides whether an issue is
     /// minted (every code failure is filed): `false` still creates a
     /// `code_fix` / `auto_fix` issue but leaves `AI Agent` unset, so the
     /// failure is reported without queuing a corrective fixup PR; `true` sets
     /// `AI Agent = cfg.queued_value` as before.
-    pub auto_fix_enabled: bool,
+    pub queue_fix_issues: bool,
 }
 
 /// SPEC-3.5: the caps, reused (not re-derived) from the runner's existing
@@ -185,7 +185,7 @@ fn route(bucket: TriageBucket) -> Option<Route> {
 
 /// SPEC-3.5: whether `bucket` routes to the queue-for-fix path (`code_fix` /
 /// `auto_fix`), i.e. whether a freshly-created issue of this bucket would get
-/// `AI Agent` set (subject to the webhook `auto_fix` toggle). Exposed so the
+/// `AI Agent` set (subject to the webhook `queue_fix_issues` toggle). Exposed so the
 /// webhook consumer's reopen-on-regression path can set `AI Agent` exactly as
 /// a new issue of that bucket would, without duplicating [`route`]'s table.
 pub(crate) fn queues_for_fix(bucket: TriageBucket) -> bool {
@@ -618,10 +618,10 @@ pub fn mint(
 
     // State first, then the authoritative AI Agent write last (bucket 1 only):
     // the `youtrack` action only picks the issue up once it is fully formed.
-    // `auto_fix_enabled` now decides only this write, never
+    // `queue_fix_issues` now decides only this write, never
     // whether the issue gets created at all.
     tracker.set_state(&key, &cfg.target_state)?;
-    if route.queue_for_fix && req.auto_fix_enabled {
+    if route.queue_for_fix && req.queue_fix_issues {
         tracker.set_field(&key, &cfg.ai_agent_field, &cfg.queued_value)?;
     }
 
@@ -752,7 +752,7 @@ fn build_auto_fix_description(
     let dedupe_keys = format!("Dedupe-Key: {primary} {secondary} {collapse}");
 
     // Fix step: the concrete command(s) when the detector knows them, else a
-    // reproduce-and-fix instruction for the generic checks-workflow case.
+    // reproduce-and-fix instruction when it does not.
     let fix_lines: Vec<String> = if detail.fix_commands.is_empty() {
         vec![format!(
             "- Reproduce the `{}` checks locally and fix every issue it reports.",
@@ -1011,7 +1011,7 @@ mod tests {
             log_path: None,
             private: false,
             has_open_pr: false,
-            auto_fix_enabled: true,
+            queue_fix_issues: true,
         }
     }
 
@@ -1390,7 +1390,7 @@ mod tests {
         let t = triage(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let mut r = req("fabrikam/forgejo-cli", &t, "alice");
-        r.auto_fix_enabled = false;
+        r.queue_fix_issues = false;
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
         assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
         let calls = tracker.calls();
@@ -1408,7 +1408,7 @@ mod tests {
         let t = auto_fix_triage(cargo_fmt_detail());
         let tracker = StubTracker::new();
         let mut r = req("fabrikam/forgejo-cli", &t, "alice");
-        r.auto_fix_enabled = false;
+        r.queue_fix_issues = false;
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
         assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
         let calls = tracker.calls();
@@ -1423,7 +1423,7 @@ mod tests {
         let t = triage(TriageBucket::HumanAction);
         let tracker = StubTracker::new();
         let mut r = req("contoso/claude-run", &t, "alice");
-        r.auto_fix_enabled = false;
+        r.queue_fix_issues = false;
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
         assert!(
             matches!(out, MintOutcome::Created { .. }),
@@ -1442,7 +1442,7 @@ mod tests {
         let t = triage(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let mut r = req("fabrikam/forgejo-cli", &t, "alice");
-        r.auto_fix_enabled = true;
+        r.queue_fix_issues = true;
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
         assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
         assert!(

@@ -2,10 +2,10 @@
 //!
 //! Implements SPEC-3.5.1's auto-fix detector step.
 //!
-//! A verification-only CI failure (the canonical case is `cargo fmt --check`;
-//! the general case is any failure of a configured checks workflow, default
-//! `check.yml`) is mechanically fixable: the fix is a known command with no
-//! judgement. These detectors run inside the hybrid triage as a deterministic
+//! A CI failure with a mechanical signature (today `cargo fmt --check`) is
+//! mechanically fixable: the fix is a known command with no judgement. A failed
+//! workflow with no such signature is never an auto-fix (SPEC-4.4.6); it goes to
+//! the analysis pass. These detectors run inside the hybrid triage as a deterministic
 //! short-circuit BEFORE the LLM classifier (see [`crate::triage::triage`]), so
 //! such a failure never reaches the prompt that would otherwise label a
 //! push-to-protected-branch failure `human_action`.
@@ -14,9 +14,6 @@
 //! `commit_sha`, log, `has_open_pr`) and returns `Some(AutoFix)` describing a
 //! stable kind id, a human-readable problem statement, the concrete fix
 //! command(s) the runner runs, and an optional step/file scope. The detectors
-//! are tried most-specific first, so a `cargo fmt` failure of `check.yml`
-//! produces the precise `cargo-fmt` verdict (fix `cargo fmt --all`) rather than
-//! the broader `checks-workflow` one.
 
 use serde::{Deserialize, Serialize};
 
@@ -51,7 +48,7 @@ pub fn detect(input: &TriageInput, cfg: &AutoFixConfig) -> Option<AutoFix> {
     if !cfg.enabled {
         return None;
     }
-    detect_cargo_fmt(&input.log).or_else(|| detect_checks_workflow(input, cfg))
+    detect_cargo_fmt(&input.log)
 }
 
 /// `cargo-fmt` detector: matches the rustfmt `cargo fmt --check` failure
@@ -73,60 +70,6 @@ fn detect_cargo_fmt(log: &str) -> Option<AutoFix> {
     } else {
         None
     }
-}
-
-/// `checks-workflow` detector: matches the run's `workflow_id` against the
-/// configured checks-workflow list (default `["check.yml"]`). These workflows
-/// verify rather than produce code, so their failures are auto-fixable; the
-/// detector hands the runner the failing step (when liftable from the log) so it
-/// can choose the right fix (fmt, `clippy --fix`, ...).
-fn detect_checks_workflow(input: &TriageInput, cfg: &AutoFixConfig) -> Option<AutoFix> {
-    let matched = cfg
-        .checks_workflows
-        .iter()
-        .any(|w| w.eq_ignore_ascii_case(&input.workflow_id));
-    if !matched {
-        return None;
-    }
-    let scope = failing_step(&input.log);
-    let problem = match &scope {
-        Some(step) => format!(
-            "the `{}` checks workflow failed at step `{}`; it verifies code rather than producing it, so the failure is mechanically fixable.",
-            input.workflow_id, step
-        ),
-        None => format!(
-            "the `{}` checks workflow failed; it verifies code rather than producing it, so the failure is mechanically fixable.",
-            input.workflow_id
-        ),
-    };
-    Some(AutoFix {
-        kind: "checks-workflow".to_string(),
-        problem,
-        fix_commands: Vec::new(),
-        scope,
-    })
-}
-
-/// Best-effort lift of the failing step name from a Forgejo job log. The runner
-/// emits `##[error]Process completed with exit code N` / `... the step has
-/// failed`; the most recent `##[group]<step>` (or `[step] <name>`) line before a
-/// failure marker names the step. Returns `None` when nothing matches: the
-/// scope is advisory context, never required.
-fn failing_step(log: &str) -> Option<String> {
-    let mut last_step: Option<String> = None;
-    for line in log.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("##[group]") {
-            last_step = Some(rest.trim().to_string());
-        }
-        let lower = trimmed.to_lowercase();
-        if (lower.contains("##[error]") || lower.contains("the step has failed"))
-            && last_step.is_some()
-        {
-            return last_step;
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -189,39 +132,18 @@ mod tests {
         assert!(detect(&input("ci.yml", log), &cfg()).is_none());
     }
 
-    // ---- AC 2: check.yml routing ------------------------------------------
+    // ---- SPEC-4.4.6: a failed workflow with no signature is not an auto-fix ----
 
     #[test]
-    fn checks_workflow_matches_configured_list() {
-        // A non-fmt failure of check.yml falls to the broader checks-workflow
-        // detector (clippy, build, tests are all auto-fixable verification).
+    fn a_checks_workflow_failure_without_a_signature_is_not_an_auto_fix() {
         let log = "##[group]Clippy\n\
             error: unused variable `x`\n\
             ##[error]the step has failed\n";
-        let af = detect(&input("check.yml", log), &cfg()).expect("checks-workflow detected");
-        assert_eq!(af.kind, "checks-workflow");
-        assert_eq!(af.scope.as_deref(), Some("Clippy"));
+        assert!(detect(&input("check.yml", log), &cfg()).is_none());
     }
 
     #[test]
-    fn checks_workflow_match_is_case_insensitive() {
-        let log = "error: build failed\n";
-        let af = detect(&input("Check.YML", log), &cfg()).expect("checks-workflow detected");
-        assert_eq!(af.kind, "checks-workflow");
-    }
-
-    #[test]
-    fn non_checks_workflow_falls_through() {
-        // A workflow not on the list and with no fmt signature is not an
-        // auto-fix; the caller hands it to the LLM classifier.
-        let log = "error: build failed\n";
-        assert!(detect(&input("release.yml", log), &cfg()).is_none());
-    }
-
-    #[test]
-    fn cargo_fmt_wins_over_checks_workflow_for_a_fmt_failure_of_check_yml() {
-        // The canonical case: check.yml fails on cargo fmt. The more specific
-        // cargo-fmt detector fires, giving the precise `cargo fmt --all` fix.
+    fn cargo_fmt_wins_for_a_fmt_failure_of_check_yml() {
         let log = "Run cargo fmt --check\nDiff in src/main.rs at line 3:\n";
         let af = detect(&input("check.yml", log), &cfg()).expect("detected");
         assert_eq!(af.kind, "cargo-fmt");

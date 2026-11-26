@@ -282,20 +282,25 @@ pub struct WebhookConfig {
     /// names with other characters are warned about at load. An empty map
     /// disables the listener (no endpoints, fail-closed like an unset secret).
     pub sources: BTreeMap<String, WebhookSource>,
-    /// Webhook-scoped auto-fix switch. It no longer
-    /// decides whether an issue is minted at all (every code failure is filed,
-    /// so `No orphan notes` holds even with this off): `false` (the default,
-    /// opt-in) still creates a `code_fix` / `auto_fix` issue but leaves it with
-    /// no `AI Agent` write, so no corrective fixup PR is queued and a red PR
-    /// check stays reported on the original PR for its author to fix in place;
-    /// `true` sets `AI Agent = Queued` on that issue
-    /// as before. A `human_action` failure is unaffected either way. This gates
-    /// only the webhook fixup queuing; it is independent of the framework-wide
-    /// `[mint].auto_fix.enabled` detector switch and of the open-PR
-    /// suppression. Being on `WebhookConfig` it is DB-backed (`config.webhook`)
-    /// and edited live on the Settings page / via `PUT /api/settings/webhook`
-    /// with no restart.
-    pub auto_fix: bool,
+    /// Whether a created `code_fix` / `auto_fix` issue gets `AI Agent` set to
+    /// the queued value (`SPEC-4.4.6`). It never decides whether an issue is
+    /// created: `false` (the default, opt-in) leaves the issue with no `AI Agent`
+    /// write, so no corrective fixup PR is queued. A `human_action` failure is
+    /// unaffected either way. Independent of `[mint].detect_fixable`, which
+    /// decides whether the detectors run. DB-backed (`config.webhook`), applied
+    /// on the next event.
+    pub queue_fix_issues: bool,
+    /// Branches whose failed runs are triaged, per repo pattern (`SPEC-4.4.6`):
+    /// exact `owner/repo`, `owner/*` or `*`, the most specific match winning.
+    /// A failed run with no open PR on a branch outside the matching list is
+    /// acknowledged and dropped before any analysis. An open PR is routed by
+    /// who opened it instead and ignores this list. Default `{"*": ["main",
+    /// "develop"]}`.
+    pub triage_branches: BTreeMap<String, Vec<String>>,
+    /// Whether a CI failure on a human-authored open PR is analyzed and
+    /// commented on (`SPEC-4.4.3`, `SPEC-4.4.6`). `false` (the default) drops it
+    /// with an `info` log; either way it never mints an issue.
+    pub pr_analysis: bool,
     /// Timeout (seconds) for the at-ingest [`crate::triage::AnalysisClassifier`]
     /// session, which runs `Read,Grep,Bash` over the complete log and the
     /// failing workflow YAML. Default 600 (the retired scheduled analysis
@@ -331,7 +336,12 @@ impl Default for WebhookConfig {
             sources: BTreeMap::new(),
             analysis_timeout_secs: 600,
             analysis_concurrency: 2,
-            auto_fix: false,
+            queue_fix_issues: false,
+            triage_branches: BTreeMap::from([(
+                "*".to_string(),
+                vec!["main".to_string(), "develop".to_string()],
+            )]),
+            pr_analysis: false,
             agent_pr_fix_attempts: 3,
             agent_pr_fix_attempts_hard_cap: 6,
             max_runs_per_day: 20,
@@ -368,6 +378,23 @@ fn source_name_is_clean(name: &str) -> bool {
 }
 
 impl WebhookConfig {
+    /// SPEC-4.4.6: whether a failed run on `branch` of `repo` is triaged. The
+    /// most specific `triage_branches` pattern wins (exact `owner/repo`, then
+    /// `owner/*`, then `*`); a repo no pattern matches triages no branch.
+    pub fn triages_branch(&self, repo: &str, branch: &str) -> bool {
+        let owner_pattern = repo.split_once('/').map(|(o, _)| format!("{o}/*"));
+        let list = self
+            .triage_branches
+            .get(repo)
+            .or_else(|| {
+                owner_pattern
+                    .as_deref()
+                    .and_then(|p| self.triage_branches.get(p))
+            })
+            .or_else(|| self.triage_branches.get("*"));
+        list.is_some_and(|branches| branches.iter().any(|b| b == branch))
+    }
+
     /// Warn at load for any source name that is not lowercase
     /// `[a-z0-9_-]`. The name is the `/webhooks/forgejo/<name>` path segment, so
     /// an unusual name needs URL escaping in the Forgejo webhook URL and is a
@@ -654,13 +681,12 @@ pub struct MintConfig {
     /// `AI Agent` value set on a bucket-1 (code-fix) issue so the `youtrack`
     /// action's pickup logic opens the fix PR. Default `Queued`.
     pub queued_value: String,
-    /// Auto-fix framework settings. A nested `[mint]` subsection (so
-    /// it rides the existing DB-backed mint section rather than
-    /// adding a whole new settings section). When enabled, mechanically-fixable
-    /// CI failures (cargo fmt, a failing checks workflow) are routed
-    /// deterministically to the auto-fix bucket (queued for a corrective PR)
-    /// instead of to a human.
-    pub auto_fix: AutoFixConfig,
+    /// Whether the deterministic detectors run (`SPEC-4.4.6`). When enabled, a
+    /// failure with a mechanical signature (cargo fmt) is routed
+    /// deterministically to the auto-fix bucket; when disabled no detector runs
+    /// and the failure goes to the analysis pass. Whether the resulting issue is
+    /// queued is `[webhook].queue_fix_issues`.
+    pub detect_fixable: AutoFixConfig,
     /// Branch-name prefixes (matched case-sensitively, e.g. `renovate/`) owned by
     /// another bot that rebases or force-pushes its branches on every run. A
     /// failing check on a branch matching one of these prefixes never routes to
@@ -689,7 +715,7 @@ impl Default for MintConfig {
             resolved_state: "Done".to_string(),
             ai_agent_field: "AI Agent".to_string(),
             queued_value: "Queued".to_string(),
-            auto_fix: AutoFixConfig::default(),
+            detect_fixable: AutoFixConfig::default(),
             bot_branch_prefixes: vec!["renovate/".to_string()],
             needs_info_tag: "Needs-Info".to_string(),
         }
@@ -700,9 +726,8 @@ impl Default for MintConfig {
 ///
 /// Detectors in [`crate::autofix`] turn a verification-only CI failure into a
 /// deterministic auto-fix verdict (no LLM call). The `cargo-fmt` detector is
-/// signature-driven and always on while the framework is `enabled`; the
-/// `checks-workflow` detector matches the run's `workflow_id` against
-/// [`AutoFixConfig::checks_workflows`]. SPEC-6.2.
+/// signature-driven and on while the framework is `enabled`. A failed workflow
+/// with no mechanical signature is never an auto-fix (SPEC-4.4.6). SPEC-6.2.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutoFixConfig {
@@ -1612,6 +1637,45 @@ pub fn resolve_database(paths: &Paths, cfg: &DatabaseConfig) -> Result<DatabaseT
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg_with(branches: &[(&str, &[&str])]) -> WebhookConfig {
+        WebhookConfig {
+            triage_branches: branches
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.iter().map(|b| b.to_string()).collect()))
+                .collect(),
+            ..WebhookConfig::default()
+        }
+    }
+
+    #[test]
+    fn triage_branches_default_lists_main_and_develop() {
+        let cfg = WebhookConfig::default();
+        assert!(cfg.triages_branch("acme/widgets", "main"));
+        assert!(cfg.triages_branch("acme/widgets", "develop"));
+        assert!(!cfg.triages_branch("acme/widgets", "specification"));
+        assert!(!cfg.triages_branch("acme/widgets", "feat/x"));
+    }
+
+    #[test]
+    fn triage_branches_most_specific_pattern_wins() {
+        let cfg = cfg_with(&[
+            ("*", &["main"]),
+            ("acme/*", &["main", "develop"]),
+            ("acme/widgets", &["release"]),
+        ]);
+        assert!(cfg.triages_branch("acme/widgets", "release"));
+        assert!(!cfg.triages_branch("acme/widgets", "main"), "exact wins");
+        assert!(cfg.triages_branch("acme/gadgets", "develop"), "owner wins");
+        assert!(!cfg.triages_branch("other/repo", "develop"), "global list");
+        assert!(cfg.triages_branch("other/repo", "main"));
+    }
+
+    #[test]
+    fn triage_branches_repo_with_no_matching_pattern_triages_nothing() {
+        let cfg = cfg_with(&[("acme/widgets", &["main"])]);
+        assert!(!cfg.triages_branch("other/repo", "main"));
+    }
 
     #[test]
     fn expand_handles_tilde_and_env() {

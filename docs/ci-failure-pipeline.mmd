@@ -11,7 +11,10 @@ flowchart TD
         PR1 -- "lookup error" --> N4["run fails (ok=false); nothing minted or commented"]
         PR1 --> PR2{"open PR for this commit?"}
 
-        PR2 -- no --> S1{"ci_failure store match?"}
+        PR2 -- no --> BR1{"branch in webhook.triage_branches?"}
+        BR1 -- "branch not derivable" --> N5["run fails (ok=false); nothing minted"]
+        BR1 -- no --> N6["acknowledged and dropped (info log); nothing minted"]
+        BR1 -- yes --> S1{"ci_failure store match?"}
         S1 -- "open" --> S2["attach run + tests, comment"]
         S1 -- "resolved" --> S3["reopen: set_state, regression comment"]
         S3 --> T1
@@ -19,7 +22,7 @@ flowchart TD
         L1 -- yes --> L2["adopt: record store row, attach"]
         L1 -- no --> T1{"transient failure?"}
         T1 -- yes --> N2["no issue"]
-        T1 -- no --> T2{"known mechanical fix? cargo fmt, checks workflow"}
+        T1 -- no --> T2{"mint.detect_fixable on, and a mechanical signature? cargo fmt"}
         T2 -- yes --> BA["auto_fix"]
         T2 -- no --> T3["AnalysisClassifier: Read/Grep/Bash over the full log + failing workflow YAML, one fenced JSON verdict"]:::claude
         T3 -- "code_defect" --> BC["code_fix"]
@@ -31,10 +34,10 @@ flowchart TD
         I1 --> R0["record ci_failures row"]
         R0 --> I2{"bucket"}
         I2 -- human_action --> I3["assign a human"]
-        I2 -- "code_fix, auto_fix" --> G2{"webhook auto_fix on?"}
+        I2 -- "code_fix, auto_fix" --> G2{"webhook queue_fix_issues on?"}
         G2 -- yes --> I4["AI Agent: Queued"]
         G2 -- no --> I5["no AI Agent write"]
-        S3 --> G3{"code_fix/auto_fix bucket and auto_fix on?"}
+        S3 --> G3{"code_fix/auto_fix bucket and queue_fix_issues on?"}
         G3 -- yes --> I4
 
         PR2 -- yes --> AG1{"agent_pull_requests row open for this PR?"}
@@ -43,10 +46,11 @@ flowchart TD
         AG2 -- no --> AG5{"failing tests overlap none of the PR's earlier attempts, and fix_attempts below agent_pr_fix_attempts_hard_cap?"}
         AG5 -- yes --> AG3
         AG5 -- no --> AG4["AI Agent: Needs Review; comment lists every attempt's run and failing-test set"]
-        AG1 -- no --> H1{"failing tests match a ci_failure row?"}
+        AG1 -- no --> HP{"webhook.pr_analysis on?"}
+        HP -- no --> HN["dropped (info log); no analysis, no comment, no issue"]
+        HP -- yes --> H1{"failing tests match a ci_failure row?"}
         H1 -- "open" --> H2["comment PR: already tracked in KEY; attach run; no analysis"]
-        H1 -- "pr_only, now 2+ distinct branches" --> H3["mint issue, point the store row at it, comment BOTH PRs"]
-        H1 -- "pr_only (still 1 branch) / none" --> H4["analyze, comment the PR, record/keep a pr_only row"]
+        H1 -- "pr_only / none" --> H4["analyze, comment the PR, record/keep a pr_only row; never mints an issue"]
     end
 
     F --> W1
