@@ -1,11 +1,11 @@
 ---
 
-# Minimal checks for `develop`, full checks for `main` (SPEC-11.11 to SPEC-11.14).
+# Minimal checks for `develop`, full checks for `main` (SPEC-11.3.1 to SPEC-11.3.4).
 # A pull request whose base is `develop` and a push to `develop` run fmt, clippy,
 # the CLAUDE.md guard, the secrets scan and spelling. A pull request whose base is
 # `main` and a push to `main` add the build, the unit tests on SQLite and
 # PostgreSQL and a not-pushed image compile. No other branch starts a workflow
-# (SPEC-11.12). Image publication is `build-image.yml`, not a check (SPEC-11.15).
+# (SPEC-11.3.2). Image publication is `build-image.yml`, not a check (SPEC-11.3.5).
 #
 # Mirrors the local `just check` recipe (the `claude-md` job is its
 # `check-claude-md` step). This stays a standalone workflow rather
@@ -24,7 +24,7 @@
 # compile job's own `if:` skips it; a skipped job still posts commit status
 # `skipped`, which satisfies the required check.
 #
-# SPEC-11.7, PSTD-1.1.9: for a pull request whose head branch is
+# SPEC-11.2.6, PSTD-1.1.9: for a pull request whose head branch is
 # `specification`, `changes`, `claude-md` and `check` skip (their `if:`
 # conditions below also check `github.head_ref`), and only `specification`,
 # `spelling` and `secrets` run. The same reasoning as above applies: these
@@ -50,7 +50,7 @@ env:
 
 jobs:
   changes:
-    # SPEC-11.7, PSTD-1.1.9: skipped (not absent) for a pull request whose head
+    # SPEC-11.2.6, PSTD-1.1.9: skipped (not absent) for a pull request whose head
     # branch is `specification`, where only `check-specification`,
     # `check-spelling` and `check-secrets` may run.
     # PSTD-1.1.14: also skipped on a title/label-only re-run.
@@ -74,7 +74,7 @@ jobs:
   claude-md:
     # Runs on every push and PR, docs-only ones included, since
     # CLAUDE.md growth is exactly what a docs-only change can introduce.
-    # SPEC-11.7, PSTD-1.1.9: skipped for a `specification` head branch, same as `changes`.
+    # SPEC-11.2.6, PSTD-1.1.9: skipped for a `specification` head branch, same as `changes`.
     # PSTD-1.1.14: also skipped on a title/label-only re-run.
     if: github.event.action != 'edited' && github.event.action != 'labeled' && github.event.action != 'unlabeled' && github.head_ref != 'specification'
     name: CLAUDE.md guard
@@ -96,7 +96,7 @@ jobs:
     # Skipped for a `non-code` diff; for `comments-only` only the
     # formatting check runs (the steps below gate on `code`). The CLAUDE.md
     # guard and secrets scan run unconditionally.
-    # SPEC-11.7, PSTD-1.1.9: also skipped for a `specification` head branch,
+    # SPEC-11.2.6, PSTD-1.1.9: also skipped for a `specification` head branch,
     # same as `changes`, whose `result` output this condition already reads.
     # PSTD-1.1.14: also skipped on a title/label-only re-run.
     if: github.event.action != 'edited' && github.event.action != 'labeled' && github.event.action != 'unlabeled' && needs.changes.outputs.result != 'non-code' && github.head_ref != 'specification'
@@ -112,7 +112,7 @@ jobs:
     #
     # The PostgreSQL pass runs on a throwaway, non-durable
     # Postgres started by `claude-run test-postgres --network` on this job's
-    # own Docker network (SPEC-6.6, SPEC-11.1), not on a service container: a
+    # own Docker network (SPEC-6.6.1, SPEC-11.1.1), not on a service container: a
     # service's `options` cannot turn off fsync, on this runner's busy array a
     # durable server made the pass take an hour (run #764, 3735 s) where the
     # non-durable one took about 5 minutes (run #766). Its data directory is a
@@ -213,7 +213,7 @@ jobs:
           print $"TIMING: clippy-end ((date now | format date '%+'))"
 
       - name: Build
-        # Full checks only (SPEC-11.14).
+        # Full checks only (SPEC-11.3.4).
         if: needs.changes.outputs.result == 'code' && ((github.event_name == 'pull_request' && github.base_ref == 'main') || github.ref == 'refs/heads/main')
         shell: nu {0}
         run: |
@@ -224,7 +224,7 @@ jobs:
           print $"TIMING: target-cache-size-after-build ($size) bytes"
 
       - name: Unit tests (SQLite, the default backend)
-        # Full checks only (SPEC-11.14).
+        # Full checks only (SPEC-11.3.4).
         if: needs.changes.outputs.result == 'code' && ((github.event_name == 'pull_request' && github.base_ref == 'main') || github.ref == 'refs/heads/main')
         timeout-minutes: 30
         shell: nu {0}
@@ -234,9 +234,9 @@ jobs:
           print $"TIMING: sqlite-tests-end ((date now | format date '%+'))"
 
       - name: Unit tests (PostgreSQL)
-        # Full checks only (SPEC-11.14).
+        # Full checks only (SPEC-11.3.4).
         if: needs.changes.outputs.result == 'code' && ((github.event_name == 'pull_request' && github.base_ref == 'main') || github.ref == 'refs/heads/main')
-        # SPEC-6.6, SPEC-11.1: `claude-run test-postgres` starts a throwaway
+        # SPEC-6.6.1, SPEC-11.1.1: `claude-run test-postgres` starts a throwaway
         # Postgres on a tmpfs with fsync, full_page_writes, synchronous_commit
         # and autovacuum off (common PSPEC-2.1.1 to PSPEC-2.1.5) and
         # sets CLAUDE_RUN_TEST_DATABASE_URL for the command only, so the SQLite
@@ -324,10 +324,10 @@ jobs:
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main
 
   image:
-    # Full checks only (SPEC-11.14): compiles the builder stage and pushes
+    # Full checks only (SPEC-11.3.4): compiles the builder stage and pushes
     # nothing; publication is build-image.yml. `classify-diff` decides the skip
-    # (SPEC-11.17), via the `changes` job.
-    # SPEC-11.7, PSTD-1.1.9: also skipped for a `specification` head branch.
+    # (SPEC-11.3.7), via the `changes` job.
+    # SPEC-11.2.6, PSTD-1.1.9: also skipped for a `specification` head branch.
     # PSTD-1.1.14: also skipped on a title/label-only re-run.
     needs: changes
     if: github.event.action != 'edited' && github.event.action != 'labeled' && github.event.action != 'unlabeled' && needs.changes.outputs.result == 'code' && ((github.event_name == 'pull_request' && github.base_ref == 'main') || github.ref == 'refs/heads/main') && github.head_ref != 'specification'
@@ -382,8 +382,8 @@ jobs:
           kingfisher_skip_regex: 'claude_run:(claude_run|secret|\(\$password\)|<that password>)@|^x-access-token$|oauth2:(secret|tok|tok-123|\(\$pat\))@|ghp_(secret|from_login|action)@|user:s3cr3t@'
 
   specification:
-    # SPEC-11.6, PSTD-1.1.8: runs on every pull request to `main`, including a
-    # `specification` head branch (SPEC-11.7, PSTD-1.1.9), and is never skipped.
+    # SPEC-11.2.5, PSTD-1.1.8: runs on every pull request to `main`, including a
+    # `specification` head branch (SPEC-11.2.6, PSTD-1.1.9), and is never skipped.
     # The shared action itself owns the check (PSTD-1.3.1); this repository
     # carries no copy of its logic.
     name: Specification scope
@@ -400,7 +400,7 @@ jobs:
   spelling:
     # PSTD-1.3.3: runs on every pull request, with no continue-on-error and no
     # `if:` that would skip it (PSTD-1.3.5) beyond the PSTD-1.1.14 title/label-only
-    # re-run, including a `specification` head branch (SPEC-11.7, PSTD-1.1.9).
+    # re-run, including a `specification` head branch (SPEC-11.2.6, PSTD-1.1.9).
     # The shared action owns the check (PSTD-1.3.1).
     if: github.event.action != 'edited' && github.event.action != 'labeled' && github.event.action != 'unlabeled'
     name: Spell check

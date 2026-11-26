@@ -1,4 +1,4 @@
-//! SPEC-4.5: the Streamable HTTP MCP listener.
+//! SPEC-4.5.1 through SPEC-4.5.4: the Streamable HTTP MCP listener.
 //!
 //! Serves the same eight read-only tools as `claude-run mcp stdio`
 //! (`src/mcp.rs`) over `/mcp`, behind the `mcp-web` crate's
@@ -33,17 +33,17 @@ use crate::db::DbPool;
 use crate::error::{Error, Result};
 use crate::mcp::McpServer;
 
-/// SPEC-4.5: the key files under `Paths::config_dir`. Config, like
+/// SPEC-4.5.1 through SPEC-4.5.4: the key files under `Paths::config_dir`. Config, like
 /// `secrets.key`: an operator's own backup/restore tooling targets the
 /// config dir, not the data dir that workdirs and `state.db` live under.
 const MASTER_KEY_FILE: &str = "mcp-master.key";
 const SESSION_KEY_FILE: &str = "mcp-session.key";
-/// SPEC-4.5: the account/session/OAuth store under `Paths::data_dir`, beside
+/// SPEC-4.5.1 through SPEC-4.5.4: the account/session/OAuth store under `Paths::data_dir`, beside
 /// `state.db`: generated state, not configuration, so it is never backed up
 /// or restored like the keys.
 const DB_FILE: &str = "mcp-web.db";
 
-/// SPEC-4.5: `mcp_web::UpstreamDirectory` trivial implementation.
+/// SPEC-4.5.1 through SPEC-4.5.4: `mcp_web::UpstreamDirectory` trivial implementation.
 ///
 /// There is no per-account upstream instance here: every tool reads the one
 /// shared `claude-run` state store regardless of which account called it, so
@@ -78,7 +78,7 @@ impl mcp_web::UpstreamDirectory for AlwaysConnected {
     }
 }
 
-/// SPEC-4.5 / SPEC-7.1: fails loudly rather than regenerating a corrupt key.
+/// SPEC-4.5.1 through SPEC-4.5.4 / SPEC-7.1.1 through SPEC-7.1.5: fails loudly rather than regenerating a corrupt key.
 ///
 /// Pull the base64 key value out of a file written by [`generate_key_file`]:
 /// blank lines and `#` comments are skipped, the key is the first line left.
@@ -93,7 +93,7 @@ fn read_key_file(path: &Path) -> Result<String> {
         .ok_or_else(|| Error::Other(anyhow::anyhow!("{} has no key line", path.display())))
 }
 
-/// SPEC-4.5: one of the two MCP key files, mode `0600`.
+/// SPEC-4.5.1 through SPEC-4.5.4: one of the two MCP key files, mode `0600`.
 ///
 /// Create a new base64-encoded 32-byte key at `path`, mode `0600`. Fails
 /// rather than overwrites when the file already exists, so a restart racing
@@ -134,7 +134,7 @@ fn generate_key_file(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// SPEC-4.5: generates a key on first start, never on a missing-then-present race.
+/// SPEC-4.5.1 through SPEC-4.5.4: generates a key on first start, never on a missing-then-present race.
 ///
 /// Load the key at `path`, generating one on first start. Unlike
 /// `secrets::ensure_key`, there is no pre-existing store to check for
@@ -152,7 +152,7 @@ fn ensure_key_file(path: &Path, label: &str) -> Result<String> {
     read_key_file(path)
 }
 
-/// SPEC-4.5: both MCP key files, generated once on first start.
+/// SPEC-4.5.1 through SPEC-4.5.4: both MCP key files, generated once on first start.
 ///
 /// Resolve both MCP key files under `config_dir`, generating either on first
 /// start. A present-but-corrupt file (not valid base64, wrong length) fails
@@ -165,7 +165,7 @@ fn ensure_mcp_keys(config_dir: &Path) -> Result<(String, String)> {
     Ok((master, session))
 }
 
-/// SPEC-4.5: builds the listener, failing it alone on an unmet precondition.
+/// SPEC-4.5.1 through SPEC-4.5.4: builds the listener, failing it alone on an unmet precondition.
 ///
 /// Assemble the generic `AppState` plus the full router (generic account /
 /// admin / OAuth surface merged with the bearer-gated `/mcp` surface), or
@@ -237,7 +237,7 @@ async fn build(
     Ok((state, router))
 }
 
-/// SPEC-4.5: off by default; a build failure degrades only this listener.
+/// SPEC-4.5.1 through SPEC-4.5.4: off by default; a build failure degrades only this listener.
 ///
 /// Spawn the listener as its own task when `[mcp].enabled` is true, else do
 /// nothing. A misconfigured or unbuildable listener logs at `error` naming

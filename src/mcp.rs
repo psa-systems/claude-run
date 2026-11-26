@@ -1,4 +1,4 @@
-//! SPEC-4.5: the eight read-only MCP tools.
+//! SPEC-4.5.1 through SPEC-4.5.4: the eight read-only MCP tools.
 //!
 //! Read-only troubleshooting MCP server (`claude-run mcp stdio`).
 //!
@@ -23,22 +23,22 @@ use crate::config as cfg;
 use crate::db::DbPool;
 use crate::{ci_failure, state};
 
-/// SPEC-4.5: `list_runs` / `list_ci_failures` `limit` default.
+/// SPEC-4.5.1 through SPEC-4.5.4: `list_runs` / `list_ci_failures` `limit` default.
 const DEFAULT_LIST_LIMIT: i64 = 20;
-/// SPEC-4.5: `list_runs` / `list_ci_failures` `limit` ceiling; above this is an error.
+/// SPEC-4.5.1 through SPEC-4.5.4: `list_runs` / `list_ci_failures` `limit` ceiling; above this is an error.
 const MAX_LIST_LIMIT: i64 = 100;
-/// SPEC-4.5: `get_stream_log` `tail_lines` default.
+/// SPEC-4.5.1 through SPEC-4.5.4: `get_stream_log` `tail_lines` default.
 const DEFAULT_TAIL_LINES: u32 = 200;
-/// SPEC-4.5: `get_stream_log` `tail_lines` ceiling; above this is an error.
+/// SPEC-4.5.1 through SPEC-4.5.4: `get_stream_log` `tail_lines` ceiling; above this is an error.
 const MAX_TAIL_LINES: u32 = 2000;
-/// SPEC-4.5: `get_stream_log` whole-response cap.
+/// SPEC-4.5.1 through SPEC-4.5.4: `get_stream_log` whole-response cap.
 const STREAM_LOG_RESPONSE_CAP_BYTES: usize = 256 * 1024;
 
 fn json_result(value: serde_json::Value) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(value.to_string())])
 }
 
-/// SPEC-4.5: every tool error logs instead of printing to stdout.
+/// SPEC-4.5.1 through SPEC-4.5.4: every tool error logs instead of printing to stdout.
 ///
 /// A failed read or an unreadable file: logged at `warn` (the query or file
 /// itself is the problem), reported to the caller with the cause.
@@ -47,7 +47,7 @@ fn tool_error(cause: impl std::fmt::Display) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(cause.to_string())])
 }
 
-/// SPEC-4.5: every tool error logs instead of printing to stdout.
+/// SPEC-4.5.1 through SPEC-4.5.4: every tool error logs instead of printing to stdout.
 ///
 /// An unknown id / key / action: logged at `info` (an expected "no such
 /// thing" rather than a failure), reported to the caller with the cause.
@@ -56,7 +56,7 @@ fn tool_not_found(cause: impl std::fmt::Display) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(cause.to_string())])
 }
 
-/// SPEC-4.5: limits above the maximum are rejected, not clamped.
+/// SPEC-4.5.1 through SPEC-4.5.4: limits above the maximum are rejected, not clamped.
 ///
 /// Validate `limit`: `None` becomes `default`, a value over `max` is an
 /// error naming the parameter and the value rather than being clamped.
@@ -73,7 +73,7 @@ fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> Result<i64, Box
     }
 }
 
-/// SPEC-4.5: `list_runs` arguments.
+/// SPEC-4.5.1 through SPEC-4.5.4: `list_runs` arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListRunsArgs {
     /// Restrict to this action name. Omit to list runs for every action.
@@ -88,14 +88,14 @@ pub struct ListRunsArgs {
     pub limit: Option<i64>,
 }
 
-/// SPEC-4.5: `get_run` arguments.
+/// SPEC-4.5.1 through SPEC-4.5.4: `get_run` arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunIdArgs {
     /// The `runs.id` to inspect.
     pub run_id: i64,
 }
 
-/// SPEC-4.5: `get_attempts` arguments.
+/// SPEC-4.5.1 through SPEC-4.5.4: `get_attempts` arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetAttemptsArgs {
     /// The action name the attempt counter is keyed under.
@@ -104,7 +104,7 @@ pub struct GetAttemptsArgs {
     pub key: String,
 }
 
-/// SPEC-4.5: `get_stream_log` arguments.
+/// SPEC-4.5.1 through SPEC-4.5.4: `get_stream_log` arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetStreamLogArgs {
     /// The `runs.id` the job ran under.
@@ -120,7 +120,7 @@ pub struct GetStreamLogArgs {
     pub tail_lines: Option<u32>,
 }
 
-/// SPEC-4.5: `get_gate_output` arguments.
+/// SPEC-4.5.1 through SPEC-4.5.4: `get_gate_output` arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetGateOutputArgs {
     /// The `runs.id` the job ran under.
@@ -132,7 +132,7 @@ pub struct GetGateOutputArgs {
     pub attempt: Option<u32>,
 }
 
-/// SPEC-4.5: `list_ci_failures` arguments.
+/// SPEC-4.5.1 through SPEC-4.5.4: `list_ci_failures` arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListCiFailuresArgs {
     /// Restrict to this `ci_failures.state` (`open` / `resolved` / `pr_only`).
@@ -145,14 +145,14 @@ pub struct ListCiFailuresArgs {
     pub limit: Option<i64>,
 }
 
-/// SPEC-4.5: `get_ci_failure` arguments.
+/// SPEC-4.5.1 through SPEC-4.5.4: `get_ci_failure` arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CiFailureIdArgs {
     /// The `ci_failures.id` to inspect.
     pub id: i64,
 }
 
-/// SPEC-4.5: the transport-agnostic tool server (shared by stdio and HTTP).
+/// SPEC-4.5.1 through SPEC-4.5.4: the transport-agnostic tool server (shared by stdio and HTTP).
 ///
 /// The `claude-run` read-only troubleshooting MCP server. Holds the DB pool
 /// (opened once, migrated by [`crate::db::open`] like every other DB-direct
@@ -167,7 +167,7 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    /// SPEC-4.5: constructs the tool server from the DB pool and resolved paths.
+    /// SPEC-4.5.1 through SPEC-4.5.4: constructs the tool server from the DB pool and resolved paths.
     pub fn new(pool: DbPool, paths: cfg::Paths) -> Self {
         Self {
             pool,
@@ -179,7 +179,7 @@ impl McpServer {
 
 #[tool_router]
 impl McpServer {
-    /// SPEC-4.5: `get_status`; `"source": "database"` makes no claim about
+    /// SPEC-4.5.1 through SPEC-4.5.4: `get_status`; `"source": "database"` makes no claim about
     /// whether the daemon process is running.
     #[tool(
         description = "Global pause state, every action with its enabled/schedule/pause/last-run \
@@ -209,7 +209,7 @@ impl McpServer {
         }
     }
 
-    /// SPEC-4.5: `list_runs`.
+    /// SPEC-4.5.1 through SPEC-4.5.4: `list_runs`.
     #[tool(
         description = "List runs newest first: id, action, started/ended, exit code, jobs \
                         processed, failed job count, triggered-by, current job key, and stage. \
@@ -235,11 +235,11 @@ impl McpServer {
         }
     }
 
-    /// SPEC-4.5: `get_run`.
+    /// SPEC-4.5.1 through SPEC-4.5.4: `get_run`.
     #[tool(
         description = "One run's row, its job outcomes (key, attempt, ok, claude ran/ok, cost, \
                         timed out, duration, summary, whether a stream log is recorded, whether a \
-                        SPEC-3.3.2 verification gate failure left an output file), and its \
+                        SPEC-3.3.20 through SPEC-3.3.25 verification gate failure left an output file), and its \
                         run_events (warn/error diagnostics first). Unknown run_id is an error.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
@@ -274,7 +274,7 @@ impl McpServer {
         }))
     }
 
-    /// SPEC-4.5 / SPEC-3.1: `get_attempts`.
+    /// SPEC-4.5.1 through SPEC-4.5.4 / SPEC-3.1.1 through SPEC-3.1.12: `get_attempts`.
     #[tool(
         description = "The attempt counter for one (action, key) pair, plus the action's \
                         effective attempt cap.",
@@ -303,7 +303,7 @@ impl McpServer {
         }))
     }
 
-    /// SPEC-4.5: `get_stream_log`, including the path-containment defense.
+    /// SPEC-4.5.1 through SPEC-4.5.4: `get_stream_log`, including the path-containment defense.
     #[tool(
         description = "Tail one job attempt's recorded stream log. run_id and job_key are \
                         required; attempt defaults to that job's latest attempt in the run. \
@@ -401,14 +401,14 @@ impl McpServer {
         }))
     }
 
-    /// SPEC-4.5: `get_gate_output`, including the
+    /// SPEC-4.5.1 through SPEC-4.5.4: `get_gate_output`, including the
     /// path-containment defense. Unlike [`Self::get_stream_log`], the served
     /// path is built from `job_key` directly (via
     /// [`crate::claude::ClaudeInvoker::gate_output_path`]) rather than read
     /// back from a DB-recorded column, so the canonicalize + `starts_with`
     /// check is load-bearing here, not only defense-in-depth.
     #[tool(
-        description = "Full output of a failed SPEC-3.3.2 verification gate for one job attempt. \
+        description = "Full output of a failed SPEC-3.3.20 through SPEC-3.3.25 verification gate for one job attempt. \
                         run_id and job_key are required; attempt defaults to that job's latest \
                         attempt in the run. Returns an error when the job's gate never failed (no \
                         output file was written).",
@@ -498,7 +498,7 @@ impl McpServer {
         }))
     }
 
-    /// SPEC-4.5: `list_ci_failures`.
+    /// SPEC-4.5.1 through SPEC-4.5.4: `list_ci_failures`.
     #[tool(
         description = "List CI failures newest-updated first: id, repo, workflow id, job name, \
                         infra kind, issue key, state, created/updated. Optional state filter \
@@ -520,7 +520,7 @@ impl McpServer {
         }
     }
 
-    /// SPEC-4.5: `get_ci_failure`.
+    /// SPEC-4.5.1 through SPEC-4.5.4: `get_ci_failure`.
     #[tool(
         description = "One CI failure row, its distinct sighted branches, and the distinct PR \
                         numbers it has been seen on. Unknown id is an error.",
@@ -554,14 +554,14 @@ impl McpServer {
 
 #[tool_handler]
 impl ServerHandler for McpServer {
-    /// SPEC-4.5: the server's advertised name/capabilities.
+    /// SPEC-4.5.1 through SPEC-4.5.4: the server's advertised name/capabilities.
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("claude-run", crate::VERSION))
     }
 }
 
-/// SPEC-4.5: the tail-by-lines-then-bytes algorithm `get_stream_log` uses.
+/// SPEC-4.5.1 through SPEC-4.5.4: the tail-by-lines-then-bytes algorithm `get_stream_log` uses.
 ///
 /// Split `content` into lines, keep the last `tail_lines`, then trim from the
 /// front (on a char boundary) so the returned text fits `cap_bytes`. Returns
@@ -589,7 +589,7 @@ fn tail_text(content: &str, tail_lines: usize, cap_bytes: usize) -> (i64, i64, b
     (total_lines as i64, returned_lines as i64, truncated, tail)
 }
 
-/// SPEC-4.5: `mcp stdio`.
+/// SPEC-4.5.1 through SPEC-4.5.4: `mcp stdio`.
 ///
 /// Start the MCP server over stdio: open the DB pool, migrate it (same as
 /// every other DB-direct subcommand), serve until the client disconnects.

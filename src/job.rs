@@ -19,7 +19,7 @@
 //! - Daily Claude-invocation count + cost ledger advance only when claude
 //!   actually ran (real budget was spent).
 //!
-//! SPEC-3.2.8: "a scripted job's per-job pipeline is: `filter` -> workdir
+//! SPEC-3.2.11: "a scripted job's per-job pipeline is: `filter` -> workdir
 //! creation -> `pre` steps -> `prompt` -> `claude` -> `post` steps -> outcome
 //! record -> guarded workdir cleanup."
 
@@ -78,7 +78,7 @@ pub struct EffectiveLimits {
     /// `EffectiveLimits` is `Copy` and is moved into each per-job task by value,
     /// so no job can raise the ceiling it runs under.
     ///
-    /// SPEC-3.2.2: "the ceiling is resolved once, before the run starts, and
+    /// SPEC-3.2.3: "the ceiling is resolved once, before the run starts, and
     /// is immutable for the run's lifetime."
     pub run_budget_usd: f64,
     pub budget_warn_fraction: f64,
@@ -96,7 +96,7 @@ impl EffectiveLimits {
     }
 }
 
-/// SPEC-3.2.2: "an action with no per-run ceiling gets its own daily budget
+/// SPEC-3.2.3: "an action with no per-run ceiling gets its own daily budget
 /// as one, so a single run can never spend more than the day allows."
 pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> EffectiveLimits {
     let l = &action.action.limits;
@@ -136,7 +136,7 @@ pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> Eff
 /// construction; they mint against `defaults`, which is what the caller passes
 /// as the fallback.
 ///
-/// SPEC-3.2.8: surfaces the `max_attempts_per_key` cap used to decide when a
+/// SPEC-3.2.11: surfaces the `max_attempts_per_key` cap used to decide when a
 /// job's key is "parked at its cap".
 pub fn attempt_caps(
     rows: &[state::ActionIndexRow],
@@ -163,9 +163,9 @@ pub fn attempt_caps(
     out
 }
 
-/// SPEC-3.2.8: carries the job pipeline's shared, run-scoped state: the
+/// SPEC-3.2.11: carries the job pipeline's shared, run-scoped state: the
 /// cancel/pause gates and the spend ledger a job's attempt-counting decisions
-/// (and SPEC-3.2.2's budget billing) read from.
+/// (and SPEC-3.2.3's budget billing) read from.
 pub struct JobContext<'a> {
     pub action: &'a LoadedAction,
     pub limits: EffectiveLimits,
@@ -192,7 +192,7 @@ pub struct JobContext<'a> {
 /// Compute the job key for a job. If `dedup_key` is set on the action, look
 /// it up; otherwise use a positional fallback.
 ///
-/// SPEC-3.2.8: "a job's key is its `dedup_key` field value, or a positional
+/// SPEC-3.2.11: "a job's key is its `dedup_key` field value, or a positional
 /// fallback when unset or absent."
 pub fn job_key(action: &LoadedAction, job: &Value, idx: usize) -> String {
     let Some(field) = action.action.dedup_key.as_deref() else {
@@ -213,7 +213,7 @@ pub fn job_key(action: &LoadedAction, job: &Value, idx: usize) -> String {
 /// the job's own key so each such job is treated as independent rather than all
 /// sharing one empty key.
 ///
-/// SPEC-3.2.8: "two jobs sharing a concurrency key never overlap, computed by
+/// SPEC-3.2.11: "two jobs sharing a concurrency key never overlap, computed by
 /// joining the configured key fields with a unit separator, falling back to
 /// the job's own key when none of those fields are present on it."
 pub fn concurrency_key(action: &LoadedAction, job: &Value, idx: usize) -> String {
@@ -238,7 +238,7 @@ pub fn concurrency_key(action: &LoadedAction, job: &Value, idx: usize) -> String
     }
 }
 
-/// SPEC-3.1: runs the `input.command` gather step ("`scripted` runs
+/// SPEC-3.1.1 through SPEC-3.1.12: runs the `input.command` gather step ("`scripted` runs
 /// `input.command` (emits a JSON array) -> `filter` -> ...") and enforces the
 /// JSON-array shape the specification requires of its stdout.
 pub async fn gather_jobs(
@@ -295,7 +295,7 @@ pub async fn gather_jobs(
 /// Process a single job. Returns the per-job outcome record that the runner
 /// will both write to the per-action JSONL and insert into `job_outcomes`.
 ///
-/// SPEC-3.2.8: runs the filter -> workdir -> pre -> prompt -> claude -> post
+/// SPEC-3.2.11: runs the filter -> workdir -> pre -> prompt -> claude -> post
 /// -> outcome -> cleanup pipeline, including the synthesized `$claude_result`
 /// on every early-exit path and the three paths that skip attempt counting.
 pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Result<ProcessedJob> {
@@ -304,7 +304,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     // before the attempt-cap check; only the `Done` path carries it into the
     // outcome record, so capped / filtered jobs (no outcome) never read it.
     let started = Instant::now();
-    // SPEC-3.14 item 4: wall-clock start for this attempt, so the
+    // SPEC-3.14.5: wall-clock start for this attempt, so the
     // scripted-action `coding`/`check`/`build` steps derived below (and the
     // `unaccounted` remainder around them) can be anchored the same way the
     // `youtrack` native action anchors its own attempt.
@@ -373,7 +373,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     // so its attempt is not counted (the job is re-gathered on the first run
     // after Resume).
     let mut paused_before_claude = false;
-    // SPEC-3.14 item 4: the claude invocation's own stream log path plus the
+    // SPEC-3.14.5: the claude invocation's own stream log path plus the
     // wall-clock span it ran in, set only on the one branch below that
     // actually calls `ctx.claude.invoke`, so `derive_claude_steps` below has
     // something to classify.
@@ -473,11 +473,11 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                     &ctx.cancel,
                     // Cap the child at what the run has left, so one session
                     // cannot overshoot the ceiling between checks.
-                    // SPEC-3.2.2: "the run's remaining budget is passed to the
+                    // SPEC-3.2.3: "the run's remaining budget is passed to the
                     // invocation as its ceiling."
                     Some(ctx.spend.remaining_usd()),
                     // Scripted actions are not a native-handler repo workdir
-                    // clone (SPEC-3.10 scopes the shared cache to those); a
+                    // clone (SPEC-3.10.1 through SPEC-3.10.11 scopes the shared cache to those); a
                     // scripted action's own `pre`/`post` snippets set
                     // `CARGO_TARGET_DIR` themselves if they need it.
                     None,
@@ -485,7 +485,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                 claude_span = Some((stream_log.clone(), invoke_start, chrono::Utc::now()));
                 // Bill the run before any branch discards `r`, so a cancelled
                 // invocation still reports what it spent.
-                // SPEC-3.2.2: "billing happens before any branch discards the
+                // SPEC-3.2.3: "billing happens before any branch discards the
                 // result."
                 ctx.spend.record(&r);
                 // Persist this invocation's plan usage before any branch
@@ -526,7 +526,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     };
 
     // Transient claude error: no post, no attempt counted, no daily count++.
-    // SPEC-3.2.8: a transient `claude` result is one of the three paths whose
+    // SPEC-3.2.11: a transient `claude` result is one of the three paths whose
     // attempt is not counted and whose daily ledger does not advance.
     if claude_result.transient {
         info!(action = %action.name, key = %key, error = %claude_result.error, "transient claude error, not counting attempt");
@@ -567,7 +567,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     // A cancelled run also skips attempt counting: an operator cancel is not a
     // genuine attempt, so the job retries cleanly on the next firing.
     // A job the global pause stopped is not an attempt either.
-    // SPEC-3.2.8: "a `post` script can additionally suppress attempt
+    // SPEC-3.2.11: "a `post` script can additionally suppress attempt
     // counting itself by writing `$workdir/.claude-run-skip-attempt`."
     let skip_marker = workdir_path.join(".claude-run-skip-attempt");
     let cancelled = ctx.cancel.is_cancelled();
@@ -599,7 +599,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
 
     let mut summary = claude_result.summary;
 
-    // SPEC-3.14 item 4: derive this attempt's `coding`/`check`/`build` steps
+    // SPEC-3.14.5: derive this attempt's `coding`/`check`/`build` steps
     // from the stream log the same way the `youtrack` native action does, so
     // a scripted action's attempts carry step data too rather than falling
     // permanently into `/reports`' "no step data" bucket. Only for an
@@ -706,9 +706,9 @@ pub enum ProcessedJob {
         /// Claude hit the wall-clock limit (exit 124). Carried into the
         /// persisted outcome so a timeout renders distinctly from a failure.
         timed_out: bool,
-        /// SPEC-3.14 item 1: the attempt's stage.
+        /// SPEC-3.14.2: the attempt's stage.
         stage: &'static str,
-        /// SPEC-3.14 item 7: the attempt's [`crate::attempt_steps::Outcome`].
+        /// SPEC-3.14.8: the attempt's [`crate::attempt_steps::Outcome`].
         outcome: crate::attempt_steps::Outcome,
     },
 }
@@ -728,7 +728,7 @@ impl ProcessedJob {
 /// Append a job-outcome record to the action's per-action JSONL log (the
 /// `output.file` field on the action). Best-effort; logs but does not fail.
 ///
-/// SPEC-3.1: "Optional `output.file` (relative to the state dir) appends one
+/// SPEC-3.1.1 through SPEC-3.1.12: "Optional `output.file` (relative to the state dir) appends one
 /// JSON record per job outcome, the same shape the DB's `job_outcomes` table
 /// stores; unset writes nothing."
 ///

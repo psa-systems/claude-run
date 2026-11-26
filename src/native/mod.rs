@@ -1,4 +1,4 @@
-//! SPEC-3.1: "Action kinds: `scripted` (default), `youtrack`,
+//! SPEC-3.1.1 through SPEC-3.1.12: "Action kinds: `scripted` (default), `youtrack`,
 //! `closed-issue-summary`. A native kind requires a matching `native` block."
 //! This module is the dispatch seam a native kind's `native` block routes
 //! through.
@@ -36,7 +36,7 @@ use crate::db::DbPool;
 use crate::error::{Error, Result};
 use crate::snippet::SnippetRunner;
 
-/// SPEC-3.1 / SPEC-3.2: carries the per-action limits, concurrency, pause and
+/// SPEC-3.1.1 through SPEC-3.1.12 / SPEC-3.2.1 through SPEC-3.2.13: carries the per-action limits, concurrency, pause and
 /// spend-ceiling inputs a native handler's run must honor exactly as a
 /// scripted action's run does.
 ///
@@ -78,7 +78,7 @@ pub struct NativeContext<'a> {
 /// `async_trait`) to keep the dependency footprint unchanged.
 pub type HandlerFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
-/// SPEC-3.1: the contract every native [`ActionKind`] handler (`youtrack`,
+/// SPEC-3.1.1 through SPEC-3.1.12: the contract every native [`ActionKind`] handler (`youtrack`,
 /// `closed-issue-summary`) implements.
 ///
 /// A built-in handler for one native [`ActionKind`].
@@ -86,7 +86,7 @@ pub trait NativeHandler: Send + Sync {
     fn run<'a>(&self, ctx: NativeContext<'a>) -> HandlerFuture<'a>;
 }
 
-/// SPEC-3.1: "Action kinds: `scripted` (default), `youtrack`,
+/// SPEC-3.1.1 through SPEC-3.1.12: "Action kinds: `scripted` (default), `youtrack`,
 /// `closed-issue-summary`."
 ///
 /// Registry: resolve a native kind to its handler. Returns `None` for
@@ -101,7 +101,7 @@ fn handler_for(kind: ActionKind) -> Option<Box<dyn NativeHandler>> {
     }
 }
 
-/// SPEC-3.1: "A native kind requires a matching `native` block."
+/// SPEC-3.1.1 through SPEC-3.1.12: "A native kind requires a matching `native` block."
 ///
 /// Dispatch a native action to its handler. Called by
 /// [`crate::daemon::run_action_inner`] when the action's `kind` is native.

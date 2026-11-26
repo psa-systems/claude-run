@@ -25,11 +25,11 @@ use tracing::warn;
 
 use crate::error::{Error, Result};
 
-/// SPEC-6.6.
+/// SPEC-6.6.1.
 pub const DEFAULT_IMAGE: &str = "docker.io/postgres:18.4-alpine3.23";
-/// SPEC-6.6.
+/// SPEC-6.6.1.
 pub const LABEL_KEY: &str = "claude-run.test-postgres";
-/// SPEC-6.6: the owning process's pid namespace. A pid means
+/// SPEC-6.6.1: the owning process's pid namespace. A pid means
 /// something only inside its own namespace, and every CI job is a container
 /// with its own, on one shared Docker daemon.
 pub const LABEL_PIDNS_KEY: &str = "claude-run.test-postgres.pidns";
@@ -40,11 +40,11 @@ const FOREIGN_MAX_AGE_SECS: i64 = 6 * 60 * 60;
 const PG_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the URL handed to the command may stay unreachable from this
-/// process after `psql` inside the container already answers. SPEC-6.6.
+/// process after `psql` inside the container already answers. SPEC-6.6.1.
 const REACH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `--image` / `--init-sql` / `--network` options for a `test-postgres`
-/// invocation. SPEC-6.6.
+/// invocation. SPEC-6.6.1.
 #[derive(Debug, Clone, Default)]
 pub struct Opts {
     pub image: Option<String>,
@@ -151,7 +151,7 @@ fn fail(stage: impl Into<String>, message: impl Into<String>) -> Error {
 /// test can pick a non-secret value and assert the exact argument list.
 /// With `network`, the container joins that network and nothing is
 /// published; without it, port 5432 is published on the Docker host's
-/// loopback. SPEC-6.6.
+/// loopback. SPEC-6.6.1.
 pub fn docker_run_args(
     name: &str,
     pid: u32,
@@ -212,7 +212,7 @@ pub fn docker_run_args(
 
 /// `claude-run-test-postgres-<pid>-<nonce>`: unique per invocation, and the
 /// pid in the name (also carried separately in the label) is what the orphan
-/// sweep keys its liveness check on. SPEC-6.6.
+/// sweep keys its liveness check on. SPEC-6.6.1.
 pub fn container_name(pid: u32, nonce: &str) -> String {
     format!("claude-run-test-postgres-{pid}-{nonce}")
 }
@@ -225,14 +225,14 @@ fn random_hex(bytes: usize) -> Result<String> {
 }
 
 /// This process's pid namespace, as `/proc/self/ns/pid` names it
-/// (`pid:[4026531836]`); empty where it cannot be read. SPEC-6.6.
+/// (`pid:[4026531836]`); empty where it cannot be read. SPEC-6.6.1.
 pub fn own_pid_namespace() -> String {
     std::fs::read_link("/proc/self/ns/pid")
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
-/// One labelled container as `docker ps` lists it. SPEC-6.6.
+/// One labelled container as `docker ps` lists it. SPEC-6.6.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PsEntry {
     pub name: String,
@@ -253,7 +253,7 @@ fn ps_format() -> String {
 }
 
 /// Parse one `docker ps` line in [`ps_format`]: name, pid label, pid
-/// namespace label, `CreatedAt` (`2026-11-05 17:09:05 +0000 UTC`). SPEC-6.6.
+/// namespace label, `CreatedAt` (`2026-11-05 17:09:05 +0000 UTC`). SPEC-6.6.1.
 pub fn parse_ps_line(line: &str) -> Option<PsEntry> {
     let mut parts = line.split('\t');
     let name = parts.next()?.trim();
@@ -278,7 +278,7 @@ pub fn parse_ps_line(line: &str) -> Option<PsEntry> {
     })
 }
 
-/// SPEC-6.6.
+/// SPEC-6.6.1.
 pub fn parse_ps_output(output: &str) -> Vec<PsEntry> {
     output.lines().filter_map(parse_ps_line).collect()
 }
@@ -294,7 +294,7 @@ fn pid_is_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-/// SPEC-6.6: whether `entry` is an orphan this run may stop. A
+/// SPEC-6.6.1: whether `entry` is an orphan this run may stop. A
 /// container from this pid namespace is one when its owning pid is dead. Any
 /// other one, from another namespace (another CI job's container on the same
 /// Docker daemon) or from before the namespace label, is judged by age alone:
@@ -310,7 +310,7 @@ pub fn is_orphan(entry: &PsEntry, own_pidns: &str, now: i64, alive: impl Fn(u32)
 
 /// Stop every labelled container that [`is_orphan`] says is one, and return
 /// the names stopped (for the "one line per container stopped" requirement;
-/// the caller prints them). SPEC-6.6.
+/// the caller prints them). SPEC-6.6.1.
 pub fn sweep_orphans() -> Result<Vec<String>> {
     let format = ps_format();
     let out = docker(
@@ -422,7 +422,7 @@ fn wait_pg_ready(name: &str) -> Result<()> {
 /// whether the command can reach the server: when this process runs in a
 /// container of its own (a CI job), the loopback a published port sits on is
 /// the Docker host's, not ours. Failing here, within seconds and
-/// with the cause named, beats every test timing out on its pool. SPEC-6.6.
+/// with the cause named, beats every test timing out on its pool. SPEC-6.6.1.
 fn wait_reachable(host: &str, port: u16) -> Result<()> {
     let deadline = Instant::now() + REACH_TIMEOUT;
     let mut last_err = String::from("no address resolved");
@@ -531,7 +531,7 @@ fn apply_sql(name: &str, stage: &str, sql: &str) -> Result<()> {
     ))
 }
 
-/// Confirm the `-c fsync=off` server argument took effect. SPEC-6.6.
+/// Confirm the `-c fsync=off` server argument took effect. SPEC-6.6.1.
 fn verify_durability_off(name: &str) -> Result<()> {
     let args = vec![
         name,
@@ -618,7 +618,7 @@ fn wait_for_child(mut child: Child) -> Result<i32> {
 /// has started, even when an earlier step, the command, or a signal is what
 /// ends the run; a teardown failure is folded into the returned error rather
 /// than swallowed, and wins over a successful command's own exit code.
-/// SPEC-6.6.
+/// SPEC-6.6.1.
 pub fn run(opts: &Opts, command: &[String]) -> Result<i32> {
     install_signal_handlers();
 
@@ -636,7 +636,7 @@ pub fn run(opts: &Opts, command: &[String]) -> Result<i32> {
     let password = random_hex(16)?;
     let image = opts.image().to_string();
 
-    // SPEC-3.14 item 3: when the runner set a span file, report the two steps
+    // SPEC-3.14.4: when the runner set a span file, report the two steps
     // only this process can time. A failed report is printed (the runner's
     // stream log shows it) and never fails the test run.
     let spans_file = std::env::var_os(crate::attempt_steps::STEP_SPANS_FILE_ENV)
@@ -1022,7 +1022,7 @@ exit 0
         let _ = std::fs::read_to_string(&log_path);
     }
 
-    /// SPEC-3.14 item 3: with the runner's span file set, a run
+    /// SPEC-3.14.4: with the runner's span file set, a run
     /// reports `postgres_start` then `postgres_healthy`, back to back and ok.
     #[test]
     fn run_reports_postgres_start_and_healthy_spans_to_the_runners_file() {

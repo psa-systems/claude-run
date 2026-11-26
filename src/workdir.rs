@@ -13,7 +13,7 @@
 //!
 //! The final per-job workdir is `<workdir_base>/<action_name>/<job_key>`.
 //!
-//! SPEC-3.2.9: "a job's workdir base resolves in order: the action's own
+//! SPEC-3.2.12: "a job's workdir base resolves in order: the action's own
 //! `workdir_base` field, then `CLAUDE_RUN_WORKDIR_BASE`, then
 //! `<data dir>/workdirs`; the job's workdir is
 //! `<base>/<action name>/<job key>`."
@@ -26,7 +26,7 @@ use tracing::{error, warn};
 
 use crate::config::{expand_path, Paths};
 
-/// SPEC-3.2.9: the workdir-base resolution order, per the module doc comment.
+/// SPEC-3.2.12: the workdir-base resolution order, per the module doc comment.
 pub fn resolve_workdir_base(action_workdir_base: Option<&str>, paths: &Paths) -> PathBuf {
     if let Some(raw) = action_workdir_base {
         return PathBuf::from(expand_path(raw));
@@ -37,7 +37,7 @@ pub fn resolve_workdir_base(action_workdir_base: Option<&str>, paths: &Paths) ->
     paths.workdirs_dir()
 }
 
-/// SPEC-3.2.9: "the job's workdir is `<base>/<action name>/<job key>`."
+/// SPEC-3.2.12: "the job's workdir is `<base>/<action name>/<job key>`."
 pub fn job_workdir(base: &Path, action_name: &str, job_key: &str) -> PathBuf {
     base.join(action_name).join(job_key)
 }
@@ -204,7 +204,7 @@ pub fn uncommitted_or_stashed(workdir: &Path) -> Result<DirtyState, WorkCheckErr
 /// [`local_only_work_with_token`] instead, since `origin` itself no longer
 /// carries the token after the post-clone scrub.
 ///
-/// SPEC-3.2.9: "a local branch tip the remote does not have under that same
+/// SPEC-3.2.12: "a local branch tip the remote does not have under that same
 /// branch name (excluding a tip that merely equals the remote default
 /// branch's tip), a tracked or staged modification, an untracked and
 /// non-ignored file, or a stash" are each local-only work.
@@ -218,7 +218,7 @@ pub fn local_only_work(workdir: &Path) -> Result<LocalWork, WorkCheckError> {
 /// `origin`'s URL. `token_url` is only ever read for its userinfo; a `None`
 /// falls back to the prior unauthenticated call.
 ///
-/// SPEC-3.2.9: the token-authenticated `ls-remote origin` variant of the
+/// SPEC-3.2.12: the token-authenticated `ls-remote origin` variant of the
 /// same local-only-work check.
 pub fn local_only_work_with_token(
     workdir: &Path,
@@ -345,7 +345,7 @@ pub fn force_remove(workdir: &Path) {
 /// any local-only work, or a failed check, preserves instead (pruning
 /// gitignored build artifacts first) and logs what was found.
 ///
-/// SPEC-3.2.9: "any local-only work, or a git or network failure while
+/// SPEC-3.2.12: "any local-only work, or a git or network failure while
 /// checking, preserves the workdir rather than risking a wrong delete; only
 /// a clean check with nothing local-only found deletes it."
 pub fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
@@ -358,12 +358,12 @@ pub fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
 /// cleanup, the comment webhook) should call this instead, since `origin`
 /// carries no credential after the post-clone scrub.
 ///
-/// SPEC-3.2.9: "a caller with a forge token in scope authenticates the one
+/// SPEC-3.2.12: "a caller with a forge token in scope authenticates the one
 /// network call this check makes (`ls-remote origin`) per invocation via
 /// the token's own userinfo."
 ///
 /// Every caller of this guarded delete shares the same preserve decision, so
-/// `target/` is stripped here (`SPEC-3.10` item 5) rather than in each
+/// `target/` is stripped here (`SPEC-3.10.6`) rather than in each
 /// caller: whichever branch below keeps `workdir`, its build output does
 /// not survive into the kept directory.
 pub fn cleanup_or_preserve_with_token(
@@ -501,7 +501,7 @@ mod tests {
         assert!(clone.exists(), "dirty tree must survive cleanup");
     }
 
-    /// `SPEC-3.10` item 5: the shared guarded delete strips a non-gitignored
+    /// `SPEC-3.10.6`: the shared guarded delete strips a non-gitignored
     /// `target/` before it keeps a workdir for local-only work, so every
     /// caller of `cleanup_or_preserve*` (not just the native YouTrack
     /// action's own wrapper) gets this for free.

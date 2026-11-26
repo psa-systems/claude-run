@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-/// The one error type every fallible path in the binary returns. SPEC-5.5.
+/// The one error type every fallible path in the binary returns. SPEC-5.5.1.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("io: {0}")]
@@ -133,12 +133,12 @@ pub enum Error {
     #[error("forge `{op}` did not answer within {timeout:?}")]
     ForgeTimeout { op: String, timeout: Duration },
 
-    /// SPEC-3.12 item 4: the final push found `branch` diverged, and the
+    /// SPEC-3.12.5: the final push found `branch` diverged, and the
     /// configured bounded conflict-resolution pass either failed or left the
     /// merge unresolved, so the merge was aborted exactly as it would have
     /// been with no resolver configured. Distinct from the generic push/
     /// PR-create failure so `finalize` can route it to `Needs Review` naming
-    /// the conflicting files and both SHAs, per the SPEC-3.12 outcome table.
+    /// the conflicting files and both SHAs, per the SPEC-3.12.1 through SPEC-3.12.10 outcome table.
     #[error(
         "remote branch `{branch}` has diverged from the local work (local {local_sha}, remote \
          {remote_sha}) and the bounded conflict-resolution pass could not resolve it ({detail}); \
@@ -156,5 +156,5 @@ pub enum Error {
     Other(#[from] anyhow::Error),
 }
 
-/// The `Result` alias every fallible path returns. SPEC-5.5.
+/// The `Result` alias every fallible path returns. SPEC-5.5.1.
 pub type Result<T> = std::result::Result<T, Error>;

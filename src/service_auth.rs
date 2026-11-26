@@ -54,7 +54,7 @@ pub type ApiKeyHandle = Arc<RwLock<Option<String>>>;
 
 /// Where the materialized `yt` config lives. Fixed, so `YOUTRACK_CLI_CONFIG` can
 /// be exported once at startup and stay correct as the credential changes.
-// SPEC-7.3: a fixed path so the exported env var stays correct across saves.
+// SPEC-7.3.1 through SPEC-7.3.4: a fixed path so the exported env var stays correct across saves.
 pub fn yt_config_path(paths: &Paths) -> PathBuf {
     paths.config_dir.join("auth").join("youtrack.yml")
 }
@@ -71,14 +71,14 @@ pub fn yt_config_path(paths: &Paths) -> PathBuf {
 /// `std::env::set_var` is not thread-safe against concurrent `getenv`. This runs
 /// on the serve path before the daemon spawns anything, which is the same
 /// discipline the rest of the startup sequence follows.
-// SPEC-7.3: exported once at serve start, before any child is spawned.
+// SPEC-7.3.1 through SPEC-7.3.4: exported once at serve start, before any child is spawned.
 pub fn export_yt_config_env(paths: &Paths) {
     std::env::set_var(YT_CONFIG_ENV, yt_config_path(paths));
 }
 
 /// Where the materialized `gh` config lives. Fixed, so [`GH_CONFIG_ENV`] can be
 /// exported once at startup and stay correct as the credential changes.
-// SPEC-7.3: a fixed path so the exported env var stays correct across saves.
+// SPEC-7.3.1 through SPEC-7.3.4: a fixed path so the exported env var stays correct across saves.
 pub fn gh_config_dir(paths: &Paths) -> PathBuf {
     paths.config_dir.join("auth").join("gh")
 }
@@ -91,7 +91,7 @@ pub fn gh_config_dir(paths: &Paths) -> PathBuf {
 ///
 /// `std::env::set_var` is not thread-safe against concurrent `getenv`. This
 /// runs on the serve path before the daemon spawns anything.
-// SPEC-7.3: exported once at serve start, before any child is spawned.
+// SPEC-7.3.1 through SPEC-7.3.4: exported once at serve start, before any child is spawned.
 pub fn export_gh_config_env(paths: &Paths) {
     std::env::set_var(GH_CONFIG_ENV, gh_config_dir(paths));
 }
@@ -103,7 +103,7 @@ pub fn export_gh_config_env(paths: &Paths) {
 /// and stay correct as the credential changes. A host install leaves
 /// `GIT_CONFIG_GLOBAL` unset and resolves git config the normal way; this path
 /// only matters once [`export_git_config_env`] points the var at it.
-// SPEC-7.3: a fixed path so the exported env var stays correct across saves.
+// SPEC-7.3.1 through SPEC-7.3.4: a fixed path so the exported env var stays correct across saves.
 pub fn git_config_path(paths: &Paths) -> PathBuf {
     paths.config_dir.join("git").join("config")
 }
@@ -117,7 +117,7 @@ pub fn git_config_path(paths: &Paths) -> PathBuf {
 ///
 /// `std::env::set_var` is not thread-safe against concurrent `getenv`. This
 /// runs on the serve path before the daemon spawns anything.
-// SPEC-7.3: exported once at serve start, before any child is spawned.
+// SPEC-7.3.1 through SPEC-7.3.4: exported once at serve start, before any child is spawned.
 pub fn export_git_config_env(paths: &Paths) {
     std::env::set_var("GIT_CONFIG_GLOBAL", git_config_path(paths));
 }
@@ -147,7 +147,7 @@ pub struct AuthStatus {
 /// test that reached for the real one overwrote the developer's own
 /// `~/.local/share/forgejo-cli/keys.json` and destroyed two live tokens. Nothing
 /// in this module resolves a home directory on its own.
-// SPEC-7.3: the XDG data dir `fj` reads, passed in rather than resolved by
+// SPEC-7.3.1 through SPEC-7.3.4: the XDG data dir `fj` reads, passed in rather than resolved by
 // `materialize` itself; see the module-level doc and the no-write-path test
 // below for why.
 pub fn default_fj_data_home() -> PathBuf {
@@ -161,7 +161,7 @@ pub fn default_fj_data_home() -> PathBuf {
 /// the secret, and that one credential is skipped: a broken YouTrack token must
 /// not stop the Forgejo login from being written, and neither is worth refusing
 /// to start over.
-// SPEC-7.3: each of the four logins materializes independently; a broken one
+// SPEC-7.3.1 through SPEC-7.3.4: each of the four logins materializes independently; a broken one
 // warns and is skipped rather than aborting the rest. The git identity (below)
 // is the one credential always written, defaulted when unset.
 pub async fn materialize(
@@ -275,7 +275,7 @@ pub enum LoginProbeOutcome {
 /// the same coreutils `timeout(1)` wrapper [`crate::claude::ClaudeInvoker`]
 /// uses. Blocking (a real subprocess spawn and wait): callers run this off the
 /// tokio worker (`crate::blocking::in_place` or `spawn_blocking`).
-// SPEC-7.4: loggedIn true/false are decisive; everything else is
+// SPEC-7.4.1: loggedIn true/false are decisive; everything else is
 // Indeterminate and must never be collapsed into either.
 pub fn probe_claude_login(
     claude_binary: &str,
@@ -330,7 +330,7 @@ fn shell_quote(s: &str) -> String {
 /// A non-zero exit is an error carrying the exit code and `gh`'s stderr, run
 /// through [`crate::forge_log::redact`] with the token as a known secret so it
 /// never reaches a log line or a rendered page.
-// SPEC-7.3: the token travels on stdin via an explicit redirection, never argv
+// SPEC-7.3.1 through SPEC-7.3.4: the token travels on stdin via an explicit redirection, never argv
 // or a bare pipe; a failure redacts the token from the reported error.
 pub fn gh_login(gh_binary: &str, config_dir: &Path, host: &str, token: &str) -> Result<()> {
     std::fs::create_dir_all(config_dir)?;
@@ -382,7 +382,7 @@ pub fn gh_login(gh_binary: &str, config_dir: &Path, host: &str, token: &str) -> 
 /// Write the single-file `yt` config: `url:` + `token:`, 0600, parent created.
 /// Same two-line shape [`crate::secrets::JobCredentials::materialize`] writes for
 /// a per-job credential, so there is one format in the tree, not two.
-// SPEC-7.3: same two-line 0600 shape the per-job path writes (SPEC-7.2), so
+// SPEC-7.3.1 through SPEC-7.3.4: same two-line 0600 shape the per-job path writes (SPEC-7.2.1 through SPEC-7.2.4), so
 // there is one `yt` config format in the tree.
 fn write_yt_config(path: &Path, base_url: &str, token: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -399,7 +399,7 @@ fn write_yt_config(path: &Path, base_url: &str, token: &str) -> Result<()> {
 /// [`write_yt_config`]'s output. With a Forgejo host, also scope `fj auth
 /// git-credential` to that host so the agent's plain `git` authenticates from
 /// `keys.json`. The file never holds a token.
-// SPEC-7.3: the Forgejo credential stanza is scoped to one host, and a host
+// SPEC-7.3.1 through SPEC-7.3.4: the Forgejo credential stanza is scoped to one host, and a host
 // value that could break out of the config quoting is refused.
 fn write_git_config(
     path: &Path,

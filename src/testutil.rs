@@ -133,7 +133,7 @@ pub fn ensure_coreutils_timeout_on_path() {
         // its clock.
         //
         // The trap must name that grandchild through `jobs -p`, never
-        // through a `spid=$!` variable (SPEC-10.1): capturing `$!` is a
+        // through a `spid=$!` variable (SPEC-10.1.1 through SPEC-10.1.4): capturing `$!` is a
         // separate statement from the `sleep "$secs" &` that forks it, and
         // under the scheduling delay `SPEC-10.1.1`/`SPEC-10.1.3` require
         // tolerating, `TERM` can land in the gap between the two, between the

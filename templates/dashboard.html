@@ -277,7 +277,7 @@
   {% endif %}
 </div>
 
-{# SPEC-4.3.15: the CI-failures table, with its own filter form
+{# SPEC-4.3.57 through SPEC-4.3.61: the CI-failures table, with its own filter form
    so the state/bucket/repo selection round-trips through the 5s poll and
    every other dashboard control the same way the search form does
    (hx-include widened below to carry both). "State" is the lifecycle state
@@ -345,7 +345,7 @@
   </table>
 {% endif %}
 
-{# SPEC-3.12 item 2 / SPEC-4.3.15: a count and list of issues the
+{# SPEC-3.12.3 / SPEC-4.3.57 through SPEC-4.3.61: a count and list of issues the
    stuck-Working reconcile sweep corrected in the last 7 days. #}
 <h2>Stuck work (last 7 days)</h2>
 {% if stuck_sweep_disabled %}

@@ -1,12 +1,12 @@
-//! SPEC-8.8: the PR comment posted after every runner push or branch update to
+//! SPEC-8.8.1 through SPEC-8.8.2: the PR comment posted after every runner push or branch update to
 //! a PR branch, so the PR's own timeline explains how the branch
 //! reached its current state, not just the title/body `refresh_pr_text`
 //! rewrites on a resumed run.
 //!
-//! The body reuses the run footer ([`crate::run_footer`], SPEC-3.9).
+//! The body reuses the run footer ([`crate::run_footer`], SPEC-3.9.1).
 //! A failed [`crate::provider::Forge::pr_comment`] call never fails, retries,
 //! or rolls back the push it is reporting on (writes are never retried,
-//! SPEC-8.4): [`post`] logs it at `error` and returns a human-readable
+//! SPEC-8.4.1 through SPEC-8.4.3): [`post`] logs it at `error` and returns a human-readable
 //! cause for the caller to fold into its own run outcome comment, naming the
 //! event (`PR comment for <event> failed: <cause>`).
 
@@ -14,11 +14,11 @@ use std::path::Path;
 
 use crate::provider::Forge;
 
-/// SPEC-8.8: the cap on commit subjects listed in a push comment body;
+/// SPEC-8.8.1 through SPEC-8.8.2: the cap on commit subjects listed in a push comment body;
 /// beyond this, the remaining count is named instead of listed.
 pub const MAX_COMMIT_LINES: usize = 20;
 
-/// SPEC-8.8: which runner-owned write to a PR branch this comment reports on
+/// SPEC-8.8.1 through SPEC-8.8.2: which runner-owned write to a PR branch this comment reports on
 /// (the enumerated table, plus `CheckpointPush`: one of
 /// the periodic WIP pushes a checkpoint watcher makes while the agent is
 /// still running, hooks disabled).
@@ -105,7 +105,7 @@ pub struct PushCommentContext<'a> {
     pub public_url: Option<&'a str>,
     pub run_id: Option<i64>,
     pub started: Option<chrono::DateTime<chrono::Utc>>,
-    /// SPEC-3.15: the rendered step list ([`crate::progress_list`]) with this
+    /// SPEC-3.15.1 through SPEC-3.15.8: the rendered step list ([`crate::progress_list`]) with this
     /// comment's own line marked, appended before the run footer. `None` when
     /// the caller has no stored step rows to render from.
     pub progress: Option<&'a str>,
@@ -142,9 +142,9 @@ fn outcome_headline(ctx: &PushCommentContext<'_>) -> String {
     }
 }
 
-/// SPEC-8.8: render the push comment body. Opens with a one-line outcome
+/// SPEC-8.8.1 through SPEC-8.8.2: render the push comment body. Opens with a one-line outcome
 /// (commit count and last subject), then the issue key, PR state, commit
-/// range, capped commit subjects, and the SPEC-3.9 run footer.
+/// range, capped commit subjects, and the SPEC-3.9.1 run footer.
 pub fn build_body(ctx: &PushCommentContext<'_>) -> String {
     let state = if ctx.draft { "draft" } else { "ready" };
     let new = ctx.new_sha.map(short).unwrap_or("unknown");
@@ -158,8 +158,8 @@ pub fn build_body(ctx: &PushCommentContext<'_>) -> String {
         ctx.issue_key,
         format_subjects(&ctx.subjects),
     );
-    // SPEC-3.15 / SPEC-8.8: the step list sits between the commit subjects
-    // and the SPEC-3.9 footer.
+    // SPEC-3.15.1 through SPEC-3.15.8 / SPEC-8.8.1 through SPEC-8.8.2: the step list sits between the commit subjects
+    // and the SPEC-3.9.1 footer.
     if let Some(progress) = ctx.progress {
         body.push_str("\n\n");
         body.push_str(progress);
@@ -186,7 +186,7 @@ fn scratch_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
     locks.entry(path.to_path_buf()).or_default().clone()
 }
 
-/// SPEC-8.8: post the push comment through `forge.pr_comment`, body written to
+/// SPEC-8.8.1 through SPEC-8.8.2: post the push comment through `forge.pr_comment`, body written to
 /// a scratch file under `scratch_dir` (the caller's choice of
 /// [`crate::provider::cli::CliBackend::git_dir_scratch`]-style git-directory
 /// scratch, or a temp directory when no workdir exists) and removed
@@ -257,8 +257,8 @@ mod tests {
         }
     }
 
-    /// SPEC-3.15 / SPEC-8.8: the list appears with the marker on the current
-    /// step, before the SPEC-3.9 footer.
+    /// SPEC-3.15.1 through SPEC-3.15.8 / SPEC-8.8.1 through SPEC-8.8.2: the list appears with the marker on the current
+    /// step, before the SPEC-3.9.1 footer.
     #[test]
     fn the_step_list_precedes_the_footer_with_the_marker_on_the_current_step() {
         let list = "| # | Step | Type | Step time | Other time before | Total |\n\

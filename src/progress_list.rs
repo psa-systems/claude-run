@@ -1,6 +1,6 @@
-//! SPEC-3.15: the step table on runner lifecycle comments.
+//! SPEC-3.15.1 through SPEC-3.15.8: the step table on runner lifecycle comments.
 //!
-//! The table is rendered from the stored `attempt_steps` rows (SPEC-3.14), not
+//! The table is rendered from the stored `attempt_steps` rows (SPEC-3.14.1 through SPEC-3.14.9), not
 //! from comment text, so it survives a restart. Rows are folded into listed
 //! milestones ([`milestones`]); the current comment's own row is marked
 //! `<-- This comment`, earlier rows carry their times, and the rest of the
@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use crate::db::DbPool;
 use crate::error::{Error, Result};
 
-/// SPEC-3.15 item 4: the happy path, in order.
+/// SPEC-3.15.5: the happy path, in order.
 pub const HAPPY_PATH: &[&str] = &[
     "Initial commit",
     "Checkpoint 1",
@@ -31,7 +31,7 @@ pub struct StepRow {
     /// The `attempt_steps.label` the row was stored under: a check/gate row's
     /// recipe or stage name, otherwise the same as `kind` for most rows.
     pub label: String,
-    /// The SPEC-3.14 item 1 stage the row was stored under.
+    /// The SPEC-3.14.2 stage the row was stored under.
     pub stage: String,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
@@ -39,8 +39,8 @@ pub struct StepRow {
 }
 
 /// A listed step that has happened: its label, the check type(s) it folds
-/// (SPEC-3.15 item 2, empty for a non-check step), its own duration, the
-/// unlisted time before it broken down by kind (SPEC-3.15 item 1, largest
+/// (SPEC-3.15.3, empty for a non-check step), its own duration, the
+/// unlisted time before it broken down by kind (SPEC-3.15.2, largest
 /// first, empty when there is none) and the elapsed time at its end, all
 /// durations in whole seconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +52,7 @@ pub struct Milestone {
     pub total_secs: i64,
 }
 
-/// SPEC-3.15 item 1: `m:ss`, or `h:mm:ss` from one hour.
+/// SPEC-3.15.2: `m:ss`, or `h:mm:ss` from one hour.
 pub fn format_secs(secs: i64) -> String {
     let secs = secs.max(0);
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
@@ -63,7 +63,7 @@ pub fn format_secs(secs: i64) -> String {
     }
 }
 
-/// SPEC-3.15 item 7: a step with no recorded time because its data is
+/// SPEC-3.15.8: a step with no recorded time because its data is
 /// incomplete.
 pub const UNKNOWN_TIME: &str = "?:??";
 
@@ -71,7 +71,7 @@ fn is_check_kind(kind: &str) -> bool {
     kind == "check" || kind == "gate"
 }
 
-/// SPEC-3.15 item 2: the check type `label` names for a `check`/`gate` row, or
+/// SPEC-3.15.3: the check type `label` names for a `check`/`gate` row, or
 /// `None` for a per-stage sub-step row (`fmt`, `clippy`, `test`, `build`) that
 /// folds into its parent's type instead of adding its own. A `gate` row's
 /// label is always its gate command; a `check` row's label is a type only when
@@ -127,10 +127,10 @@ struct Counts {
     ci_remediation: usize,
 }
 
-/// SPEC-3.15 item 1: the breakdown bucket name for an unlisted row: the
+/// SPEC-3.15.2: the breakdown bucket name for an unlisted row: the
 /// stored `kind`, except `kind = "other"` splits by `label` (`"other"` for an
 /// unclassified command, `"unaccounted"` for the recorder's own gap filler,
-/// SPEC-3.14 items 4 and 6).
+/// SPEC-3.14.5 and SPEC-3.14.7).
 fn unlisted_bucket(kind: &str, label: &str) -> String {
     if kind == "other" {
         label.to_string()
@@ -139,7 +139,7 @@ fn unlisted_bucket(kind: &str, label: &str) -> String {
     }
 }
 
-/// SPEC-3.15 item 1: close the pending breakdown window that ends at a listed
+/// SPEC-3.15.2: close the pending breakdown window that ends at a listed
 /// point spanning `start` to `end`: the buckets accumulated since the last
 /// listed point, plus any part of the raw gap no stored row explains folded
 /// into `other` so nothing is left unattributed, sorted largest duration
@@ -165,7 +165,7 @@ fn close_window(
     breakdown
 }
 
-/// SPEC-3.15 items 1, 5 and 6: fold `rows` (all attempts of one job, ordered by
+/// SPEC-3.15.2, SPEC-3.15.6 and SPEC-3.15.7: fold `rows` (all attempts of one job, ordered by
 /// attempt then sequence) into the milestones that have happened. A later
 /// attempt opens with its `Retry N` line, so a resumed run continues the
 /// numbering of the branch's earlier attempts. Adjacent `check`/`gate` rows are
@@ -291,10 +291,10 @@ pub fn milestones(rows: &[StepRow]) -> Vec<Milestone> {
     out
 }
 
-/// SPEC-3.15 item 2: what the `Type` column's check-type names mean.
+/// SPEC-3.15.3: what the `Type` column's check-type names mean.
 const LEGEND: &str = "`pre-commit`, `pre-push`, `check` and `verify` are the repo's own recipes run by the agent, `ad-hoc` is any other test or lint command the agent chose to run, and a gate command is run by the runner.";
 
-/// SPEC-3.15 item 1: `Other time before` cell text, each bucket as its name
+/// SPEC-3.15.2: `Other time before` cell text, each bucket as its name
 /// and `format_secs` duration, largest first, joined with `, `; empty when
 /// there is none.
 fn format_other_before(entries: &[(String, i64)]) -> String {
@@ -305,13 +305,13 @@ fn format_other_before(entries: &[(String, i64)]) -> String {
         .join(", ")
 }
 
-/// SPEC-3.15 items 1 to 4: render the step table. `done` are the earlier
+/// SPEC-3.15.2 to 4: render the step table. `done` are the earlier
 /// steps, `current` is the row this comment reports (marked
 /// `<-- This comment` in every time cell), and the rest of [`HAPPY_PATH`]
 /// after `current` is listed with empty cells. When `current` is not a
 /// happy-path label (`Failed`, `Needs Review`, `Retry 2`, ...) nothing follows
 /// it, so a terminal row ends the table. `incomplete` renders every time cell
-/// as `?:??` (SPEC-3.15 item 7, SPEC-3.14 item 8).
+/// as `?:??` (SPEC-3.15.8, SPEC-3.14.9).
 pub fn render(done: &[Milestone], current: &str, incomplete: bool) -> String {
     const MARK: &str = "<-- This comment";
     let mut lines: Vec<String> = vec![
@@ -370,7 +370,7 @@ pub async fn load_rows(pool: &DbPool, action: &str, key: &str) -> Result<Vec<Ste
 /// [`load_rows`] for a caller that knows the job key but not which action
 /// stored it (a webhook handler). `None` matches every action.
 async fn load_rows_where(pool: &DbPool, action: Option<&str>, key: &str) -> Result<Vec<StepRow>> {
-    // SPEC-3.14: step-end writes (a checkpoint, the clone) interleave with the
+    // SPEC-3.14.1 through SPEC-3.14.9: step-end writes (a checkpoint, the clone) interleave with the
     // attempt-end rows, so chronological order is `started_at`, not `seq`.
     let sql = if action.is_some() {
         "SELECT attempt, kind, label, stage, started_at, ended_at, ok FROM attempt_steps \
@@ -410,7 +410,7 @@ async fn load_rows_where(pool: &DbPool, action: Option<&str>, key: &str) -> Resu
         .collect()
 }
 
-/// SPEC-3.15 item 6: the list for `current` rendered from the stored rows of
+/// SPEC-3.15.7: the list for `current` rendered from the stored rows of
 /// `key`. A failed read is logged at `error` with the key and renders an
 /// all-unknown list (`?:??`), so the comment never shows a made-up time.
 pub async fn render_for(pool: &DbPool, action: &str, key: &str, current: &str) -> String {
@@ -423,7 +423,7 @@ pub async fn render_for(pool: &DbPool, action: &str, key: &str, current: &str) -
     }
 }
 
-/// SPEC-3.15 item 6: the stored rows of `key` as a [`ListContext`]. A failed
+/// SPEC-3.15.7: the stored rows of `key` as a [`ListContext`]. A failed
 /// read is logged at `error` with the key and marks the context incomplete, so
 /// every time renders `?:??` instead of a made-up one. `action` is `None` for
 /// a caller with no action name (a webhook handler).
@@ -443,7 +443,7 @@ pub async fn context_for(pool: &DbPool, action: Option<&str>, key: &str) -> List
     }
 }
 
-/// SPEC-3.15 + SPEC-8.8: the line a push comment of `event` reports, given the
+/// SPEC-3.15.1 through SPEC-3.15.8 + SPEC-8.8.1 through SPEC-8.8.2: the line a push comment of `event` reports, given the
 /// steps already listed. A checkpoint push is the next `Checkpoint N`.
 pub fn push_step_label(event: crate::push_comment::PushEvent, done: &[Milestone]) -> String {
     use crate::push_comment::PushEvent;
@@ -465,7 +465,7 @@ pub fn push_step_label(event: crate::push_comment::PushEvent, done: &[Milestone]
     }
 }
 
-/// SPEC-3.15 item 6 + SPEC-8.8: the list for a push comment of `event`,
+/// SPEC-3.15.7 + SPEC-8.8.1 through SPEC-8.8.2: the list for a push comment of `event`,
 /// rendered from the context stashed for `key` (see [`stash_context`]). No
 /// stashed context is logged at `info` with the key and renders the current
 /// line alone: a push outside any run has no earlier steps to list.
@@ -525,7 +525,7 @@ pub fn clear_context(key: &str) {
         .remove(key);
 }
 
-/// SPEC-3.15: the list for a comment whose own line is `current`, from the
+/// SPEC-3.15.1 through SPEC-3.15.8: the list for a comment whose own line is `current`, from the
 /// context stashed for `key` (earlier steps only when none was stashed).
 pub fn render_with_context(key: &str, current: &str) -> String {
     let ctx = context_registry()
@@ -576,7 +576,7 @@ mod tests {
         }
     }
 
-    /// The SPEC-3.15 item 4 happy-path example, as a table: headings, a check
+    /// The SPEC-3.15.5 happy-path example, as a table: headings, a check
     /// type on the folded `Checks N` row, an `Other time before` column that
     /// names the unlisted clone time ahead of the first listed step, the
     /// current-comment marker and the not-yet-reached rows with empty cells.
@@ -606,7 +606,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.15 item 2: two distinct check types folded into one `Checks N`
+    /// SPEC-3.15.3: two distinct check types folded into one `Checks N`
     /// row join in order, separated by `, `.
     #[test]
     fn a_mixed_type_check_fold_joins_distinct_types_in_order() {
@@ -621,7 +621,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.15 item 2: a `gate` row's type is the gate command itself.
+    /// SPEC-3.15.3: a `gate` row's type is the gate command itself.
     #[test]
     fn a_gate_rows_type_is_its_gate_command() {
         let rows = [gate_row(1, "just check-docker", 0, 15, true)];
@@ -632,7 +632,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.15 item 2: a recipe's own per-stage sub-step rows (`fmt`,
+    /// SPEC-3.15.3: a recipe's own per-stage sub-step rows (`fmt`,
     /// `clippy`, ...) do not add their own type.
     #[test]
     fn a_per_stage_sub_step_does_not_add_its_own_type() {
@@ -648,7 +648,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.15 acceptance example: the gap between `Checkpoint 2` (total
+    /// SPEC-3.15.1 through SPEC-3.15.8 acceptance example: the gap between `Checkpoint 2` (total
     /// 7:16) and `Verdict` (total 12:08) is attributed by kind in `Other
     /// time before` (coding then build, largest first) instead of appearing
     /// as one undifferentiated number.
@@ -672,7 +672,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.15 item 6, SPEC-8.8: a push comment renders the
+    /// SPEC-3.15.7, SPEC-8.8.1 through SPEC-8.8.2: a push comment renders the
     /// stashed rows with its own line marked, and the next checkpoint is
     /// numbered after the stored ones.
     #[test]
@@ -803,7 +803,7 @@ mod tests {
     }
 
     /// A `(failed)` check and a `Retry N` row: the inter-attempt gap has no
-    /// stored row to explain it, so it folds into `other` (SPEC-3.15 item 1),
+    /// stored row to explain it, so it folds into `other` (SPEC-3.15.2),
     /// reconciling `Other time before` against `Total` across the retry
     /// boundary.
     #[test]

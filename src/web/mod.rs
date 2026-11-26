@@ -40,7 +40,7 @@ pub mod env_form;
 pub mod native_forms;
 pub mod webhooks;
 
-/// SPEC-6.3: custom Askama filters. `{{ ts | datetime }}` renders a stored
+/// SPEC-6.3.1 through SPEC-6.3.2: custom Askama filters. `{{ ts | datetime }}` renders a stored
 /// RFC3339 UTC timestamp string through the live display preferences (timezone +
 /// strftime format). Askama filters are free functions, so the preferences come
 /// from the process-global snapshot kept current by `LiveSettings`. Malformed
@@ -59,30 +59,30 @@ const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
 // morph the DOM in place instead of replacing it (preserves selection/scroll).
 const IDIOMORPH_JS: &[u8] = include_bytes!("../../assets/idiomorph-ext.min.js");
 
-/// SPEC-4.3.11/SPEC-7.16: Clarence, the signed-out landing page's mascot.
+/// SPEC-4.3.38 through SPEC-4.3.39/SPEC-7.16.1 through SPEC-7.16.3: Clarence, the signed-out landing page's mascot.
 /// Replacing `assets/mascot.png` swaps the art with no other change.
 const MASCOT_PNG: &[u8] = include_bytes!("../../assets/mascot.png");
 
-/// SPEC-7.16: where the landing page's mascot is served. The auth gate lets a
+/// SPEC-7.16.1 through SPEC-7.16.3: where the landing page's mascot is served. The auth gate lets a
 /// signed-out browser fetch this one asset, and nothing else under `/static/`.
 pub const MASCOT_PATH: &str = "/static/mascot.png";
 
-/// SPEC-4.3.11: the favicon (`image/x-icon`), served to every browser whether
+/// SPEC-4.3.38 through SPEC-4.3.39: the favicon (`image/x-icon`), served to every browser whether
 /// signed in or not.
 const FAVICON_ICO: &[u8] = include_bytes!("../../assets/favicon.ico");
 pub const FAVICON_PATH: &str = "/static/favicon.ico";
 
-/// SPEC-4.3.11: the iOS/home-screen touch icon, Clarence's running figure
+/// SPEC-4.3.38 through SPEC-4.3.39: the iOS/home-screen touch icon, Clarence's running figure
 /// cropped to a 180px chip.
 const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../../assets/apple-touch-icon.png");
 pub const APPLE_TOUCH_ICON_PATH: &str = "/static/apple-touch-icon.png";
 
-/// SPEC-4.3.11: the header brand mark, the same running-figure chip drawn
+/// SPEC-4.3.38 through SPEC-4.3.39: the header brand mark, the same running-figure chip drawn
 /// small (48px asset, 24px display size).
 const BRAND_MARK_PNG: &[u8] = include_bytes!("../../assets/brand-mark.png");
 pub const BRAND_MARK_PATH: &str = "/static/brand-mark.png";
 
-/// SPEC-4.3: shared handler state (the daemon's `AppState` plus config
+/// SPEC-4.3.1 through SPEC-4.3.61: shared handler state (the daemon's `AppState` plus config
 /// paths) threaded through every web UI route.
 #[derive(Clone)]
 pub struct WebState {
@@ -90,8 +90,8 @@ pub struct WebState {
     pub paths: Paths,
 }
 
-/// SPEC-4.3: mounts the full web UI page set listed in SPEC-4.3 onto one
-/// `Router`; see SPEC-4.3.1 through SPEC-4.3.13 for each page group's own
+/// SPEC-4.3.1 through SPEC-4.3.61: mounts the full web UI page set listed in SPEC-4.3.1 through SPEC-4.3.61 onto one
+/// `Router`; see SPEC-4.3.2 through SPEC-4.3.4 through SPEC-4.3.41 through SPEC-4.3.47 for each page group's own
 /// requirement. Auth routes (`/login`, `/setup`, `/account/2fa/setup`,
 /// `/invite/{token}`, `/settings/accounts`) are mounted elsewhere (`src/auth.rs`
 /// / `src/web_admin.rs`), not in this router.
@@ -236,7 +236,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         // it. The shared aggregations live in `crate::report`.
         .route("/reports", get(reports_page))
         // Status page (version + build info), the live Activity card, and
-        // the cargo-cache Management part (SPEC-3.10 item 10). `/about` and
+        // the cargo-cache Management part (SPEC-3.10.11). `/about` and
         // `/about/activity` are the pre-rename paths, kept as permanent
         // redirects so an existing link or bookmark keeps working.
         .route("/status", get(status_page))
@@ -251,7 +251,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         // viewer is connected. Web listener only, like the
         // other `/sse` route below; never mounted on the unix socket.
         .route("/sse/status/storage", get(status_storage_sse))
-        // Cargo-cache delete routes (SPEC-3.10 item 10). Posted under `/api`
+        // Cargo-cache delete routes (SPEC-3.10.11). Posted under `/api`
         // the way the Pause form posts to `/api/pause`, but defined here
         // (not in `api::router`) rather than there so they add no route to
         // the unix socket.
@@ -263,7 +263,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             "/api/status/cargo-cache/delete",
             post(cargo_cache_delete_all),
         )
-        // Docker storage prune route (SPEC-3.11 item 4). Same
+        // Docker storage prune route (SPEC-3.11.5). Same
         // `/api`-mirrored, no-unix-socket pattern as the cargo-cache routes
         // above.
         .route(
@@ -328,7 +328,7 @@ struct ActionView {
     providers: String,
 }
 
-/// SPEC-4.3.1: one dashboard run-list row, including the in-flight
+/// SPEC-4.3.2 through SPEC-4.3.4: one dashboard run-list row, including the in-flight
 /// `stage` and `failed_jobs` count the dashboard renders per run.
 #[derive(Serialize, sqlx::FromRow)]
 struct RunRow {
@@ -382,7 +382,7 @@ impl RunRow {
     }
 }
 
-/// SPEC-4.3.10: one run-detail outcomes-table row for a single job
+/// SPEC-4.3.32 through SPEC-4.3.37: one run-detail outcomes-table row for a single job
 /// attempt, including the "timed out" and free-text summary fields the
 /// run-detail page renders.
 #[derive(Serialize)]
@@ -406,7 +406,7 @@ struct JobOutcomeRow {
     /// stream log, so this carries the triage bucket + mint result + redacted
     /// log artifact reference; rendered on the run-detail outcomes table.
     summary: Option<String>,
-    /// SPEC-3.16 item 3: whether the post-success review session for this
+    /// SPEC-3.16.4: whether the post-success review session for this
     /// attempt left an evidence file on disk. Not a DB column: set by
     /// `run_detail` after the fetch, by checking
     /// `ClaudeInvoker::review_evidence_path` for existence, so the template
@@ -414,7 +414,7 @@ struct JobOutcomeRow {
     /// the filesystem every page load for jobs that never ran a review.
     #[serde(skip)]
     has_evidence: bool,
-    /// SPEC-3.3.2: whether this attempt's failed verification
+    /// SPEC-3.3.20 through SPEC-3.3.25: whether this attempt's failed verification
     /// gate left an output file on disk. Not a DB column, set the same way
     /// as `has_evidence`: checked for existence after the fetch so the
     /// template can link it without the route touching the filesystem for
@@ -466,7 +466,7 @@ impl JobOutcomeRow {
     }
 }
 
-/// SPEC-7: "Run summaries rendered in the UI are Markdown with raw HTML
+/// SPEC-7.13.1: "Run summaries rendered in the UI are Markdown with raw HTML
 /// demoted to text." Convert a job-outcome summary from Markdown to HTML. Raw
 /// HTML events in the source are demoted to text (which `push_html` escapes),
 /// never passed through: summaries are model output and must not inject markup
@@ -554,7 +554,7 @@ struct DurationChart {
     count: usize,
 }
 
-/// SPEC-4.3.2: the `/actions/{name}/durations` chart geometry. Compute the
+/// SPEC-4.3.5 through SPEC-4.3.7: the `/actions/{name}/durations` chart geometry. Compute the
 /// duration-chart geometry from a `(started_at, duration_ms)` series ordered
 /// oldest to newest. Pure function of its input so it is unit-testable without
 /// a database. Caller guarantees `series` is non-empty.
@@ -724,7 +724,7 @@ fn usage_series(
     (polylines, markers)
 }
 
-/// SPEC-4.3.13: the Reports page plan-usage chart geometry. Compute the
+/// SPEC-4.3.41 through SPEC-4.3.47: the Reports page plan-usage chart geometry. Compute the
 /// usage-chart geometry from the report's chart series (oldest to newest).
 /// Caller guarantees `points` is non-empty.
 fn build_usage_chart(points: &[crate::report::ClaudeUsagePoint]) -> UsageChart {
@@ -778,7 +778,7 @@ fn build_usage_chart(points: &[crate::report::ClaudeUsagePoint]) -> UsageChart {
 /// shared settings handles rather than a startup snapshot, so saving the
 /// first source (or removing the last one) for either section is reflected on
 /// the next page load with no restart.
-/// SPEC-4.3.1: "A configured event-driven listener surfaces as a
+/// SPEC-4.3.2 through SPEC-4.3.4: "A configured event-driven listener surfaces as a
 /// synthetic, read-only action on the dashboard, with its own provider
 /// display names."
 async fn listener_providers(s: &WebState) -> (Option<String>, Option<String>) {
@@ -794,7 +794,7 @@ async fn listener_providers(s: &WebState) -> (Option<String>, Option<String>) {
     (webhook_providers, comment_providers)
 }
 
-/// SPEC-4.3.1: assembles the dashboard's action list, appending a
+/// SPEC-4.3.2 through SPEC-4.3.4: assembles the dashboard's action list, appending a
 /// synthetic entry per configured event-driven listener.
 async fn enriched_actions(
     pool: &DbPool,
@@ -844,7 +844,7 @@ async fn enriched_actions(
     Ok(out)
 }
 
-/// SPEC-4.3.1: "It has no backing YAML and is never indexed in the
+/// SPEC-4.3.2 through SPEC-4.3.4: "It has no backing YAML and is never indexed in the
 /// `actions` table; it participates in Pause like any other action, is always
 /// shown as enabled (it fires on deliveries, not a timer), and rejects edit,
 /// export and delete." Build the synthetic webhook action view (e.g.
@@ -891,7 +891,7 @@ async fn synthetic_action_view(
 /// `providers`, joined with ", ". Used to describe a synthetic listener's
 /// configured sources without hardcoding a provider name that may not be
 /// configured.
-/// SPEC-4.3.1: sorted, de-duplicated provider display names for a
+/// SPEC-4.3.2 through SPEC-4.3.4: sorted, de-duplicated provider display names for a
 /// synthetic listener's configured sources.
 fn provider_display_names(providers: impl Iterator<Item = webhooks::WebhookProvider>) -> String {
     let mut names: Vec<&'static str> = providers.map(|p| p.display_name()).collect();
@@ -900,14 +900,14 @@ fn provider_display_names(providers: impl Iterator<Item = webhooks::WebhookProvi
     names.join(", ")
 }
 
-/// SPEC-4.3.1: true for the reserved synthetic action name. Mutating
+/// SPEC-4.3.2 through SPEC-4.3.4: true for the reserved synthetic action name. Mutating
 /// endpoints (edit / export / delete) reject it: it has no backing YAML to
 /// operate on.
 pub fn is_synthetic_action(name: &str) -> bool {
     SYNTHETIC_ACTIONS.contains(&name)
 }
 
-/// SPEC-4.3.1: every reserved synthetic action name, in ONE place.
+/// SPEC-4.3.2 through SPEC-4.3.4: every reserved synthetic action name, in ONE place.
 /// The daemon's scan guard, the API's trigger / delete rejections, and the web
 /// layer's edit / export / delete rejections all read this set, so a new
 /// event-driven listener is reserved everywhere by adding one entry here.
@@ -916,8 +916,8 @@ pub const SYNTHETIC_ACTIONS: &[&str] = &[
     comment_webhooks::WEBHOOK_COMMENT_ACTION,
 ];
 
-/// SPEC-4.3.1: "A synthetic action whose listener is unconfigured
-/// this run keeps its historical runs queryable (SPEC-4.3.2) but has no live
+/// SPEC-4.3.2 through SPEC-4.3.4: "A synthetic action whose listener is unconfigured
+/// this run keeps its historical runs queryable (SPEC-4.3.5 through SPEC-4.3.7) but has no live
 /// dashboard entry." True when `name` is a synthetic action whose listener is
 /// actually configured this run, so the action-detail / durations pages render
 /// it instead of 404ing.
@@ -930,7 +930,7 @@ async fn synthetic_enabled(s: &WebState, name: &str) -> bool {
     }
 }
 
-/// SPEC-4.3.1: "Edit, export and delete reject the synthetic action
+/// SPEC-4.3.2 through SPEC-4.3.4: "Edit, export and delete reject the synthetic action
 /// with 403." A 403 response rejecting a mutating operation on the synthetic
 /// action, or `None` when `name` is a normal action.
 fn reject_synthetic(name: &str) -> Option<Response> {
@@ -945,7 +945,7 @@ fn reject_synthetic(name: &str) -> Option<Response> {
     })
 }
 
-/// SPEC-4.3.1: "A run's `failed_jobs` count and its Jobs-column
+/// SPEC-4.3.2 through SPEC-4.3.4: "A run's `failed_jobs` count and its Jobs-column
 /// outcome filter both key off the latest attempt of each job, excluding
 /// timeouts from the failed count." The one definition of "the latest attempt
 /// of each job in this run", parameterised by an outcome predicate on the `o`
@@ -981,7 +981,7 @@ fn has_job_matching(pred: &str) -> String {
     format!("EXISTS (SELECT 1 {})", latest_job_attempts(pred))
 }
 
-/// SPEC-4.3.1: "The dashboard hides finished zero-job runs unless
+/// SPEC-4.3.2 through SPEC-4.3.4: "The dashboard hides finished zero-job runs unless
 /// `show_empty` is set, always keeps in-progress runs, paginates with
 /// `limit`/`offset`, and sorts/filters through a fixed column allow-list with
 /// bound filter values." When `show_empty` is false, finished runs that
@@ -1039,7 +1039,7 @@ async fn count_recent_runs(
     Ok(total)
 }
 
-/// SPEC-4.3.1: dashboard Action filter options, restricted to actions
+/// SPEC-4.3.2 through SPEC-4.3.4: dashboard Action filter options, restricted to actions
 /// with actual runs. Distinct `action_name` values that appear in the `runs` table,
 /// alphabetically. Drives the dashboard Action filter dropdown so it only offers
 /// actions that actually have runs (not every indexed action), and serves as the
@@ -1057,7 +1057,7 @@ async fn distinct_run_actions(pool: &DbPool) -> Result<Vec<String>, WebError> {
     Ok(rows)
 }
 
-/// SPEC-4.3.1: dashboard Triggered filter options. Distinct `triggered_by` values present in the `runs` table,
+/// SPEC-4.3.2 through SPEC-4.3.4: dashboard Triggered filter options. Distinct `triggered_by` values present in the `runs` table,
 /// alphabetically. Drives the dashboard Triggered filter dropdown and whitelists
 /// the incoming `?triggered=` value.
 async fn distinct_triggered_by(pool: &DbPool) -> Result<Vec<String>, WebError> {
@@ -1075,7 +1075,7 @@ async fn distinct_triggered_by(pool: &DbPool) -> Result<Vec<String>, WebError> {
 
 // ---- run search --------------------------------------------------------------
 //
-// SPEC-4.3.1: "The dashboard's Runs search finds jobs by content: the
+// SPEC-4.3.2 through SPEC-4.3.4: "The dashboard's Runs search finds jobs by content: the
 // `summary` column is always searched; an opt-in `in_stream` toggle also greps
 // the per-attempt stream `.jsonl` logs server-side, newest first, up to a fixed
 // file count and a per-file byte cap. Matching is a case-insensitive ASCII
@@ -1279,7 +1279,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
-/// SPEC-4.3.1: the dashboard Runs-search handler. Find jobs whose
+/// SPEC-4.3.2 through SPEC-4.3.4: the dashboard Runs-search handler. Find jobs whose
 /// `summary` (always) - and, when `in_stream`, whose
 /// per-attempt stream `.jsonl` log - contains `q` (case-insensitive ASCII
 /// substring). Stream search is bounded to the most recent failed-job attempts
@@ -1436,13 +1436,13 @@ async fn search_jobs(
 
 // ---- templates ---------------------------------------------------------------
 
-/// SPEC-4.3.1: "The dashboard renders global pause, today's run/action/cost
+/// SPEC-4.3.2 through SPEC-4.3.4: "The dashboard renders global pause, today's run/action/cost
 /// counters, the action list (including synthetic listeners), a paginated and
 /// filterable recent-runs table with an optional content search, a 24h
 /// warn/error event banner that separately names access-failure events, a
 /// stale dependency-gate banner, and an attempt-cap banner." Render state for
 /// the dashboard page.
-/// SPEC-4.3.15: one row of the dashboard's in-flight panel, pre-formatted.
+/// SPEC-4.3.57 through SPEC-4.3.61: one row of the dashboard's in-flight panel, pre-formatted.
 #[derive(Debug, Clone, PartialEq)]
 struct InflightRow {
     action: String,
@@ -1455,7 +1455,7 @@ struct InflightRow {
     highlight: &'static str,
 }
 
-/// SPEC-4.3.15: one bar of the 7-day mean attempt duration graph.
+/// SPEC-4.3.57 through SPEC-4.3.61: one bar of the 7-day mean attempt duration graph.
 #[derive(Debug, Clone, PartialEq)]
 struct MeanBar {
     action: String,
@@ -1464,7 +1464,7 @@ struct MeanBar {
     pct: u32,
 }
 
-/// SPEC-4.3.15: the dashboard's live panels. Each series carries its own
+/// SPEC-4.3.57 through SPEC-4.3.61: the dashboard's live panels. Each series carries its own
 /// error so one unreadable series renders an error panel naming the cause
 /// instead of an empty chart.
 #[derive(Default)]
@@ -1477,7 +1477,7 @@ struct LiveView {
     kinds_error: Option<String>,
 }
 
-/// `m:ss`, or `h:mm:ss` from one hour (the SPEC-3.15 time format).
+/// `m:ss`, or `h:mm:ss` from one hour (the SPEC-3.15.1 through SPEC-3.15.8 time format).
 fn clock(secs: i64) -> String {
     crate::progress_list::format_secs(secs)
 }
@@ -1506,7 +1506,7 @@ fn inflight_row(j: &crate::report::InflightJob) -> InflightRow {
     }
 }
 
-/// SPEC-4.3.15: build the in-flight panel and the two 7-day graphs. Every
+/// SPEC-4.3.57 through SPEC-4.3.61: build the in-flight panel and the two 7-day graphs. Every
 /// failure is logged at `error` and kept on its own series.
 async fn live_view(pool: &crate::db::DbPool, actions_dir: &std::path::Path) -> LiveView {
     let mut v = LiveView::default();
@@ -1628,7 +1628,7 @@ struct DashboardTpl {
     /// Distinct `triggered_by` values present in `runs`, for the
     /// Triggered filter dropdown options.
     triggered_options: Vec<String>,
-    /// SPEC-4.3.15: the CI-failures table, newest first, under the
+    /// SPEC-4.3.57 through SPEC-4.3.61: the CI-failures table, newest first, under the
     /// active state/repo filter.
     ci_failures: Vec<CiFailureRow>,
     /// Whitelisted active state filter (`open`/`resolved`/`pr_only`, or
@@ -1636,7 +1636,7 @@ struct DashboardTpl {
     /// lifecycle `state`, not a persisted triage bucket: see
     /// `CiFailureRow::state()`.
     ci_state: String,
-    /// SPEC-4.3.15: whitelisted active triage-bucket filter
+    /// SPEC-4.3.57 through SPEC-4.3.61: whitelisted active triage-bucket filter
     /// (`code_fix`/`human_action`/`transient`/`auto_fix`, or empty for
     /// "all"), echoed into its own filter dropdown. Narrows independently
     /// of `ci_state`.
@@ -1646,7 +1646,7 @@ struct DashboardTpl {
     /// Distinct repos with at least one `ci_failures` row, for the
     /// repository filter dropdown options.
     ci_repo_options: Vec<String>,
-    /// SPEC-3.12 item 2 / SPEC-4.3.15: count of stuck-Working corrections
+    /// SPEC-3.12.3 / SPEC-4.3.57 through SPEC-4.3.61: count of stuck-Working corrections
     /// in the last 7 days.
     stuck_count: i64,
     /// The stuck-Working corrections themselves, newest first.
@@ -1655,7 +1655,7 @@ struct DashboardTpl {
     /// then says the sweep is disabled instead of "No stuck-Working
     /// corrections", so an empty `stuck_rows` is not read as "nothing stuck".
     stuck_sweep_disabled: bool,
-    /// SPEC-4.3.15: the in-flight panel and the 7-day graphs.
+    /// SPEC-4.3.57 through SPEC-4.3.61: the in-flight panel and the 7-day graphs.
     live: LiveView,
 }
 
@@ -1752,7 +1752,7 @@ impl CappedKeyRow {
     }
 }
 
-/// SPEC-4.3.15: one dashboard table cell that is either a resolved link,
+/// SPEC-4.3.57 through SPEC-4.3.61: one dashboard table cell that is either a resolved link,
 /// plain text, the "none" sentinel, or a failed lookup. Kept distinct from a
 /// plain `Option<String>` because a failed lookup must render visibly
 /// differently from "no PR"/"no issue": "A failure with no PR or no issue
@@ -1786,7 +1786,7 @@ impl DashboardCell {
     }
 }
 
-/// SPEC-4.3.15: one row of the dashboard's CI-failures table.
+/// SPEC-4.3.57 through SPEC-4.3.61: one row of the dashboard's CI-failures table.
 struct CiFailureRow {
     failure: crate::ci_failure::store::Failure,
     pr_cell: DashboardCell,
@@ -1813,7 +1813,7 @@ impl CiFailureRow {
         &self.failure.state
     }
 
-    /// SPEC-4.3.15: the dashboard's "Bucket" column: the
+    /// SPEC-4.3.57 through SPEC-4.3.61: the dashboard's "Bucket" column: the
     /// persisted triage bucket (`code_fix`/`human_action`/`transient`/
     /// `auto_fix`, `src/triage.rs`'s `TriageBucket`), distinct from
     /// lifecycle `state`. `"none"` when no triage ran for this row (a
@@ -1839,7 +1839,7 @@ impl CiFailureRow {
     }
 }
 
-/// SPEC-3.12 item 2 / SPEC-4.3.15: one issue the stuck-Working reconcile
+/// SPEC-3.12.3 / SPEC-4.3.57 through SPEC-4.3.61: one issue the stuck-Working reconcile
 /// sweep corrected, as rendered in the dashboard's "Stuck work" list.
 struct StuckWorkRow {
     ts: String,
@@ -1878,7 +1878,7 @@ struct PageNav {
     has_next: bool,
 }
 
-/// SPEC-4.3.1: "Sort/filter input never reaches SQL unvalidated: the
+/// SPEC-4.3.2 through SPEC-4.3.4: "Sort/filter input never reaches SQL unvalidated: the
 /// sort column, direction, exit and job-outcome filters are checked against
 /// fixed allow-lists, and the action/triggered filters against the actual
 /// distinct DB values." Whitelisted sort + filter selection for the dashboard
@@ -2078,16 +2078,16 @@ struct DashboardQuery {
     /// value is clamped to the valid range in the handler.
     #[serde(default)]
     page: Option<i64>,
-    /// SPEC-4.3.15: CI-failures state filter. `None` (the param absent, i.e.
+    /// SPEC-4.3.57 through SPEC-4.3.61: CI-failures state filter. `None` (the param absent, i.e.
     /// first page load) defaults to "open" per "a table of every open CI
     /// failure"; `Some(String::new())` is an explicit "all" from the filter
     /// dropdown's empty option.
     #[serde(default)]
     ci_state: Option<String>,
-    /// SPEC-4.3.15: CI-failures repo filter, empty for all.
+    /// SPEC-4.3.57 through SPEC-4.3.61: CI-failures repo filter, empty for all.
     #[serde(default)]
     ci_repo: String,
-    /// SPEC-4.3.15: CI-failures triage-bucket filter
+    /// SPEC-4.3.57 through SPEC-4.3.61: CI-failures triage-bucket filter
     /// (`code_fix`/`human_action`/`transient`/`auto_fix`), empty for all.
     /// Narrows independently of `ci_state`.
     #[serde(default)]
@@ -2098,13 +2098,13 @@ struct DashboardQuery {
 /// previous hardcoded `LIMIT 20` so page 1 shows exactly the rows it did before.
 const DASHBOARD_PAGE_SIZE: i64 = 20;
 
-/// SPEC-4.3.15: cap on the CI-failures table.
+/// SPEC-4.3.57 through SPEC-4.3.61: cap on the CI-failures table.
 const CI_FAILURES_LIMIT: i64 = 100;
 
-/// SPEC-3.12 item 2 / SPEC-4.3.15: cap on the dashboard's stuck-work list.
+/// SPEC-3.12.3 / SPEC-4.3.57 through SPEC-4.3.61: cap on the dashboard's stuck-work list.
 const STUCK_WORK_LIMIT: i64 = 50;
 
-/// SPEC-4.3.1: the `/` dashboard handler.
+/// SPEC-4.3.2 through SPEC-4.3.4: the `/` dashboard handler.
 async fn dashboard(
     State(s): State<WebState>,
     Query(q): Query<DashboardQuery>,
@@ -2205,7 +2205,7 @@ async fn dashboard(
 
     let (today_runs, today_cost) = totals.unwrap_or((0, 0.0));
 
-    // SPEC-4.3.1: "The dashboard shows today's run/action/cost totals
+    // SPEC-4.3.2 through SPEC-4.3.4: "The dashboard shows today's run/action/cost totals
     // from `daily_ledger`, a 24h warn/error event count that separately names
     // the access-failure subset, stale dependency gates past
     // `STALE_GATE_AFTER_MS`, and keys parked at their per-action attempt cap,
@@ -2284,7 +2284,7 @@ async fn dashboard(
         })
         .collect();
 
-    // SPEC-4.3.15: CI failures table. The state filter defaults to "open"
+    // SPEC-4.3.57 through SPEC-4.3.61: CI failures table. The state filter defaults to "open"
     // on first load (no `?ci_state=` at all); an explicit (possibly empty,
     // i.e. "all") value from the filter dropdown is whitelisted against the
     // fixed set of stored `state` values.
@@ -2309,7 +2309,7 @@ async fn dashboard(
         CI_FAILURES_LIMIT,
     )
     .await?;
-    // SPEC-4.3.15: "the tracker issue (linked through the action's
+    // SPEC-4.3.57 through SPEC-4.3.61: "the tracker issue (linked through the action's
     // link_template)". A `ci_failures` row carries no `action_name` of its
     // own (unlike a run), so the native action that mints these issues
     // ("youtrack") stands in for the usual per-action resolution.
@@ -2331,7 +2331,7 @@ async fn dashboard(
         });
     }
 
-    // SPEC-3.12 item 2 / SPEC-4.3.15: stuck-work count and list over the
+    // SPEC-3.12.3 / SPEC-4.3.57 through SPEC-4.3.61: stuck-work count and list over the
     // last 7 days.
     let stuck_since = stuck_work_window_start();
     let stuck_count = stuck_work_count(pool, &stuck_since).await?;
@@ -2380,7 +2380,7 @@ async fn dashboard(
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
 
-/// SPEC-4.3.2: render state for the `/actions/{name}` detail page.
+/// SPEC-4.3.5 through SPEC-4.3.7: render state for the `/actions/{name}` detail page.
 #[derive(Template)]
 #[template(path = "action_detail.html")]
 struct ActionDetailTpl {
@@ -2408,7 +2408,7 @@ struct ActionDetailQuery {
     show_empty: bool,
 }
 
-/// SPEC-4.3.2: the `/actions/{name}` detail-page handler. Unknown
+/// SPEC-4.3.5 through SPEC-4.3.7: the `/actions/{name}` detail-page handler. Unknown
 /// action name: 404.
 async fn action_detail(
     State(s): State<WebState>,
@@ -2476,7 +2476,7 @@ struct ActionChartTpl {
     chart: Option<DurationChart>,
 }
 
-/// SPEC-4.3.2: "The durations chart accepts the configured synthetic
+/// SPEC-4.3.5 through SPEC-4.3.7: "The durations chart accepts the configured synthetic
 /// webhook action (unindexed but charts its recorded runs) in addition to any
 /// indexed action name; any other unknown name is 404. Only completed runs are
 /// plotted, oldest to newest." The `/actions/{name}/durations` handler.
@@ -2523,7 +2523,7 @@ async fn action_durations(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-// SPEC-4.3.5: "The `/logs` page lists every `run_events` row with no
+// SPEC-4.3.19: "The `/logs` page lists every `run_events` row with no
 // dedup, filtered by whitelisted Level / Action / Context selections, a
 // parameterized message substring search, and a since-this-serve / last-24h /
 // all-time window, sorted by time and paginated. Every user-supplied value is
@@ -2555,7 +2555,7 @@ fn events_window_start() -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// SPEC-3.12 item 2 / SPEC-4.3.15: start of the 7-day window for the
+/// SPEC-3.12.3 / SPEC-4.3.57 through SPEC-4.3.61: start of the 7-day window for the
 /// dashboard's "Stuck work" list ("a count and list of issues the reconcile
 /// sweep corrected ... in the last 7 days").
 fn stuck_work_window_start() -> String {
@@ -2563,7 +2563,7 @@ fn stuck_work_window_start() -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// SPEC-3.12 item 2 / SPEC-4.3.15: count of stuck-Working sweep corrections
+/// SPEC-3.12.3 / SPEC-4.3.57 through SPEC-4.3.61: count of stuck-Working sweep corrections
 /// (tagged `context = STUCK_WORKING_SWEEP_CONTEXT`) since `since`.
 async fn stuck_work_count(pool: &DbPool, since: &str) -> Result<i64, WebError> {
     let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
@@ -2580,7 +2580,7 @@ async fn stuck_work_count(pool: &DbPool, since: &str) -> Result<i64, WebError> {
     Ok(count)
 }
 
-/// SPEC-3.12 item 2 / SPEC-4.3.15: the stuck-Working sweep corrections
+/// SPEC-3.12.3 / SPEC-4.3.57 through SPEC-4.3.61: the stuck-Working sweep corrections
 /// themselves since `since`, newest first, capped at `limit`.
 async fn stuck_work_corrections(
     pool: &DbPool,
@@ -2610,7 +2610,7 @@ async fn stuck_work_corrections(
         .collect())
 }
 
-/// SPEC-4.3.15: resolve one CI failure's PR and Issue cells, and the
+/// SPEC-4.3.57 through SPEC-4.3.61: resolve one CI failure's PR and Issue cells, and the
 /// remediation attempt count. A failure with no `issue_key` has resolved
 /// neither (no issue was ever minted, so there is no PR to find either): both
 /// cells render "none". A failure with an `issue_key` resolves the Issue
@@ -2645,7 +2645,7 @@ async fn resolve_issue_cell(
     }
 }
 
-/// SPEC-4.3.5: distinct `level` values present in `run_events`,
+/// SPEC-4.3.19: distinct `level` values present in `run_events`,
 /// alphabetically. Drives the Level dropdown and whitelists the incoming
 /// `?level=`.
 async fn distinct_event_levels(pool: &DbPool) -> Result<Vec<String>, WebError> {
@@ -2687,7 +2687,7 @@ async fn distinct_event_contexts(pool: &DbPool) -> Result<Vec<String>, WebError>
     Ok(rows)
 }
 
-/// SPEC-4.3.5: "Logs page filter input (level, action, context, dir,
+/// SPEC-4.3.19: "Logs page filter input (level, action, context, dir,
 /// since) never reaches SQL unvalidated; the free-text message search binds
 /// through a parameter, never interpolated." Whitelisted filter + sort
 /// selection for the error-log table. The
@@ -2839,7 +2839,7 @@ impl EventsView {
     }
 }
 
-/// SPEC-4.3.5: total `run_events` rows matching the active filter, for
+/// SPEC-4.3.19: total `run_events` rows matching the active filter, for
 /// the page bounds and the "X-Y of N" indicator. Counts over the same `WHERE` as
 /// [`fetch_run_events`], so the two never disagree.
 async fn count_run_events(
@@ -2879,7 +2879,7 @@ async fn fetch_run_events(
     Ok(q.bind(limit).bind(offset).fetch_all(pool).await?)
 }
 
-/// SPEC-4.3.5: "Each `/logs` row links its own context key wherever it
+/// SPEC-4.3.19: "Each `/logs` row links its own context key wherever it
 /// appears in the Context column and inside the free-text Message column (not
 /// any key-shaped token), everything else HTML-escaped." One `/logs` row, with
 /// its Context link and linked-message HTML pre-rendered: the row's own
@@ -2900,7 +2900,7 @@ struct EventRow {
     message_html: String,
 }
 
-/// SPEC-4.3.5: render state for the `/logs` page.
+/// SPEC-4.3.19: render state for the `/logs` page.
 #[derive(Template)]
 #[template(path = "logs.html")]
 struct LogsTpl {
@@ -2944,7 +2944,7 @@ struct LogsQuery {
     page: Option<i64>,
 }
 
-/// SPEC-4.3.2: "`/actions/{name}/events` is a permanent redirect to
+/// SPEC-4.3.5 through SPEC-4.3.7: "`/actions/{name}/events` is a permanent redirect to
 /// `/logs?action={name}`." The log page moved from `/actions/:name/events` to the global
 /// `/logs`. The old route stays as a permanent redirect that carries the action
 /// into the Action filter, so links, bookmarks and old READMEs still land on the
@@ -2953,7 +2953,7 @@ async fn action_events_redirect(AxumPath(name): AxumPath<String>) -> Redirect {
     Redirect::permanent(&format!("/logs?action={name}"))
 }
 
-/// SPEC-4.3.5: the `/logs` handler.
+/// SPEC-4.3.19: the `/logs` handler.
 async fn logs(State(s): State<WebState>, Query(q): Query<LogsQuery>) -> Result<Response, WebError> {
     let pool = &s.api.pool;
 
@@ -3108,7 +3108,7 @@ struct WeekdayBar {
     pct: u32,
 }
 
-/// SPEC-4.3.14: one `kind`'s total duration, with a precomputed bar width
+/// SPEC-4.3.48 through SPEC-4.3.56: one `kind`'s total duration, with a precomputed bar width
 /// relative to the window's busiest kind.
 #[derive(Serialize)]
 struct KindBar {
@@ -3117,7 +3117,7 @@ struct KindBar {
     pct: u32,
 }
 
-/// SPEC-4.3.14: one `check` sub-step `label`'s total duration + occurrence
+/// SPEC-4.3.48 through SPEC-4.3.56: one `check` sub-step `label`'s total duration + occurrence
 /// count, with a precomputed bar width relative to the window's busiest label.
 #[derive(Serialize)]
 struct CheckBar {
@@ -3156,7 +3156,7 @@ struct ReportsTpl {
     action: Option<String>,
     /// Action names offered in the filter dropdown.
     actions: Vec<String>,
-    /// SPEC-3.17 item 10: true while peering is enabled, so the instance
+    /// SPEC-3.17.11: true while peering is enabled, so the instance
     /// selector and the per-instance note show.
     peering: bool,
     /// Selected instance (`all`, `local` or a peer name).
@@ -3178,24 +3178,24 @@ struct ReportsTpl {
     /// Count of charted invocations with no rate-limit data at all.
     usage_missing_count: usize,
     usage_recent: Vec<RecentInvocationRow>,
-    /// SPEC-4.3.14: total duration per step `kind`, oldest-feature-first
+    /// SPEC-4.3.48 through SPEC-4.3.56: total duration per step `kind`, oldest-feature-first
     /// ordering not required, so by descending seconds.
     time_by_kind: Vec<KindBar>,
-    /// SPEC-4.3.14: the `check` step breakdown by `label`.
+    /// SPEC-4.3.48 through SPEC-4.3.56: the `check` step breakdown by `label`.
     checks: Vec<CheckBar>,
-    /// SPEC-4.3.14: counted attempts in the window with no `attempt_steps`
+    /// SPEC-4.3.48 through SPEC-4.3.56: counted attempts in the window with no `attempt_steps`
     /// rows at all (an attempt that predates this feature, or whose step
     /// writes all failed); shown as its own figure, never folded into either
     /// series above as zero.
     attempts_with_no_step_data: i64,
-    /// SPEC-4.3.14 stages series, every stage in order.
+    /// SPEC-4.3.48 through SPEC-4.3.56 stages series, every stage in order.
     stages: Vec<crate::report::StageStats>,
     stages_no_step_data: i64,
-    /// SPEC-4.3.14 Postgres series.
+    /// SPEC-4.3.48 through SPEC-4.3.56 Postgres series.
     postgres: crate::report::PostgresReport,
-    /// SPEC-4.3.14 funnel; `mismatch` renders as an error banner.
+    /// SPEC-4.3.48 through SPEC-4.3.56 funnel; `mismatch` renders as an error banner.
     funnel: crate::report::FunnelReport,
-    /// SPEC-4.3.14 failure causes, every cause in order.
+    /// SPEC-4.3.48 through SPEC-4.3.56 failure causes, every cause in order.
     failure_causes: crate::report::FailureCauseReport,
 }
 
@@ -3213,7 +3213,7 @@ struct ReportsQuery {
 }
 
 /// One peer named on the Reports page as possibly lacking recent runs
-/// (`SPEC-3.17` item 10).
+/// (`SPEC-3.17.11`).
 struct PeerReportNote {
     name: String,
     state: &'static str,
@@ -3238,7 +3238,7 @@ impl From<crate::peer::ViewError> for WebError {
 
 /// Bar width as a percentage of the series max, guarded against an all-zero
 /// series so an empty window renders flat rather than dividing by zero.
-/// SPEC-4.3.13: bar-width percentage helper for the Reports page bars.
+/// SPEC-4.3.41 through SPEC-4.3.47: bar-width percentage helper for the Reports page bars.
 fn bar_pct(value: f64, max: f64) -> u32 {
     if max <= 0.0 {
         0
@@ -3247,7 +3247,7 @@ fn bar_pct(value: f64, max: f64) -> u32 {
     }
 }
 
-/// SPEC-4.3.13: the `/reports` handler.
+/// SPEC-4.3.41 through SPEC-4.3.47: the `/reports` handler.
 async fn reports_page(
     State(s): State<WebState>,
     Query(q): Query<ReportsQuery>,
@@ -3529,7 +3529,7 @@ prompt: |\n\
 \x20\x20print \"Describe the task for this job.\"\n\
 enabled: false\n";
 
-/// SPEC-4.3.3: "Edit, export and delete resolve an action's on-disk path only
+/// SPEC-4.3.8 through SPEC-4.3.12: "Edit, export and delete resolve an action's on-disk path only
 /// through the daemon's scanned index, by exact name, so a hostile `:name`
 /// path segment can never reach the filesystem." Resolve an indexed action's
 /// on-disk path by exact name. Only names the daemon has scanned (always
@@ -3543,7 +3543,7 @@ async fn indexed_action_path(pool: &DbPool, name: &str) -> Result<Option<String>
         .map(|r| r.file_path))
 }
 
-/// SPEC-4.3.3: "A new action's name must be a single safe path component:
+/// SPEC-4.3.8 through SPEC-4.3.12: "A new action's name must be a single safe path component:
 /// non-empty, not `.`/`..`, with no path separator, restricted to
 /// `[A-Za-z0-9._-]`, used as the `<stem>.yml` filename." Constrain an action
 /// name to a single safe path component for use as a `<stem>.yml` filename.
@@ -3563,7 +3563,7 @@ fn safe_action_stem(name: &str) -> Option<String> {
     Some(n.to_string())
 }
 
-/// SPEC-4.3.3: "A rejected create or edit re-renders the raw-YAML editor with
+/// SPEC-4.3.8 through SPEC-4.3.12: "A rejected create or edit re-renders the raw-YAML editor with
 /// the draft preserved and an inline error, HTTP 422, never a redirect or a
 /// blank form." Re-render the editor with an inline error (HTTP 422),
 /// preserving the draft.
@@ -3596,7 +3596,7 @@ fn editor_error(
         .into_response())
 }
 
-/// SPEC-4.3.3: "The raw-YAML edit page offers a structured-form link whenever
+/// SPEC-4.3.8 through SPEC-4.3.12: "The raw-YAML edit page offers a structured-form link whenever
 /// the stored YAML parses as a native kind; a `scripted` action, or one that
 /// fails to parse, stays raw-YAML only." The `/actions/{name}/edit` page
 /// handler.
@@ -3635,7 +3635,7 @@ async fn action_edit_page(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-/// SPEC-4.3.3: "Saving an edit validates the new YAML through the same
+/// SPEC-4.3.8 through SPEC-4.3.12: "Saving an edit validates the new YAML through the same
 /// checks the loader/scanner uses before writing it; a failure leaves the
 /// on-disk file untouched and re-renders the editor with the draft. A
 /// successful save re-scans actions synchronously so the redirect target
@@ -3674,7 +3674,7 @@ async fn redirect_to_action_edit(AxumPath(name): AxumPath<String>) -> Redirect {
     Redirect::to(&format!("/actions/{name}/edit"))
 }
 
-/// SPEC-4.3.3: the Environment form's save. Rewrites only the
+/// SPEC-4.3.8 through SPEC-4.3.12: the Environment form's save. Rewrites only the
 /// submitted `env` values in place ([`env_form::set_env_values`]), then
 /// takes the raw editor's path: the same validation, and nothing is written
 /// unless the result parses to exactly the submitted `env`.
@@ -3738,7 +3738,7 @@ async fn action_env_save(
     Ok(Redirect::to(&format!("/actions/{name}")).into_response())
 }
 
-/// SPEC-4.3.3: "The new-action page lists every action kind with a one-line
+/// SPEC-4.3.8 through SPEC-4.3.12: "The new-action page lists every action kind with a one-line
 /// description and a link to its editor; raw-YAML paste is an explicit
 /// alternative, not the default." The new-action page lists every
 /// [`ActionKind`] with a one-line description and a link to its editor.
@@ -3752,7 +3752,7 @@ async fn action_new_page(State(s): State<WebState>) -> Result<Html<String>, WebE
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
 
-/// SPEC-4.3.3: one row of the new-action kind picker.
+/// SPEC-4.3.8 through SPEC-4.3.12: one row of the new-action kind picker.
 struct KindCard {
     kind: &'static str,
     description: &'static str,
@@ -3761,7 +3761,7 @@ struct KindCard {
     action_label: &'static str,
 }
 
-/// SPEC-4.3.3: "Every action kind must decide, exhaustively, which editor
+/// SPEC-4.3.8 through SPEC-4.3.12: "Every action kind must decide, exhaustively, which editor
 /// creates it: a native kind gets a structured form, `scripted` is raw YAML
 /// only." Describe a kind for the picker. The match is exhaustive, so a new
 /// [`ActionKind`] cannot ship without deciding which editor creates it.
@@ -3794,7 +3794,7 @@ fn kind_card(kind: ActionKind) -> KindCard {
     }
 }
 
-/// SPEC-4.3.3: the `/actions/new/raw` raw-YAML editor for a new action,
+/// SPEC-4.3.8 through SPEC-4.3.12: the `/actions/new/raw` raw-YAML editor for a new action,
 /// reached from the kind picker.
 async fn action_new_raw_page(State(s): State<WebState>) -> Result<Html<String>, WebError> {
     let tpl = ActionEditorTpl {
@@ -3818,7 +3818,7 @@ async fn redirect_to_actions_new_raw() -> Redirect {
     Redirect::to("/actions/new/raw")
 }
 
-/// SPEC-4.3.3: "Creating an action from raw YAML rejects a name that is not
+/// SPEC-4.3.8 through SPEC-4.3.12: "Creating an action from raw YAML rejects a name that is not
 /// a safe filename or whose destination `.yml` already exists, inline with
 /// the draft preserved; a successful create writes the file and re-scans
 /// actions synchronously so the redirect target resolves immediately." The
@@ -3854,7 +3854,7 @@ async fn action_create(
     Ok(Redirect::to(&format!("/actions/{}", loaded.action.name)).into_response())
 }
 
-/// SPEC-4.3.3: "Export streams the action's own on-disk YAML back as an
+/// SPEC-4.3.8 through SPEC-4.3.12: "Export streams the action's own on-disk YAML back as an
 /// `application/x-yaml` attachment named `<action>.yml`; the synthetic
 /// action and an unknown name both reject it." The `/actions/{name}/export`
 /// handler.
@@ -3880,7 +3880,7 @@ async fn action_export(
     Ok(resp)
 }
 
-/// SPEC-4.3.3: "Delete 404s an unknown action, rejects the synthetic action,
+/// SPEC-4.3.8 through SPEC-4.3.12: "Delete 404s an unknown action, rejects the synthetic action,
 /// and 409s while a run for it is dispatched or active in the DB; otherwise
 /// it removes the YAML file and purges the derived index/control state while
 /// keeping run history, then redirects to the dashboard, which no longer
@@ -3919,7 +3919,7 @@ async fn action_delete(
 
 // ---- structured YouTrack action editor -------------------------------------
 //
-// SPEC-4.3.4: "The structured YouTrack action editor is a field-based form,
+// SPEC-4.3.13 through SPEC-4.3.18: "The structured YouTrack action editor is a field-based form,
 // an alternative to the raw-YAML textarea, that owns the native config
 // (youtrack source + forgejo target) plus the generic Action blocks it
 // surfaces; every other key the file carries is left untouched on save.
@@ -3937,7 +3937,7 @@ async fn action_delete(
 // `crate::action::validate_str` the raw editor uses, so a bad config is rejected
 // inline with the entered values preserved.
 
-/// SPEC-4.3.4: render state for the structured YouTrack action editor page.
+/// SPEC-4.3.13 through SPEC-4.3.18: render state for the structured YouTrack action editor page.
 #[derive(Template)]
 #[template(path = "youtrack_editor.html")]
 struct YoutrackEditorTpl {
@@ -3963,7 +3963,7 @@ struct YoutrackEditorTpl {
     prompt_preset: &'static str,
 }
 
-/// SPEC-4.3.4: flat form backing the structured editor. Every input posts a string; the
+/// SPEC-4.3.13 through SPEC-4.3.18: flat form backing the structured editor. Every input posts a string; the
 /// mapping into the typed config (and number / enum parsing) happens in
 /// [`youtrack_form_to_yaml`]. `#[serde(default)]` lets an unchecked checkbox or
 /// an omitted field deserialize cleanly.
@@ -4111,7 +4111,7 @@ impl YoutrackEditForm {
     }
 }
 
-/// SPEC-4.3.4: "A brand-new YouTrack action's form opens with a blank
+/// SPEC-4.3.13 through SPEC-4.3.18: "A brand-new YouTrack action's form opens with a blank
 /// identity but the query, custom field, and state labels seeded from the
 /// same defaults a bare `native: {}` resolves to." Field defaults for a
 /// brand-new YouTrack action: blank identity, but the query / custom field /
@@ -4149,7 +4149,7 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
     }
 }
 
-/// SPEC-4.3.4: "The structured editor only handles the native `kind:
+/// SPEC-4.3.13 through SPEC-4.3.18: "The structured editor only handles the native `kind:
 /// youtrack` action; any other kind redirects to the raw editor instead."
 /// Prefill the form from a loaded action. Returns `None` when the action is
 /// not a native `kind: youtrack` action (the structured editor only handles
@@ -4244,7 +4244,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
     })
 }
 
-/// SPEC-4.3.4: "The structured editor emits YAML with only the fields the
+/// SPEC-4.3.13 through SPEC-4.3.18: "The structured editor emits YAML with only the fields the
 /// user actually set: a `None` field disappears rather than serializing as
 /// an explicit null." Recursively drop `null` values and empty maps /
 /// sequences so the emitted YAML carries only the fields the user actually
@@ -4272,7 +4272,7 @@ fn prune_yaml(v: serde_yaml::Value) -> Option<serde_yaml::Value> {
     }
 }
 
-/// SPEC-4.3.4: "Saving the structured form overlays the form's owned keys
+/// SPEC-4.3.13 through SPEC-4.3.18: "Saving the structured form overlays the form's owned keys
 /// (name, kind, native, claude, limits, schedule, workdir_base,
 /// link_template, enabled) onto the existing file for an edit, or an empty
 /// mapping for a create, preserving every other on-disk key untouched. A
@@ -4623,7 +4623,7 @@ fn youtrack_form_to_yaml(
     serde_yaml::to_string(&base).map_err(|e| e.to_string())
 }
 
-/// SPEC-4.3.4: insert `val` under `key`, or remove the key when `val` is `None`.
+/// SPEC-4.3.13 through SPEC-4.3.18: insert `val` under `key`, or remove the key when `val` is `None`.
 fn set_or_remove(map: &mut serde_yaml::Mapping, key: &str, val: Option<serde_yaml::Value>) {
     match val {
         Some(v) => {
@@ -4635,12 +4635,12 @@ fn set_or_remove(map: &mut serde_yaml::Mapping, key: &str, val: Option<serde_yam
     }
 }
 
-/// SPEC-4.3.4: insert a scalar string under `key`, or remove the key when `val` is `None`.
+/// SPEC-4.3.13 through SPEC-4.3.18: insert a scalar string under `key`, or remove the key when `val` is `None`.
 fn set_scalar_or_remove(map: &mut serde_yaml::Mapping, key: &str, val: Option<String>) {
     set_or_remove(map, key, val.map(serde_yaml::Value::from));
 }
 
-/// SPEC-4.3.4: "The `token_ref` dropdowns list every stored secret name, plus
+/// SPEC-4.3.13 through SPEC-4.3.18: "The `token_ref` dropdowns list every stored secret name, plus
 /// any `token_ref` the action already references that no longer exists, so
 /// an orphaned reference still shows as selected rather than silently
 /// resetting." Stored secret names, with any `token_ref` the action already
@@ -4667,7 +4667,7 @@ async fn token_ref_options(s: &WebState, form: &YoutrackEditForm) -> Result<Vec<
     Ok(names)
 }
 
-/// SPEC-4.3.4: "The structured editor shows the resolved prompt's
+/// SPEC-4.3.13 through SPEC-4.3.18: "The structured editor shows the resolved prompt's
 /// provenance (override vs. builtin preset); a file that fails to load
 /// renders as `unknown` with the reason, never a guessed preset." Prompt
 /// provenance shown on the structured editor.
@@ -4714,7 +4714,7 @@ impl PromptProvenance {
     }
 }
 
-/// SPEC-4.3.4: render the structured editor at `status`, preserving the supplied `form`.
+/// SPEC-4.3.13 through SPEC-4.3.18: render the structured editor at `status`, preserving the supplied `form`.
 async fn render_youtrack_editor(
     s: &WebState,
     status: StatusCode,
@@ -4751,7 +4751,7 @@ async fn render_youtrack_editor(
     Ok((status, Html(tpl.render().map_err(WebError::from)?)).into_response())
 }
 
-/// SPEC-4.3.4: "`/actions/{name}/form` renders the structured editor
+/// SPEC-4.3.13 through SPEC-4.3.18: "`/actions/{name}/form` renders the structured editor
 /// matching the action's own native config; an action with no structured
 /// editor (`scripted`, or a file that no longer parses) falls back to the
 /// raw editor." `/actions/:name/form` for any kind. Renders the structured
@@ -4783,7 +4783,7 @@ async fn action_form_page(
     }
 }
 
-/// SPEC-4.3.4: "The form-save route decodes the POST body raw, not through
+/// SPEC-4.3.13 through SPEC-4.3.18: "The form-save route decodes the POST body raw, not through
 /// `Form<T>`, because the per-repo `log_token_ref` rows post repeated keys
 /// that `Form<T>` would collapse, then dispatches by the action's own
 /// kind." POST counterpart of [`action_form_page`]: decodes the body with
@@ -4828,7 +4828,7 @@ async fn action_form_save(
     }
 }
 
-/// SPEC-4.3.4: the `/actions/new/youtrack` structured-editor page for a new action.
+/// SPEC-4.3.13 through SPEC-4.3.18: the `/actions/new/youtrack` structured-editor page for a new action.
 async fn youtrack_new_page(State(s): State<WebState>) -> Result<Response, WebError> {
     render_youtrack_editor(
         &s,
@@ -4841,7 +4841,7 @@ async fn youtrack_new_page(State(s): State<WebState>) -> Result<Response, WebErr
     .await
 }
 
-/// SPEC-4.3.4: "The structured edit page names why a file no longer parses
+/// SPEC-4.3.13 through SPEC-4.3.18: "The structured edit page names why a file no longer parses
 /// and links to the raw editor (422) instead of redirecting there with no
 /// explanation; a file that validates but is not a youtrack action still
 /// redirects, since it simply has no structured form." The
@@ -4870,7 +4870,7 @@ async fn youtrack_edit_page(
     render_youtrack_editor(&s, StatusCode::OK, Some(name), form, None, prompt).await
 }
 
-/// SPEC-4.3.4: "A structured-editor route that cannot load the action file
+/// SPEC-4.3.13 through SPEC-4.3.18: "A structured-editor route that cannot load the action file
 /// at all (read failure or a validation rejection) renders a shared 422
 /// naming the reason, instead of silently falling back to the raw editor."
 /// Shared 422 response for a structured-editor route that could not
@@ -4893,7 +4893,7 @@ async fn action_load_error_response(
         .into_response())
 }
 
-/// SPEC-4.3.4: render state for the shared action-load-error page.
+/// SPEC-4.3.13 through SPEC-4.3.18: render state for the shared action-load-error page.
 #[derive(Template)]
 #[template(path = "action_load_error.html")]
 struct ActionLoadErrorTpl {
@@ -4902,7 +4902,7 @@ struct ActionLoadErrorTpl {
     message: String,
 }
 
-/// SPEC-4.3.4: "An unparsable on-disk base never becomes an empty mapping
+/// SPEC-4.3.13 through SPEC-4.3.18: "An unparsable on-disk base never becomes an empty mapping
 /// for the save: that would drop every key the form does not show, so it
 /// is rejected inline instead, naming the raw editor as the fix." The
 /// `/actions/{name}/form` youtrack save handler.
@@ -4975,7 +4975,7 @@ async fn youtrack_edit_save(
     Ok(Redirect::to(&format!("/actions/{}", loaded.action.name)).into_response())
 }
 
-/// SPEC-4.3.4: the `/actions/new/youtrack` structured-editor create handler.
+/// SPEC-4.3.13 through SPEC-4.3.18: the `/actions/new/youtrack` structured-editor create handler.
 async fn youtrack_create(
     State(s): State<WebState>,
     Form(form): Form<YoutrackEditForm>,
@@ -5050,7 +5050,7 @@ async fn youtrack_create(
 
 // ---- secrets management -----------------------------------------------
 //
-// SPEC-4.3.6: "Secret values are write-only: the create / rotate forms
+// SPEC-4.3.20 through SPEC-4.3.24: "Secret values are write-only: the create / rotate forms
 // accept a value, but the listing only ever shows a secret's name and
 // timestamps; a stored value is never re-rendered or sent back to the
 // browser, leaving the DB only as ciphertext, decrypted in-process at run
@@ -5065,7 +5065,7 @@ async fn youtrack_create(
 // `CLAUDE_RUN_SECRETS_KEY_FILE`; when it is missing, create / rotate fail closed
 // with an inline error and the listing shows a banner.
 
-/// SPEC-4.3.6: render state for the `/secrets` page.
+/// SPEC-4.3.20 through SPEC-4.3.24: render state for the `/secrets` page.
 #[derive(Template)]
 #[template(path = "secrets.html")]
 struct SecretsTpl {
@@ -5096,7 +5096,7 @@ struct SecretValueForm {
     value: String,
 }
 
-/// SPEC-4.3.6: "A secret name is constrained to a safe handle: non-empty,
+/// SPEC-4.3.20 through SPEC-4.3.24: "A secret name is constrained to a safe handle: non-empty,
 /// `[A-Za-z0-9._-]` only." Constrain a secret name to a safe handle:
 /// non-empty, `[A-Za-z0-9._-]` only.
 fn valid_secret_name(name: &str) -> bool {
@@ -5106,7 +5106,7 @@ fn valid_secret_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// SPEC-4.3.6: render the secrets page (HTTP `status`), loading the listing and the key
+/// SPEC-4.3.20 through SPEC-4.3.24: render the secrets page (HTTP `status`), loading the listing and the key
 /// status. Never renders any secret value.
 async fn render_secrets(
     s: &WebState,
@@ -5150,7 +5150,7 @@ async fn render_secrets_with_key(
     })
 }
 
-/// SPEC-4.3.6: the `/secrets` page handler.
+/// SPEC-4.3.20 through SPEC-4.3.24: the `/secrets` page handler.
 async fn secrets_page(State(s): State<WebState>) -> Result<Response, WebError> {
     render_secrets(&s, StatusCode::OK, None).await
 }
@@ -5165,7 +5165,7 @@ async fn redirect_to_secrets() -> Redirect {
     Redirect::to("/secrets")
 }
 
-/// SPEC-4.3.6: "Create rejects an invalid name, an empty value, a missing
+/// SPEC-4.3.20 through SPEC-4.3.24: "Create rejects an invalid name, an empty value, a missing
 /// key file, or a name that already exists (which must go through rotate
 /// instead), each inline with 422 and the listing preserved." The
 /// `/secrets` create handler.
@@ -5218,7 +5218,7 @@ async fn secret_create(
     Ok(Redirect::to("/secrets").into_response())
 }
 
-/// SPEC-4.3.6: "Rotate rejects an empty value or a missing key file inline
+/// SPEC-4.3.20 through SPEC-4.3.24: "Rotate rejects an empty value or a missing key file inline
 /// with 422, and 404s an unknown secret name; a successful rotate keeps the
 /// same name and redirects to the listing." The `/secrets/{name}/rotate`
 /// handler.
@@ -5258,7 +5258,7 @@ async fn secret_rotate(
     Ok(Redirect::to("/secrets").into_response())
 }
 
-/// SPEC-4.3.6: "Delete 404s an unknown secret name; a successful delete
+/// SPEC-4.3.20 through SPEC-4.3.24: "Delete 404s an unknown secret name; a successful delete
 /// redirects to the listing." The `/secrets/{name}/delete` handler.
 async fn secret_delete(
     State(s): State<WebState>,
@@ -5344,7 +5344,7 @@ async fn api_key_revoke(
 
 // ---- Access check -----------------------------------------------------
 //
-// SPEC-4.3.7: "One service backs the `/access` page, `POST
+// SPEC-4.3.25: "One service backs the `/access` page, `POST
 // /api/access/check`, and `claude-run access check`; a row names the
 // secret, the probe, and the failure text, and a secret VALUE is never read
 // back here, exactly as on `/secrets`."
@@ -5353,7 +5353,7 @@ async fn api_key_revoke(
 // `claude-run access check`. A row names the secret, the probe, and the failure
 // text; a secret VALUE is never read back here, exactly as on `/secrets`.
 
-/// SPEC-4.3.7: render state for the `/access` page.
+/// SPEC-4.3.25: render state for the `/access` page.
 #[derive(Template)]
 #[template(path = "access.html")]
 struct AccessTpl {
@@ -5364,14 +5364,14 @@ struct AccessTpl {
     report: Option<crate::access::AccessReport>,
 }
 
-/// SPEC-4.3.7: the result table alone, for the HTMX swap.
+/// SPEC-4.3.25: the result table alone, for the HTMX swap.
 #[derive(Template)]
 #[template(path = "access_rows.html")]
 struct AccessRowsTpl {
     report: Option<crate::access::AccessReport>,
 }
 
-/// SPEC-4.3.7: "A setup failure (the daemon cannot invoke `yt` / `fj`)
+/// SPEC-4.3.25: "A setup failure (the daemon cannot invoke `yt` / `fj`)
 /// renders as a report row, not a 500: the failure itself is the answer."
 /// Run the check, rendering a setup failure as a report row rather than a 500:
 /// "the daemon cannot invoke `yt` / `fj`" is itself the answer.
@@ -5386,7 +5386,7 @@ async fn run_access_check(
     }
 }
 
-/// SPEC-4.3.7: the `/access` page handler (bare GET, no check run yet).
+/// SPEC-4.3.25: the `/access` page handler (bare GET, no check run yet).
 async fn access_page(
     State(s): State<WebState>,
     Query(q): Query<crate::access::AccessRequest>,
@@ -5399,7 +5399,7 @@ async fn access_page(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-/// SPEC-4.3.7: the `/access` check handler, returning the result-table HTMX swap.
+/// SPEC-4.3.25: the `/access` check handler, returning the result-table HTMX swap.
 async fn access_check(
     State(s): State<WebState>,
     Form(form): Form<crate::access::AccessRequest>,
@@ -5419,7 +5419,7 @@ async fn redirect_to_access() -> Redirect {
     Redirect::to("/access")
 }
 
-/// SPEC-4.3.7: "The per-secret Check button on `/secrets` runs the identity
+/// SPEC-4.3.25: "The per-secret Check button on `/secrets` runs the identity
 /// probe of every action that references that secret, and lands on
 /// `/access` with the result." The per-secret Check button on `/secrets`:
 /// run the identity probe of every action that references this secret, and
@@ -5443,13 +5443,13 @@ async fn secret_check(
 
 // ---- Settings page ----------------------------------------------------
 //
-// SPEC-4.3.8: "The Settings page renders the runtime config sections plus
+// SPEC-4.3.26 through SPEC-4.3.30: "The Settings page renders the runtime config sections plus
 // the service-auth cards (Claude, YouTrack, Forgejo, GitHub, Git identity)
 // and a read-only Email card. Rendering never decrypts a secret: a card's
 // `configured` state means a credential is named and its non-secret half is
 // present, not that its value was read."
 
-/// SPEC-4.3.8: render state for the `/settings` page.
+/// SPEC-4.3.26 through SPEC-4.3.30: render state for the `/settings` page.
 #[derive(Template)]
 #[template(path = "settings.html")]
 struct SettingsTpl {
@@ -5460,7 +5460,7 @@ struct SettingsTpl {
     email: EmailCardView,
 }
 
-/// SPEC-4.3.8: "The Email card is read-only, resolved from the environment
+/// SPEC-4.3.26 through SPEC-4.3.30: "The Email card is read-only, resolved from the environment
 /// at render time; a password is never shown, only whether one is set."
 /// What the Email card shows (read-only, resolved from the
 /// environment at render time; the password is never shown, only whether one
@@ -5478,7 +5478,7 @@ struct EmailCardView {
     error: Option<String>,
 }
 
-/// SPEC-4.3.8: "The Auth card is derived from the `config.auth` document
+/// SPEC-4.3.26 through SPEC-4.3.30: "The Auth card is derived from the `config.auth` document
 /// alone, so rendering the page never decrypts a secret; `configured` means
 /// a credential is named and its non-secret half is present." What the
 /// Auth card shows. Derived from the `config.auth` document alone, so
@@ -5511,7 +5511,7 @@ struct AuthCardView {
     login_error: Option<String>,
 }
 
-/// SPEC-4.3.8: one runtime-config section card's render state.
+/// SPEC-4.3.26 through SPEC-4.3.30: one runtime-config section card's render state.
 struct SettingsSectionView {
     path: &'static str,
     title: &'static str,
@@ -5519,17 +5519,17 @@ struct SettingsSectionView {
     json: String,
     error: Option<String>,
     fields: Vec<FieldDoc>,
-    /// SPEC-4.4.6: whether the notes table carries a "Used by" column, true
+    /// SPEC-4.4.39 through SPEC-4.4.46: whether the notes table carries a "Used by" column, true
     /// for a section whose fields name the actions that read them.
     shows_used_by: bool,
 }
 
-/// SPEC-4.3.8: one field's apply-semantics doc shown on a section card.
+/// SPEC-4.3.26 through SPEC-4.3.30: one field's apply-semantics doc shown on a section card.
 struct FieldDoc {
     name: &'static str,
     badge: &'static str,
     note: &'static str,
-    /// SPEC-4.4.6: the actions that read this field, for a section more than one
+    /// SPEC-4.4.39 through SPEC-4.4.46: the actions that read this field, for a section more than one
     /// action reads; empty for a section only one action reads.
     used_by: &'static [&'static str],
 }
@@ -5542,7 +5542,7 @@ struct SettingsForm {
     json: String,
 }
 
-/// SPEC-4.3.8: "Each runtime-config section card documents, per field,
+/// SPEC-4.3.26 through SPEC-4.3.30: "Each runtime-config section card documents, per field,
 /// when an edit takes effect: `live` (immediately), `next event` / `next
 /// sweep` (the next matching run), or `restart` (only after the daemon
 /// restarts)." Static per-field apply-semantics reference shown on each
@@ -5617,7 +5617,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "needs_info_tag",
                 badge: "next event",
-                note: "tag added alongside Needs Review at the CI fix-attempt ceiling (SPEC-3.12 item 3); empty disables the tag write.",
+                note: "tag added alongside Needs Review at the CI fix-attempt ceiling (SPEC-3.12.4); empty disables the tag write.",
                 used_by: USED_BY_TRIAGE,
             },
         ],
@@ -5876,7 +5876,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "max_bytes",
                 badge: "next sweep",
-                note: "total ceiling across every Docker storage category (images, containers, local volumes, build cache); over it with no run in flight, storage is reclaimed in the SPEC-3.11 order until under it again; must be >= 1.",
+                note: "total ceiling across every Docker storage category (images, containers, local volumes, build cache); over it with no run in flight, storage is reclaimed in the SPEC-3.11.1 through SPEC-3.11.6 order until under it again; must be >= 1.",
                 used_by: &[],
             },
         ],
@@ -5941,7 +5941,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
     }
 }
 
-/// SPEC-4.3.8: build the full settings view. `flash` carries a just-saved section name or a
+/// SPEC-4.3.26 through SPEC-4.3.30: build the full settings view. `flash` carries a just-saved section name or a
 /// just-rejected section's submitted-but-invalid JSON + serde error.
 async fn render_settings(
     s: &WebState,
@@ -5952,7 +5952,7 @@ async fn render_settings(
     render_settings_with(s, status, saved, rejected, None).await
 }
 
-/// SPEC-4.3.8: like [`render_settings`], with an optional Auth-card error.
+/// SPEC-4.3.26 through SPEC-4.3.30: like [`render_settings`], with an optional Auth-card error.
 async fn render_settings_with(
     s: &WebState,
     status: StatusCode,
@@ -5963,7 +5963,7 @@ async fn render_settings_with(
     render_settings_full(s, status, saved, rejected, auth_error, None, None).await
 }
 
-/// SPEC-4.3.8: like [`render_settings_with`], but the error belongs to the Email card
+/// SPEC-4.3.26 through SPEC-4.3.30: like [`render_settings_with`], but the error belongs to the Email card
 /// instead of the Auth card.
 async fn render_settings_with_email_error(
     s: &WebState,
@@ -5973,7 +5973,7 @@ async fn render_settings_with_email_error(
     render_settings_full(s, status, None, None, None, None, email_error).await
 }
 
-/// SPEC-4.3.8: "The Auth section is excluded from the generic JSON-textarea
+/// SPEC-4.3.26 through SPEC-4.3.30: "The Auth section is excluded from the generic JSON-textarea
 /// section list and rendered instead as a dedicated card with real password
 /// inputs: a JSON textarea would invite pasting a token into a stored
 /// document." Assembles the full settings view for every variant above.
@@ -6081,7 +6081,7 @@ async fn render_settings_full(
     Ok((status, Html(tpl.render()?)).into_response())
 }
 
-/// SPEC-4.3.8: "`?saved=<what>` renders the confirmation banner after an
+/// SPEC-4.3.26 through SPEC-4.3.30: "`?saved=<what>` renders the confirmation banner after an
 /// Auth-card save redirects back here." `?saved=<what>` renders the
 /// confirmation banner after an Auth-card save redirects back here.
 #[derive(Deserialize)]
@@ -6089,7 +6089,7 @@ struct SettingsQuery {
     saved: Option<String>,
 }
 
-/// SPEC-4.3.8: the `/settings` page handler.
+/// SPEC-4.3.26 through SPEC-4.3.30: the `/settings` page handler.
 async fn settings_page(
     State(s): State<WebState>,
     Query(q): Query<SettingsQuery>,
@@ -6105,7 +6105,7 @@ async fn redirect_to_settings() -> Redirect {
     Redirect::to("/settings")
 }
 
-/// SPEC-4.3.8: "Saving a section 404s an unknown section path; an invalid
+/// SPEC-4.3.26 through SPEC-4.3.30: "Saving a section 404s an unknown section path; an invalid
 /// JSON submission re-renders the settings page at 422 with the rejected
 /// section's submitted text and the serde error inline, never a silent
 /// fallback to the stored value." The `/settings/{section}` save handler.
@@ -6136,7 +6136,7 @@ async fn settings_save(
 
 // ---- Settings: service auth ------------------------------------------------
 //
-// SPEC-4.3.8: "Each service-auth card stores its secret encrypted under a
+// SPEC-4.3.26 through SPEC-4.3.30: "Each service-auth card stores its secret encrypted under a
 // fixed name, records the non-secret half in the `config.auth` document,
 // and re-materializes the credential files the CLIs read with no restart.
 // A stored value is never rendered back, only the fact that it is set."
@@ -6177,7 +6177,7 @@ struct AuthGitForm {
     email: String,
 }
 
-/// SPEC-4.3.8: store `value` under `name`, creating or rotating as needed. The caller has
+/// SPEC-4.3.26 through SPEC-4.3.30: store `value` under `name`, creating or rotating as needed. The caller has
 /// already checked the value is non-empty.
 async fn put_secret(s: &WebState, name: &str, value: &str) -> std::result::Result<(), String> {
     let key = crate::secrets::SecretsKey::load().map_err(|e| e.to_string())?;
@@ -6197,7 +6197,7 @@ async fn put_secret(s: &WebState, name: &str, value: &str) -> std::result::Resul
     Ok(())
 }
 
-/// SPEC-4.3.8: persist `cfg` as the `config.auth` document and re-materialize the credential
+/// SPEC-4.3.26 through SPEC-4.3.30: persist `cfg` as the `config.auth` document and re-materialize the credential
 /// files from it, so the next `yt` / `fj` / `claude` child sees the new login
 /// with no restart.
 async fn save_auth_config(
@@ -6233,7 +6233,7 @@ async fn save_auth_config(
     Ok(())
 }
 
-/// SPEC-4.3.8: "Saving the Claude auth card requires a non-empty API key;
+/// SPEC-4.3.26 through SPEC-4.3.30: "Saving the Claude auth card requires a non-empty API key;
 /// a successful save also clears any login-required gate with no restart,
 /// alongside a brokered sign-in and the status probe." The
 /// `/settings/auth/claude` handler.
@@ -6271,7 +6271,7 @@ async fn auth_save_claude(
     Ok(Redirect::to("/settings?saved=Claude+auth").into_response())
 }
 
-/// SPEC-4.3.8: "Saving the YouTrack auth card requires a non-empty base
+/// SPEC-4.3.26 through SPEC-4.3.30: "Saving the YouTrack auth card requires a non-empty base
 /// URL and token, and rejects a base URL with no `http(s)://` scheme." The
 /// `/settings/auth/youtrack` handler.
 async fn auth_save_youtrack(
@@ -6317,7 +6317,7 @@ async fn auth_save_youtrack(
     Ok(Redirect::to("/settings?saved=YouTrack+auth").into_response())
 }
 
-/// SPEC-4.3.8: "Saving the Forgejo auth card requires a non-empty host and
+/// SPEC-4.3.26 through SPEC-4.3.30: "Saving the Forgejo auth card requires a non-empty host and
 /// token; a pasted scheme is stripped since `fj` keys by bare host." The
 /// `/settings/auth/forgejo` handler.
 async fn auth_save_forgejo(
@@ -6359,7 +6359,7 @@ async fn auth_save_forgejo(
     Ok(Redirect::to("/settings?saved=Forgejo+auth").into_response())
 }
 
-/// SPEC-4.3.8: "Saving the GitHub auth card runs `gh auth login` BEFORE
+/// SPEC-4.3.26 through SPEC-4.3.30: "Saving the GitHub auth card runs `gh auth login` BEFORE
 /// anything is stored, so a bad token shows on the page instead of failing
 /// at the first job. A blank host defaults to `github.com`; a pasted scheme
 /// is stripped the same way the Forgejo host is." POST
@@ -6422,7 +6422,7 @@ async fn auth_save_github(
     Ok(Redirect::to("/settings?saved=GitHub+auth").into_response())
 }
 
-/// SPEC-4.3.8: "Saving the Git-identity card is not a credential save (no
+/// SPEC-4.3.26 through SPEC-4.3.30: "Saving the Git-identity card is not a credential save (no
 /// secret store entry): an empty field clears it back to the default
 /// `\"claude-run\"` / `\"claude-run@a8n.run\"` identity rather than being
 /// rejected as required input." POST `/settings/auth/git`: sets the git
@@ -6452,7 +6452,7 @@ struct TestEmailForm {
     test_address: String,
 }
 
-/// SPEC-4.3.8: "The Email card's test send goes through the
+/// SPEC-4.3.26 through SPEC-4.3.30: "The Email card's test send goes through the
 /// environment-resolved SMTP transport, the same config a real invite send
 /// would use; it requires a non-blank destination address." POST
 /// `/settings/auth/email/test`: sends a short test message through the
@@ -6520,7 +6520,7 @@ struct AuthCodeForm {
     code: String,
 }
 
-/// SPEC-4.3.8: "The brokered sign-in start route 503s when the broker is
+/// SPEC-4.3.26 through SPEC-4.3.30: "The brokered sign-in start route 503s when the broker is
 /// unavailable in this process, and starts `claude auth login`, keeping the
 /// child alive holding its PKCE verifier until a code arrives." POST
 /// `/settings/auth/claude/login`: start `claude auth login` and show the
@@ -6556,7 +6556,7 @@ async fn auth_login_start(State(s): State<WebState>) -> Result<Response, WebErro
     }
 }
 
-/// SPEC-4.3.8: "An empty pasted code is rejected inline at 422. A refused
+/// SPEC-4.3.26 through SPEC-4.3.30: "An empty pasted code is rejected inline at 422. A refused
 /// code leaves the session open for another paste, showing the CLI's own
 /// wording; a successful code clears login-required immediately, rather
 /// than waiting for the next status-probe tick, so the next scheduler tick
@@ -6631,7 +6631,7 @@ async fn auth_login_code(
     }
 }
 
-/// SPEC-4.3.8: "Cancel abandons an in-flight sign-in by killing the child,
+/// SPEC-4.3.26 through SPEC-4.3.30: "Cancel abandons an in-flight sign-in by killing the child,
 /// rather than leaving it holding a pipe and a verifier." POST
 /// `/settings/auth/claude/cancel`: abandon an in-flight sign-in, killing
 /// the child rather than leaving it holding a pipe and a verifier.
@@ -6642,7 +6642,7 @@ async fn auth_login_cancel(State(s): State<WebState>) -> Result<Response, WebErr
     Ok(Redirect::to("/settings#section-auth").into_response())
 }
 
-/// SPEC-4.3.8: "The shared not-ready banner fragment is polled from every
+/// SPEC-4.3.26 through SPEC-4.3.30: "The shared not-ready banner fragment is polled from every
 /// page via the base template, and is behind the same auth gate as the
 /// rest of `/settings` since it is mounted on the same router; the
 /// unauthenticated login and setup pages do not extend that base template,
@@ -6658,7 +6658,7 @@ struct ClaudeReadinessBannerTpl {
     login_required: bool,
 }
 
-/// SPEC-4.3.8: the polled not-ready banner fragment handler.
+/// SPEC-4.3.26 through SPEC-4.3.30: the polled not-ready banner fragment handler.
 async fn auth_claude_banner(State(s): State<WebState>) -> Result<Html<String>, WebError> {
     let check = s.api.readiness.as_ref().map(|g| g.check());
     let tpl = ClaudeReadinessBannerTpl {
@@ -6674,15 +6674,15 @@ async fn auth_claude_banner(State(s): State<WebState>) -> Result<Html<String>, W
 
 // ---- Status page --------------------------------------------------------
 //
-// SPEC-4.3.9: "The Status page shows version/build info plus the Activity
+// SPEC-4.3.31: "The Status page shows version/build info plus the Activity
 // card (live quiet indicator and global pause); updating is by pulling a
-// newer image, so the page has no update action." SPEC-3.10 item 10 adds the
+// newer image, so the page has no update action." SPEC-3.10.11 adds the
 // cargo-cache Management part below the Activity card.
 //
 // Version / build info plus the Activity card (live quiet indicator and global
 // pause). Updating is by pulling a newer image; the page has no update action.
 
-/// SPEC-4.3.9: "The Activity card's live indicator renders in exactly one
+/// SPEC-4.3.31: "The Activity card's live indicator renders in exactly one
 /// of three states; `Unknown` exists because the alternative (rendering an
 /// empty list as idle) would tell an operator it is safe to reboot BECAUSE
 /// the query failed." The Activity card's live indicator, in exactly one of
@@ -6744,7 +6744,7 @@ struct ActiveRunView {
     started_at: String,
 }
 
-/// SPEC-4.3.9: resolve the current activity for the Activity card. A failed query is
+/// SPEC-4.3.31: resolve the current activity for the Activity card. A failed query is
 /// logged at `error` here and converted to [`ActivityView::Unknown`],
 /// so the failure reaches both the log and the operator's screen instead of
 /// being collapsed into an empty (idle-looking) list.
@@ -6785,7 +6785,7 @@ async fn activity_view(s: &WebState) -> ActivityView {
     }
 }
 
-/// SPEC-4.3.9: "The polled Activity fragment is rendered standalone every
+/// SPEC-4.3.31: "The polled Activity fragment is rendered standalone every
 /// 2s and included in the full Status page, so both surfaces agree by
 /// construction." The polled Activity fragment (`GET /status/activity`).
 /// Rendered standalone every 2s and included in the full Status page, so
@@ -6796,7 +6796,7 @@ struct ActivityTpl {
     activity: ActivityView,
 }
 
-/// SPEC-4.3.9: the `/status/activity` polled fragment handler.
+/// SPEC-4.3.31: the `/status/activity` polled fragment handler.
 async fn status_activity(State(s): State<WebState>) -> Result<Response, WebError> {
     let tpl = ActivityTpl {
         activity: activity_view(&s).await,
@@ -6804,7 +6804,7 @@ async fn status_activity(State(s): State<WebState>) -> Result<Response, WebError
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-/// SPEC-4.3.9 / SPEC-3.10 item 10: one Management-part row, the shared Cargo
+/// SPEC-4.3.31 / SPEC-3.10.11: one Management-part row, the shared Cargo
 /// target directory for one repo. `slug` is the directory's own name, already
 /// in `<owner>__<repo>` form (`crate::native::youtrack::repo_slug`).
 #[derive(Serialize)]
@@ -6822,8 +6822,7 @@ struct CargoCacheRow {
 }
 
 /// `<data dir>/cache/cargo-target/`, the root `crate::native::youtrack::
-/// cargo_target_dir` creates one subdirectory under, per repo. SPEC-3.10
-/// item 2.
+/// cargo_target_dir` creates one subdirectory under, per repo. SPEC-3.10.3.
 fn cargo_cache_root(paths: &Paths) -> std::path::PathBuf {
     paths.data_dir.join("cache").join("cargo-target")
 }
@@ -6847,7 +6846,7 @@ fn human_bytes(bytes: u64) -> String {
 
 /// Whether `slug` names a repo with a run currently in flight, per
 /// `inflight_keys` (`state::all_inflight_concurrency_keys`). The default
-/// concurrency key is `project\u{1f}repo\u{1f}` (`SPEC-3.1`), so a match is
+/// concurrency key is `project\u{1f}repo\u{1f}` (`SPEC-3.1.1` through `SPEC-3.1.12`), so a match is
 /// any `\u{1f}`-separated segment whose own repo-slug equals `slug`.
 fn cargo_cache_slug_in_flight(inflight_keys: &[String], slug: &str) -> bool {
     inflight_keys.iter().any(|key| {
@@ -6906,7 +6905,7 @@ fn cargo_cache_rows_sync(
     Ok(rows)
 }
 
-/// SPEC-3.10 items 9 and 10: the one async DB read (in-flight concurrency
+/// SPEC-3.10.10 and SPEC-3.10.11: the one async DB read (in-flight concurrency
 /// keys) plus the sync disk walk ([`cargo_cache_rows_sync`]) that together
 /// build the Management part's Cargo-cache rows.
 async fn cargo_cache_rows(paths: &Paths, pool: &DbPool) -> Result<Vec<CargoCacheRow>, WebError> {
@@ -6914,14 +6913,14 @@ async fn cargo_cache_rows(paths: &Paths, pool: &DbPool) -> Result<Vec<CargoCache
     cargo_cache_rows_sync(paths, &inflight_keys)
 }
 
-// ---- SPEC-3.11 item 4: Docker storage prune -------------------
+// ---- SPEC-3.11.5: Docker storage prune -------------------
 //
 // The Management part's second table: one row per sidecar Docker storage
 // category (stopped containers, images, build cache, unreferenced volumes),
 // each with its size, or "unknown" with the error when the usage read
 // fails, and a Prune button refused with `409` while any run is in flight.
 
-/// SPEC-3.11 item 4: one Docker storage category the Management part lists
+/// SPEC-3.11.5: one Docker storage category the Management part lists
 /// and prunes individually. `slug` is the route segment
 /// (`/api/status/docker/{slug}/prune`); `label` is the display name used in
 /// the row, the confirmation dialog, and the log/error messages.
@@ -6986,7 +6985,7 @@ impl DockerCategory {
     }
 }
 
-/// SPEC-3.11 item 4: one Docker storage Management row. `size_bytes` is
+/// SPEC-3.11.5: one Docker storage Management row. `size_bytes` is
 /// `None`, and `size_human` reads "unknown", when the usage read failed;
 /// `error` then carries the message so the operator sees why, never a
 /// silent zero.
@@ -6999,7 +6998,7 @@ struct DockerStorageRow {
     error: Option<String>,
 }
 
-/// SPEC-3.11 item 4: build the Management part's Docker storage rows from
+/// SPEC-3.11.5: build the Management part's Docker storage rows from
 /// one `usage()` read, shared by every category so a single unreachable
 /// daemon shows the same "unknown" + error on all four rows rather than
 /// querying per category.
@@ -7032,7 +7031,7 @@ fn docker_storage_rows(client: &dyn crate::gc::DockerVolumeClient) -> Vec<Docker
         .collect()
 }
 
-/// SPEC-3.11 item 4: `POST /api/status/docker/{category}/prune`'s logic is
+/// SPEC-3.11.5: `POST /api/status/docker/{category}/prune`'s logic is
 /// split across this function and [`docker_storage_prune_run`] below, since
 /// a `&dyn DockerVolumeClient` (not `Sync`) cannot live across an `.await`
 /// without making the handler's future non-`Send`; [`docker_storage_prune`]
@@ -7076,7 +7075,7 @@ fn docker_storage_prune_run(
             tracing::info!(
                 category = cat.label(),
                 bytes_reclaimed = bytes,
-                "Status page: Docker storage pruned (SPEC-3.11 item 4)"
+                "Status page: Docker storage pruned (SPEC-3.11.5)"
             );
             Json(serde_json::json!({
                 "ok": true,
@@ -7099,7 +7098,7 @@ fn docker_storage_prune_run(
     }
 }
 
-/// SPEC-3.11 item 4: `POST /api/status/docker/{category}/prune`'s production
+/// SPEC-3.11.5: `POST /api/status/docker/{category}/prune`'s production
 /// entry point. Posted under `/api` the way the Pause form posts to
 /// `/api/pause`, but defined here (not in `api::router`) rather than there
 /// so it adds no route to the unix socket.
@@ -7114,7 +7113,7 @@ async fn docker_storage_prune(
     ))
 }
 
-/// SPEC-4.3.9: render state for the Status page.
+/// SPEC-4.3.31: render state for the Status page.
 #[derive(Template)]
 #[template(path = "status.html")]
 struct StatusTpl {
@@ -7130,11 +7129,11 @@ struct StatusTpl {
     /// the Docker storage "run in flight" warning, shown immediately while
     /// the Docker storage table itself is still loading.
     docker_run_in_flight: bool,
-    /// SPEC-3.17 item 11: `Some` only while peering is enabled.
+    /// SPEC-3.17.12: `Some` only while peering is enabled.
     peers: Option<Vec<crate::peer::PeerRow>>,
 }
 
-/// SPEC-4.3.9: the `/status` page handler. Renders immediately with the
+/// SPEC-4.3.31: the `/status` page handler. Renders immediately with the
 /// cheap reads only: the Management part's two slow disk-usage tables
 /// (`cargo_cache_rows`, `docker_storage_rows`, `crate::gc::dir_size`) are not
 /// called here. They are pushed separately once a viewer is connected to
@@ -7166,7 +7165,7 @@ async fn status_page(State(s): State<WebState>) -> Result<Response, WebError> {
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-/// SPEC-4.3.9 / SPEC-3.10 item 10: the Management part's Cargo-cache
+/// SPEC-4.3.31 / SPEC-3.10.11: the Management part's Cargo-cache
 /// fragment, pushed by `status_storage_sse` as the `cargo-cache` event.
 /// `error` carries a whole-read failure (the directory could not be listed at
 /// all); there is no per-row "unknown" the way Docker storage has one,
@@ -7206,7 +7205,7 @@ fn render_cargo_cache_fragment(result: Result<Vec<CargoCacheRow>, WebError>) -> 
         .unwrap_or_else(|e| format!("template error: {e}"))
 }
 
-/// SPEC-4.3.9 / SPEC-3.11 item 4: the Management part's Docker storage
+/// SPEC-4.3.31 / SPEC-3.11.5: the Management part's Docker storage
 /// fragment (just the table; the "run in flight" warning stays inline on
 /// `status.html`, not deferred), pushed by `status_storage_sse` as the
 /// `docker-storage` event. `error` is a whole-read failure (the blocking task
@@ -7237,8 +7236,8 @@ fn render_docker_storage_fragment(result: Result<Vec<DockerStorageRow>, String>)
         .unwrap_or_else(|e| format!("template error: {e}"))
 }
 
-/// SPEC-4.3.10: `GET /sse/status/storage` pushes the Status page's two slow
-/// Management reads (SPEC-3.10 item 10, SPEC-3.11 item 4) to a connected
+/// SPEC-4.3.32 through SPEC-4.3.37: `GET /sse/status/storage` pushes the Status page's two slow
+/// Management reads (SPEC-3.10.11, SPEC-3.11.5) to a connected
 /// viewer as each finishes, then closes with a `done` event. Mounted only on
 /// the web router, not the unix socket, like the other `/status` controls.
 /// Both reads are started only by this connection, never by a
@@ -7320,7 +7319,7 @@ async fn about_activity_redirect() -> Redirect {
     Redirect::permanent("/status/activity")
 }
 
-/// SPEC-3.10 item 10: `POST /api/status/cargo-cache/{slug}/delete`. Refused
+/// SPEC-3.10.11: `POST /api/status/cargo-cache/{slug}/delete`. Refused
 /// with `409` while a run for the repo is in flight; a removal failure is
 /// logged at `error` and shown (the message is also what a non-htmx caller
 /// of the same URL sees).
@@ -7351,7 +7350,7 @@ async fn cargo_cache_delete_one(
                 repo = %slug,
                 path = %dir.display(),
                 bytes_reclaimed = bytes,
-                "Status page: Cargo cache directory deleted (SPEC-3.10 item 10)"
+                "Status page: Cargo cache directory deleted (SPEC-3.10.11)"
             );
             Ok(
                 Json(serde_json::json!({"ok": true, "message": format!("deleted `{slug}`")}))
@@ -7374,7 +7373,7 @@ async fn cargo_cache_delete_one(
     }
 }
 
-/// SPEC-3.10 item 10: `POST /api/status/cargo-cache/delete` (Delete all).
+/// SPEC-3.10.11: `POST /api/status/cargo-cache/delete` (Delete all).
 /// Refused with `409` naming the first repo found with a run in flight, so
 /// a bulk delete never removes some rows and skips others silently.
 async fn cargo_cache_delete_all(State(s): State<WebState>) -> Result<Response, WebError> {
@@ -7400,7 +7399,7 @@ async fn cargo_cache_delete_all(State(s): State<WebState>) -> Result<Response, W
                     repo = %row.slug,
                     path = %dir.display(),
                     bytes_reclaimed = row.size_bytes,
-                    "Status page: Cargo cache directory deleted (SPEC-3.10 item 10)"
+                    "Status page: Cargo cache directory deleted (SPEC-3.10.11)"
                 );
             }
             Err(e) => {
@@ -7425,7 +7424,7 @@ async fn cargo_cache_delete_all(State(s): State<WebState>) -> Result<Response, W
     .into_response())
 }
 
-/// SPEC-4.3.10: one planned job row on the run-detail page.
+/// SPEC-4.3.32 through SPEC-4.3.37: one planned job row on the run-detail page.
 #[derive(Serialize)]
 pub struct PlannedJob {
     pub key: String,
@@ -7444,7 +7443,7 @@ pub struct PlannedJob {
     pub watch_attempt: Option<u32>,
 }
 
-/// SPEC-4.3.10: "A job's \"running\" badge on the run-detail page resolves
+/// SPEC-4.3.32 through SPEC-4.3.37: "A job's \"running\" badge on the run-detail page resolves
 /// its attempt number from the highest `<key>-attempt-<n>.jsonl` stream log
 /// on disk, the on-disk fallback for the per-run in-flight registry: the
 /// presence of one without a matching `job_outcomes` record means that job
@@ -7476,7 +7475,7 @@ fn latest_attempt_on_disk(logs_dir: &std::path::Path, action: &str, key: &str) -
     best
 }
 
-/// SPEC-4.3.10: render state for the run-detail page.
+/// SPEC-4.3.32 through SPEC-4.3.37: render state for the run-detail page.
 #[derive(Template)]
 #[template(path = "run_detail.html")]
 struct RunDetailTpl {
@@ -7507,7 +7506,7 @@ struct RunDetailTpl {
     has_outcomes: bool,
 }
 
-/// SPEC-4.3.10: "Run-detail sort/filter state for its two tables (Jobs in
+/// SPEC-4.3.32 through SPEC-4.3.37: "Run-detail sort/filter state for its two tables (Jobs in
 /// batch, Job outcomes) is validated against a fixed allow-list before it
 /// lands in the template, so nothing user-controlled reaches the in-memory
 /// sort/filter or gets echoed unescaped into the page." Whitelisted
@@ -7612,7 +7611,7 @@ impl RunDetailSort {
     }
 }
 
-/// SPEC-4.3.10: up/down triangle for the column `col` given the active `sort`/`dir`, or the
+/// SPEC-4.3.32 through SPEC-4.3.37: up/down triangle for the column `col` given the active `sort`/`dir`, or the
 /// empty string when `col` is not the sorted column.
 fn arrow(sort: &str, dir: &str, col: &str) -> &'static str {
     if sort != col {
@@ -7624,7 +7623,7 @@ fn arrow(sort: &str, dir: &str, col: &str) -> &'static str {
     }
 }
 
-/// SPEC-4.3.10: keep `v` only when it is in `allowed`, else return the empty string (the
+/// SPEC-4.3.32 through SPEC-4.3.37: keep `v` only when it is in `allowed`, else return the empty string (the
 /// "no selection" sentinel). This is the whitelist that stops raw query
 /// input from reaching the in-memory `ORDER BY`/`WHERE` equivalents.
 fn whitelisted(v: &str, allowed: &[&str]) -> String {
@@ -7635,7 +7634,7 @@ fn whitelisted(v: &str, allowed: &[&str]) -> String {
     }
 }
 
-/// SPEC-4.3.10: keep `v` only when it appears in `allowed` (an owned allow-list
+/// SPEC-4.3.32 through SPEC-4.3.37: keep `v` only when it appears in `allowed` (an owned allow-list
 /// built from actual DB values, e.g. the distinct action / triggered_by sets),
 /// else the empty "no selection" sentinel. The `&[String]` sibling of
 /// [`whitelisted`] for filters whose legal values come from the data.
@@ -7647,7 +7646,7 @@ fn whitelist_member(v: &str, allowed: &[String]) -> String {
     }
 }
 
-/// SPEC-4.3.10: "The Job-outcomes \"Claude\" column sorts
+/// SPEC-4.3.32 through SPEC-4.3.37: "The Job-outcomes \"Claude\" column sorts
 /// did-not-run < ran-and-failed < ran-and-ok." Claude-column rank used to
 /// sort the Job-outcomes "Claude" column: did-not-run < ran-and-failed <
 /// ran-and-ok.
@@ -7661,7 +7660,7 @@ fn claude_rank(o: &JobOutcomeRow) -> u8 {
     }
 }
 
-/// SPEC-4.3.10: compare two outcomes by a whitelisted column. Unknown columns compare
+/// SPEC-4.3.32 through SPEC-4.3.37: compare two outcomes by a whitelisted column. Unknown columns compare
 /// equal (the caller only sorts when the column passed the whitelist).
 fn out_cmp(a: &JobOutcomeRow, b: &JobOutcomeRow, col: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -7707,7 +7706,7 @@ struct RunDetailQuery {
     out_counted: String,
 }
 
-/// SPEC-4.3.10: "The template that links a run's job keys is the action's
+/// SPEC-4.3.32 through SPEC-4.3.37: "The template that links a run's job keys is the action's
 /// own override, else (for actions whose keys are YouTrack issue keys)
 /// `{base}/issue/{key}` from the Auth card's YouTrack URL, else none (keys
 /// render as plain text)." The template that links a run's job keys: the
@@ -7725,7 +7724,7 @@ fn effective_link_template(
     })
 }
 
-/// SPEC-4.3.10: "One resolution rule backs every tracker-keyed site in the
+/// SPEC-4.3.32 through SPEC-4.3.37: "One resolution rule backs every tracker-keyed site in the
 /// web UI (Dashboard gates/parked tables, `/logs`, the usage report, the
 /// job stream page, and the run-detail page): an action's own declared
 /// `link_template`, else (for a native-kind action, whose keys are
@@ -7758,7 +7757,7 @@ async fn action_link_template(
     effective_link_template(declared, keys_are_youtrack, base_url)
 }
 
-/// SPEC-4.3.10: HTML-escape plain text for a context where it is not auto-escaped by
+/// SPEC-4.3.32 through SPEC-4.3.37: HTML-escape plain text for a context where it is not auto-escaped by
 /// askama (building a `|safe`-marked string in Rust, e.g. the Logs Message
 /// column). Mirrors askama's own default escaping.
 fn html_escape(s: &str) -> String {
@@ -7776,7 +7775,7 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-/// SPEC-4.3.10: an `<a target="_blank" rel="noopener">` anchor around `text`, both
+/// SPEC-4.3.32 through SPEC-4.3.37: an `<a target="_blank" rel="noopener">` anchor around `text`, both
 /// HTML-escaped, matching the run-detail anchors.
 fn link_anchor(href: &str, text: &str) -> String {
     format!(
@@ -7786,7 +7785,7 @@ fn link_anchor(href: &str, text: &str) -> String {
     )
 }
 
-/// SPEC-4.3.10: whether `token` looks like a tracker issue key (`^[A-Z][A-Z0-9_]*-[0-9]+$`),
+/// SPEC-4.3.32 through SPEC-4.3.37: whether `token` looks like a tracker issue key (`^[A-Z][A-Z0-9_]*-[0-9]+$`),
 /// used to decide whether the leading token of a blocker-signature part is a
 /// key to link, versus free text to leave alone.
 fn looks_like_issue_key(token: &str) -> bool {
@@ -7804,7 +7803,7 @@ fn looks_like_issue_key(token: &str) -> bool {
     chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// SPEC-4.3.10: "A dependency-gate signature links each leading key token
+/// SPEC-4.3.32 through SPEC-4.3.37: "A dependency-gate signature links each leading key token
 /// that looks issue-key-shaped via the action's link template, and
 /// HTML-escapes every other part of the text; a part whose leading token
 /// is not key-shaped is left unchanged (escaped, not linked)." Render a
@@ -7837,7 +7836,7 @@ fn render_blocker_signature(signature: &str, template: Option<&str>) -> String {
         .join("; ")
 }
 
-/// SPEC-4.3.10: render a log-event `message`, linking occurrences of the row's own
+/// SPEC-4.3.32 through SPEC-4.3.37: render a log-event `message`, linking occurrences of the row's own
 /// `context` key (not any key-shaped token) and HTML-escaping everything
 /// else. `context` is linked only when `template` resolves, else the whole
 /// message is just escaped.
@@ -7855,7 +7854,7 @@ fn link_message(message: &str, context: &str, template: Option<&str>) -> String 
     }
 }
 
-/// SPEC-4.3.10: "The run-detail page 404s an unknown run id. A planned
+/// SPEC-4.3.32 through SPEC-4.3.37: "The run-detail page 404s an unknown run id. A planned
 /// job's status is ok/fail/timed_out from its latest outcome, else
 /// running/queued (for an active run) or skipped (for an ended run with no
 /// outcome), where running resolves its live-stream attempt from disk.
@@ -7887,7 +7886,7 @@ async fn run_detail(
     .bind(id)
     .fetch_all(pool)
     .await?;
-    // SPEC-3.16 item 3: link an attempt's review evidence file only when one
+    // SPEC-3.16.4: link an attempt's review evidence file only when one
     // was actually written (a job with no post-success review, or one that
     // never reached that step, has none).
     let logs_dir = s.paths.logs_dir();
@@ -8067,7 +8066,7 @@ async fn run_detail(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-/// SPEC-4.3.10: render state for the job-stream page.
+/// SPEC-4.3.32 through SPEC-4.3.37: render state for the job-stream page.
 #[derive(Template)]
 #[template(path = "job_stream.html")]
 struct JobStreamTpl {
@@ -8102,7 +8101,7 @@ fn canonicalize_within_logs_dir(
         .then_some(canon_path)
 }
 
-/// SPEC-4.3.10: "The job-stream page 404s an unknown run, otherwise resolves
+/// SPEC-4.3.32 through SPEC-4.3.37: "The job-stream page 404s an unknown run, otherwise resolves
 /// the attempt's on-disk stream-log path and the job key's link href through
 /// the same effective-link-template resolution used elsewhere."
 async fn job_stream_page(
@@ -8153,7 +8152,7 @@ async fn job_stream_page(
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
 
-/// SPEC-3.16 item 3: serves an attempt's post-success review evidence file
+/// SPEC-3.16.4: serves an attempt's post-success review evidence file
 /// (the full sweep the capped verdict marker links to) as plain text. 404s
 /// when the run is unknown or the attempt wrote no evidence file, mirroring
 /// [`job_stream_page`]'s action-name lookup. Like [`job_gate_output`], the
@@ -8196,7 +8195,7 @@ async fn job_review_evidence(
     Ok(resp)
 }
 
-/// SPEC-4.3.10: serves an attempt's stored SPEC-3.3.2
+/// SPEC-4.3.32 through SPEC-4.3.37: serves an attempt's stored SPEC-3.3.20 through SPEC-3.3.25
 /// verification-gate output (written only when the gate failed) as plain
 /// text. 404s when the run is unknown or the attempt wrote no gate-output
 /// file. Unlike [`job_review_evidence`], the served path is built from the
@@ -8242,11 +8241,11 @@ async fn job_gate_output(
     Ok(resp)
 }
 
-// SPEC-4.3.10: "The live job stream is a server-sent events feed over the
+// SPEC-4.3.32 through SPEC-4.3.37: "The live job stream is a server-sent events feed over the
 // same on-disk `.jsonl` log the job-stream page links to."
 // ---- SSE ------------------------------------------------------------------
 
-/// SPEC-4.3.10: "Each SSE line gets a server-formatted `ts_fmt` alongside its
+/// SPEC-4.3.32 through SPEC-4.3.37: "Each SSE line gets a server-formatted `ts_fmt` alongside its
 /// raw `ts`, since the browser can't run chrono's strftime; a line that is
 /// not a JSON object, or carries no string `ts`, passes through unchanged."
 /// Add a preference-formatted `ts_fmt` alongside a stream event's
@@ -8267,7 +8266,7 @@ fn augment_stream_line_ts(line: &str, prefs: &crate::config::PreferencesConfig) 
     Value::Object(map).to_string()
 }
 
-/// SPEC-4.3.10: "The SSE feed 404s an unknown run, otherwise tails the
+/// SPEC-4.3.32 through SPEC-4.3.37: "The SSE feed 404s an unknown run, otherwise tails the
 /// attempt's stream-log file: waiting briefly for it to appear on a live run,
 /// reporting a permanently absent file as `stream-log-gone` on an ended run
 /// versus `no-stream-yet` on a live one, resuming from `Last-Event-ID` (or a
@@ -8424,12 +8423,12 @@ async fn job_stream_sse(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-// SPEC-4.3.11: "The htmx and idiomorph client scripts are served from the
+// SPEC-4.3.38 through SPEC-4.3.39: "The htmx and idiomorph client scripts are served from the
 // binary itself, not fetched from a CDN, with a one-year immutable
 // cache-control so the browser never re-requests them."
 // ---- static htmx ----------------------------------------------------------
 
-/// SPEC-4.3.11: serves the vendored htmx script as `application/javascript`
+/// SPEC-4.3.38 through SPEC-4.3.39: serves the vendored htmx script as `application/javascript`
 /// with an immutable one-year cache header.
 async fn htmx_handler() -> Response {
     let mut resp = Response::new(Body::from(HTMX_JS));
@@ -8444,7 +8443,7 @@ async fn htmx_handler() -> Response {
     resp
 }
 
-/// SPEC-4.3.11: serves the vendored idiomorph script as `application/javascript`
+/// SPEC-4.3.38 through SPEC-4.3.39: serves the vendored idiomorph script as `application/javascript`
 /// with an immutable one-year cache header.
 async fn idiomorph_handler() -> Response {
     let mut resp = Response::new(Body::from(IDIOMORPH_JS));
@@ -8459,14 +8458,14 @@ async fn idiomorph_handler() -> Response {
     resp
 }
 
-/// SPEC-4.3.11/SPEC-7.16: serves the landing page's mascot as `image/png`.
+/// SPEC-4.3.38 through SPEC-4.3.39/SPEC-7.16.1 through SPEC-7.16.3: serves the landing page's mascot as `image/png`.
 /// A one-day cache rather than immutable, so swapping the file reaches browsers
 /// after an upgrade.
 async fn mascot_handler() -> Response {
     png_response(MASCOT_PNG, 86400)
 }
 
-/// SPEC-4.3.11: serves the favicon as `image/x-icon` with a one-day cache.
+/// SPEC-4.3.38 through SPEC-4.3.39: serves the favicon as `image/x-icon` with a one-day cache.
 async fn favicon_handler() -> Response {
     let mut resp = Response::new(Body::from(FAVICON_ICO));
     resp.headers_mut().insert(
@@ -8480,17 +8479,17 @@ async fn favicon_handler() -> Response {
     resp
 }
 
-/// SPEC-4.3.11: serves the apple touch icon as `image/png` with a one-day cache.
+/// SPEC-4.3.38 through SPEC-4.3.39: serves the apple touch icon as `image/png` with a one-day cache.
 async fn apple_touch_icon_handler() -> Response {
     png_response(APPLE_TOUCH_ICON_PNG, 86400)
 }
 
-/// SPEC-4.3.11: serves the header brand mark as `image/png` with a one-day cache.
+/// SPEC-4.3.38 through SPEC-4.3.39: serves the header brand mark as `image/png` with a one-day cache.
 async fn brand_mark_handler() -> Response {
     png_response(BRAND_MARK_PNG, 86400)
 }
 
-/// SPEC-4.3.11: a `image/png` response with a `public, max-age=<seconds>` cache
+/// SPEC-4.3.38 through SPEC-4.3.39: a `image/png` response with a `public, max-age=<seconds>` cache
 /// header, shared by the three PNG icon handlers.
 fn png_response(bytes: &'static [u8], max_age_secs: u64) -> Response {
     let mut resp = Response::new(Body::from(bytes));
@@ -8503,12 +8502,12 @@ fn png_response(bytes: &'static [u8], max_age_secs: u64) -> Response {
     resp
 }
 
-// SPEC-4.3.12: "Every fallible handler returns one `WebError` type: a status
+// SPEC-4.3.40: "Every fallible handler returns one `WebError` type: a status
 // code plus a plain message, with `From` conversions for the error types
 // handlers hit, so a stray `?` can never bypass the page's error rendering."
 // ---- error ----------------------------------------------------------------
 
-/// SPEC-4.3.12: carries the HTTP status and message a handler's error renders as.
+/// SPEC-4.3.40: carries the HTTP status and message a handler's error renders as.
 #[derive(Debug)]
 pub struct WebError {
     status: StatusCode,
@@ -8516,7 +8515,7 @@ pub struct WebError {
 }
 
 impl WebError {
-    /// SPEC-4.3.12: constructs a 404 for a missing row or path.
+    /// SPEC-4.3.40: constructs a 404 for a missing row or path.
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -8525,7 +8524,7 @@ impl WebError {
     }
 }
 
-/// SPEC-4.3.12: an internal `crate::error::Error` always renders as 500.
+/// SPEC-4.3.40: an internal `crate::error::Error` always renders as 500.
 impl From<crate::error::Error> for WebError {
     fn from(e: crate::error::Error) -> Self {
         Self {
@@ -8535,7 +8534,7 @@ impl From<crate::error::Error> for WebError {
     }
 }
 
-/// SPEC-4.3.12: a database error always renders as 500.
+/// SPEC-4.3.40: a database error always renders as 500.
 impl From<sqlx::Error> for WebError {
     fn from(e: sqlx::Error) -> Self {
         Self {
@@ -8545,7 +8544,7 @@ impl From<sqlx::Error> for WebError {
     }
 }
 
-/// SPEC-4.3.12: a filesystem error always renders as 500.
+/// SPEC-4.3.40: a filesystem error always renders as 500.
 impl From<std::io::Error> for WebError {
     fn from(e: std::io::Error) -> Self {
         Self {
@@ -8555,7 +8554,7 @@ impl From<std::io::Error> for WebError {
     }
 }
 
-/// SPEC-4.3.12: a template-rendering error always renders as 500.
+/// SPEC-4.3.40: a template-rendering error always renders as 500.
 impl From<askama::Error> for WebError {
     fn from(e: askama::Error) -> Self {
         Self {
@@ -8565,7 +8564,7 @@ impl From<askama::Error> for WebError {
     }
 }
 
-/// SPEC-4.3.12: a `WebError` becomes a plain-text response at its status code.
+/// SPEC-4.3.40: a `WebError` becomes a plain-text response at its status code.
 impl IntoResponse for WebError {
     fn into_response(self) -> Response {
         (self.status, self.message).into_response()
@@ -8637,7 +8636,7 @@ mod tests {
         }
     }
 
-    /// SPEC-7.16: the landing page's mascot is served as PNG from the
+    /// SPEC-7.16.1 through SPEC-7.16.3: the landing page's mascot is served as PNG from the
     /// binary's embedded copy.
     #[tokio::test]
     async fn mascot_is_served_as_png() {
@@ -8654,7 +8653,7 @@ mod tests {
         assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 
-    /// SPEC-4.3.11: the favicon and the two PNG icons (apple touch icon,
+    /// SPEC-4.3.38 through SPEC-4.3.39: the favicon and the two PNG icons (apple touch icon,
     /// header brand mark) are each served with their own content type and a
     /// one-day cache.
     #[tokio::test]
@@ -9288,7 +9287,7 @@ mod tests {
         assert!(v.query_without("triggered").contains("outcome=timedout"));
     }
 
-    /// SPEC-4.3.15: rows, the over-median and at-risk highlights,
+    /// SPEC-4.3.57 through SPEC-4.3.61: rows, the over-median and at-risk highlights,
     /// and "no history" render on the dashboard; an unreadable series renders
     /// an error panel naming the cause.
     #[test]
@@ -10596,7 +10595,7 @@ mod tests {
             assert!(!body.contains("still-open repo-access failures"));
         }
 
-        /// SPEC-4.3.15: a CI failure with a PR and an issue renders both as
+        /// SPEC-4.3.57 through SPEC-4.3.61: a CI failure with a PR and an issue renders both as
         /// links; one with neither renders "none" for both, visibly
         /// different from a lookup failure, which renders an error cell.
         #[tokio::test]
@@ -10605,7 +10604,7 @@ mod tests {
             let s = web_state(tmp.path()).await;
 
             // The "youtrack" action's declared link_template is what resolves
-            // the Issue cell into a link (SPEC-4.3.15: "linked through the
+            // the Issue cell into a link (SPEC-4.3.57 through SPEC-4.3.61: "linked through the
             // action's link_template").
             state::action_index_upsert(
                 &s.api.pool,
@@ -10714,9 +10713,9 @@ mod tests {
             );
         }
 
-        /// SPEC-4.3.15: the state/bucket/repo filters narrow
+        /// SPEC-4.3.57 through SPEC-4.3.61: the state/bucket/repo filters narrow
         /// the CI-failures rows (the bucket filter independently of the
-        /// state filter), and SPEC-3.12 item 2's stuck-work list shows the
+        /// state filter), and SPEC-3.12.3's stuck-work list shows the
         /// sweep's own seeded corrections.
         #[tokio::test]
         async fn dashboard_ci_filters_narrow_rows_and_stuck_work_lists_corrections() {
@@ -10750,7 +10749,7 @@ mod tests {
             .await
             .unwrap();
 
-            // Default load (no ?ci_state=) is "open"-only per SPEC-4.3.15.
+            // Default load (no ?ci_state=) is "open"-only per SPEC-4.3.57 through SPEC-4.3.61.
             let body = body_string(
                 dashboard(State(s.clone()), Query(DashboardQuery::default()))
                     .await
@@ -10799,7 +10798,7 @@ mod tests {
             assert!(!body.contains(widgets_row), "{body}");
             assert!(body.contains(gizmos_row), "{body}");
 
-            // SPEC-4.3.15: the bucket filter narrows
+            // SPEC-4.3.57 through SPEC-4.3.61: the bucket filter narrows
             // independently of the state filter. "all" state + "code_fix"
             // bucket keeps only the resolved acme/gizmos row, even though
             // its state differs from the open acme/widgets row (which is
@@ -12698,7 +12697,7 @@ mod tests {
             }
         }
 
-        /// SPEC-4.4.6: the Issue minting notes table carries a "Used by" column
+        /// SPEC-4.4.39 through SPEC-4.4.46: the Issue minting notes table carries a "Used by" column
         /// with a row for every `MintConfig` field naming the reading actions;
         /// a section only one action reads has no such column.
         #[tokio::test]
@@ -14680,7 +14679,7 @@ mod tests {
     // ---- Status page handlers -----------------------------------------------
     //
     // The GET renders the version, the Activity card, and the cargo-cache
-    // Management part (SPEC-3.10 item 10).
+    // Management part (SPEC-3.10.11).
     mod status {
         use super::super::{
             about_activity_redirect, about_redirect, cargo_cache_delete_all,
@@ -15002,7 +15001,7 @@ mod tests {
             assert!(dir.exists());
         }
 
-        // ---- SPEC-3.11 item 4: Docker storage prune --------
+        // ---- SPEC-3.11.5: Docker storage prune --------
 
         /// A fake [`crate::gc::DockerVolumeClient`] so these tests never shell
         /// out to the real, reachable sidecar Docker daemon. `usage` and
@@ -15547,7 +15546,7 @@ mod tests {
         }
     }
 
-    /// SPEC-3.16 item 3: the run-detail attempt route that serves the
+    /// SPEC-3.16.4: the run-detail attempt route that serves the
     /// post-success review's evidence file.
     mod review_evidence_route {
         use super::super::{job_review_evidence, WebState};
@@ -15736,8 +15735,8 @@ mod tests {
         }
     }
 
-    /// SPEC-4.3.10: the run-detail attempt route that serves a
-    /// failed SPEC-3.3.2 gate's stored output.
+    /// SPEC-4.3.32 through SPEC-4.3.37: the run-detail attempt route that serves a
+    /// failed SPEC-3.3.20 through SPEC-3.3.25 gate's stored output.
     mod gate_output_route {
         use super::super::{job_gate_output, WebState};
         use crate::api::AppState;
@@ -15867,7 +15866,7 @@ mod tests {
         }
     }
 
-    /// SPEC-4.3.10: the job-stream page shell, which renders the resolved
+    /// SPEC-4.3.32 through SPEC-4.3.37: the job-stream page shell, which renders the resolved
     /// stream-log path for display rather than reading the file's content.
     mod stream_page_route {
         use super::super::{job_stream_page, WebState};
@@ -15978,7 +15977,7 @@ mod tests {
         }
     }
 
-    /// SPEC-4.3.10: the live job-stream SSE feed.
+    /// SPEC-4.3.32 through SPEC-4.3.37: the live job-stream SSE feed.
     mod stream_sse_route {
         use super::super::{job_stream_sse, WebState};
         use crate::api::AppState;

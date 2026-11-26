@@ -1,4 +1,4 @@
-//! Optional peering between independently operating instances (`SPEC-3.17`).
+//! Optional peering between independently operating instances (`SPEC-3.17.1` through `SPEC-3.17.12`).
 //!
 //! This module holds the instance identity helper, the peer state endpoint
 //! (`GET /api/peer/state`), the claim endpoint and client (`POST
@@ -27,7 +27,7 @@ use crate::db::DbPool;
 use crate::error::{Error, Result};
 
 /// A peer whose reported clock differs from ours by more than this is logged at
-/// `warn` (`SPEC-3.17` item 5). No decision compares two instances' clocks.
+/// `warn` (`SPEC-3.17.6`). No decision compares two instances' clocks.
 const CLOCK_SKEW_WARN_SECS: i64 = 60;
 /// Upper bound on one pull, further capped by `poll_secs`.
 const PULL_TIMEOUT_MAX_SECS: u64 = 10;
@@ -59,7 +59,7 @@ pub fn hash_api_key(key: &str) -> String {
     hex::encode(h.finalize())
 }
 
-/// A random (version 4) UUID in its canonical text form. `SPEC-3.17` item 2.
+/// A random (version 4) UUID in its canonical text form. `SPEC-3.17.3`.
 pub fn new_uuid_v4() -> Result<String> {
     let mut b = [0u8; 16];
     getrandom::getrandom(&mut b)
@@ -85,7 +85,7 @@ pub struct InFlightEntry {
     pub started_at: String,
 }
 
-/// The body of `GET /api/peer/state` (`SPEC-3.17` item 4). Carries no secret,
+/// The body of `GET /api/peer/state` (`SPEC-3.17.5`). Carries no secret,
 /// prompt, log text or comment body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerStateDoc {
@@ -99,7 +99,7 @@ pub struct PeerStateDoc {
     pub in_flight: Vec<InFlightEntry>,
 }
 
-/// Liveness of one peer. A peer is never called dead (`SPEC-3.17` item 5): a
+/// Liveness of one peer. A peer is never called dead (`SPEC-3.17.6`): a
 /// partition and a crash look the same from here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -131,11 +131,11 @@ struct PeerStatus {
     skewed: bool,
     /// When each claim bypass happened, pruned to the last 24 hours.
     bypasses: Vec<DateTime<Utc>>,
-    /// The outcome of the last summary sync (`SPEC-3.17` item 9).
+    /// The outcome of the last summary sync (`SPEC-3.17.10`).
     sync: SummarySync,
 }
 
-/// Where a peer's run-summary replication stands (`SPEC-3.17` items 9 and 11).
+/// Where a peer's run-summary replication stands (`SPEC-3.17.10` and `SPEC-3.17.12`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SummarySync {
     /// No sync has run since this process started.
@@ -168,7 +168,7 @@ impl SummarySync {
     }
 }
 
-/// One Status page row (`SPEC-3.17` item 11, less the columns later issues add).
+/// One Status page row (`SPEC-3.17.12`, less the columns later issues add).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerRow {
     pub name: String,
@@ -178,10 +178,9 @@ pub struct PeerRow {
     pub last_error: Option<String>,
     /// The peer's in-flight count, only while `reachable`.
     pub in_flight: Option<u64>,
-    /// Event claims bypassed for this peer in the last 24 hours (`SPEC-3.17`
-    /// item 11). Kept in memory, so a restart resets it.
+    /// Event claims bypassed for this peer in the last 24 hours (`SPEC-3.17.12`). Kept in memory, so a restart resets it.
     pub claims_bypassed: u64,
-    /// Summary replication state (`SPEC-3.17` item 11).
+    /// Summary replication state (`SPEC-3.17.12`).
     pub summary_sync: SummarySync,
 }
 
@@ -394,7 +393,7 @@ impl PeerRegistry {
     }
 
     /// `(action, job_key)` pairs listed in flight by every `reachable` peer
-    /// whose snapshot is no older than `stale_after_secs` (`SPEC-3.17` item 6).
+    /// whose snapshot is no older than `stale_after_secs` (`SPEC-3.17.7`).
     /// Empty while peering is disabled.
     pub fn live_peer_in_flight(
         &self,
@@ -497,7 +496,7 @@ async fn resolve_token(pool: &DbPool, name: &str) -> std::result::Result<String,
     Ok(token)
 }
 
-/// The poller: every `poll_secs`, pull each peer's state (`SPEC-3.17` item 5).
+/// The poller: every `poll_secs`, pull each peer's state (`SPEC-3.17.6`).
 /// Reads the live config each tick, so a Settings save applies on the next one.
 /// With peering disabled it makes no outbound call.
 pub async fn poll_loop(pool: DbPool, cfg: Arc<RwLock<PeersConfig>>, registry: PeerRegistry) {
@@ -529,7 +528,7 @@ pub async fn poll_loop(pool: DbPool, cfg: Arc<RwLock<PeersConfig>>, registry: Pe
     }
 }
 
-/// The `instance` filter of the report routes (`SPEC-3.17` item 10).
+/// The `instance` filter of the report routes (`SPEC-3.17.11`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstanceFilter {
     All,
@@ -559,7 +558,7 @@ impl InstanceFilter {
 }
 
 /// A peer whose figures may lack recent runs: it is `unknown`, or its summary
-/// sync is not caught up (`SPEC-3.17` item 10).
+/// sync is not caught up (`SPEC-3.17.11`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerNote {
     pub name: String,
@@ -608,7 +607,7 @@ impl From<Error> for ViewError {
 }
 
 /// Resolve the `instance` parameter against the live peer config and registry
-/// (`SPEC-3.17` item 10). With peering disabled the series read as before and
+/// (`SPEC-3.17.11`). With peering disabled the series read as before and
 /// only `all` and `local` are accepted.
 pub async fn resolve_report_view(
     pool: &DbPool,
@@ -692,7 +691,7 @@ pub async fn resolve_report_view(
     })
 }
 
-/// The body of `GET /api/peer/summaries` (`SPEC-3.17` item 4).
+/// The body of `GET /api/peer/summaries` (`SPEC-3.17.5`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SummariesResponse {
     pub instance_id: String,
@@ -753,7 +752,7 @@ async fn peer_summaries(
     .into_response()
 }
 
-/// Check one pulled page before any of it is applied (`SPEC-3.17` item 9). The
+/// Check one pulled page before any of it is applied (`SPEC-3.17.10`). The
 /// whole batch is refused on the first bad row; the message names its
 /// `run_uuid`.
 pub fn validate_summaries(
@@ -881,7 +880,7 @@ async fn note_sync_error(pool: &DbPool, peer_id: &str, msg: &str) {
 
 /// Pull one peer's rows after its stored cursor until it has no more (or the
 /// per-tick page cap), applying each page and the cursor advance in one
-/// transaction (`SPEC-3.17` item 9).
+/// transaction (`SPEC-3.17.10`).
 async fn sync_peer(
     pool: &DbPool,
     client: &reqwest::Client,
@@ -981,12 +980,12 @@ pub async fn sync_summaries_with_tokens(
     }
 }
 
-/// State of the peer API router (`SPEC-3.17` item 4).
+/// State of the peer API router (`SPEC-3.17.5`).
 #[derive(Clone)]
 pub struct PeerApiState {
     pub pool: DbPool,
     pub cfg: Arc<RwLock<PeersConfig>>,
-    /// The instance's own web bearer token (`SPEC-7.6`); `None` when it did not
+    /// The instance's own web bearer token (`SPEC-7.6.1` through `SPEC-7.6.6`); `None` when it did not
     /// resolve, in which case every request is refused.
     pub token: Option<Arc<String>>,
     /// Keys this instance already started, so a lower-load claim is refused.
@@ -1106,7 +1105,7 @@ async fn peer_state(State(s): State<PeerApiState>) -> Response {
     .into_response()
 }
 
-/// The body of `POST /api/peer/claim` (`SPEC-3.17` item 4).
+/// The body of `POST /api/peer/claim` (`SPEC-3.17.5`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimRequest {
     pub event_key: String,
@@ -1123,7 +1122,7 @@ pub struct ClaimResponse {
 }
 
 /// Decide a peer's claim against this instance's `peer_claims` row
-/// (`SPEC-3.17` item 7). A row naming a peer is final: this instance granted
+/// (`SPEC-3.17.8`). A row naming a peer is final: this instance granted
 /// it, so that peer may already be working the event. An own row that has not
 /// started yields to a lower `(load, id)` pair; one that has started refuses.
 pub async fn respond_to_claim(
@@ -1251,7 +1250,7 @@ const DISPATCHED_KEYS_MAX: usize = 4096;
 
 /// The event keys this instance has started, shared between the claim step
 /// and the peer API so a started event refuses a lower-load claim
-/// (`SPEC-3.17` item 7). Cheap to clone; in process only.
+/// (`SPEC-3.17.8`). Cheap to clone; in process only.
 #[derive(Clone, Default)]
 pub struct DispatchedClaims {
     keys: Arc<tokio::sync::Mutex<std::collections::VecDeque<String>>>,
@@ -1302,7 +1301,7 @@ impl Drop for PendingGuard {
     }
 }
 
-/// The claim step of the webhook pipeline (`SPEC-3.17` item 7). Cheap to clone.
+/// The claim step of the webhook pipeline (`SPEC-3.17.8`). Cheap to clone.
 #[derive(Clone)]
 pub struct PeerClaims {
     pool: DbPool,
@@ -2069,7 +2068,7 @@ mod tests {
         assert!(r.last_error.as_deref().unwrap().contains("b-token"));
     }
 
-    // ---- Event claims (SPEC-3.17 item 7) ----
+    // ---- Event claims (SPEC-3.17.8) ----
 
     use crate::testutil::LogCapture;
 
@@ -2430,7 +2429,7 @@ mod tests {
     }
 }
 
-/// Summary replication and the merged Reports view (`SPEC-3.17` items 9 and 10).
+/// Summary replication and the merged Reports view (`SPEC-3.17.10` and `SPEC-3.17.11`).
 #[cfg(test)]
 mod summary_tests {
     use super::testkit::*;

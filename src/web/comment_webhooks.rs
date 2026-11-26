@@ -1,4 +1,4 @@
-//! Comment-command webhook listener. Implements SPEC-4.4.5.
+//! Comment-command webhook listener. Implements SPEC-4.4.31 through SPEC-4.4.38.
 //!
 //! `POST /webhooks/{provider}/comment/{source}` receives `issue_comment`
 //! deliveries from the forge named by `{provider}` ([`super::webhooks::WebhookProvider`]:
@@ -96,7 +96,7 @@ use super::webhooks::{
 /// route and name stopped being Forgejo-specific).
 pub const WEBHOOK_COMMENT_ACTION: &str = "webhook-comment";
 
-/// SPEC-3.9's `Source:` line for every comment this listener posts, distinct
+/// SPEC-3.9.1's `Source:` line for every comment this listener posts, distinct
 /// from [`WEBHOOK_COMMENT_ACTION`] (the state/cap bookkeeping name).
 const COMMENT_WEBHOOK_SOURCE: &str = "comment-webhook";
 
@@ -203,7 +203,7 @@ pub enum CommandKind {
     Run { instruction: String },
 }
 
-/// SPEC-4.4.5: the typed command emitted downstream for a verified, allow-listed, triggered
+/// SPEC-4.4.31 through SPEC-4.4.38: the typed command emitted downstream for a verified, allow-listed, triggered
 /// comment. Everything the consumer needs; no request state travels with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedCommentCommand {
@@ -281,7 +281,7 @@ fn thread_label(is_pull_request: bool) -> &'static str {
 
 // ---- trigger parsing -------------------------------------------------------
 
-/// SPEC-4.4.5: "A comment is a command only when its first line opens with
+/// SPEC-4.4.31 through SPEC-4.4.38: "A comment is a command only when its first line opens with
 /// the configured `trigger` followed by whitespace or end-of-line; everything
 /// after it on that line plus every remaining line is the instruction. An
 /// empty or `help` instruction is a help request; one over
@@ -325,7 +325,7 @@ fn forge_host_from_url(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// SPEC-4.4.5: "A delivery is dropped (acked 2xx, logged with a reason,
+/// SPEC-4.4.31 through SPEC-4.4.38: "A delivery is dropped (acked 2xx, logged with a reason,
 /// never a command) when its action is not `created`, its repo is not in
 /// `allowed_repos`, its author is a configured bot login, or its body does
 /// not start with the trigger."
@@ -386,7 +386,7 @@ pub fn verified_comment_command(
 
 // ---- listener state + router ----------------------------------------------
 
-/// SPEC-4.4.5: "the comment listener shares the triage listener's replay
+/// SPEC-4.4.31 through SPEC-4.4.38: "the comment listener shares the triage listener's replay
 /// store instance, rate-limiter type and builder, and allow-list matcher by
 /// reference rather than by copy, so one delivery id fanned out to both
 /// endpoints is still caught once; its own write token and pause switch stay
@@ -405,7 +405,7 @@ pub struct CommentWebhookState {
     /// The SHARED replay store instance (see the module docs).
     seen: Arc<Mutex<SeenDeliveries>>,
     rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
-    /// The peer claim step (`SPEC-3.17` item 7); `None` runs no claim.
+    /// The peer claim step (`SPEC-3.17.8`); `None` runs no claim.
     claims: Option<crate::peer::PeerClaims>,
 }
 
@@ -462,7 +462,7 @@ impl CommentWebhookState {
     }
 }
 
-/// SPEC-4.4.5: "`POST /webhooks/{provider}/comment/{source}`: Comment commands."
+/// SPEC-4.4.31 through SPEC-4.4.38: "`POST /webhooks/{provider}/comment/{source}`: Comment commands."
 /// Router carrying the per-source comment route, merged into the daemon's TCP
 /// app alongside the CI-failure webhook router. `{provider}` names the
 /// sending forge ([`WebhookProvider`]).
@@ -475,7 +475,7 @@ pub fn router(state: CommentWebhookState) -> Router {
         .with_state(state)
 }
 
-/// SPEC-4.4.5: the comment listener's pipeline, numbered 0-7 in the module
+/// SPEC-4.4.31 through SPEC-4.4.38: the comment listener's pipeline, numbered 0-7 in the module
 /// doc comment above: provider/source resolution (404), rate limit (429),
 /// secret resolve (401), signature verify (401), delivery/replay (400/409),
 /// GitHub non-`issue_comment` drop (200), pause accept-and-drop (200),
@@ -717,8 +717,8 @@ async fn forgejo_comment_webhook(
     }
 }
 
-/// SPEC-4.4.5: "Resolve the source's HMAC secret from the secrets store;
-/// missing or unresolvable: 401" (the shared pipeline mechanics of SPEC-4.4
+/// SPEC-4.4.31 through SPEC-4.4.38: "Resolve the source's HMAC secret from the secrets store;
+/// missing or unresolvable: 401" (the shared pipeline mechanics of SPEC-4.4.1 through SPEC-4.4.46
 /// apply unchanged to the comment listener).
 /// Resolve a source's HMAC secret to plaintext. Errors when the source has no
 /// `secret_ref` or the secret cannot be decrypted (both fail closed as 401).
@@ -734,7 +734,7 @@ async fn resolve_secret(pool: &DbPool, src: &CommentWebhookSource) -> crate::err
 
 // ---- authorization gate ----------------------------------------------------
 
-/// SPEC-4.4.5: "A command is authorized by a LIVE read of the commenter's
+/// SPEC-4.4.31 through SPEC-4.4.38: "A command is authorized by a LIVE read of the commenter's
 /// repository permission against the forge, never a cache or static list.
 /// The read failing, or the permission ranking below `allowed_permissions`,
 /// denies (fail closed) with a reply naming the reason; a synthetic
@@ -809,7 +809,7 @@ pub fn check_permission(
     }
 }
 
-/// SPEC-4.4.5: "At most one denial reply per (repo, commenter) every
+/// SPEC-4.4.31 through SPEC-4.4.38: "At most one denial reply per (repo, commenter) every
 /// `DENIAL_REPLY_WINDOW_SECS`, so a scripted denied commenter cannot flood a
 /// PR with bot replies; the command is still dropped either way."
 /// Per-(repo, login) throttle for DENIAL replies, so a scripted denied commenter
@@ -866,7 +866,7 @@ pub struct CommentContext {
     pub readiness: Option<crate::readiness::ReadinessGate>,
 }
 
-/// SPEC-4.4.5: "Accepted commands leave the request path on an mpsc
+/// SPEC-4.4.31 through SPEC-4.4.38: "Accepted commands leave the request path on an mpsc
 /// channel; the consumer does the authorization read and then the route's
 /// work, plus every reply, off the request path, each on its own task so two
 /// pull requests progress concurrently. At most one comment job per thread is
@@ -903,9 +903,9 @@ struct ServeEnv {
     _creds: secrets::JobCredentials,
 }
 
-/// SPEC-4.4.5: drives one accepted command end to end: the comment-webhook
+/// SPEC-4.4.31 through SPEC-4.4.38: drives one accepted command end to end: the comment-webhook
 /// pause check, write-token resolution, the per-thread key gate, the
-/// commenter authorization gate (SPEC-4.4.5), then dispatch by
+/// commenter authorization gate (SPEC-4.4.31 through SPEC-4.4.38), then dispatch by
 /// [`CommandKind`] (help, too-long refusal, or a real instruction).
 /// Serve one accepted command end to end: authorize, then help / refuse / run.
 async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
@@ -943,7 +943,7 @@ async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
 
     // At most one comment job per thread. A second command while one is running
     // is told so and dropped rather than queued behind it.
-    // SPEC-3.6: "every rejection is posted as a comment naming the reason."
+    // SPEC-3.6.1 through SPEC-3.6.7: "every rejection is posted as a comment naming the reason."
     let Some(_gate) = ctx.keygate.try_acquire(&cmd.pr_gate_key()) else {
         info!(repo = %cmd.repo, number = cmd.number, "a comment job is already running for this thread; replying and dropping");
         reply(&ctx, &env, &cmd, &key, busy_comment(cmd.is_pull_request)).await;
@@ -966,7 +966,7 @@ async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
             })
         };
         if !verdict.is_allowed() {
-            // SPEC-3.6: "every rejection is posted as a comment naming the reason."
+            // SPEC-3.6.1 through SPEC-3.6.7: "every rejection is posted as a comment naming the reason."
             let body = denied_comment(&verdict, &src.allowed_permissions);
             match &verdict {
                 PermissionVerdict::Denied(p) => {
@@ -1001,7 +1001,7 @@ async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
             reply(&ctx, &env, &cmd, &key, body).await;
         }
         CommandKind::TooLong { chars, limit } => {
-            // SPEC-3.6: "every rejection is posted as a comment naming the reason."
+            // SPEC-3.6.1 through SPEC-3.6.7: "every rejection is posted as a comment naming the reason."
             info!(repo = %cmd.repo, number = cmd.number, chars, limit, "instruction over the configured limit; refusing");
             reply(&ctx, &env, &cmd, &key, too_long_comment(*chars, *limit)).await;
         }
@@ -1011,14 +1011,14 @@ async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
     }
 }
 
-/// SPEC-4.4.5: true when serving this command consumes an attempt / daily-ledger slot. Help
+/// SPEC-4.4.31 through SPEC-4.4.38: true when serving this command consumes an attempt / daily-ledger slot. Help
 /// and the oversize refusal reply and stop: no clone, no Claude run, and no
 /// attempt counted. Only a real instruction runs work.
 pub fn counts_attempt(kind: &CommandKind) -> bool {
     matches!(kind, CommandKind::Run { .. })
 }
 
-/// SPEC-4.4.5: "A comment command is a ONE-SHOT request: its effective
+/// SPEC-4.4.31 through SPEC-4.4.38: "A comment command is a ONE-SHOT request: its effective
 /// per-key attempt cap is one however high the runner default is, and that
 /// counter (keyed by `hash(repo, number, comment_id)`) is the redelivery
 /// guard. Admission also checks the comment-webhook synthetic action's
@@ -1053,7 +1053,7 @@ pub fn admit(
     Admission::Run
 }
 
-/// SPEC-4.4.5: "A command is served by the source's own `write_token_ref`
+/// SPEC-4.4.31 through SPEC-4.4.38: "A command is served by the source's own `write_token_ref`
 /// (GitHub-provider sources route through the GitHub forge backend, others
 /// through `fj`); a source with no write token cannot post comments or push
 /// and the command is dropped."
@@ -1177,7 +1177,7 @@ async fn reply(
     }
 }
 
-/// SPEC-3.13: "A start comment that fails to post is logged at `error` with
+/// SPEC-3.13.1 through SPEC-3.13.5: "A start comment that fails to post is logged at `error` with
 /// the issue key and the cause; the run proceeds." Separate from [`reply`]'s
 /// ordinary `warn` on a failed post, because the start notice is this
 /// action's one mandatory write, not a best-effort follow-up.
@@ -1194,17 +1194,17 @@ async fn reply_start_notice(
         &format!("start-{key}"),
     );
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        error!(key = %key, error = %e, "SPEC-3.13: creating the start-notice workdir failed; the run proceeds");
+        error!(key = %key, error = %e, "SPEC-3.13.1 through SPEC-3.13.5: creating the start-notice workdir failed; the run proceeds");
         return;
     }
     let path = dir.join(PR_COMMENT_FILE);
     if let Err(e) = std::fs::write(&path, addressed(cmd, body)) {
-        error!(key = %key, error = %e, "SPEC-3.13: writing the start-notice body failed; the run proceeds");
+        error!(key = %key, error = %e, "SPEC-3.13.1 through SPEC-3.13.5: writing the start-notice body failed; the run proceeds");
     } else {
         let backend = &env.backend;
         let r = tokio::task::block_in_place(|| post_on_thread(backend.as_ref(), cmd, &path));
         if let Err(e) = r {
-            error!(key = %key, repo = %cmd.repo, number = cmd.number, error = %e, "SPEC-3.13: posting the start notice failed; the run proceeds");
+            error!(key = %key, repo = %cmd.repo, number = cmd.number, error = %e, "SPEC-3.13.1 through SPEC-3.13.5: posting the start notice failed; the run proceeds");
         }
     }
     if let Err(e) = std::fs::remove_dir_all(&dir) {
@@ -1212,12 +1212,12 @@ async fn reply_start_notice(
     }
 }
 
-/// SPEC-4.4.5: "A command refused before admission (Claude login required,
+/// SPEC-4.4.31 through SPEC-4.4.38: "A command refused before admission (Claude login required,
 /// over the daily run cap) advances no attempt counter and runs no `claude`;
 /// a replying refusal names the reason to the commenter rather than the
 /// CI-triage webhook's silent accept-and-drop. An admitted instruction's
 /// per-key attempt counter advances before the work runs." Also drives the
-/// PR-vs-plain-issue route split (SPEC-4.4.5) and the per-delivery spend
+/// PR-vs-plain-issue route split (SPEC-4.4.31 through SPEC-4.4.38) and the per-delivery spend
 /// ceiling.
 /// Work a real instruction: caps + dedupe, run row, then the route's work (the
 /// PR clone / Claude / decision gate / push, or the plain-issue
@@ -1230,7 +1230,7 @@ async fn run_instruction(
     src: &CommentWebhookSource,
     instruction: String,
 ) {
-    // SPEC-3.6: "every rejection is posted as a comment naming the reason."
+    // SPEC-3.6.1 through SPEC-3.6.7: "every rejection is posted as a comment naming the reason."
     // Right after the pause check (already taken before this
     // command was accepted), refuse before admission so no attempt counter is
     // advanced and no `claude` runs. Unlike the CI-triage webhook's silent
@@ -1273,7 +1273,7 @@ async fn run_instruction(
             return;
         }
         Admission::DailyCapReached => {
-            // SPEC-3.6: "every rejection is posted as a comment naming the reason."
+            // SPEC-3.6.1 through SPEC-3.6.7: "every rejection is posted as a comment naming the reason."
             warn!(repo = %cmd.repo, number = cmd.number, daily, "daily run cap reached; replying and running nothing");
             reply(ctx, env, cmd, key, cap_comment()).await;
             return;
@@ -1282,7 +1282,7 @@ async fn run_instruction(
     if let Err(e) = state::attempts_increment(&ctx.pool, WEBHOOK_COMMENT_ACTION, key).await {
         warn!(error = %e, "advancing the comment attempt counter failed");
     }
-    // SPEC-3.13: admitted, so post the start notice before any clone or
+    // SPEC-3.13.1 through SPEC-3.13.5: admitted, so post the start notice before any clone or
     // mint work starts (`begin_webhook_run` below, which is the earliest
     // this attempt opens a run row). A synthetic command has no asker to
     // tell and is left with the pre-existing no-op.
@@ -1484,10 +1484,10 @@ impl RunOutcome {
     }
 }
 
-/// SPEC-4.4.5: "A pull-request comment command clones the PR's head branch,
+/// SPEC-4.4.31 through SPEC-4.4.38: "A pull-request comment command clones the PR's head branch,
 /// writes the human's instruction verbatim to a file outside the work tree
 /// (never interpolated into a command line), runs Claude against it, applies
-/// the decision gate (SPEC-4.4.5), pushes on a `Push` decision, and replies
+/// the decision gate (SPEC-4.4.31 through SPEC-4.4.38), pushes on a `Push` decision, and replies
 /// on the PR on every outcome path (pushed, no changes, unresolved conflicts,
 /// too big, or an error)."
 /// The whole blocking half of one instruction: resolve the PR's head branch,
@@ -1522,7 +1522,7 @@ fn serve_run(
     paths: &Paths,
 ) -> RunOutcome {
     let cancel = CancellationToken::new();
-    // SPEC-3.14 item 4: wall-clock start for this delivery, so the
+    // SPEC-3.14.5: wall-clock start for this delivery, so the
     // `coding`/`check`/`build` steps derived below (and the `unaccounted`
     // remainder around them) can be anchored the same way a native-action
     // attempt anchors its own.
@@ -1541,7 +1541,7 @@ fn serve_run(
     };
 
     if let Err(e) = std::fs::create_dir_all(workdir) {
-        // SPEC-4.4.5: no outcome is silent. Mirrors the branch-resolve fault
+        // SPEC-4.4.31 through SPEC-4.4.38: no outcome is silent. Mirrors the branch-resolve fault
         // above. `post_reply` re-attempts `create_dir_all(workdir)` and
         // logs-and-skips on its own failure, so a hard fault still exits
         // cleanly, but a transient one now reaches the thread.
@@ -1551,7 +1551,7 @@ fn serve_run(
         return RunOutcome::failed(format!("creating the workdir failed: {e}"));
     }
 
-    // SPEC-3.10 items 2-3: the repo's shared Cargo target directory comes from
+    // SPEC-3.10.3 through SPEC-3.10.4: the repo's shared Cargo target directory comes from
     // the clone URL path and must be writable before the session starts; the
     // runner never falls back to a per-workdir `target/`.
     let clone = backend
@@ -1582,7 +1582,7 @@ fn serve_run(
 
     let mut claude_ran = false;
     let mut cloned_head = None;
-    // SPEC-3.14 item 4: set only on the branch below that actually calls
+    // SPEC-3.14.5: set only on the branch below that actually calls
     // `claude.invoke`, so the step derivation at the end of this function has
     // a span to classify.
     let mut claude_span: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
@@ -1650,7 +1650,7 @@ fn serve_run(
                             &cancel,
                             // Cap the child at this run's remaining ceiling.
                             Some(spend.remaining_usd()),
-                            // SPEC-3.10 item 3: this repo workdir shares the
+                            // SPEC-3.10.4: this repo workdir shares the
                             // repo's compiled-dependency cache.
                             Some(cargo_target_dir.as_path()),
                         ) {
@@ -1773,7 +1773,7 @@ fn serve_run(
         first_line(&claude_result.summary)
     );
 
-    // SPEC-3.14 item 4: derive this delivery's `coding`/`check`/`build` steps
+    // SPEC-3.14.5: derive this delivery's `coding`/`check`/`build` steps
     // from the stream log, same as the `youtrack` native action and the
     // scripted-action pipeline, so a comment-command run carries step data
     // too instead of falling permanently into `/reports`' "no step data"
@@ -1836,7 +1836,7 @@ fn serve_run(
     }
 }
 
-/// SPEC-4.4.5: "A comment command on a plain issue (not a pull request)
+/// SPEC-4.4.31 through SPEC-4.4.38: "A comment command on a plain issue (not a pull request)
 /// clones nothing and runs no agent session: it resolves the repo's YouTrack
 /// project through the shared VCS route cache, creates an issue carrying the
 /// instruction verbatim and a link back to the forge issue, sets the target
@@ -2058,7 +2058,7 @@ fn build_prompt(
     lines.join("\n")
 }
 
-/// SPEC-4.4.5: "The decision gate classifies a completed PR-route run into
+/// SPEC-4.4.31 through SPEC-4.4.38: "The decision gate classifies a completed PR-route run into
 /// no changes, unresolved conflicts (nothing staged/committed/pushed),
 /// a measurement failure (never read as no changes), a change over
 /// `max_files` / `max_lines` (too big, not pushed), or a push. Unmerged paths
@@ -2090,7 +2090,7 @@ pub enum Decision {
 }
 
 /// The result of pushing a [`Decision::TooBig`] change to its side branch
-/// (SPEC-3.3.1, SPEC-3.6): the commits still reach the forge, just not the PR
+/// (SPEC-3.3.8 through SPEC-3.3.19, SPEC-3.6.1 through SPEC-3.6.7): the commits still reach the forge, just not the PR
 /// head, since an over-cap diff is never pushed unattended onto a live PR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TooBigPush {
@@ -2111,7 +2111,7 @@ impl Decision {
     }
 }
 
-/// SPEC-4.4.5: "A clean base merge with no other change (`commits >= 1,
+/// SPEC-4.4.31 through SPEC-4.4.38: "A clean base merge with no other change (`commits >= 1,
 /// files == 0`) is still a push, never 'no changes'."
 /// Classify a completed run into a [`Decision`]. Pure, so the gate is unit
 /// tested without a workdir. `commits` is the number of commits made since the
@@ -2192,7 +2192,7 @@ fn git_output(workdir: &FsPath, args: &[&str]) -> crate::error::Result<String> {
     }
 }
 
-/// SPEC-4.4.5: "A merge commit (more than one parent) is measured by
+/// SPEC-4.4.31 through SPEC-4.4.38: "A merge commit (more than one parent) is measured by
 /// `--remerge-diff --numstat`, counting only the conflict resolution, never
 /// the lines the base branch brought in; an ordinary commit is measured by
 /// its own `--numstat`. `files` is the count of distinct paths across every
@@ -2355,7 +2355,7 @@ fn numstat_files_and_lines(stdout: &str, files: &mut std::collections::HashSet<S
     lines
 }
 
-/// SPEC-4.4.5: "A `Push` decision pushes the PR's own head branch, then
+/// SPEC-4.4.31 through SPEC-4.4.38: "A `Push` decision pushes the PR's own head branch, then
 /// posts a push comment naming the issue key (parsed from the
 /// pushed tip's commit body) and the commit range; a failure to post that
 /// comment is a note, not a fault, since the push itself already succeeded."
@@ -2372,7 +2372,7 @@ fn push_fix(
 }
 
 /// Push a [`Decision::TooBig`] change to a side branch instead of the PR head
-/// (SPEC-3.3.1, SPEC-3.6): an over-cap diff still gets its commits onto the
+/// (SPEC-3.3.8 through SPEC-3.3.19, SPEC-3.6.1 through SPEC-3.6.7): an over-cap diff still gets its commits onto the
 /// forge, just not onto the live PR branch. The branch name is derived from
 /// [`VerifiedCommentCommand::key`] so a redelivery of the same comment lands
 /// on the same side branch rather than minting a new one each retry.
@@ -2391,7 +2391,7 @@ fn push_too_big_fix(
 /// Push any commit [`run_decision_gate`] already made to the same kind of
 /// side branch [`push_too_big_fix`] uses, for every decision that can be
 /// reached with a local commit already sitting on top of `cloned_head` but
-/// whose diff was never cleared for the live PR head (SPEC-3.3.1).
+/// whose diff was never cleared for the live PR head (SPEC-3.3.8 through SPEC-3.3.19).
 /// `Decision::MeasureFailed` qualifies: `run_decision_gate` commits the
 /// leftovers before it measures them, so a failure in that measurement step
 /// (the `rev-list`/`show --numstat` calls) still leaves a commit behind.
@@ -2457,7 +2457,7 @@ fn post_fix_push_comment(
     } else {
         crate::push_comment::PushEvent::CommentWebhookFixPush
     };
-    // SPEC-3.15 item 6, SPEC-8.8: a comment-driven run stores no steps, so the
+    // SPEC-3.15.7, SPEC-8.8.1 through SPEC-8.8.2: a comment-driven run stores no steps, so the
     // list is this comment's own line unless a context was stashed for the key.
     let progress = crate::progress_list::render_push(&issue_key, event);
     let ctx = crate::push_comment::PushCommentContext {
@@ -2604,7 +2604,7 @@ fn with_verdict(verdict: &str, body: String) -> String {
     format!("**{verdict}**\n\n{body}")
 }
 
-/// SPEC-3.9: "Every runner-posted comment ... webhook replies ... appends a
+/// SPEC-3.9.1: "Every runner-posted comment ... webhook replies ... appends a
 /// footer." The rejection, help and outcome replies post before (or beside) a
 /// run row and have no run id to hand, so the footer says so explicitly
 /// ("no run id is available") instead of omitting the line. The trigger is the
@@ -2640,7 +2640,7 @@ pub fn addressed(cmd: &VerifiedCommentCommand, body: String) -> String {
     }
 }
 
-/// SPEC-3.13: "Every action that starts work posts a start comment before it
+/// SPEC-3.13.1 through SPEC-3.13.5: "Every action that starts work posts a start comment before it
 /// clones, as the first runner write for that attempt ... A comment-command
 /// start comment mentions the commenter by login and names the trigger
 /// (`/claude`) and the instruction length." The commenter mention is left to
@@ -2684,7 +2684,7 @@ pub fn started_comment(
     )
 }
 
-/// SPEC-4.4.5: "Every outcome of a comment command (help, refused as too
+/// SPEC-4.4.31 through SPEC-4.4.38: "Every outcome of a comment command (help, refused as too
 /// long, denied, dropped for being busy or over cap, a run fault, or a
 /// decision-gate outcome) is reported back as a reply on the originating
 /// thread; no outcome is silent."
@@ -2827,7 +2827,7 @@ pub fn cap_comment() -> String {
 
 /// Reply for a fault before the agent could run. `cause` is the underlying
 /// error text (it can carry captured command output), so it is fenced and
-/// never pasted raw (SPEC-3.16).
+/// never pasted raw (SPEC-3.16.1 through SPEC-3.16.7).
 pub fn error_comment(summary: &str, cause: &str) -> String {
     with_verdict(
         "Blocked.",
@@ -2861,7 +2861,7 @@ pub fn outcome_comment(
         _ => "Blocked.",
     };
     let body = match decision {
-        // SPEC-3.16.3/5: at most 3 bullets, cause first, no raw stream-log
+        // SPEC-3.16.4/5: at most 3 bullets, cause first, no raw stream-log
         // path. A recognized timeout or SIGKILL uses `failure_hint`'s
         // plain-language line as the agent-error message; anything else
         // falls back to the friendly summary's first line.
@@ -2897,7 +2897,7 @@ pub fn outcome_comment(
             let tail = match too_big_push {
                 Some(TooBigPush::Pushed { branch }) => format!(
                     "Any commits made before the measurement failed were pushed to `{branch}` \
-                     (SPEC-3.3.1), not to this PR's branch; this needs human review."
+                     (SPEC-3.3.8 through SPEC-3.3.19), not to this PR's branch; this needs human review."
                 ),
                 Some(TooBigPush::Failed { error }) => format!(
                     "Pushing any commits made before the measurement failed also FAILED:\n\n{}\n\n\
@@ -2918,7 +2918,7 @@ pub fn outcome_comment(
         Decision::TooBig { files, lines } => {
             let tail = match too_big_push {
                 Some(TooBigPush::Pushed { branch }) => format!(
-                    "The commits were pushed to `{branch}` (SPEC-3.3.1), not to this PR's \
+                    "The commits were pushed to `{branch}` (SPEC-3.3.8 through SPEC-3.3.19), not to this PR's \
                      branch; this needs human review before it lands here."
                 ),
                 Some(TooBigPush::Failed { error }) => format!(
@@ -2981,7 +2981,7 @@ fn first_line(s: &str) -> String {
         .to_string()
 }
 
-/// SPEC-4.4.5: "A served comment command, like every other job, records one
+/// SPEC-4.4.31 through SPEC-4.4.38: "A served comment command, like every other job, records one
 /// `job_outcomes` row and finalizes through `RunGuard` so a failed finalize
 /// still closes the row as unexpected on drop, rather than
 /// leaving a run open forever."
@@ -3039,7 +3039,7 @@ async fn finish_comment_run(
     spend.finish(Some(run_id), exit_code);
 }
 
-/// SPEC-4.4.5: root the per-command credential dirs live under. One directory per command,
+/// SPEC-4.4.31 through SPEC-4.4.38: root the per-command credential dirs live under. One directory per command,
 /// removed when its [`secrets::JobCredentials`] guard drops.
 pub fn creds_root(paths: &Paths) -> PathBuf {
     paths.runtime_dir.join("comment-creds")
@@ -4280,7 +4280,7 @@ mod tests {
         assert_eq!(addressed(&cmd, cap_comment()), cap_comment());
     }
 
-    /// SPEC-3.9: a rejection reply carries the run footer, with
+    /// SPEC-3.9.1: a rejection reply carries the run footer, with
     /// the explicit no-run-id line, and still opens with the asker's mention.
     #[test]
     fn rejection_replies_carry_the_run_footer() {
@@ -4347,7 +4347,7 @@ mod tests {
 
     #[test]
     fn the_acknowledgement_names_the_action_trigger_length_and_timeout() {
-        // SPEC-3.13: "names the trigger (`/claude`) and the instruction
+        // SPEC-3.13.1 through SPEC-3.13.5: "names the trigger (`/claude`) and the instruction
         // length"; the action and session timeout are the general start
         // comment fields the same requirement describes.
         let body = started_comment(
@@ -4557,7 +4557,7 @@ mod tests {
         assert!(!body.contains("secret reasoning"), "{body}");
     }
 
-    /// SPEC-3.16.3: when no `result` event and no assistant text landed in
+    /// SPEC-3.16.4: when no `result` event and no assistant text landed in
     /// the stream log, `friendly_failure_summary` falls back to
     /// `no_final_message_summary`, which embeds the stream-log path in an
     /// otherwise single-line summary; the `ClaudeFailed` comment must still
@@ -5361,7 +5361,7 @@ mod tests {
         }
     }
 
-    /// SPEC-3.13: "Every action that starts work posts a start comment
+    /// SPEC-3.13.1 through SPEC-3.13.5: "Every action that starts work posts a start comment
     /// before it clones, as the first runner write for that attempt ... A
     /// comment-command start comment mentions the commenter by login." The
     /// clone itself is a real `git clone` subprocess the test cannot stub,
@@ -5419,7 +5419,7 @@ mod tests {
             "the start notice must post before the PR lookup that precedes the clone: {calls:?}"
         );
 
-        // The start notice carries the fields SPEC-3.13 names, and mentions
+        // The start notice carries the fields SPEC-3.13.1 through SPEC-3.13.5 names, and mentions
         // the commenter by login via `addressed`.
         let posted = runner
             .captured
@@ -5440,7 +5440,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.13: "A start comment that fails to post is logged at `error`
+    /// SPEC-3.13.1 through SPEC-3.13.5: "A start comment that fails to post is logged at `error`
     /// with the issue key and the cause; the run proceeds." Distinct from
     /// [`reply`]'s ordinary `warn` on a failed post.
     #[test]
@@ -5470,7 +5470,7 @@ mod tests {
         });
         assert!(logs.contains("ERROR"), "{logs}");
         assert!(logs.contains(&cmd_key_placeholder()), "{logs}");
-        assert!(logs.contains("SPEC-3.13"), "{logs}");
+        assert!(logs.contains("SPEC-3.13.1 through SPEC-3.13.5"), "{logs}");
         assert!(logs.contains("network error"), "{logs}");
     }
 
@@ -5480,7 +5480,7 @@ mod tests {
         gate_cmd().key()
     }
 
-    /// SPEC-3.6: "Post a comment naming the reason for each rejection path
+    /// SPEC-3.6.1 through SPEC-3.6.7: "Post a comment naming the reason for each rejection path
     /// instead of only logging it." Each reason's comment body already names
     /// the reason (see `denied_comment`, `too_long_comment`, `busy_comment`,
     /// `cap_comment`, `login_required_comment`'s own tests); this proves
@@ -6530,7 +6530,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.3.1 / SPEC-3.6: an over-cap diff still gets its commits onto the
+    /// SPEC-3.3.8 through SPEC-3.3.19 / SPEC-3.6.1 through SPEC-3.6.7: an over-cap diff still gets its commits onto the
     /// forge, on a side branch keyed off the comment, instead of being left
     /// local-only. `clone_url` is real `CliBackend` code (token read from
     /// `keys.json`); the only test-only wiring is a `url.<bare>.insteadOf`
@@ -6600,7 +6600,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.3.1: `run_decision_gate` commits the leftovers before it
+    /// SPEC-3.3.8 through SPEC-3.3.19: `run_decision_gate` commits the leftovers before it
     /// measures them, so a `Decision::MeasureFailed` can be reached with a
     /// local commit already sitting on top of `cloned_head`. That commit
     /// must still reach the forge, on the same side branch an over-cap diff

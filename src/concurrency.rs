@@ -45,7 +45,7 @@
 //! job waits on a permit while another waits on that key, and the pipeline stays
 //! deadlock-free.
 //!
-//! SPEC-3.1 / SPEC-10: concurrency keys are process-wide, not scoped per
+//! SPEC-3.1.1 through SPEC-3.1.12 / SPEC-10.2.1 through SPEC-10.2.8: concurrency keys are process-wide, not scoped per
 //! action; each cap floors to 1 even when configured 0; a resize swaps in a
 //! new semaphore with in-flight permits draining against the old one; no
 //! fairness or ordering guarantee holds among deferred jobs.
@@ -67,7 +67,7 @@ use crate::pause::RunPause;
 /// (e.g. a pre-launch cap/budget check tripped), or `Err` on a hard error.
 pub type JobFuture = Pin<Box<dyn Future<Output = Result<bool>> + Send>>;
 
-/// SPEC-3.1: concurrency keys are process-wide, not scoped per action.
+/// SPEC-3.1.1 through SPEC-3.1.12: concurrency keys are process-wide, not scoped per action.
 ///
 /// Process-wide map of concurrency-key -> a per-key async mutex. Cloning shares
 /// the same map (it lives behind an `Arc`), so the daemon hands the same gate to
@@ -112,7 +112,7 @@ impl KeyGate {
     }
 }
 
-/// SPEC-2.2: advisory, scheduler-only gather marker.
+/// SPEC-2.2.1 through SPEC-2.2.2: advisory, scheduler-only gather marker.
 ///
 /// A per-action marker for "this action is gathering right now".
 ///
@@ -169,7 +169,7 @@ impl Drop for GatherGuard {
     }
 }
 
-/// SPEC-10: the global + per-action semaphore permits; see SPEC-6.3 for the
+/// SPEC-10.2.1 through SPEC-10.2.8: the global + per-action semaphore permits; see SPEC-6.3.1 through SPEC-6.3.2 for the
 /// resolved effective cap this is built from.
 ///
 /// The daemon-wide concurrency limiter. Holds a global semaphore
@@ -270,7 +270,7 @@ impl Limiter {
         (gp, ap)
     }
 
-    /// SPEC-2.2: a racy, best-effort admission check; the executor's real
+    /// SPEC-2.2.1 through SPEC-2.2.2: a racy, best-effort admission check; the executor's real
     /// `acquire` is the authority.
     ///
     /// True when a job for `action` could acquire a permit right now
@@ -317,7 +317,7 @@ pub struct Executor {
 }
 
 impl Executor {
-    /// SPEC-10 / SPEC-3.1: no fairness or ordering guarantee holds among
+    /// SPEC-10.2.1 through SPEC-10.2.8 / SPEC-3.1.1 through SPEC-3.1.12: no fairness or ordering guarantee holds among
     /// deferred jobs.
     ///
     /// Run all `items` concurrently under the key gate and the daemon-wide caps,
@@ -352,7 +352,7 @@ impl Executor {
                 };
                 let global = limiter.global();
                 // A queued job can wait as long as the jobs ahead of it run, so
-                // a cancel must not wait for a permit (SPEC-3.7).
+                // a cancel must not wait for a permit (SPEC-3.7.1 through SPEC-3.7.3).
                 let _global_permit = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Ok(false),

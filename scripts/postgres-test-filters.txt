@@ -4,7 +4,7 @@
 # re-runs only the tests matched here, so pure-logic tests - which execute no
 # SQL and would do identical work on both backends - are not re-run on
 # Postgres. The SQLite leg still runs the whole suite. This preserves the
-# SPEC-5.6 both-backends guarantee: every test that runs SQL does so on both
+# SPEC-5.6.1 through SPEC-5.6.12 both-backends guarantee: every test that runs SQL does so on both
 # backends, because SQL only ever runs through a DB pool and only these files
 # build one in a test.
 #

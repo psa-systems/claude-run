@@ -37,7 +37,7 @@ reverse proxy (and whatever the proxy already enforces) and complete setup promp
 
 Once the instance has a browser login (an account, or the pre-setup `auth_username` pair), a signed-out browser at `/`
 sees a landing page with a **Sign in** button rather than a redirect to `/login`; every other page still redirects to
-`/login`, and API clients still get `401` (`SPEC-7.16`).
+`/login`, and API clients still get `401` (`SPEC-7.16.1` through `SPEC-7.16.3`).
 
 Every account after the first comes from an invite, not from `/setup`. Any signed-in account can open **Accounts**
 (`/settings/accounts`) and create a single-use invite link, valid for 72 hours and shown exactly once. The invitee
@@ -78,7 +78,7 @@ still signs in: `auth_username` plus the token plaintext as the password, so exi
 
 Run the daemon behind a TLS-terminating reverse proxy when exposed; the token is bearer credentials and must not cross
 the network in plaintext. The `/webhooks/` route keeps its own HMAC verification and is exempt from the gate, before and
-after setup. `/api/peer/*` is exempt too: it has its own bearer gate (`SPEC-3.17`) that also accepts generated API keys.
+after setup. `/api/peer/*` is exempt too: it has its own bearer gate (`SPEC-3.17.1` through `SPEC-3.17.12`) that also accepts generated API keys.
 
 ### Service auth (Settings -> Auth)
 
