@@ -150,10 +150,7 @@ mod tests {
 
     #[test]
     fn disabled_framework_detects_nothing() {
-        let disabled = AutoFixConfig {
-            enabled: false,
-            ..AutoFixConfig::default()
-        };
+        let disabled = AutoFixConfig { enabled: false };
         let log = "Run cargo fmt --check\nDiff in src/main.rs at line 3:\n";
         assert!(detect(&input("check.yml", log), &disabled).is_none());
     }
