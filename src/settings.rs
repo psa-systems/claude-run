@@ -1672,10 +1672,10 @@ mod tests {
             .unwrap();
         let sql = match crate::db::dialect(&pool) {
             crate::db::Dialect::Sqlite => {
-                include_str!("../migrations/sqlite/0038_rename_auto_fix_settings.sql")
+                include_str!("../migrations/sqlite/0039_rename_auto_fix_settings.sql")
             }
             crate::db::Dialect::Postgres => {
-                include_str!("../migrations/postgres/0019_rename_auto_fix_settings.sql")
+                include_str!("../migrations/postgres/0020_rename_auto_fix_settings.sql")
             }
         };
         for _ in 0..2 {
