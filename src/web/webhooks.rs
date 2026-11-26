@@ -7366,9 +7366,11 @@ mod tests {
             "main",
             "branch/a",
             "branch/b",
+            "chore/ALPHA-1130-cleanup",
             "feat/ALPHA-1126-kb-provenance",
             "feature/x",
             "fix/ALPHA-1041-invoice-module-gate",
+            "fix/ALPHA-1140-retry-logic",
             "fix/PROJ-40",
             "fix/PROJ-41",
             "fix/PROJ-50",
@@ -7976,7 +7978,7 @@ mod tests {
         let cfg = WebhookConfig {
             analysis_concurrency: 2,
             max_runs_per_day: 20,
-            ..WebhookConfig::default()
+            ..test_webhook_cfg()
         };
         consume_events(
             rx,
@@ -11234,9 +11236,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn human_pr_on_a_second_branch_mints_one_issue_and_comments_both_prs() {
-        // The same failing tests on a second
-        // branch's PR create one issue, and both PRs get the issue link.
+    async fn human_pr_on_a_second_branch_mints_no_issue_and_comments_both_prs() {
+        // The same failing tests on a second human PR's branch never mint an
+        // issue (SPEC-4.4.43): both PRs are analyzed and commented instead.
         let _env = crate::secrets::key_file_env_lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let pool = crate::db::test_pool().await;
@@ -11330,7 +11332,7 @@ mod tests {
 
         let calls = backend.calls();
         let creates: Vec<_> = calls.iter().filter(|c| c.starts_with("create")).collect();
-        assert_eq!(creates.len(), 1, "exactly one issue created: {calls:?}");
+        assert!(creates.is_empty(), "no issue is ever minted: {calls:?}");
 
         let runner_calls = runner.calls.lock().unwrap();
         assert!(
