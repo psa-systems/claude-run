@@ -759,9 +759,8 @@ mod tests {
     }
 
     /// Default auto-fix config for the hybrid-triage tests. The cargo-fmt
-    /// detector is signature-driven and the checks-workflow list defaults to
-    /// `["check.yml"]`; `input_with_log` uses `ci.yml`, so the existing
-    /// non-auto-fix cases fall through to the classifier unchanged.
+    /// detector is signature-driven, so a log with no fmt signature falls
+    /// through to the classifier.
     fn autofix_cfg() -> AutoFixConfig {
         AutoFixConfig::default()
     }
@@ -1058,49 +1057,27 @@ mod tests {
     }
 
     #[test]
-    fn check_yml_failure_routes_to_auto_fix_only_without_an_open_pr() {
-        // AC 3: the checks-workflow detector fires for a non-fmt
-        // check.yml failure, but ONLY when the failing branch has no open PR.
-        // With an open PR the failure is that PR's own concern, so triage skips
-        // auto-fix and hands it to the classifier instead of opening a new
-        // corrective PR against the unmerged PR.
+    fn check_yml_failure_without_a_signature_goes_to_the_classifier() {
+        // SPEC-4.4.6: a listed checks workflow failing with no mechanical
+        // signature is not an auto-fix, with or without an open PR; the
+        // classifier decides.
         let log = "##[group]Clippy\nerror: unused variable\n##[error]the step has failed\n";
-
-        // No open PR (push to main): routed to auto-fix, no LLM call.
-        let stub = StubClassifier::new(Triage::llm(TriageBucket::HumanAction, "unused"));
-        let mut input = input_with_log(log);
-        input.workflow_id = "check.yml".to_string();
-        input.has_open_pr = false;
-        let verdict = triage(
-            &input,
-            &stub,
-            &autofix_cfg(),
-            &bot_branch_prefixes(),
-            &test_spend(),
-        );
-        assert_eq!(verdict.bucket, TriageBucket::AutoFix);
-        assert_eq!(verdict.auto_fix.unwrap().kind, "checks-workflow");
-        assert_eq!(stub.calls(), 0, "auto-fix short-circuits before the LLM");
-
-        // Open PR: auto-fix is skipped and the classifier decides instead.
-        let stub = StubClassifier::new(Triage::llm(TriageBucket::CodeFix, "fix the PR branch"));
-        let mut input = input_with_log(log);
-        input.workflow_id = "check.yml".to_string();
-        input.has_open_pr = true;
-        let verdict = triage(
-            &input,
-            &stub,
-            &autofix_cfg(),
-            &bot_branch_prefixes(),
-            &test_spend(),
-        );
-        assert_eq!(verdict.bucket, TriageBucket::CodeFix);
-        assert!(verdict.auto_fix.is_none());
-        assert_eq!(
-            stub.calls(),
-            1,
-            "the classifier is consulted for an open-PR failure"
-        );
+        for has_open_pr in [false, true] {
+            let stub = StubClassifier::new(Triage::llm(TriageBucket::CodeFix, "fix it"));
+            let mut input = input_with_log(log);
+            input.workflow_id = "check.yml".to_string();
+            input.has_open_pr = has_open_pr;
+            let verdict = triage(
+                &input,
+                &stub,
+                &autofix_cfg(),
+                &bot_branch_prefixes(),
+                &test_spend(),
+            );
+            assert_eq!(verdict.bucket, TriageBucket::CodeFix);
+            assert!(verdict.auto_fix.is_none());
+            assert_eq!(stub.calls(), 1, "the classifier is consulted");
+        }
     }
 
     #[test]

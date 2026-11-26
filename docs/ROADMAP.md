@@ -36,7 +36,7 @@ Related outside this repository: making app-server's integration suite fast enou
    branch, so a failure every PR inherits from `main` gets one issue per PR.
 2. **A resolved issue silences its failure permanently.** A later failure matching a resolved issue creates nothing:
    no issue, no comment, no reopen.
-3. **With `webhook.auto_fix` off (the default), a code failure produces no issue.**
+3. **With the queuing setting off (the default), a code failure produces no issue.** That setting is now `webhook.queue_fix_issues` and no longer decides whether an issue is created.
 4. **Two `claude` passes, and the better one cannot route.** A tool-less classifier over a 48 KiB log decides the
    routing; the later analysis with tools over the complete log can only comment.
 5. **The reason for the split is gone.** Analysis was moved to a scheduled action because run logs were not readable
@@ -122,7 +122,7 @@ not as a silent no-op.
 | Tool-less classifier at ingest, then `ci-failure-analysis` comments every 60s poll        | One analysis at ingest, only for a new fingerprint; its verdict routes the failure                      |
 | Dedupe by YouTrack full-text search on branch-scoped markers                              | Fingerprint table in the runner's database, branch-agnostic, exact and immediate                        |
 | A failure matching a resolved issue is dropped silently                                   | The issue is reopened as a regression                                                                   |
-| `webhook.auto_fix` off drops code failures; the open-PR check drops them silently         | Every code defect gets an issue; a human's PR gets the analysis as a PR comment                          |
+| The queuing setting off drops code failures; the open-PR check drops them silently       | Every code defect gets an issue; a human's PR gets the analysis as a PR comment                          |
 | `ci-failure-reconcile` collapses duplicates and polls for green on `main`                 | Removed: duplicates cannot form; a YouTrack workflow resolves an issue when its own PR merges |
 | `forgejo-ci-fix` iterates on the bot's PRs, matched by login string                       | Removed: a failure on an agent PR goes back to its source issue, identified by the runner's own PR record |
 | Automerge polls for 300s                                                                  | A "run succeeded" event triggers automerge                                                              |
@@ -150,4 +150,4 @@ One issue and one agent thread, instead of four issues, four agents, and a stuck
 3. **The integration check is not required before merge yet.** In `app-server` it takes about half an hour, which
    is too long to hold a merge on. Making it fast enough to require is separate work. The proposal handles a PR
    merged before its CI finished either way.
-4. **A human's PR always gets the analysis comment.**
+4. **A human's PR gets the analysis comment when `webhook.pr_analysis` is on.**

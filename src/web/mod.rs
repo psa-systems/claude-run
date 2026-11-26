@@ -5519,6 +5519,9 @@ struct SettingsSectionView {
     json: String,
     error: Option<String>,
     fields: Vec<FieldDoc>,
+    /// SPEC-4.4.6: whether the notes table carries a "Used by" column, true
+    /// for a section whose fields name the actions that read them.
+    shows_used_by: bool,
 }
 
 /// SPEC-4.3.8: one field's apply-semantics doc shown on a section card.
@@ -5526,7 +5529,13 @@ struct FieldDoc {
     name: &'static str,
     badge: &'static str,
     note: &'static str,
+    /// SPEC-4.4.6: the actions that read this field, for a section more than one
+    /// action reads; empty for a section only one action reads.
+    used_by: &'static [&'static str],
 }
+
+const USED_BY_TRIAGE: &[&str] = &["webhook-triage"];
+const USED_BY_TRIAGE_AND_COMMENT: &[&str] = &["webhook-triage", "webhook-comment"];
 
 #[derive(Deserialize)]
 struct SettingsForm {
@@ -5549,51 +5558,67 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "repo_project_map",
                 badge: "next event",
                 note: "owner/repo -> YouTrack project override.",
+                used_by: USED_BY_TRIAGE_AND_COMMENT,
             },
             FieldDoc {
                 name: "fallback_project",
                 badge: "next event",
                 note: "project for unclaimed repos.",
+                used_by: USED_BY_TRIAGE_AND_COMMENT,
             },
             FieldDoc {
                 name: "bot_logins",
                 badge: "next event",
-                note: "trigger logins that never mint (loop safety).",
+                note: "logins the comment listener ignores as a command author (loop safety), and the author an automerge conflict-resolve command is sent as; never a mint-time guard.",
+                used_by: USED_BY_TRIAGE_AND_COMMENT,
             },
             FieldDoc {
                 name: "human_assignee",
                 badge: "next event",
                 note: "bucket-2 assignee login; null leaves unassigned.",
+                used_by: USED_BY_TRIAGE,
             },
             FieldDoc {
                 name: "target_state",
                 badge: "next event",
                 note: "State set on a minted issue.",
+                used_by: USED_BY_TRIAGE_AND_COMMENT,
             },
             FieldDoc {
                 name: "resolved_state",
                 badge: "next event",
                 note: "State the runner treats as resolved when it reads a CI-failure issue's own State (the YouTrack workflow, not the runner, sets it).",
+                used_by: USED_BY_TRIAGE,
             },
             FieldDoc {
                 name: "ai_agent_field",
                 badge: "next event",
                 note: "AI Agent custom-field name.",
+                used_by: USED_BY_TRIAGE_AND_COMMENT,
             },
             FieldDoc {
                 name: "queued_value",
                 badge: "next event",
                 note: "AI Agent value for a code-fix issue.",
+                used_by: USED_BY_TRIAGE_AND_COMMENT,
+            },
+            FieldDoc {
+                name: "detect_fixable",
+                badge: "next event",
+                note: "enabled: run the deterministic detectors (a cargo fmt failure becomes an Auto-fix issue); false sends every failure to the analysis pass as a CI failure issue. checks_workflows is not read by any detector. Whether the issue is queued is the Webhook sources field queue_fix_issues.",
+                used_by: USED_BY_TRIAGE,
             },
             FieldDoc {
                 name: "bot_branch_prefixes",
                 badge: "next event",
                 note: "branch prefixes (e.g. renovate/) owned by another bot; a failing check there routes to human_action, never code_fix/auto_fix.",
+                used_by: USED_BY_TRIAGE,
             },
             FieldDoc {
                 name: "needs_info_tag",
                 badge: "next event",
                 note: "tag added alongside Needs Review at the CI fix-attempt ceiling (SPEC-3.12 item 3); empty disables the tag write.",
+                used_by: USED_BY_TRIAGE,
             },
         ],
         Webhook => vec![
@@ -5601,41 +5626,61 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "replay_window_secs",
                 badge: "restart",
                 note: "shared replay window; the replay store is built once at start.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "sources",
                 badge: "live",
                 note: "a saved source puts webhook-triage on the dashboard immediately; per-source secret_ref, allowed_repos, rate_limit_per_min, log_token_ref, write_token_ref (WRITE scope, required to comment on a PR).",
+                used_by: &[],
             },
             FieldDoc {
-                name: "auto_fix",
+                name: "queue_fix_issues",
                 badge: "next event",
-                note: "queuing only: every code failure still mints; off just leaves AI Agent unset.",
+                note: "queuing only: set AI Agent on a created code_fix / auto_fix issue; off leaves it unset. Never decides whether an issue is created. Independent of the Issue minting field detect_fixable.",
+                used_by: &[],
+            },
+            FieldDoc {
+                name: "triage_branches",
+                badge: "next event",
+                note: "repo pattern (owner/repo, owner/*, *; most specific wins) -> branches whose failed runs are triaged (default * -> main, develop). Any other branch with no open PR is dropped; an open PR is routed by its opener and ignores this list.",
+                used_by: &[],
+            },
+            FieldDoc {
+                name: "pr_analysis",
+                badge: "next event",
+                note: "analyze and comment on a failure on a human-authored open PR (default false: dropped with an info log). Never mints an issue either way.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "analysis_timeout_secs",
                 badge: "restart",
                 note: "timeout for the at-ingest analysis session (Read,Grep,Bash over the full log); the classifier is built once at daemon start.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "analysis_concurrency",
                 badge: "restart",
                 note: "how many events are analyzed at once; the worker pool's semaphore is sized once at daemon start.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "agent_pr_fix_attempts",
                 badge: "next event",
                 note: "fix attempts on the agent's own open PR before its issue is flagged Needs Review instead of re-queued.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "agent_pr_fix_attempts_hard_cap",
                 badge: "next event",
                 note: "at the cap above, a failure overlapping none of the PR's earlier failing tests gets one more attempt, up to this many in all (default 6, at least agent_pr_fix_attempts).",
+                used_by: &[],
             },
             FieldDoc {
                 name: "max_runs_per_day",
                 badge: "next event",
                 note: "daily run cap of the webhook-triage ledger (default 20, at least 1).",
+                used_by: &[],
             },
         ],
         WebhookComment => vec![
@@ -5643,53 +5688,63 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "trigger",
                 badge: "live",
                 note: "command prefix the first line of a PR comment must open with (default /claude).",
+                used_by: &[],
             },
             FieldDoc {
                 name: "max_instruction_chars",
                 badge: "live",
                 note: "longer instructions are refused with a reply naming the limit.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "max_runs_per_day",
                 badge: "next event",
                 note: "daily run cap of the webhook-comment ledger (default 20, at least 1).",
+                used_by: &[],
             },
             FieldDoc {
                 name: "claude_timeout_seconds",
                 badge: "next event",
                 note: "per-run claude session timeout for the PR-comment route, read live per command (default 600, at least 1).",
+                used_by: &[],
             },
             FieldDoc {
                 name: "agent_conflict_resolve_attempts",
                 badge: "next event",
                 note: "automerge conflict auto-resolve runs per agent PR before its issue is parked delivery-blocked with the unresolved files named (default 2, at least 1).",
+                used_by: &[],
             },
             FieldDoc {
                 name: "sources",
                 badge: "live",
                 note: "a saved source puts webhook-comment on the dashboard immediately; per-source secret_ref, allowed_repos, rate_limit_per_min, write_token_ref (WRITE scope), allowed_permissions, max_files, max_lines.",
+                used_by: &[],
             },
         ],
         LogFilter => vec![FieldDoc {
             name: "filter",
             badge: "live",
             note: "tracing EnvFilter directive; CLAUDE_RUN_LOG still wins this run.",
+            used_by: &[],
         }],
         WorkdirGc => vec![
             FieldDoc {
                 name: "enabled",
                 badge: "next sweep",
                 note: "master toggle; false parks the sweeper without losing the windows.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "retention_days",
                 badge: "next sweep",
                 note: "age past which a preserved / aside workdir is deleted.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "unpushed_hard_cap_days",
                 badge: "next sweep",
                 note: "longer age past which even unpushed-commit workdirs are deleted.",
+                used_by: &[],
             },
         ],
         StreamLogGc => vec![
@@ -5697,36 +5752,43 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "enabled",
                 badge: "next sweep",
                 note: "master toggle; false parks the stream-log sweeper without losing the window.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "retention_days",
                 badge: "next sweep",
                 note: "age past which logs/<action>/streams/<key>-attempt-<n>.jsonl is deleted; a job still in flight keeps its log at any age.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "daemon_log_max_bytes",
                 badge: "next sweep",
                 note: "size ceiling for logs/daemon.log; past it the file rolls to daemon.log.1 and keeps its newest half. 0 = unbounded.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "output_file_max_bytes",
                 badge: "next sweep",
                 note: "size ceiling for each logs/<action>/<output.file>; bounded by size, never deleted by age, because it is an operator-configured sink. 0 = unbounded.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "usage_log_max_bytes",
                 badge: "next sweep",
                 note: "size ceiling for logs/usage.jsonl, the per-run token and cost record; past it the file rolls to usage.jsonl.1 and keeps its newest whole records. 0 = unbounded.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "snippet_retention_days",
                 badge: "next sweep",
                 note: "age past which snippets/<action>/<job_key>/ is deleted; a job still in flight keeps its snippet directory at any age.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "webhook_log_retention_days",
                 badge: "next sweep",
                 note: "age past which a file directly under webhook-logs/ is deleted; the reused webhook-logs/triage/ working directory is never swept.",
+                used_by: &[],
             },
         ],
         Preferences => vec![
@@ -5735,16 +5797,19 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 badge: "live",
                 note:
                     "BCP-47 locale (e.g. fr-FR); localizes month/weekday/AM-PM names (%A %a %B %b %p).",
+                used_by: &[],
             },
             FieldDoc {
                 name: "timezone",
                 badge: "live",
                 note: "IANA name (e.g. America/New_York); all displayed dates convert into it.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "datetime_format",
                 badge: "live",
                 note: "chrono strftime pattern; use a preset button below or edit freely.",
+                used_by: &[],
             },
         ],
         Concurrency => vec![
@@ -5752,16 +5817,19 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "max_parallel_global",
                 badge: "next tick",
                 note: "global cap on concurrent jobs across all actions; 0 = auto (max enabled max_parallel).",
+                used_by: &[],
             },
             FieldDoc {
                 name: "regather_interval_secs",
                 badge: "next tick",
                 note: "cadence (seconds) the scheduler starts overlapping pickup runs; >= 1.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "stuck_working_sweep",
                 badge: "next tick",
                 note: "moves an issue stranded on Working back to Queued or Needs Review when this instance has no live run for it. Can cause problems when more than one claude-run instance polls the same tracker and the instances are not clustered: another instance's live run can be re-queued. Disable it in that setup. Disabled, an issue stranded on Working stays there until a person moves it. Restart recovery of this instance's own runs is unaffected.",
+                used_by: &[],
             },
         ],
         Claude => vec![
@@ -5769,11 +5837,13 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "model",
                 badge: "next invocation",
                 note: "default --model for every action that pins no claude.model; null = the claude CLI's own default. Passed through unvalidated (sonnet, opus, claude-sonnet-4-5-20250929, ...).",
+                used_by: &[],
             },
             FieldDoc {
                 name: "effort",
                 badge: "next invocation",
                 note: "default --effort for every action that pins no claude.effort; null = the claude CLI's own default. low, medium, high, xhigh, max; another value is warned about and still passed through.",
+                used_by: &[],
             },
         ],
         DbRetention => vec![
@@ -5781,11 +5851,13 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "enabled",
                 badge: "next sweep",
                 note: "master toggle; false parks the history-table prune without losing the window.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "retention_days",
                 badge: "next sweep",
                 note: "age past which job_outcomes / run_events / ci_failure_runs rows are pruned; must be >= 90 (the longest report range).",
+                used_by: &[],
             },
         ],
         DockerGc => vec![
@@ -5793,16 +5865,19 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "enabled",
                 badge: "next sweep",
                 note: "master toggle; false parks the Docker sidecar volume sweep without losing the window.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "volume_retention_days",
                 badge: "next sweep",
                 note: "age past which an unused named volume in the sidecar is removed, measured from Docker's CreatedAt; must be >= 1.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "max_bytes",
                 badge: "next sweep",
                 note: "total ceiling across every Docker storage category (images, containers, local volumes, build cache); over it with no run in flight, storage is reclaimed in the SPEC-3.11 order until under it again; must be >= 1.",
+                used_by: &[],
             },
         ],
         Peers => vec![
@@ -5810,36 +5885,43 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "enabled",
                 badge: "next tick",
                 note: "master toggle; false mounts no peer route, makes no outbound call and shows no peer on the Status page.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "instance_name",
                 badge: "next tick",
                 note: "this instance's name as peers see it; required when enabled, and different from every peer name.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "peers",
                 badge: "next tick",
                 note: "list of {name, url, token_ref}; token_ref names the secret holding that peer's bearer token; names unique, url http(s).",
+                used_by: &[],
             },
             FieldDoc {
                 name: "poll_secs",
                 badge: "next tick",
                 note: "seconds between liveness pulls; >= 5.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "stale_after_secs",
                 badge: "next tick",
                 note: "a peer with no successful pull within this window is unknown; >= 2 x poll_secs.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "claim_timeout_secs",
                 badge: "next tick",
                 note: "bound on one webhook-claim call to a peer; 1 to 30.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "summary_batch",
                 badge: "next tick",
                 note: "rows per summary pull; >= 1.",
+                used_by: &[],
             },
         ],
         CargoCache => vec![
@@ -5847,11 +5929,13 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "enabled",
                 badge: "next sweep",
                 note: "master toggle; false parks the per-repo Cargo target cache sweep without losing the ceiling.",
+                used_by: &[],
             },
             FieldDoc {
                 name: "max_bytes_per_repo",
                 badge: "next sweep",
                 note: "size ceiling for each repo's shared cargo-target directory; over it with no run for that repo in flight, the directory is deleted and rebuilt cold on the next run; must be >= 1.",
+                used_by: &[],
             },
         ],
     }
@@ -5915,13 +5999,15 @@ async fn render_settings_full(
             }
             _ => (s.api.settings.section_json(section).await, None),
         };
+        let fields = section_fields(section);
         sections.push(SettingsSectionView {
             path: section.as_path(),
             title: section.title(),
             apply_badge: section.apply_badge(),
             json,
             error,
-            fields: section_fields(section),
+            shows_used_by: fields.iter().any(|f| !f.used_by.is_empty()),
+            fields,
         });
     }
     let auth_cfg = s.api.settings.auth_config().await;
@@ -12609,6 +12695,50 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(del.status(), StatusCode::FORBIDDEN, "{synthetic}");
+            }
+        }
+
+        /// SPEC-4.4.6: the Issue minting notes table carries a "Used by" column
+        /// with a row for every `MintConfig` field naming the reading actions;
+        /// a section only one action reads has no such column.
+        #[tokio::test]
+        async fn issue_minting_notes_table_names_the_actions_reading_each_field() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let page = settings_page(
+                State(s.clone()),
+                Query(crate::web::SettingsQuery { saved: None }),
+            )
+            .await
+            .unwrap();
+            let body = axum::body::to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = String::from_utf8_lossy(&body);
+            assert_eq!(
+                html.matches("<th>Used by</th>").count(),
+                1,
+                "only the Issue minting table has the column"
+            );
+
+            let doc = serde_json::to_value(crate::config::MintConfig::default()).unwrap();
+            let fields = crate::web::section_fields(crate::settings::Section::Mint);
+            for key in doc.as_object().unwrap().keys() {
+                let row = fields
+                    .iter()
+                    .find(|f| f.name == key)
+                    .unwrap_or_else(|| panic!("no notes row for mint field `{key}`"));
+                assert!(
+                    !row.used_by.is_empty(),
+                    "mint field `{key}` does not name the actions that read it"
+                );
+            }
+            for f in &fields {
+                assert!(
+                    doc.get(f.name).is_some(),
+                    "notes row `{}` names no mint field",
+                    f.name
+                );
             }
         }
 

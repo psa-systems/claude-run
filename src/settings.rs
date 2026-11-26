@@ -1138,6 +1138,24 @@ fn comment_rate_map(cfg: &CommentWebhookConfig) -> HashMap<String, Mutex<RateLim
     rate_map_from(cfg.sources.iter().map(|(n, s)| (n, s.rate_limit_per_min)))
 }
 
+/// SPEC-4.4.6: one of the three literal repo-pattern forms `repo_matches`
+/// reads (`owner/repo`, `owner/*`, `*`), with no other wildcard.
+fn is_repo_pattern(p: &str) -> bool {
+    if p == "*" {
+        return true;
+    }
+    match p.split_once('/') {
+        Some((owner, repo)) => {
+            !owner.is_empty()
+                && !repo.is_empty()
+                && !owner.contains('*')
+                && (repo == "*" || !repo.contains('*'))
+                && !repo.contains('/')
+        }
+        None => false,
+    }
+}
+
 /// Validate a [`CommentWebhookConfig`] before it is persisted. An
 /// empty trigger would match every comment and a zero instruction cap would
 /// refuse every command, so both are rejected rather than stored.
@@ -1168,6 +1186,13 @@ pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> 
     }
     if cfg.max_runs_per_day < 1 {
         return Err("max_runs_per_day must be >= 1".to_string());
+    }
+    for pattern in cfg.triage_branches.keys() {
+        if !is_repo_pattern(pattern) {
+            return Err(format!(
+                "triage_branches key `{pattern}` must be `owner/repo`, `owner/*` or `*`"
+            ));
+        }
     }
     if cfg.enabled {
         validate_enabled_sources(&cfg.sources)?;
@@ -1620,6 +1645,59 @@ mod tests {
         sqlx::query(sql).execute(&pool).await.unwrap();
         assert!(get_raw(&pool, "config.update").await.unwrap().is_none());
         assert!(get_raw(&pool, Section::Mint.key()).await.unwrap().is_some());
+    }
+
+    /// SPEC-4.4.6: the migration renames `auto_fix` in the stored mint and
+    /// webhook documents, keeps each value, leaves a document without the key
+    /// alone, and replaying it changes nothing.
+    #[tokio::test]
+    async fn rename_auto_fix_settings_migration_renames_both_stored_keys() {
+        let pool = pool().await;
+        set_raw(
+            &pool,
+            Section::Mint.key(),
+            r#"{"fallback_project":"FJ","auto_fix":{"enabled":false,"checks_workflows":["ci.yml"]}}"#,
+        )
+        .await
+        .unwrap();
+        set_raw(
+            &pool,
+            Section::Webhook.key(),
+            r#"{"enabled":true,"auto_fix":true,"max_runs_per_day":7}"#,
+        )
+        .await
+        .unwrap();
+        set_raw(&pool, Section::WorkdirGc.key(), r#"{"enabled":true}"#)
+            .await
+            .unwrap();
+        let sql = match crate::db::dialect(&pool) {
+            crate::db::Dialect::Sqlite => {
+                include_str!("../migrations/sqlite/0038_rename_auto_fix_settings.sql")
+            }
+            crate::db::Dialect::Postgres => {
+                include_str!("../migrations/postgres/0019_rename_auto_fix_settings.sql")
+            }
+        };
+        for _ in 0..2 {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+            let mint: MintConfig = get_json(&pool, Section::Mint.key()).await.unwrap().unwrap();
+            assert_eq!(mint.fallback_project, "FJ");
+            assert!(!mint.detect_fixable.enabled);
+            assert_eq!(mint.detect_fixable.checks_workflows, vec!["ci.yml"]);
+            let webhook: WebhookConfig = get_json(&pool, Section::Webhook.key())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(webhook.queue_fix_issues, "the boolean stays a boolean");
+            assert_eq!(webhook.max_runs_per_day, 7);
+            assert_eq!(
+                get_raw(&pool, Section::WorkdirGc.key())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                r#"{"enabled":true}"#
+            );
+        }
     }
 
     #[tokio::test]
@@ -2396,6 +2474,30 @@ mod tests {
             },
         );
         validate_webhook(&cfg).expect("fully-configured source must pass");
+    }
+
+    #[test]
+    fn webhook_triage_branches_keys_must_be_repo_patterns() {
+        for good in ["*", "acme/*", "acme/widgets"] {
+            let mut cfg = WebhookConfig::default();
+            cfg.triage_branches
+                .insert(good.to_string(), vec!["main".to_string()]);
+            validate_webhook(&cfg).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+        for bad in [
+            "acme",
+            "acme/wid*",
+            "*/widgets",
+            "/widgets",
+            "acme/",
+            "a/b/c",
+        ] {
+            let mut cfg = WebhookConfig::default();
+            cfg.triage_branches
+                .insert(bad.to_string(), vec!["main".to_string()]);
+            let err = validate_webhook(&cfg).unwrap_err();
+            assert!(err.contains("triage_branches"), "{bad}: {err}");
+        }
     }
 
     #[test]
