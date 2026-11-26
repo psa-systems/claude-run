@@ -1,6 +1,6 @@
 //! The CI-failure store.
 //!
-//! Implements SPEC-3.5.2.
+//! Implements SPEC-3.5.14 through SPEC-3.5.18.
 //!
 //! The CI-failure redesign dedupes failures by failing-test
 //! overlap and recognises the agent's own PRs from the runner's own records,

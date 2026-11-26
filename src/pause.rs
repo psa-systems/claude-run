@@ -16,7 +16,7 @@
 //! daemon on a transient DB error, which is the worse failure; the log line
 //! always comes first, and no read is collapsed into a bare `unwrap_or`.
 //!
-//! SPEC-3.7: the mid-run pause re-check, TTL-cached and distinct from the
+//! SPEC-3.7.1 through SPEC-3.7.3: the mid-run pause re-check, TTL-cached and distinct from the
 //! scheduler's up-front pause gate, and the exit-code priority (cancel over
 //! pause over login-required over ok) a run resolves to.
 
@@ -34,7 +34,7 @@ use crate::state;
 /// parallel run does not hammer SQLite once per job checkpoint.
 const DEFAULT_TTL: Duration = Duration::from_millis(1500);
 
-/// SPEC-3.7: the TTL-cached mid-run pause re-check, distinct from the
+/// SPEC-3.7.1 through SPEC-3.7.3: the TTL-cached mid-run pause re-check, distinct from the
 /// scheduler's up-front gate.
 ///
 /// Daemon-wide reader of the `global_pause` flag, cheap to clone.
@@ -159,7 +159,7 @@ impl PauseGate {
     }
 }
 
-/// SPEC-3.7 / SPEC-4.1: unifies a global pause and a login-required stop into
+/// SPEC-3.7.1 through SPEC-3.7.3 / SPEC-4.1.1 through SPEC-4.1.4: unifies a global pause and a login-required stop into
 /// one exit-code-priority decision for the run.
 ///
 /// Run-scoped gate handle: the shared [`PauseGate`] plus a record of whether
@@ -232,7 +232,7 @@ impl RunPause {
         self.login_tripped.load(Ordering::SeqCst)
     }
 
-    /// SPEC-3.7 / SPEC-4.1: cancel (130) wins over a global pause
+    /// SPEC-3.7.1 through SPEC-3.7.3 / SPEC-4.1.1 through SPEC-4.1.4: cancel (130) wins over a global pause
     /// (`exit::PAUSED`), which wins over login-required
     /// (`exit::LOGIN_REQUIRED`), which wins over a clean finish.
     ///

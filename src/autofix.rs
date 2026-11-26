@@ -1,10 +1,10 @@
 //! Deterministic auto-fix detector layer.
 //!
-//! Implements SPEC-3.5.1's auto-fix detector step.
+//! Implements SPEC-3.5.8 through SPEC-3.5.13's auto-fix detector step.
 //!
 //! A CI failure with a mechanical signature (today `cargo fmt --check`) is
 //! mechanically fixable: the fix is a known command with no judgement. A failed
-//! workflow with no such signature is never an auto-fix (SPEC-4.4.6); it goes to
+//! workflow with no such signature is never an auto-fix (SPEC-4.4.39 through SPEC-4.4.46); it goes to
 //! the analysis pass. These detectors run inside the hybrid triage as a deterministic
 //! short-circuit BEFORE the LLM classifier (see [`crate::triage::triage`]), so
 //! such a failure never reaches the prompt that would otherwise label a
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::AutoFixConfig;
 use crate::triage::TriageInput;
 
-/// SPEC-3.5.1: a mechanically-fixable CI failure produced by a detector. Flows through the
+/// SPEC-3.5.8 through SPEC-3.5.13: a mechanically-fixable CI failure produced by a detector. Flows through the
 /// [`crate::triage::Triage`] verdict into the mint so the issue summary /
 /// description name the concrete problem and fix instead of the generic
 /// "CI failure" template.
@@ -38,7 +38,7 @@ pub struct AutoFix {
     pub scope: Option<String>,
 }
 
-/// SPEC-3.5.1: run the detectors against a failure, most-specific first, only
+/// SPEC-3.5.8 through SPEC-3.5.13: run the detectors against a failure, most-specific first, only
 /// when the framework is enabled. Returns `None` when disabled or no detector
 /// matches (the caller then falls through to the LLM classifier).
 pub fn detect(input: &TriageInput, cfg: &AutoFixConfig) -> Option<AutoFix> {
@@ -129,7 +129,7 @@ mod tests {
         assert!(detect(&input("ci.yml", log), &cfg()).is_none());
     }
 
-    // ---- SPEC-4.4.6: a failed workflow with no signature is not an auto-fix ----
+    // ---- SPEC-4.4.39 through SPEC-4.4.46: a failed workflow with no signature is not an auto-fix ----
 
     #[test]
     fn a_checks_workflow_failure_without_a_signature_is_not_an_auto_fix() {

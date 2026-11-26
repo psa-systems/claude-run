@@ -1,6 +1,6 @@
 //! Turn a redacted job log into the ids the CI-failure store matches on.
 //!
-//! Implements SPEC-3.5.2's fingerprint.
+//! Implements SPEC-3.5.14 through SPEC-3.5.18's fingerprint.
 //!
 //! Assumes cargo test output is the only format that needs per-test parsing.
 //! A repository whose CI runs something else falls back to
@@ -30,7 +30,7 @@ const TARGETS_FAILED_MARKER: &str = "target failed:";
 const TARGETS_FAILED_MARKER_PLURAL: &str = "targets failed:";
 const TARGET_LINE_MARKER: &str = "--test ";
 
-/// SPEC-3.5.2: a BuildKit progress-line prefix (`#<step> <seconds> `) that
+/// SPEC-3.5.14 through SPEC-3.5.18: a BuildKit progress-line prefix (`#<step> <seconds> `) that
 /// `docker buildx build` interleaves onto every line of a `RUN` step's
 /// output, e.g. `#16 63.58 test needs_host_tools::foo ... FAILED`. Strips it,
 /// if present, so a cargo log is fingerprinted identically whether or not it
@@ -70,7 +70,7 @@ fn is_buildkit_seconds_token(tok: &str) -> bool {
         && frac.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// SPEC-3.5.2: parse cargo test output into sorted, deduplicated
+/// SPEC-3.5.14 through SPEC-3.5.18: parse cargo test output into sorted, deduplicated
 /// `<target>::<test>` ids.
 ///
 /// The target comes from the nearest preceding `Running <path>.rs (...)` line;
@@ -125,7 +125,7 @@ pub fn failing_tests(log: &str) -> Vec<String> {
     ids.into_iter().collect()
 }
 
-/// SPEC-3.5.2: the full fingerprint of a job log: `["infra:<kind>"]` when
+/// SPEC-3.5.14 through SPEC-3.5.18: the full fingerprint of a job log: `["infra:<kind>"]` when
 /// [`infra_failure::detect`] recognises a host condition, else
 /// [`failing_tests`], falling back to the normalized
 /// [`mint::failure_signature`] as a single id when neither parses anything.
@@ -260,7 +260,7 @@ test foo ... FAILED
         assert_eq!(fingerprint("Diff in src/lib.rs:1:\n"), Vec::<String>::new());
     }
 
-    /// SPEC-3.12 item 8: a log with no diagnostic at all is the infrastructure
+    /// SPEC-3.12.9: a log with no diagnostic at all is the infrastructure
     /// `no-diagnostic` kind, keyed branch-agnostically.
     #[test]
     fn a_log_with_no_diagnostic_fingerprints_as_infrastructure() {

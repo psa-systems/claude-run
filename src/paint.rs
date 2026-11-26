@@ -1,4 +1,4 @@
-//! Implements the `--color` half of SPEC-4.1. Shared color palette and
+//! Implements the `--color` half of SPEC-4.1.1 through SPEC-4.1.4. Shared color palette and
 //! helpers for human-facing CLI messages.
 //!
 //! One place for the success / notice / error palette so every CLI message
@@ -18,7 +18,7 @@ pub const ERROR: Style = AnsiColor::Red.on_default().bold();
 /// Emphasis for the value in a neutral key/value line (default fg, bold).
 pub const VALUE: Style = Style::new().bold();
 
-/// SPEC-4.1: "`--color auto|always|never`." Wrap `text` in `style`'s ANSI
+/// SPEC-4.1.1 through SPEC-4.1.4: "`--color auto|always|never`." Wrap `text` in `style`'s ANSI
 /// codes. Always emits codes; rely on `anstream` to strip them when color is
 /// disabled.
 pub fn paint(style: Style, text: &str) -> String {

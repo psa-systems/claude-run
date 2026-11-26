@@ -21,7 +21,7 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 ## Commands
 
 - `just check`: fmt + clippy + build + tests + builder-stage docker compile (the full CI gate). It starts with the CLAUDE.md guard, `just check-claude-md`. `just pre-commit` runs only `check-tree-ownership`; `just pre-push` runs the fmt check inside the builder image via `docker run` plus common's guard scripts, and compiles and tests nothing.
-- CI's exact steps (`.forgejo/workflows/check.yml`): `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build --all-targets`, then `cargo test` twice: once on SQLite, once with `CLAUDE_RUN_TEST_DATABASE_URL=postgres://...` set, switching every fixture to Postgres (one schema per test, `SPEC-5.6`). A DB change must pass both.
+- CI's exact steps (`.forgejo/workflows/check.yml`): `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build --all-targets`, then `cargo test` twice: once on SQLite, once with `CLAUDE_RUN_TEST_DATABASE_URL=postgres://...` set, switching every fixture to Postgres (one schema per test, `SPEC-5.6.1` through `SPEC-5.6.12`). A DB change must pass both.
 - Single test: `cargo test <name_substring>` (e.g. `cargo test shipped_action_queries_are_disjoint`); one module: `cargo test native::youtrack::`. Unit tests live in `src/**` under `mod tests` on the library target; `tests/fixtures/` holds data only.
 - `just run <args>` = `cargo run -- <args>`.
 - Any test that execs a stub script must create it with `testutil::write_stub`, never `fs::write` + `set_permissions` (ETXTBSY race across test threads).
@@ -47,7 +47,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - Builder: rust-builder-musl. Runtime image: FROM opensuse-dev, slim bot CLAUDE.md ([details](docs/conventions/governance.md#runtime-images))
 - Governance `.env.example`, HOST_IP/PORT split and fixed ports do not apply; UI binds `127.0.0.1:7321` ([details](docs/conventions/governance.md#template-env-and-ports-do-not-apply))
 - `actions/SCHEMA.md` is the authoritative action schema; a change updates runner and doc together ([details](docs/conventions/governance.md#action-schema))
-- `docs/specification.md` is normative: code cites `SPEC-<section>`, and every attempt with commits ends with a pushed branch ([details](docs/conventions/specification.md))
+- `docs/specification.md` is normative: code cites `SPEC-<chapter>.<section>.<n>`, and every attempt with commits ends with a pushed branch ([details](docs/conventions/specification.md))
 - A `specification`-branch PR runs only three CI jobs ([details](docs/conventions/specification.md#the-specification-branch-flow))
 
 ### Web UI authentication
@@ -132,8 +132,8 @@ Each line names one rule and links its full text. A new convention adds one inde
 - `logs/` stream logs are bounded by their own age sweep ([details](docs/conventions/retention.md#stream-log-sweep))
 - `daemon.log`, `output.file` and `usage.jsonl` are bounded by SIZE on the same tick ([details](docs/conventions/retention.md#size-bounded-log-files))
 - `snippets/` and `webhook-logs/` are bounded by AGE on the same tick ([details](docs/conventions/retention.md#snippet-and-webhook-log-sweeps))
-- Over `docker_gc.max_bytes`, storage is reclaimed in a fixed order until under it; a run in flight skips the pass ([details](docs/conventions/retention.md#docker-storage-ceiling-reclaim-spec-311))
-- A repo's shared Cargo target cache over `cargo_cache.max_bytes_per_repo` is deleted once no run for that repo is in flight ([details](docs/conventions/retention.md#per-repo-cargo-target-cache-ceiling-spec-310-item-6))
+- Over `docker_gc.max_bytes`, storage is reclaimed in a fixed order until under it; a run in flight skips the pass ([details](docs/conventions/retention.md#docker-storage-ceiling-reclaim-spec-3111-through-spec-3116))
+- A repo's shared Cargo target cache over `cargo_cache.max_bytes_per_repo` is deleted once no run for that repo is in flight ([details](docs/conventions/retention.md#per-repo-cargo-target-cache-ceiling-spec-3107))
 
 ## Phases
 
@@ -155,12 +155,12 @@ Cross-cutting (not a numbered phase): a container runtime (made self-contained) 
 
 ## Working on this repo
 
-- Branch off `develop` per `governance/GIT_WORKFLOW.md`; a person merges `develop` into `main` (`SPEC-11.11`). Run `just pre-push` (or rely on the installed hook) before pushing; `just install-hooks` writes the `pre-commit`, `commit-msg` and `pre-push` stubs; re-run it after a `common` bump to pick up the hook.
+- Branch off `develop` per `governance/GIT_WORKFLOW.md`; a person merges `develop` into `main` (`SPEC-11.3.1`). Run `just pre-push` (or rely on the installed hook) before pushing; `just install-hooks` writes the `pre-commit`, `commit-msg` and `pre-push` stubs; re-run it after a `common` bump to pick up the hook.
 - `just check` mirrors CI's fmt + clippy + build + tests; CI also runs the CLAUDE.md guard as `claude-md`.
 - The task runner is the shared `psa-systems/common` recipe set, vendored as the `common` submodule (`git submodule update --init` after a fresh clone).
   `justfile` configures it through variables (`pre_commit_mode := "docker"` + `dev_image` because there is no `compose.dev.yml`) and overrides only `default`, `check`, and `run`. Prefer setting a common variable over shadowing a shared recipe.
   `default` is redefined locally (as the file's first recipe) because just resolves the default recipe by source order and a top-level definition outranks the imported one, so without it a bare `just` runs whichever local recipe comes first instead of common's `just --list`.
   CI keeps its own `.forgejo/workflows/check.yml` rather than calling common's reusable one, which hardcodes `cargo test --bins`; making that configurable is a limitation of `common`'s reusable workflow. It deviates from governance `CI.md` ("Check runs on every push / PR"):
-  the workflow still runs on every push and PR to `main` and `develop` (`develop` gets the minimal checks, `main` the full ones, `SPEC-11.13`), but common's shared `classify-diff` action (a leading `changes` job and an `if:`, not a workflow-level `paths-ignore`) skips the compile job for a docs-only PR and everything but `cargo fmt --check` for a comment-only one.
+  the workflow still runs on every push and PR to `main` and `develop` (`develop` gets the minimal checks, `main` the full ones, `SPEC-11.3.3`), but common's shared `classify-diff` action (a leading `changes` job and an `if:`, not a workflow-level `paths-ignore`) skips the compile job for a docs-only PR and everything but `cargo fmt --check` for a comment-only one.
 - Daemon smoke-test pattern: `CLAUDE_RUN_*_DIR=/tmp/...` env vars + a stub `claude` on `PATH` (see `src/bin/claude-run.rs`).
 - The legacy `scripts/claude-run.nu` is gone; the Rust binary is the only runner.

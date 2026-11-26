@@ -1,4 +1,4 @@
-//! SPEC-3.8: GC sweepers for the unbounded on-disk trees: preserved and aside
+//! SPEC-3.8.1 through SPEC-3.8.21: GC sweepers for the unbounded on-disk trees: preserved and aside
 //! workdirs ([`sweep`]), per-attempt stream logs ([`sweep_stream_logs`]), the
 //! two size-bounded files under `logs/` ([`sweep_oversized_logs`]), per-job
 //! snippet directories ([`sweep_snippets`]), and redacted webhook CI logs
@@ -18,7 +18,7 @@
 //! `crate::workdir::cleanup_or_preserve_with_token` and from
 //! `crate::native::youtrack`'s set-aside), and [`sweep`] strips it again from
 //! any workdir older than one day regardless of the kept/deleted decision
-//! (`SPEC-3.10` item 5), so a kept workdir no longer holds its multi-GB build
+//! (`SPEC-3.10.6`), so a kept workdir no longer holds its multi-GB build
 //! output for weeks.
 //!
 //! [`sweep`] walks `<base>/*/*` and deletes any directory older than the
@@ -29,7 +29,7 @@
 //! passes. Every deletion is logged with action, key, path, age, and bytes
 //! reclaimed so a sweep is auditable. Independently of that decision, any
 //! workdir older than one day has its `target/` removed in place
-//! (`SPEC-3.10` item 5): a kept workdir's build output does not get to wait
+//! (`SPEC-3.10.6`): a kept workdir's build output does not get to wait
 //! out the full retention window.
 //!
 //! The local-only-work predicate is injected (production passes
@@ -49,7 +49,7 @@ use crate::config::{CargoCacheConfig, DockerGcConfig, StreamLogGcConfig, Workdir
 const SECS_PER_DAY: u64 = 86_400;
 
 /// Age past which [`sweep`] strips a workdir's `target/` regardless of the
-/// kept/deleted decision (`SPEC-3.10` item 5).
+/// kept/deleted decision (`SPEC-3.10.6`).
 const TARGET_REMOVAL_AGE: Duration = Duration::from_secs(SECS_PER_DAY);
 
 /// The daemon's own stdout/stderr file, opened by `detach_now` in
@@ -61,7 +61,7 @@ const DAEMON_LOG: &str = "daemon.log";
 /// over into a second generation.
 const ROTATED_SUFFIX: &str = ".1";
 
-/// SPEC-3.8: tally of one age- or in-use-based sweep pass ([`sweep`],
+/// SPEC-3.8.1 through SPEC-3.8.21: tally of one age- or in-use-based sweep pass ([`sweep`],
 /// [`sweep_stream_logs`], [`sweep_snippets`], [`sweep_webhook_logs`],
 /// [`sweep_docker_volumes`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -72,15 +72,15 @@ pub struct SweepStats {
     pub kept: u64,
     /// Total bytes reclaimed, including whole-directory deletions and the
     /// `target/` removals [`sweep`] performs on a workdir older than one day
-    /// whether or not the workdir itself is kept (`SPEC-3.10` item 5).
+    /// whether or not the workdir itself is kept (`SPEC-3.10.6`).
     pub bytes_reclaimed: u64,
     /// `target/` removals this pass that failed (logged at `error`, never
     /// read as success); a workdir that reported one still finished its
-    /// normal kept/deleted decision (`SPEC-3.10` item 5).
+    /// normal kept/deleted decision (`SPEC-3.10.6`).
     pub target_removal_failed: u64,
 }
 
-/// SPEC-3.8.1: walk `<base>/<source>/<key>` and delete every workdir older
+/// SPEC-3.8.2 through SPEC-3.8.6: walk `<base>/<source>/<key>` and delete every workdir older
 /// than the retention window, keeping workdirs holding local-only work
 /// (unpushed commits, a dirty tree, or a stash) until the longer hard cap.
 ///
@@ -136,7 +136,7 @@ where
             }
             let key_name = key.file_name().to_string_lossy().into_owned();
             let age = dir_age(&path, now);
-            // `SPEC-3.10` item 5: a workdir's `target/` does not get to wait
+            // `SPEC-3.10.6`: a workdir's `target/` does not get to wait
             // out the full retention window just because the workdir itself
             // is kept; strip it from anything older than one day before the
             // kept/deleted decision below, which continues unchanged.
@@ -187,7 +187,7 @@ where
     stats
 }
 
-/// SPEC-3.8.2: walk `<logs_dir>/<action>/streams/*` and delete every file
+/// SPEC-3.8.7 through SPEC-3.8.9: walk `<logs_dir>/<action>/streams/*` and delete every file
 /// older than the retention window.
 ///
 /// `in_flight` is the set of `(action, job_key)` pairs whose job is still
@@ -199,7 +199,7 @@ where
 /// authority, and anything it names is kept regardless of age. [`streams_file_key`]
 /// maps every file shape the runner writes under `streams/` back to its job
 /// key; a file that matches none of those shapes was not written by a run,
-/// logs at `warn` naming it (SPEC-3.8.2), and is swept on age alone.
+/// logs at `warn` naming it (SPEC-3.8.7 through SPEC-3.8.9), and is swept on age alone.
 ///
 /// `now` is injected the same way [`sweep`] injects it, so a test can age a file
 /// by passing a future instant. Per-entry filesystem errors are logged and
@@ -245,7 +245,7 @@ pub fn sweep_stream_logs(
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            // SPEC-3.8.2: a file matching none of the known streams/ shapes is
+            // SPEC-3.8.7 through SPEC-3.8.9: a file matching none of the known streams/ shapes is
             // not something a prior sweep ever skipped on purpose; it is an
             // unswept kind that should be findable, so it is logged here
             // rather than silently aged out like a recognized one.
@@ -298,14 +298,14 @@ pub fn sweep_stream_logs(
 }
 
 /// Content-type suffix recognized under `streams/`, stripped of its optional
-/// SPEC-3.12 item 9 `-retry` sibling marker
+/// SPEC-3.12.10 `-retry` sibling marker
 /// ([`crate::claude::ClaudeInvoker::review_retry_sibling`]) so the job-key
 /// shape underneath can be read from what is left. Covers every kind the
 /// runner writes there: the main attempt log
 /// (`<key>-attempt-<n>.jsonl`, [`crate::claude::ClaudeInvoker::stream_log_path`]),
 /// the post-success review session's own log
 /// (`<key>-attempt-<n>-review.jsonl`, [`crate::claude::ClaudeInvoker::review_stream_log_path`]),
-/// and the SPEC-3.16 item 2 evidence file
+/// and the SPEC-3.16.3 evidence file
 /// (`<key>-attempt-<n>-review-evidence.md`, [`crate::claude::ClaudeInvoker::review_evidence_path`]).
 /// `None` means the name matches none of those shapes. Longer, more specific
 /// suffixes are tried before the plain `.jsonl` one so a review log is not
@@ -335,7 +335,7 @@ fn streams_file_key(file_name: &str) -> Option<String> {
     Some(key.to_string())
 }
 
-/// SPEC-3.8.2: walk `<state_dir>/snippets/<action>/<job_key>/` and delete
+/// SPEC-3.8.7 through SPEC-3.8.9: walk `<state_dir>/snippets/<action>/<job_key>/` and delete
 /// every snippet directory older than `cfg.snippet_retention_days`, keeping
 /// one whose job is still in flight regardless of age.
 ///
@@ -433,7 +433,7 @@ pub fn sweep_snippets(
     stats
 }
 
-/// SPEC-3.8.2: walk the files directly under `<state_dir>/webhook-logs/` and
+/// SPEC-3.8.7 through SPEC-3.8.9: walk the files directly under `<state_dir>/webhook-logs/` and
 /// delete every one older than `cfg.webhook_log_retention_days`.
 ///
 /// Only files DIRECTLY under `webhook-logs/` are considered: `write_artifact`
@@ -495,7 +495,7 @@ pub fn sweep_webhook_logs(dir: &Path, cfg: &StreamLogGcConfig, now: SystemTime) 
     stats
 }
 
-/// SPEC-3.8.3: tally of one [`sweep_oversized_logs`] pass.
+/// SPEC-3.8.10 through SPEC-3.8.13: tally of one [`sweep_oversized_logs`] pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BoundStats {
     /// Files rolled over and truncated back under their ceiling this pass.
@@ -508,7 +508,7 @@ pub struct BoundStats {
     pub bytes_reclaimed: u64,
 }
 
-/// SPEC-3.8.3: bound the append-forever files under `<logs_dir>` by SIZE:
+/// SPEC-3.8.10 through SPEC-3.8.13: bound the append-forever files under `<logs_dir>` by SIZE:
 /// `daemon.log`, `usage.jsonl`, and every `logs/<action>/<output.file>`.
 ///
 /// None is a per-run artifact, so the age window [`sweep_stream_logs`] uses
@@ -689,7 +689,7 @@ fn whole_secs(d: Duration) -> Duration {
     Duration::from_secs(d.as_secs())
 }
 
-/// Remove `<workdir>/target` in place (`SPEC-3.10` item 5), covering a
+/// Remove `<workdir>/target` in place (`SPEC-3.10.6`), covering a
 /// `target/` left behind despite `CARGO_TARGET_DIR` (for example a project
 /// that sets its own `build.target-dir`). Used by [`sweep`] on any workdir
 /// older than one day, by the shared guarded delete
@@ -714,7 +714,7 @@ pub(crate) fn remove_target(action: &str, key: &str, workdir: &Path) -> Option<u
                 key = %key,
                 path = %target.display(),
                 bytes_reclaimed = bytes,
-                "workdir GC: target/ removed from kept workdir (SPEC-3.10 item 5)"
+                "workdir GC: target/ removed from kept workdir (SPEC-3.10.6)"
             );
             Some(bytes)
         }
@@ -771,7 +771,7 @@ fn dir_size_checked(path: &Path) -> std::io::Result<u64> {
 
 // ---- Shared Cargo target directory per-repo ceiling ----------
 
-/// `SPEC-3.10` item 6: walk the immediate subdirectories of `base` (each one
+/// `SPEC-3.10.7`: walk the immediate subdirectories of `base` (each one
 /// a `repo_slug()`-named shared `cargo-target/<repo-slug>` directory) and
 /// delete any directory over `cfg.max_bytes_per_repo` once no run for that
 /// repo is in flight, logged at `warn` with the repo, size, and ceiling. The
@@ -856,12 +856,12 @@ pub fn sweep_cargo_cache(
 
 // ---- Docker sidecar named-volume sweep -----------------------
 
-/// SPEC-3.8.5: name prefix of a buildx state volume. Never removed: it is
+/// SPEC-3.8.17 through SPEC-3.8.21: name prefix of a buildx state volume. Never removed: it is
 /// buildkit's own cache, not a stack artifact, and recreating it is far more
 /// expensive than the disk it costs.
 pub const BUILDX_VOLUME_PREFIX: &str = "buildx_buildkit_";
 
-/// SPEC-3.8.5: one Docker named volume as reported by
+/// SPEC-3.8.17 through SPEC-3.8.21: one Docker named volume as reported by
 /// [`DockerVolumeClient::list_volumes`].
 #[derive(Debug, Clone)]
 pub struct DockerVolume {
@@ -879,7 +879,7 @@ pub struct DockerVolume {
     pub size_bytes: Option<u64>,
 }
 
-/// SPEC-3.8.5: why [`DockerVolumeClient::remove_volume`] failed, so the sweep can log a
+/// SPEC-3.8.17 through SPEC-3.8.21: why [`DockerVolumeClient::remove_volume`] failed, so the sweep can log a
 /// volume Docker refused because it is in use at `info` (routine) and any
 /// other failure at `error` (actionable).
 #[derive(Debug)]
@@ -891,7 +891,7 @@ pub enum VolumeRemoveError {
     Other(String),
 }
 
-/// SPEC-3.11 item 1: the sidecar's total Docker storage usage by category, in
+/// SPEC-3.11.2: the sidecar's total Docker storage usage by category, in
 /// bytes. Read once before a [`reclaim_docker_storage`] pass decides whether
 /// the ceiling is exceeded, and the running total each step's before/after
 /// log is computed from.
@@ -938,7 +938,7 @@ pub struct DockerImage {
     pub in_use: bool,
 }
 
-/// SPEC-3.8.5, SPEC-3.11: talks to the sidecar's Docker daemon on behalf of
+/// SPEC-3.8.17 through SPEC-3.8.21, SPEC-3.11.1 through SPEC-3.11.6: talks to the sidecar's Docker daemon on behalf of
 /// [`sweep_docker_volumes`] and [`reclaim_docker_storage`]. Injected so the decision logic (age,
 /// in-use, buildx-prefix, reclaim order) is testable without a real Docker
 /// daemon; production passes [`CliDockerVolumeClient`].
@@ -951,7 +951,7 @@ pub trait DockerVolumeClient {
     /// of an in-use volume is exactly the safety net this sweep relies on.
     fn remove_volume(&self, name: &str) -> Result<(), VolumeRemoveError>;
 
-    /// SPEC-3.11 item 1: the sidecar's total usage by category. `Err` means
+    /// SPEC-3.11.2: the sidecar's total usage by category. `Err` means
     /// the daemon could not be reached; [`reclaim_docker_storage`] treats that
     /// as "skip this pass, remove nothing" rather than guessing the total is
     /// zero, which would read as always-under-the-ceiling and never reclaim.
@@ -972,7 +972,7 @@ pub trait DockerVolumeClient {
     /// Remove one image by id.
     fn remove_image(&self, id: &str) -> Result<(), String>;
 
-    /// SPEC-3.11: build cache cannot be removed by id with the `docker` CLI
+    /// SPEC-3.11.1 through SPEC-3.11.6: build cache cannot be removed by id with the `docker` CLI
     /// (there is no `docker builder rm <id>`), so this is the one exception
     /// to "remove by explicit id from a listing": it shells out to `docker
     /// builder prune`, scoped to `older_than` with a `--filter until=` so it
@@ -983,7 +983,7 @@ pub trait DockerVolumeClient {
     fn prune_build_cache(&self, older_than: Duration) -> Result<u64, String>;
 }
 
-/// SPEC-3.8.5: production [`DockerVolumeClient`], talking to whichever daemon
+/// SPEC-3.8.17 through SPEC-3.8.21: production [`DockerVolumeClient`], talking to whichever daemon
 /// `DOCKER_HOST` points the `docker` CLI at (the sidecar, in the deployed
 /// container). Never passes `--all` to a list or prune call, which has no age
 /// filter and would remove a volume a session created moments ago.
@@ -1163,7 +1163,7 @@ impl DockerVolumeClient for CliDockerVolumeClient {
             return Err("DOCKER_HOST is not set".to_string());
         }
         let filter = format!("until={}h", older_than.as_secs() / 3600);
-        // SPEC-3.11: the one exception to "remove by explicit id from a
+        // SPEC-3.11.1 through SPEC-3.11.6: the one exception to "remove by explicit id from a
         // listing, never a prune command that needs a force flag" - there is
         // no `docker builder rm <id>`, so the engine's own prune call is the
         // only way to remove build cache at all. The `--filter` bounds its
@@ -1309,7 +1309,7 @@ fn run_docker(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// SPEC-3.8.5: remove every named volume in the sidecar's Docker daemon that
+/// SPEC-3.8.17 through SPEC-3.8.21: remove every named volume in the sidecar's Docker daemon that
 /// no container references and that is older than `cfg.volume_retention_days`,
 /// keeping a `buildx_buildkit_*` state volume regardless of age.
 ///
@@ -1384,9 +1384,9 @@ pub fn sweep_docker_volumes(
     stats
 }
 
-// ---- Docker sidecar storage ceiling (SPEC-3.11) ---------------
+// ---- Docker sidecar storage ceiling (SPEC-3.11.1 through SPEC-3.11.6) ---------------
 
-/// One SPEC-3.11 reclaim step's result, for the "category, bytes reclaimed,
+/// One SPEC-3.11.1 through SPEC-3.11.6 reclaim step's result, for the "category, bytes reclaimed,
 /// size before and after" line each step logs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReclaimStep {
@@ -1430,7 +1430,7 @@ fn record_step(
     *total = after;
 }
 
-/// SPEC-3.11 step 1: stopped containers older than 1 day. Skipped entirely
+/// SPEC-3.11.1 through SPEC-3.11.6 step 1: stopped containers older than 1 day. Skipped entirely
 /// (logged at `error`, zero reclaimed) when the listing cannot be read.
 fn reclaim_stopped_containers(client: &dyn DockerVolumeClient, now: SystemTime) -> u64 {
     let containers = match client.list_stopped_containers() {
@@ -1463,7 +1463,7 @@ fn reclaim_stopped_containers(client: &dyn DockerVolumeClient, now: SystemTime) 
     reclaimed
 }
 
-/// SPEC-3.11 step 2: dangling images, no age filter. An image a running or
+/// SPEC-3.11.1 through SPEC-3.11.6 step 2: dangling images, no age filter. An image a running or
 /// stopped container still references is kept regardless.
 fn reclaim_dangling_images(client: &dyn DockerVolumeClient) -> u64 {
     let images = match client.list_dangling_images() {
@@ -1476,7 +1476,7 @@ fn reclaim_dangling_images(client: &dyn DockerVolumeClient) -> u64 {
     reclaim_images(client, images, None, SystemTime::now())
 }
 
-/// SPEC-3.11 step 4: tagged images no container references, older than 7
+/// SPEC-3.11.1 through SPEC-3.11.6 step 4: tagged images no container references, older than 7
 /// days.
 fn reclaim_unused_images(client: &dyn DockerVolumeClient, now: SystemTime) -> u64 {
     let images = match client.list_unused_images() {
@@ -1526,7 +1526,7 @@ fn reclaim_images(
     reclaimed
 }
 
-/// SPEC-3.11 step 3: build cache older than 7 days, through the one
+/// SPEC-3.11.1 through SPEC-3.11.6 step 3: build cache older than 7 days, through the one
 /// prune-call exception [`DockerVolumeClient::prune_build_cache`] documents.
 fn reclaim_build_cache(client: &dyn DockerVolumeClient) -> u64 {
     match client.prune_build_cache(Duration::from_secs(7 * SECS_PER_DAY)) {
@@ -1544,7 +1544,7 @@ fn reclaim_build_cache(client: &dyn DockerVolumeClient) -> u64 {
     }
 }
 
-/// SPEC-3.11: when the sidecar's total Docker storage exceeds
+/// SPEC-3.11.1 through SPEC-3.11.6: when the sidecar's total Docker storage exceeds
 /// `cfg.max_bytes`, reclaim in order (stopped containers older than 1 day,
 /// dangling images, build cache older than 7 days, unused images older than 7
 /// days, then the existing unreferenced-volume sweep) and stop as soon as the
@@ -1628,10 +1628,10 @@ pub fn reclaim_docker_storage(
     stats
 }
 
-// ---- Docker sidecar storage: manual per-category prune (SPEC-3.11 item 4)
+// ---- Docker sidecar storage: manual per-category prune (SPEC-3.11.5)
 // ----------------------------------------------------------------------------
 
-/// SPEC-3.11 item 4: remove every stopped container with NO age filter, for
+/// SPEC-3.11.5: remove every stopped container with NO age filter, for
 /// an operator-confirmed Status page prune of one category. Unlike
 /// [`reclaim_stopped_containers`], which only removes containers stopped more
 /// than a day ago for the automatic ceiling sweep, a manual prune the
@@ -1660,7 +1660,7 @@ pub fn prune_stopped_containers(client: &dyn DockerVolumeClient) -> Result<u64, 
     Ok(reclaimed)
 }
 
-/// SPEC-3.11 item 4: remove every dangling and unused image with NO age
+/// SPEC-3.11.5: remove every dangling and unused image with NO age
 /// filter, mirroring [`prune_stopped_containers`]'s "whole category, operator
 /// just confirmed it" semantics. An image a running or stopped container
 /// still references is kept regardless, the same guard
@@ -1688,7 +1688,7 @@ pub fn prune_images(client: &dyn DockerVolumeClient) -> Result<u64, String> {
     Ok(reclaimed)
 }
 
-/// SPEC-3.11 item 4: prune ALL build cache (no age filter), through the one
+/// SPEC-3.11.5: prune ALL build cache (no age filter), through the one
 /// prune-call exception [`DockerVolumeClient::prune_build_cache`] documents.
 /// Unlike [`reclaim_build_cache`], a failure here is returned rather than
 /// swallowed to zero, so the Status page can show it.
@@ -1708,7 +1708,7 @@ pub fn prune_build_cache_now(client: &dyn DockerVolumeClient) -> Result<u64, Str
     }
 }
 
-/// SPEC-3.11 item 4: remove every named volume no container references, with
+/// SPEC-3.11.5: remove every named volume no container references, with
 /// NO age filter (a `buildx_buildkit_*` state volume is still kept
 /// regardless, the same as [`sweep_docker_volumes`]). `Err` only when the
 /// listing itself fails; a single volume's remove failure (including Docker's
@@ -1852,7 +1852,7 @@ mod tests {
         assert_eq!(stats, SweepStats::default());
     }
 
-    // ---- SPEC-3.10 item 5: target/ stripped from kept workdirs --------------
+    // ---- SPEC-3.10.6: target/ stripped from kept workdirs --------------
 
     /// Add `<dir>/target/build.o` with `bytes` bytes inside an existing
     /// workdir created by [`make_workdir`].
@@ -2112,7 +2112,7 @@ mod tests {
         assert_eq!(stats, SweepStats::default());
     }
 
-    /// Create the SPEC-3.16 item 2 evidence file, its SPEC-3.12 item 9
+    /// Create the SPEC-3.16.3 evidence file, its SPEC-3.12.10
     /// `-retry` sibling, and the retried review session's own stream log
     /// (`<key>-attempt-<n>-review.jsonl-retry`) for one attempt.
     fn make_review_evidence_and_retry_files(
@@ -2158,7 +2158,7 @@ mod tests {
         assert_eq!(stats.kept, 0);
     }
 
-    /// Acceptance criterion: the SPEC-3.3.2 gate's stored output
+    /// Acceptance criterion: the SPEC-3.3.20 through SPEC-3.3.25 gate's stored output
     /// file is recognized by the same age-based sweep as the review-evidence
     /// file it is named after, both swept once aged and not in flight.
     #[test]
@@ -2674,7 +2674,7 @@ mod tests {
             streams_file_key("PROJ-9-attempt-2-review-evidence.md-retry").as_deref(),
             Some("PROJ-9")
         );
-        // The SPEC-3.3.2 gate's stored output.
+        // The SPEC-3.3.20 through SPEC-3.3.25 gate's stored output.
         assert_eq!(
             streams_file_key("DEMO-9-attempt-2-gate.log").as_deref(),
             Some("DEMO-9")
@@ -2710,7 +2710,7 @@ mod tests {
     /// Fake [`DockerVolumeClient`]: `list` is the fixed set of volumes to
     /// report, `removed` records every name [`remove_volume`] was called
     /// with, and `remove_result` maps a name to the outcome to return (missing
-    /// = success). The SPEC-3.11 fields (`usage`, the three listings, the
+    /// = success). The SPEC-3.11.1 through SPEC-3.11.6 fields (`usage`, the three listings, the
     /// build-cache result) each default to an empty/zero `Ok`, so a test only
     /// sets the ones its scenario needs.
     struct FakeDockerClient {
@@ -2921,7 +2921,7 @@ mod tests {
         assert!(client.removed.lock().unwrap().is_empty());
     }
 
-    // ---- SPEC-3.11 docker storage ceiling reclaim ------------------------
+    // ---- SPEC-3.11.1 through SPEC-3.11.6 docker storage ceiling reclaim ------------------------
 
     fn stopped_container(id: &str, age_days: u64, size: u64) -> StoppedContainer {
         StoppedContainer {
@@ -2960,7 +2960,7 @@ mod tests {
         assert!(!stats.usage_read_failed);
     }
 
-    /// AC: over the ceiling, reclaim runs in the SPEC-3.11 order and stops
+    /// AC: over the ceiling, reclaim runs in the SPEC-3.11.1 through SPEC-3.11.6 order and stops
     /// as soon as the running total is back under the ceiling.
     #[test]
     fn over_ceiling_reclaims_in_order_and_stops_early() {
@@ -3194,7 +3194,7 @@ mod tests {
         assert_eq!(stats.kept, 1);
     }
 
-    // ---- SPEC-3.11 item 4: manual per-category Docker storage prune
+    // ---- SPEC-3.11.5: manual per-category Docker storage prune
     // ----------------------------------------------------------
 
     /// AC: pruning the stopped-containers category removes every stopped

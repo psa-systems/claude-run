@@ -1,6 +1,6 @@
 //! Failure triage engine.
 //!
-//! Implements SPEC-3.5.1 (and the bucket meanings in SPEC-3.5).
+//! Implements SPEC-3.5.8 through SPEC-3.5.13 (and the bucket meanings in SPEC-3.5.1 through SPEC-3.5.18).
 //!
 //! A verified `action_run_failure` event plus its redacted job log
 //! ([`crate::forge_log`]) is sorted into one of three buckets:
@@ -51,7 +51,7 @@ use crate::db::DbPool;
 use crate::error::Result;
 use crate::forge_log::ForgeReads;
 
-/// SPEC-3.5: the triage buckets. Lowercase `snake_case` is the stable wire form
+/// SPEC-3.5.1 through SPEC-3.5.18: the triage buckets. Lowercase `snake_case` is the stable wire form
 /// (used in the classifier reply and any persistence).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,7 +104,7 @@ impl FromStr for TriageBucket {
     }
 }
 
-/// SPEC-3.5.1: which pass produced a [`Triage`].
+/// SPEC-3.5.8 through SPEC-3.5.13: which pass produced a [`Triage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClassifiedBy {
@@ -114,7 +114,7 @@ pub enum ClassifiedBy {
     Llm,
 }
 
-/// SPEC-3.5.1: the typed triage result consumed by the issue-minting subtask.
+/// SPEC-3.5.8 through SPEC-3.5.13: the typed triage result consumed by the issue-minting subtask.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Triage {
     /// The bucket this failure was sorted into.
@@ -162,7 +162,7 @@ impl Triage {
     }
 }
 
-/// SPEC-3.5.1: everything the engine needs about one verified failure: the
+/// SPEC-3.5.8 through SPEC-3.5.13: everything the engine needs about one verified failure: the
 /// metadata from the `action_run_failure` event plus its redacted log.
 #[derive(Debug, Clone)]
 pub struct TriageInput {
@@ -199,7 +199,7 @@ pub struct TriageInput {
     pub log_token: Option<String>,
 }
 
-/// SPEC-3.5.1: infra / transient signatures (lowercased substrings) that mark a bucket-3
+/// SPEC-3.5.8 through SPEC-3.5.13: infra / transient signatures (lowercased substrings) that mark a bucket-3
 /// failure unambiguously enough to skip the LLM. Curated to stay clear of
 /// ordinary test-failure output.
 const TRANSIENT_SIGNATURES: &[&str] = &[
@@ -227,7 +227,7 @@ const TRANSIENT_SIGNATURES: &[&str] = &[
     "dial tcp",
 ];
 
-/// SPEC-3.5.1: deterministic first pass. Returns `Some` only for a clear transient/infra
+/// SPEC-3.5.8 through SPEC-3.5.13: deterministic first pass. Returns `Some` only for a clear transient/infra
 /// failure (bucket 3), so the caller skips the LLM; `None` for everything else,
 /// which the caller hands to the [`FailureClassifier`].
 pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
@@ -270,7 +270,7 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
     // no corrective PR can fix. It mints one grouped, branch-agnostic issue
     // (keyed on the infra kind) for a human instead of vanishing as transient.
     // This runs BEFORE the transient scan so the detector owns its phrases.
-    // SPEC-3.12 item 8: a job killed by its timeout, a container that never
+    // SPEC-3.12.9: a job killed by its timeout, a container that never
     // started, a runner API deadline and a log with no diagnostic are the same
     // kind of runner problem, routed to a human (not an LLM fix attempt).
     if let Some(infra) = crate::infra_failure::detect(&input.log) {
@@ -293,7 +293,7 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
         ));
     }
 
-    // SPEC-3.12 item 8: a log with no test id and no diagnostic is a runner
+    // SPEC-3.12.9: a log with no test id and no diagnostic is a runner
     // problem. After the transient scan so a named transient signature keeps
     // its bucket.
     if let Some(infra) = crate::infra_failure::detect(&input.log) {
@@ -305,7 +305,7 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
     None
 }
 
-/// SPEC-3.5.1: whether `branch` matches one of `prefixes` (case-sensitive, e.g.
+/// SPEC-3.5.8 through SPEC-3.5.13: whether `branch` matches one of `prefixes` (case-sensitive, e.g.
 /// `renovate/`). An empty `branch` (unresolvable) never matches, since there is
 /// nothing to compare a prefix against.
 fn is_bot_owned_branch(branch: &str, prefixes: &[String]) -> bool {
@@ -315,7 +315,7 @@ fn is_bot_owned_branch(branch: &str, prefixes: &[String]) -> bool {
             .any(|p| !p.is_empty() && branch.starts_with(p.as_str()))
 }
 
-/// SPEC-3.5.1: the LLM pass, behind a trait so tests inject a stub and production shells out
+/// SPEC-3.5.8 through SPEC-3.5.13: the LLM pass, behind a trait so tests inject a stub and production shells out
 /// to `claude`. Implementations classify the residue into bucket 1 vs 2 and write
 /// the analysis; they must never panic and should degrade rather than propagate.
 pub trait FailureClassifier: Send + Sync {
@@ -333,7 +333,7 @@ pub trait FailureClassifier: Send + Sync {
     fn classify(&self, input: &TriageInput, spend: &crate::usage::RunSpend) -> Result<Triage>;
 }
 
-/// SPEC-3.5.1: hybrid triage: deterministic rules first, then the deterministic auto-fix
+/// SPEC-3.5.8 through SPEC-3.5.13: hybrid triage: deterministic rules first, then the deterministic auto-fix
 /// detectors, and only then the `classifier` for the residue. A classifier error
 /// degrades to [`TriageBucket::HumanAction`] (a human looks) rather than failing
 /// the pipeline.
@@ -416,14 +416,14 @@ fn extract_last_json_object(s: &str) -> Option<Value> {
     serde_json::from_str(&s[start..=end]).ok()
 }
 
-/// SPEC-3.5.1: the four verdicts [`AnalysisClassifier`]'s prompt asks for, and
+/// SPEC-3.5.8 through SPEC-3.5.13: the four verdicts [`AnalysisClassifier`]'s prompt asks for, and
 /// how each routes.
 const VERDICT_CODE_DEFECT: &str = "code_defect";
 const VERDICT_NEEDS_HUMAN: &str = "needs_human";
 const VERDICT_FLAKY: &str = "flaky";
 const VERDICT_INFRA: &str = "infra";
 
-/// SPEC-3.5.1: parse an [`AnalysisClassifier`] reply into a [`Triage`]. Reads the LAST
+/// SPEC-3.5.8 through SPEC-3.5.13: parse an [`AnalysisClassifier`] reply into a [`Triage`]. Reads the LAST
 /// JSON object in the reply (the fenced verdict [`analysis::build_prompt`]
 /// asks for at the end): `{"verdict": "code_defect"|"needs_human"|"flaky"|
 /// "infra", "failing_tests": [...], "summary": "..."}`. `code_defect` maps to
@@ -469,7 +469,7 @@ pub fn parse_analysis_verdict(reply: &str) -> Triage {
     )
 }
 
-/// SPEC-3.5.1: production [`FailureClassifier`]: one tool-using `claude`
+/// SPEC-3.5.8 through SPEC-3.5.13: production [`FailureClassifier`]: one tool-using `claude`
 /// session per failure, over the COMPLETE log (not the bounded copy the old
 /// classifier used) plus the failing workflow YAML, ending
 /// with a fenced JSON verdict ([`parse_analysis_verdict`]) that routes the
@@ -533,7 +533,7 @@ impl AnalysisClassifier {
     }
 }
 
-/// SPEC-3.5.1: the production classifier session, run over the complete
+/// SPEC-3.5.8 through SPEC-3.5.13: the production classifier session, run over the complete
 /// redacted log plus the failing workflow YAML, ending in the fenced verdict
 /// [`parse_analysis_verdict`] maps into a bucket.
 impl FailureClassifier for AnalysisClassifier {
@@ -647,7 +647,7 @@ impl FailureClassifier for AnalysisClassifier {
             // Cap the child at the caller's remaining per-delivery ceiling.
             Some(spend.remaining_usd()),
             // The CI-failure analysis session reads a log, not a repo
-            // workdir (SPEC-3.10 scopes the shared cache to those).
+            // workdir (SPEC-3.10.1 through SPEC-3.10.11 scopes the shared cache to those).
             None,
         )?;
         // Fold this call's tokens and cost into the caller's own
@@ -1058,7 +1058,7 @@ mod tests {
 
     #[test]
     fn check_yml_failure_without_a_signature_goes_to_the_classifier() {
-        // SPEC-4.4.6: a listed checks workflow failing with no mechanical
+        // SPEC-4.4.39 through SPEC-4.4.46: a listed checks workflow failing with no mechanical
         // signature is not an auto-fix, with or without an open PR; the
         // classifier decides.
         let log = "##[group]Clippy\nerror: unused variable\n##[error]the step has failed\n";

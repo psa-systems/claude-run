@@ -22,7 +22,7 @@
 //! spend grows linearly. `context_per_tool_call` is that ratio, and it is what
 //! the per-run record makes comparable across runs.
 //!
-//! SPEC-3.2.2 (the per-run spend ceiling) and SPEC-3.2.7 (usage, cost and
+//! SPEC-3.2.3 (the per-run spend ceiling) and SPEC-3.2.10 (usage, cost and
 //! rate-limit accounting) are both implemented here.
 
 use std::collections::{BTreeMap, HashMap};
@@ -97,7 +97,7 @@ pub struct ToolUsage {
 
 /// What one `claude` invocation spent, recovered from its stream log.
 ///
-/// SPEC-3.2.7: "tokens, tool-call counts and context growth per tool" and
+/// SPEC-3.2.10: "tokens, tool-call counts and context growth per tool" and
 /// "the last-seen Claude plan rate-limit reading ... plus a count of
 /// `api_retry` events per reason."
 #[derive(Debug, Clone, Default, Serialize)]
@@ -125,7 +125,7 @@ pub struct StreamUsage {
 /// `rate_limit_event` stream events. Every field is `Option`: an absent field
 /// means the event did not carry it, and must never be read as zero or
 /// "allowed" by default.
-/// SPEC-3.2.7: "every rate-limit field stays absent rather than defaulting
+/// SPEC-3.2.10: "every rate-limit field stays absent rather than defaulting
 /// to zero when the CLI reported none."
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct RateLimitSnapshot {
@@ -226,7 +226,7 @@ impl StreamUsage {
 /// absent log yields an empty [`StreamUsage`]; usage accounting must never turn
 /// a completed run into a failed one.
 ///
-/// SPEC-3.2.7: "each invocation's stream log is replayed once to attribute
+/// SPEC-3.2.10: "each invocation's stream log is replayed once to attribute
 /// tokens, tool-call counts and context growth per tool (a turn is
 /// attributed to the tool whose result most recently entered its context)."
 pub fn parse_stream_usage(stream_log: &Path) -> StreamUsage {
@@ -362,7 +362,7 @@ fn parse_rate_limit_event(event: &Value) -> RateLimitSnapshot {
 
 /// A run's spend ceiling, frozen before the run starts.
 ///
-/// SPEC-3.2.2: "the ledger's ceiling is resolved once, before the run
+/// SPEC-3.2.3: "the ledger's ceiling is resolved once, before the run
 /// starts, and is immutable for the run's lifetime: no job can raise it
 /// mid-run."
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -482,7 +482,7 @@ impl RunSpend {
     /// Fold one completed invocation into the run's ledger and report where the
     /// run now stands against its ceiling.
     ///
-    /// SPEC-3.2.2: "each invocation's reported cost is folded into the run's
+    /// SPEC-3.2.3: "each invocation's reported cost is folded into the run's
     /// shared ledger before any other branch can discard the result,
     /// including a cancelled invocation, so a cancelled run still bills what
     /// it actually spent."
@@ -531,7 +531,7 @@ impl RunSpend {
     /// would otherwise have finished cleanly, so a cancel still reads as a
     /// cancel.
     ///
-    /// SPEC-3.2.2: "the run stops" once the ceiling is reached; this is
+    /// SPEC-3.2.3: "the run stops" once the ceiling is reached; this is
     /// where that exit is surfaced, without overriding an already-non-OK
     /// base outcome.
     pub fn exit_code(&self, base: i32) -> i32 {
@@ -549,9 +549,9 @@ impl RunSpend {
     /// Emit the end-of-run summary and append the machine-readable record.
     /// Idempotent: a driver that finishes twice reports once.
     ///
-    /// SPEC-3.2: "each run appends one JSON record ... and each invocation
+    /// SPEC-3.2.1 through SPEC-3.2.13: "each run appends one JSON record ... and each invocation
     /// is recorded in `claude_invocations`" (closing sentence); see also
-    /// SPEC-3.2.7 for the per-tool and rate-limit figures this record
+    /// SPEC-3.2.10 for the per-tool and rate-limit figures this record
     /// carries, and [`record_invocation`] for the per-invocation half.
     pub fn finish(&self, run_id: Option<i64>, exit_code: i32) {
         let (usage, calls, cost) = {
@@ -662,7 +662,7 @@ fn append_record(path: &Path, record: &Value) {
 /// happened and its own outcome must not be lost because the usage record
 /// could not be saved.
 ///
-/// SPEC-3.2.7: "each invocation is also persisted to `claude_invocations`
+/// SPEC-3.2.10: "each invocation is also persisted to `claude_invocations`
 /// ... immediately after it returns, independent of the outcome ... a
 /// persistence failure is logged and never fails the job."
 pub async fn record_invocation(

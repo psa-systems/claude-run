@@ -1,4 +1,4 @@
-//! Implements SPEC-4.3.4. Structured editors for the native action kinds
+//! Implements SPEC-4.3.13 through SPEC-4.3.18. Structured editors for the native action kinds
 //! other than `youtrack`: `closed-issue-summary`.
 //!
 //! Same shape as the YouTrack editor in the parent module: a route pair
@@ -116,7 +116,7 @@ fn parse_opt_f64(label: &str, raw: &str) -> Result<Option<f64>, String> {
 
 // ---- blocks shared by every kind ------------------------------------------
 
-/// SPEC-4.3.4: the generic `Action` blocks every structured editor surfaces:
+/// SPEC-4.3.13 through SPEC-4.3.18: the generic `Action` blocks every structured editor surfaces:
 /// identity, `workdir_base`, `link_template`, `schedule`, `claude`, `output`, and
 /// `limits`. A kind that runs no agent session (`closed-issue-summary`) renders
 /// no claude fields and passes `with_claude: false` so a hand-written block is
@@ -228,7 +228,7 @@ impl CommonForm {
     }
 }
 
-/// SPEC-4.3.4: "An edit overlays only the fields the form owns onto the
+/// SPEC-4.3.13 through SPEC-4.3.18: "An edit overlays only the fields the form owns onto the
 /// existing YAML mapping ... every other key in the file is untouched." Also
 /// rejects an unrecognized `schedule_kind` rather than silently ignoring it.
 fn apply_common(
@@ -316,7 +316,7 @@ fn apply_common(
     Ok(())
 }
 
-/// SPEC-4.3.4: backing form for `kind: closed-issue-summary`.
+/// SPEC-4.3.13 through SPEC-4.3.18: backing form for `kind: closed-issue-summary`.
 #[derive(Debug, Clone, Default)]
 pub struct ClosedIssueSummaryForm {
     pub common: CommonForm,
@@ -376,7 +376,7 @@ impl ClosedIssueSummaryForm {
     }
 }
 
-/// SPEC-4.3.4: prefill from a loaded action, or `None` when it is not a
+/// SPEC-4.3.13 through SPEC-4.3.18: prefill from a loaded action, or `None` when it is not a
 /// `closed-issue-summary`.
 pub fn action_to_closed_issue_summary_form(a: &Action) -> Option<ClosedIssueSummaryForm> {
     let NativeConfig::ClosedIssueSummary(c) = a.native.as_ref()? else {
@@ -399,7 +399,7 @@ pub fn action_to_closed_issue_summary_form(a: &Action) -> Option<ClosedIssueSumm
     })
 }
 
-/// SPEC-4.3.4: "A cleared text field whose config key has a documented
+/// SPEC-4.3.13 through SPEC-4.3.18: "A cleared text field whose config key has a documented
 /// default ... is written back as that default rather than as an empty
 /// string; a cleared field with no default ... removes the key instead."
 pub fn closed_issue_summary_form_to_yaml(
@@ -491,7 +491,7 @@ enum Saved {
     Rejected(String),
 }
 
-/// SPEC-4.3.4: "Every submitted form is serialized to YAML and run through the
+/// SPEC-4.3.13 through SPEC-4.3.18: "Every submitted form is serialized to YAML and run through the
 /// same `validate_str` + write + re-index path the raw editor uses ... so a
 /// structured save can never write a file the raw editor would reject."
 async fn write_existing(s: &WebState, path: &str, yaml: &str) -> Result<Saved, WebError> {
@@ -508,7 +508,7 @@ async fn write_existing(s: &WebState, path: &str, yaml: &str) -> Result<Saved, W
     ))
 }
 
-/// SPEC-4.3.4: "the destination filename is derived from the posted name via
+/// SPEC-4.3.13 through SPEC-4.3.18: "the destination filename is derived from the posted name via
 /// `safe_action_stem` ... and a save is rejected if that file already exists,
 /// rather than silently overwritten." Same checks and write path as
 /// `action_create`.
@@ -542,7 +542,7 @@ async fn write_new(s: &WebState, yaml: &str) -> Result<Saved, WebError> {
 
 // ---- closed-issue-summary handlers ----------------------------------------
 
-/// SPEC-4.3.4: renders the structured editor, re-rendering inline with
+/// SPEC-4.3.13 through SPEC-4.3.18: renders the structured editor, re-rendering inline with
 /// `error` on a rejected save instead of discarding the submission.
 async fn render_closed_issue_summary(
     s: &WebState,
@@ -564,7 +564,7 @@ async fn render_closed_issue_summary(
     Ok((status, Html(tpl.render().map_err(WebError::from)?)).into_response())
 }
 
-/// SPEC-4.3.4: `GET /actions/new/closed-issue-summary`, the structured
+/// SPEC-4.3.13 through SPEC-4.3.18: `GET /actions/new/closed-issue-summary`, the structured
 /// create form.
 pub(super) async fn closed_issue_summary_new_page(
     State(s): State<WebState>,
@@ -579,7 +579,7 @@ pub(super) async fn closed_issue_summary_new_page(
     .await
 }
 
-/// SPEC-4.3.4: `POST /actions/new/closed-issue-summary`, the structured
+/// SPEC-4.3.13 through SPEC-4.3.18: `POST /actions/new/closed-issue-summary`, the structured
 /// create save.
 pub(super) async fn closed_issue_summary_create(
     State(s): State<WebState>,
@@ -613,7 +613,7 @@ pub(super) async fn closed_issue_summary_create(
     }
 }
 
-/// SPEC-4.3.4: `GET /actions/{name}/form`, the structured editor's edit page,
+/// SPEC-4.3.13 through SPEC-4.3.18: `GET /actions/{name}/form`, the structured editor's edit page,
 /// for a `closed-issue-summary` action.
 pub(super) async fn closed_issue_summary_edit_page(
     s: &WebState,
@@ -626,7 +626,7 @@ pub(super) async fn closed_issue_summary_edit_page(
     render_closed_issue_summary(s, StatusCode::OK, Some(name), form, None).await
 }
 
-/// SPEC-4.3.4: `POST /actions/{name}/form`, the structured editor's edit
+/// SPEC-4.3.13 through SPEC-4.3.18: `POST /actions/{name}/form`, the structured editor's edit
 /// save. "If the on-disk YAML for an edited action fails to parse, the save
 /// is rejected with a message pointing at the raw editor rather than
 /// silently treated as an empty mapping."
@@ -690,7 +690,7 @@ pub(super) async fn closed_issue_summary_edit_save(
 
 // ---- edit dispatch --------------------------------------------------------
 
-/// SPEC-4.3.4: "A kind with a structured editor ... is edited through
+/// SPEC-4.3.13 through SPEC-4.3.18: "A kind with a structured editor ... is edited through
 /// `GET /actions/{name}/form` ... a kind with no structured editor (e.g.
 /// `scripted`) redirects to the raw editor instead of 404ing."
 pub(super) async fn edit_page_for_kind(
@@ -706,7 +706,7 @@ pub(super) async fn edit_page_for_kind(
     }
 }
 
-/// SPEC-4.3.4: dispatches `POST /actions/{name}/form` to the structured
+/// SPEC-4.3.13 through SPEC-4.3.18: dispatches `POST /actions/{name}/form` to the structured
 /// editor matching the action's native kind, or redirects to the raw editor.
 pub(super) async fn edit_save_for_kind(
     s: &WebState,
@@ -736,7 +736,7 @@ pub(super) enum IndexedAction {
     Loaded(String, Box<Action>),
 }
 
-/// SPEC-4.3.4: resolves an indexed action to its file path and parsed form,
+/// SPEC-4.3.13 through SPEC-4.3.18: resolves an indexed action to its file path and parsed form,
 /// distinguishing "no structured editor" (`NotIndexed`) from "file no longer
 /// parses" (`Invalid`),.
 pub(super) async fn indexed_action(s: &WebState, name: &str) -> Result<IndexedAction, WebError> {

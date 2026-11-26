@@ -1,12 +1,12 @@
-//! SPEC-3.14: step timing. An attempt is stored as a sequence of timed
+//! SPEC-3.14.1 through SPEC-3.14.9: step timing. An attempt is stored as a sequence of timed
 //! `attempt_steps` rows (`migrations/{sqlite,postgres}/00{30,11}_attempt_steps.sql`)
 //! instead of being summarized by one `job_outcomes.duration_ms`.
 //!
 //! [`StepRecorder`] times the runner-owned steps directly; [`derive_claude_steps`]
 //! and [`classify_bash_command`] derive the `coding` / `check` / `build` steps
-//! from a `claude` invocation's stream log after the attempt (SPEC-3.14 item 4).
+//! from a `claude` invocation's stream log after the attempt (SPEC-3.14.5).
 //! Every gap the recorder never saw a step for is written back as its own
-//! `kind = "other", label = "unaccounted"` row (SPEC-3.14 item 6), so
+//! `kind = "other", label = "unaccounted"` row (SPEC-3.14.7), so
 //! `SUM(ended_at - started_at)` over an attempt's rows always equals its wall
 //! time; the remainder is never a separate, driftable column.
 
@@ -16,7 +16,7 @@ use tracing::error;
 use crate::db::DbPool;
 use crate::error::Result;
 
-/// SPEC-3.14 item 2: the closed set of step kinds.
+/// SPEC-3.14.3: the closed set of step kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
     Clone,
@@ -58,7 +58,7 @@ impl StepKind {
     }
 }
 
-/// SPEC-3.14 item 1: the stage an attempt belongs to, from its 1-based attempt
+/// SPEC-3.14.2: the stage an attempt belongs to, from its 1-based attempt
 /// number. `ci-remediation`, `conflict-resolution`, `review` and `final` are
 /// set by their own paths, never derived from a count.
 pub fn stage_for_attempt(attempt: u32) -> &'static str {
@@ -69,15 +69,15 @@ pub fn stage_for_attempt(attempt: u32) -> &'static str {
     }
 }
 
-/// SPEC-3.14 item 7: the closed set of attempt outcomes stored in
-/// `job_outcomes.outcome`, each a row of the SPEC-3.12 table folded to what a
+/// SPEC-3.14.8: the closed set of attempt outcomes stored in
+/// `job_outcomes.outcome`, each a row of the SPEC-3.12.1 through SPEC-3.12.10 table folded to what a
 /// funnel needs. `Queued` is the only non-terminal value: the issue goes back
 /// for another attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// A non-tracker job (scripted action, comment or triage run) succeeded.
     Success,
-    /// The PR is open for review (SPEC-3.12 "Code Review").
+    /// The PR is open for review (SPEC-3.12.1 through SPEC-3.12.10 "Code Review").
     CodeReview,
     /// The `.claude-run-no-code-change` marker.
     NoCodeChange,
@@ -139,11 +139,11 @@ pub struct ClaudeStep {
     pub detail: Option<&'static str>,
 }
 
-/// SPEC-3.14 item 5: the `detail` of a check row whose recipe printed no
+/// SPEC-3.14.6: the `detail` of a check row whose recipe printed no
 /// observable, timed stage boundary, so Reports lists its sub-steps as unknown.
 pub const SUBSTEPS_UNKNOWN: &str = "sub-steps unknown";
 
-/// SPEC-3.14 item 5: classify one output line as a recipe stage banner. The
+/// SPEC-3.14.6: classify one output line as a recipe stage banner. The
 /// shared recipes print `[<recipe>] <command>` before each stage (for example
 /// `[pre-commit] cargo clippy --all-targets`); the stage is named by the
 /// cargo subcommand. `Some(None)` is a banner that is not a timed stage (such
@@ -198,7 +198,7 @@ pub struct StageSpan {
     pub end: DateTime<Utc>,
 }
 
-/// SPEC-3.14 item 5: the timed stage spans in `lines`. A stage runs from its
+/// SPEC-3.14.6: the timed stage spans in `lines`. A stage runs from its
 /// banner to the next banner (stage or not), or to `end` for the last one.
 /// Only a banner with an arrival time is a boundary: an untimed banner proves
 /// the stage exists but not how long it took, so it yields no span.
@@ -222,7 +222,7 @@ pub fn stage_spans(lines: &[TimedLine], end: DateTime<Utc>) -> Vec<StageSpan> {
     out
 }
 
-/// SPEC-3.14 items 5 and 6: tile the check span `[start, end]` with its stage
+/// SPEC-3.14.6 and SPEC-3.14.7: tile the check span `[start, end]` with its stage
 /// spans, filling every gap (the prologue, a non-stage banner, the tail) with a
 /// row labelled `parent`, so the rows still sum to the check's own duration.
 /// With no stage spans the result is the single `parent` row, which the caller
@@ -252,7 +252,7 @@ pub fn tile_check(
     rows
 }
 
-/// A verification-gate run's timing (SPEC-3.3.2, SPEC-3.14).
+/// A verification-gate run's timing (SPEC-3.3.20 through SPEC-3.3.25, SPEC-3.14.1 through SPEC-3.14.9).
 #[derive(Debug, Clone)]
 pub struct GateTiming {
     pub command: &'static str,
@@ -263,7 +263,7 @@ pub struct GateTiming {
 }
 
 /// One finished runner-owned step, handed from the synchronous `finalize` to
-/// the attempt's recorder the moment it ends (SPEC-3.14 item 3).
+/// the attempt's recorder the moment it ends (SPEC-3.14.4).
 #[derive(Debug, Clone)]
 pub struct StepSpan {
     pub kind: StepKind,
@@ -277,7 +277,7 @@ pub struct StepSpan {
 /// Where `finalize` reports each runner-owned step as it ends.
 pub type StepSink<'a> = &'a dyn Fn(Vec<StepSpan>);
 
-/// SPEC-3.14 items 3 and 5: the rows one gate run stores. The whole span is one
+/// SPEC-3.14.4 and SPEC-3.14.6: the rows one gate run stores. The whole span is one
 /// `gate` row when no stage boundary was timed (flagged [`SUBSTEPS_UNKNOWN`]),
 /// else `check` rows per stage with `gate` rows for the gaps.
 pub fn gate_spans(g: &GateTiming) -> Vec<StepSpan> {
@@ -345,7 +345,7 @@ pub fn drain_stashed_spans(key: &str, steps: StepSink<'_>) -> Option<DateTime<Ut
 }
 
 impl<'a> StepRecorder<'a> {
-    /// Record a batch of finished steps (SPEC-3.14 item 3).
+    /// Record a batch of finished steps (SPEC-3.14.4).
     pub async fn record_spans(&mut self, stage: &str, spans: &[StepSpan]) {
         for s in spans {
             self.record(stage, s.kind, s.label, s.start, s.end, s.ok, s.detail)
@@ -353,13 +353,13 @@ impl<'a> StepRecorder<'a> {
         }
     }
 
-    /// Record one verification-gate run (SPEC-3.14 items 3 and 5).
+    /// Record one verification-gate run (SPEC-3.14.4 and SPEC-3.14.6).
     pub async fn record_gate(&mut self, stage: &str, g: &GateTiming) {
         self.record_spans(stage, &gate_spans(g)).await;
     }
 }
 
-/// SPEC-3.14 item 3: the env var through which the runner tells a `claude`
+/// SPEC-3.14.4: the env var through which the runner tells a `claude`
 /// child (and so the `test-postgres` process it runs) where to append the
 /// `postgres_start` / `postgres_healthy` spans only that process can time.
 pub const STEP_SPANS_FILE_ENV: &str = "CLAUDE_RUN_STEP_SPANS_FILE";
@@ -409,7 +409,7 @@ pub fn append_file_step(path: &std::path::Path, step: &FileStep) -> std::io::Res
 
 /// Read the span file for a stream log. A missing file is no spans (no
 /// `test-postgres` ran); an unreadable or malformed one is an error naming the
-/// line, never a silently short list (SPEC-3.14 item 8).
+/// line, never a silently short list (SPEC-3.14.9).
 pub fn read_file_steps(path: &std::path::Path) -> std::io::Result<Vec<FileStep>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -451,7 +451,7 @@ pub fn read_file_steps(path: &std::path::Path) -> std::io::Result<Vec<FileStep>>
     Ok(out)
 }
 
-/// SPEC-3.14 item 6: trim `steps` so none overlaps another or a hole (parallel
+/// SPEC-3.14.7: trim `steps` so none overlaps another or a hole (parallel
 /// `test-postgres` runs, a checkpoint push), keeping every instant counted
 /// once. A step a hole splits keeps both pieces; a step it covers is dropped.
 pub fn disjoint_file_steps(
@@ -498,7 +498,7 @@ fn fmt_ts(ts: DateTime<Utc>) -> String {
 }
 
 /// Records one attempt's steps as they happen, then fills the remainder.
-/// SPEC-3.14.
+/// SPEC-3.14.1 through SPEC-3.14.9.
 pub struct StepRecorder<'a> {
     pool: &'a DbPool,
     run_id: i64,
@@ -507,7 +507,7 @@ pub struct StepRecorder<'a> {
     attempt: i64,
     seq: i64,
     spans: Vec<(DateTime<Utc>, DateTime<Utc>)>,
-    /// Set once any step write fails. SPEC-3.14 item 8.
+    /// Set once any step write fails. SPEC-3.14.9.
     incomplete: bool,
 }
 
@@ -533,7 +533,7 @@ impl<'a> StepRecorder<'a> {
 
     /// Records one step. A write failure is logged at `error` with the issue
     /// key and the step, and marks the attempt "step data incomplete"
-    /// (SPEC-3.14 item 8) rather than aborting the attempt.
+    /// (SPEC-3.14.9) rather than aborting the attempt.
     #[allow(clippy::too_many_arguments)]
     pub async fn record(
         &mut self,
@@ -611,11 +611,11 @@ impl<'a> StepRecorder<'a> {
         }
     }
 
-    /// SPEC-3.14 item 6: fills every gap between recorded spans (and before
+    /// SPEC-3.14.7: fills every gap between recorded spans (and before
     /// the first / after the last) with its own `other`/`unaccounted` row, so
     /// the attempt's steps plus this remainder always equal its wall time.
     /// Call once, after the last `record`. Returns whether any step write
-    /// failed (SPEC-3.14 item 8), so the caller can mark the attempt "step
+    /// failed (SPEC-3.14.9), so the caller can mark the attempt "step
     /// data incomplete".
     pub async fn finish(
         &mut self,
@@ -701,7 +701,7 @@ async fn insert_step(
     Ok(())
 }
 
-/// SPEC-3.14 item 6: remove `holes` (steps recorded while `claude` ran, such as
+/// SPEC-3.14.7: remove `holes` (steps recorded while `claude` ran, such as
 /// a checkpoint push) from derived steps so no instant is counted twice. A
 /// step a hole splits keeps both pieces; a step a hole covers is dropped.
 pub fn carve_steps(
@@ -740,12 +740,12 @@ pub fn carve_steps(
     out
 }
 
-/// SPEC-3.14 item 4: classify a Bash tool call by its command text alone.
+/// SPEC-3.14.5: classify a Bash tool call by its command text alone.
 /// Word-exact matching (not substring) so `git checkout` never matches
 /// `check` and `unchecked_foo.sh` never matches `check`. A repo's own
 /// pre-commit / pre-push / check / verify recipe wins over a generic build or
 /// ad-hoc test/lint command; anything unmatched is `other`, never silently
-/// `coding` (SPEC-3.14 item 4: "A command that matches no rule is `other`").
+/// `coding` (SPEC-3.14.5: "A command that matches no rule is `other`").
 pub fn classify_bash_command(cmd: &str) -> (StepKind, &'static str) {
     let lower = cmd.to_lowercase();
     let words: Vec<&str> = lower
@@ -779,7 +779,7 @@ pub fn classify_bash_command(cmd: &str) -> (StepKind, &'static str) {
     (StepKind::Other, "other")
 }
 
-/// SPEC-3.14 item 4: derive the `coding` / `check` / `build` / `other` steps
+/// SPEC-3.14.5: derive the `coding` / `check` / `build` / `other` steps
 /// for one `claude.invoke` call from its stream log. The time between
 /// recognized Bash tool calls is `coding`; a Bash call's own span runs from
 /// the `ts` of the `tool_use` line to the `ts` of the next stream-log line
@@ -900,7 +900,7 @@ pub fn derive_claude_steps(
         let (kind, label) = classify_bash_command(cmd);
         if end > start {
             if kind == StepKind::Check {
-                // SPEC-3.14 item 5: the result arrives on the next line; its
+                // SPEC-3.14.6: the result arrives on the next line; its
                 // text names the recipe's stages and, when timed, their spans.
                 let lines = events
                     .get(i + 1)
@@ -1114,7 +1114,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.14 item 6: an attempt's recorded steps plus the filled
+    /// SPEC-3.14.7: an attempt's recorded steps plus the filled
     /// remainder always equal its wall time, on whichever backend
     /// `CLAUDE_RUN_TEST_DATABASE_URL` selects (SQLite when unset, Postgres
     /// when set; CI runs this module's tests both ways).
@@ -1323,8 +1323,8 @@ mod tests {
         );
     }
 
-    /// SPEC-3.14 item 3: `push`, `pr_create` and `gate` spans are
-    /// stored as they end, so the SPEC-3.15 list built for the next comment
+    /// SPEC-3.14.4: `push`, `pr_create` and `gate` spans are
+    /// stored as they end, so the SPEC-3.15.1 through SPEC-3.15.8 list built for the next comment
     /// of the same attempt already includes them.
     #[tokio::test]
     async fn push_pr_create_and_gate_spans_are_stored_for_the_next_comments_list() {
@@ -1437,7 +1437,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.14 item 3: a `conflict_resolution` span stashed by the
+    /// SPEC-3.14.4: a `conflict_resolution` span stashed by the
     /// resolver and the gate span after it reach the sink in order, and the
     /// latest end is returned so the caller's next step starts after them.
     #[test]
@@ -1480,7 +1480,7 @@ mod tests {
         assert_eq!(drain_stashed_spans("T-DRAIN", &sink), None);
     }
 
-    /// SPEC-3.14 item 3: the span file round-trips, a missing file
+    /// SPEC-3.14.4: the span file round-trips, a missing file
     /// is no spans, and a malformed line is an error, not a short list.
     #[test]
     fn step_span_file_round_trips_and_rejects_malformed_lines() {
@@ -1517,7 +1517,7 @@ mod tests {
         assert!(err.to_string().contains("line 1"), "{err}");
     }
 
-    /// SPEC-3.14 item 6: overlapping child-reported steps and a hole never
+    /// SPEC-3.14.7: overlapping child-reported steps and a hole never
     /// count an instant twice.
     #[test]
     fn overlapping_file_steps_are_trimmed_to_disjoint_spans() {

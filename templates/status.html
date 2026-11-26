@@ -53,7 +53,7 @@
   </div>
 </div>
 
-{# SPEC-3.17 item 11: shown only with peering enabled. State is `reachable` or
+{# SPEC-3.17.12: shown only with peering enabled. State is `reachable` or
    `unknown`, never "dead": a partition and a crash look the same from here. #}
 {% if let Some(rows) = peers %}
 <h2>Peers</h2>
@@ -92,7 +92,7 @@
 </div>
 {% endif %}
 
-{# SPEC-3.10 items 9 and 10: the shared Cargo target directories, one row per
+{# SPEC-3.10.10 and SPEC-3.10.11: the shared Cargo target directories, one row per
    repo, each with its size, last-used time and whether a run for that repo is
    in flight. The table itself is slow to compute (a full recursive size of
    every repo's build cache), so this card renders a loading state and the
@@ -103,7 +103,7 @@
   <span class="dim">Loading disk usage...</span>
 </div>
 
-{# SPEC-3.11 item 4: the sidecar Docker storage categories, one row per
+{# SPEC-3.11.5: the sidecar Docker storage categories, one row per
    category, each with its size (or "unknown" plus the error when the usage
    read failed) and a Prune button. The "run in flight" warning comes from a
    cheap read (`docker_run_in_flight`) and renders immediately; the table

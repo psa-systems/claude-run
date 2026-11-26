@@ -1,4 +1,4 @@
-//! SPEC-3.8.4: age-based retention prune for the unbounded history tables.
+//! SPEC-3.8.14 through SPEC-3.8.16: age-based retention prune for the unbounded history tables.
 //!
 //! `job_outcomes` (and `run_events`) grow without bound: every
 //! job outcome and every poll-phase diagnostic is appended and nothing ever
@@ -22,7 +22,7 @@ use chrono::{DateTime, Duration, Utc};
 use crate::config::DbRetentionConfig;
 use crate::error::Result;
 
-/// SPEC-3.8.4: one history table pruned by the retention sweep: its name and
+/// SPEC-3.8.14 through SPEC-3.8.16: one history table pruned by the retention sweep: its name and
 /// the RFC3339 `ts` column the cutoff compares against. Both are compile-time
 /// `&'static str` constants drawn only from [`RETENTION_TABLES`] (never user
 /// input), so interpolating them into the DELETE statement carries no
@@ -35,7 +35,7 @@ pub struct RetentionTable {
     pub ts_col: &'static str,
 }
 
-/// SPEC-3.8.4: the tables the daemon retention sweep prunes. `job_outcomes` is the driver;
+/// SPEC-3.8.14 through SPEC-3.8.16: the tables the daemon retention sweep prunes. `job_outcomes` is the driver;
 /// `run_events` joins the same list, each with its
 /// own single-column `ts` index (`idx_job_outcomes_ts` from migration 0017,
 /// `idx_run_events_ts` from migration 0018) so both share this exact helper,
@@ -68,14 +68,14 @@ pub const RETENTION_TABLES: &[RetentionTable] = &[
     },
 ];
 
-/// SPEC-3.8.4: tally of one [`sweep`] pass.
+/// SPEC-3.8.14 through SPEC-3.8.16: tally of one [`sweep`] pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RetentionStats {
     /// Rows deleted across every pruned table this pass.
     pub deleted: u64,
 }
 
-/// SPEC-3.8.4: delete every row of `t` whose `ts` is strictly older than
+/// SPEC-3.8.14 through SPEC-3.8.16: delete every row of `t` whose `ts` is strictly older than
 /// `cutoff` (an RFC3339 string). Returns the number of rows deleted. The
 /// predicate is a range on the indexed `ts` column, so it seeks rather than
 /// scans.
@@ -90,7 +90,7 @@ pub async fn prune_older_than(pool: &DbPool, t: &RetentionTable, cutoff: &str) -
     Ok(res.rows_affected())
 }
 
-/// SPEC-3.8.4 / SPEC-3.17 item 9: delete `run_summaries` rows ended before
+/// SPEC-3.8.14 through SPEC-3.8.16 / SPEC-3.17.10: delete `run_summaries` rows ended before
 /// `cutoff`, keeping each origin's newest row. That row anchors the next `seq`
 /// (`MAX(seq) + 1`): without it a fully aged-out table would restart at 1 and
 /// peers whose cursor is past that would never see the new rows.
@@ -109,11 +109,11 @@ pub async fn prune_run_summaries(pool: &DbPool, cutoff: &str) -> Result<u64> {
     Ok(res.rows_affected())
 }
 
-/// SPEC-3.17 item 7: `peer_claims` rows older than this are pruned. Fixed, not
+/// SPEC-3.17.8: `peer_claims` rows older than this are pruned. Fixed, not
 /// the `retention_days` window: a claim only has to outlive a forge's redelivery.
 pub const PEER_CLAIMS_TTL_HOURS: i64 = 24;
 
-/// SPEC-3.8.4 / SPEC-3.17 item 7: delete `peer_claims` rows claimed before
+/// SPEC-3.8.14 through SPEC-3.8.16 / SPEC-3.17.8: delete `peer_claims` rows claimed before
 /// `now - 24h`. Returns the number deleted.
 pub async fn prune_peer_claims(pool: &DbPool, now: DateTime<Utc>) -> Result<u64> {
     let cutoff = (now - Duration::hours(PEER_CLAIMS_TTL_HOURS)).to_rfc3339();
@@ -130,7 +130,7 @@ pub async fn prune_peer_claims(pool: &DbPool, now: DateTime<Utc>) -> Result<u64>
     Ok(deleted)
 }
 
-/// SPEC-3.8.4: prune every table in [`RETENTION_TABLES`] to the retention
+/// SPEC-3.8.14 through SPEC-3.8.16: prune every table in [`RETENTION_TABLES`] to the retention
 /// window, using `now` to compute the cutoff (`now - retention_days`). A
 /// disabled config is a no-op. `now` is injected so a test can age rows by
 /// passing a future instant.

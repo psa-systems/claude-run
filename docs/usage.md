@@ -66,7 +66,7 @@ It exposes exactly eight tools, each read-only (no tool ever writes):
 | `get_run` | one run's row plus its job outcomes |
 | `get_attempts` | attempt-count history for one action/key pair |
 | `get_stream_log` | the tail of one job attempt's stream log (`tail_lines`, capped and reported as `truncated` when the log is longer) |
-| `get_gate_output` | the full stored output of one job attempt's failed SPEC-3.3.2 verification gate |
+| `get_gate_output` | the full stored output of one job attempt's failed SPEC-3.3.20 through SPEC-3.3.25 verification gate |
 | `list_ci_failures` | recent CI-failure records, optionally filtered by state |
 | `get_ci_failure` | one CI-failure record by id |
 
@@ -104,12 +104,12 @@ will want to know about:
   page describing claude-run, with Clarence (the mascot), **Sign in** and a link to the documentation, instead of
   being sent straight to `/login`. It shows no instance data. Signed in, `/` is the Dashboard; an instance with no
   account yet still serves only `/setup`. The mascot is `assets/mascot.png` (served at `/static/mascot.png`); replace
-  it and rebuild to change the art. See `SPEC-7.16`.
+  it and rebuild to change the art. See `SPEC-7.16.1` through `SPEC-7.16.3`.
 - **Favicon, touch icon and brand mark.** Every page links a favicon (`assets/favicon.ico`, served at
   `/static/favicon.ico`) and an apple touch icon (`assets/apple-touch-icon.png`, served at
   `/static/apple-touch-icon.png`); the header shows a small brand mark (`assets/brand-mark.png`, served at
   `/static/brand-mark.png`) before the app name. Unlike the mascot, these three carry no instance data and stay
-  reachable in every gate state, including on `/login` and `/setup` while signed out. See `SPEC-4.3.11`.
+  reachable in every gate state, including on `/login` and `/setup` while signed out. See `SPEC-4.3.38` through `SPEC-4.3.39`.
 - **Dashboard** (`/`) leads with the conditions that make work stop without anything failing: the global-pause card, the
   24h diagnostics banner (see "Access check"), the stale-dependency-gate banner,
 and the attempt-cap banner. The diagnostics banner is one line: how many `warn`/`error`
@@ -183,7 +183,7 @@ and the attempt-cap banner. The diagnostics banner is one line: how many `warn`/
   row per probe. `/secrets` grows a per-secret **Check** button that lands here with that credential's identity probe
   already run. See "Access check".
 - **Reports** (`/reports`) is the historical reporting page (spend / runs / time-of-day / day-of-week),
-  global by default and narrowable with `action` + `range` query params. With peering enabled (`SPEC-3.17`) it also
+  global by default and narrowable with `action` + `range` query params. With peering enabled (`SPEC-3.17.1` through `SPEC-3.17.12`) it also
   takes an `instance` param (`all`, `local` or a peer name), merges this instance with every peer's replicated run
   summaries by default, and names any peer that is unknown or behind with its last sync time. Its "Claude plan usage" section
   charts the Claude subscription's own rate-limit utilization (five-hour and seven-day windows, 0-100%) per `claude`
@@ -192,12 +192,12 @@ and the attempt-cap banner. The diagnostics banner is one line: how many `warn`/
   wherever an invocation's log carried no rate-limit reading at all rather than a fabricated zero. A table below the
   chart lists the 20 most recent invocations with their status and API-retry counts.
 - **Status** (`/status`, renamed from About; `/about` and `/about/activity` redirect permanently) shows version + build info. Its **Activity** card carries the global Pause / Resume control and the live quiet
-  indicator (see [Global pause and the restart-safety workflow](operations.md#global-pause-and-the-restart-safety-workflow)). Its **Management** part (SPEC-3.10 item 10) lists each shared Cargo target cache directory under `cache/cargo-target/`
+  indicator (see [Global pause and the restart-safety workflow](operations.md#global-pause-and-the-restart-safety-workflow)). Its **Management** part (SPEC-3.10.11) lists each shared Cargo target cache directory under `cache/cargo-target/`
   with its size, last-used time, and whether a run for that repo is in flight, with a Delete button per row and a Delete all button; a delete is refused with `409` while a run for that repo is in flight. The same part also lists the sidecar's Docker storage by
-  category (SPEC-3.11 item 4: stopped containers, images, build cache, unreferenced volumes), each with its
+  category (SPEC-3.11.5: stopped containers, images, build cache, unreferenced volumes), each with its
   size, or "unknown" with the read's error when the usage read fails, and a Prune button that removes everything in
   that category now; a prune is refused with `409` while any run is in flight, and a failed prune is shown rather than
-  swallowed. See [Docker storage prune from the Status page](operations.md#docker-storage-prune-from-the-status-page-spec-311-item-4).
+  swallowed. See [Docker storage prune from the Status page](operations.md#docker-storage-prune-from-the-status-page-spec-3115).
 
 ## Access check
 

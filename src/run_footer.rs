@@ -1,4 +1,4 @@
-//! Implements SPEC-3.9.
+//! Implements SPEC-3.9.1.
 //!
 //! The footer every runner-posted YouTrack comment carries: the
 //! run's start time, end time, duration, and an absolute link back to it, so
@@ -14,7 +14,7 @@
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
-/// SPEC-3.9: "a comment about one job's attempt" links the attempt page.
+/// SPEC-3.9.1: "a comment about one job's attempt" links the attempt page.
 ///
 /// The job-attempt-specific page to link to, when the comment is about one
 /// job's attempt rather than the run as a whole.
@@ -90,7 +90,7 @@ pub struct CommentRun<'a> {
     pub trigger: Option<&'a Trigger>,
 }
 
-/// SPEC-3.9: "`public_url` is resolved independently of SMTP configuration."
+/// SPEC-3.9.1: "`public_url` is resolved independently of SMTP configuration."
 ///
 /// `crate::config::public_url()`, defaulting to `None` on a malformed
 /// `CLAUDE_RUN_PUBLIC_URL` rather than letting a comment-posting path fail on
@@ -99,13 +99,13 @@ pub fn resolved_public_url() -> Option<String> {
     crate::config::public_url().unwrap_or_default()
 }
 
-/// SPEC-3.9: the attempt-page `Run:` line for a job-lifecycle comment.
+/// SPEC-3.9.1: the attempt-page `Run:` line for a job-lifecycle comment.
 ///
 /// [`render`] appended for a job-lifecycle comment: links the job's own attempt page,
 /// with "now" as the finish time. The `source` for the `Source:` line is
 /// taken from the `CommentRun` itself.
 pub fn append_job(body: &str, public_url: Option<&str>, run: CommentRun<'_>, key: &str) -> String {
-    // SPEC-3.13: the first progress comment after a failed start notice says so.
+    // SPEC-3.13.1 through SPEC-3.13.5: the first progress comment after a failed start notice says so.
     let body = if take_start_notice_missing(key) {
         format!("{body}\n\nNote: the start notice for this run could not be posted; see the runner log.")
     } else {
@@ -126,9 +126,9 @@ pub fn append_job(body: &str, public_url: Option<&str>, run: CommentRun<'_>, key
     format!("{body}{footer}")
 }
 
-/// SPEC-3.13: the start notice body for one attempt: the action, the attempt
+/// SPEC-3.13.1 through SPEC-3.13.5: the start notice body for one attempt: the action, the attempt
 /// and its stage, the session timeout and the expected duration, then the
-/// SPEC-3.15 step list when there is one. The caller appends the SPEC-3.9
+/// SPEC-3.15.1 through SPEC-3.15.8 step list when there is one. The caller appends the SPEC-3.9.1
 /// footer ([`append_job`] / [`append_run`]), which carries the run link.
 pub fn start_notice(
     action: &str,
@@ -157,7 +157,7 @@ fn missing_start_notices() -> &'static MissingStartNotices {
     M.get_or_init(Default::default)
 }
 
-/// SPEC-3.13: record that the start notice for `key` could not be posted, so
+/// SPEC-3.13.1 through SPEC-3.13.5: record that the start notice for `key` could not be posted, so
 /// the next lifecycle comment for the key states so. Keyed because the
 /// comments are composed in synchronous code far from the pickup path.
 pub fn mark_start_notice_missing(key: &str) {
@@ -174,7 +174,7 @@ fn take_start_notice_missing(key: &str) -> bool {
         .remove(key)
 }
 
-/// SPEC-3.9: the run-page `Run:` line for a comment about a run as a whole.
+/// SPEC-3.9.1: the run-page `Run:` line for a comment about a run as a whole.
 ///
 /// [`render`] appended for a comment about a run as a whole rather than one job's
 /// attempt (webhook runs, the closed-issue summary, the dependency gate, the
@@ -226,7 +226,7 @@ pub fn append_start_notice(
     )
 }
 
-/// SPEC-3.9: full footer text, all three link/no-link/no-run-id cases, the
+/// SPEC-3.9.1: full footer text, all three link/no-link/no-run-id cases, the
 /// `Started:` / `Finished:` / `Duration:` lines, and the `Source:` line
 /// naming the action that produced the comment.
 ///
@@ -277,7 +277,7 @@ fn run_line(public_url: Option<&str>, run_id: Option<i64>, attempt: Option<Attem
     }
 }
 
-/// SPEC-3.16.3: "The cause is one line from a closed set." One variant per
+/// SPEC-3.16.4: "The cause is one line from a closed set." One variant per
 /// member of that set; an exhaustive match with no wildcard arm means a new
 /// variant fails to compile here until [`FailureCause::render`] names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -300,7 +300,7 @@ pub enum FailureCause {
 }
 
 impl FailureCause {
-    /// SPEC-3.16.3: the one-line cause text, first bullet of
+    /// SPEC-3.16.4: the one-line cause text, first bullet of
     /// [`failure_comment`].
     fn render(&self) -> String {
         match self {
@@ -315,9 +315,9 @@ impl FailureCause {
     }
 }
 
-/// SPEC-3.16.3: a `FAILED` comment body, at most 3 bullets: the cause first,
+/// SPEC-3.16.4: a `FAILED` comment body, at most 3 bullets: the cause first,
 /// then what was or was not pushed, then the run link. The run link is the
-/// third bullet SPEC-3.16.3 names; every caller already appends the SPEC-3.9
+/// third bullet SPEC-3.16.4 names; every caller already appends the SPEC-3.9.1
 /// footer (which carries its own `Run:` line), so this body holds only the
 /// two bullets it owns and relies on that footer for the third. The raw
 /// stream-log path never appears here, since the run link reaches it.
@@ -650,7 +650,7 @@ mod tests {
         assert!(body.contains("\nTrigger: scheduled poll"), "{body}");
     }
 
-    /// SPEC-3.16.3: one case per [`FailureCause`] variant, asserting the
+    /// SPEC-3.16.4: one case per [`FailureCause`] variant, asserting the
     /// rendered body is at most 3 bullets (2 here plus the footer's run
     /// link), the cause is the first bullet, and no stream-log path ever
     /// appears.

@@ -1,6 +1,6 @@
 #!/usr/bin/env nu
 
-# SPEC-9.2: "The CI image-publish workflow resolves a single publish train
+# SPEC-9.2.1 through SPEC-9.2.2: "The CI image-publish workflow resolves a single publish train
 # from its own trigger ... never from `git describe`." Resolve the single
 # publish tag and train for the build workflow.
 #
@@ -13,7 +13,7 @@
 # Deriving the mode from the trigger keeps the tag-push run and the branch-push
 # run off the same destination. Trigger-derived modes return DISJOINT tag sets:
 # the tag-push run publishes only `vX.Y.Z`, the branch-push run (`develop`)
-# publishes only `latest`. A push to `main` publishes nothing (SPEC-11.15).
+# publishes only `latest`. A push to `main` publishes nothing (SPEC-11.3.5).
 #
 # A dry-run still resolves to one of the two real publish trains so the caller
 # can exercise either path:
@@ -30,7 +30,7 @@
 # When used as a module (`use get-tags.nu`) it returns the record. When run as a
 # script for a workflow step, pass --json to serialize the record for capture
 # (e.g. `^nu oci-build/get-tags.nu --mode latest --json | from json`).
-# SPEC-9.2: "`release` train ... `latest` train ... `dry-run` ... resolves to
+# SPEC-9.2.1 through SPEC-9.2.2: "`release` train ... `latest` train ... `dry-run` ... resolves to
 # the `release` train when given a `--simulate-tag` version to exercise, else
 # to the `latest` train."
 export def main [

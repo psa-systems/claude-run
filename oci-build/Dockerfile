@@ -1,4 +1,4 @@
-# SPEC-9: "multi-stage. The builder compiles a static musl binary with a
+# SPEC-9.3.1: "multi-stage. The builder compiles a static musl binary with a
 # locked dependency build." Build a static `claude-run` binary against the
 # musl rust-builder image and assemble a self-contained runtime image around
 # it. The image is the only supported distribution; no standalone binary is
@@ -62,7 +62,7 @@ COPY assets ./assets
 COPY deploy ./deploy
 COPY build.rs ./
 
-# SPEC-2.1: the `CLAUDE_RUN_GIT_SHA` / `CLAUDE_RUN_BUILD_DATE` build.rs reads;
+# SPEC-2.1.1 through SPEC-2.1.4: the `CLAUDE_RUN_GIT_SHA` / `CLAUDE_RUN_BUILD_DATE` build.rs reads;
 # the workflow passes the real values via --build-arg.
 ARG GIT_SHA=unknown
 ARG BUILD_DATE=unknown
@@ -74,7 +74,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --release --locked
 
-# SPEC-9: "The runtime stage is a Linux image carrying `claude`, `yt`, `fj`,
+# SPEC-9.3.1: "The runtime stage is a Linux image carrying `claude`, `yt`, `fj`,
 # `gh`, `nu`, `just`, Docker CLI, git and Rust tooling, plus `gosu` and
 # `catatonit`." (rebased onto opensuse-dev). The base
 # carries the whole toolchain already (nu, claude, yt, fj, gh, just,
@@ -103,7 +103,7 @@ FROM dev.a8n.run/pandoras-box/opensuse-dev:v1.16.0-leap-16.0 AS runtime
 
 USER root
 
-# SPEC-9: "smoke-checks the base image's toolchain at build time ... a base
+# SPEC-9.3.2: "smoke-checks the base image's toolchain at build time ... a base
 # image that lost a tool fails the image build there instead of ... the first
 # job that needs it."
 RUN nu --version \
@@ -124,7 +124,7 @@ RUN nu --version \
     && usermod --help >/dev/null \
     && groupmod --help >/dev/null
 
-# SPEC-9: "`gosu` has no openSUSE Leap package: the runtime stage downloads
+# SPEC-9.3.3: "`gosu` has no openSUSE Leap package: the runtime stage downloads
 # the upstream per-architecture release binary and verifies it against that
 # release's published SHA256SUMS before installing it.". `setpriv`
 # stays installed by the base (nothing else in this image uses it; it is
@@ -143,12 +143,12 @@ RUN set -eu; \
     gosu --version; \
     gosu nobody true
 
-# SPEC-9: "this stage only creates the runtime user, copies the binary and
+# SPEC-9.3.1 through SPEC-9.3.12: "this stage only creates the runtime user, copies the binary and
 # shipped config." The `claude-run` binary itself, from the builder stage
 # above.
 COPY --from=builder /build/target/release/claude-run /usr/local/bin/claude-run
 
-# SPEC-9: "Entrypoint hooks seed `config.toml` and the shipped action files
+# SPEC-9.3.4: "Entrypoint hooks seed `config.toml` and the shipped action files
 # into an empty config volume.". Baked read-only here; the
 # entrypoint seeds it into the config volume the first time that volume has no
 # actions, so a fresh container starts with the actions this repo ships
@@ -158,14 +158,14 @@ COPY --from=builder /build/target/release/claude-run /usr/local/bin/claude-run
 # existing deployment through that same editor.
 COPY actions/*.yml /usr/share/claude-run/actions/
 
-# SPEC-9: "Seeded container config binds the web UI to `0.0.0.0:7321`."
+# SPEC-9.3.6: "Seeded container config binds the web UI to `0.0.0.0:7321`."
 # Bootstrap config seeded the same way, and for the same reason the actions
 # are: the container binds 0.0.0.0 because a loopback bind is reachable from
 # nothing outside the container, and the operator owns the file once it lands
 # on the volume.
 COPY deploy/container-config.toml /usr/share/claude-run/config.toml
 
-# SPEC-9 / SPEC-9.1: "The image starts as root and drops to uid/gid 1001
+# SPEC-9.3.1 through SPEC-9.3.12 / SPEC-9.1.1 through SPEC-9.1.5: "The image starts as root and drops to uid/gid 1001
 # through the entrypoint" ... "else 1001/1001" is the default `PUID`/`PGID`
 # resolution gosu-entrypoint.sh falls back to when unset and the first data
 # dir has no non-root owner to adopt. Home directory path kept at
@@ -175,7 +175,7 @@ COPY deploy/container-config.toml /usr/share/claude-run/config.toml
 # every store the operator cares about lives under the three volumes below.
 RUN groupadd --gid 1001 appuser \
     && useradd --uid 1001 --gid 1001 --create-home --home-dir /home/claudebot appuser
-# SPEC-9: "The agent's `CLAUDE.md` is baked from `deploy/bot-CLAUDE.md`."
+# SPEC-9.3.5: "The agent's `CLAUDE.md` is baked from `deploy/bot-CLAUDE.md`."
 COPY deploy/bot-CLAUDE.md /home/claudebot/.claude/CLAUDE.md
 
 # Three flat mounts instead of seven XDG paths under a home
@@ -196,7 +196,7 @@ COPY deploy/bot-CLAUDE.md /home/claudebot/.claude/CLAUDE.md
 # GIT_CONFIG_GLOBAL. Outside the container (tests, local development) none of
 # these variables is set and XDG defaults apply.
 #
-# SPEC-9: "Image environment: `CLAUDE_RUN_CONFIG_DIR=/config`,
+# SPEC-9.3.5: "Image environment: `CLAUDE_RUN_CONFIG_DIR=/config`,
 # `CLAUDE_RUN_DATA_DIR=/data`, `CLAUDE_RUN_STATE_DIR=/state`,
 # `CLAUDE_RUN_RUNTIME_DIR=/run/claude-run`,
 # `CLAUDE_CONFIG_DIR=/config/claude-agent-home`." CLAUDE_CONFIG_DIR names the
@@ -219,7 +219,7 @@ RUN mkdir -p /config/actions /config/claude-agent-home /config/git /config/youtr
     && chown -R appuser:appuser /config /data /state /run/claude-run \
     && chown -R appuser:appuser /home/claudebot
 
-# SPEC-9.1: "`CLAUDE_RUN_DATA_DIR` (`/data`) is deliberately not a member of
+# SPEC-9.1.1 through SPEC-9.1.5: "`CLAUDE_RUN_DATA_DIR` (`/data`) is deliberately not a member of
 # `DATA_DIRS`." gosu-entrypoint.sh's PUID/PGID remap and chown apply only to
 # these three (config, state, runtime dir, in that order); /data is excluded
 # because it holds workdirs/, a tree of job git clones the runtime user made
@@ -235,7 +235,7 @@ ENV APP_USER=appuser \
 ENV HOME=/home/claudebot
 WORKDIR /home/claudebot
 
-# SPEC-9.1: "the shared, byte-identical entrypoint; image-specific root steps
+# SPEC-9.1.1 through SPEC-9.1.5: "the shared, byte-identical entrypoint; image-specific root steps
 # run as hooks under `/etc/entrypoint.d/` instead of being added to this
 # file." (CONTAINER_UID_GID.md). The image-specific root steps
 # that used to live in entrypoint.sh (config seeding, the data-dir chown) now
@@ -245,7 +245,7 @@ RUN chmod 0755 /usr/local/bin/gosu-entrypoint.sh
 COPY oci-build/entrypoint.d/ /etc/entrypoint.d/
 RUN chmod 0755 /etc/entrypoint.d/*.sh
 
-# SPEC-9.1: "Started as root ... every `DATA_DIRS` entry is chowned
+# SPEC-9.1.1 through SPEC-9.1.5: "Started as root ... every `DATA_DIRS` entry is chowned
 # recursively to the resolved uid/gid" and "started as a non-root user ...
 # the remap, hooks and chown ... are all skipped." The container starts as
 # root so gosu-entrypoint.sh can run the hooks above and chown the mounted
@@ -258,8 +258,8 @@ RUN chmod 0755 /etc/entrypoint.d/*.sh
 # it execs gosu-entrypoint.sh as its only child and forwards
 # signals.
 #
-# SPEC-9: "Entrypoint: `catatonit -- gosu-entrypoint.sh claude-run`, default
-# command `serve --no-socket`." SPEC-10: "The container image runs its default
+# SPEC-9.3.1: "Entrypoint: `catatonit -- gosu-entrypoint.sh claude-run`, default
+# command `serve --no-socket`." SPEC-10.2.1: "The container image runs its default
 # command foregrounded (`serve --no-socket`, no `--detach`), so its logs are
 # its stdout." No unix-socket API either: that socket is the CLI's control
 # plane; this image has no CLI operator (the web UI and its /api routes are

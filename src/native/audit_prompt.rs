@@ -1,7 +1,7 @@
 //! Built-in prompt for scheduled audit runs, selected by `prompt_preset: audit` and
 //! resolved by [`super::youtrack::prompt_template`]; a YAML `prompt` override still wins.
 
-/// SPEC-3.3.1: "Prompt: `prompt` overrides; otherwise `prompt_preset` is
+/// SPEC-3.3.8 through SPEC-3.3.19: "Prompt: `prompt` overrides; otherwise `prompt_preset` is
 /// `default` or `audit`." This is the `audit` preset's built-in template.
 ///
 /// The audit agent prompt as a placeholder template: it permits the tracker writes an audit

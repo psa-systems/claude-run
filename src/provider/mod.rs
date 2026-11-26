@@ -1,4 +1,4 @@
-//! SPEC-8.2: provider abstraction for the external services native handlers talk to.
+//! SPEC-8.2.1 through SPEC-8.2.4: provider abstraction for the external services native handlers talk to.
 //!
 //! Native handlers need a typed, testable interface over the host CLIs (`yt`,
 //! `fj`) instead of the raw nu snippets the scripted youtrack action uses. Two
@@ -174,8 +174,7 @@ pub struct PullRequest {
     #[serde(default)]
     pub push_comment_failure: Option<String>,
     /// When the branch push that preceded this PR's open finished, so the
-    /// caller can time `push` and `pr_create` as separate steps (SPEC-3.14
-    /// item 3). `None` when nothing was pushed or the push is part of one
+    /// caller can time `push` and `pr_create` as separate steps (SPEC-3.14.4). `None` when nothing was pushed or the push is part of one
     /// opaque call (AGit).
     #[serde(default)]
     pub push_ended_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -233,7 +232,7 @@ pub struct IssueInspect {
     pub comments: Vec<String>,
 }
 
-/// SPEC-8.2: the YouTrack-side operations native handlers need. Backed by
+/// SPEC-8.2.1 through SPEC-8.2.4: the YouTrack-side operations native handlers need. Backed by
 /// `yt` today; an MCP backend can implement the same surface later.
 pub trait IssueTracker: Send + Sync {
     /// Queued issues matching `query` (e.g. `-Resolved AI Agent: Queued`),
@@ -313,7 +312,7 @@ pub trait IssueTracker: Send + Sync {
     /// Read the issue's `Estimation` custom field as whole minutes
     /// (`yt issue get-field <key> Estimation --json`'s `raw.minutes`), or
     /// `None` when the field is unset. Backs the pickup-time estimate-vs-
-    /// session-timeout check (SPEC-3.12 item 7). The default returns
+    /// session-timeout check (SPEC-3.12.8). The default returns
     /// `Ok(None)`, so a backend with no `Estimation` support never blocks
     /// pickup.
     fn get_estimation_minutes(&self, key: &str) -> Result<Option<i64>> {
@@ -394,7 +393,7 @@ pub trait IssueTracker: Send + Sync {
     }
 }
 
-/// SPEC-8.9: render a failed [`Forge::repo_access`] probe as an error an
+/// SPEC-8.9.1 through SPEC-8.9.2: render a failed [`Forge::repo_access`] probe as an error an
 /// operator can act on: which capability failed (`cmd`), the exit status, and
 /// the grant to add (`scope`). A 403 and a 404 need different grants, so they
 /// are told apart from the CLI's own text: `fj` says `unexpected status code
@@ -453,7 +452,7 @@ pub(crate) fn probe_denied(
 /// that has no YouTrack job key passed in directly (the GitHub provider
 /// layer, which only sees the repo and the commit text). `None` when no such
 /// token appears.
-/// SPEC-8.8: resolves the push comment's issue key when none is passed in
+/// SPEC-8.8.1 through SPEC-8.8.2: resolves the push comment's issue key when none is passed in
 /// directly.
 pub fn bare_issue_key(text: &str) -> Option<String> {
     text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '#')
@@ -532,7 +531,7 @@ pub(crate) fn scan_tracker_keys(text: &str) -> Vec<String> {
 /// push or PR-create call, so a bad tip opens nothing: the error names the
 /// branch and the offending subject, and reaches the issue comment through
 /// the existing PR-creation failure path in `finalize`.
-/// SPEC-8.7: rejects a PR tip subject that is empty or heading/bare-issue-ref
+/// SPEC-8.7.1 through SPEC-8.7.5: rejects a PR tip subject that is empty or heading/bare-issue-ref
 /// shaped.
 pub fn validate_pr_subject(subject: &str, branch: &str) -> Result<()> {
     let trimmed = subject.trim();
@@ -558,7 +557,7 @@ pub fn validate_pr_subject(subject: &str, branch: &str) -> Result<()> {
 /// and blank lines) that is not one or more bare `#KEY-N` lines. Called at
 /// the same point [`validate_pr_subject`] is, so a bad tail refuses before
 /// any push or PR-create call; the error names the offending line.
-/// SPEC-8.7: rejects a PR tip body whose tail is not a bare issue-reference
+/// SPEC-8.7.1 through SPEC-8.7.5: rejects a PR tip body whose tail is not a bare issue-reference
 /// block.
 pub fn validate_pr_body(body: &str, branch: &str) -> Result<()> {
     for line in body.lines() {
@@ -610,7 +609,7 @@ pub fn validate_pr_body(body: &str, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// SPEC-8.2: the Forgejo-side operations native handlers need.
+/// SPEC-8.2.1 through SPEC-8.2.4: the Forgejo-side operations native handlers need.
 pub trait Forge: Send + Sync {
     /// Open a PR from the local commits in `workdir` against `host`. `strategy`
     /// selects branch-backed (push a real server branch, open via
@@ -717,15 +716,15 @@ pub trait Forge: Send + Sync {
         )))
     }
 
-    /// Push the resolved feature branch (SPEC-3.3.1), same as every other
+    /// Push the resolved feature branch (SPEC-3.3.8 through SPEC-3.3.19), same as every other
     /// runner push of an agent branch: the repo's `pre-push` hook is never
-    /// run, since the SPEC-3.3.2 verification gate is the only
+    /// run, since the SPEC-3.3.20 through SPEC-3.3.25 verification gate is the only
     /// post-agent full-suite run. Opens no PR; used by the finalize paths
     /// that must never create one (needs-review, no-code-change, hard
     /// failure). Returns `Ok(None)` when there is nothing to push: no
     /// feature branch yet, or its tip already matches the remote. Any push
     /// failure (network, a real non-fast-forward divergence, ...) is
-    /// returned as `Err` and MUST be treated as a failed run (SPEC-3.3.1: "a
+    /// returned as `Err` and MUST be treated as a failed run (SPEC-3.3.8 through SPEC-3.3.19: "a
     /// failed final push is a failure... never reported as success"). The
     /// default errors so a backend without support (every test-only stub)
     /// reports clearly rather than silently no-op'ing.
@@ -991,7 +990,7 @@ pub fn resolve_branch_up_to_date(
     }
 }
 
-/// SPEC-8.2: a backend implementing the full provider surface. Marker
+/// SPEC-8.2.1 through SPEC-8.2.4: a backend implementing the full provider surface. Marker
 /// super-trait so the factory can hand callers one object exposing both halves.
 pub trait Backend: IssueTracker + Forge {
     /// Stable name for diagnostics / the `NoBackend` error message.
@@ -1035,7 +1034,7 @@ pub(crate) fn pr_status_on_thread<F: Forge + 'static>(
     }
 }
 
-/// SPEC-8.2: ordered backend preference. The YouTrack / Forgejo provider resolution
+/// SPEC-8.2.1 through SPEC-8.2.4: ordered backend preference. The YouTrack / Forgejo provider resolution
 /// ([`resolve`], [`resolve_runner`]) walks `[Cli]`. The GitHub `Forge`
 /// walks `[Mcp, Gh]`: prefer the remote MCP, fall back to the `gh`
 /// CLI. Variants are shared so one ordered priority type covers every backend.
@@ -1073,7 +1072,7 @@ const GIT_CRED_PASS_ENV: &str = "CLAUDE_RUN_GIT_PASSWORD";
 /// [`GIT_CRED_USER_ENV`] / [`GIT_CRED_PASS_ENV`] and the `-c` pair re-exported
 /// as `GIT_CONFIG_PARAMETERS`, so a hook's own test suite must not
 /// assume a clean ambient git environment (see `testutil::clear_ambient_git_env`).
-/// SPEC-8.5: per-invocation credential helper; the token lives only in the
+/// SPEC-8.5.1 through SPEC-8.5.3: per-invocation credential helper; the token lives only in the
 /// child process's own environment, never in argv or `.git/config`.
 pub(crate) const CREDENTIAL_HELPER: &str = concat!(
     "credential.helper=!f() { echo \"username=$",
@@ -1127,7 +1126,7 @@ pub(crate) fn strip_userinfo(url: &str) -> String {
 /// applies). Used by call sites that shell out directly with
 /// [`std::process::Command`] rather than through a [`CommandRunner`] (this
 /// module's own clone/scrub machinery, and [`crate::workdir`]).
-/// SPEC-8.5: every git subprocess authenticates per invocation through this
+/// SPEC-8.5.1 through SPEC-8.5.3: every git subprocess authenticates per invocation through this
 /// path or [`run_authed_git`].
 pub fn authed_git_output(
     dir: Option<&std::path::Path>,
@@ -1274,7 +1273,7 @@ pub fn run_authed_git(
     }
 }
 
-/// SPEC-8.5: rewrite every remote URL a fresh clone could have persisted with
+/// SPEC-8.5.1 through SPEC-8.5.3: rewrite every remote URL a fresh clone could have persisted with
 /// credentials: `origin` in `workdir` itself, `submodule.<name>.url` in the
 /// superproject config, and `origin` inside every submodule's own git
 /// directory, recursively. Called once at the end of [`shallow_clone`], after
@@ -1467,7 +1466,7 @@ impl GitAttemptOutput for cli::CmdOutput {
     }
 }
 
-/// SPEC-8.5: run a git network call with up to four attempts total,
+/// SPEC-8.5.1 through SPEC-8.5.3: run a git network call with up to four attempts total,
 /// waiting `waits[0]` / `waits[1]` / `waits[2]` before attempts 2, 3 and 4,
 /// with the same semantics as `run_fj_read_retrying`: a failed
 /// attempt is a completed process with a non-zero exit, retried on the exit
@@ -1515,7 +1514,7 @@ pub fn retry_git_network<O: GitAttemptOutput>(
     Ok(out)
 }
 
-/// SPEC-8.5: shallow-clone `url` into `workdir`, pinning `branch` when given.
+/// SPEC-8.5.1 through SPEC-8.5.3: shallow-clone `url` into `workdir`, pinning `branch` when given.
 ///
 /// Captures git's output instead of letting it inherit the daemon's
 /// stderr, so a failure reports WHY. Before this every clone site reported only
@@ -1727,7 +1726,7 @@ fn init_submodules_retrying(
 /// remote's actual default branch (never assumed) and restores
 /// `origin/HEAD`, so a pinned clone ends up with the same base refs as a
 /// default-branch clone.
-/// SPEC-8.5: restore real `origin/HEAD` tracking refs after a pinned shallow
+/// SPEC-8.5.1 through SPEC-8.5.3: restore real `origin/HEAD` tracking refs after a pinned shallow
 /// clone.
 fn restore_default_branch_refs_retrying(
     url: &str,
@@ -1803,7 +1802,7 @@ fn restore_default_branch_refs_retrying(
 /// when the command had one, so its credential is masked verbatim on top of the
 /// shape-based redaction; the URL itself is never included, because this string
 /// is persisted to `run_events` and can reach a YouTrack comment.
-/// SPEC-8.6: the error for a failed git subprocess, exit code plus a
+/// SPEC-8.6.1 through SPEC-8.6.5: the error for a failed git subprocess, exit code plus a
 /// redacted tail of git's own stderr.
 pub fn git_error(context: &str, out: &std::process::Output, url: Option<&str>) -> Error {
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1840,7 +1839,7 @@ const STDOUT_TAIL_MAX_BYTES: usize = 4000;
 /// bytes, redacted with `secrets` before it is cut so a credential straddling
 /// the cut is never half-shown. Empty stdout returns `stderr` unchanged
 /// (still stripped).
-/// SPEC-8.6: append a bounded, redacted, escape-stripped stdout tail to a
+/// SPEC-8.6.1 through SPEC-8.6.5: append a bounded, redacted, escape-stripped stdout tail to a
 /// failed call's error text.
 pub(crate) fn append_stdout_tail(stderr: &str, stdout: &str, secrets: &[String]) -> String {
     let stderr = strip_terminal_escapes(stderr);
@@ -1864,7 +1863,7 @@ pub(crate) fn append_stdout_tail(stderr: &str, stdout: &str, secrets: &[String])
     }
 }
 
-/// SPEC-8.6: strip terminal escape sequences and raw control bytes from
+/// SPEC-8.6.1 through SPEC-8.6.5: strip terminal escape sequences and raw control bytes from
 /// captured command text, so `just` and the tools it runs never
 /// leave ANSI colour/cursor codes or other control characters in a stored
 /// tail or a comment. Removes every ESC (`0x1B`)-introduced sequence: CSI
@@ -1933,7 +1932,7 @@ fn longest_backtick_run(text: &str) -> usize {
     longest
 }
 
-/// SPEC-8.6: fence `text` (optionally tagged `lang`) in a Markdown code
+/// SPEC-8.6.1 through SPEC-8.6.5: fence `text` (optionally tagged `lang`) in a Markdown code
 /// block, choosing a backtick run strictly longer than any run already
 /// inside `text` (at least 3) so untrusted captured command text can never
 /// close the fence early and spill out of the block.
@@ -1979,7 +1978,7 @@ fn clone_error_tail(stderr: &str) -> String {
         .join("; ")
 }
 
-/// SPEC-8.2: resolve a usable [`Backend`] from `priority`, walking the list in order and
+/// SPEC-8.2.1 through SPEC-8.2.4: resolve a usable [`Backend`] from `priority`, walking the list in order and
 /// returning the first backend that probes successfully. Errors
 /// [`Error::NoBackend`] (listing every attempt) when none is usable, e.g. when
 /// `yt` / `fj` are absent from `PATH`.
@@ -2053,7 +2052,7 @@ pub fn resolve_runner_with(
 /// fetch each hold one shared client across every webhook source - so the
 /// `host` argument on each call, not a per-source config lookup, decides
 /// which client answers.
-/// SPEC-3.5: per-host dispatch to `fj` vs `gh` readers for CI-failure analysis.
+/// SPEC-3.5.1 through SPEC-3.5.18: per-host dispatch to `fj` vs `gh` readers for CI-failure analysis.
 pub struct HostRoutedForgeReads {
     fj: Arc<dyn crate::forge_log::ForgeReads>,
     gh: Arc<dyn crate::forge_log::ForgeReads>,

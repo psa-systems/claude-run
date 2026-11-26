@@ -116,7 +116,7 @@ whether `agent_pull_requests` has an `open` row for `(host, repo, pr.number)`:
   instead, with a comment listing every fix attempt's run and every distinct failing-test set seen on the PR. A
   failure whose fingerprint repeats the immediately preceding attempt's unchanged (the loop-breaker) also
   flags `Needs Review` instead of re-queueing, naming the decision needed (fix the recurring failure by hand, or
-  re-queue once it no longer reproduces). Both of these `Needs Review` writes are the `SPEC-3.12` item 3 "CI
+  re-queue once it no longer reproduces). Both of these `Needs Review` writes are the `SPEC-3.12.4` "CI
   remediation ceiling reached" table row, so both also tag `Needs-Info` (`mint.needs_info_tag`, default
   `Needs-Info`). One exception: when this failure's tests overlap none of the earlier attempts' on the
   PR (the agent fixed what it was asked to and a different test tripped), it gets one more attempt, up to
@@ -270,7 +270,7 @@ forever; automerge itself does not depend on the webhook.
 ### Branch scope
 
 A failed run is triaged only when its branch is in `config.webhook.triage_branches`, a map from repo pattern (`owner/repo`,
-`owner/*` or `*`; the most specific wins) to a list of branches, default `{"*": ["main", "develop"]}` (`SPEC-4.4.6`).
+`owner/*` or `*`; the most specific wins) to a list of branches, default `{"*": ["main", "develop"]}` (`SPEC-4.4.39` through `SPEC-4.4.46`).
 The check runs after the open-PR lookup. With no open PR, a branch outside the list is acknowledged and dropped before
 any store write, `claude` call or mint, logged at `info` with the repo, run and branch; a branch
 the run log does not reveal fails the run (`error` log, failed run row) and is never dropped. A run on the agent's own
@@ -384,4 +384,4 @@ pair processes it; the other answers `200` and drops the delivery with an `info`
 is built from payload fields identical across hook targets (run index and outcome, PR number, action and head commit,
 or comment id), never the delivery id. A peer that times out, errors or answers garbage is bypassed: the event is
 processed, a `warn` log names the peer and key, and the Status page counts the bypass per peer for 24 hours. A paused
-instance drops without claiming, so its peer takes the event. `SPEC-3.17` item 7 is the contract.
+instance drops without claiming, so its peer takes the event. `SPEC-3.17.8` is the contract.

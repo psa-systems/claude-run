@@ -5,7 +5,7 @@
 //! Process model: single daemon per machine, enforced by a pidfile lock.
 //! `--detach` forks via the `daemonize` crate before binding the listener.
 //!
-//! SPEC-2.2: the single daemon per machine, its pidfile lock, its concurrent
+//! SPEC-2.2.1 through SPEC-2.2.2: the single daemon per machine, its pidfile lock, its concurrent
 //! tasks (scheduler, trigger consumer, HTTP servers, webhook consumers,
 //! background loops), its startup sequence (reap, reconcile, scan, record
 //! serve start), its SIGTERM shutdown (30s grace, cancel-then-drain, exit
@@ -69,7 +69,7 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// SPEC-2.2: the startup sequence (pidfile lock, reap orphaned runs,
+    /// SPEC-2.2.1 through SPEC-2.2.2: the startup sequence (pidfile lock, reap orphaned runs,
     /// reconcile restart-stranded issues, scan actions, bind sockets,
     /// materialize service logins, spawn background tasks) and the SIGTERM
     /// shutdown sequence (trip every in-flight run's cancellation token,
@@ -386,7 +386,7 @@ impl Daemon {
             mpsc::channel::<crate::web::webhooks::VerifiedActionSuccessEvent>(64);
         // The listener routes against the live config + limiter map shared with
         // LiveSettings, so a Settings save is routable immediately.
-        // SPEC-3.17 item 7: both listeners claim events through one handle.
+        // SPEC-3.17.8: both listeners claim events through one handle.
         let peer_claims = crate::peer::PeerClaims::new(
             pool.clone(),
             settings.peers_handle(),
@@ -427,7 +427,7 @@ impl Daemon {
         let webhook_router = crate::web::webhooks::router(webhook_state);
         let comment_router = crate::web::comment_webhooks::router(comment_state);
 
-        // SPEC-3.17 item 4: the peer API, TCP only, with its own bearer check
+        // SPEC-3.17.5: the peer API, TCP only, with its own bearer check
         // that holds even where the gate below is off (loopback bind).
         let peer_token = match self.on_disk.web.auth_token_ref.as_deref() {
             Some(name) => match crate::secrets::SecretsKey::load() {
@@ -580,7 +580,7 @@ impl Daemon {
             mint_ctx.clone(),
             keygate.clone(),
         ));
-        // SPEC-3.12 item 2: the live-daemon backstop for an issue left on
+        // SPEC-3.12.3: the live-daemon backstop for an issue left on
         // Working by a run that exited without finalizing. Same cadence as
         // the automerge reconciler above; the first tick fires immediately,
         // so a sweep also runs on serve start.
@@ -594,10 +594,10 @@ impl Daemon {
         match crate::settings::ensure_instance_id(&pool).await {
             Ok(id) => info!(instance_id = %id, "instance identity"),
             Err(e) => {
-                tracing::error!(error = %e, "could not create or read the instance id (SPEC-3.17 item 2)")
+                tracing::error!(error = %e, "could not create or read the instance id (SPEC-3.17.3)")
             }
         }
-        // SPEC-3.17 item 5: the liveness poller. Idle (no outbound call) while
+        // SPEC-3.17.6: the liveness poller. Idle (no outbound call) while
         // peering is disabled; reads the live config each tick.
         let peer_poll_task = tokio::spawn(crate::peer::poll_loop(
             pool.clone(),
@@ -703,7 +703,7 @@ impl Daemon {
         ));
 
         // Sweep unused named volumes from the sidecar's Docker daemon older
-        // than the configured window, and (SPEC-3.11) reclaim the
+        // than the configured window, and (SPEC-3.11.1 through SPEC-3.11.6) reclaim the
         // rest of the sidecar's storage (stopped containers, images, build
         // cache) once the measured total exceeds `docker_gc.max_bytes`.
         // Nothing ever removed any of this, and a deployment can fill its
@@ -723,7 +723,7 @@ impl Daemon {
         // reason (nothing to probe yet).
         // Sweep the shared Cargo target cache: a repo directory over
         // `cargo_cache.max_bytes_per_repo` is deleted once no run for that
-        // repo is in flight (`SPEC-3.10` item 6). Same cadence
+        // repo is in flight (`SPEC-3.10.7`). Same cadence
         // and live-config shape as the sweeps above.
         let cargo_cache_gc_task = tokio::spawn(cargo_cache_gc_loop(
             self.paths.clone(),
@@ -841,7 +841,7 @@ impl Daemon {
     }
 }
 
-/// SPEC-3.5: the mint pipeline degrades to log-only (returns `None`) when no
+/// SPEC-3.5.1 through SPEC-3.5.18: the mint pipeline degrades to log-only (returns `None`) when no
 /// provider backend is usable or the analysis directory cannot be created.
 ///
 /// Build the webhook [`crate::web::webhooks::MintContext`]: resolve a provider
@@ -933,7 +933,7 @@ fn build_mint_context(
     })
 }
 
-/// SPEC-2.2: the single-instance pidfile lock (`flock`, non-blocking) held
+/// SPEC-2.2.1 through SPEC-2.2.2: the single-instance pidfile lock (`flock`, non-blocking) held
 /// for the daemon's lifetime.
 fn pidfile_lock(pidfile: &Path) -> Result<std::fs::File> {
     use std::io::Write;
@@ -1008,7 +1008,7 @@ fn rename_webhook_log_dir(paths: &Paths) {
     }
 }
 
-/// SPEC-2.2: the TCP bind retries every 5 seconds while the address is not
+/// SPEC-2.2.1 through SPEC-2.2.2: the TCP bind retries every 5 seconds while the address is not
 /// yet assigned; any other bind failure disables the TCP surface for the run.
 ///
 /// Classified web-UI bind failure. Carries a stable `kind` tag, a one-line
@@ -1022,7 +1022,7 @@ pub struct BindFailure {
     pub retry: bool,
 }
 
-/// SPEC-2.2: classifies a bind failure into the retry decision above.
+/// SPEC-2.2.1 through SPEC-2.2.2: classifies a bind failure into the retry decision above.
 ///
 /// Map a bind [`std::io::ErrorKind`] to its classified [`BindFailure`]. Pure (no
 /// logging, no I/O) so the classification is unit-testable without a socket.
@@ -1052,7 +1052,7 @@ pub fn classify_bind_error(kind: std::io::ErrorKind) -> BindFailure {
     }
 }
 
-/// SPEC-2.2: retries the TCP bind every 5 seconds while the address is not
+/// SPEC-2.2.1 through SPEC-2.2.2: retries the TCP bind every 5 seconds while the address is not
 /// yet assigned.
 ///
 /// Bind `tcp_bind`, retrying indefinitely on the boot-race `AddrNotAvailable`
@@ -1137,7 +1137,7 @@ async fn bind_and_serve_tcp(tcp_bind: String, config_path: PathBuf, app: axum::R
     }
 }
 
-/// SPEC-2.2: the optional unix-socket API server task (disabled by
+/// SPEC-2.2.1 through SPEC-2.2.2: the optional unix-socket API server task (disabled by
 /// `--no-socket`).
 async fn serve_unix(listener: UnixListener, app: axum::Router) -> Result<()> {
     // axum::serve doesn't take a UnixListener directly; loop accept + handle.
@@ -1158,7 +1158,7 @@ async fn serve_unix(listener: UnixListener, app: axum::Router) -> Result<()> {
     }
 }
 
-/// SPEC-2.2: one enabled, successfully-parsed action's identity, collected
+/// SPEC-2.2.1 through SPEC-2.2.2: one enabled, successfully-parsed action's identity, collected
 /// during a scan so the collision guardrail can spot two actions doing
 /// identical work.
 struct ScannedAction {
@@ -1172,7 +1172,7 @@ struct ScannedAction {
     source_key: Option<String>,
 }
 
-/// SPEC-2.2: a detected collision (case-insensitive name collision, or same
+/// SPEC-2.2.1 through SPEC-2.2.2: a detected collision (case-insensitive name collision, or same
 /// native kind and effective source) flagged with a WARN log and a persisted
 /// `run_events` notice; detection is observability-only and never disables
 /// either action.
@@ -1187,7 +1187,7 @@ struct Collision {
 /// jobs it gathers, so two actions with equal keys provably poll the same
 /// source. `\u{1f}` (unit separator) joins the parts so no field value can forge
 /// a boundary.
-/// SPEC-2.2: the same-native-source half of the enabled-action collision
+/// SPEC-2.2.1 through SPEC-2.2.2: the same-native-source half of the enabled-action collision
 /// check.
 fn native_source_key(action: &crate::action::Action) -> Option<String> {
     use crate::action::NativeConfig;
@@ -1217,7 +1217,7 @@ fn native_source_key(action: &crate::action::Action) -> Option<String> {
     }
 }
 
-/// SPEC-2.2: flags two enabled actions doing redundant work (case-insensitive
+/// SPEC-2.2.1 through SPEC-2.2.2: flags two enabled actions doing redundant work (case-insensitive
 /// name collision, or same native kind and effective source).
 ///
 /// Detect enabled actions that do redundant work. Two conditions,
@@ -1285,7 +1285,7 @@ fn detect_collisions(scanned: &[ScannedAction]) -> Vec<Collision> {
     collisions
 }
 
-/// SPEC-2.2: scans the actions directory, upserts the index, prunes rows
+/// SPEC-2.2.1 through SPEC-2.2.2: scans the actions directory, upserts the index, prunes rows
 /// whose backing YAML no longer exists (run history is kept), and flags
 /// redundant-work collisions.
 pub async fn scan_actions(pool: &DbPool, actions_dir: &Path) -> Result<()> {
@@ -1426,10 +1426,10 @@ fn schedule_kind_str(k: &crate::action::ScheduleKind) -> &'static str {
     }
 }
 
-/// SPEC-3.1 / SPEC-3.7: holds the daemon-wide concurrency primitives
+/// SPEC-3.1.1 through SPEC-3.1.12 / SPEC-3.7.1 through SPEC-3.7.3: holds the daemon-wide concurrency primitives
 /// (`KeyGate`, `Limiter`, `GatherGate`), the run registry, the pause gate and
 /// the readiness gate every dispatched run consults, and the in-memory
-/// `last_fire` cadence map SPEC-2.2's scheduler relies on.
+/// `last_fire` cadence map SPEC-2.2.1 through SPEC-2.2.2's scheduler relies on.
 struct Dispatcher {
     paths: Paths,
     pool: DbPool,
@@ -1465,13 +1465,13 @@ struct Dispatcher {
     /// whose re-gather finds no fresh work (and thus creates no run row) is
     /// still not re-fired every 5s tick.
     last_fire: Mutex<HashMap<String, DateTime<Utc>>>,
-    /// SPEC-2.2: when the scheduler first saw a `cron` action with no run yet, which
+    /// SPEC-2.2.1 through SPEC-2.2.2: when the scheduler first saw a `cron` action with no run yet, which
     /// is where counting toward its next matching instant starts.
     first_seen: Mutex<HashMap<String, DateTime<Utc>>>,
 }
 
 impl Dispatcher {
-    /// SPEC-2.2: overlapping runs are allowed; the scheduler and the trigger
+    /// SPEC-2.2.1 through SPEC-2.2.2: overlapping runs are allowed; the scheduler and the trigger
     /// consumer both dispatch through this path.
     ///
     /// Start an (overlapping) run for `action_name`. Unlike the previous
@@ -1499,7 +1499,7 @@ impl Dispatcher {
         });
     }
 
-    /// SPEC-3.7: checks readiness, then the global pause, then the
+    /// SPEC-3.7.1 through SPEC-3.7.3: checks readiness, then the global pause, then the
     /// per-action pause, in that order, before a run is allowed to start.
     async fn execute(&self, action_name: &str, trigger_source: &'static str) -> Result<()> {
         // Readiness first: an unconfigured instance cannot spawn an agent, and a
@@ -1562,10 +1562,10 @@ impl Dispatcher {
     }
 }
 
-/// SPEC-6.3: resolves the run's spend ceiling and checks
+/// SPEC-6.3.1 through SPEC-6.3.2: resolves the run's spend ceiling and checks
 /// the daily run-count cap and daily budget for every kind before any work
 /// starts, refusing with `exit::DAILY_CAP` (4) or `exit::OVER_BUDGET` (6).
-/// SPEC-3.1: the concurrency-key admission check drops a gathered job whose
+/// SPEC-3.1.1 through SPEC-3.1.12: the concurrency-key admission check drops a gathered job whose
 /// key is already in flight in an overlapping run, and dedupes by
 /// concurrency key rather than issue id.
 ///
@@ -1870,7 +1870,7 @@ pub async fn run_action_inner(
     Ok(exit_code)
 }
 
-/// SPEC-10: an explicit cap wins; auto (0) resolves to the max enabled
+/// SPEC-10.2.1 through SPEC-10.2.8: an explicit cap wins; auto (0) resolves to the max enabled
 /// action's `max_parallel`, floored to 1.
 ///
 /// Resolve the effective global concurrency cap. An explicit
@@ -1892,7 +1892,7 @@ pub fn resolve_global_cap(cfg: &ConcurrencyConfig, actions: &[ActionIndexRow]) -
         .max(1)
 }
 
-/// SPEC-2.2: the drain wait after SIGTERM trips every in-flight run's
+/// SPEC-2.2.1 through SPEC-2.2.2: the drain wait after SIGTERM trips every in-flight run's
 /// cancellation token, bounded by the caller's 30s grace timeout.
 ///
 /// Resolve once every in-flight run has unregistered, i.e. all the
@@ -1905,7 +1905,7 @@ async fn wait_for_runs_drain(runs: &RunRegistry) {
     }
 }
 
-/// SPEC-3.8: periodic workdir GC on the hourly tick.
+/// SPEC-3.8.1 through SPEC-3.8.21: periodic workdir GC on the hourly tick.
 ///
 /// Periodic workdir GC. The `tokio::time::interval` fires its first
 /// tick immediately, so this both performs the serve-start sweep and the hourly
@@ -1944,7 +1944,7 @@ async fn gc_loop(paths: Paths, cfg: Arc<tokio::sync::RwLock<crate::config::Workd
     }
 }
 
-/// SPEC-3.8: periodic DB retention sweep on the hourly tick.
+/// SPEC-3.8.1 through SPEC-3.8.21: periodic DB retention sweep on the hourly tick.
 ///
 /// Periodic DB retention sweep. Prunes the unbounded history tables
 /// past the configured window on the [`GC_TICK_SECS`] cadence, reading the live
@@ -1971,7 +1971,7 @@ async fn retention_loop(
     }
 }
 
-/// SPEC-3.8 / SPEC-3.11: periodic Docker volume GC and storage-ceiling
+/// SPEC-3.8.1 through SPEC-3.8.21 / SPEC-3.11.1 through SPEC-3.11.6: periodic Docker volume GC and storage-ceiling
 /// reclaim on the hourly tick.
 ///
 /// Periodic Docker sidecar GC, on the [`GC_TICK_SECS`] cadence the other
@@ -1980,7 +1980,7 @@ async fn retention_loop(
 /// Settings save applies on the next pass. Talking to the Docker daemon is
 /// blocking I/O (subprocess calls), so it runs on a blocking thread.
 ///
-/// SPEC-3.11's reclaim pass is skipped (logged, never silently) while any run
+/// SPEC-3.11.1 through SPEC-3.11.6's reclaim pass is skipped (logged, never silently) while any run
 /// is in flight, since a run may be using the sidecar; the named-volume sweep
 /// alone was already safe to run regardless (it only ever removes a volume no
 /// container references), so [`crate::gc::reclaim_docker_storage`] folds that
@@ -2019,7 +2019,7 @@ async fn docker_gc_loop(
     }
 }
 
-/// `SPEC-3.10` item 6, resolve each in-flight `(action_name,
+/// `SPEC-3.10.7`, resolve each in-flight `(action_name,
 /// job_key)` pair to the repo-slug of the git remote its workdir points at,
 /// which is the same slug the shared `cargo-target/<repo-slug>` directory is
 /// named for. This is blocking I/O (a `git remote get-url` subprocess per
@@ -2073,7 +2073,7 @@ fn inflight_cargo_repos(
     repos
 }
 
-/// `SPEC-3.10` item 6, periodic sweep of the shared Cargo target
+/// `SPEC-3.10.7`, periodic sweep of the shared Cargo target
 /// cache, on the same [`GC_TICK_SECS`] cadence as the other sweeps. A failed
 /// read of `run_inflight_jobs` is treated as "evidence unavailable" rather
 /// than skipping the sweep outright, since an unavailable-evidence pass still
@@ -2131,7 +2131,7 @@ async fn cargo_cache_gc_loop(
     }
 }
 
-/// SPEC-3.8: the in-flight evidence the stream-log sweep uses to protect a
+/// SPEC-3.8.1 through SPEC-3.8.21: the in-flight evidence the stream-log sweep uses to protect a
 /// running job's log from deletion.
 ///
 /// The `(action_name, job_key)` pairs whose job is running right
@@ -2159,7 +2159,7 @@ async fn inflight_stream_log_jobs(
     Ok(rows.into_iter().collect())
 }
 
-/// SPEC-3.8: periodic stream-log, snippet, size-bounded log, and
+/// SPEC-3.8.1 through SPEC-3.8.21: periodic stream-log, snippet, size-bounded log, and
 /// webhook-log GC on the hourly tick.
 ///
 /// Periodic log GC, on the [`GC_TICK_SECS`] cadence the other two
@@ -2271,7 +2271,7 @@ async fn stream_log_gc_loop(
     }
 }
 
-/// SPEC-2.2: the automerge reconciler's 300-second tick, the backstop for a
+/// SPEC-2.2.1 through SPEC-2.2.2: the automerge reconciler's 300-second tick, the backstop for a
 /// missed, dropped, or too-early Action Run success webhook.
 ///
 /// The automerge reconciler's own tick. Independent of both the
@@ -2311,7 +2311,7 @@ async fn automerge_reconciler_loop(
     }
 }
 
-/// SPEC-3.12 item 2: the stuck-Working sweep's tick, the same cadence as the
+/// SPEC-3.12.3: the stuck-Working sweep's tick, the same cadence as the
 /// automerge reconciler (`AUTOMERGE_RECONCILE_TICK_SECS`) since both are a
 /// live-daemon backstop with no reason to run on a different schedule.
 ///
@@ -2415,7 +2415,7 @@ const LOGIN_PROBE_INTERVAL_READY_SECS: u64 = 600;
 /// than the ready-state cadence.
 const LOGIN_PROBE_INTERVAL_LOGIN_REQUIRED_SECS: u64 = 60;
 
-/// SPEC-7.4 / SPEC-2.2: the login status probe loop, every 600 seconds while
+/// SPEC-7.4.1 / SPEC-2.2.1 through SPEC-2.2.2: the login status probe loop, every 600 seconds while
 /// ready and every 60 seconds while login-required.
 ///
 /// Periodically probe whether the agent's own Claude login is
@@ -2447,7 +2447,7 @@ async fn login_probe_loop(
     }
 }
 
-/// SPEC-7.4: one probe pass; trips or clears the login-required axis per the
+/// SPEC-7.4.1: one probe pass; trips or clears the login-required axis per the
 /// probe outcome, leaving readiness unchanged on an indeterminate result.
 ///
 /// One pass of [`login_probe_loop`], factored out so it is unit-testable
@@ -2496,7 +2496,7 @@ async fn login_probe_tick(
     }
 }
 
-/// SPEC-2.2: the scheduler's 5-second tick.
+/// SPEC-2.2.1 through SPEC-2.2.2: the scheduler's 5-second tick.
 async fn scheduler_loop(
     dispatch: Arc<Dispatcher>,
     _trigger_tx: mpsc::Sender<String>,
@@ -2510,7 +2510,7 @@ async fn scheduler_loop(
     }
 }
 
-/// SPEC-2.2: a failed pause read skips only that action's pickup for this
+/// SPEC-2.2.1 through SPEC-2.2.2: a failed pause read skips only that action's pickup for this
 /// tick rather than aborting the whole tick.
 ///
 /// What one action's pause read means for this tick's fire decision.
@@ -2525,9 +2525,9 @@ fn pause_read_skips_pickup<T>(status: &Result<Option<T>>) -> bool {
     }
 }
 
-/// SPEC-2.2: one scheduler tick: rescans actions, refreshes global pause and
+/// SPEC-2.2.1 through SPEC-2.2.2: one scheduler tick: rescans actions, refreshes global pause and
 /// readiness, resolves the effective concurrency cap, then fires a pickup
-/// per enabled, unpaused, non-manual action whose schedule (SPEC-3.1) is due,
+/// per enabled, unpaused, non-manual action whose schedule (SPEC-3.1.1 through SPEC-3.1.12) is due,
 /// gated on the in-memory re-gather cadence, no gather in flight, and a free
 /// concurrency slot.
 async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
@@ -2592,7 +2592,7 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
         if !scheduler::regather_due(last_fire, now, interval) {
             continue;
         }
-        // SPEC-2.2: the action's own schedule decides whether it is due at all.
+        // SPEC-2.2.1 through SPEC-2.2.2: the action's own schedule decides whether it is due at all.
         // Checked after the cadence so an idle action queries once per re-gather.
         if !schedule_due(dispatch, &r, kind, now).await {
             continue;
@@ -2617,7 +2617,7 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
     Ok(())
 }
 
-/// SPEC-2.2: whether an action's own schedule makes it due, measured from its last
+/// SPEC-2.2.1 through SPEC-2.2.2: whether an action's own schedule makes it due, measured from its last
 /// run's `started_at`. An empty re-gather creates no run, so an action with nothing
 /// to do stays due and keeps re-gathering at the cadence. Never run, `interval` is
 /// due at once, and `cron` counts from when the scheduler first saw it.
@@ -2662,7 +2662,7 @@ async fn schedule_due(
     scheduler::next_fire_due(&parsed, anchor, now).is_some()
 }
 
-/// SPEC-2.2: the trigger consumer task; runs actions requested by `trigger`.
+/// SPEC-2.2.1 through SPEC-2.2.2: the trigger consumer task; runs actions requested by `trigger`.
 async fn trigger_consumer(dispatch: Arc<Dispatcher>, mut rx: mpsc::Receiver<String>) -> Result<()> {
     while let Some(name) = rx.recv().await {
         info!(action = %name, "trigger received");
@@ -2680,7 +2680,7 @@ pub fn daemon_pidfile_path(paths: &Paths) -> PathBuf {
     paths.runtime_dir.join("daemon.pid")
 }
 
-/// SPEC-2.2 / SPEC-4.1: the `serve --no-socket` marker a daemonless caller
+/// SPEC-2.2.1 through SPEC-2.2.2 / SPEC-4.1.1 through SPEC-4.1.4: the `serve --no-socket` marker a daemonless caller
 /// uses, alongside the pidfile's liveness, to classify daemon presence.
 ///
 /// Marker written next to the pidfile for the lifetime of a `serve
@@ -2699,7 +2699,7 @@ pub fn read_pidfile(paths: &Paths) -> Option<i32> {
     contents.trim().parse::<i32>().ok()
 }
 
-/// SPEC-2.2 / SPEC-4.1: the three-way classification (running-no-socket /
+/// SPEC-2.2.1 through SPEC-2.2.2 / SPEC-4.1.1 through SPEC-4.1.4: the three-way classification (running-no-socket /
 /// undetermined / not-running) a daemonless caller resolves to.
 ///
 /// What a daemonless caller (one that could not reach the unix socket) can
@@ -2720,7 +2720,7 @@ pub enum DaemonPresence {
     Undetermined(String),
 }
 
-/// SPEC-2.2 / SPEC-4.1: never guesses "not running" from a missing socket
+/// SPEC-2.2.1 through SPEC-2.2.2 / SPEC-4.1.1 through SPEC-4.1.4: never guesses "not running" from a missing socket
 /// alone; derives presence from the pidfile lock's liveness and the
 /// `--no-socket` marker.
 ///
@@ -3162,7 +3162,7 @@ mod tests {
         );
     }
 
-    /// SPEC-2.2: an action's own schedule decides whether it is due, measured from
+    /// SPEC-2.2.1 through SPEC-2.2.2: an action's own schedule decides whether it is due, measured from
     /// its last run's `started_at`.
     #[tokio::test]
     async fn schedules_are_measured_from_the_last_run() {
@@ -3220,7 +3220,7 @@ mod tests {
         assert!(!schedule_due(&dispatch, &row("bad", "cron", "not cron"), "cron", mins(10)).await);
     }
 
-    /// SPEC-2.2: the scheduler tick honours the schedule: a recent run holds an
+    /// SPEC-2.2.1 through SPEC-2.2.2: the scheduler tick honours the schedule: a recent run holds an
     /// `interval` action back even though the re-gather cadence has elapsed.
     #[tokio::test]
     async fn a_recent_run_holds_an_interval_action_back() {
@@ -3530,7 +3530,7 @@ mod tests {
         );
     }
 
-    /// SPEC-3.14 item 4: a scripted action's attempt (the other half of
+    /// SPEC-3.14.5: a scripted action's attempt (the other half of
     /// `ActionKind`, alongside `youtrack`) must get step data too, not only
     /// the native `youtrack` handler's attempts. Runs a real scripted job
     /// through `run_action_inner` -> `job::process_job` with a stub claude
