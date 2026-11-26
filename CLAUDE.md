@@ -113,6 +113,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - At most `max_ci_in_flight_per_repo` runner PRs per repo have CI pending: pickups defer, branch updates wait ([details](docs/conventions/merge.md#ci-in-flight-cap))
 - The runner writes no `State` on merge; a YouTrack workflow resolves the issue ([details](docs/conventions/merge.md#state-on-merge-is-a-youtrack-workflow))
 - A checkpoint-opened PR is `salvaged` from the moment it is opened, not only after a timeout ([details](docs/conventions/merge.md#salvaged-prs-block-automerge))
+- `automerge.branch_up_to_date` (`match_forge`/`require`/`dont_require`) governs whether a behind-base PR updates before merging ([details](docs/conventions/merge.md#branch-up-to-date-setting))
 
 ### Claude invocation and runtime
 
