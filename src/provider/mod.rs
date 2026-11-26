@@ -910,6 +910,31 @@ pub trait Forge: Send + Sync {
         )))
     }
 
+    /// Whether this forge's own branch-protection rule for `base_ref` in
+    /// `repo` on `host` blocks a merge while the branch is behind base
+    /// (Forgejo's `block_on_outdated_branch`). `Ok(None)` means this read is
+    /// not supported by this backend, which [`Automerge::branch_up_to_date`]'s
+    /// `MatchForge` resolution treats the same as `DontRequire`; this is NOT
+    /// an error. The default returns `Ok(None)`, matching GitHub (the rule is
+    /// not readable through `gh`) and every test-only stub. Forgejo's CLI
+    /// backend overrides this to read `fj --host <host> repo
+    /// branch-protection <repo> list --json` and resolve the rule matching
+    /// `base_ref` (an exact `rule_name` match first, else the first rule
+    /// whose `rule_name` glob-matches `base_ref`), returning its
+    /// `block_on_outdated_branch`; a failed or unparsable read is an `Err`
+    /// naming the repo and base branch, never defaulted to `None` or `false`.
+    ///
+    /// [`Automerge::branch_up_to_date`]: crate::action::Automerge::branch_up_to_date
+    fn branch_requires_up_to_date(
+        &self,
+        host: &str,
+        repo: &str,
+        base_ref: &str,
+    ) -> Result<Option<bool>> {
+        let _ = (host, repo, base_ref);
+        Ok(None)
+    }
+
     /// Add Forgejo labels to PR `pr_number` in `repo` on `host`
     /// (`fj pr edit <repo>#<n> labels --add <label>`). Used to flag a PR Needs
     /// Review when the per-PR auto-fix ceiling is reached. The default errors so
