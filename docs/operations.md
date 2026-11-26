@@ -170,7 +170,7 @@ run dispatched before its row exists and the row catches a run started by a daem
 ## Docker storage prune from the Status page (SPEC-3.11.5)
 
 The **Management** part of `/status` also lists the sidecar's Docker storage by category: stopped containers, images,
-build cache, and unreferenced volumes (the same four categories [Docker storage ceiling reclaim](conventions/retention.md#docker-storage-ceiling-reclaim-spec-311)
+build cache, and unreferenced volumes (the same four categories [Docker storage ceiling reclaim](conventions/retention.md#docker-storage-ceiling-reclaim-spec-3111-through-spec-3116)
 reads for its ceiling check). Each row's size comes from one `DockerVolumeClient::usage()` read shared across all four
 rows, so a single unreachable daemon shows the same "unknown" plus the read's error on every row rather than querying
 per category; a Prune button next to each row removes everything currently in that category, with a confirmation

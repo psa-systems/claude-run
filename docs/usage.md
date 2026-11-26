@@ -197,7 +197,7 @@ and the attempt-cap banner. The diagnostics banner is one line: how many `warn`/
   category (SPEC-3.11.5: stopped containers, images, build cache, unreferenced volumes), each with its
   size, or "unknown" with the read's error when the usage read fails, and a Prune button that removes everything in
   that category now; a prune is refused with `409` while any run is in flight, and a failed prune is shown rather than
-  swallowed. See [Docker storage prune from the Status page](operations.md#docker-storage-prune-from-the-status-page-spec-311-item-4).
+  swallowed. See [Docker storage prune from the Status page](operations.md#docker-storage-prune-from-the-status-page-spec-3115).
 
 ## Access check
 

@@ -132,8 +132,8 @@ Each line names one rule and links its full text. A new convention adds one inde
 - `logs/` stream logs are bounded by their own age sweep ([details](docs/conventions/retention.md#stream-log-sweep))
 - `daemon.log`, `output.file` and `usage.jsonl` are bounded by SIZE on the same tick ([details](docs/conventions/retention.md#size-bounded-log-files))
 - `snippets/` and `webhook-logs/` are bounded by AGE on the same tick ([details](docs/conventions/retention.md#snippet-and-webhook-log-sweeps))
-- Over `docker_gc.max_bytes`, storage is reclaimed in a fixed order until under it; a run in flight skips the pass ([details](docs/conventions/retention.md#docker-storage-ceiling-reclaim-spec-311))
-- A repo's shared Cargo target cache over `cargo_cache.max_bytes_per_repo` is deleted once no run for that repo is in flight ([details](docs/conventions/retention.md#per-repo-cargo-target-cache-ceiling-spec-310-item-6))
+- Over `docker_gc.max_bytes`, storage is reclaimed in a fixed order until under it; a run in flight skips the pass ([details](docs/conventions/retention.md#docker-storage-ceiling-reclaim-spec-3111-through-spec-3116))
+- A repo's shared Cargo target cache over `cargo_cache.max_bytes_per_repo` is deleted once no run for that repo is in flight ([details](docs/conventions/retention.md#per-repo-cargo-target-cache-ceiling-spec-3107))
 
 ## Phases
 
