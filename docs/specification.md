@@ -455,9 +455,8 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
 - Processing: fetch the job logs (`fj actions logs`), redact secrets, fingerprint the failure (3.5.2), match or store it
   in `ci_failures`, then triage into a bucket (3.5.1) and act:
   - `code_fix`: create a tracker issue; set the queued value only when `webhook.queue_fix_issues` is true.
-  - `auto_fix`: set only by deterministic detectors (`cargo-fmt` signature; failing workflows named in
-    `mint.detect_fixable.checks_workflows`, default `check.yml`, and only with the mechanical signature of
-    `SPEC-4.4.6`) when the failing branch has no open PR; skipped when `mint.detect_fixable.enabled` is false.
+  - `auto_fix`: set only by a deterministic detector (the `cargo-fmt` signature) when the failing branch has no open
+    PR; skipped when `mint.detect_fixable.enabled` is false.
   - `human_action`: create an issue assigned to `mint.human_assignee` when set, no queue.
   - `transient`: no issue. An infrastructure failure kind is stored on the failure row.
 - Branches matching `mint.bot_branch_prefixes` (default `renovate/`) never route to `code_fix` or `auto_fix`.
@@ -491,8 +490,7 @@ Hybrid: a cheap deterministic pass runs first and only the residue it cannot lab
   with no LLM call.
 - A branch matching `mint.bot_branch_prefixes` always routes to `human_action` before auto-fix or the classifier run:
   the owning bot force-pushes/rebases that branch on its own schedule, so a fix pushed there would be wiped.
-- Deterministic auto-fix detectors (cargo-fmt signature; a failing workflow named in `mint.detect_fixable.checks_workflows`)
-  run next, only when the failing branch has no open PR, and only when `mint.detect_fixable.enabled`; a match routes to
+- The deterministic auto-fix detector (cargo-fmt signature) runs next, only when the failing branch has no open PR, and only when `mint.detect_fixable.enabled`; a match routes to
   `auto_fix` with no LLM call.
 - The residue goes to one tool-using `claude` session (`Read,Grep,Bash`) over the complete redacted log plus the
   failing workflow YAML, ending with a fenced JSON verdict: `code_defect` maps to `code_fix`, `needs_human` to
@@ -1560,7 +1558,7 @@ delivery that is not `issue_comment` (except `ping`) is acked and dropped before
   apply to this setting. A human-authored PR's failure never mints an issue, even when it is seen on a second branch:
   `SPEC-4.4.3`'s promotion of a `pr_only` row to a minted issue does not apply.
 - Two settings, named for what each does:
-  - `mint.detect_fixable` (`enabled`, `checks_workflows`; Issue minting section) decides
+  - `mint.detect_fixable` (`enabled`; Issue minting section) decides
     whether the deterministic detectors run. When true, a detector match is minted as `auto_fix` (`Auto-fix:` title,
     runner-spec body, no analysis). When false, no detector runs and the failure goes to the analysis pass and is
     minted as `CI failure:`.
@@ -1568,9 +1566,9 @@ delivery that is not `issue_comment` (except `ping`) is acked and dropped before
     `code_fix` or `auto_fix` issue gets `AI Agent` set to the queued value. When false, the issue is still created
     and `AI Agent` stays unset.
   Neither setting decides whether an issue is created.
-- The `checks_workflows` detector matches only when the log also shows a failure the runner can fix mechanically
-  (the `cargo-fmt` signature or another named detector). A failed workflow named in `checks_workflows` with no such
-  signature is not an `auto_fix`; it goes to the analysis pass.
+- A detector matches only when the log shows a failure the runner can fix mechanically; today that is the `cargo-fmt`
+  signature. A failed workflow with no such signature, whatever its name, is not an `auto_fix`; it goes to the
+  analysis pass. There is no workflow-name setting.
 - Every field of every Settings section that more than one action reads, and in particular Issue minting, has a row in
   that section's notes table, and the table states which actions read the field. The table has one column per action
   (`webhook-triage`, `webhook-comment`) holding a checkmark where that action reads the field, or a single "Used by"
