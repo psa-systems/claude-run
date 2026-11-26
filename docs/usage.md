@@ -183,7 +183,7 @@ and the attempt-cap banner. The diagnostics banner is one line: how many `warn`/
   row per probe. `/secrets` grows a per-secret **Check** button that lands here with that credential's identity probe
   already run. See "Access check".
 - **Reports** (`/reports`) is the historical reporting page (spend / runs / time-of-day / day-of-week),
-  global by default and narrowable with `action` + `range` query params. With peering enabled (`SPEC-3.17.1` through `SPEC-3.17.12`) it also
+  global by default and narrowable with `action` + `range` query params. With peering enabled (`SPEC-3.17.1` through `SPEC-3.17.22`) it also
   takes an `instance` param (`all`, `local` or a peer name), merges this instance with every peer's replicated run
   summaries by default, and names any peer that is unknown or behind with its last sync time. Its "Claude plan usage" section
   charts the Claude subscription's own rate-limit utilization (five-hour and seven-day windows, 0-100%) per `claude`

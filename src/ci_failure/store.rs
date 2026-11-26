@@ -735,6 +735,29 @@ pub async fn agent_pr(
     row.as_ref().map(agent_pr_from_row).transpose()
 }
 
+/// SPEC-3.17.14: the agent's PR on `(host, repo)` whose head branch is `branch`, preferring an `open`
+/// row, for a peer's PR-form work query that names the branch instead of the number.
+pub async fn agent_pr_by_branch(
+    pool: &DbPool,
+    host: &str,
+    repo: &str,
+    branch: &str,
+) -> Result<Option<AgentPullRequest>> {
+    let row = sqlx::query(sqlx::AssertSqlSafe(db::q(
+        pool,
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, ready, failed, created_at, updated_at, \
+         conflict_resolve_attempts, conflict_resolve_started_at, conflict_files \
+         FROM agent_pull_requests WHERE host = ? AND repo = ? AND head_branch = ? \
+         ORDER BY CASE WHEN state = 'open' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1",
+    ).into_owned()))
+    .bind(host)
+    .bind(repo)
+    .bind(branch)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(agent_pr_from_row).transpose()
+}
+
 /// SPEC-3.5.14 through SPEC-3.5.18: the agent PR filed against `issue_key` that a re-queue should continue:
 /// the `open` row when one exists (an issue carries at most one open agent PR
 /// at a time), falling back to the most recently updated row otherwise. Over
@@ -778,6 +801,23 @@ pub async fn open_agent_prs(pool: &DbPool) -> Result<Vec<AgentPullRequest>> {
     .fetch_all(pool)
     .await?;
     rows.iter().map(agent_pr_from_row).collect()
+}
+
+/// SPEC-3.17.16: set `id`'s `fix_attempts` to `attempts`, for a PR adopted from a peer with the peer's count.
+pub async fn set_fix_attempts(pool: &DbPool, id: i64, attempts: i64, now: &str) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(
+        db::q(
+            pool,
+            "UPDATE agent_pull_requests SET fix_attempts = ?, updated_at = ? WHERE id = ?",
+        )
+        .into_owned(),
+    ))
+    .bind(attempts)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// SPEC-3.5.1 through SPEC-3.5.18 / SPEC-3.5.14 through SPEC-3.5.18: increment `id`'s `fix_attempts` by one.

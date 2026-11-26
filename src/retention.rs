@@ -130,6 +130,26 @@ pub async fn prune_peer_claims(pool: &DbPool, now: DateTime<Utc>) -> Result<u64>
     Ok(deleted)
 }
 
+/// SPEC-3.17.21: `peer_work_events` rows older than this are pruned, fixed like [`PEER_CLAIMS_TTL_HOURS`].
+pub const PEER_WORK_EVENTS_TTL_HOURS: i64 = 24;
+
+/// SPEC-3.8.14 through SPEC-3.8.16 / SPEC-3.17.21: delete `peer_work_events` rows received before
+/// `now - 24h`. Returns the number deleted.
+pub async fn prune_peer_work_events(pool: &DbPool, now: DateTime<Utc>) -> Result<u64> {
+    let cutoff = (now - Duration::hours(PEER_WORK_EVENTS_TTL_HOURS)).to_rfc3339();
+    let res = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(pool, "DELETE FROM peer_work_events WHERE received_at < ?").into_owned(),
+    ))
+    .bind(&cutoff)
+    .execute(pool)
+    .await?;
+    let deleted = res.rows_affected();
+    if deleted > 0 {
+        tracing::info!(deleted, cutoff = %cutoff, "db retention: pruned peer_work_events older than 24 hours");
+    }
+    Ok(deleted)
+}
+
 /// SPEC-3.8.14 through SPEC-3.8.16: prune every table in [`RETENTION_TABLES`] to the retention
 /// window, using `now` to compute the cutoff (`now - retention_days`). A
 /// disabled config is a no-op. `now` is injected so a test can age rows by
@@ -143,6 +163,7 @@ pub async fn sweep(
     // Not a history table: claims are bounded by a fixed 24 hours whatever the
     // operator's retention setting, so this runs even when retention is off.
     stats.deleted += prune_peer_claims(pool, now).await?;
+    stats.deleted += prune_peer_work_events(pool, now).await?;
     if !cfg.enabled {
         return Ok(stats);
     }
@@ -286,6 +307,39 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn sweep_prunes_peer_work_events_older_than_24_hours_even_with_retention_off() {
+        let pool = pool().await;
+        let now = Utc::now();
+        for (run_id, age_hours) in [(1i64, 25), (2i64, 23)] {
+            crate::state::peer_work_event_insert(
+                &pool,
+                &crate::state::PeerWorkEvent {
+                    instance_id: "peer-a".into(),
+                    run_id,
+                    event: "outcome".into(),
+                    key: "PROJ-1".into(),
+                    pr_number: None,
+                    at: now.to_rfc3339(),
+                    received_at: (now - Duration::hours(age_hours)).to_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let cfg = DbRetentionConfig {
+            enabled: false,
+            ..DbRetentionConfig::default()
+        };
+        let stats = sweep(&pool, &cfg, now).await.unwrap();
+        assert_eq!(stats.deleted, 1);
+        let left = crate::state::peer_work_events_recent(&pool, 10)
+            .await
+            .unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].run_id, 2, "only the 23-hour-old notice survives");
     }
 
     #[tokio::test]

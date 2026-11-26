@@ -62,6 +62,7 @@ pub const TABLES: &[&str] = &[
     "agent_pull_requests",
     "claude_invocations",
     "peer_claims",
+    "peer_work_events",
     "run_summaries",
     "peer_cursors",
 ];
@@ -800,6 +801,19 @@ mod tests {
         .bind("instance-a")
         .bind(2i64)
         .bind("2026-09-01T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(q(
+            "INSERT INTO peer_work_events (instance_id, run_id, event, key, pr_number, at, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )))
+        .bind("instance-a")
+        .bind(7i64)
+        .bind("outcome")
+        .bind("PROJ-1")
+        .bind(None::<i64>)
+        .bind("2026-09-01T00:00:00Z")
+        .bind("2026-09-01T00:00:01Z")
         .execute(pool)
         .await
         .unwrap();

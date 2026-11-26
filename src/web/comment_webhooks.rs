@@ -687,6 +687,24 @@ async fn forgejo_comment_webhook(
             } else {
                 None
             };
+            let named_pr = if command.is_pull_request {
+                crate::peer::EventPr::Number(command.number as i64)
+            } else {
+                crate::peer::EventPr::None
+            };
+            if let Some(resp) = crate::web::webhooks::ownership_or_drop(
+                &st.claims,
+                Some(command.host.clone()),
+                &command.repo,
+                named_pr,
+                &format!("comment {}", command.comment_id),
+                &source,
+                delivery,
+            )
+            .await
+            {
+                return resp;
+            }
             if let Some(resp) = crate::web::webhooks::claim_or_drop(
                 &st.claims,
                 key,

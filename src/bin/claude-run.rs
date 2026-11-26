@@ -705,6 +705,7 @@ async fn run_action(
     // ceiling exits `exit::OVER_BUDGET` rather than reporting success.
     daemon::run_action_inner(
         &loaded, paths, &pool, snippet, claude, "cli", None, &keygate, &limiter, &pause, &gather,
+        None,
     )
     .await
 }
