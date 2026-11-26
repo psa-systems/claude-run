@@ -454,10 +454,10 @@ marker comment (`Report-Window:`) on the parent so one report is filed per windo
   with action `closed` reconciles recorded agent PRs; other PR actions are acknowledged and dropped.
 - Processing: fetch the job logs (`fj actions logs`), redact secrets, fingerprint the failure (3.5.2), match or store it
   in `ci_failures`, then triage into a bucket (3.5.1) and act:
-  - `code_fix`: create a tracker issue; set the queued value only when `webhook.auto_fix` is true.
+  - `code_fix`: create a tracker issue; set the queued value only when `webhook.queue_fix_issues` is true.
   - `auto_fix`: set only by deterministic detectors (`cargo-fmt` signature; failing workflows named in
-    `mint.auto_fix.checks_workflows`, default `check.yml`) when the failing branch has no open PR; skipped when
-    `mint.auto_fix.enabled` is false.
+    `mint.detect_fixable.checks_workflows`, default `check.yml`, and only with the mechanical signature of
+    `SPEC-4.4.6`) when the failing branch has no open PR; skipped when `mint.detect_fixable.enabled` is false.
   - `human_action`: create an issue assigned to `mint.human_assignee` when set, no queue.
   - `transient`: no issue. An infrastructure failure kind is stored on the failure row.
 - Branches matching `mint.bot_branch_prefixes` (default `renovate/`) never route to `code_fix` or `auto_fix`.
@@ -491,8 +491,8 @@ Hybrid: a cheap deterministic pass runs first and only the residue it cannot lab
   with no LLM call.
 - A branch matching `mint.bot_branch_prefixes` always routes to `human_action` before auto-fix or the classifier run:
   the owning bot force-pushes/rebases that branch on its own schedule, so a fix pushed there would be wiped.
-- Deterministic auto-fix detectors (cargo-fmt signature; a failing workflow named in `mint.auto_fix.checks_workflows`)
-  run next, only when the failing branch has no open PR, and only when `mint.auto_fix.enabled`; a match routes to
+- Deterministic auto-fix detectors (cargo-fmt signature; a failing workflow named in `mint.detect_fixable.checks_workflows`)
+  run next, only when the failing branch has no open PR, and only when `mint.detect_fixable.enabled`; a match routes to
   `auto_fix` with no LLM call.
 - The residue goes to one tool-using `claude` session (`Read,Grep,Bash`) over the complete redacted log plus the
   failing workflow YAML, ending with a fenced JSON verdict: `code_defect` maps to `code_fix`, `needs_human` to
@@ -1469,11 +1469,10 @@ configured for a different provider, or a disabled listener returns 404. Pipelin
 - A failure on the agent's own open PR either re-queues the issue or, past a fix-attempt ceiling, flags it `Needs
   Review`; a re-queue is suppressed in favor of `Needs Review` when the new failure's fingerprint set repeats the
   immediately preceding attempt (the loop-breaker).
-- A failure on a human-authored open PR routes by whether its tests overlap an existing `ci_failures` row: an open
-  match attaches (after re-checking the issue is not already resolved); a resolved match reopens and comments; a
-  `pr_only` match on a second distinct branch promotes to a real minted issue, pointing the existing row at the new
-  issue rather than duplicating it, and comments the issue link onto every open PR the failure was sighted on; a
-  first sighting records a `pr_only` row and always comments the PR, minting no issue yet.
+- A failure on a human-authored open PR is handled only when `webhook.pr_analysis` is true (`SPEC-4.4.6`). It then
+  routes by whether its tests overlap an existing `ci_failures` row: an open match attaches (after re-checking the
+  issue is not already resolved) and comments the PR; a resolved match reopens and comments; a first sighting or a
+  `pr_only` match records a `pr_only` row and comments the PR with the analysis. It never mints an issue.
 - On an automerge conflict (an `update_pr_branch` failure), a configured conflict-auto-resolve dispatch sends a
   synthetic command to the comment listener (`SPEC-4.4.5`) instead of leaving a "needs a human" comment.
 - An automerge outcome (conflict dispatch, behind-base update/merge, or clean merge) is recorded and its comment
@@ -1542,6 +1541,40 @@ delivery that is not `issue_comment` (except `ping`) is acked and dropped before
   before any work. The usage reply has no verdict; a synthetic command mentions no one and posts no acknowledgement.
 - Every outcome replies on the originating thread; a served command records one `job_outcomes` row and finalizes
   through the run guard.
+
+#### 4.4.6 CI-failure triage scope (`SPEC-4.4.6`)
+
+- A failed Action run is triaged (log analysis, store match, issue mint) only when the branch it ran on is in the
+  repository's `webhook.triage_branches`: a map from repository pattern (exact `owner/repo`, `owner/*`, or `*`; the
+  most specific match wins) to a list of branch names. The default is `main` and `develop`.
+- A failed run on any other branch, including `specification` and every working branch, is acknowledged and dropped
+  before any `claude` call, store write or mint. The drop is logged at `info` naming the repository, run and branch,
+  and records a webhook run row stating the branch and the setting that excluded it.
+- The branch is read from the run log's environment dump. A run whose branch cannot be derived is not dropped: it is
+  a failure, logged at `error` with the run, and its webhook run row finishes as failed.
+- A failure on the agent's own open PR is not affected by this scope: it keeps the routing of `SPEC-4.4.3` (re-queue,
+  ceiling, loop-breaker).
+- A failure on a human-authored open PR is analyzed and commented on (the third bullet of `SPEC-4.4.3`) only when
+  `webhook.pr_analysis` is true; the default is false. When false, the failure is not analyzed, not commented on, and
+  mints nothing; the drop is logged at `info` naming the repository, run and PR. The branch list above does not
+  apply to this setting. A human-authored PR's failure never mints an issue, even when it is seen on a second branch:
+  `SPEC-4.4.3`'s promotion of a `pr_only` row to a minted issue does not apply.
+- Two settings, named for what each does:
+  - `mint.detect_fixable` (`enabled`, `checks_workflows`; Issue minting section) decides
+    whether the deterministic detectors run. When true, a detector match is minted as `auto_fix` (`Auto-fix:` title,
+    runner-spec body, no analysis). When false, no detector runs and the failure goes to the analysis pass and is
+    minted as `CI failure:`.
+  - `webhook.queue_fix_issues` (Webhook sources section) decides whether a created
+    `code_fix` or `auto_fix` issue gets `AI Agent` set to the queued value. When false, the issue is still created
+    and `AI Agent` stays unset.
+  Neither setting decides whether an issue is created.
+- The `checks_workflows` detector matches only when the log also shows a failure the runner can fix mechanically
+  (the `cargo-fmt` signature or another named detector). A failed workflow named in `checks_workflows` with no such
+  signature is not an `auto_fix`; it goes to the analysis pass.
+- Every field of every Settings section that more than one action reads, and in particular Issue minting, has a row in
+  that section's notes table, and the table states which actions read the field. The table has one column per action
+  (`webhook-triage`, `webhook-comment`) holding a checkmark where that action reads the field, or a single "Used by"
+  column naming the actions in words. A field no action reads is not listed.
 
 ### 4.5 MCP tools
 
