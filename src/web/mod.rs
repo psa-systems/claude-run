@@ -5605,7 +5605,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "detect_fixable",
                 badge: "next event",
-                note: "enabled: run the deterministic detectors (a cargo fmt failure becomes an Auto-fix issue); false sends every failure to the analysis pass as a CI failure issue. checks_workflows is not read by any detector. Whether the issue is queued is the Webhook sources field queue_fix_issues.",
+                note: "enabled: run the deterministic detectors (a cargo fmt failure becomes an Auto-fix issue); false sends every failure to the analysis pass as a CI failure issue. Whether the issue is queued is the Webhook sources field queue_fix_issues.",
                 used_by: USED_BY_TRIAGE,
             },
             FieldDoc {
