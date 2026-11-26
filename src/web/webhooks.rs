@@ -5204,35 +5204,19 @@ async fn effective_branch_up_to_date(
     pr_number: u64,
     setting: crate::action::BranchUpToDate,
 ) -> Result<bool, String> {
-    use crate::action::BranchUpToDate;
-    match setting {
-        BranchUpToDate::Require => Ok(true),
-        BranchUpToDate::DontRequire => Ok(false),
-        BranchUpToDate::MatchForge => {
-            let (forge_for_list, host_owned, repo_owned) =
-                (forge.clone(), host.to_string(), repo.to_string());
-            let prs = tokio::task::spawn_blocking(move || {
-                forge_for_list.list_open_prs(&host_owned, &repo_owned)
-            })
-            .await
-            .map_err(|e| format!("list_open_prs task panicked: {e}"))?
-            .map_err(|e| format!("list_open_prs for {repo} failed: {e}"))?;
-            let base_ref = prs
-                .iter()
-                .find(|p| p.number == pr_number)
-                .map(|p| p.base_ref.clone())
-                .ok_or_else(|| format!("PR #{pr_number} not found in open-PR listing"))?;
-            let (forge_for_check, host_owned, repo_owned) =
-                (forge.clone(), host.to_string(), repo.to_string());
-            let result = tokio::task::spawn_blocking(move || {
-                forge_for_check.branch_requires_up_to_date(&host_owned, &repo_owned, &base_ref)
-            })
-            .await
-            .map_err(|e| format!("branch_requires_up_to_date task panicked: {e}"))?
-            .map_err(|e| format!("branch_requires_up_to_date failed: {e}"))?;
-            Ok(result.unwrap_or(false))
-        }
-    }
+    let (forge_for_resolve, host_owned, repo_owned) =
+        (forge.clone(), host.to_string(), repo.to_string());
+    tokio::task::spawn_blocking(move || {
+        crate::provider::resolve_branch_up_to_date(
+            forge_for_resolve.as_ref(),
+            &host_owned,
+            &repo_owned,
+            pr_number,
+            setting,
+        )
+    })
+    .await
+    .map_err(|e| format!("resolve_branch_up_to_date task panicked: {e}"))?
 }
 
 /// Send one conflict-resolution run for a runner PR that reports

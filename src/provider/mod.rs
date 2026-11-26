@@ -953,6 +953,44 @@ pub trait Forge: Send + Sync {
     }
 }
 
+/// Resolve one `branch_up_to_date` setting to its effective `bool`: `Require`
+/// and `DontRequire` settle without a forge call; `MatchForge` looks up the
+/// PR's own base branch via [`Forge::list_open_prs`], then asks
+/// [`Forge::branch_requires_up_to_date`], treating `Ok(None)` (the read is not
+/// supported by this backend, which is always true for GitHub) the same as
+/// `DontRequire`. `true` means a behind-base PR must update from base before
+/// merging (the pre-setting behavior); `false` means a green, mergeable,
+/// behind-base PR merges directly. A listing or forge-protection-read failure
+/// is returned as `Err` naming the cause, never defaulted. Synchronous:
+/// `crate::web::webhooks`'s async caller runs this through `spawn_blocking`.
+pub fn resolve_branch_up_to_date(
+    forge: &dyn Forge,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    setting: crate::action::BranchUpToDate,
+) -> std::result::Result<bool, String> {
+    use crate::action::BranchUpToDate;
+    match setting {
+        BranchUpToDate::Require => Ok(true),
+        BranchUpToDate::DontRequire => Ok(false),
+        BranchUpToDate::MatchForge => {
+            let prs = forge
+                .list_open_prs(host, repo)
+                .map_err(|e| format!("list_open_prs for {repo} failed: {e}"))?;
+            let base_ref = prs
+                .iter()
+                .find(|p| p.number == pr_number)
+                .map(|p| p.base_ref.clone())
+                .ok_or_else(|| format!("PR #{pr_number} not found in open-PR listing"))?;
+            let result = forge
+                .branch_requires_up_to_date(host, repo, &base_ref)
+                .map_err(|e| format!("branch_requires_up_to_date failed: {e}"))?;
+            Ok(result.unwrap_or(false))
+        }
+    }
+}
+
 /// SPEC-8.2: a backend implementing the full provider surface. Marker
 /// super-trait so the factory can hand callers one object exposing both halves.
 pub trait Backend: IssueTracker + Forge {

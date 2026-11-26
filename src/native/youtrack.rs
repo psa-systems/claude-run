@@ -6934,15 +6934,17 @@ fn append_compaction_note(body: &str, stream_log: Option<&Path>, key: &str) -> S
 /// SPEC-3.3.1's finalize-time merge. After a successful run's PR
 /// is promoted from draft, make ONE status read bounded by
 /// `automerge.finalize_status_timeout_secs` and merge the PR right away when
-/// its checks are already `success`, its branch is not behind base and the
-/// forge reports it mergeable: the same three conditions
-/// `crate::web::webhooks::apply_automerge_decision` merges on. Every other
-/// answer returns `false` and changes nothing, leaving the PR at Code Review
-/// for the webhook and the reconciler, which own the pending, red,
-/// behind-base and not-mergeable cases (and their comments). In particular a
-/// behind-base PR is never branch-updated here, so this path never starts a
-/// new CI run and never takes a `max_ci_in_flight_per_repo` slot;
-/// merging a green PR only ever frees one.
+/// its checks are already `success`, the forge reports it mergeable, and it
+/// is either not behind base or `automerge.branch_up_to_date` resolves (via
+/// [`crate::provider::resolve_branch_up_to_date`]) to not requiring it: the
+/// same conditions `crate::web::webhooks::apply_automerge_decision` merges
+/// on. Every other answer returns `false` and changes nothing, leaving the
+/// PR at Code Review for the webhook and the reconciler, which own the
+/// pending, red, not-mergeable, and behind-base-and-required cases (and their
+/// comments). A behind-base PR is never branch-updated here even when the
+/// setting would require it before merging, so this path never starts a new
+/// CI run and never takes a `max_ci_in_flight_per_repo` slot; merging a green
+/// PR only ever frees one.
 ///
 /// Returns `true` only when the merge landed. A merge failure is logged at
 /// `error` and returns `false`: the next webhook or reconciler pass retries
@@ -6984,7 +6986,26 @@ fn automerge_at_finalize(
         }
     };
     let green = status.state.trim() == "success";
-    if !(green && status.behind_base == Some(false) && status.mergeable == Some(true)) {
+    let base_ok = match status.behind_base {
+        Some(false) => true,
+        Some(true) => {
+            match crate::provider::resolve_branch_up_to_date(
+                forge,
+                host,
+                repo,
+                pr_number,
+                automerge.branch_up_to_date,
+            ) {
+                Ok(requires_up_to_date) => !requires_up_to_date,
+                Err(e) => {
+                    warn!(key = %issue_key, pr_number, error = %e, "finalize-time automerge: branch_up_to_date resolution failed; leaving the PR at Code Review for the webhook and reconciler");
+                    false
+                }
+            }
+        }
+        None => false,
+    };
+    if !(green && base_ok && status.mergeable == Some(true)) {
         info!(
             key = %issue_key,
             pr_number,
@@ -18598,6 +18619,58 @@ mod tests {
                 .iter()
                 .any(|c| c.contains(" pr merge ") || c.contains(" pr update ")),
             "a behind-base PR must be neither merged nor updated at finalize: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_merges_a_green_behind_base_pr_when_branch_up_to_date_is_dont_require() {
+        // `branch_up_to_date: dont_require` resolves without a forge
+        // lookup, so a behind-base PR merges directly at finalize instead of
+        // being left for the webhook/reconciler branch update.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
+            "fj",
+            &FINALIZE_PR_STATUS_ARGS,
+            r#"{"pr":7,"head_sha":"abc","state":"success","mergeable":true,"behind_base":true}"#,
+        ));
+        let forge = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
+        let mut src = automerge_src(10);
+        src.automerge.branch_up_to_date = crate::action::BranchUpToDate::DontRequire;
+        let res = finalize_automerge_case(&forge, &src, dir.path());
+        assert_eq!(res, code_review_pr7(true));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.contains(FINALIZE_PR_MERGE_CALL)),
+            "a behind-base PR must merge directly when branch_up_to_date is dont_require: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains(" pr update ")),
+            "dont_require must never update the branch first: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_leaves_a_green_behind_base_pr_when_branch_up_to_date_is_require() {
+        // `branch_up_to_date: require` keeps the pre-setting behavior: a
+        // behind-base PR is left for the webhook/reconciler branch update,
+        // same as the `match_forge` default against an unreadable forge.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(automerge_finalize_runner_already_ready(&dir.path().join(".git")).ok(
+            "fj",
+            &FINALIZE_PR_STATUS_ARGS,
+            r#"{"pr":7,"head_sha":"abc","state":"success","mergeable":true,"behind_base":true}"#,
+        ));
+        let forge = CliBackend::new(runner.clone()).with_git_retry_waits([Duration::ZERO; 3]);
+        let mut src = automerge_src(10);
+        src.automerge.branch_up_to_date = crate::action::BranchUpToDate::Require;
+        let res = finalize_automerge_case(&forge, &src, dir.path());
+        assert_eq!(res, code_review_pr7(false));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains(" pr merge ") || c.contains(" pr update ")),
+            "a behind-base PR must be neither merged nor updated at finalize when require: {calls:?}"
         );
     }
 
