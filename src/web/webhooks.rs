@@ -5189,6 +5189,52 @@ async fn pr_draft_status(
     Ok(prs.iter().find(|p| p.number == pr_number).map(|p| p.draft))
 }
 
+/// Resolve one decision's effective `branch_up_to_date` value (`Require` and
+/// `DontRequire` settle without a forge call; `MatchForge` asks the forge's
+/// [`Forge::branch_requires_up_to_date`] for the PR's own base branch,
+/// treating `Ok(None)` - the read is not supported by this backend, GitHub
+/// always - the same as `DontRequire`). `Ok(true)` keeps the existing
+/// behind-base-branch-update behavior; `Ok(false)` means a green, mergeable,
+/// behind-base PR merges directly. A listing or forge-protection-read failure
+/// is returned as `Err` naming the cause, never defaulted.
+async fn effective_branch_up_to_date(
+    forge: &Arc<dyn Forge>,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    setting: crate::action::BranchUpToDate,
+) -> Result<bool, String> {
+    use crate::action::BranchUpToDate;
+    match setting {
+        BranchUpToDate::Require => Ok(true),
+        BranchUpToDate::DontRequire => Ok(false),
+        BranchUpToDate::MatchForge => {
+            let (forge_for_list, host_owned, repo_owned) =
+                (forge.clone(), host.to_string(), repo.to_string());
+            let prs = tokio::task::spawn_blocking(move || {
+                forge_for_list.list_open_prs(&host_owned, &repo_owned)
+            })
+            .await
+            .map_err(|e| format!("list_open_prs task panicked: {e}"))?
+            .map_err(|e| format!("list_open_prs for {repo} failed: {e}"))?;
+            let base_ref = prs
+                .iter()
+                .find(|p| p.number == pr_number)
+                .map(|p| p.base_ref.clone())
+                .ok_or_else(|| format!("PR #{pr_number} not found in open-PR listing"))?;
+            let (forge_for_check, host_owned, repo_owned) =
+                (forge.clone(), host.to_string(), repo.to_string());
+            let result = tokio::task::spawn_blocking(move || {
+                forge_for_check.branch_requires_up_to_date(&host_owned, &repo_owned, &base_ref)
+            })
+            .await
+            .map_err(|e| format!("branch_requires_up_to_date task panicked: {e}"))?
+            .map_err(|e| format!("branch_requires_up_to_date failed: {e}"))?;
+            Ok(result.unwrap_or(false))
+        }
+    }
+}
+
 /// Send one conflict-resolution run for a runner PR that reports
 /// `mergeable: false`, whatever its CI state, through the per-repo
 /// push cap. A Forgejo WIP/draft PR reports `mergeable: false` without
@@ -5591,6 +5637,57 @@ async fn apply_automerge_decision(
                 Err(msg)
             }
             Some(true) => {
+                let needs_update = match effective_branch_up_to_date(
+                    &forge,
+                    host,
+                    repo,
+                    pr_number,
+                    youtrack_cfg.automerge.branch_up_to_date,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let msg =
+                            format!("PR #{pr_number}: checking branch_up_to_date setting failed: {e}");
+                        error!(repo = %repo, pr = pr_number, issue = %row.issue_key, error = %e, "action-run success: {msg}");
+                        let body = format!(
+                            "The runner could not check this PR's automerge status: {msg}.\n\nPR: {pr_url}\n\nA later Action Run event or the periodic reconciler will retry automatically."
+                        );
+                        record_automerge_outcome_and_comment_once(
+                            mint,
+                            pool,
+                            AutomergePr {
+                                repo,
+                                pr_number,
+                                issue_key: &row.issue_key,
+                            },
+                            "error",
+                            msg.clone(),
+                            body,
+                            "action-run success: branch-up-to-date-check comment failed",
+                        )
+                        .await;
+                        return Err(msg);
+                    }
+                };
+                if !needs_update {
+                    return merge_or_not_mergeable(
+                        mint,
+                        pool,
+                        &forge,
+                        host,
+                        repo,
+                        pr_number,
+                        pr_url,
+                        row,
+                        &status,
+                        ci_cap,
+                        &github_cfg,
+                        &youtrack_cfg,
+                    )
+                    .await;
+                }
                 // A draft the runner does not own mid-run (a
                 // failed-review leftover) is never acted on here: no branch
                 // update, no comment of any kind, just one `info` log. A
@@ -5775,38 +5872,8 @@ async fn apply_automerge_decision(
                     }
                 }
             }
-            Some(false) if status.mergeable != Some(true) => {
-                // A draft with no conflict verdict (for example one
-                // a no-verdict review left behind) reports `mergeable: false`
-                // and can never merge, so it gets no comment on any pass.
-                if status.conflicted != Some(true) {
-                    match pr_draft_status(&forge, host, repo, pr_number).await {
-                        Ok(Some(Some(true))) => {
-                            info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR is a draft; automerge skipped");
-                            return Ok(AutomergeOutcome::NoAction(
-                                "PR is a draft; automerge skipped".to_string(),
-                            ));
-                        }
-                        Ok(Some(Some(false))) => {}
-                        Ok(Some(None)) => {
-                            warn!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR draft flag unreported by the forge; proceeding");
-                        }
-                        Ok(None) => {
-                            info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR not found in open-PR listing; no action");
-                            return Ok(AutomergeOutcome::NoAction(
-                                "PR not found in open-PR listing; no action".to_string(),
-                            ));
-                        }
-                        Err(msg) => {
-                            let msg = format!("checking PR draft status failed: {msg}");
-                            error!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: {msg}");
-                            record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone())
-                                .await;
-                            return Err(msg);
-                        }
-                    }
-                }
-                let route = route_conflicting_pr(
+            Some(false) => {
+                merge_or_not_mergeable(
                     mint,
                     pool,
                     &forge,
@@ -5817,172 +5884,10 @@ async fn apply_automerge_decision(
                     row,
                     &status,
                     ci_cap,
-                    is_github_host(host, &github_cfg.hosts),
+                    &github_cfg,
+                    &youtrack_cfg,
                 )
-                .await?;
-                match route {
-                    ConflictRoute::Dispatched { attempt, cap } => {
-                        let body = crate::native::youtrack::automerge_conflict_resolving_comment(
-                            pr_url, attempt, cap,
-                        );
-                        record_automerge_outcome_and_comment_once(
-                            mint,
-                            pool,
-                            AutomergePr {
-                                repo,
-                                pr_number,
-                                issue_key: &row.issue_key,
-                            },
-                            "info",
-                            format!(
-                                "not mergeable (conflict auto-resolve dispatched, attempt {attempt} of {cap})"
-                            ),
-                            body,
-                            "action-run success: conflict-resolving comment failed",
-                        )
-                        .await;
-                        return Ok(AutomergeOutcome::Acted(format!(
-                            "PR #{pr_number} not mergeable; conflict auto-resolve dispatched"
-                        )));
-                    }
-                    ConflictRoute::Deferred(reason) => {
-                        return Ok(AutomergeOutcome::NoAction(format!(
-                            "PR #{pr_number} not mergeable; conflict resolution deferred: {reason}"
-                        )));
-                    }
-                    ConflictRoute::InFlight => {
-                        return Ok(AutomergeOutcome::NoAction(format!(
-                            "PR #{pr_number} not mergeable; a conflict auto-resolve run is already in flight"
-                        )));
-                    }
-                    ConflictRoute::CapReached { attempts, cap } => {
-                        return park_unresolved_conflicts(
-                            mint,
-                            pool,
-                            row,
-                            repo,
-                            pr_number,
-                            pr_url,
-                            &youtrack_cfg,
-                            attempts,
-                            cap,
-                        )
-                        .await;
-                    }
-                    ConflictRoute::AlreadyAttempted
-                    | ConflictRoute::NotApplicable
-                    | ConflictRoute::Skipped => {}
-                }
-                let backend = if is_github_host(host, &github_cfg.hosts) {
-                    BehindBaseBackend::GitHub
-                } else {
-                    BehindBaseBackend::Forgejo
-                };
-                let body =
-                    crate::native::youtrack::automerge_not_mergeable_comment(pr_url, backend);
-                record_automerge_outcome_and_comment_once(
-                    mint,
-                    pool,
-                    AutomergePr {
-                        repo,
-                        pr_number,
-                        issue_key: &row.issue_key,
-                    },
-                    "info",
-                    "not mergeable".to_string(),
-                    body,
-                    "action-run success: not-mergeable comment failed",
-                )
-                .await;
-                info!(repo = %repo, pr = pr_number, "action-run success: not mergeable; commented, left at Code Review");
-                Ok(AutomergeOutcome::NoAction(format!(
-                    "PR #{pr_number} not mergeable; commented, left at Code Review"
-                )))
-            }
-            Some(false) => {
-                // A draft that otherwise reads green, mergeable and not
-                // behind base can never actually be merged by the forge, so
-                // this route to `complete_automerge` gets the same draft
-                // check as the `behind_base: Some(true)` and not-mergeable
-                // arms above: one `info` log and no merge, no comment. An
-                // unreported draft flag warns and proceeds as before; a PR
-                // absent from the listing is a no-op the reconciler's own
-                // stale-row retirement handles separately.
-                match pr_draft_status(&forge, host, repo, pr_number).await {
-                    Ok(Some(Some(true))) => {
-                        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR is a draft; automerge skipped");
-                        return Ok(AutomergeOutcome::NoAction(
-                            "PR is a draft; automerge skipped".to_string(),
-                        ));
-                    }
-                    Ok(Some(None)) => {
-                        warn!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR draft flag unreported by the forge; proceeding");
-                    }
-                    Ok(Some(Some(false))) => {}
-                    Ok(None) => {
-                        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR not found in open-PR listing; no action");
-                        return Ok(AutomergeOutcome::NoAction(
-                            "PR not found in open-PR listing; no action".to_string(),
-                        ));
-                    }
-                    Err(msg) => {
-                        let msg = format!("checking PR draft status failed: {msg}");
-                        error!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: {msg}");
-                        record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone())
-                            .await;
-                        return Err(msg);
-                    }
-                }
-                let backend = mint.backend.clone();
-                let forge_for_merge = forge.clone();
-                let host_owned = host.to_string();
-                let repo_owned = repo.to_string();
-                let issue_key = row.issue_key.clone();
-                let pr_url_owned = pr_url.to_string();
-                let merge_result = tokio::task::spawn_blocking(move || {
-                    crate::native::youtrack::complete_automerge(
-                        backend.as_ref(),
-                        forge_for_merge.as_ref(),
-                        &issue_key,
-                        &host_owned,
-                        &repo_owned,
-                        pr_number,
-                        &pr_url_owned,
-                        None,
-                    )
-                })
                 .await
-                .map_err(|e| format!("complete_automerge task panicked: {e}"))?;
-                match merge_result {
-                    Ok(()) => {
-                        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: merged PR; the YouTrack workflow will resolve the issue");
-                        mark_agent_pr_merged(pool, row, repo, pr_number).await?;
-                        Ok(AutomergeOutcome::Acted(format!(
-                            "merged PR #{pr_number}; issue {} left for the YouTrack workflow to resolve",
-                            row.issue_key
-                        )))
-                    }
-                    Err(e) => {
-                        let msg = format!("complete_automerge failed: {e}");
-                        let body =
-                            crate::native::youtrack::automerge_merge_failed_comment(pr_url, &msg);
-                        record_automerge_outcome_and_comment_once(
-                            mint,
-                            pool,
-                            AutomergePr {
-                                repo,
-                                pr_number,
-                                issue_key: &row.issue_key,
-                            },
-                            "error",
-                            msg.clone(),
-                            body,
-                            "action-run success: merge-failed comment failed",
-                        )
-                        .await;
-                        Err(msg)
-                    }
-                }
             }
         },
         "merged" => {
@@ -6049,6 +5954,228 @@ async fn apply_automerge_decision(
             Ok(AutomergeOutcome::NoAction(format!(
                 "PR #{pr_number} checks not successful ({other}); no action"
             )))
+        }
+    }
+}
+
+/// The shared tail of [`apply_automerge_decision`]'s green-CI handling for a
+/// PR that is not (or no longer, per the resolved `branch_up_to_date`
+/// setting) treated as behind base: a not-mergeable PR (a conflict, or a
+/// draft with no verdict yet) is routed to conflict auto-resolve or
+/// commented; a mergeable one is merged via [`complete_automerge`]. Reached
+/// directly for `behind_base: Some(false)`, and for `Some(true)` once the
+/// resolved setting is `false` (the PR is merged without first updating its
+/// branch from base).
+///
+/// [`complete_automerge`]: crate::native::youtrack::complete_automerge
+#[allow(clippy::too_many_arguments)]
+async fn merge_or_not_mergeable(
+    mint: &MintContext,
+    pool: &DbPool,
+    forge: &Arc<dyn Forge>,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    pr_url: &str,
+    row: &ci_failure_store::AgentPullRequest,
+    status: &crate::provider::PrStatus,
+    ci_cap: u32,
+    github_cfg: &crate::action::GithubTarget,
+    youtrack_cfg: &crate::action::YoutrackSource,
+) -> Result<AutomergeOutcome, String> {
+    if status.mergeable != Some(true) {
+        // A draft with no conflict verdict (for example one
+        // a no-verdict review left behind) reports `mergeable: false`
+        // and can never merge, so it gets no comment on any pass.
+        if status.conflicted != Some(true) {
+            match pr_draft_status(forge, host, repo, pr_number).await {
+                Ok(Some(Some(true))) => {
+                    info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR is a draft; automerge skipped");
+                    return Ok(AutomergeOutcome::NoAction(
+                        "PR is a draft; automerge skipped".to_string(),
+                    ));
+                }
+                Ok(Some(Some(false))) => {}
+                Ok(Some(None)) => {
+                    warn!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR draft flag unreported by the forge; proceeding");
+                }
+                Ok(None) => {
+                    info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR not found in open-PR listing; no action");
+                    return Ok(AutomergeOutcome::NoAction(
+                        "PR not found in open-PR listing; no action".to_string(),
+                    ));
+                }
+                Err(msg) => {
+                    let msg = format!("checking PR draft status failed: {msg}");
+                    error!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: {msg}");
+                    record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone()).await;
+                    return Err(msg);
+                }
+            }
+        }
+        let route = route_conflicting_pr(
+            mint,
+            pool,
+            forge,
+            host,
+            repo,
+            pr_number,
+            pr_url,
+            row,
+            status,
+            ci_cap,
+            is_github_host(host, &github_cfg.hosts),
+        )
+        .await?;
+        match route {
+            ConflictRoute::Dispatched { attempt, cap } => {
+                let body = crate::native::youtrack::automerge_conflict_resolving_comment(
+                    pr_url, attempt, cap,
+                );
+                record_automerge_outcome_and_comment_once(
+                    mint,
+                    pool,
+                    AutomergePr {
+                        repo,
+                        pr_number,
+                        issue_key: &row.issue_key,
+                    },
+                    "info",
+                    format!(
+                        "not mergeable (conflict auto-resolve dispatched, attempt {attempt} of {cap})"
+                    ),
+                    body,
+                    "action-run success: conflict-resolving comment failed",
+                )
+                .await;
+                return Ok(AutomergeOutcome::Acted(format!(
+                    "PR #{pr_number} not mergeable; conflict auto-resolve dispatched"
+                )));
+            }
+            ConflictRoute::Deferred(reason) => {
+                return Ok(AutomergeOutcome::NoAction(format!(
+                    "PR #{pr_number} not mergeable; conflict resolution deferred: {reason}"
+                )));
+            }
+            ConflictRoute::InFlight => {
+                return Ok(AutomergeOutcome::NoAction(format!(
+                    "PR #{pr_number} not mergeable; a conflict auto-resolve run is already in flight"
+                )));
+            }
+            ConflictRoute::CapReached { attempts, cap } => {
+                return park_unresolved_conflicts(
+                    mint, pool, row, repo, pr_number, pr_url, youtrack_cfg, attempts, cap,
+                )
+                .await;
+            }
+            ConflictRoute::AlreadyAttempted
+            | ConflictRoute::NotApplicable
+            | ConflictRoute::Skipped => {}
+        }
+        let backend = if is_github_host(host, &github_cfg.hosts) {
+            BehindBaseBackend::GitHub
+        } else {
+            BehindBaseBackend::Forgejo
+        };
+        let body = crate::native::youtrack::automerge_not_mergeable_comment(pr_url, backend);
+        record_automerge_outcome_and_comment_once(
+            mint,
+            pool,
+            AutomergePr {
+                repo,
+                pr_number,
+                issue_key: &row.issue_key,
+            },
+            "info",
+            "not mergeable".to_string(),
+            body,
+            "action-run success: not-mergeable comment failed",
+        )
+        .await;
+        info!(repo = %repo, pr = pr_number, "action-run success: not mergeable; commented, left at Code Review");
+        return Ok(AutomergeOutcome::NoAction(format!(
+            "PR #{pr_number} not mergeable; commented, left at Code Review"
+        )));
+    }
+    // A draft that otherwise reads green, mergeable and not
+    // behind base (or behind base with the setting resolved to not require
+    // up to date) can never actually be merged by the forge, so this route
+    // to `complete_automerge` gets the same draft check as the not-mergeable
+    // branch above: one `info` log and no merge, no comment. An unreported
+    // draft flag warns and proceeds as before; a PR absent from the listing
+    // is a no-op the reconciler's own stale-row retirement handles
+    // separately.
+    match pr_draft_status(forge, host, repo, pr_number).await {
+        Ok(Some(Some(true))) => {
+            info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR is a draft; automerge skipped");
+            return Ok(AutomergeOutcome::NoAction(
+                "PR is a draft; automerge skipped".to_string(),
+            ));
+        }
+        Ok(Some(None)) => {
+            warn!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR draft flag unreported by the forge; proceeding");
+        }
+        Ok(Some(Some(false))) => {}
+        Ok(None) => {
+            info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR not found in open-PR listing; no action");
+            return Ok(AutomergeOutcome::NoAction(
+                "PR not found in open-PR listing; no action".to_string(),
+            ));
+        }
+        Err(msg) => {
+            let msg = format!("checking PR draft status failed: {msg}");
+            error!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: {msg}");
+            record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone()).await;
+            return Err(msg);
+        }
+    }
+    let backend = mint.backend.clone();
+    let forge_for_merge = forge.clone();
+    let host_owned = host.to_string();
+    let repo_owned = repo.to_string();
+    let issue_key = row.issue_key.clone();
+    let pr_url_owned = pr_url.to_string();
+    let merge_result = tokio::task::spawn_blocking(move || {
+        crate::native::youtrack::complete_automerge(
+            backend.as_ref(),
+            forge_for_merge.as_ref(),
+            &issue_key,
+            &host_owned,
+            &repo_owned,
+            pr_number,
+            &pr_url_owned,
+            None,
+        )
+    })
+    .await
+    .map_err(|e| format!("complete_automerge task panicked: {e}"))?;
+    match merge_result {
+        Ok(()) => {
+            info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: merged PR; the YouTrack workflow will resolve the issue");
+            mark_agent_pr_merged(pool, row, repo, pr_number).await?;
+            Ok(AutomergeOutcome::Acted(format!(
+                "merged PR #{pr_number}; issue {} left for the YouTrack workflow to resolve",
+                row.issue_key
+            )))
+        }
+        Err(e) => {
+            let msg = format!("complete_automerge failed: {e}");
+            let body = crate::native::youtrack::automerge_merge_failed_comment(pr_url, &msg);
+            record_automerge_outcome_and_comment_once(
+                mint,
+                pool,
+                AutomergePr {
+                    repo,
+                    pr_number,
+                    issue_key: &row.issue_key,
+                },
+                "error",
+                msg.clone(),
+                body,
+                "action-run success: merge-failed comment failed",
+            )
+            .await;
+            Err(msg)
         }
     }
 }
@@ -6992,6 +7119,11 @@ mod tests {
         /// Every body `pr_comment` was asked to post, read from its
         /// `--body-file`-style path argument.
         pr_comments: StdMutex<Vec<String>>,
+        /// Canned `branch_requires_up_to_date` result. Defaults to
+        /// `Ok(Some(true))`, matching the behavior every pre-existing
+        /// behind-base test exercises (the `Require`/pre-setting behavior),
+        /// so none of them has to name a value it never tested.
+        branch_requires_up_to_date: StdMutex<Result<Option<bool>, String>>,
     }
 
     impl StoreBackend {
@@ -7010,7 +7142,18 @@ mod tests {
                 state_field_error: StdMutex::new(None),
                 pr_comment_error: StdMutex::new(None),
                 pr_comments: StdMutex::new(Vec::new()),
+                branch_requires_up_to_date: StdMutex::new(Ok(Some(true))),
             }
+        }
+        /// Override the canned `branch_requires_up_to_date` result.
+        fn with_branch_requires_up_to_date(self, value: Option<bool>) -> Self {
+            *self.branch_requires_up_to_date.lock().unwrap() = Ok(value);
+            self
+        }
+        /// Make `branch_requires_up_to_date` fail with `message`.
+        fn with_branch_requires_up_to_date_error(self, message: &str) -> Self {
+            *self.branch_requires_up_to_date.lock().unwrap() = Err(message.to_string());
+            self
         }
         fn with_legacy_match(self, key: &str) -> Self {
             *self.legacy_match.lock().unwrap() = Some(key.to_string());
@@ -7312,6 +7455,18 @@ mod tests {
                 return Err(crate::error::Error::Other(anyhow::anyhow!(message)));
             }
             Ok(())
+        }
+        fn branch_requires_up_to_date(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _base_ref: &str,
+        ) -> crate::error::Result<Option<bool>> {
+            self.branch_requires_up_to_date
+                .lock()
+                .unwrap()
+                .clone()
+                .map_err(|message| crate::error::Error::Other(anyhow::anyhow!(message)))
         }
     }
 
@@ -15634,6 +15789,15 @@ mod tests {
                 let pool = crate::db::test_pool().await;
                 let dir = tempfile::tempdir().unwrap();
                 write_youtrack_action(dir.path(), "yt", true);
+                // GitHub never reports its own branch-protection rule
+                // (`branch_requires_up_to_date` always answers `None` there), so
+                // `match_forge` would merge directly instead of updating; `require`
+                // is set explicitly so this test keeps exercising the update path.
+                std::fs::write(
+                    dir.path().join("actions/yt.yml"),
+                    "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\n      branch_up_to_date: require\n",
+                )
+                .unwrap();
                 let backend = Arc::new(StoreBackend::new());
                 let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
                 let runs_args = gh_pr_runs_args("octo/widget");
