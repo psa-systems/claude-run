@@ -1554,8 +1554,8 @@ delivery that is not `issue_comment` (except `ping`) is acked and dropped before
   a failure, logged at `error` with the run, and its webhook run row finishes as failed.
 - A failure on the agent's own open PR is not affected by this scope: it keeps the routing of `SPEC-4.4.3` (re-queue,
   ceiling, loop-breaker).
-- A failure on a human-authored open PR is analysed and commented on (the third bullet of `SPEC-4.4.3`) only when
-  `webhook.pr_analysis` is true; the default is false. When false, the failure is not analysed, not commented on, and
+- A failure on a human-authored open PR is analyzed and commented on (the third bullet of `SPEC-4.4.3`) only when
+  `webhook.pr_analysis` is true; the default is false. When false, the failure is not analyzed, not commented on, and
   mints nothing; the drop is logged at `info` naming the repository, run and PR. The branch list above does not
   apply to this setting. A human-authored PR's failure never mints an issue, even when it is seen on a second branch:
   `SPEC-4.4.3`'s promotion of a `pr_only` row to a minted issue does not apply.
