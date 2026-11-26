@@ -172,17 +172,17 @@ fn pr_create_error_with_lookup(
 /// including none) and `?` (exactly one character). Used to find which rule
 /// governs a PR's base branch when no rule name matches it exactly.
 fn glob_match(pattern: &str, candidate: &str) -> bool {
-    fn rec(pat: &[char], cand: &[char]) -> bool {
+    fn rec(pat: &[char], text: &[char]) -> bool {
         match pat.first() {
-            None => cand.is_empty(),
-            Some('*') => rec(&pat[1..], cand) || (!cand.is_empty() && rec(pat, &cand[1..])),
-            Some('?') => !cand.is_empty() && rec(&pat[1..], &cand[1..]),
-            Some(c) => cand.first() == Some(c) && rec(&pat[1..], &cand[1..]),
+            None => text.is_empty(),
+            Some('*') => rec(&pat[1..], text) || (!text.is_empty() && rec(pat, &text[1..])),
+            Some('?') => !text.is_empty() && rec(&pat[1..], &text[1..]),
+            Some(c) => text.first() == Some(c) && rec(&pat[1..], &text[1..]),
         }
     }
     let pat: Vec<char> = pattern.chars().collect();
-    let cand: Vec<char> = candidate.chars().collect();
-    rec(&pat, &cand)
+    let text: Vec<char> = candidate.chars().collect();
+    rec(&pat, &text)
 }
 
 fn number_from_pr_url(url: &str) -> Option<u64> {
