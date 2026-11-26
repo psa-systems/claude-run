@@ -2840,7 +2840,9 @@ impl Forge for CliBackend {
             .iter()
             .find(|r| r.rule_name == base_ref)
             .or_else(|| rules.iter().find(|r| glob_match(&r.rule_name, base_ref)));
-        Ok(Some(rule.map(|r| r.block_on_outdated_branch).unwrap_or(false)))
+        Ok(Some(
+            rule.map(|r| r.block_on_outdated_branch).unwrap_or(false),
+        ))
     }
 
     fn repo_permission(&self, host: &str, repo: &str, username: &str) -> Result<String> {
@@ -3548,9 +3550,7 @@ mod tests {
             "list",
             "--json",
         ];
-        let b = CliBackend::new(Arc::new(
-            StubRunner::new().ok("fj", &args, json),
-        ));
+        let b = CliBackend::new(Arc::new(StubRunner::new().ok("fj", &args, json)));
         assert_eq!(
             b.branch_requires_up_to_date("dev.example.org", "acme/widgets", "main")
                 .unwrap(),

@@ -1399,9 +1399,7 @@ mod tests {
             .unwrap();
         assert!(!fresh.ready, "a newly recorded row is not ready yet");
 
-        mark_ready(&pool, id, "2026-11-05T00:00:00Z")
-            .await
-            .unwrap();
+        mark_ready(&pool, id, "2026-11-05T00:00:00Z").await.unwrap();
 
         let ready = agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 558)
             .await

@@ -5632,8 +5632,9 @@ async fn apply_automerge_decision(
                 {
                     Ok(v) => v,
                     Err(e) => {
-                        let msg =
-                            format!("PR #{pr_number}: checking branch_up_to_date setting failed: {e}");
+                        let msg = format!(
+                            "PR #{pr_number}: checking branch_up_to_date setting failed: {e}"
+                        );
                         error!(repo = %repo, pr = pr_number, issue = %row.issue_key, error = %e, "action-run success: {msg}");
                         let body = format!(
                             "The runner could not check this PR's automerge status: {msg}.\n\nPR: {pr_url}\n\nA later Action Run event or the periodic reconciler will retry automatically."
@@ -6048,7 +6049,15 @@ async fn merge_or_not_mergeable(
             }
             ConflictRoute::CapReached { attempts, cap } => {
                 return park_unresolved_conflicts(
-                    mint, pool, row, repo, pr_number, pr_url, youtrack_cfg, attempts, cap,
+                    mint,
+                    pool,
+                    row,
+                    repo,
+                    pr_number,
+                    pr_url,
+                    youtrack_cfg,
+                    attempts,
+                    cap,
                 )
                 .await;
             }
@@ -13516,6 +13525,179 @@ mod tests {
                 pr_comments[0]
             );
             assert!(pr_comments[0].contains("MX-16"), "{:?}", pr_comments[0]);
+        }
+
+        /// SPEC-4.4.3: `branch_up_to_date: require` on a behind-base green PR
+        /// keeps the branch-update behavior, same as the default
+        /// [`behind_base_updates_branch_and_leaves_code_review`] (which relies
+        /// on [`StoreBackend`]'s own default forge answer). Written out with
+        /// an explicit setting so a future change to that default cannot
+        /// silently stop covering `require` itself.
+        #[tokio::test]
+        async fn branch_up_to_date_require_updates_a_behind_base_branch() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            std::fs::write(
+                dir.path().join("actions/yt.yml"),
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\n      branch_up_to_date: require\n",
+            )
+            .unwrap();
+            record_open_pr(&pool, "MX-16", 7).await;
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", true, Some(true))
+                    .with_branch_requires_up_to_date(Some(false)),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let result = run_success_for(&ctx, &pool, 7).await;
+            assert!(result.contains("branch updated"), "{result}");
+            let calls = backend.calls();
+            assert!(calls.iter().any(|c| c == "update_pr_branch 7"), "{calls:?}");
+            assert!(
+                !calls.iter().any(|c| c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+        }
+
+        /// SPEC-4.4.3: `branch_up_to_date: dont_require` on a behind-base
+        /// green, mergeable PR merges it directly instead of updating the
+        /// branch first.
+        #[tokio::test]
+        async fn branch_up_to_date_dont_require_merges_a_behind_base_pr_directly() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            std::fs::write(
+                dir.path().join("actions/yt.yml"),
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\n      branch_up_to_date: dont_require\n",
+            )
+            .unwrap();
+            record_open_pr(&pool, "MX-16", 7).await;
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", true, Some(true))
+                    .with_branch_requires_up_to_date(Some(true)),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let result = run_success_for(&ctx, &pool, 7).await;
+            assert!(result.contains("merged"), "{result}");
+            let calls = backend.calls();
+            assert!(calls.iter().any(|c| c.starts_with("merge_pr")), "{calls:?}");
+            assert!(
+                !calls.iter().any(|c| c == "update_pr_branch 7"),
+                "{calls:?}"
+            );
+        }
+
+        /// SPEC-4.4.3: the default `match_forge` setting follows whatever the
+        /// forge's own `branch_requires_up_to_date` answers, on both sides:
+        /// `Some(true)` updates the branch, `Some(false)` merges directly.
+        #[tokio::test]
+        async fn branch_up_to_date_match_forge_follows_the_forge_answer() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            record_open_pr(&pool, "MX-16", 7).await;
+
+            let requires = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", true, Some(true))
+                    .with_branch_requires_up_to_date(Some(true)),
+            );
+            let ctx = ctx_for(pool.clone(), requires.clone(), dir.path());
+            let result = run_success_for(&ctx, &pool, 7).await;
+            assert!(result.contains("branch updated"), "{result}");
+            assert!(
+                requires.calls().iter().any(|c| c == "update_pr_branch 7"),
+                "{:?}",
+                requires.calls()
+            );
+
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MX-17",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                8,
+                "fix/mk-17",
+                "open",
+                false,
+                "2026-09-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            let not_required = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(8, "")])
+                    .with_pr_status_behind("success", true, Some(true))
+                    .with_branch_requires_up_to_date(Some(false)),
+            );
+            let ctx2 = ctx_for(pool.clone(), not_required.clone(), dir.path());
+            let result2 = handle_action_success_for_pr(
+                &ctx2,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                8,
+                "https://dev.a8n.run/contoso/claude-run/pulls/8",
+            )
+            .await
+            .unwrap();
+            assert!(result2.contains("merged"), "{result2}");
+            assert!(
+                not_required
+                    .calls()
+                    .iter()
+                    .any(|c| c.starts_with("merge_pr")),
+                "{:?}",
+                not_required.calls()
+            );
+        }
+
+        /// SPEC-4.4.3: a forge-protection-read failure under `match_forge`
+        /// (e.g. a Forgejo whose `fj repo branch-protection` call errors) is
+        /// named in an error comment and returned as an `Err`, never
+        /// defaulted to either behavior.
+        #[tokio::test]
+        async fn branch_up_to_date_match_forge_read_failure_is_commented_and_errors() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            record_open_pr(&pool, "MX-16", 7).await;
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", true, Some(true))
+                    .with_branch_requires_up_to_date_error("branch-protection read failed"),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let err = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains("branch-protection read failed"), "{err}");
+            let calls = backend.calls();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c == "update_pr_branch 7" || c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+            assert!(
+                calls.iter().any(|c| c.starts_with("comment MX-16")),
+                "{calls:?}"
+            );
         }
 
         /// A draft PR, green and behind base, gets no branch
