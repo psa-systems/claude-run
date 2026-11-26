@@ -1906,11 +1906,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_fix_description_handles_a_checks_workflow_without_fix_commands() {
-        // The generic checks-workflow detector carries no fix command, so the
-        // body instructs a reproduce-and-fix and uses the workflow-kind branch.
+    fn auto_fix_description_handles_a_detector_without_fix_commands() {
+        // A detector with no fix command carried instructs a reproduce-and-fix
+        // and uses the detector-kind branch.
         let detail = crate::autofix::AutoFix {
-            kind: "checks-workflow".to_string(),
+            kind: "example-detector".to_string(),
             problem: "the `check.yml` checks workflow failed at step `Clippy`; ...".to_string(),
             fix_commands: Vec::new(),
             scope: Some("Clippy".to_string()),
@@ -1922,7 +1922,7 @@ mod tests {
         let root_cause = root_cause_marker(&r);
         let body = build_description(&r, &primary, &secondary, &root_cause);
         assert!(body.contains("Reproduce the `ci.yml` checks"), "{body}");
-        assert!(body.contains("chore/checks-workflow-abc123de"), "{body}");
+        assert!(body.contains("chore/example-detector-abc123de"), "{body}");
         assert!(body.contains("Failing step: `Clippy`."), "{body}");
     }
 }

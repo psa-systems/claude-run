@@ -1284,6 +1284,27 @@ mod tests {
         rewrite(Dialect::Sqlite, sql).into_owned()
     }
 
+    /// `_sqlx_migrations.version` is a `BIGINT PRIMARY KEY` on both backends
+    /// and the migrator has no duplicate check of its own, so two migration
+    /// files sharing a version make the second insert fail on any fresh
+    /// database or upgrade. Catch that here instead of at migration time.
+    #[test]
+    fn embedded_migrations_have_unique_versions_on_both_backends() {
+        for (name, migrator) in [
+            ("migrations/sqlite", &SQLITE_MIGRATOR),
+            ("migrations/postgres", &POSTGRES_MIGRATOR),
+        ] {
+            let mut seen = std::collections::HashSet::new();
+            for migration in migrator.iter() {
+                assert!(
+                    seen.insert(migration.version),
+                    "{name} has two migrations with version {}",
+                    migration.version
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn refresh_repairs_a_modified_migration_checksum() {
         let dir = tempfile::tempdir().unwrap();

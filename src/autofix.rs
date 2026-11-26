@@ -26,15 +26,12 @@ use crate::triage::TriageInput;
 /// "CI failure" template.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoFix {
-    /// Stable detector id, e.g. `cargo-fmt` or `checks-workflow`. Used verbatim
-    /// in the corrective branch name (`chore/<kind>-<short-sha>`).
+    /// Stable detector id, e.g. `cargo-fmt`. Used verbatim in the corrective
+    /// branch name (`chore/<kind>-<short-sha>`).
     pub kind: String,
     /// Human-readable statement of what failed and why it is auto-fixable.
     pub problem: String,
-    /// Concrete fix command(s) the runner executes, in order. Empty when the
-    /// fix is "reproduce the failing workflow and fix what it reports" (the
-    /// generic checks-workflow case, where the exact command depends on the
-    /// failing step).
+    /// Concrete fix command(s) the runner executes, in order.
     pub fix_commands: Vec<String>,
     /// Optional failing step / file scope lifted from the log, surfaced to the
     /// runner. `None` when not determinable.
@@ -153,10 +150,7 @@ mod tests {
 
     #[test]
     fn disabled_framework_detects_nothing() {
-        let disabled = AutoFixConfig {
-            enabled: false,
-            ..AutoFixConfig::default()
-        };
+        let disabled = AutoFixConfig { enabled: false };
         let log = "Run cargo fmt --check\nDiff in src/main.rs at line 3:\n";
         assert!(detect(&input("check.yml", log), &disabled).is_none());
     }

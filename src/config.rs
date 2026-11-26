@@ -734,19 +734,11 @@ pub struct AutoFixConfig {
     /// Master enable toggle. When `false`, no detector runs and every failure
     /// follows the prior transient / code_fix / human_action triage path.
     pub enabled: bool,
-    /// Workflow filenames whose failures are verification-only (they check code
-    /// rather than produce it) and are therefore mechanically auto-fixable.
-    /// Matched case-insensitively against the run's `workflow_id`. Default
-    /// `["check.yml"]`.
-    pub checks_workflows: Vec<String>,
 }
 
 impl Default for AutoFixConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            checks_workflows: vec!["check.yml".to_string()],
-        }
+        Self { enabled: true }
     }
 }
 

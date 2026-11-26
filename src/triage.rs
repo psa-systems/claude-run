@@ -1128,10 +1128,7 @@ mod tests {
     fn disabled_auto_fix_falls_through_to_classifier() {
         // With the framework off, a cargo-fmt failure is handed to the LLM like
         // any other non-transient failure (today's behavior).
-        let disabled = AutoFixConfig {
-            enabled: false,
-            ..AutoFixConfig::default()
-        };
+        let disabled = AutoFixConfig { enabled: false };
         let stub = StubClassifier::new(Triage::llm(TriageBucket::HumanAction, "human"));
         let mut input = input_with_log("Run cargo fmt --check\nDiff in src/main.rs at line 1:\n");
         input.workflow_id = "check.yml".to_string();

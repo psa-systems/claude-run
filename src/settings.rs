@@ -1656,7 +1656,7 @@ mod tests {
         set_raw(
             &pool,
             Section::Mint.key(),
-            r#"{"fallback_project":"FJ","auto_fix":{"enabled":false,"checks_workflows":["ci.yml"]}}"#,
+            r#"{"fallback_project":"FJ","auto_fix":{"enabled":false}}"#,
         )
         .await
         .unwrap();
@@ -1672,10 +1672,10 @@ mod tests {
             .unwrap();
         let sql = match crate::db::dialect(&pool) {
             crate::db::Dialect::Sqlite => {
-                include_str!("../migrations/sqlite/0038_rename_auto_fix_settings.sql")
+                include_str!("../migrations/sqlite/0039_rename_auto_fix_settings.sql")
             }
             crate::db::Dialect::Postgres => {
-                include_str!("../migrations/postgres/0019_rename_auto_fix_settings.sql")
+                include_str!("../migrations/postgres/0020_rename_auto_fix_settings.sql")
             }
         };
         for _ in 0..2 {
@@ -1683,13 +1683,52 @@ mod tests {
             let mint: MintConfig = get_json(&pool, Section::Mint.key()).await.unwrap().unwrap();
             assert_eq!(mint.fallback_project, "FJ");
             assert!(!mint.detect_fixable.enabled);
-            assert_eq!(mint.detect_fixable.checks_workflows, vec!["ci.yml"]);
             let webhook: WebhookConfig = get_json(&pool, Section::Webhook.key())
                 .await
                 .unwrap()
                 .unwrap();
             assert!(webhook.queue_fix_issues, "the boolean stays a boolean");
             assert_eq!(webhook.max_runs_per_day, 7);
+            assert_eq!(
+                get_raw(&pool, Section::WorkdirGc.key())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                r#"{"enabled":true}"#
+            );
+        }
+    }
+
+    /// The migration that drops `detect_fixable.checks_workflows` from the
+    /// stored `config.mint` document leaves the key absent so the document
+    /// loads as `MintConfig` (which no longer has the field), is idempotent,
+    /// and leaves another row alone.
+    #[tokio::test]
+    async fn drop_checks_workflows_setting_migration_removes_only_that_key() {
+        let pool = pool().await;
+        set_raw(
+            &pool,
+            Section::Mint.key(),
+            r#"{"fallback_project":"FJ","detect_fixable":{"enabled":false,"checks_workflows":["ci.yml"]}}"#,
+        )
+        .await
+        .unwrap();
+        set_raw(&pool, Section::WorkdirGc.key(), r#"{"enabled":true}"#)
+            .await
+            .unwrap();
+        let sql = match crate::db::dialect(&pool) {
+            crate::db::Dialect::Sqlite => {
+                include_str!("../migrations/sqlite/0040_drop_checks_workflows_setting.sql")
+            }
+            crate::db::Dialect::Postgres => {
+                include_str!("../migrations/postgres/0021_drop_checks_workflows_setting.sql")
+            }
+        };
+        for _ in 0..2 {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+            let mint: MintConfig = get_json(&pool, Section::Mint.key()).await.unwrap().unwrap();
+            assert_eq!(mint.fallback_project, "FJ");
+            assert!(!mint.detect_fixable.enabled);
             assert_eq!(
                 get_raw(&pool, Section::WorkdirGc.key())
                     .await
