@@ -5652,9 +5652,11 @@ fn final_push(
             detail: None,
         }]);
     }
-    pushed
-        .map(|_| ())
-        .map_err(|e| Error::Other(anyhow::anyhow!("final push failed (SPEC-3.3.8 through SPEC-3.3.19): {e}")))
+    pushed.map(|_| ()).map_err(|e| {
+        Error::Other(anyhow::anyhow!(
+            "final push failed (SPEC-3.3.8 through SPEC-3.3.19): {e}"
+        ))
+    })
 }
 
 /// The outcome of a failed [`final_push`] call (SPEC-3.3.8 through SPEC-3.3.19): always
@@ -14495,7 +14497,8 @@ mod tests {
         assert_eq!(
             res,
             Finalized::Failed {
-                cause: "SPEC-3.3.20 through SPEC-3.3.25 verification gate failed (`just pre-push`)".into(),
+                cause: "SPEC-3.3.20 through SPEC-3.3.25 verification gate failed (`just pre-push`)"
+                    .into(),
                 pr_step: Some("verify"),
                 requeued: false,
                 pr_number: Some(7),
