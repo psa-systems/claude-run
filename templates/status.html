@@ -71,6 +71,7 @@
           <th>In flight</th>
           <th>Summary sync</th>
           <th>Claims bypassed (24h)</th>
+          <th>Duplicates (24h)</th>
           <th>Last error</th>
         </tr>
       </thead>
@@ -83,7 +84,79 @@
           <td>{% if let Some(n) = row.in_flight %}{{ n }}{% else %}<span class="dim">-</span>{% endif %}</td>
           <td>{{ row.summary_sync.label() }}</td>
           <td>{{ row.claims_bypassed }}</td>
+          <td>{{ row.duplicates }}</td>
           <td>{% if let Some(e) = row.last_error %}{{ e }}{% else %}<span class="dim">none</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+
+{# SPEC-3.17.12 and SPEC-3.17.22: what each peer is working. A run is cancelled on the instance running
+   it, never from here, so the card names that instance instead of offering a button. #}
+<h3>Peer work</h3>
+
+<div class="card" style="margin-bottom: 16px;">
+  {% if peer_work.is_empty() %}
+    <span class="dim">No reachable peer has a job in flight.</span>
+  {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th>Peer</th>
+          <th>Issue</th>
+          <th>Stage</th>
+          <th>Branch</th>
+          <th>PR</th>
+          <th>Run</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for w in peer_work %}
+        <tr>
+          <td>{{ w.peer }}</td>
+          <td class="mono">{{ w.key }}</td>
+          <td>{{ w.stage }}</td>
+          <td class="mono">{{ w.branch }}</td>
+          <td>{{ w.pr }}</td>
+          <td class="mono">#{{ w.run_id }} on {{ w.peer }}</td>
+          <td>{% if w.duplicate %}<span class="badge bad">also in flight here</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="dim" style="margin-top: 8px;">A run is cancelled on the instance that runs it: open that instance's Status page.</p>
+  {% endif %}
+</div>
+
+<h3>Recent peer notices</h3>
+
+<div class="card" style="margin-bottom: 16px;">
+  {% if peer_notices.is_empty() %}
+    <span class="dim">No notice received in the last 24 hours.</span>
+  {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th>When</th>
+          <th>Peer</th>
+          <th>Event</th>
+          <th>Issue</th>
+          <th>PR</th>
+          <th>Run</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for n in peer_notices %}
+        <tr>
+          <td>{{ n.at|datetime }}</td>
+          <td>{{ n.peer }}</td>
+          <td>{{ n.event }}</td>
+          <td class="mono">{{ n.key }}</td>
+          <td>{{ n.pr }}</td>
+          <td class="mono">#{{ n.run_id }}</td>
         </tr>
         {% endfor %}
       </tbody>

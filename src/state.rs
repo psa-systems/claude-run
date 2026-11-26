@@ -583,6 +583,53 @@ pub async fn run_inflight_remove(pool: &DbPool, run_id: i64, key: &str) -> Resul
     Ok(())
 }
 
+/// SPEC-3.17.20: record the `SPEC-3.14.2` stage of the attempt a job is running, once `process_job`
+/// knows it. Peers read it from the in-flight snapshot.
+pub async fn run_inflight_set_stage(
+    pool: &DbPool,
+    run_id: i64,
+    key: &str,
+    stage: &str,
+) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "UPDATE run_inflight_jobs SET stage = ? WHERE run_id = ? AND job_key = ?",
+        )
+        .into_owned(),
+    ))
+    .bind(stage)
+    .bind(run_id)
+    .bind(key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// SPEC-3.17.20: record the branch and PR a job's run works on, once a PR is resolved or opened.
+pub async fn run_inflight_set_pr(
+    pool: &DbPool,
+    run_id: i64,
+    key: &str,
+    branch: &str,
+    pr_number: i64,
+) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "UPDATE run_inflight_jobs SET branch = ?, pr_number = ? WHERE run_id = ? AND job_key = ?",
+        )
+        .into_owned(),
+    ))
+    .bind(branch)
+    .bind(pr_number)
+    .bind(run_id)
+    .bind(key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// The set of job keys currently in flight for a run. SPEC-5.2.1.
 pub async fn run_inflight_keys(pool: &DbPool, run_id: i64) -> Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(
@@ -1264,6 +1311,125 @@ pub async fn peer_claim_reassign(
     Ok(res.rows_affected() == 1)
 }
 
+/// One `peer_work_events` row: a lifecycle notice a peer sent (`SPEC-3.17.21`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerWorkEvent {
+    pub instance_id: String,
+    pub run_id: i64,
+    pub event: String,
+    pub key: String,
+    pub pr_number: Option<i64>,
+    pub at: String,
+    pub received_at: String,
+}
+
+/// Store a peer's lifecycle notice, idempotent per `(instance_id, run_id, event)`.
+/// True when this call inserted it, false when the row already existed.
+pub async fn peer_work_event_insert(pool: &DbPool, e: &PeerWorkEvent) -> Result<bool> {
+    let res = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "INSERT INTO peer_work_events (instance_id, run_id, event, key, pr_number, at, received_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance_id, run_id, event) DO NOTHING",
+        )
+        .into_owned(),
+    ))
+    .bind(&e.instance_id)
+    .bind(e.run_id)
+    .bind(&e.event)
+    .bind(&e.key)
+    .bind(e.pr_number)
+    .bind(&e.at)
+    .bind(&e.received_at)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// One `peer_work_events` row as selected by [`peer_work_events_recent`].
+type PeerWorkEventRow = (String, i64, String, String, Option<i64>, String, String);
+
+/// One in-flight job row joined with its run's start, as selected by [`run_inflight_with_start`].
+type InflightJobStartRow = (
+    String,
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+/// The newest `limit` peer notices, newest first, for the Status page (`SPEC-3.17.12`).
+pub async fn peer_work_events_recent(pool: &DbPool, limit: i64) -> Result<Vec<PeerWorkEvent>> {
+    let rows: Vec<PeerWorkEventRow> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT instance_id, run_id, event, key, pr_number, at, received_at
+             FROM peer_work_events ORDER BY received_at DESC, instance_id, run_id, event LIMIT ?",
+        )
+        .into_owned(),
+    ))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(instance_id, run_id, event, key, pr_number, at, received_at)| PeerWorkEvent {
+                instance_id,
+                run_id,
+                event,
+                key,
+                pr_number,
+                at,
+                received_at,
+            },
+        )
+        .collect())
+}
+
+/// The live run for `key` on this instance, if any: the in-flight row of a still-open run
+/// (`SPEC-3.17.14`). Returns `(run_id, stage, started_at)`.
+pub async fn live_run_for_key(
+    pool: &DbPool,
+    key: &str,
+) -> Result<Option<(i64, Option<String>, String)>> {
+    let row: Option<(i64, Option<String>, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            r#"
+        SELECT rij.run_id, rij.stage, r.started_at
+        FROM run_inflight_jobs rij
+        JOIN runs r ON r.id = rij.run_id
+        WHERE r.ended_at IS NULL AND rij.job_key = ?
+        ORDER BY r.started_at LIMIT 1
+        "#,
+        )
+        .into_owned(),
+    ))
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// The newest recorded outcome for `key`: `(outcome, ended_at)` (`SPEC-3.17.14`). Rows from before the
+/// `outcome` column existed hold NULL there and are not outcomes, so they are skipped.
+pub async fn latest_outcome_for_key(pool: &DbPool, key: &str) -> Result<Option<(String, String)>> {
+    let row: Option<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        crate::db::q(
+            pool,
+            "SELECT outcome, ts FROM job_outcomes WHERE job_key = ? AND outcome IS NOT NULL ORDER BY ts DESC LIMIT 1",
+        )
+        .into_owned(),
+    ))
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// One in-flight job of a still-open run: its action, job key and the run's
 /// start time. Served to peers by `GET /api/peer/state` (`SPEC-3.17.5`).
 #[derive(Debug, Clone)]
@@ -1271,33 +1437,49 @@ pub struct InflightJobStart {
     pub action_name: String,
     pub job_key: String,
     pub started_at: String,
+    /// This instance's local run id (`SPEC-3.17.20`).
+    pub run_id: i64,
+    /// The `SPEC-3.14.2` stage; `None` for a job with no attempt stage (a scripted or webhook job) and until the attempt starts.
+    pub stage: Option<String>,
+    /// The PR branch and number, `None` until a PR exists.
+    pub branch: Option<String>,
+    pub pr_number: Option<i64>,
 }
 
 /// Every `run_inflight_jobs` row of a still-open run, with the run's start.
 /// Unlike [`run_inflight_rows_all`] this is safe to call on a live daemon.
 pub async fn run_inflight_with_start(pool: &DbPool) -> Result<Vec<InflightJobStart>> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
-        crate::db::q(
-            pool,
-            r#"
-        SELECT r.action_name, rij.job_key, r.started_at
+    let rows: Vec<InflightJobStartRow> =
+        sqlx::query_as(sqlx::AssertSqlSafe(
+            crate::db::q(
+                pool,
+                r#"
+        SELECT r.action_name, rij.job_key, r.started_at, rij.run_id, rij.stage, rij.branch, rij.pr_number
         FROM run_inflight_jobs rij
         JOIN runs r ON r.id = rij.run_id
         WHERE r.ended_at IS NULL
         ORDER BY r.started_at, rij.job_key
         "#,
-        )
-        .into_owned(),
-    ))
-    .fetch_all(pool)
-    .await?;
+            )
+            .into_owned(),
+        ))
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
-        .map(|(action_name, job_key, started_at)| InflightJobStart {
-            action_name,
-            job_key,
-            started_at,
-        })
+        .map(
+            |(action_name, job_key, started_at, run_id, stage, branch, pr_number)| {
+                InflightJobStart {
+                    action_name,
+                    job_key,
+                    started_at,
+                    run_id,
+                    stage,
+                    branch,
+                    pr_number,
+                }
+            },
+        )
         .collect())
 }
 

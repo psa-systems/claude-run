@@ -7131,6 +7131,89 @@ struct StatusTpl {
     docker_run_in_flight: bool,
     /// SPEC-3.17.12: `Some` only while peering is enabled.
     peers: Option<Vec<crate::peer::PeerRow>>,
+    /// SPEC-3.17.12: every peer's in-flight job, empty while peering is disabled.
+    peer_work: Vec<PeerWorkRow>,
+    /// SPEC-3.17.21: the newest lifecycle notices peers sent, empty while peering is disabled.
+    peer_notices: Vec<PeerNoticeRow>,
+}
+
+/// One peer's in-flight job on the Status page (`SPEC-3.17.12`). `duplicate` is true when this
+/// instance also has a live run for the key (`SPEC-3.17.19`).
+struct PeerWorkRow {
+    peer: String,
+    key: String,
+    run_id: i64,
+    stage: String,
+    branch: String,
+    pr: String,
+    duplicate: bool,
+}
+
+/// One lifecycle notice on the Status page (`SPEC-3.17.21`).
+struct PeerNoticeRow {
+    peer: String,
+    run_id: i64,
+    event: String,
+    key: String,
+    pr: String,
+    at: String,
+}
+
+/// The Status page's peer work and notice tables (`SPEC-3.17.12`, `SPEC-3.17.21`, `SPEC-3.17.22`).
+/// A failed read is returned, so the page answers `500` instead of showing an empty table.
+async fn peer_work_views(
+    pool: &crate::db::DbPool,
+    registry: &crate::peer::PeerRegistry,
+    cfg: &crate::config::PeersConfig,
+    rows: &[crate::peer::PeerRow],
+) -> Result<(Vec<PeerWorkRow>, Vec<PeerNoticeRow>), WebError> {
+    let local: std::collections::HashSet<String> = state::run_inflight_with_start(pool)
+        .await?
+        .into_iter()
+        .map(|j| j.job_key)
+        .collect();
+    let dash = || "-".to_string();
+    let mut work = Vec::new();
+    for row in rows {
+        // `None`: the peer is not reachable, so there is nothing known to list.
+        let Some(jobs) = &row.in_flight_jobs else {
+            continue;
+        };
+        for j in jobs {
+            work.push(PeerWorkRow {
+                peer: row.name.clone(),
+                duplicate: local.contains(&j.job_key),
+                key: j.job_key.clone(),
+                run_id: j.run_id,
+                stage: j.stage.clone().unwrap_or_else(dash),
+                branch: j.branch.clone().unwrap_or_else(dash),
+                pr: j.pr_number.map(|n| format!("#{n}")).unwrap_or_else(dash),
+            });
+        }
+    }
+    let notices = state::peer_work_events_recent(pool, 20)
+        .await?
+        .into_iter()
+        .map(|e| {
+            let peer = cfg
+                .peers
+                .iter()
+                .find(|p| {
+                    registry.peer_instance_id(&p.name).as_deref() == Some(e.instance_id.as_str())
+                })
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| e.instance_id.clone());
+            PeerNoticeRow {
+                peer,
+                run_id: e.run_id,
+                event: e.event,
+                key: e.key,
+                pr: e.pr_number.map(|n| format!("#{n}")).unwrap_or_else(dash),
+                at: e.at,
+            }
+        })
+        .collect();
+    Ok((work, notices))
 }
 
 /// SPEC-4.3.31: the `/status` page handler. Renders immediately with the
@@ -7155,12 +7238,26 @@ async fn status_page(State(s): State<WebState>) -> Result<Response, WebError> {
             .peer_registry()
             .rows(&peers_cfg, chrono::Utc::now())
     });
+    let (peer_work, peer_notices) = match &peers {
+        Some(rows) => {
+            peer_work_views(
+                &s.api.pool,
+                &s.api.settings.peer_registry(),
+                &peers_cfg,
+                rows,
+            )
+            .await?
+        }
+        None => (Vec::new(), Vec::new()),
+    };
     let tpl = StatusTpl {
         version: s.api.version,
         global_pause,
         activity: activity_view(&s).await,
         docker_run_in_flight,
         peers,
+        peer_work,
+        peer_notices,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }

@@ -392,7 +392,22 @@ impl Daemon {
             settings.peers_handle(),
             settings.peer_registry(),
         );
+        // SPEC-3.17.18: an Action-run delivery names its PR by commit, which the claim step resolves
+        // through the forge. Without a usable backend that ownership check is skipped and logged.
+        let peer_claims = match crate::provider::resolve(crate::provider::DEFAULT_PRIORITY) {
+            Ok(b) => {
+                let backend: Arc<dyn crate::provider::Backend> = Arc::from(b);
+                let forge: Arc<dyn crate::provider::Forge> = backend;
+                peer_claims.with_forge(forge)
+            }
+            Err(e) => {
+                warn!(error = %e, "no usable provider backend; peer ownership checks of Action-run deliveries are skipped");
+                peer_claims
+            }
+        };
         let peer_dispatched = peer_claims.dispatched();
+        // SPEC-3.17.16 and SPEC-3.17.21: the same handle serves pickups, notices and the webhook consumer.
+        let peer_link = peer_claims.clone();
         let webhook_state = crate::web::webhooks::WebhookState::from_shared(
             pool.clone(),
             settings.webhook_handle(),
@@ -546,15 +561,18 @@ impl Daemon {
         let analysis_timeout_secs = settings.webhook_handle().read().await.analysis_timeout_secs;
         let mint_ctx = build_mint_context(
             &pool,
-            settings.mint_handle(),
-            analysis_timeout_secs,
-            &claude,
-            &webhook_log_dir,
-            &self.paths,
-            Some(crate::web::webhooks::CommentDispatch {
-                tx: automerge_comment_tx,
-                cfg: settings.webhook_comment_handle(),
-            }),
+            MintContextInputs {
+                mint_cfg: settings.mint_handle(),
+                analysis_timeout_secs,
+                claude: &claude,
+                webhook_log_dir: &webhook_log_dir,
+                paths: &self.paths,
+                comment_dispatch: Some(crate::web::webhooks::CommentDispatch {
+                    tx: automerge_comment_tx,
+                    cfg: settings.webhook_comment_handle(),
+                }),
+                peers: Some(peer_link.clone()),
+            },
         );
         // The pull-request and success-event consumers share the same
         // MintContext (backend, mint config) as the failure consumer; built
@@ -672,6 +690,7 @@ impl Daemon {
             readiness: readiness.clone(),
             last_fire: Mutex::new(HashMap::new()),
             first_seen: Mutex::new(HashMap::new()),
+            peers: Some(peer_link.clone()),
         });
 
         let scheduler_task = tokio::spawn(scheduler_loop(dispatch.clone(), trigger_tx.clone()));
@@ -841,6 +860,17 @@ impl Daemon {
     }
 }
 
+/// The non-pool inputs of [`build_mint_context`], bundled to keep its signature small.
+struct MintContextInputs<'a> {
+    mint_cfg: Arc<tokio::sync::RwLock<crate::config::MintConfig>>,
+    analysis_timeout_secs: u64,
+    claude: &'a Arc<ClaudeInvoker>,
+    webhook_log_dir: &'a Path,
+    paths: &'a Paths,
+    comment_dispatch: Option<crate::web::webhooks::CommentDispatch>,
+    peers: Option<crate::peer::PeerClaims>,
+}
+
 /// SPEC-3.5.1 through SPEC-3.5.18: the mint pipeline degrades to log-only (returns `None`) when no
 /// provider backend is usable or the analysis directory cannot be created.
 ///
@@ -853,14 +883,18 @@ impl Daemon {
 /// logs failures.
 fn build_mint_context(
     pool: &DbPool,
-    mint_cfg: Arc<tokio::sync::RwLock<crate::config::MintConfig>>,
-    analysis_timeout_secs: u64,
-    claude: &Arc<ClaudeInvoker>,
-    webhook_log_dir: &Path,
-    paths: &Paths,
-    comment_dispatch: Option<crate::web::webhooks::CommentDispatch>,
+    inputs: MintContextInputs<'_>,
 ) -> Option<crate::web::webhooks::MintContext> {
     use crate::action::ClaudeBlock;
+    let MintContextInputs {
+        mint_cfg,
+        analysis_timeout_secs,
+        claude,
+        webhook_log_dir,
+        paths,
+        comment_dispatch,
+        peers,
+    } = inputs;
     use crate::triage::{AnalysisClassifier, FailureClassifier};
 
     let backend: Arc<dyn crate::provider::Backend> =
@@ -919,6 +953,7 @@ fn build_mint_context(
     info!(backend = backend.name(), "webhook mint enabled");
     Some(crate::web::webhooks::MintContext {
         pool: pool.clone(),
+        peers,
         classifier,
         backend,
         mint_cfg,
@@ -1468,6 +1503,9 @@ struct Dispatcher {
     /// SPEC-2.2.1 through SPEC-2.2.2: when the scheduler first saw a `cron` action with no run yet, which
     /// is where counting toward its next matching instant starts.
     first_seen: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// SPEC-3.17.13 through SPEC-3.17.22: the peer handle a native run asks before a pickup and
+    /// notifies through. `None` where there is no peer layer (tests).
+    peers: Option<crate::peer::PeerClaims>,
 }
 
 impl Dispatcher {
@@ -1556,6 +1594,7 @@ impl Dispatcher {
             &self.limiter,
             &self.pause,
             &self.gather,
+            self.peers.as_ref(),
         )
         .await
         .map(|_| ())
@@ -1588,6 +1627,8 @@ pub async fn run_action_inner(
     pause: &crate::pause::PauseGate,
     // Per-action gather marker, held across the gather step only.
     gather: &GatherGate,
+    // SPEC-3.17.13 through SPEC-3.17.22: the peer handle; `None` for a standalone run, which has no peers.
+    peers: Option<&crate::peer::PeerClaims>,
 ) -> Result<i32> {
     let defaults = RunnerDefaults::default();
     let limits = job::effective_limits(&defaults, loaded);
@@ -1631,6 +1672,7 @@ pub async fn run_action_inner(
             pause: pause.clone(),
             gather: gather.clone(),
             spend: spend.clone(),
+            peers: peers.cloned(),
         })
         .await?;
         // The handler owns its own run row and closed it with the right
@@ -3327,6 +3369,7 @@ mod tests {
             readiness: crate::readiness::ReadinessGate::always(),
             last_fire: Mutex::new(HashMap::new()),
             first_seen: Mutex::new(HashMap::new()),
+            peers: None,
         })
     }
 
@@ -3366,6 +3409,7 @@ mod tests {
             readiness: crate::readiness::ReadinessGate::always(),
             last_fire: Mutex::new(HashMap::new()),
             first_seen: Mutex::new(HashMap::new()),
+            peers: None,
         });
 
         scheduler_tick(&dispatch).await.unwrap();
@@ -3418,6 +3462,7 @@ mod tests {
             &Limiter::new(1),
             &crate::pause::PauseGate::never(),
             &GatherGate::new(),
+            None,
         )
         .await
         .expect("native handler caps out cleanly");
@@ -3450,6 +3495,7 @@ mod tests {
                     &Limiter::new(1),
                     &crate::pause::PauseGate::never(),
                     &GatherGate::new(),
+                    None,
                 )
                 .await
                 .unwrap()
@@ -3514,6 +3560,7 @@ mod tests {
             &Limiter::new(1),
             &crate::pause::PauseGate::never(),
             &GatherGate::new(),
+            None,
         )
         .await
         .unwrap();
@@ -3572,6 +3619,7 @@ mod tests {
             &Limiter::new(1),
             &crate::pause::PauseGate::never(),
             &GatherGate::new(),
+            None,
         )
         .await
         .unwrap();

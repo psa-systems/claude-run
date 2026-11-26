@@ -408,7 +408,7 @@ pub struct EffectiveRuntime {
     /// Per-repo shared Cargo target directory size ceiling (`SPEC-3.10.7`). Brand-new section (never in `config.toml`), so the DB value or the
     /// built-in default (60 GB).
     pub cargo_cache: CargoCacheConfig,
-    /// Peering (`SPEC-3.17.1` through `SPEC-3.17.12`). Brand-new section: the DB value or the
+    /// Peering (`SPEC-3.17.1` through `SPEC-3.17.22`). Brand-new section: the DB value or the
     /// built-in default (disabled).
     pub peers: PeersConfig,
 }
