@@ -178,7 +178,7 @@ services:
   # namespace (daemon on `tcp://127.0.0.1:2375`, healthcheck `nc -z`)."
   claude-bot-docker:
     container_name: claude-bot-docker
-    image: docker.io/docker:29.6.2-dind
+    image: docker.io/docker:29.10.1-dind
     privileged: true
     restart: unless-stopped
     # Deliberately no `depends_on: claude-bot`: this service JOINS claude-bot's

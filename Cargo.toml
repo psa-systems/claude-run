@@ -15,41 +15,41 @@ name = "claude_run"
 path = "src/lib.rs"
 
 [dependencies]
-age = "0.11"
+age = "0.12.1"
 anstream = "1"
-anstyle = "1"
-anyhow = "1"
-askama = "0.12"
-async-stream = "0.3"
-async-trait = "0.1"
-base64 = "0.22"
-cron = "0.12"
+anstyle = "1.0.14"
+anyhow = "1.0.105"
+askama = "0.16.1"
+async-stream = "0.3.6"
+async-trait = "0.1.92"
+base64 = "0.23.1"
+cron = "0.17.0"
 daemonize = "0.5"
 dirs = "7.0.0"
-fs2 = "0.4"
-futures-util = "0.3"
-hex = "0.4"
-hmac = "0.12"
-humantime = "2"
-http-body-util = "0.1"
-hyperlocal = "0.9"
-libc = "0.2"
-rpassword = "7"
-serde_json = "1"
-serde_urlencoded = "0.7"
-serde_yaml = "0.9"
-sha2 = "0.10"
-shellexpand = "3"
+fs2 = "0.4.3"
+futures-util = "0.3.34"
+hex = "0.4.3"
+hmac = "0.13.0"
+humantime = "2.4.0"
+http-body-util = "0.1.5"
+hyperlocal = "0.9.1"
+libc = "0.2.191"
+rpassword = "7.5.5"
+serde_json = "1.0.154"
+serde_urlencoded = "0.7.1"
+serde_yaml = "0.9.34"
+sha2 = "0.11.2"
+shellexpand = "3.1.2"
 thiserror = "2.0.21"
-tokio-util = "0.7"
-toml = "1.2.2"
-tower = "0.5"
-tracing = "0.1"
-getrandom = "0.2"
+tokio-util = "0.7.20"
+toml = "1.2.3"
+tower = "0.5.3"
+tracing = "0.1.44"
+getrandom = "0.4.3"
 argon2 = "0.6.0"
 qrcodegen = "1.8.0"
-schemars = "1"
-tempfile = "3"
+schemars = "1.2.3"
+tempfile = "3.27.0"
 
 [dependencies.totp-rs]
 version = "6.0.0"
@@ -61,41 +61,41 @@ features = [
 ]
 
 [dependencies.pulldown-cmark]
-version = "0.13.4"
+version = "0.13.6"
 default-features = false
 features = ["html"]
 
 [dependencies.axum]
-version = "0.8"
+version = "0.8.9"
 features = ["macros"]
 
 [dependencies.chrono]
-version = "0.4"
+version = "0.4.45"
 features = [
     "serde",
     "unstable-locales",
 ]
 
 [dependencies.chrono-tz]
-version = "0.10"
+version = "0.10.4"
 features = ["serde"]
 
 [dependencies.clap]
-version = "4"
+version = "4.6.10"
 features = [
     "derive",
     "env",
 ]
 
 [dependencies.hyper]
-version = "1"
+version = "1.13.0"
 features = [
     "client",
     "http1",
 ]
 
 [dependencies.hyper-util]
-version = "0.1"
+version = "0.1.21"
 features = [
     "client",
     "client-legacy",
@@ -104,10 +104,10 @@ features = [
 ]
 
 [dependencies.url]
-version = "2"
+version = "2.5.9"
 
 [dependencies.lettre]
-version = "0.11"
+version = "0.11.24"
 default-features = false
 features = [
     "builder",
@@ -118,11 +118,11 @@ features = [
 ]
 
 [dependencies.serde]
-version = "1"
+version = "1.0.229"
 features = ["derive"]
 
 [dependencies.sqlx]
-version = "0.9"
+version = "0.9.1"
 features = [
     "runtime-tokio",
     "any",
@@ -135,7 +135,7 @@ features = [
 ]
 
 [dependencies.reqwest]
-version = "0.12"
+version = "0.13.5"
 default-features = false
 features = [
     "blocking",
@@ -144,20 +144,20 @@ features = [
 ]
 
 [dependencies.tokio]
-version = "1"
+version = "1.54.1"
 features = ["full"]
 
 [dependencies.rmcp]
-version = "3.10.0"
+version = "3.12.0"
 default-features = false
 features = ["server", "macros", "transport-io", "transport-streamable-http-server"]
 
 [dependencies.mcp-web]
-version = "0.1"
+version = "0.3.0"
 registry = "pandoras-box-cargo"
 
 [dependencies.tracing-subscriber]
-version = "0.3"
+version = "0.3.23"
 features = [
     "env-filter",
     "json",
@@ -166,7 +166,7 @@ features = [
 [dev-dependencies]
 
 [dev-dependencies.rmcp]
-version = "3.10.0"
+version = "3.12.0"
 default-features = false
 features = ["client", "transport-streamable-http-client-reqwest"]
 
