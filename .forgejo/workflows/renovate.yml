@@ -12,7 +12,7 @@ on:
 jobs:
   renovate:
     name: Renovate (caller)
-    uses: https://dev.a8n.run/psa-systems/common/.forgejo/workflows/renovate-reusable.yml@1cffab08dfe5c9f69b4c7f0d2422ae3644574ad9  # main
+    uses: https://dev.a8n.run/psa-systems/common/.forgejo/workflows/renovate-reusable.yml@6a3153457f1528afcdd55499c3a11f4db21d742c  # main
     # Base label: the same one the reusable workflow's own job uses; it compiles nothing.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     with:
